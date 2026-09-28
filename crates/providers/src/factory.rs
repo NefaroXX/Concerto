@@ -23,7 +23,7 @@ use crate::moonshot::MoonshotProvider;
 use crate::nim::NimProvider;
 use crate::novita::NovitaProvider;
 use crate::ollama::OllamaProvider;
-use crate::openai::{OpenAiProvider, ReasoningEcho};
+use crate::openai::{OpenAiProvider, ReasoningEcho, UsageRequest};
 use crate::opencode::OpenCodeZenProvider;
 use crate::openrouter::OpenRouterProvider;
 use crate::perplexity::PerplexityProvider;
@@ -186,6 +186,11 @@ impl ProviderFactory {
             "openai" => {
                 let mut provider =
                     OpenAiProvider::new(key, config.model.clone(), config.timeout_seconds)
+                        // ADR-48 §4: OpenAI reports usage on a streamed
+                        // response only when asked for it, so without this
+                        // opt-in every per-message usage column stays 0 on
+                        // the OpenAI connector.
+                        .with_usage_request(UsageRequest::IncludeStreamUsage)
                         .with_tool_schema_mode(resolve_tool_schema_mode(config));
                 if let Some(base) = &config.api_base {
                     provider = provider.with_api_base(base.clone());

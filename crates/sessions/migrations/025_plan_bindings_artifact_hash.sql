@@ -1,4 +1,4 @@
--- ADR-55 §1 (pending): artifact hash for durable plan bindings.
+-- ADR-55 §4: artifact hash for durable plan bindings.
 --
 -- `artifact_hash` is the blake3 fingerprint of the binding's `plan_text`,
 -- captured when the plan was created (the plan text shown in the

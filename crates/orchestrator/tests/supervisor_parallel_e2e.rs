@@ -259,6 +259,9 @@ async fn two_concurrent_agents_share_a_file_with_loud_conflict_and_clean_revert(
         memory: Arc::new(NullMemory),
         project_id: ProjectId("proj-parallel".to_owned()),
         consolidation: None,
+        // ADR-60 S5: fail-closed default (no approval sink, no audit bus) for this test.
+        approval_sink: None,
+        bus: None,
     };
     supervisor = supervisor.with_services(services);
     let shutdown = CancellationToken::new();

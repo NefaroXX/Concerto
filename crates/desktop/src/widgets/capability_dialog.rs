@@ -78,12 +78,87 @@ pub struct PendingAck {
     pub sender: AckSender,
 }
 
-/// Shared pending-ack state (None = no dialog shown).
-pub type SharedPendingAck = Arc<Mutex<Option<PendingAck>>>;
+/// Maximum number of acknowledgement requests the desktop will hold pending at
+/// once — the active dialog plus at most one queued behind it.
+///
+/// ADR-68 §6 settled this policy: the UI "queues at most one pending ack beyond
+/// the active one; overflow rejects with an explicit error." The bound is
+/// deliberately tiny because an ack is a *blocking, user-facing* confirmation,
+/// not a background job:
+///
+/// * One active dialog is what the user can actually read; a second queued acks
+///   keeps a concurrent prompt (another run/session) from overwriting the first.
+/// * A deeper queue would only delay the *second* prompt past the point where
+///   the requester is still waiting on it, and would let an ack storm grow UI
+///   state without bound. Two is the smallest depth that covers the real
+///   concurrent case without becoming an ack buffer.
+///
+/// Overflow is an explicit [`AckQueueError::QueueFull`] rejection, never a
+/// silent drop.
+pub const MAX_PENDING_ACKS: usize = 2;
 
-/// Create a new shared pending-ack cell.
+/// Why an acknowledgement request could not be queued for display.
+///
+/// Both variants are fail-closed: the caller must abort the task rather than
+/// proceed without the acknowledgement it asked for. Neither is a silent drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckQueueError {
+    /// The bounded acknowledgement queue already holds [`MAX_PENDING_ACKS`]
+    /// entries. The new request is refused outright — it never displaces an
+    /// already-pending ack and is never dropped without a signal.
+    QueueFull { capacity: usize },
+    /// The shared queue state could not be read (its lock is poisoned), so the
+    /// desktop cannot prove the request was recorded. Failing closed beats
+    /// reporting "no pending acks" for a request that was actually made.
+    StateUnavailable,
+}
+
+impl std::fmt::Display for AckQueueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QueueFull { capacity } => write!(
+                f,
+                "acknowledgement queue is full ({capacity} pending); refusing the new ack"
+            ),
+            Self::StateUnavailable => {
+                write!(f, "acknowledgement queue state is unavailable; refusing the new ack")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AckQueueError {}
+
+/// Shared pending-ack queue — a depth-bounded FIFO so a second acknowledgement
+/// arriving while the first is displayed is queued rather than overwriting it
+/// (ADR-68 §6, DEFERRED row 4). The front entry is the active dialog; entries
+/// carry their owning session id and resolution is session-gated, so a stale or
+/// cross-session entry can never answer another run's prompt.
+pub type SharedPendingAck = Arc<Mutex<VecDeque<PendingAck>>>;
+
+/// Create a new shared pending-ack queue.
 pub fn shared_pending_ack() -> SharedPendingAck {
-    Arc::new(Mutex::new(None))
+    Arc::new(Mutex::new(VecDeque::new()))
+}
+
+/// Queue an acknowledgement for display, honouring [`MAX_PENDING_ACKS`].
+///
+/// Returns [`AckQueueError::QueueFull`] when the bound is already reached: the
+/// new request is rejected — never dropped silently and never by displacing an
+/// existing ack. Returns [`AckQueueError::StateUnavailable`] when the shared
+/// state cannot be read, so the caller can fail closed rather than assume the
+/// request was shown.
+pub fn enqueue_ack(state: &SharedPendingAck, ack: PendingAck) -> Result<(), AckQueueError> {
+    // A poisoned lock means the queue is unreadable; refuse rather than guess.
+    let mut guard = match state.lock() {
+        Ok(guard) => guard,
+        Err(_) => return Err(AckQueueError::StateUnavailable),
+    };
+    if guard.len() >= MAX_PENDING_ACKS {
+        return Err(AckQueueError::QueueFull { capacity: MAX_PENDING_ACKS });
+    }
+    guard.push_back(ack);
+    Ok(())
 }
 
 /// User action on the acknowledgement dialog.
@@ -95,14 +170,28 @@ pub enum AckDialogMessage {
     Cancel,
 }
 
+/// Position indicator for the acknowledgement dialog.
+///
+/// `None` while a single ack is pending, so the common case renders exactly as
+/// before. `Some("Acknowledgement 1 of N pending")` when more than one ack is
+/// queued, so the user can see they have N outstanding acknowledgements rather
+/// than believing the displayed one is the only prompt. The front entry is
+/// always position 1 (FIFO); resolution drains the queue in order.
+fn ack_queue_position(pending: usize) -> Option<String> {
+    if pending <= 1 {
+        return None;
+    }
+    Some(format!("Acknowledgement 1 of {pending} pending"))
+}
+
 /// Render the acknowledgement dialog.
 ///
 /// Returns `None` when there is no pending request.
 pub fn ack_view(state: &SharedPendingAck) -> Option<Element<'static, AckDialogMessage>> {
-    let message = {
+    let (message, pending) = {
         let guard = state.lock().unwrap_or_else(|e| e.into_inner());
-        let ack = guard.as_ref()?;
-        ack.message.clone()
+        let ack = guard.front()?;
+        (ack.message.clone(), guard.len())
     };
 
     let header = text("⚠  Warning").size(20);
@@ -115,7 +204,15 @@ pub fn ack_view(state: &SharedPendingAck) -> Option<Element<'static, AckDialogMe
 
     let buttons = row![cancel_btn, continue_btn].spacing(10).padding(10);
 
-    let content = column![header, body, buttons].spacing(12).padding(24).width(460);
+    // The count/position line is added only when more than one ack is pending:
+    // a single ack keeps the original modal layout unchanged (DEFERRED row 4).
+    let mut children: Vec<Element<'static, AckDialogMessage>> = vec![header.into(), body.into()];
+    if let Some(position) = ack_queue_position(pending) {
+        children.push(text(position).size(12).into());
+    }
+    children.push(buttons.into());
+
+    let content = column(children).spacing(12).padding(24).width(460);
 
     let surface = container(content)
         .width(500)
@@ -128,19 +225,20 @@ pub fn ack_view(state: &SharedPendingAck) -> Option<Element<'static, AckDialogMe
 
 /// Apply a user decision to the pending ack state.
 ///
-/// Resolves the pending ack — but only when it belongs to `session_id`: a
-/// stale or cross-session entry must never answer a different run's prompt
-/// (ADR-68, audit H-04). A non-matching entry is left in place. Returns `true`
-/// when the matching entry was resolved.
+/// Resolves the front (active) pending ack — but only when it belongs to
+/// `session_id`: a stale or cross-session entry must never answer a different
+/// run's prompt (ADR-68, audit H-04). A non-matching entry is restored to the
+/// front so the owning session still sees its dialog. Returns `true` when the
+/// matching entry was resolved.
 pub fn resolve_ack(state: &SharedPendingAck, session_id: Ulid, acknowledged: bool) -> bool {
     let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(pending) = guard.take() else {
+    let Some(pending) = guard.pop_front() else {
         return false;
     };
     if pending.session_id != session_id {
-        // A different (stale/cross-session) entry reached the slot — never
+        // A different (stale/cross-session) entry reached the front — never
         // answer it; restore it so the owning session still sees its dialog.
-        *guard = Some(pending);
+        guard.push_front(pending);
         return false;
     }
     let _ = pending.sender.send(acknowledged);
@@ -256,7 +354,7 @@ pub fn resolve(state: &SharedPending, decision: &Message) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Intent confirmation dialog (ADR-55 §1)
+// Intent confirmation dialog (ADR-55 §2)
 // ---------------------------------------------------------------------------
 //
 // The run loop asks the user to confirm a change of run intent before letting
@@ -377,7 +475,7 @@ pub fn resolve_intent(state: &SharedPendingIntent, message: IntentDialogMessage)
 }
 
 // ---------------------------------------------------------------------------
-// Plan approval dialog (ADR-55 Phase 1d)
+// Plan approval dialog (ADR-55 §4)
 // ---------------------------------------------------------------------------
 //
 // Mirrors the intent dialog: the sink queues a [`PendingPlan`] and awaits its
@@ -597,18 +695,30 @@ mod tests {
     }
 
     #[test]
+    fn ack_queue_position_is_none_for_a_single_pending_ack() {
+        assert_eq!(ack_queue_position(0), None);
+        assert_eq!(ack_queue_position(1), None, "the common single-ack case renders unchanged");
+    }
+
+    #[test]
+    fn ack_queue_position_counts_pending_acks() {
+        assert_eq!(ack_queue_position(2), Some("Acknowledgement 1 of 2 pending".to_string()));
+        assert_eq!(ack_queue_position(3), Some("Acknowledgement 1 of 3 pending".to_string()));
+    }
+
+    #[test]
     fn resolve_ack_matching_session_delivers_decision() {
         let state = shared_pending_ack();
         let session_id = Ulid::new();
         let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
-        *state.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(PendingAck { session_id, message: "warning".into(), sender: tx });
+        enqueue_ack(&state, PendingAck { session_id, message: "warning".into(), sender: tx })
+            .expect("queue has room");
 
         assert!(resolve_ack(&state, session_id, true), "matching session must resolve");
         assert_eq!(rx.blocking_recv(), Ok(true));
         assert!(
-            state.lock().unwrap_or_else(|e| e.into_inner()).is_none(),
-            "resolved ack must leave the slot empty"
+            state.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "resolved ack must leave the queue empty"
         );
     }
 
@@ -617,19 +727,126 @@ mod tests {
         let state = shared_pending_ack();
         let owning_session = Ulid::new();
         let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
-        *state.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(PendingAck { session_id: owning_session, message: "warning".into(), sender: tx });
+        enqueue_ack(
+            &state,
+            PendingAck { session_id: owning_session, message: "warning".into(), sender: tx },
+        )
+        .expect("queue has room");
 
         // A different session's resolution must never answer this ack
         // (ADR-68, audit H-04).
         assert!(!resolve_ack(&state, Ulid::new(), false), "cross-session resolve must be rejected");
         assert!(
-            state.lock().unwrap_or_else(|e| e.into_inner()).is_some(),
+            !state.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
             "the owning session's ack must stay pending"
         );
 
         // The owner can still resolve it.
         assert!(resolve_ack(&state, owning_session, false), "the owner resolve succeeds");
         assert_eq!(rx.blocking_recv(), Ok(false));
+    }
+
+    /// The queue is bounded: filling it to [`MAX_PENDING_ACKS`] succeeds, and
+    /// the next request is refused with a named error instead of being dropped
+    /// or displacing an existing entry.
+    #[test]
+    fn ack_queue_depth_bound_refuses_n_plus_one_with_named_error() {
+        let state = shared_pending_ack();
+        let mut receivers = Vec::new();
+        for _ in 0..MAX_PENDING_ACKS {
+            let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+            receivers.push(rx);
+            enqueue_ack(
+                &state,
+                PendingAck { session_id: Ulid::new(), message: "warning".into(), sender: tx },
+            )
+            .expect("the bounded queue has room up to its capacity");
+        }
+
+        let (tx, _rx) = tokio::sync::oneshot::channel::<bool>();
+        let refused = enqueue_ack(
+            &state,
+            PendingAck { session_id: Ulid::new(), message: "overflow warning".into(), sender: tx },
+        );
+        assert_eq!(
+            refused,
+            Err(AckQueueError::QueueFull { capacity: MAX_PENDING_ACKS }),
+            "the N+1th request must be refused with the named error"
+        );
+        assert_eq!(
+            state.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            MAX_PENDING_ACKS,
+            "a refused request must neither grow the queue nor displace an entry"
+        );
+    }
+
+    /// Acks resolve FIFO: the entry raised first is delivered first.
+    #[test]
+    fn ack_queue_resolves_in_fifo_order() {
+        let state = shared_pending_ack();
+        let first_session = Ulid::new();
+        let second_session = Ulid::new();
+        let (tx_first, rx_first) = tokio::sync::oneshot::channel::<bool>();
+        let (tx_second, rx_second) = tokio::sync::oneshot::channel::<bool>();
+        enqueue_ack(
+            &state,
+            PendingAck { session_id: first_session, message: "first".into(), sender: tx_first },
+        )
+        .expect("queue has room");
+        enqueue_ack(
+            &state,
+            PendingAck { session_id: second_session, message: "second".into(), sender: tx_second },
+        )
+        .expect("queue has room");
+
+        // The second session cannot jump the queue: the front (first) is the
+        // only resoluble entry until it is answered.
+        assert!(
+            !resolve_ack(&state, second_session, true),
+            "the queued second ack must not resolve before the active first ack"
+        );
+        assert!(resolve_ack(&state, first_session, true), "the first ack resolves first");
+        assert_eq!(rx_first.blocking_recv(), Ok(true));
+        assert!(resolve_ack(&state, second_session, false), "the second ack resolves next");
+        assert_eq!(rx_second.blocking_recv(), Ok(false));
+    }
+
+    /// Fail-closed: an unreadable queue state refuses the request with a named
+    /// error rather than reporting that nothing is pending.
+    #[test]
+    fn enqueue_ack_refuses_when_state_is_unavailable() {
+        let state = shared_pending_ack();
+        let poisoned = state.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().expect("queue lock");
+            panic!("poison the ack queue lock");
+        })
+        .join();
+
+        let (tx, _rx) = tokio::sync::oneshot::channel::<bool>();
+        let refused = enqueue_ack(
+            &state,
+            PendingAck { session_id: Ulid::new(), message: "warning".into(), sender: tx },
+        );
+        assert_eq!(
+            refused,
+            Err(AckQueueError::StateUnavailable),
+            "an unreadable queue must refuse, never silently accept"
+        );
+    }
+
+    /// Fail-closed waiting primitive: a dropped decision sender (the dialog
+    /// went away with the run) resolves the wait as `None` — which the sink
+    /// maps to a denial — instead of hanging forever.
+    #[tokio::test]
+    async fn await_decision_on_a_closed_channel_returns_none() {
+        let (sender, receiver) = tokio::sync::watch::channel::<Option<Vec<GrantDecision>>>(None);
+        drop(sender);
+
+        let decision =
+            tokio::time::timeout(std::time::Duration::from_secs(5), await_decision(receiver))
+                .await
+                .expect("a closed decision channel must resolve, never hang");
+        assert!(decision.is_none(), "an unanswerable capability dialog must deny");
     }
 }

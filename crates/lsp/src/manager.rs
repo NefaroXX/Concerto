@@ -12,6 +12,17 @@ pub struct LspManager;
 static CLIENTS: Lazy<Mutex<HashMap<ProjectId, Arc<Mutex<LspClient>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// Serialises every unit test that touches the process-global [`CLIENTS`] map.
+///
+/// `LspManager` is a process-wide singleton, so tests in *any* module that call
+/// [`LspManager::get_or_start`] or [`LspManager::stop_all`] must hold this lock.
+/// Without a crate-wide lock, a concurrent `stop_all` (for example from
+/// `lib.rs`'s `test_lsp_manager_stop_all`, which does not otherwise coordinate
+/// with this module) can drain the map between the two `get_or_start` calls in
+/// `test_manager_caches_same_project`, making that cache assertion flaky.
+#[cfg(test)]
+pub(crate) static MANAGER_TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
 impl LspManager {
     /// Get the client for a project, starting it if necessary.
     pub async fn get_or_start(
@@ -47,13 +58,13 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    /// Serialises tests in this module that access the global `CLIENTS` static.
-    static TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+    // Tests here acquire the crate-wide `MANAGER_TEST_LOCK` defined in the
+    // parent module; `lib.rs` tests that touch the manager take the same lock.
 
     /// `get_or_start` must return an `Arc<Mutex<LspClient>>` that can be locked.
     #[tokio::test]
     async fn test_manager_returns_arc_mutex() {
-        let _guard = TEST_LOCK.lock().await;
+        let _guard = MANAGER_TEST_LOCK.lock().await;
         let cancel = CancellationToken::new();
         let project_dir = std::path::PathBuf::from("/tmp/arc_test");
         let project_id = concerto_core::types::ProjectId::resolve(&project_dir);
@@ -66,7 +77,7 @@ mod tests {
     /// pointer (cached behaviour).
     #[tokio::test]
     async fn test_manager_caches_same_project() {
-        let _guard = TEST_LOCK.lock().await;
+        let _guard = MANAGER_TEST_LOCK.lock().await;
         let cancel = CancellationToken::new();
         // Use a unique temp dir to avoid accidental collisions.
         let dir = tempfile::TempDir::new().expect("temp dir");
@@ -91,7 +102,7 @@ mod tests {
     /// return a valid `Arc` — the start error is swallowed.
     #[tokio::test]
     async fn test_manager_get_or_start_nonexistent_binary() {
-        let _guard = TEST_LOCK.lock().await;
+        let _guard = MANAGER_TEST_LOCK.lock().await;
         let cancel = CancellationToken::new();
         // Use a binary path that definitely does not exist on any system.
         let project_dir = std::path::PathBuf::from("/tmp/nonexistent_binary");
@@ -108,7 +119,7 @@ mod tests {
     /// `stop_all` on a manager that has no entries must not panic or deadlock.
     #[tokio::test]
     async fn test_manager_empty_stop_all() {
-        let _guard = TEST_LOCK.lock().await;
+        let _guard = MANAGER_TEST_LOCK.lock().await;
         let cancel = CancellationToken::new();
 
         // Ensure the static map starts clean for this test by calling stop_all first.
@@ -121,7 +132,7 @@ mod tests {
     /// must still return a valid `Arc` without panicking.
     #[tokio::test]
     async fn test_manager_get_or_start_nonexistent_dir() {
-        let _guard = TEST_LOCK.lock().await;
+        let _guard = MANAGER_TEST_LOCK.lock().await;
         let cancel = CancellationToken::new();
         // Use a directory that definitely does not exist.
         let project_dir = std::path::PathBuf::from("/tmp/_nonexistent_dir_42a9b1c7");
@@ -137,7 +148,7 @@ mod tests {
     /// each return distinct `Arc` pointers.
     #[tokio::test]
     async fn test_manager_concurrent_get_or_start() {
-        let _guard = TEST_LOCK.lock().await;
+        let _guard = MANAGER_TEST_LOCK.lock().await;
         let cancel = CancellationToken::new();
 
         let dirs: Vec<std::path::PathBuf> =

@@ -1,4 +1,4 @@
--- ADR-55 Phase 1d §4: expand the audit log with schema-derived
+-- ADR-55 §6: expand the audit log with schema-derived
 -- intent-decision columns (bound plan id, source revision the plan was
 -- approved at) alongside the existing `user_response` JSON envelope, which is
 -- retained for replay/backward compatibility. All new columns are nullable so

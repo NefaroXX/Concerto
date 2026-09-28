@@ -144,6 +144,21 @@ pub(crate) const RECONSIDER_TOOL: &str = "reconsider";
 /// is the human-in-the-loop consent path itself, not a workspace mutation.
 pub(crate) const REQUEST_USER_INPUT_TOOL: &str = "request_user_input";
 
+/// C-06 evidence kind (3): the Coordinator's explicit, recorded declaration
+/// that no separate verification pass is required for this objective, with a
+/// reason. The declaration is auditable — the handler records a
+/// `coordinator_decision` audit row and a whiteboard `Decision` event (code
+/// `verification-exempt`) — which is what the completion-time C-06 acceptance
+/// gate reads as evidence. It dispatches no agents and touches no tools; like
+/// `request_user_input` it applies no policy gate (it mutates no workspace
+/// state), and a declaration that cannot be durably recorded is refused.
+pub(crate) const DECLARE_VERIFICATION_EXEMPT_TOOL: &str = "declare_no_verification_required";
+
+/// The whiteboard `Decision`/audit code stamped by
+/// [`DECLARE_VERIFICATION_EXEMPT_TOOL`]; the C-06 gate recognises exactly this
+/// code when reading a run's recorded declarations.
+const VERIFICATION_EXEMPT_DECISION_CODE: &str = "verification-exempt";
+
 /// Maximum Coordinator decision-loop iterations (model turns with tool
 /// calls) before the loop stops. The run-wide ADR-52 doom guard
 /// (`max_total_iterations`) bounds the loop further; this constant is the
@@ -161,23 +176,22 @@ const MAX_DISPATCH_ITERATIONS: usize = 64;
 /// exit with a preserved checkpoint.
 const MAX_PROSE_STOP_REPROMPTS: u32 = 5;
 
-/// ADR-35 same-role dispatch cap: the number of CONSECUTIVE dispatches to one
-/// role on the same objective, with no implement/code artifact produced, at
-/// which the loop guard fires. It is a pure loop invariant — an ADVISORY guard,
-/// never a compiled dispatch policy or state forcing (the guard only records
-/// the loop evidence and nudges toward a different role; it never selects,
-/// auto-dispatches, or escalates the run itself).
+/// Same-role dispatch cap: the number of CONSECUTIVE dispatches to one role on
+/// the same objective before the repeat-dispatch path is bounded and
+/// escalated. At the cap the next dispatch naming that role is NOT re-run as
+/// that role: it escalates through the agent axis (a same-stage peer first,
+/// then any agent whose configured coverage can take the work) and, when no
+/// alternative specialist exists, surfaces the existing user-input decision
+/// point. The escalation never registers a reason for the coordinator to
+/// self-execute (ADR-74): another specialist or an operator decision, never
+/// in-house work while a specialist remains.
 const MAX_CONSECUTIVE_SAME_ROLE_DISPATCHES: u32 = 3;
 
-/// The bounded advisory nudges the same-role guard may emit. Past the ceiling
-/// the guard stays silent on the tool result (the ledger note already carries
-/// the loop evidence); it never escalates on the operator's behalf.
-const MAX_SAME_ROLE_GUARD_NUDGES: u32 = 1;
-
 /// Whether a produced path is an implement/code artifact (as opposed to a
-/// docs-only deliverable). Extension-based, deliberately conservative: the
-/// same-role guard only treats a streak as productive when a code artifact
-/// landed, so a docs-only streak keeps counting toward the cap.
+/// docs-only or rename-style deliverable). Extension-based, deliberately
+/// conservative: the same-role cap only treats a code-edit streak as
+/// productive when a code artifact landed, so a docs-only streak keeps
+/// counting toward the cap.
 fn is_code_artifact_path(path: &camino::Utf8Path) -> bool {
     path.extension().is_some_and(|extension| {
         matches!(
@@ -230,6 +244,23 @@ fn prose_stop_dispatch_instruction(attempt: u32) -> String {
     )
 }
 
+/// The explicit dispatch instruction appended to a RESUMED run's decision
+/// context by [`CoordinatorAgent::drive_resumed_implement`]: the restored
+/// steps are all settled, the implement stage was never dispatched, and the
+/// session must decide the next dispatch instead of re-reporting the
+/// completion guard's verdict in prose.
+fn resume_drive_instruction() -> String {
+    "<resume_drive>\n\
+     This run was resumed from a checkpoint whose restored steps are ALL settled, yet the \
+     plan's implement stage was never dispatched and no code artifact exists. Decide the \
+     NEXT dispatch now with the `call_specialist` tool.\n\
+     - Do NOT re-dispatch a restored step: they are all Completed.\n\
+     - Do NOT close in prose: an action-required resume that ends with no implement \
+     dispatch is reported as an unattempted-implementation failure and pauses Partial.\n\
+     </resume_drive>\n"
+        .to_owned()
+}
+
 /// ADR-35 amendment (2026-09-05) §1: built-in instructions for the
 /// Coordinator's decision loop. The roster ([`Self::render_specialist_roster`])
 /// is injected after these instructions; the Orchestration Studio's
@@ -238,15 +269,25 @@ const COORDINATOR_DISPATCH_PROMPT: &str = r#"You are the Coordinator: the sole d
 
 How to work:
 1. Read the objective, the recorded evidence (workspace facts, the design document if one binds), and the specialist roster below.
-2. Call a specialist with the call_specialist tool when one is the right tool for the work: name the agent_id exactly as listed, give the specialist a complete self-contained task, and put your guidance in notes.
+2. Delegation is the DEFAULT action for implementation, review, and validation work. Use the call_specialist tool: name the agent_id exactly as listed, give the specialist a complete self-contained task, and put your guidance in notes. Do not keep the work in-house because a call feels costly — the registered specialists are the run's capacity.
 3. The tool returns the specialist's outcome (success / failed / blocked / needs_revision, its summary, and the files it changed). Decide the next step from that outcome: re-call the specialist with corrective notes, call a different specialist, or finish.
-4. When a specialist failed or returned needs_revision, you may retry with corrective notes. Every call you make is recorded as a Decision on the whiteboard, so call deliberately.
-5. If no registered specialist fits (or none is registered for the work at all), do the work yourself with your own tools — you are a full agent.
+4. When a specialist failed or returned needs_revision, retry with corrective notes or re-target the SAME work to another registered specialist before treating the work as impossible. Every call is recorded as a Decision on the whiteboard; the record exists for auditability, never to discourage a needed dispatch — do not avoid a call merely to keep the ledger short.
+5. Self-execution is permitted ONLY when you have exhausted the roster: (a) no agents are registered (an empty roster), (b) the roster is disabled or unavailable, or (c) you attempted delegation and it genuinely failed. While ANY specialist remains that could do the work, you must delegate. Doing the work yourself is never a shortcut around a capable specialist.
 6. When the objective is met (or nothing more can be done), reply with a plain summary and NO tool call. List what was done, by whom, and any remaining risk.
+
+Transforming an EXISTING artifact (no synthesis):
+- When an objective requires transforming, renaming, moving, editing, or otherwise operating on a NAMED EXISTING artifact, and that artifact is absent, you must NOT create, stub, placeholder, or synthesize it. Surface the discrepancy to the user through the request_user_input path, naming the exact path you looked for.
+- Creating a file to satisfy a rename is not a rename. Never offer to synthesize the missing source as a fallback, and never write a subtask that instructs a specialist to fabricate one.
+- Absent an explicit user instruction to create something, absence is information to report, not an obstacle to route around.
 
 Evidence discipline:
 - When your decision rests on recorded evidence, cite the real event ids from the context in supporting_evidence_ids. Fabricated ids are rejected and your decision loses its citations.
 - The stage tag of a specialist is informational context. You are never required to follow a stage order — call whoever the work needs, whenever the work needs it.
+
+Selecting a specialist (read the roster below — it is data, this prompt hardcodes no roles):
+- The roster is the authoritative, operator-configured list of callable agents; it may list any ids, stages, or counts. Prefer the agent whose declared stage matches the work at hand (design work to a design-stage agent, implementation to an implement-stage agent, review to a review-stage agent, validation to a validate-stage agent). A stage tag is context, not a dispatch rule: never infer a fixed pipeline from it, and treat a stage-less agent as a full participant.
+- Before concluding that work cannot be delegated, scan the roster for ANOTHER agent that can take it: first another agent at the same stage, then any agent whose configured coverage includes the target stage (an agent may declare that it can cover more than its own stage). Prefer re-targeting a specialist over doing the work yourself.
+- Changing WHICH specialist takes the work and re-targeting a chosen specialist to a different model/provider are separate choices; either is preferable to self-execution.
 
 Restructuring an open task (use sparingly, deterministically):
 - When one open task is doing too much, split_task re-cuts it into ordered children that inherit the task's specialist role, evidence, and attempt counter. Splits of pending/running tasks only — completed work is never re-cut.
@@ -551,6 +592,39 @@ fn request_user_input_tool_definition() -> ToolDefinition {
     }
 }
 
+/// Argument schema for the Coordinator's
+/// [`DECLARE_VERIFICATION_EXEMPT_TOOL`] declaration (C-06 evidence kind 3):
+/// the explicit, auditable statement that no separate verification pass is
+/// required for this objective, carrying the reason. It records a
+/// `verification-exempt` decision (audit + whiteboard) that the completion-time
+/// acceptance gate consumes as evidence. A reason is mandatory so "no
+/// verification needed" is never silent.
+fn declare_verification_exempt_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: DECLARE_VERIFICATION_EXEMPT_TOOL.to_string(),
+        description: "Declare that no separate verification pass is required for this \
+                      objective, and state why. Use this ONLY when the work is directly \
+                      self-evidencing (for example a rename or a mechanical edit whose \
+                      success is visible in the executed tool result). The declaration and \
+                      its reason are recorded in the run's audit trail and are consumed by \
+                      the completion-time acceptance gate as verification evidence. It does \
+                      NOT waive the declared-deliverable artifact checks: those still run."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Why no separate verification pass is required for this \
+                                    objective. Mandatory and non-empty; it is recorded as the \
+                                    auditable justification."
+                }
+            },
+            "required": ["reason"]
+        }),
+    }
+}
+
 /// Three-way failure classification for subtask dispatches (ADR-42 §1).
 enum SubtaskFailureClass {
     /// Transient; retry the same agent/model (today's recoverable path).
@@ -631,6 +705,23 @@ fn is_cancellation_error(error: &OrchestratorError) -> bool {
 /// surfaces exhaustion. Bounded so a run can never loop pipes; every attempt
 /// still counts toward the ADR-52 run-wide dispatch cap.
 const MAX_FALLBACK_ATTEMPTS: usize = 3;
+
+/// Ladder hold (owner doctrine, option b): the maximum number of
+/// coordinator-owned planning-recovery ROUNDS per run. Replaces the historical
+/// once-per-run `planning_recovery_attempted` latch so recovery is no longer
+/// one-shot, while staying bounded.
+const MAX_PLANNING_RECOVERY_ROUNDS: u32 = 3;
+
+/// Ladder hold (owner doctrine, option b): the maximum number of times one run
+/// may HOLD a throttled planning rung (wait out its `Retry-After`, then retry
+/// the SAME provider) before falling back to the provider bridge.
+const MAX_PLANNING_HOLDS: u32 = 2;
+
+/// Ladder hold (owner doctrine, option b): the documented ceiling on a single
+/// hold wait, regardless of how long a provider's `Retry-After` asks for. The
+/// provider's own hint is respected up to this bound so a rogue hint can never
+/// park a run indefinitely.
+const MAX_PLANNING_HOLD: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// `(provider_config_id, model)` — the identity of a fallback pipe, used to
 /// record which pipes a guarded scope has already tried so the bounded
@@ -776,16 +867,29 @@ fn check_one_artifact(
 /// root) and holds non-placeholder content (audit C-06). Returns the
 /// verified paths on success, or the offending artifacts with a per-file
 /// reason. An empty `expected` list passes vacuously.
+///
+/// Artifact identity is a FILE PATH: declarations that carry no parseable
+/// path (prose a model emitted where a path was expected) are violations
+/// with [`crate::declared_artifacts::UNVERIFIABLE_REASON`] — never
+/// `missing:`. They still fail the gate (no weakening): the declaration
+/// itself is the defect.
 fn verify_expected_artifacts(
     project_root: &camino::Utf8Path,
     expected: &[camino::Utf8PathBuf],
 ) -> Result<Vec<camino::Utf8PathBuf>, Vec<(camino::Utf8PathBuf, String)>> {
+    use crate::declared_artifacts::{classify, DeclaredArtifact, UNVERIFIABLE_REASON};
+
     let mut verified = Vec::new();
     let mut violations = Vec::new();
     for artifact in expected {
-        match check_one_artifact(project_root, artifact) {
-            Ok(()) => verified.push(artifact.clone()),
-            Err(reason) => violations.push((artifact.clone(), reason)),
+        match classify(artifact.as_str()) {
+            DeclaredArtifact::Path(_) => match check_one_artifact(project_root, artifact) {
+                Ok(()) => verified.push(artifact.clone()),
+                Err(reason) => violations.push((artifact.clone(), reason)),
+            },
+            DeclaredArtifact::NonFile | DeclaredArtifact::Unverifiable => {
+                violations.push((artifact.clone(), UNVERIFIABLE_REASON.to_owned()))
+            }
         }
     }
     if violations.is_empty() {
@@ -802,6 +906,180 @@ fn expected_artifact_list(
 ) -> Vec<camino::Utf8PathBuf> {
     let mut seen = HashSet::new();
     snapshot.values().flatten().filter(|path| seen.insert((*path).clone())).cloned().collect()
+}
+
+/// Cap on the per-kind whiteboard window the C-06 evidence reader scans. A
+/// generous bound: a real run's `ToolExecuted`/`Decision` rows are far below
+/// it, and a truncated read only degrades to "no evidence" (fail-closed),
+/// never to a false accept.
+const VERIFICATION_EVIDENCE_SCAN_LIMIT: usize = 4096;
+
+/// Which kind of verification evidence satisfied the C-06 acceptance gate.
+/// Recorded for the audit trail and the completion decision; never a routing
+/// signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerificationEvidenceKind {
+    /// (1) An Acceptance-kind subtask settled `completed` in the ledger.
+    DeclaredValidator,
+    /// (2a) A successful mutating tool touched a declared deliverable.
+    MutatingToolOnDeliverable,
+    /// (2b) A successful build/test/lint/format command ran.
+    BuildOrTestCommand,
+    /// (3) A recorded coordinator declaration that verification is unnecessary.
+    CoordinatorDeclaration,
+}
+
+/// One piece of evidence that satisfies the C-06 acceptance gate, with a
+/// short human-readable detail for the decision record.
+#[derive(Debug, Clone)]
+struct VerificationEvidence {
+    kind: VerificationEvidenceKind,
+    detail: String,
+}
+
+/// Normalise a project-relative path for identity comparison: strip any
+/// leading `./` segments. Both the declared artifacts and the recorded tool
+/// facts are project-relative, so this is sufficient (no root resolution).
+fn normalize_evidence_path(raw: &str) -> String {
+    let mut value = raw.trim();
+    while let Some(stripped) = value.strip_prefix("./") {
+        value = stripped;
+    }
+    value.to_owned()
+}
+
+/// Whether a recorded tool fact names a mutating file operation (write /
+/// delete / move / copy / edit). Reuses the evidence-spine grammar
+/// ([`crate::tool_facts::is_file_affecting_tool`]) plus the `write` alias.
+fn is_mutating_tool_fact(tool: &str, args: &serde_json::Value) -> bool {
+    tool == "write" || crate::tool_facts::is_file_affecting_tool(tool, args)
+}
+
+/// Whether a recorded `shell` tool command is a build/test/lint/format
+/// invocation. Bounded, documented classifier over the first one or two
+/// whitespace-separated tokens of `command` + `args` (joined). Pure so it is
+/// unit-testable. Unknown runners return `false` (fail-closed).
+fn is_build_or_test_command(args: &serde_json::Value) -> bool {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(command) = args.get("command").and_then(serde_json::Value::as_str) {
+        parts.push(command.to_owned());
+    }
+    if let Some(list) = args.get("args").and_then(serde_json::Value::as_array) {
+        for item in list {
+            if let Some(value) = item.as_str() {
+                parts.push(value.to_owned());
+            }
+        }
+    }
+    if parts.is_empty() {
+        return false;
+    }
+    let normalized = parts.join(" ").to_lowercase();
+    let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let tokens: Vec<&str> = normalized.split(' ').collect();
+    let first = tokens.first().copied().unwrap_or("");
+    let second = tokens.get(1).copied().unwrap_or("");
+    match first {
+        "cargo" => {
+            matches!(
+                second,
+                "build" | "check" | "test" | "clippy" | "fmt" | "nextest" | "deny" | "audit"
+            )
+        }
+        "make" => true,
+        "npm" | "yarn" | "pnpm" => matches!(second, "test" | "run"),
+        "pytest" => true,
+        "python" => second == "-m" && tokens.get(2).copied() == Some("pytest"),
+        "go" => matches!(second, "build" | "test" | "vet"),
+        "dotnet" => matches!(second, "build" | "test"),
+        "mvn" => matches!(second, "test" | "verify" | "package"),
+        "gradle" | "./gradlew" => matches!(second, "test" | "build"),
+        "tsc" | "eslint" | "rustfmt" => true,
+        _ => false,
+    }
+}
+
+/// Every path a recorded tool fact touches: the observed `paths` plus the
+/// raw arguments' `path` / `destination` / `target`. The destination is read
+/// explicitly because move/copy record it in the arguments and in the tool's
+/// output data, neither of which the fact's observed `paths` include.
+fn tool_fact_touched_paths(
+    args: &serde_json::Value,
+    paths: &[concerto_sessions::ObservedPath],
+) -> Vec<String> {
+    let mut candidates: Vec<String> =
+        paths.iter().map(|observed| normalize_evidence_path(&observed.path)).collect();
+    for key in ["path", "destination", "target"] {
+        if let Some(value) = args.get(key).and_then(serde_json::Value::as_str) {
+            candidates.push(normalize_evidence_path(value));
+        }
+    }
+    candidates
+}
+
+/// (2a): whether a successful recorded mutation touched one of the run's
+/// declared expected artifacts (the objective's declared deliverable). An
+/// empty declared set is never satisfied — there is no deliverable to
+/// evidence.
+fn fact_touches_declared_deliverable(
+    args: &serde_json::Value,
+    paths: &[concerto_sessions::ObservedPath],
+    declared: &[camino::Utf8PathBuf],
+) -> bool {
+    if declared.is_empty() {
+        return false;
+    }
+    let touched = tool_fact_touched_paths(args, paths);
+    declared.iter().any(|artifact| {
+        let artifact = normalize_evidence_path(artifact.as_str());
+        touched.iter().any(|candidate| candidate == &artifact)
+    })
+}
+
+/// Evaluate a run's recorded `ToolExecuted` facts for C-06 evidence (2).
+/// FAIL-CLOSED: only `success == true` facts qualify, so a failed or
+/// policy-refused call never counts; a fact whose payload cannot be decoded
+/// contributes nothing. Facts are attributed to the run when they carry no
+/// `run_id` (legacy/test producers) or when their `run_id` matches the
+/// current run — a fact from a different run is ignored.
+fn tool_fact_verification_evidence(
+    events: &[WhiteboardEvent],
+    run_id: Option<&str>,
+    declared: &[camino::Utf8PathBuf],
+) -> Option<VerificationEvidence> {
+    for event in events {
+        let Ok(fact) =
+            serde_json::from_value::<concerto_sessions::ToolExecutedPayload>(event.payload.clone())
+        else {
+            continue;
+        };
+        if !fact.success {
+            continue;
+        }
+        if let (Some(fact_run), Some(current_run)) = (fact.run_id.as_deref(), run_id) {
+            if fact_run != current_run {
+                continue;
+            }
+        }
+        if fact.tool == "shell" && is_build_or_test_command(&fact.args) {
+            return Some(VerificationEvidence {
+                kind: VerificationEvidenceKind::BuildOrTestCommand,
+                detail: format!("successful build/test/lint command via `{}`", fact.tool),
+            });
+        }
+        if is_mutating_tool_fact(&fact.tool, &fact.args)
+            && fact_touches_declared_deliverable(&fact.args, &fact.paths, declared)
+        {
+            return Some(VerificationEvidence {
+                kind: VerificationEvidenceKind::MutatingToolOnDeliverable,
+                detail: format!(
+                    "successful mutating tool `{}` touched a declared deliverable",
+                    fact.tool
+                ),
+            });
+        }
+    }
+    None
 }
 
 /// Whether any declared expected artifact is unproduced on disk (missing,
@@ -843,6 +1121,35 @@ fn is_unfinished_subtask_status(status: SubTaskStatus) -> bool {
 /// Whether the graph holds any unfinished (non-terminal) subtask.
 fn graph_has_unfinished_work(graph: &TaskGraph) -> bool {
     graph.all_tasks().iter().any(|subtask| is_unfinished_subtask_status(subtask.status))
+}
+
+/// The restored graph's dispatch-chain tip: the newest leaf (no outgoing
+/// dependents), or the newest node when every node has dependents. This is
+/// the resume-drive's chain parent, so a dispatch decided after restore
+/// attaches exactly where the interrupted session's next dispatch would have
+/// (a child of the frontier, `MustFinishBefore` its parent) instead of
+/// becoming a detached root.
+///
+/// [`TaskGraph::all_tasks`] iterates a `HashMap`, so the order is made
+/// explicit here — `created_at`, then task id — to keep the choice
+/// deterministic across restores of the same row.
+fn restored_chain_tip(graph: &TaskGraph) -> Option<TaskId> {
+    let mut candidates = graph
+        .all_tasks()
+        .into_iter()
+        .filter(|subtask| graph.outgoing_dependents(&subtask.id).is_empty())
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        candidates = graph.all_tasks();
+    }
+    candidates
+        .into_iter()
+        .max_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.0.to_string().cmp(&right.id.0.to_string()))
+        })
+        .map(|subtask| subtask.id)
 }
 
 /// Run-continuity Phase 1: the stall predicate evaluated at a run's final
@@ -1014,7 +1321,7 @@ struct ReadyTask {
     previous_results: Vec<AgentRunResult>,
 }
 
-/// ADR-55 Phase 2b: how far a multi-agent run may take the orchestrated
+/// ADR-55 archived Phase 2b §1: how far a multi-agent run may take the
 /// graph. `Full` runs the historical lifecycle (plan, execute, review,
 /// validate); `PlanningOnly` stops after the plan is produced, rendered and
 /// persisted — no subtask dispatch, review, or validation.
@@ -1024,7 +1331,7 @@ pub enum OrchestrationDepth {
     #[default]
     Full,
     /// Plan only: memory + design + TaskPlanner + graph validation, then
-    /// return the rendered plan (ADR-55 Phase 2b).
+    /// return the rendered plan (ADR-55 §4).
     PlanningOnly,
 }
 
@@ -1467,6 +1774,10 @@ pub struct CoordinatorAgent {
     /// ADR-42 §4 tier 2 guard: whether coordinator self-execution has already
     /// been attempted for a task this run (at most once per task).
     self_execute_attempted: HashSet<TaskId>,
+    /// Agent-axis takeover guard (owner doctrine): whether a DIFFERENT
+    /// registered specialist has already been tried for a task this run
+    /// (at most once per task). Runs BEFORE the provider-axis tiers.
+    specialist_takeover_attempted: HashSet<TaskId>,
     /// ADR-45 tier 1b guard: whether a default-model-on-default-provider
     /// re-dispatch has already been attempted for a task this run (at most
     /// once per task).
@@ -1495,12 +1806,19 @@ pub struct CoordinatorAgent {
     fallback_pipes: Vec<(Arc<dyn concerto_core::traits::provider::LlmProvider>, ModelProfile)>,
     /// Coordinator-owned planning-provider recovery (ADR-42/45 ladder
     /// semantics, owned by the Coordinator since the compiled scheduler was
-    /// removed): whether this run may still attempt the one-shot fallback
-    /// retry of the planning dispatch session. `false` until a provider-class
-    /// planning failure either retried on the default-model provider or was
-    /// skipped (degenerate/unavailable/disabled); at most one recovery per
-    /// run. Run-scoped: reset at the start of every `run` invocation.
-    planning_recovery_attempted: bool,
+    /// removed): the number of recovery ROUNDS this run has entered, bounded
+    /// by [`MAX_PLANNING_RECOVERY_ROUNDS`]. Replaces the historical
+    /// once-per-run `planning_recovery_attempted` latch so recovery is not
+    /// one-shot. Run-scoped: reset at the start of every `run` invocation.
+    planning_recovery_rounds: u32,
+    /// Re-entrancy guard for the planning recovery: `true` while a recovery
+    /// (hold retry or fallback swap) is in flight, so the nested
+    /// `decompose_task` failure cannot start a SECOND, concurrent recovery.
+    planning_recovery_in_progress: bool,
+    /// Ladder hold: the number of throttled rungs this run has held (waited
+    /// out `Retry-After` then retried the SAME provider), bounded by
+    /// [`MAX_PLANNING_HOLDS`]. Run-scoped: reset at the start of every `run`.
+    planning_hold_rounds: u32,
     /// Set when the coordinator-owned planning recovery was attempted or
     /// skipped, so `run()`'s decompose error arm renders a ladder-exhausted
     /// note instead of a silent "Automation paused". Consumed (`take()`n) by
@@ -1549,9 +1867,22 @@ pub struct CoordinatorAgent {
     skills_section: String,
     /// Pre-rendered OS/shell identity card (custom-ai-shell plan, Phase C),
     /// threaded from the runtime's resolved shell settings. Injected into
-    /// every dispatch prompt and into the self-implement persona's prompts.
-    /// Empty when unset (manual/test constructions).
+    /// the self-implement persona's prompts. Empty when unset (manual/test
+    /// constructions). The DISPATCH prompt now receives its card through the
+    /// shared [`crate::prompts::PromptBuilder`] seam, so it is rendered from
+    /// `shell_profile` below rather than from this cached string.
     environment_card: String,
+    /// The session's resolved shell profile (ADR-28), used by the shared
+    /// `PromptBuilder` to append the same OS/shell identity card the
+    /// single-agent loop gets. `None` renders the OS-facts-only card.
+    shell_profile: Option<concerto_config::ShellProfileConfig>,
+    /// ADR-048 prefix discipline for the dispatch prompt: `[context]
+    /// .cache_stable_prefix`, resolved by the runtime via
+    /// [`crate::context_engine::ContextBudgetPolicy::from_config`] so the
+    /// knob's default lives in exactly one place. `false` keeps the default
+    /// (placeholder-substituted) assembly; `true` pins a byte-stable head and
+    /// appends the volatile working memory after it.
+    cache_stable_prefix: bool,
     /// Run-scoped project AGENTS.md context (ADR-70). Constructed once per
     /// run by the runtime (`ProjectContext::refresh` at run start) and
     /// injected into the dispatch system prompt between the skills section
@@ -1561,7 +1892,8 @@ pub struct CoordinatorAgent {
     /// pace the project-context maintenance nudge. Reset at construction; the
     /// cadence is [`crate::project_context::ProjectContext::nudge_frequency`].
     project_context_nudge_count: u64,
-    /// ADR-55 Phase 2b: how far this run may go — full lifecycle (default)
+    /// ADR-55 archived Phase 2b §1: how far this run may go — full
+    /// lifecycle (default)
     /// or planning-only (produce + render + persist the plan, nothing else).
     ///
     /// Advisor-mode intent routing: this is the DECIDED depth. When a
@@ -1583,7 +1915,7 @@ pub struct CoordinatorAgent {
     /// [`Self::decided_run_shape`], mirrored into the audit row and whiteboard
     /// payload (`None` when the run was not hint-driven).
     run_shape_decision_label: Option<String>,
-    /// ADR-55 Phase 2b: plan id of the most recently persisted PlanArtifact
+    /// ADR-55 §4: plan id of the most recently persisted PlanArtifact
     /// (ADR-52), surfaced so the runtime runner can bind a planning-only
     /// run's rendered plan to its durable artifact.
     last_plan_id: Option<String>,
@@ -1659,6 +1991,11 @@ pub struct CoordinatorAgent {
     /// Never used to gate behavior in this phase — persistence/write gating is
     /// load-bearing only with the Phase 5/6 evidence checks.
     workspace_snapshot: Option<crate::workspace_snapshot::WorkspaceSnapshotRecord>,
+    /// Phase 6 M3c step 5: the confirmed plan drift a resume re-armed Pending
+    /// (the affected COMPLETED subtasks), held until the completion tail so a
+    /// re-dispatch that never settles can attach the diff to its Partial note.
+    /// Cleared as soon as it is read; `None` on a run without confirmed drift.
+    plan_drift_redispatch: Option<crate::external_change::PlanDriftRedispatch>,
     /// ADR-65 §3: the run id (fresh per `execute_graph`, matching the
     /// checkpoint scope) stamped into every dispatched agent's tool-evidence
     /// facts, so a run's tool commands are attributable across task
@@ -1948,6 +2285,60 @@ fn own_write_paths(
     own
 }
 
+/// One entry of a ready batch: the node id plus the role that will staff it,
+/// the shape the scheduler's picks resolve to. Aliased so the Phase 6 M3c
+/// drift-bypass partition stays readable (clippy type-complexity).
+type ReadyEntry = (TaskId, AgentId);
+
+/// The plan's declared artifacts for the subtasks the checkpoint recorded
+/// COMPLETE, de-duplicated in declaration order.
+///
+/// A Pending subtask's artifacts legitimately do not exist yet, so including
+/// them would report drift on every mid-run resume (issue #: the C-06 scope
+/// rule, shared by the publish path and its tests).
+fn completed_expected_artifacts(
+    expected_artifacts: &HashMap<TaskId, Vec<camino::Utf8PathBuf>>,
+    completed_results: &HashMap<TaskId, AgentRunResult>,
+) -> Vec<camino::Utf8PathBuf> {
+    let mut seen = HashSet::new();
+    expected_artifacts
+        .iter()
+        .filter(|(task_id, _)| completed_results.contains_key(task_id))
+        .flat_map(|(_, paths)| paths.iter())
+        .filter(|path| seen.insert((*path).clone()))
+        .cloned()
+        .collect()
+}
+
+/// Phase 6 M3c step 1: the run-start workspace inventory the classified diff
+/// compares against — the `WorkspaceSnapshot` event whose generation the
+/// checkpoint recorded (`cp.snapshot_generation`).
+///
+/// The resume's OWN readiness-barrier snapshot (captured after the tamper)
+/// is the `live` side; this is the `baseline` side, so it must predate the
+/// interruption. Fail-soft by contract: no recorded generation, no pool
+/// events, an unparsable payload, or an event older than the
+/// [`RESUME_LOG_WINDOW`] tail all degrade to an empty baseline — the
+/// classification then falls back to its missing-only reading (absence is
+/// still provable without history; alteration and addition are not).
+fn plan_drift_baseline(
+    log_window: &[WhiteboardEvent],
+    generation: Option<&str>,
+) -> Vec<concerto_sessions::SnapshotEntry> {
+    let Some(generation) = generation else { return Vec::new() };
+    let Some(payload) = log_window.iter().rev().find_map(|event| {
+        if event.kind != WhiteboardKind::WorkspaceSnapshot {
+            return None;
+        }
+        serde_json::from_value::<concerto_sessions::WorkspaceSnapshotPayload>(event.payload.clone())
+            .ok()
+            .filter(|payload| payload.generation == generation)
+    }) else {
+        return Vec::new();
+    };
+    payload.files
+}
+
 /// Phase 6 M3b: classify a settled subtask outcome into a decision category
 /// from the role's **stage kind** in the resolved blueprint (never a role-name
 /// substring). A renamed or custom stage-staffed specialist is categorized by
@@ -2095,7 +2486,16 @@ impl SplitTaskArgs {
             .iter()
             .filter_map(|child| {
                 let description = child.get("description").and_then(serde_json::Value::as_str)?;
-                let expected_artifacts = parse_string_array(child, "expected_artifacts");
+                // Declaration boundary: strip `": <description>"` off a
+                // path-like head so canonicalization, the decision journal,
+                // and the C-06 map all see the same PATH (see
+                // `declared_artifacts`).
+                let expected_artifacts = parse_string_array(child, "expected_artifacts")
+                    .into_iter()
+                    .map(|raw| {
+                        crate::declared_artifacts::path_without_description(&raw).into_owned()
+                    })
+                    .collect::<Vec<_>>();
                 let after = child
                     .get("after")
                     .and_then(serde_json::Value::as_array)
@@ -2142,7 +2542,13 @@ impl MergeTaskArgs {
         Some(Self {
             task_ids,
             merged_description: merged_description.to_owned(),
-            merged_artifacts: parse_string_array(arguments, "merged_artifacts"),
+            // Declaration boundary: strip `": <description>"` off a
+            // path-like head so canonicalization, the transform spec, and
+            // the C-06 map all see the same PATH (see `declared_artifacts`).
+            merged_artifacts: parse_string_array(arguments, "merged_artifacts")
+                .into_iter()
+                .map(|raw| crate::declared_artifacts::path_without_description(&raw).into_owned())
+                .collect(),
             notes: arguments.get("notes").and_then(serde_json::Value::as_str).map(str::to_owned),
             supporting_evidence_ids: parse_string_array(arguments, "supporting_evidence_ids"),
         })
@@ -2197,15 +2603,20 @@ struct DispatchSessionState {
     doc: Option<DesignDoc>,
     doc_verdict: Option<DesignDocVerdict>,
     last_node: Option<TaskId>,
-    /// ADR-35 same-role dispatch cap (in-memory run state, reset per
-    /// objective because a fresh session state is built for each objective):
-    /// the role of the last settled dispatch and how many consecutive
-    /// dispatches to it have settled without an implement/code artifact.
+    /// Same-role dispatch cap (in-memory run state, reset per objective
+    /// because a fresh session state is built for each objective): the role
+    /// of the last settled dispatch and how many consecutive dispatches to it
+    /// have settled without the objective's expected deliverable.
     last_role: Option<AgentId>,
     consecutive_role_count: u32,
-    /// Bounded guidance turns the same-role guard has emitted; at the ceiling
-    /// the guard escalates to `AwaitingUser` instead of nudging again.
-    role_guard_nudges: u32,
+    /// The role whose consecutive-dispatch cap was reached and not yet
+    /// escalated. A later `call_specialist` naming it is redirected to a
+    /// covering specialist (or surfaces a decision point) instead of being
+    /// re-dispatched; cleared as soon as that episode resolves.
+    capped_role: Option<AgentId>,
+    /// Roles already escalated away from on this objective, so a takeover
+    /// never ping-pongs back to a role that itself hit the cap.
+    escalated_roles: HashSet<AgentId>,
 }
 
 /// The binding DesignDoc for expected-artifact derivation: a Verified doc
@@ -2242,6 +2653,348 @@ fn specialist_task_description(task: &str, notes: Option<&str>) -> String {
     match notes {
         Some(notes) => format!("{task}\n\nCoordinator notes: {notes}"),
         None => task.to_owned(),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Duplicate-dispatch guard (near-identical re-dispatch after a provable
+// failure) — pure text comparison, no state, no I/O.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Cosine-similarity threshold above which two task descriptions count as the
+/// SAME dispatch request. Calibrated on the pathology this guard exists for:
+/// two paraphrases of one intent differing only in filler and terminal
+/// phrasing score ≈0.89, while genuinely different actions on different
+/// target paths score ≈0.14. One auditable number beats a pile of special
+/// cases.
+const DUPLICATE_DISPATCH_SIMILARITY_THRESHOLD: f64 = 0.85;
+
+/// Multiplier applied to each occurrence of a path-shaped token (a path, a
+/// dotted file name, a snake_case identifier) so target paths dominate the
+/// similarity score — two descriptions naming the same files are the same
+/// work regardless of how the surrounding sentence is phrased.
+const DESCRIPTION_PATH_TOKEN_WEIGHT: f64 = 3.0;
+
+/// Function words with no intent signal when comparing dispatch text.
+/// Negation (`not`, `never`, `without`) is deliberately NOT listed: dropping
+/// it would make "rename X" and "do not rename X" compare identical.
+const DESCRIPTION_STOPWORDS: &[&str] = &[
+    "a", "an", "the", "in", "on", "at", "to", "of", "for", "and", "or", "with", "by", "from",
+    "into", "is", "are", "be", "as", "that", "this", "it", "its", "using", "use", "then", "than",
+    "please", "will", "would", "should", "can", "could", "you", "your", "we", "our", "they",
+    "their", "if", "when", "while", "so", "but", "also", "any", "all", "some", "more", "most",
+    "other", "which", "what", "who", "how", "here", "there", "these", "those", "up", "out", "over",
+    "under", "again", "new", "across", "against", "about", "per", "via",
+];
+
+/// Whether a token names a FILE or a PATH (dotted file name, path segment,
+/// snake_case identifier). These carry the intent of a dispatch description
+/// and are weighted accordingly.
+fn is_path_like_token(token: &str) -> bool {
+    if token.contains(['/', '\\', '_']) {
+        return true;
+    }
+    match token.rsplit_once('.') {
+        Some((stem, ext)) => {
+            !stem.is_empty()
+                && !ext.is_empty()
+                && ext.len() <= 8
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        }
+        None => false,
+    }
+}
+
+/// Lowercase, split on punctuation, drop stopwords — the token view two task
+/// descriptions are compared in. Bounded by the input text itself (task text
+/// is already bounded by the decision validator).
+fn description_tokens(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '.' | '/' | '-' | '\\')))
+        .map(|token| token.trim_matches(|c: char| matches!(c, '.' | '-' | '/' | '\\')))
+        .filter(|token| !token.is_empty() && !DESCRIPTION_STOPWORDS.contains(token))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The distinct path-shaped tokens of a description (sorted, so the sets of
+/// two descriptions compare equal).
+fn path_token_set(tokens: &[String]) -> Vec<&str> {
+    let mut paths: Vec<&str> =
+        tokens.iter().filter(|token| is_path_like_token(token)).map(String::as_str).collect();
+    paths.sort_unstable();
+    paths.dedup();
+    paths
+}
+
+/// The weighted token vector of a description: token → accumulated weight
+/// (path tokens weigh [`DESCRIPTION_PATH_TOKEN_WEIGHT`]).
+fn weighted_token_vector(tokens: &[String]) -> HashMap<&str, f64> {
+    let mut counts: HashMap<&str, f64> = HashMap::new();
+    for token in tokens {
+        let weight = if is_path_like_token(token) { DESCRIPTION_PATH_TOKEN_WEIGHT } else { 1.0 };
+        *counts.entry(token).or_default() += weight;
+    }
+    counts
+}
+
+/// Cosine similarity of two token views, with path tokens weighted by
+/// [`DESCRIPTION_PATH_TOKEN_WEIGHT`]. `0.0` when either side is empty (an
+/// empty description never duplicates anything).
+fn description_similarity(a: &[String], b: &[String]) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let (va, vb) = (weighted_token_vector(a), weighted_token_vector(b));
+    let norm = |v: &HashMap<&str, f64>| v.values().map(|value| value * value).sum::<f64>().sqrt();
+    let (norm_a, norm_b) = (norm(&va), norm(&vb));
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+    let dot: f64 = va.iter().filter_map(|(token, x)| vb.get(token).map(|y| x * y)).sum();
+    dot / (norm_a * norm_b)
+}
+
+/// Whether two task descriptions request the SAME dispatch: with identical
+/// non-empty target paths, the leading action verb must also match ("rename"
+/// vs "copy" of the same file are different work); with no shared target
+/// paths, the path-weighted cosine similarity must reach
+/// [`DUPLICATE_DISPATCH_SIMILARITY_THRESHOLD`].
+fn is_near_duplicate_description(a: &str, b: &str) -> bool {
+    let (tokens_a, tokens_b) = (description_tokens(a), description_tokens(b));
+    if tokens_a.is_empty() || tokens_b.is_empty() {
+        return false;
+    }
+    let (paths_a, paths_b) = (path_token_set(&tokens_a), path_token_set(&tokens_b));
+    if !paths_a.is_empty() && paths_a == paths_b {
+        return tokens_a.first() == tokens_b.first();
+    }
+    description_similarity(&tokens_a, &tokens_b) >= DUPLICATE_DISPATCH_SIMILARITY_THRESHOLD
+}
+
+/// Bound an excerpt of prior task text for the refusal message (model-facing,
+/// so it stays short no matter how long the original description was).
+fn bounded_description_excerpt(text: &str) -> String {
+    const MAX_CHARS: usize = 160;
+    let first_line = text.split('\n').next().unwrap_or(text).trim();
+    if first_line.chars().count() <= MAX_CHARS {
+        return first_line.to_owned();
+    }
+    let mut out: String = first_line.chars().take(MAX_CHARS).collect();
+    out.push('…');
+    out
+}
+
+/// The duplicate-dispatch guard: the reason this `call_specialist` must NOT
+/// run, or `None` when dispatching is allowed.
+///
+/// The guard is ARMED only once the run has recorded a TOOL-level diagnosis
+/// that is not retryable — a provably impossible action (missing path, denied
+/// permission, containment rejection, policy denial) — and it only fires for
+/// a near-duplicate of an earlier dispatch by the SAME specialist that itself
+/// settled failed or blocked, when the new call carries no corrective delta.
+/// Provider, agent and contract diagnoses never arm it: a context-overflow or
+/// auth failure is recovered by re-dispatching the SAME task to another model,
+/// which must stay allowed. The delta valves (non-empty coordinator notes, a
+/// different target specialist) are the model's escape hatch, and the text
+/// comparison refuses only near-identical wording, so an agent that genuinely
+/// changes the work still dispatches.
+fn duplicate_dispatch_reason(
+    graph: &TaskGraph,
+    diagnoses: &[crate::failure_diagnosis::FailureDiagnosis],
+    agent: &AgentId,
+    args: &CallSpecialistArgs,
+) -> Option<String> {
+    let armed = diagnoses.iter().any(|diagnosis| {
+        !diagnosis.retryable && diagnosis.kind == crate::failure_diagnosis::FailureKind::Tool
+    });
+    if !armed {
+        // No provably impossible action has been diagnosed yet: no arm, no
+        // gate. Transient failures stay retryable and never arm it either.
+        return None;
+    }
+    if args.notes.as_deref().is_some_and(|notes| !notes.trim().is_empty()) {
+        // Coordinator notes on the dispatch are an explicit corrective
+        // delta — a re-dispatch that changes the instruction is the point.
+        return None;
+    }
+    for prior in graph.all_tasks() {
+        if &prior.role != agent {
+            continue; // a different specialist's task: not this dispatch
+        }
+        if !matches!(prior.status, SubTaskStatus::Blocked | SubTaskStatus::Failed) {
+            continue; // only a dispatch that did NOT deliver is a repeat
+        }
+        // The stored description carries the notes suffix of ITS dispatch;
+        // strip it so the comparison is the task text both times.
+        let prior_task =
+            prior.description.split("\n\nCoordinator notes: ").next().unwrap_or(&prior.description);
+        if prior_task != args.task && !is_near_duplicate_description(prior_task, &args.task) {
+            continue;
+        }
+        return Some(format!(
+            "duplicate dispatch refused: specialist {agent} already ran the near-identical \
+             task {} ({}) — \"{}\". Re-issuing it cannot succeed; add corrective notes or \
+             change the action and its target before dispatching again.",
+            prior.id,
+            prior.status.as_str(),
+            bounded_description_excerpt(prior_task),
+        ));
+    }
+    None
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Source-existence preflight (coordinator error invariant)
+// ─────────────────────────────────────────────────────────────────────
+
+/// Operation verbs whose OBJECT is the SOURCE of a transform: the concrete
+/// path named right after one of them must ALREADY EXIST for the operation
+/// to mean anything. Inflected forms are listed because subtask text is
+/// free prose, not a command grammar.
+const SOURCE_TRANSFORM_VERBS: &[&str] =
+    &["rename", "renamed", "renaming", "move", "moved", "moving"];
+
+/// The in-place-edit counterpart: the file being edited is the source, and
+/// editing a file that is not there invites the same synthesis a missing
+/// rename source does.
+const SOURCE_EDIT_VERBS: &[&str] = &[
+    "edit",
+    "edited",
+    "editing",
+    "modify",
+    "modified",
+    "modifying",
+    "update",
+    "updated",
+    "updating",
+    "append",
+    "appended",
+];
+
+/// The words that end a source span by naming the DESTINATION instead.
+/// Everything after them is excluded from the preflight: a move's
+/// destination normally must NOT exist yet, so it is never preflighted.
+const SOURCE_SPAN_SEPARATORS: &[&str] = &["to", "into"];
+
+/// How far past a source verb the scan looks for the named source. A source
+/// named further away than this belongs to a different sentence — treat the
+/// parse as inconclusive and fail open rather than guess.
+const SOURCE_SCAN_TOKEN_LIMIT: usize = 16;
+
+/// The objective text split into candidate tokens: path characters stay
+/// inside a token, surrounding punctuation drops away, and case is
+/// PRESERVED (the existence lookup needs the path's real spelling on a
+/// case-sensitive filesystem).
+fn source_scan_tokens(text: &str) -> Vec<&str> {
+    text.split(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '.' | '/' | '-' | '\\')))
+        .map(|token| token.trim_end_matches(['.', '-']))
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+/// Whether a token is a CONCRETE workspace path rather than a bare
+/// identifier: the existing path-like shape, further required to carry a
+/// directory separator or a dotted file-name extension whose final segment
+/// holds a letter. Bare snake_case identifiers (`handle_call`) and version
+/// numbers (`1.2.3`) are not workspace paths — a miss there is
+/// inconclusive and must fail OPEN.
+fn is_concrete_source_path(token: &str) -> bool {
+    if !is_path_like_token(token) {
+        return false;
+    }
+    if token.contains(['/', '\\']) {
+        return true;
+    }
+    match token.rsplit_once('.') {
+        Some((stem, ext)) => !stem.is_empty() && ext.chars().any(|c| c.is_ascii_alphabetic()),
+        None => false,
+    }
+}
+
+/// The distinct concrete paths the objective names as the SOURCE of a
+/// transform/edit operation, in first-appearance order.
+///
+/// A path counts only when it sits between a source verb and the
+/// destination separator (`to` / `into`), so a rename/move DESTINATION —
+/// which legitimately may not exist yet — is never a candidate. A verb span
+/// holding no concrete path (nothing named) or several (two operations in
+/// one sentence) contributes nothing, and [`missing_source_preflight_reason`]
+/// fails open unless exactly ONE source resolves overall.
+fn named_source_paths(task_text: &str) -> Vec<String> {
+    let tokens = source_scan_tokens(task_text);
+    let mut found: Vec<String> = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let word = token.to_ascii_lowercase();
+        if !SOURCE_TRANSFORM_VERBS.contains(&word.as_str())
+            && !SOURCE_EDIT_VERBS.contains(&word.as_str())
+        {
+            continue;
+        }
+        let mut span: Vec<&str> = Vec::new();
+        for next in tokens.iter().skip(index + 1).take(SOURCE_SCAN_TOKEN_LIMIT) {
+            let following = next.to_ascii_lowercase();
+            if SOURCE_SPAN_SEPARATORS.contains(&following.as_str()) {
+                break;
+            }
+            if is_concrete_source_path(next) {
+                span.push(next);
+            }
+        }
+        let [source] = span.as_slice() else {
+            continue; // none named, or ambiguous within this span: skip it
+        };
+        if !found.iter().any(|existing| existing.as_str() == *source) {
+            found.push((*source).to_owned());
+        }
+    }
+    found
+}
+
+/// The dispatch-time source-existence preflight: the reason this subtask
+/// must NOT be dispatched, or `None` when dispatching is allowed.
+///
+/// NARROW by construction — it fires only when the objective names EXACTLY
+/// ONE concrete path as the source of a transform/edit operation and that
+/// path is provably absent from the workspace. Everything else fails OPEN:
+/// no source verb (a creation objective names none), no concrete path, more
+/// than one candidate (ambiguous parsing), a path outside the workspace or
+/// otherwise unresolvable, or an I/O error other than `NotFound`.
+/// Destinations are never preflighted.
+///
+/// Path identity goes through [`crate::tool_facts::canonical_project_path`],
+/// the same normalizer the decision validator uses for artifact paths, so
+/// the preflight and the validator can never disagree about which file the
+/// objective named. It is a lexical join plus one `stat` — cheap enough to
+/// run on every dispatch.
+fn missing_source_preflight_reason(
+    task_text: &str,
+    project_root: &camino::Utf8Path,
+) -> Option<String> {
+    let sources = named_source_paths(task_text);
+    if sources.len() != 1 {
+        return None;
+    }
+    let named = sources[0].clone();
+    let canonical = crate::tool_facts::canonical_project_path(project_root.as_std_path(), &named)?;
+    match std::fs::metadata(project_root.join(&canonical).as_std_path()) {
+        // The named source exists: the operation is meaningful, dispatch.
+        Ok(_) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let named_as = if canonical == named {
+                canonical.clone()
+            } else {
+                format!("{named} ({canonical})")
+            };
+            Some(format!(
+                "missing source: the objective transforms the EXISTING path {named_as}, but it \
+                 does not exist in the workspace. Dispatch refused — creating it would fabricate \
+                 the source instead of transforming it. The run pauses for your decision: confirm \
+                 the correct path, or state explicitly that {canonical} should be created."
+            ))
+        }
+        // Any other I/O problem is inconclusive: fail OPEN.
+        Err(_) => None,
     }
 }
 
@@ -2457,6 +3210,23 @@ fn tool_executor_offers(executor: Option<&ToolExecutor>, tool_name: &str) -> boo
         executor.tool_definitions().iter().any(|definition| definition.name == tool_name)
     })
 }
+
+/// The precise set of the Coordinator's own tool calls that MUTATE the
+/// workspace, derived from the executor's registered tool names: the `write`
+/// alias, `shell`, and `git`, plus the `filesystem` tool's destructive
+/// operations (`write`/`delete`/`move`/`copy`). Read-only calls (`filesystem`
+/// `read`/`list`/`exists`, LSP, consult, etc.) are never classified here, so
+/// they stay unrestricted.
+fn is_mutating_self_execution_tool(tool_name: &str, arguments: &serde_json::Value) -> bool {
+    match tool_name {
+        "write" | "shell" | "git" => true,
+        "filesystem" => matches!(
+            arguments.get("operation").and_then(serde_json::Value::as_str),
+            Some("write" | "delete" | "move" | "copy")
+        ),
+        _ => false,
+    }
+}
 /// Resolve each registered agent to the stage kind it staffs, for building the
 /// engine-default collaboration topology (ADR-58 D2/ADR-35).
 ///
@@ -2525,12 +3295,15 @@ impl CoordinatorAgent {
             identical_failures: crate::failure_diagnosis::IdenticalFailureTracker::default(),
             default_model_attempted: HashSet::new(),
             self_execute_attempted: HashSet::new(),
+            specialist_takeover_attempted: HashSet::new(),
             default_model_provider_attempted: HashSet::new(),
             default_model_provider: None,
             default_model_profile: None,
             default_model_fallback: true,
             fallback_pipes: Vec::new(),
-            planning_recovery_attempted: false,
+            planning_recovery_rounds: 0,
+            planning_recovery_in_progress: false,
+            planning_hold_rounds: 0,
             planning_recovery_note: None,
             planning_produced_files: Vec::new(),
             planning_profile: None,
@@ -2538,6 +3311,8 @@ impl CoordinatorAgent {
             max_subtask_attempts: DEFAULT_MAX_SUBTASK_ATTEMPTS,
             skills_section: String::new(),
             environment_card: String::new(),
+            shell_profile: None,
+            cache_stable_prefix: false,
             project_context: None,
             project_context_nudge_count: 0,
             max_total_iterations: None,
@@ -2561,6 +3336,7 @@ impl CoordinatorAgent {
             review_store: None,
             write_gate: None,
             workspace_snapshot: None,
+            plan_drift_redispatch: None,
             run_id: None,
             memory_decision_store: None,
             memory_task_tree: None,
@@ -2675,6 +3451,80 @@ impl CoordinatorAgent {
     /// evidence, and `project_root` bounds artifact canonicalization.
     fn decision_roster(&self) -> HashSet<String> {
         self.registry.ids().into_iter().map(|id| id.as_str().to_owned()).collect()
+    }
+
+    /// Whether this run has RECORDED at least one validated `call_specialist`
+    /// dispatch decision. Read from the checkpointed decision journal, so the
+    /// answer survives a resume. A malformed or validator-rejected call is
+    /// never recorded as a dispatch decision, so it does not count.
+    fn has_recorded_delegation_attempt(&self) -> bool {
+        self.decision_journal
+            .entries()
+            .iter()
+            .any(|entry| entry.kind == crate::decisions::DecisionKind::DispatchSpecialist)
+    }
+
+    /// Delegation-doctrine guard (owner spec): refuse the Coordinator's own
+    /// MUTATING tool call with a named, policy-visible verdict when the run
+    /// has recorded no delegation attempt while the roster is non-empty. A
+    /// roster that is empty (or disabled — disabled agents never register)
+    /// permits self-execution and records `CoordinatorSelfImplementing` with
+    /// the reason, so self-work is never again indistinguishable from
+    /// delegation. The roster's SHAPE is never inspected: staffing a
+    /// particular stage is the user's business, never a gate here.
+    ///
+    /// Returns `Some(refusal_json)` when the call must be refused, `None`
+    /// when it may proceed.
+    fn guard_self_execution(
+        &self,
+        session_id: Ulid,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        if !is_mutating_self_execution_tool(tool_name, arguments) {
+            return None;
+        }
+        let roster_empty = self.registry.ids().is_empty();
+        if roster_empty {
+            self.publish_self_implementing(session_id, tool_name, "roster-empty-or-disabled");
+            return None;
+        }
+        if self.has_recorded_delegation_attempt() {
+            self.publish_self_implementing(session_id, tool_name, "delegation-attempted");
+            return None;
+        }
+        // Roster is non-empty and no delegation was recorded: refuse, so the
+        // Coordinator must dispatch instead of quietly doing the work itself.
+        let verdict = "Denied: delegation-required".to_owned();
+        let _ = self.bus.publish_for_session(
+            session_id,
+            Ulid::new(),
+            EventKind::PolicyVerdict { tool_name: tool_name.to_owned(), verdict: verdict.clone() },
+        );
+        Some(serde_json::json!({
+            "error": "delegation_required",
+            "verdict": verdict,
+            "message": format!(
+                "the Coordinator may not run its own mutating tool '{tool_name}' while a \
+                 non-empty specialist roster is registered and no delegation has been \
+                 attempted; dispatch work with call_specialist first, or delegate to \
+                 another registered specialist that can cover the work"
+            ),
+        }))
+    }
+
+    /// Publish the self-execution record (never fails the run).
+    fn publish_self_implementing(&self, session_id: Ulid, tool_name: &str, reason: &str) {
+        let _ = self.bus.publish_for_session(
+            session_id,
+            Ulid::new(),
+            EventKind::CoordinatorSelfImplementing {
+                run_id: self.run_id.clone(),
+                session_id,
+                tool_name: tool_name.to_owned(),
+                reason: reason.to_owned(),
+            },
+        );
     }
 
     /// The decision time's advisory the coordinator's decision machinery
@@ -3332,7 +4182,8 @@ impl CoordinatorAgent {
         self
     }
 
-    /// ADR-55 Phase 2b: cap the run at planning. The coordinator produces
+    /// ADR-55 archived Phase 2b §1: cap the run at planning. The
+    /// coordinator produces
     /// and renders the plan (persisted as a PlanArtifact when `with_plans`
     /// is attached) but never dispatches subtask execution, review, or
     /// validation.
@@ -3375,7 +4226,7 @@ impl CoordinatorAgent {
         self.run_shape_decision_label.as_deref()
     }
 
-    /// ADR-55 Phase 2b: the plan id of the most recently persisted plan
+    /// ADR-55 §4: the plan id of the most recently persisted plan
     /// artifact (`None` when plan persistence is disabled or failed). The
     /// runtime runner reads this after a planning-only run to bind the
     /// rendered plan to its durable artifact.
@@ -3852,6 +4703,27 @@ impl CoordinatorAgent {
         self
     }
 
+    /// Attach the session's resolved shell profile so the dispatch prompt
+    /// receives the SAME OS/shell identity card the single-agent loop gets,
+    /// through the shared `PromptBuilder` seam. Pass `None` for the
+    /// OS-facts-only card.
+    pub fn with_shell_profile(
+        mut self,
+        shell_profile: Option<concerto_config::ShellProfileConfig>,
+    ) -> Self {
+        self.shell_profile = shell_profile;
+        self
+    }
+
+    /// Honor the ADR-048 `[context].cache_stable_prefix` knob for the
+    /// dispatch prompt: the runtime resolves it through
+    /// [`crate::context_engine::ContextBudgetPolicy::from_config`] so the
+    /// default lives in exactly one place.
+    pub fn with_cache_stable_prefix(mut self, enabled: bool) -> Self {
+        self.cache_stable_prefix = enabled;
+        self
+    }
+
     /// Attach the run-scoped project AGENTS.md context (ADR-70), injected
     /// into the dispatch system prompt between the skills section and the
     /// environment card; its refresh cadence also gates the coordinator's
@@ -4044,7 +4916,7 @@ impl CoordinatorAgent {
         self.design_doc.lock().unwrap_or_else(|error| error.into_inner()).clone()
     }
 
-    /// ADR-55 Phase 2b: render the produced plan as the run's final message —
+    /// ADR-55 §4: render the produced plan as the run's final message —
     /// the design-doc summary plus one line per planned subtask (role,
     /// description, dependencies). Rendered from the GRAPH so both the
     /// TaskPlanner success path and the heuristic fallback pipeline produce
@@ -4166,6 +5038,7 @@ impl CoordinatorAgent {
             default_model_attempted: self.default_model_attempted.clone(),
             default_model_provider_attempted: self.default_model_provider_attempted.clone(),
             self_execute_attempted: self.self_execute_attempted.clone(),
+            specialist_takeover_attempted: self.specialist_takeover_attempted.clone(),
             escalation_attempted: self.escalation_attempted.clone(),
             doc_resolution: self.last_doc_resolution.clone(),
             snapshot_generation: self.snapshot_generation(),
@@ -4540,6 +5413,35 @@ impl CoordinatorAgent {
     /// `FallbackOutcome::Exhausted` when every tier was skipped or failed.
     /// Cancellation observed inside a tier short-circuits with
     /// `FallbackOutcome::Cancelled`.
+    /// The registered specialist that should take over a failed subtask on
+    /// the AGENT axis before any provider escalation: another agent at the
+    /// original role's stage, else any agent whose configured coverage
+    /// includes that stage. `None` when the role has no stage or no OTHER
+    /// agent can cover it. Pure and config-driven — no role names appear here.
+    fn takeover_candidate_for_role(&self, original_role: &AgentId) -> Option<AgentId> {
+        let stage = self.registry.get(original_role).and_then(|agent| agent.stage())?;
+        self.registry.takeover_candidate(&stage, original_role)
+    }
+
+    /// The registered specialist that should take over a role that hit the
+    /// repeat-dispatch cap: the first covering candidate (same-stage peer
+    /// first, then a `can_cover` agent) that has not already been escalated to
+    /// on this objective. `None` when no such candidate exists — the caller
+    /// then surfaces the existing user-input decision point rather than
+    /// looping. Pure and config-driven, exactly like
+    /// [`Self::takeover_candidate_for_role`].
+    fn takeover_candidate_for_capped_role(
+        &self,
+        capped_role: &AgentId,
+        avoid: &HashSet<AgentId>,
+    ) -> Option<AgentId> {
+        let stage = self.registry.get(capped_role).and_then(|agent| agent.stage())?;
+        self.registry
+            .takeover_candidates(&stage, capped_role)
+            .into_iter()
+            .find(|candidate| !avoid.contains(candidate))
+    }
+
     async fn attempt_fallback_ladder(
         &mut self,
         task: &SubTask,
@@ -4711,6 +5613,78 @@ impl CoordinatorAgent {
                                 }
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        // ── Agent axis: a DIFFERENT registered specialist takes the work ───
+        // Owner doctrine: before escalating across PROVIDERS, check the AGENT
+        // axis — another agent at the same stage, then any agent whose
+        // configured coverage includes the target stage. Choosing a DIFFERENT
+        // agent and re-targeting a chosen agent to a different provider are
+        // SEPARATE axes; re-targeting a specialist is preferred over a
+        // provider swap or self-execution. Coverage is configuration data
+        // (`can_cover`), never a hardcoded role→stage table.
+        if !self.specialist_takeover_attempted.contains(&task.id) {
+            self.specialist_takeover_attempted.insert(task.id);
+            if let Some(candidate) = self.takeover_candidate_for_role(original_role) {
+                match self.model_selector.fallback_to_default(&candidate) {
+                    Ok(profile) => {
+                        // ADR-52: a takeover dispatch is a real model dispatch
+                        // and counts toward the run-wide cap.
+                        self.model_dispatch_count = self.model_dispatch_count.saturating_add(1);
+                        match self
+                            .runner
+                            .run(candidate.clone(), task, context.clone(), &profile, cancel.clone())
+                            .await
+                        {
+                            Ok(result) if matches!(result.outcome, AgentOutcome::Success) => {
+                                self.publish_ladder_note(
+                                    task,
+                                    format!(
+                                        "Agent-axis takeover: {candidate} covered {original_role} \
+                                         subtask {} before any provider escalation",
+                                        task.id
+                                    ),
+                                );
+                                return FallbackOutcome::Success(Box::new(result));
+                            }
+                            Ok(_) => {
+                                self.publish_ladder_note(
+                                    task,
+                                    format!(
+                                        "Agent-axis takeover by {candidate} for {original_role} \
+                                         subtask {} did not succeed; the provider ladder continues",
+                                        task.id
+                                    ),
+                                );
+                            }
+                            Err(tier_err) => {
+                                if is_cancellation_error(&tier_err) {
+                                    return FallbackOutcome::Cancelled;
+                                }
+                                self.publish_ladder_note(
+                                    task,
+                                    format!(
+                                        "Agent-axis takeover by {candidate} for {original_role} \
+                                         subtask {} failed: {tier_err}; the provider ladder \
+                                         continues",
+                                        task.id
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    Err(tier_err) => {
+                        self.publish_ladder_note(
+                            task,
+                            format!(
+                                "Agent-axis takeover for {original_role} subtask {} skipped: no \
+                                 serving profile resolved for {candidate}: {tier_err}",
+                                task.id
+                            ),
+                        );
                     }
                 }
             }
@@ -5072,9 +6046,306 @@ impl CoordinatorAgent {
     /// JSON without deserializing the whole record — the cheap seed for a
     /// resumed run's Phase-0 retrieval. Fail-soft: a malformed/absent
     /// checkpoint yields `None` (no seed; vector matches only).
-    fn checkpoint_run_id_hint(json: Option<&str>) -> Option<String> {
+    ///
+    /// `pub(crate)` so the runtime runner can tie the `ResumeRequested`
+    /// run-history event to the checkpoint's run without a full parse.
+    pub(crate) fn checkpoint_run_id_hint(json: Option<&str>) -> Option<String> {
         let value: serde_json::Value = serde_json::from_str(json?).ok()?;
         value.get("run_id").and_then(serde_json::Value::as_str).map(str::to_owned)
+    }
+
+    /// Run-history audit: record a deliberate operator interrupt (the
+    /// `Cancelled` terminal class, ADR-42) as its own event.
+    ///
+    /// The run's output alone cannot distinguish a user stop from a provider
+    /// failure — both normalize to `Partial` — so the history carries the
+    /// interrupt explicitly. Fail-soft like every other bus publish: a full
+    /// or lagging subscriber must never turn a stop into a failure.
+    ///
+    /// `checkpoint_run_id` is the resume checkpoint's run id — the only id
+    /// tying the run to its prior attempts before a decision session stamps
+    /// [`Self::run_id`]. The active run id wins when one has been stamped
+    /// (it names the run in scope right now and matches the checkpoints
+    /// written in the same phase); the checkpoint hint only covers a stop
+    /// landing before any session scope exists. Both `None` means the run
+    /// stopped before any run id was minted at all — a genuine edge, logged
+    /// below so the event's `null` is explainable rather than silent.
+    fn publish_run_interrupted(
+        &self,
+        task_id: TaskId,
+        session_id: Ulid,
+        checkpoint_run_id: Option<String>,
+        at_stage: &str,
+    ) {
+        let run_id = self.run_id.clone().or(checkpoint_run_id);
+        if run_id.is_none() {
+            tracing::warn!(
+                %task_id,
+                %session_id,
+                at_stage,
+                "run interrupted before any run id was minted: RunInterruptedByUser carries \
+                 no run_id"
+            );
+        }
+        let _ = self.bus.publish_for_session(
+            session_id,
+            task_id.0,
+            EventKind::RunInterruptedByUser { run_id, session_id, at_stage: at_stage.to_owned() },
+        );
+        tracing::info!(%task_id, %session_id, at_stage, "run interrupted by the operator");
+    }
+
+    /// Run-history wording for a dispatch outcome recorded because the
+    /// OPERATOR stopped the run — the run's `CancellationToken` was already
+    /// cancelled when the outcome was published. Same meaning as
+    /// `RunInterruptedByUser`, so an audit joins the two on one wording
+    /// instead of parsing free-form cause text.
+    const USER_STOP_DISPATCH_REASON: &str = "interrupted by user stop";
+
+    /// The `reason` for a CANCELLED [`EventKind::SpecialistDispatchOutcome`].
+    ///
+    /// A stop the operator issued (the run token is already cancelled) is
+    /// reported with [`Self::USER_STOP_DISPATCH_REASON`]; any other
+    /// cancellation keeps its own cause text, so a provider-side or
+    /// engine-side cancellation stays distinguishable from a deliberate stop.
+    fn cancelled_dispatch_reason(
+        cancel: &CancellationToken,
+        cause: impl std::fmt::Display,
+    ) -> String {
+        if cancel.is_cancelled() {
+            Self::USER_STOP_DISPATCH_REASON.to_owned()
+        } else {
+            cause.to_string()
+        }
+    }
+
+    /// Run-history audit: record the outcome of ONE `call_specialist`
+    /// dispatch attempt at the moment the Coordinator's decision does NOT
+    /// reach a successful specialist run.
+    ///
+    /// `attempted` is the guard's discriminator: `false` means the dispatch
+    /// never reached a specialist (policy denial, model selection), `true`
+    /// means a specialist call was issued and then failed or was cancelled.
+    /// `reason` carries free-form text (sanitized on publish); the
+    /// `outcome` label is a fixed caller-chosen constant. Fail-soft like
+    /// every other bus publish.
+    ///
+    /// `scope` is the dispatch session's checkpoint scope: its `session_id`
+    /// and `run_id` are the ids this outcome is published under, so the
+    /// outcome is never reported under a null run id — it names the run the
+    /// dispatch was part of, and [`Self::run_dispatch_session`] stamps the
+    /// same id as the active run when the session opens.
+    fn publish_dispatch_outcome(
+        &self,
+        scope: &checkpoint::CheckpointScope,
+        task_id: TaskId,
+        role: &AgentId,
+        attempted: bool,
+        outcome: &str,
+        reason: Option<String>,
+    ) {
+        let _ = self.bus.publish_for_session(
+            scope.session_id,
+            task_id.0,
+            EventKind::SpecialistDispatchOutcome {
+                run_id: Some(scope.run_id.to_string()),
+                session_id: scope.session_id,
+                task_id,
+                role: role.clone(),
+                attempted,
+                outcome: outcome.to_owned(),
+                reason,
+            },
+        );
+    }
+
+    /// Whether a restored checkpoint is in the shape the resume-drive exists
+    /// for: an ACTION-REQUIRED, full-depth run that PROMISED implementation
+    /// (the same predicate the completion guard arms on) yet holds no
+    /// implement-stage dispatch, no code artifact, and no unresolved pause —
+    /// with every restored node already `Completed`, so there is no open work
+    /// for the decision loop to wait on.
+    ///
+    /// Returning `true` hands the restored result to
+    /// [`Self::drive_resumed_implement`] instead of returning it verbatim:
+    /// verbatim would fall straight through to `execute_graph`'s
+    /// unattempted-implementation guard, which re-reports the SAME canned
+    /// Partial the run already was — a dead end that re-persists on every
+    /// resume.
+    ///
+    /// Deliberately narrower than the guard: any `Failed`/`Blocked` node, a
+    /// preserved input/approval pause, a parked wait, or an empty graph keeps
+    /// today's restore behaviour untouched.
+    fn resume_needs_implement_drive(&self, task: &AgentTask, result: &DecomposeResult) -> bool {
+        matches!(task.execution_mode, TaskExecutionMode::ActionRequired { .. })
+            && self.orchestration_depth == OrchestrationDepth::Full
+            && self.run_has_promised_plan()
+            && !self.implement_stage_dispatch_occurred(&result.graph, &result.action_ledger)
+            && !result.all_files.iter().any(|path| is_code_artifact_path(path))
+            && result.requested_user_input.is_none()
+            && result.pending_approval.is_none()
+            && self.active_wait.is_none()
+            && !result.graph.is_empty()
+            && result
+                .graph
+                .all_tasks()
+                .iter()
+                .all(|subtask| subtask.status == SubTaskStatus::Completed)
+    }
+
+    /// Resume-drive: re-enter the Coordinator's decision loop over the
+    /// RESTORED graph so a settled-but-unattempted implement stage gets its
+    /// dispatch, instead of returning the restore verbatim and letting the
+    /// completion guard downgrade the run to the Partial it already was.
+    ///
+    /// ADR-35 §1: dispatch happens ONLY through `call_specialist` inside
+    /// [`Self::run_dispatch_session`] — never a direct graph mutation — so
+    /// every decision stays policy-gated, whiteboard-recorded and settled
+    /// with a checkpoint persist, exactly like a live-loop dispatch (a stop
+    /// mid-drive leaves the same durable shape a mid-run stop does).
+    ///
+    /// `MultiAgentModeStarted` is NOT re-fired: the restore already published
+    /// it for this run. The restored ledger rides through; the drive's own
+    /// dispatches merge on top, deduplicated.
+    async fn drive_resumed_implement(
+        &mut self,
+        task: &AgentTask,
+        context: &AgentContext,
+        cancel: &CancellationToken,
+        cp_json: &str,
+        mut result: DecomposeResult,
+    ) -> Result<DecomposeResult, OrchestratorError> {
+        // The restore already wrote the checkpoint's plan back into the
+        // run-scoped doc store (and its expected artifacts alongside), so an
+        // implement dispatch decided here derives the same contract.
+        let doc = self.design_doc_snapshot();
+        // Output-mode typing and relationship resolution ONLY — the roster
+        // still decides who gets dispatched (ADR-35).
+        let design_role = self.first_agent_for_stage(&AgentStage::new(AgentStage::DESIGN));
+        let mut intro = self.dispatch_context_intro(doc.as_ref(), None, cancel).await;
+        intro.push_str(&resume_drive_instruction());
+        let mut state = DispatchSessionState {
+            doc,
+            doc_verdict: None,
+            last_node: restored_chain_tip(&result.graph),
+            ..Default::default()
+        };
+        // The drive's ledger STARTS from the restored state, so a
+        // settle-persist inside the session writes the MERGED checkpoint —
+        // restored rows plus this session's dispatches — instead of a row
+        // that silently drops the restored bookkeeping (a stop mid-drive
+        // would otherwise lose the design step's results, files, and action
+        // ledger on the next resume). `retry_feedback` has no ledger mirror;
+        // it stays on the result as everywhere else. The fields are moved out
+        // of `result` and moved back on the success arm below, so nothing is
+        // double-counted.
+        let mut ledger = DispatchLedger {
+            completed_results: std::mem::take(&mut result.completed_results),
+            total_cost: result.total_cost,
+            total_tool_calls: result.total_tool_calls,
+            all_files: std::mem::take(&mut result.all_files),
+            provider_metrics: std::mem::take(&mut result.provider_metrics),
+            subtask_attempts: std::mem::take(&mut result.subtask_attempts),
+            model_assignments: std::mem::take(&mut result.model_assignments),
+            action_ledger: std::mem::take(&mut result.action_ledger),
+            notes: Vec::new(),
+        };
+        // Persist under the RESTORED run id + sequence so the drive's
+        // intermediate checkpoints stay part of the same run history. The
+        // restore already deserialized this payload; a repeat failure can
+        // only be corruption, and degrading to a fresh scope is strictly
+        // better than failing the resume over bookkeeping.
+        let restored = checkpoint::GraphCheckpoint::from_json(cp_json).ok();
+        let mut scope = checkpoint::CheckpointScope {
+            run_id: restored.as_ref().map_or_else(Ulid::new, |cp| cp.run_id),
+            session_id: task.session_id,
+            root_task_id: task.id,
+            project_id: context.session.project_id.0.clone(),
+            objective: result.objective.clone(),
+            objective_hash: result.objective_hash.clone(),
+            source_revision: self.source_revision.clone(),
+            sequence_num: restored.as_ref().map_or(0, |cp| cp.sequence_num),
+        };
+        let session = self
+            .run_dispatch_session(
+                &mut result.graph,
+                task,
+                context,
+                cancel,
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                design_role.as_ref(),
+                &intro,
+            )
+            .await;
+        let summary = match session {
+            Ok((summary, _advisory_plan)) => summary,
+            Err(error) => {
+                // The ledger (seeded with the restored state AND carrying the
+                // drive's own dispatches) unwinds with the error: preserve
+                // every file it holds on the run-scoped accumulator, so the
+                // caller's pause report names what the resumed run produced
+                // instead of claiming it produced none.
+                self.planning_produced_files.extend(ledger.all_files.iter().cloned());
+                // Cancellation propagates unchanged — the caller records the
+                // `RunInterruptedByUser` run-history event from it. Every other
+                // class surfaces as an explicit resume failure rather than a
+                // bare planning-pause message.
+                if is_cancellation_error(&error) {
+                    return Err(error);
+                }
+                return Err(OrchestratorError::AgentLoopError(format!(
+                    "resume could not dispatch the pending implement stage: {error}"
+                )));
+            }
+        };
+        // Completion superset: the ledger already holds the restored state
+        // plus this session's dispatches (seeded above), so move it back
+        // verbatim and fold in whatever the run-scoped accumulator held —
+        // the same merge `finish_decompose_result` performs, deduplicated.
+        let mut files = std::mem::take(&mut ledger.all_files);
+        for path in std::mem::take(&mut self.planning_produced_files) {
+            if !files.contains(&path) {
+                files.push(path);
+            }
+        }
+        result.all_files = files;
+        result.completed_results = std::mem::take(&mut ledger.completed_results);
+        result.total_cost = ledger.total_cost;
+        result.total_tool_calls = ledger.total_tool_calls;
+        result.provider_metrics = std::mem::take(&mut ledger.provider_metrics);
+        result.subtask_attempts = std::mem::take(&mut ledger.subtask_attempts);
+        result.model_assignments = std::mem::take(&mut ledger.model_assignments);
+        result.action_ledger = std::mem::take(&mut ledger.action_ledger);
+        result.dispatch_summary = summary;
+        result.loop_notes.append(&mut ledger.notes);
+        // A pause raised by THIS drive (model-requested input, a dispatch
+        // pending approval) supersedes whatever the restored row carried;
+        // otherwise the restored pause survives the resume unchanged.
+        if let Some(requested) = self.requested_user_input.take() {
+            result.requested_user_input = Some(requested);
+        }
+        if let Some(pending) = self.pending_approval.take() {
+            result.pending_approval = Some(pending);
+        }
+        // Truthful pause when the session closed without the dispatch the
+        // run promised: the guard would fire at the exit anyway, so name the
+        // real cause instead of leaving only the guard's verdict to explain it.
+        if !self.implement_stage_dispatch_occurred(&result.graph, &result.action_ledger) {
+            result.loop_notes.push(
+                "Resume-drive: the restored plan's implement stage is still unattempted — the \
+                 resumed decision session closed without an implement dispatch, so the run \
+                 reports Partial and keeps its checkpoint for resume."
+                    .to_owned(),
+            );
+        }
+        // The drive added nodes to an already-restored graph: re-validate the
+        // whole DAG (empty graphs stay legal, as everywhere else).
+        if !result.graph.is_empty() {
+            TaskGraphValidator::validate(&result.graph)?;
+        }
+        Ok(result)
     }
 
     /// Decompose the task into a TaskGraph, or restore from a previous checkpoint.
@@ -5088,7 +6359,20 @@ impl CoordinatorAgent {
         let checkpoint_present = resume_checkpoint_json.is_some();
         if let Some(cp_json) = resume_checkpoint_json {
             match self.restore_and_evaluate(&cp_json, task, context, cancel).await {
-                Ok(Some(result)) => return Ok(result),
+                Ok(Some(result)) => {
+                    // Resume-drive: a restored graph that is fully settled
+                    // yet never dispatched its implement stage would fall
+                    // through to the completion guard's canned Partial — a
+                    // dead end that re-persists on every resume. Hand it back
+                    // to the decision loop instead, so the Coordinator
+                    // dispatches the promised work.
+                    if self.resume_needs_implement_drive(task, &result) {
+                        return self
+                            .drive_resumed_implement(task, context, cancel, &cp_json, result)
+                            .await;
+                    }
+                    return Ok(result);
+                }
                 // ADR-65 §7 Replan: the workspace objectively changed
                 // materially to the pending step. The resume path itself
                 // dispatches nothing — the fresh decompose below lets the
@@ -5229,7 +6513,7 @@ impl CoordinatorAgent {
     /// [`DecomposeResult`] whose objective/hash fields describe WHAT this run
     /// is executing (the fresh task description, or the evidence seed's
     /// original plan text + objective hash). Event ordering is load-bearing:
-    /// `MultiAgentModeStarted` must fire before the ADR-55 Phase 2b
+    /// `MultiAgentModeStarted` must fire before the ADR-55 §4
     /// planning-only early return.
     ///
     /// Terminal classes do not surface here: this tail runs only after a
@@ -5267,7 +6551,7 @@ impl CoordinatorAgent {
                 self.persist_plan_artifact(&fallback_plan)
             }
         };
-        // ADR-55 Phase 2b: retain the id so a planning-only run can bind
+        // ADR-55 §4: retain the id so a planning-only run can bind
         // its rendered plan to the durable artifact.
         self.last_plan_id = plan_id.clone();
         let _ = self.bus.publish_for_session(
@@ -5279,7 +6563,7 @@ impl CoordinatorAgent {
                 plan_id,
             },
         );
-        // ADR-55 Phase 2b: the planning-only run's plan IS the Coordinator's
+        // ADR-55 §4: the planning-only run's plan IS the Coordinator's
         // decision-loop summary (advisory prose; nothing was dispatched).
         if self.orchestration_depth == OrchestrationDepth::PlanningOnly && summary.is_empty() {
             return Ok(DecomposeResult {
@@ -5386,7 +6670,42 @@ impl CoordinatorAgent {
         let mut graph = crate::checkpoint::restore_graph(&cp).map_err(|e| {
             OrchestratorError::AgentLoopError(format!("checkpoint restore failed: {e}"))
         })?;
-        let completed_results = cp.completed_results;
+        // Declaration boundary: a checkpoint (especially one written before
+        // the shared declaration split) can carry `"<path>: <description>"`
+        // entries. Normalize them to paths BEFORE their first use below
+        // (`plan_present`, the C-06 map restore, the plan artifact, plan
+        // drift) so every existence check sees a path — or, for prose that
+        // has none, an `undeclared/unverifiable` classification.
+        for paths in cp.expected_artifacts.values_mut() {
+            *paths = crate::declared_artifacts::declared_paths(paths);
+        }
+        // Run-history audit: record the shape the resume actually received —
+        // before any resume-evaluator outcome (Applied / Replan / recovery
+        // re-arming) mutates it — so a later completion verdict is auditable
+        // against what was restored. `plan_present` reports whether the
+        // checkpoint promised an implementation (a binding design doc or
+        // declared expected artifacts). Fail-soft like every publish.
+        {
+            let restored = graph.all_tasks();
+            let _ = self.bus.publish_for_session(
+                task.session_id,
+                task.id.0,
+                EventKind::CheckpointRestored {
+                    run_id: Some(cp.run_id.to_string()),
+                    session_id: task.session_id,
+                    pending_nodes: restored
+                        .iter()
+                        .filter(|subtask| is_unfinished_subtask_status(subtask.status))
+                        .count(),
+                    completed_nodes: restored
+                        .iter()
+                        .filter(|subtask| subtask.status == SubTaskStatus::Completed)
+                        .count(),
+                    plan_present: cp.design_doc.is_some() || !cp.expected_artifacts.is_empty(),
+                },
+            );
+        }
+        let mut completed_results = cp.completed_results;
         let total_cost = cp.total_cost;
         let total_tool_calls = cp.total_tool_calls;
         let all_files = cp.all_files;
@@ -5408,6 +6727,7 @@ impl CoordinatorAgent {
         self.default_model_attempted = cp.default_model_attempted.clone();
         self.default_model_provider_attempted = cp.default_model_provider_attempted.clone();
         self.self_execute_attempted = cp.self_execute_attempted.clone();
+        self.specialist_takeover_attempted = cp.specialist_takeover_attempted.clone();
         self.escalation_attempted = cp.escalation_attempted.clone();
         // ADR-65 §7: keep the doc resolution and pending decision
         // round-tripping — the resumed run's checkpoints carry them forward
@@ -5468,6 +6788,60 @@ impl CoordinatorAgent {
                 _ => false,
             };
 
+        // ── Phase 6 M3c steps 1–2: plan-drift investigation ──────────────
+        // Runs BEFORE the §7 evaluation: confirmed drift is evidence the
+        // resume policy weighs (it can yield Replan or RefreshEvidence), and
+        // its confirmed findings are what step 3 re-arms after the evaluation.
+        // Scope: the artifacts of the subtasks the checkpoint recorded
+        // COMPLETE (a Pending subtask's artifacts legitimately do not exist
+        // yet) and not the run's own recorded writes (a path F3 already
+        // reports as an external change is never double-reported). Fail-soft
+        // at every step: no snapshot ⇒ no findings; a run-start baseline the
+        // log window no longer carries ⇒ missing-only reading; a re-read that
+        // fails for a reason other than absence ⇒ `Unverified`, which step 5
+        // below reports as Partial instead of guessing a verdict.
+        let expected = completed_expected_artifacts(&cp.expected_artifacts, &completed_results);
+        let own_written = own_write_paths(
+            &all_files,
+            &completed_results,
+            post_cursor,
+            &context.session.project_dir,
+        );
+        let investigation = match self.workspace_snapshot.as_ref() {
+            Some(snapshot) => crate::external_change::investigate_plan_drift(
+                &expected,
+                &plan_drift_baseline(&log_window, cp.snapshot_generation.as_deref()),
+                &snapshot.entries,
+                &own_written,
+                &context.session.project_dir,
+            ),
+            None => crate::external_change::PlanDriftInvestigation::default(),
+        };
+        // Phase 6 M3c step 5 (re-verification failure): the finding could not
+        // be re-read, so neither clearing nor re-dispatch is honest. State the
+        // blocker and the diff — the recoverable note downgrades the exit to
+        // Partial without inviting a resume that would hit the same unreadable
+        // file.
+        let mut loop_notes: Vec<String> = Vec::new();
+        if investigation.reverify_failed() {
+            loop_notes.push(format!(
+                "Plan-drift re-verification failed: the live filesystem could not be read for \
+                 {} ({}); the resume could neither confirm nor clear the drift, so no \
+                 re-dispatch was attempted and the run is reported Partial.",
+                investigation.affected_paths().join(", "),
+                investigation
+                    .reverify
+                    .iter()
+                    .filter(|entry| {
+                        entry.status == concerto_core::event::PlanDriftReverifyStatus::Unverified
+                    })
+                    .map(|entry| entry.path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        let confirmed_drift = investigation.confirmed_paths();
+
         // ── ADR-65 §7: evaluate the resume at the cursor ─────────────────
         let pending_decision = cp.pending_decision.clone();
         let snapshot_generation_at_checkpoint = cp.snapshot_generation.clone();
@@ -5483,6 +6857,7 @@ impl CoordinatorAgent {
                 snapshot_generation_at_checkpoint.as_deref(),
                 &log_window,
                 post_cursor,
+                &confirmed_drift,
                 cancel,
             )
             .await;
@@ -5513,6 +6888,12 @@ impl CoordinatorAgent {
                 "ADR-65 §7: resume chose REPLAN — the workspace objectively changed \
                  materially to the pending step; delegating to the Phase-6 scheduler"
             );
+            // Phase 6 M3c step 4: the investigation still reports when the
+            // drift itself is what forced the replan — a signal that shaped
+            // the resume must not vanish with the superseded graph. The fresh
+            // plan's id does not exist yet, so it rides as `None` (additive
+            // field); `redispatched` is empty because the fresh plan dispatches.
+            self.publish_plan_drift(task, None, &investigation, &[]);
             return Ok(None);
         };
         let mut action_ledger = action_ledger;
@@ -5524,6 +6905,27 @@ impl CoordinatorAgent {
             // Partial before ever dispatching the decided task.
             subtask_attempts.insert(re_armed, 0);
         }
+        // Phase 6 M3c step 3 (replan): confirmed drift re-arms the affected
+        // COMPLETED subtasks (Completed → Pending) so the normal ready batch
+        // re-dispatches them through the usual policy-gated specialist path —
+        // the restored ledger, expected artifacts, and attempt budget ride
+        // along, exactly as a Continue re-arm does. Never a halt: the raw
+        // signal alone never stops a run.
+        let redispatched = if investigation.reverify_failed() || confirmed_drift.is_empty() {
+            // Step 5: a re-read that failed is reported Partial above instead
+            // of re-armed (the note must stay true: no re-dispatch ran), and
+            // nothing confirmed means there is nothing to re-dispatch.
+            Vec::new()
+        } else {
+            self.redispatch_drift_subtasks(
+                &mut graph,
+                &mut completed_results,
+                &cp.expected_artifacts,
+                &mut subtask_attempts,
+                &mut action_ledger,
+                &investigation,
+            )
+        };
 
         // ADR-52: a resumed run re-persists its durable plan artifact
         // (idempotent overwrite of `plan-<run_id>.json`) so the plans dir
@@ -5532,26 +6934,15 @@ impl CoordinatorAgent {
         let plan =
             PlanArtifact::from_graph(cp.run_id.to_string(), task, &graph, &cp.expected_artifacts);
         let plan_id = self.persist_plan_artifact(&plan);
-        // ADR-55 Phase 2b: retain the id so a planning-only run can bind
+        // ADR-55 §4: retain the id so a planning-only run can bind
         // its rendered plan to the durable artifact.
         self.last_plan_id = plan_id.clone();
-        // ── Phase 6 M3c: plan-drift signal ────────────────────────────────
-        // The resume is Applied: this run continues the restored plan, so
-        // compare the plan's declared artifacts against the live inventory.
-        // Scoped to the subtasks the checkpoint already recorded complete — a
-        // Pending subtask's artifacts legitimately do not exist yet — and
-        // excluding the run's own recorded writes, so a path F3 already
-        // reports as an external change is never double-reported. Fail-soft
-        // and advisory: it never gates the resume.
-        self.emit_plan_drift(
-            plan_id.as_deref(),
-            &cp.expected_artifacts,
-            &all_files,
-            &completed_results,
-            post_cursor,
-            &context.session.project_dir,
-            task,
-        );
+        // ── Phase 6 M3c step 4: publish the investigation ─────────────────
+        // One signal carries what drifted, what the live re-read concluded,
+        // and which steps were re-dispatched, so both frontends can render
+        // the same one-line report. Cleared investigations publish nothing
+        // (step 2 is silent by design); a publish error is logged only.
+        self.publish_plan_drift(task, plan_id.as_deref(), &investigation, &redispatched);
         let _ = self.bus.publish_for_session(
             task.session_id,
             task.id.0,
@@ -5581,7 +6972,7 @@ impl CoordinatorAgent {
             model_assignments,
             action_ledger,
             dispatch_summary: String::new(),
-            loop_notes: Vec::new(),
+            loop_notes,
             // TODO #22 (tracking half): an AwaitingUser pause carries its
             // pending question on the checkpoint; the resume hands it to
             // `execute_graph` so the run stops again with the SAME reason —
@@ -5599,55 +6990,41 @@ impl CoordinatorAgent {
         }))
     }
 
-    /// Phase 6 M3c: detect planned-but-absent artifacts on a resumed run and
-    /// publish a [`EventKind::PlanDrift`] signal.
+    /// Phase 6 M3c step 4: publish the investigation as ONE
+    /// [`EventKind::PlanDrift`] carrying what drifted (the classified diff),
+    /// what the live re-read concluded, and which steps were re-dispatched —
+    /// so both frontends render the same one-line report from the same data.
     ///
-    /// Scope is the artifacts of the subtasks the checkpoint recorded COMPLETE
-    /// (a pending subtask's artifacts are not yet expected to exist —
-    /// including them would report drift on every mid-run resume). The run's
-    /// own recorded writes are excluded, so a path F3 already reports as an
-    /// external change is never double-reported here.
-    ///
-    /// Fail-soft and advisory: no captured snapshot means no signal, a publish
-    /// error is logged only, and the signal never gates the resume.
-    #[allow(clippy::too_many_arguments)]
-    fn emit_plan_drift(
+    /// Silent by contract on a cleared investigation (step 2) and when the
+    /// classification found nothing; the malformed-declaration warning is
+    /// logged either way (declaration quality, never workspace drift).
+    /// Fail-soft: a publish error is logged only — the signal never gates the
+    /// resume.
+    fn publish_plan_drift(
         &self,
-        plan_id: Option<&str>,
-        expected_artifacts: &HashMap<TaskId, Vec<camino::Utf8PathBuf>>,
-        checkpoint_all_files: &[camino::Utf8PathBuf],
-        completed_results: &HashMap<TaskId, AgentRunResult>,
-        post_cursor: &[WhiteboardEvent],
-        project_root: &std::path::Path,
         task: &AgentTask,
+        plan_id: Option<&str>,
+        investigation: &crate::external_change::PlanDriftInvestigation,
+        redispatched: &[String],
     ) {
-        let Some(snapshot) = self.workspace_snapshot.as_ref() else { return };
-        let mut seen = HashSet::new();
-        let expected: Vec<camino::Utf8PathBuf> = expected_artifacts
-            .iter()
-            .filter(|(task_id, _)| completed_results.contains_key(task_id))
-            .flat_map(|(_, paths)| paths.iter())
-            .filter(|path| seen.insert((*path).clone()))
-            .cloned()
-            .collect();
-        if expected.is_empty() {
-            return;
+        if !investigation.unverifiable.is_empty() {
+            warn!(
+                run_id = plan_id.unwrap_or("<none>"),
+                count = investigation.unverifiable.len(),
+                entries = ?investigation.unverifiable,
+                "plan declaration is undeclared/unverifiable (no file path) — not workspace drift"
+            );
         }
-        let own_written =
-            own_write_paths(checkpoint_all_files, completed_results, post_cursor, project_root);
-        let drift = crate::external_change::detect_plan_drift(
-            plan_id,
-            &expected,
-            &snapshot.entries,
-            &own_written,
-        );
-        if drift.is_empty() {
+        if investigation.is_empty() || investigation.is_cleared() {
             return;
         }
         warn!(
             run_id = plan_id.unwrap_or("<none>"),
-            affected = drift.affected_paths.len(),
-            "Phase 6 M3c: plan drift detected — planned artifact(s) absent from the live workspace"
+            affected = investigation.affected_paths().len(),
+            confirmed = investigation.confirmed_paths().len(),
+            unverified = investigation.reverify_failed(),
+            redispatched = redispatched.len(),
+            "Phase 6 M3c: plan drift confirmed — re-dispatching diverged subtasks"
         );
         let _ = self.bus.publish_for_session(
             task.session_id,
@@ -5655,9 +7032,74 @@ impl CoordinatorAgent {
             EventKind::PlanDrift {
                 task_id: task.id,
                 plan_id: plan_id.map(str::to_owned),
-                affected_paths: drift.affected_paths,
+                affected_paths: investigation.affected_paths(),
+                diff: investigation.diff.clone(),
+                reverify: investigation.reverify.clone(),
+                redispatched: redispatched.to_vec(),
             },
         );
+    }
+
+    /// Phase 6 M3c step 3 (replan): drop the COMPLETED subtasks whose
+    /// artifacts the investigation confirmed diverged back to `Pending` so the
+    /// normal ready batch re-dispatches them through the usual policy-gated
+    /// specialist path — the restored ledger, expected artifacts, and attempt
+    /// budget ride along exactly as a `Continue` re-arm does, and each dispatch
+    /// runs the same policy gate as any other specialist run.
+    ///
+    /// Keeps the re-armed node ids on [`Self::plan_drift_redispatch`] so the
+    /// completion tail can attach the diff if the re-dispatch never settles
+    /// (step 5). Returns the re-armed roles for the drift signal.
+    fn redispatch_drift_subtasks(
+        &mut self,
+        graph: &mut TaskGraph,
+        completed_results: &mut HashMap<TaskId, AgentRunResult>,
+        expected_artifacts: &HashMap<TaskId, Vec<camino::Utf8PathBuf>>,
+        subtask_attempts: &mut HashMap<TaskId, u32>,
+        action_ledger: &mut Vec<checkpoint::CheckpointAction>,
+        investigation: &crate::external_change::PlanDriftInvestigation,
+    ) -> Vec<String> {
+        let confirmed_paths = investigation.confirmed_paths();
+        let confirmed: HashSet<&str> = confirmed_paths.iter().map(String::as_str).collect();
+        let timestamp = time::OffsetDateTime::now_utc();
+        let mut nodes: Vec<TaskId> = Vec::new();
+        let mut labels: Vec<String> = Vec::new();
+        for (task_id, paths) in expected_artifacts {
+            // Only the subtasks the checkpoint recorded COMPLETE can have
+            // drifted: a Pending subtask's artifacts are not written yet.
+            if !completed_results.contains_key(task_id)
+                || !paths.iter().any(|path| confirmed.contains(path.as_str()))
+            {
+                continue;
+            }
+            let Some(subtask) = graph.get(task_id) else { continue };
+            labels.push(subtask.role.as_str().to_owned());
+            graph.mark_pending(task_id);
+            if let Some(subtask) = graph.get_mut(task_id) {
+                // The evidence it completed is no longer valid: its artifact
+                // diverged, so the deliverable and completion stamp go too.
+                subtask.deliverable = None;
+                subtask.completed_at = None;
+            }
+            completed_results.remove(task_id);
+            subtask_attempts.insert(*task_id, 0);
+            action_ledger.push(checkpoint::CheckpointAction {
+                kind: "plan-drift-redispatch".into(),
+                task_id: Some(*task_id),
+                timestamp,
+                evidence: None,
+            });
+            nodes.push(*task_id);
+        }
+        if !nodes.is_empty() {
+            self.plan_drift_redispatch = Some(crate::external_change::PlanDriftRedispatch {
+                paths: confirmed_paths,
+                nodes,
+                labels: labels.clone(),
+                diff: investigation.diff.clone(),
+            });
+        }
+        labels
     }
 
     /// Read this session's log tail window for the resume evaluation
@@ -5790,6 +7232,7 @@ impl CoordinatorAgent {
         checkpoint_snapshot_generation: Option<&str>,
         log_window: &[WhiteboardEvent],
         post_cursor: &[WhiteboardEvent],
+        plan_drift: &[String],
         cancel: &CancellationToken,
     ) -> ResumeApplication {
         // Steps a previous resume already skipped stay skipped — a recorded
@@ -5941,9 +7384,18 @@ impl CoordinatorAgent {
             post_cursor,
             &context.session.project_dir,
         );
-        let change = self
+        let mut change = self
             .workspace_change_verdict(checkpoint_snapshot_generation, &own_written, cancel)
             .await;
+        // Phase 6 M3c: the step 1–2 investigation's confirmed findings ride
+        // into the §7 policy as workspace-change evidence — a confirmed
+        // divergence is exactly the condition §7 has always been written
+        // against, it simply could never be observed at this depth before.
+        // Advisory: `evaluate` treats it as one input among the others, so a
+        // settled graph still resolves to RefreshEvidence (the caller re-arms
+        // the diverged steps) while material open work forces the Replan the
+        // policy already prescribes.
+        change.plan_drift = plan_drift.to_vec();
         // Issue #65: the F3 external evidence becomes explicit, reconcilable
         // records (ownership-aware, conflict-flagged, checkpoint-persisted)
         // instead of a one-shot verdict the model reads once and loses.
@@ -6479,6 +7931,20 @@ impl CoordinatorAgent {
                     .collect()
             };
 
+            // Phase 6 M3c step 3: a plan-drift re-armed node bypasses the
+            // resolver. Its artifact evidence lives in the whiteboard timeline
+            // (the pre-tamper run's log), not in the live filesystem the
+            // investigation just contradicted — a `Reuse` verdict would
+            // re-inject the pre-tamper cached result and silently swallow the
+            // re-dispatch this resume exists to perform. Every other ready
+            // node keeps its resolver verdict.
+            let (drift_ids, resolver_ids): (Vec<ReadyEntry>, Vec<ReadyEntry>) =
+                ready_ids.clone().into_iter().partition(|(task_id, _)| {
+                    self.plan_drift_redispatch
+                        .as_ref()
+                        .is_some_and(|redispatch| redispatch.nodes.contains(task_id))
+                });
+
             // ADR-64 Phase 5: capsule projection — clone the timeline
             // projection out of the resolver block so it is available
             // for capsule building in the dispatch futures below.
@@ -6533,7 +7999,7 @@ impl CoordinatorAgent {
                         let expected_map = self.expected_artifacts_snapshot();
 
                         let pass = resolver_integration::resolve_batch(
-                            &ready_ids,
+                            &resolver_ids,
                             &graph,
                             &completed_results,
                             &projection,
@@ -6613,8 +8079,11 @@ impl CoordinatorAgent {
                             }
                         }
 
-                        // Return only the non-reused task IDs for normal dispatch.
-                        pass.dispatch_ids
+                        // Return only the non-reused task IDs for normal
+                        // dispatch, with the drift bypass re-attached first.
+                        let mut dispatch_ids = drift_ids;
+                        dispatch_ids.extend(pass.dispatch_ids);
+                        dispatch_ids
                     } else {
                         // Projection build failed — dispatch all.
                         ready_ids
@@ -7354,7 +8823,12 @@ impl CoordinatorAgent {
                                                 .cloned()
                                                 .unwrap_or_default()
                                         } else {
-                                            doc.proposed_files.clone()
+                                            // Declaration boundary (see the
+                                            // DesignDoc dispatch insert): keep
+                                            // the path, drop `": <description>"`.
+                                            crate::declared_artifacts::declared_paths(
+                                                &doc.proposed_files,
+                                            )
                                         };
                                         let orig_desc = graph
                                             .get(&orig_impl_id)
@@ -8222,15 +9696,19 @@ impl CoordinatorAgent {
         };
         // ── C-06 completion-time acceptance gate ─────────────────────────
         // ADR-35 amendment (2026-09-16 §4): a build task may only be
-        // reported Completed when the Coordinator actually invoked
-        // verification and the artifacts passed acceptance. The gate
-        // detects "declared verification evidence" — a successful
-        // acceptance-stage dispatch in the ledger (subtask settled with
-        // kind "completed" whose role resolves to StageKind::Acceptance) —
-        // and invokes `acceptance_rejection` to enforce artifact checks
-        // and record the accepted/rejected decision. Without declared
-        // verification evidence the completion claim is downgraded to
-        // Partial with a recoverable note.
+        // reported Completed when the run's promised work is evidenced and
+        // the artifacts passed acceptance. Evidence may be (1) an accepted
+        // validation-stage dispatch (the original declared-verification
+        // path), (2) direct executed-tool evidence recorded on the run's
+        // evidence spine (a successful mutating tool against a declared
+        // deliverable, or a successful build/test/lint command), or (3) a
+        // recorded coordinator declaration that no separate verification is
+        // required. When evidence exists `acceptance_rejection` enforces the
+        // artifact checks and records the accepted/rejected decision;
+        // without any evidence the completion claim is downgraded to Partial
+        // with a note naming the missing evidence. FAIL-CLOSED: absence of
+        // evidence is never Complete; failed or refused tool calls are never
+        // evidence.
         let build_task = graph.all_tasks().iter().any(|subtask| {
             self.stage_of(&subtask.role).as_ref().is_some_and(AgentStage::is_implement)
         });
@@ -8242,42 +9720,65 @@ impl CoordinatorAgent {
         });
         if build_task && completion_status == concerto_core::types::AgentCompletionStatus::Completed
         {
-            if has_declared_verification {
-                // ADR-35 §4: the Coordinator dispatched a validator that
-                // succeeded. Invoke acceptance_rejection to enforce artifact
-                // checks and record the accepted/rejected decision in the
-                // action ledger.
-                if let Some(rejected) =
-                    self.acceptance_rejection(&task, build_task, &project_root, &mut action_ledger)
-                {
-                    recoverable_notes.push(rejected.summary.clone());
-                    completion_status = concerto_core::types::AgentCompletionStatus::Partial;
+            let declared_artifacts = expected_artifact_list(&self.expected_artifacts_snapshot());
+            let run_id = checkpoint_scope.run_id.to_string();
+            let evidence = self
+                .run_verification_evidence(
+                    task.session_id,
+                    Some(run_id.as_str()),
+                    &declared_artifacts,
+                    has_declared_verification,
+                )
+                .await;
+            match evidence {
+                Some(evidence) => {
+                    // The run's promised work is evidenced. Enforce the
+                    // artifact checks and record the accepted/rejected
+                    // decision in the action ledger.
+                    tracing::debug!(
+                        kind = ?evidence.kind,
+                        detail = %evidence.detail,
+                        "C-06 acceptance gate: verification evidence present"
+                    );
+                    if let Some(rejected) = self.acceptance_rejection(
+                        &task,
+                        build_task,
+                        &project_root,
+                        &mut action_ledger,
+                    ) {
+                        recoverable_notes.push(rejected.summary.clone());
+                        completion_status = concerto_core::types::AgentCompletionStatus::Partial;
+                    }
                 }
-            } else {
-                // No verification evidence was declared for this run. Name
-                // any declared-but-unproduced deliverables (a quarantined
-                // DesignDoc's carried contract paths included) so the
-                // omission is concrete, not generic.
-                completion_status = concerto_core::types::AgentCompletionStatus::Partial;
-                let unproduced = unproduced_expected_artifacts(
-                    &project_root,
-                    &self.expected_artifacts_snapshot(),
-                );
-                let detail = if unproduced.is_empty() {
-                    String::new()
-                } else {
-                    let list = unproduced
-                        .iter()
-                        .map(|(path, reason)| format!("{path} ({reason})"))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!(" Unproduced declared deliverable(s): {list}.")
-                };
-                recoverable_notes.push(format!(
-                    "Acceptance gate C-06: the run contained implement-stage work but no \
-                     verification evidence was declared for this run; the completion claim \
-                     is reported Partial.{detail}"
-                ));
+                None => {
+                    // No evidence of any kind. Name the blocker concretely
+                    // (including any declared-but-unproduced deliverables, a
+                    // quarantined DesignDoc's carried contract paths
+                    // included) so the omission is actionable, not generic.
+                    completion_status = concerto_core::types::AgentCompletionStatus::Partial;
+                    let unproduced = unproduced_expected_artifacts(
+                        &project_root,
+                        &self.expected_artifacts_snapshot(),
+                    );
+                    let detail = if unproduced.is_empty() {
+                        String::new()
+                    } else {
+                        let list = unproduced
+                            .iter()
+                            .map(|(path, reason)| format!("{path} ({reason})"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!(" Unproduced declared deliverable(s): {list}.")
+                    };
+                    recoverable_notes.push(format!(
+                        "Acceptance gate C-06: the run contained implement-stage work and \
+                         reported completion, but no verification evidence exists for this run \
+                         — no accepted validator pass, no successful mutating tool against a \
+                         declared deliverable, no successful build/test/lint command, and no \
+                         recorded declaration that separate verification is unnecessary; the \
+                         completion claim is reported Partial.{detail}"
+                    ));
+                }
             }
         }
         // ── Completion-time unfinished-work guards ───────────────────────
@@ -8343,6 +9844,62 @@ impl CoordinatorAgent {
             )
             .await;
         }
+        // 3. Plan-drift re-dispatch: the subtasks this resume re-armed after
+        // a confirmed artifact divergence must settle before the run may claim
+        // Completed. A re-dispatch that never settles leaves the divergence
+        // unaddressed, so the exit is Partial with the classification attached
+        // and the checkpoint preserved — a later resume retries the
+        // re-dispatch instead of reading an unverified state. Taken rather
+        // than read: a settled drift never re-asserts itself on a later cycle
+        // or a later resume of the same run.
+        if let Some(redispatch) = self.plan_drift_redispatch.take() {
+            let unfinished: Vec<TaskId> = redispatch
+                .nodes
+                .iter()
+                .copied()
+                .filter(|task_id| {
+                    graph
+                        .get(task_id)
+                        .is_some_and(|subtask| subtask.status != SubTaskStatus::Completed)
+                })
+                .collect();
+            if !unfinished.is_empty() {
+                let detail = unfinished
+                    .iter()
+                    .map(|task_id| {
+                        graph
+                            .get(task_id)
+                            .map(|subtask| {
+                                format!("{} [{}]", subtask.role, subtask.status.as_str())
+                            })
+                            .unwrap_or_else(|| task_id.to_string())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let note = format!(
+                    "Plan-drift re-dispatch guard: re-dispatched subtask(s) ({detail}) did not \
+                     settle after a confirmed artifact divergence on {}; the drift remains \
+                     unaddressed, so the run is reported Partial and its checkpoint is preserved \
+                     for resume. Diff: {}.",
+                    redispatch.paths.join(", "),
+                    redispatch
+                        .diff
+                        .iter()
+                        .map(|entry| format!("{} ({})", entry.path, entry.class.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                recoverable_notes.push(note.clone());
+                completion_status = concerto_core::types::AgentCompletionStatus::Partial;
+                self.record_completion_guard_decision(
+                    task.session_id,
+                    "completion-blocked-plan-drift-redispatch",
+                    &note,
+                )
+                .await;
+            }
+        }
+
         // ── Run-continuity Phase 1: stall gate at the final exit ────────
         // A stalled run (declared-Completion false, declared deliverables
         // unproduced, or a Failed/Blocked subtask) KEEPS its resumable
@@ -8435,10 +9992,12 @@ impl CoordinatorAgent {
         // loop counts toward it too, so loop + graph dispatches share one
         // ceiling.
         self.model_dispatch_count = 0;
-        // The coordinator-owned planning recovery is once per `run`: the
-        // attempt guard and its ladder-exhausted note do not carry across
-        // runs.
-        self.planning_recovery_attempted = false;
+        // The coordinator-owned planning recovery budget is per `run`: the
+        // bounded rounds/holds and the ladder-exhausted note do not carry
+        // across runs (recovery is no longer one-shot, but still bounded).
+        self.planning_recovery_rounds = 0;
+        self.planning_recovery_in_progress = false;
+        self.planning_hold_rounds = 0;
         self.planning_recovery_note = None;
         self.planning_produced_files.clear();
         // Advisor-mode intent routing: finalize the run shape from the router's
@@ -8499,6 +10058,13 @@ impl CoordinatorAgent {
         self.retrieve_memory_context(&task, &mut context, plan_seed.as_deref(), cancel.clone())
             .await;
 
+        // Run-history audit: the checkpoint's run id is the only identifier
+        // that ties this run to its prior attempts BEFORE `self.run_id` is
+        // (re)established inside `execute_graph`, so a deliberate interrupt
+        // landing in the planning phase still reports the right run. Fail-soft
+        // by construction: an unreadable checkpoint simply yields `None`.
+        let checkpoint_run_id = Self::checkpoint_run_id_hint(resume_checkpoint_json.as_deref());
+
         // Phase 1: Decompose or restore
         let DecomposeResult {
             graph,
@@ -8538,6 +10104,18 @@ impl CoordinatorAgent {
                 // Partial result rather than crashing the session. When the
                 // ladder was attempted or skipped first, its ladder-exhausted
                 // note makes the pause explicit instead of silent.
+                //
+                // Run-history audit: a user stop mid-planning surfaces here as
+                // `Cancelled`; record it so the run history shows a deliberate
+                // interrupt rather than an anonymous partial plan failure.
+                if is_cancellation_error(&e) {
+                    self.publish_run_interrupted(
+                        task.id,
+                        task.session_id,
+                        checkpoint_run_id,
+                        "planning",
+                    );
+                }
                 let note = self.planning_recovery_note.take();
                 // A planning failure that came AFTER the run already produced
                 // artifacts (a later planning dispatch failed) must not read
@@ -8578,7 +10156,8 @@ impl CoordinatorAgent {
             }
         };
 
-        // ADR-55 Phase 2b: planning-only orchestration. The plan was just
+        // ADR-55 archived Phase 2b §1: planning-only orchestration. The plan
+        // was just
         // produced (resume is always `None` on this path, so nothing was
         // restored); the Coordinator's decision-loop summary IS the plan.
         // Render it as the run's final message and return without dispatching
@@ -8612,29 +10191,49 @@ impl CoordinatorAgent {
             });
         }
 
-        // Phase 2: Execute graph
-        self.execute_graph(
-            task,
-            context,
-            cancel,
-            graph,
-            completed_results,
-            total_cost,
-            total_tool_calls,
-            all_files,
-            provider_metrics,
-            subtask_attempts,
-            retry_feedback,
-            model_assignments,
-            action_ledger,
-            run_objective,
-            run_objective_hash,
-            loop_notes,
-            requested_user_input,
-            pending_approval,
-        )
-        .await
-        .map(|(output, _notes)| output)
+        // Phase 2: Execute graph. `task` is consumed here, so its ids are
+        // captured first for the run-history interrupt audit below.
+        let (task_id, session_id) = (task.id, task.session_id);
+        let outcome = self
+            .execute_graph(
+                task,
+                context,
+                cancel,
+                graph,
+                completed_results,
+                total_cost,
+                total_tool_calls,
+                all_files,
+                provider_metrics,
+                subtask_attempts,
+                retry_feedback,
+                model_assignments,
+                action_ledger,
+                run_objective,
+                run_objective_hash,
+                loop_notes,
+                requested_user_input,
+                pending_approval,
+            )
+            .await;
+        match outcome {
+            Ok((output, _notes)) => Ok(output),
+            Err(e) => {
+                // Run-history audit: a user stop during graph dispatch is the
+                // same `Cancelled` terminal class as a provider-level stop.
+                // Record the stage so a later audit can tell a deliberate
+                // interrupt (this event present) from a provider failure.
+                if is_cancellation_error(&e) {
+                    self.publish_run_interrupted(
+                        task_id,
+                        session_id,
+                        checkpoint_run_id,
+                        "executing",
+                    );
+                }
+                Err(e)
+            }
+        }
     }
 
     // ── review cycle (§3.8) ─────────────────────────────────────────────
@@ -8670,6 +10269,91 @@ impl CoordinatorAgent {
                 verification_passed,
             }),
         });
+    }
+
+    /// C-06 evidence evaluation at completion: whether the run's promised
+    /// work is evidenced, and by what. Evidence kinds, checked in order:
+    ///
+    /// 1. declared verification (an accepted validator dispatch) — the
+    ///    existing path, trusted unchanged;
+    /// 2. direct executed-tool evidence read from the run's recorded
+    ///    `ToolExecuted` whiteboard facts — a successful mutating tool that
+    ///    touched a declared deliverable, or a successful build/test/lint
+    ///    command;
+    /// 3. a recorded coordinator declaration (`verification-exempt`) that no
+    ///    separate verification is required, with a reason.
+    ///
+    /// FAIL-CLOSED: `None` means there is no evidence and the gate must
+    /// downgrade to `Partial`. A missing pool or a read error yields `None`
+    /// (logged, never a panic); failed/refused tool calls are never
+    /// evidence.
+    async fn run_verification_evidence(
+        &self,
+        session_id: Ulid,
+        run_id: Option<&str>,
+        declared: &[camino::Utf8PathBuf],
+        has_declared_verification: bool,
+    ) -> Option<VerificationEvidence> {
+        if has_declared_verification {
+            return Some(VerificationEvidence {
+                kind: VerificationEvidenceKind::DeclaredValidator,
+                detail: "declared validation-stage subtask settled completed".to_owned(),
+            });
+        }
+        let pool = self.review_store.as_ref()?;
+        let session = session_id.to_string();
+
+        match concerto_sessions::whiteboard::load_session_events_of_kind(
+            pool,
+            &session,
+            WhiteboardKind::ToolExecuted,
+            VERIFICATION_EVIDENCE_SCAN_LIMIT,
+        )
+        .await
+        {
+            Ok(events) => {
+                if let Some(evidence) = tool_fact_verification_evidence(&events, run_id, declared) {
+                    return Some(evidence);
+                }
+            }
+            Err(error) => {
+                warn!(%error, "C-06 evidence: tool-fact read failed (fail-closed)");
+            }
+        }
+
+        match concerto_sessions::whiteboard::load_session_events_of_kind(
+            pool,
+            &session,
+            WhiteboardKind::Decision,
+            VERIFICATION_EVIDENCE_SCAN_LIMIT,
+        )
+        .await
+        {
+            Ok(events) => {
+                for event in events {
+                    let code =
+                        event.payload.get("required_output").and_then(serde_json::Value::as_str);
+                    let reason = event
+                        .payload
+                        .get("reason")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    if code == Some(VERIFICATION_EXEMPT_DECISION_CODE) && !reason.trim().is_empty()
+                    {
+                        return Some(VerificationEvidence {
+                            kind: VerificationEvidenceKind::CoordinatorDeclaration,
+                            detail: format!(
+                                "coordinator declared no verification required: {reason}"
+                            ),
+                        });
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(%error, "C-06 evidence: declaration read failed (fail-closed)");
+            }
+        }
+        None
     }
 
     /// C-06: coordinator-owned acceptance for build tasks.
@@ -8849,9 +10533,9 @@ impl CoordinatorAgent {
         // The retried session may finally dispatch (the run proceeds); if it too
         // ends empty, the retried result flows into `execute_graph`, whose
         // vacuous-completion guard reports Partial and KEEPS the checkpoint for
-        // resume. The recovery is once-per-run: the nested retry's own
-        // prose-only stop is skipped via `planning_recovery_attempted`, so this
-        // never recurses deeper than one level.
+        // resume. The nested retry's own prose-only stop is suppressed by
+        // `planning_recovery_in_progress`, so this never recurses deeper than
+        // one level (the run budget is bounded by MAX_PLANNING_RECOVERY_ROUNDS).
         let prose_only_stop = self.orchestration_depth != OrchestrationDepth::PlanningOnly
             && matches!(task.execution_mode, TaskExecutionMode::ActionRequired { .. })
             && graph.is_empty();
@@ -8883,7 +10567,9 @@ impl CoordinatorAgent {
     /// compiled scheduler is gone: when the planning dispatch session's
     /// provider fails with a provider-class error (HTTP status, auth,
     /// capability refusal, or a throttle/transient-5xx-caused retry exhaustion
-    /// — never cancellation or a structural error), the Coordinator retries
+    /// — never cancellation or a structural error), the Coordinator HOLDs the
+    /// rung on a throttled exhaustion that preserved a `Retry-After` (retry
+    /// the SAME provider after its cooldown, no demotion), otherwise retries
     /// `decompose_task` on the run's fallback pipes (ADR-45 tier-1b pipe; then
     /// the next capable alternate on a 404 model-not-found fallback failure,
     /// up to [`MAX_FALLBACK_ATTEMPTS`] total) and records each attempt as an
@@ -8892,13 +10578,13 @@ impl CoordinatorAgent {
     /// because the retried `run_dispatch_session` increments it per turn.
     ///
     /// The retry is skipped — straight to a graceful `Partial` — when
-    /// cancellation/structural errors surface, the run already consumed its
-    /// one recovery, the tier-1b gate is disabled, no fallback provider is
-    /// configured, or the fallback resolves to the same (provider, model) as
-    /// the failed planning provider (a permanent 400 would just repeat). The
-    /// ORIGINAL error always drives the caller's Partial exit; failure of the
-    /// fallback retry is surfaced through `planning_recovery_note`, never as
-    /// a hard crash.
+    /// cancellation/structural errors surface, the run spent its bounded
+    /// recovery budget ([`MAX_PLANNING_RECOVERY_ROUNDS`]), the tier-1b gate is
+    /// disabled, no fallback provider is configured, or the fallback resolves
+    /// to the same (provider, model) as the failed planning provider (a
+    /// permanent 400 would just repeat). The ORIGINAL error always drives the
+    /// caller's Partial exit; failure of the fallback retry is surfaced
+    /// through `planning_recovery_note`, never as a hard crash.
     async fn attempt_planning_provider_recovery(
         &mut self,
         task: &AgentTask,
@@ -8910,6 +10596,13 @@ impl CoordinatorAgent {
         // misrouted cancellation/structural failure must not be swallowed
         // into a retry (immediate-exit semantics, ADR-42 NonRecoverable).
         if is_cancellation_error(original_error) {
+            return PlanningRecoveryOutcome::Exhausted;
+        }
+        // Nested re-entry: the retried `decompose_task` failed and called back
+        // in. The outer recovery round owns the decision — never start a
+        // second, concurrent recovery (the re-entrancy guard that replaces the
+        // historical once-per-run latch's recursion-stopping duty).
+        if self.planning_recovery_in_progress {
             return PlanningRecoveryOutcome::Exhausted;
         }
         // Recoverable provider failures: any surfaced HTTP status (permanent
@@ -8934,13 +10627,63 @@ impl CoordinatorAgent {
         if !recoverable {
             return PlanningRecoveryOutcome::Exhausted;
         }
-        // The Decision reason must distinguish the throttle-exhausted cause
-        // from the ordinary provider-failure path (an operator reading the
-        // whiteboard can tell *why* recovery fired).
+        if self.planning_recovery_rounds >= MAX_PLANNING_RECOVERY_ROUNDS {
+            self.planning_recovery_note = Some(format!(
+                "planning recovery budget spent ({MAX_PLANNING_RECOVERY_ROUNDS} rounds this run)"
+            ));
+            return PlanningRecoveryOutcome::Exhausted;
+        }
+        self.planning_recovery_rounds += 1;
+        self.planning_recovery_in_progress = true;
+        let outcome = self.recover_planning_rung(task, context, cancel, original_error).await;
+        self.planning_recovery_in_progress = false;
+        outcome
+    }
+
+    /// The bounded body of ONE planning-recovery round.
+    ///
+    /// Owner doctrine, option (b): when the planning provider exhausted its
+    /// retries on THROTTLING and preserved a known `Retry-After`, HOLD the rung
+    /// — wait out the cooldown (cancellably, capped at [`MAX_PLANNING_HOLD`])
+    /// and retry the SAME provider. A held rung that recovers stays the primary
+    /// pipe (no swap, no demotion). Only terminal classes (auth, 404/model-not-
+    /// found, malformed request, capability refusal) and a rung without a
+    /// cooldown hint go straight to the existing fallback behaviour. A hold that
+    /// fails afterwards bridges to a fallback provider as a BRIDGE (not a
+    /// demotion), with the trail naming the bridge.
+    async fn recover_planning_rung(
+        &mut self,
+        task: &AgentTask,
+        context: &AgentContext,
+        cancel: &CancellationToken,
+        original_error: &OrchestratorError,
+    ) -> PlanningRecoveryOutcome {
+        // Field names stay in sync: `recoverable` was checked by the caller.
+        // Extraction stays on the error, never a global.
         let throttle_exhausted = matches!(
             original_error,
             OrchestratorError::Provider(error) if error.is_throttle_exhaustion()
         );
+        let mut bridged = false;
+        if throttle_exhausted {
+            let retry_after = match original_error {
+                OrchestratorError::Provider(error) => error.retry_after_hint(),
+                _ => None,
+            };
+            if let Some(retry_after) = retry_after {
+                // A hold is attempted: any fallback that follows is a BRIDGE,
+                // not an abandonment of the rung.
+                bridged = true;
+                if let Some(recovered) =
+                    self.hold_rung_and_retry(task, context, cancel, retry_after).await
+                {
+                    return PlanningRecoveryOutcome::Recovered(recovered);
+                }
+            }
+        }
+        // The Decision reason must distinguish the throttle-exhausted cause
+        // from the ordinary provider-failure path (an operator reading the
+        // whiteboard can tell *why* recovery fired).
         let (tag_prefix, decision_output) = if throttle_exhausted {
             (
                 "planning-provider-recovery-throttle-exhausted",
@@ -8955,8 +10698,113 @@ impl CoordinatorAgent {
                  (ADR-45 tier-1b fallback) after the planning provider failed",
             )
         };
-        self.retry_planning_on_default_model(task, context, cancel, tag_prefix, decision_output)
-            .await
+        self.retry_planning_on_default_model_inner(
+            task,
+            context,
+            cancel,
+            tag_prefix,
+            decision_output,
+            bridged,
+        )
+        .await
+    }
+
+    /// HOLD a throttled planning rung: wait out the provider's own
+    /// `Retry-After` (capped at [`MAX_PLANNING_HOLD`]) with cancellation, then
+    /// retry the SAME planning provider. `Some(recovered)` when the rung
+    /// recovers — it stays the primary pipe, nothing was demoted; `None` when
+    /// the wait was cancelled or the rung still failed, so the caller bridges.
+    async fn hold_rung_and_retry(
+        &mut self,
+        task: &AgentTask,
+        context: &AgentContext,
+        cancel: &CancellationToken,
+        first_retry_after: std::time::Duration,
+    ) -> Option<Box<(TaskGraph, Option<PlanArtifact>, DispatchLedger, String)>> {
+        let mut retry_after = first_retry_after;
+        loop {
+            if self.planning_hold_rounds >= MAX_PLANNING_HOLDS {
+                self.planning_recovery_note = Some(format!(
+                    "planning hold budget spent ({MAX_PLANNING_HOLDS} holds this run); \
+                     bridging to a fallback pipe instead of waiting again"
+                ));
+                return None;
+            }
+            self.planning_hold_rounds += 1;
+            let hold = retry_after.min(MAX_PLANNING_HOLD);
+            self.append_planning_recovery_decision(
+                task,
+                "planning-provider-hold",
+                &format!(
+                    "Hold the planning rung: the provider exhausted its retries on throttling and \
+                     asked to wait {retry_after:?}. Waiting {hold:?} (cap {MAX_PLANNING_HOLD:?}), \
+                     then retrying the SAME provider — not abandoning it — before any bridge or \
+                     fallback"
+                ),
+            )
+            .await;
+            tokio::select! {
+                _ = tokio::time::sleep(hold) => {}
+                _ = cancel.cancelled() => {
+                    self.planning_recovery_note =
+                        Some("planning rung hold cancelled".to_owned());
+                    return None;
+                }
+            }
+            if cancel.is_cancelled() {
+                self.planning_recovery_note = Some("planning rung hold cancelled".to_owned());
+                return None;
+            }
+            // The hold retry is a real model dispatch (ADR-52): count it.
+            self.model_dispatch_count = self.model_dispatch_count.saturating_add(1);
+            // Retry the SAME provider/profile: no swap, no demotion. Nested
+            // failures observe `planning_recovery_in_progress` and return
+            // Exhausted instead of recursing.
+            let this = &mut *self;
+            let retried =
+                Box::pin(async move { this.decompose_task(task, context, cancel).await }).await;
+            match retried {
+                Ok((graph, advisory_plan, ledger, summary)) => {
+                    self.append_planning_recovery_decision(
+                        task,
+                        "planning-provider-hold-recovered",
+                        "The held planning rung recovered on the SAME provider after its \
+                         cooldown; it remains the primary pipe (no bridge, no demotion)",
+                    )
+                    .await;
+                    return Some(Box::new((graph, advisory_plan, ledger, summary)));
+                }
+                Err(error) => {
+                    // Still throttled AND still within the hold budget: wait
+                    // out this cooldown too before ever bridging.
+                    let next_hint = match &error {
+                        OrchestratorError::Provider(provider_error)
+                            if provider_error.is_throttle_exhaustion() =>
+                        {
+                            provider_error.retry_after_hint()
+                        }
+                        _ => None,
+                    };
+                    if let Some(next_hint) = next_hint {
+                        retry_after = next_hint;
+                        continue;
+                    }
+                    self.planning_recovery_note = Some(format!(
+                        "the held planning rung still failed after its cooldown: {error}"
+                    ));
+                    self.append_planning_recovery_decision(
+                        task,
+                        "planning-provider-hold-failed-bridging",
+                        &format!(
+                            "The held planning rung still failed after its cooldown ({error}); \
+                             bridging to a fallback provider as a BRIDGE, not abandoning the run"
+                        ),
+                    )
+                    .await;
+                    return None;
+                }
+            }
+        }
     }
 
     /// Coordinator-owned recovery for a prose-only, zero-dispatch planning
@@ -8989,31 +10837,12 @@ impl CoordinatorAgent {
         .await
     }
 
-    /// Shared tail of the coordinator-owned planning recovery (ADR-45
-    /// tier-1b): resolve the fallback pipe, record the attempt (or skip) as an
-    /// ADR-65 `Decision` event, retry `decompose_task` on the fallback, and
-    /// restore the original planning pipe/profile regardless of the outcome.
-    ///
-    /// `tag_prefix` seeds every `Decision` reason tag (`{tag}-attempted`,
-    /// `{tag}-failed`, `{tag}-exhausted`, `{tag}-skipped-disabled`,
-    /// `{tag}-skipped-unavailable`, `{tag}-skipped-degenerate`);
-    /// `decision_output` is the `required_output` the Decision event records
-    /// for the retry. Shared by the provider-failure recovery
-    /// ([`Self::attempt_planning_provider_recovery`]) and the prose-only
-    /// zero-dispatch recovery ([`Self::attempt_prose_only_planning_recovery`]).
-    ///
-    /// The first retry enters as ONE recovery per run (the run-scoped
-    /// `planning_recovery_attempted` latch also stops the nested retry from
-    /// re-entering). From there, a fallback failure that is a model-not-found
-    /// (HTTP 404) advances to the NEXT capable alternate pipe, bounded to
-    /// [`MAX_FALLBACK_ATTEMPTS`] total attempts and never repeating a pipe.
-    /// Other failure classes keep the historical single-attempt semantics.
-    /// The retry is skipped — the caller's graceful `Partial` stands — when
-    /// the run already consumed its recovery, the tier-1b gate is disabled, no
-    /// fallback provider is configured, or the fallback resolves to the same
-    /// (provider, model) as the current planning provider (the failure would
-    /// just repeat). Failure of the fallback retry is surfaced through
-    /// `planning_recovery_note`, never as a hard crash.
+    /// Enter a fallback bridge as ONE bounded recovery round: guard against
+    /// re-entry, spend a round from the run budget, and run the shared bridge
+    /// tail. Used by the prose-only zero-dispatch recovery
+    /// ([`Self::attempt_prose_only_planning_recovery`]); the provider-failure
+    /// path enters the bridge tail directly from
+    /// [`Self::recover_planning_rung`] (which already owns the round).
     async fn retry_planning_on_default_model(
         &mut self,
         task: &AgentTask,
@@ -9022,15 +10851,63 @@ impl CoordinatorAgent {
         tag_prefix: &str,
         decision_output: &str,
     ) -> PlanningRecoveryOutcome {
-        if self.planning_recovery_attempted {
-            self.planning_recovery_note =
-                Some("planning recovery was already attempted or skipped this run".to_owned());
+        if self.planning_recovery_in_progress {
+            self.planning_recovery_note = Some("planning recovery re-entry suppressed".to_owned());
             return PlanningRecoveryOutcome::Exhausted;
         }
-        // Once this run's recovery slot is decided (attempted or skipped) it
-        // is spent — a replan follow-up cannot re-enter recovery.
-        self.planning_recovery_attempted = true;
+        if self.planning_recovery_rounds >= MAX_PLANNING_RECOVERY_ROUNDS {
+            self.planning_recovery_note = Some(format!(
+                "planning recovery budget spent ({MAX_PLANNING_RECOVERY_ROUNDS} rounds this run)"
+            ));
+            return PlanningRecoveryOutcome::Exhausted;
+        }
+        self.planning_recovery_rounds += 1;
+        self.planning_recovery_in_progress = true;
+        let outcome = self
+            .retry_planning_on_default_model_inner(
+                task,
+                context,
+                cancel,
+                tag_prefix,
+                decision_output,
+                false,
+            )
+            .await;
+        self.planning_recovery_in_progress = false;
+        outcome
+    }
 
+    /// Shared tail of the coordinator-owned planning recovery (ADR-45
+    /// tier-1b): resolve the fallback pipe, record the attempt (or skip) as an
+    /// ADR-65 `Decision` event, retry `decompose_task` on the fallback, and
+    /// restore the original planning pipe/profile regardless of the outcome.
+    ///
+    /// `tag_prefix` seeds every `Decision` reason tag (`{tag}-attempted`,
+    /// `{tag}-failed`, `{tag}-exhausted`, `{tag}-skipped-disabled`,
+    /// `{tag}-skipped-unavailable`, `{tag}-skipped-degenerate`, plus
+    /// `{tag}-bridged-recovered`/`{tag}-abandoned` when `bridged`); the run's
+    /// bounded recovery round is already spent by the caller. `bridged` is
+    /// `true` when this bridge follows a FAILED hold of the throttled rung —
+    /// it distinguishes "bridged and recovered" from "abandoned" in the trail.
+    ///
+    /// A fallback failure that is a model-not-found (HTTP 404) advances to the
+    /// NEXT capable alternate pipe, bounded to [`MAX_FALLBACK_ATTEMPTS`] total
+    /// attempts and never repeating a pipe. Other failure classes keep the
+    /// historical single-attempt semantics. The retry is skipped — the
+    /// caller's graceful `Partial` stands — when the tier-1b gate is disabled,
+    /// no fallback provider is configured, or the fallback resolves to the same
+    /// (provider, model) as the current planning provider (the failure would
+    /// just repeat). Failure of the fallback retry is surfaced through
+    /// `planning_recovery_note`, never as a hard crash.
+    async fn retry_planning_on_default_model_inner(
+        &mut self,
+        task: &AgentTask,
+        context: &AgentContext,
+        cancel: &CancellationToken,
+        tag_prefix: &str,
+        decision_output: &str,
+        bridged: bool,
+    ) -> PlanningRecoveryOutcome {
         // ADR-45 §4 user gate: tier-1b default-model re-dispatch disabled.
         if !self.default_model_fallback {
             self.planning_recovery_note =
@@ -9108,9 +10985,9 @@ impl CoordinatorAgent {
             // exit below restores before returning. The swap re-enters
             // `decompose_task` through this shared helper (self-recursion), so
             // the inner call is boxed to keep the future sized (E0733); the
-            // cycle terminates because the prose-only guard inside the retried
-            // `decompose_task` observes `planning_recovery_attempted` and
-            // returns Exhausted instead of re-entering recovery.
+            // cycle terminates because the nested call observes
+            // `planning_recovery_in_progress` and returns Exhausted instead of
+            // re-entering recovery.
             let original_provider =
                 std::mem::replace(&mut self.planning_provider, fallback_provider);
             let original_profile = self.planning_profile.replace(fallback_profile.clone());
@@ -9128,6 +11005,15 @@ impl CoordinatorAgent {
                         task_id = %task.id,
                         "coordinator planning recovery succeeded on the default-model provider"
                     );
+                    if bridged {
+                        self.append_planning_recovery_decision(
+                            task,
+                            &format!("{tag_prefix}-bridged-recovered"),
+                            "The fallback provider carried the planning session as a BRIDGE \
+                             after the held rung failed; the run recovered on the bridge",
+                        )
+                        .await;
+                    }
                     return PlanningRecoveryOutcome::Recovered(Box::new((
                         graph,
                         advisory_plan,
@@ -9160,6 +11046,15 @@ impl CoordinatorAgent {
                     self.planning_recovery_note = Some(format!(
                         "fallback planning-provider retry also failed: {second_error}"
                     ));
+                    self.append_planning_recovery_decision(
+                        task,
+                        &format!("{tag_prefix}-abandoned"),
+                        &format!(
+                            "The fallback provider also failed; the rung is abandoned and the \
+                             run pauses with a Partial outcome ({second_error})"
+                        ),
+                    )
+                    .await;
                     tracing::warn!(
                         error = %second_error,
                         "coordinator planning recovery exhausted: the fallback provider also failed"
@@ -9386,9 +11281,9 @@ impl CoordinatorAgent {
         // recovery slot already spent. The SAME ADR-45 tier-1b ladder
         // applies: retry the planning session ONCE on the run's
         // default-model provider, recording the attempt as an ADR-65
-        // `Decision` event. The recovery is once-per-run, so the nested
-        // retry's own prose-only stop is skipped via
-        // `planning_recovery_attempted` — never deeper than one level.
+        // `Decision` event. The recovery is re-entrancy guarded and bounded, so
+        // the nested retry's own prose-only stop is suppressed via
+        // `planning_recovery_in_progress` — never deeper than one level.
         let prose_only_stop = self.orchestration_depth != OrchestrationDepth::PlanningOnly
             && matches!(task.execution_mode, TaskExecutionMode::ActionRequired { .. })
             && graph.is_empty();
@@ -9444,7 +11339,8 @@ impl CoordinatorAgent {
     /// structural iteration bound. Every iteration is a model dispatch and
     /// counts toward the ADR-52 run-wide doom guard.
     ///
-    /// `PlanningOnly` depth (ADR-55 Phase 2b) offers NO tools: the single
+    /// `PlanningOnly` depth (ADR-55 archived Phase 2b §1) offers NO tools:
+    /// the single
     /// planning response IS the plan — advisory prose, nothing is
     /// dispatched, no tools are touched (M1).
     ///
@@ -9463,6 +11359,15 @@ impl CoordinatorAgent {
         design_role: Option<&AgentId>,
         intro: &str,
     ) -> Result<(String, Option<PlanArtifact>), OrchestratorError> {
+        // Run-history audit: the session's scope run id IS the run in scope
+        // from here on. Stamping it at session entry — rather than at each
+        // scope-creation site — gives every decision session (fresh
+        // decompose, evidence re-entry, resume-drive) the id its
+        // mid-session `RunInterruptedByUser` and its in-session dispatch
+        // evidence are reported under: `execute_graph` stamps its own id
+        // only at Phase 2, so without this a fresh run stopped during
+        // planning would have no run to name.
+        self.run_id = Some(scope.run_id.to_string());
         let dispatching = self.orchestration_depth != OrchestrationDepth::PlanningOnly;
         // Issue #56: rebuild the world model BEFORE the decision prompt is
         // rendered so the injected block reflects the state the decisions
@@ -9470,6 +11375,14 @@ impl CoordinatorAgent {
         self.refresh_world_model(task, &[], Vec::new(), cancel).await;
         let system_prompt =
             self.render_dispatch_system_prompt(task, intro, dispatching, state, ledger);
+        // Thread the dispatch prompt through the shared `PromptBuilder` seam:
+        // the working-memory block (retrieved chunks + active run state) rides
+        // the prompt under the same ADR-048 stable-head/volatile-tail
+        // discipline as the single-agent loop, and the prompt is emitted as
+        // the single `Role::System` message the adapters expect.
+        let working_memory_block = self.dispatch_working_memory_block(base_ctx);
+        let system_message =
+            self.build_dispatch_system_message(system_prompt, &working_memory_block);
         let mut tool_defs: Vec<ToolDefinition> = Vec::new();
         if dispatching {
             tool_defs.push(call_specialist_tool_definition());
@@ -9491,6 +11404,9 @@ impl CoordinatorAgent {
             // ADR-35 amendment (2026-09-16 §2): the human-input request
             // surface — stops the run AwaitingUser for the operator's answer.
             tool_defs.push(request_user_input_tool_definition());
+            // C-06 evidence kind (3): the explicit, recorded declaration that
+            // no separate verification is required for this objective.
+            tool_defs.push(declare_verification_exempt_tool_definition());
             // Issue #64: the reconsideration surface — supersede a decision
             // and freeze only its affected pending tasks.
             tool_defs.push(reconsider_tool_definition());
@@ -9515,15 +11431,7 @@ impl CoordinatorAgent {
         };
         let model = profile.model_name().to_string();
 
-        let mut messages = vec![Message {
-            role: Role::User,
-            content: system_prompt,
-            tool_calls: None,
-            tool_results: None,
-            reasoning_content: None,
-            tokens_in: None,
-            tokens_out: None,
-        }];
+        let mut messages = vec![system_message];
         // ── Issue #63: resume one-shot WAIT re-evaluation ────────────────
         // A checkpoint-restored in-flight wait is NEVER re-entered into the
         // park loop; instead it is re-evaluated exactly once against the
@@ -9873,6 +11781,16 @@ impl CoordinatorAgent {
                     REQUEST_USER_INPUT_TOOL if dispatching => {
                         self.handle_request_user_input(&tool_call.arguments).await
                     }
+                    // C-06 evidence kind (3): the explicit, recorded
+                    // declaration that no separate verification pass is
+                    // required for this objective. Dispatches nothing and
+                    // touches no tools; the reason is recorded durably (audit
+                    // + whiteboard) so the completion gate can consume it as
+                    // evidence and the decision is visible after the fact.
+                    DECLARE_VERIFICATION_EXEMPT_TOOL if dispatching => {
+                        self.handle_declare_no_verification(task.session_id, &tool_call.arguments)
+                            .await
+                    }
                     // Issue #64: the explicit reconsideration surface — the
                     // model supersedes a decision and freezes ONLY its
                     // affected pending tasks (a deterministic transform,
@@ -10112,29 +12030,32 @@ impl CoordinatorAgent {
         Ok((summary, advisory_plan))
     }
 
-    /// ADR-35 same-role dispatch cap — an ADVISORY guard beside the
-    /// vacuous-completion and zero-work guards.
+    /// Same-role dispatch cap — the bound on the repeat-dispatch path beside
+    /// the vacuous-completion and zero-work guards.
     ///
     /// The decision loop tracks, in memory for one objective, how many
-    /// consecutive dispatches have settled against the same role without any
-    /// implement/code artifact landing. At
-    /// [`MAX_CONSECUTIVE_SAME_ROLE_DISPATCHES`] it fires and pushes a ledger
-    /// note (which downgrades the run exit to `Partial` and keeps the resume
-    /// checkpoint — never a silent `Completed`), plus, while nudge budget
-    /// remains, an advisory nudge in the tool result.
+    /// consecutive dispatches have settled against the same role without the
+    /// objective's expected deliverable. At
+    /// [`MAX_CONSECUTIVE_SAME_ROLE_DISPATCHES`] it records the loop evidence
+    /// ONCE (a ledger note, which downgrades the run exit to `Partial` and
+    /// keeps the resume checkpoint — never a silent `Completed`) and marks the
+    /// role as capped. The NEXT `call_specialist` naming that role is not
+    /// re-dispatched: `handle_call_specialist` escalates it through the agent
+    /// axis (same-stage peer, then a `can_cover` agent) or, when none exists,
+    /// surfaces the user-input decision point.
     ///
-    /// It NEVER forces a target role and NEVER escalates the run itself: the
-    /// nudge only recommends considering a different role, and re-dispatching
-    /// the same role stays the Coordinator's decision (ADR-35: no compiled
-    /// dispatch policy, no state forcing). A code artifact on the ledger
-    /// resets the streak: a run making real implement progress is never
-    /// flagged by the cap.
+    /// Fit-for-purpose deliverable: a code-edit objective judges a dispatch on
+    /// a code artifact; any other objective judges it on a file change (a
+    /// rename is a file deliverable even though its extension is not code) and
+    /// an inspect/design/research objective that owes no file is judged on
+    /// repetition alone. This is why a rename never trips the code-artifact
+    /// wording, while a real implement circle still does.
     ///
-    /// It also YIELDS to the #53 progress guard: once that guard is engaged
+    /// It YIELDS to the #53 progress guard: once that guard is engaged
     /// (`progress_guard_engaged` — equivalent cycles accumulating or any
     /// reconsideration already emitted), it owns the repetition and the cap
-    /// stays silent. The cap only catches the same-role circles the progress
-    /// guard sees as *progressing*, which is exactly the production failure.
+    /// stays silent.
+    #[allow(clippy::too_many_arguments)]
     fn apply_same_role_dispatch_cap(
         &mut self,
         state: &mut DispatchSessionState,
@@ -10142,13 +12063,22 @@ impl CoordinatorAgent {
         subtask_id: TaskId,
         session_id: Ulid,
         progress_guard_engaged: bool,
+        expects_code_artifact: bool,
         ledger: &mut DispatchLedger,
     ) -> Option<serde_json::Value> {
-        let produced_code = ledger.all_files.iter().any(|path| is_code_artifact_path(path));
-        if produced_code {
-            // Implement progress: the role is not circling. Reset the streak.
+        // A settled dispatch is productive when it produced the deliverable
+        // the objective expected: a code artifact for code-edit work, any
+        // file change otherwise. The expectation is derived from the
+        // objective/subtask, never assumed.
+        let produced_deliverable = if expects_code_artifact {
+            ledger.all_files.iter().any(|path| is_code_artifact_path(path))
+        } else {
+            !ledger.all_files.is_empty()
+        };
+        if produced_deliverable {
             state.last_role = Some(agent_id.clone());
             state.consecutive_role_count = 1;
+            state.capped_role = None;
             return None;
         }
         if state.last_role.as_ref() == Some(agent_id) {
@@ -10156,6 +12086,7 @@ impl CoordinatorAgent {
         } else {
             state.last_role = Some(agent_id.clone());
             state.consecutive_role_count = 1;
+            state.capped_role = None;
             return None;
         }
         if state.consecutive_role_count < MAX_CONSECUTIVE_SAME_ROLE_DISPATCHES {
@@ -10165,22 +12096,22 @@ impl CoordinatorAgent {
             // The #53 progress guard owns repetition stalls; yield to it.
             return None;
         }
+        if state.capped_role.as_ref() == Some(agent_id) {
+            // The episode is already recorded. Never repeat the note.
+            return Some(serde_json::json!({ "same_role_guard": "cap_reached" }));
+        }
 
+        state.capped_role = Some(agent_id.clone());
         let count = state.consecutive_role_count;
-        // A binding DesignDoc is the one cheap signal that implement work is
-        // the legitimate next step, so the guard may nudge toward it.
-        let design_binds =
-            state.doc_verdict.as_ref().is_some_and(|verdict| verdict.state.is_active());
-        let can_nudge = design_binds && state.role_guard_nudges < MAX_SAME_ROLE_GUARD_NUDGES;
         let note = format!(
-            "Same-role dispatch guard (advisory): specialist {agent_id} settled {count} \
-             consecutive dispatches on this objective with no implement/code artifact produced. \
-             {}. The Coordinator decides the next step — re-dispatching {agent_id} is permitted, \
-             but a different implement-stage role (or requesting user input) is recommended.",
-            if design_binds {
-                "A verified DesignDoc binds, so implement work is the recommended next step"
+            "Same-role dispatch cap: specialist {agent_id} settled {count} consecutive \
+             dispatches on this objective without producing {}. The next dispatch naming \
+             {agent_id} is not re-dispatched: it escalates to a different registered \
+             specialist that can cover the work, or pauses for operator input when none exists.",
+            if expects_code_artifact {
+                "the expected code artifact"
             } else {
-                "No binding DesignDoc is attached, so the objective may be design-only"
+                "the expected file change"
             }
         );
         let _ = self.bus.publish_for_session(
@@ -10192,34 +12123,8 @@ impl CoordinatorAgent {
                 kind: ThinkingKind::Detail,
             },
         );
-        ledger.notes.push(note);
-
-        if can_nudge {
-            state.role_guard_nudges += 1;
-            let nudge = format!(
-                "Same-role dispatch guard (advisory): you have dispatched {agent_id} {count} \
-                 times consecutively without any implement/code artifact. Consider dispatching \
-                 a different implement-stage specialist next; re-dispatching {agent_id} remains \
-                 your decision."
-            );
-            let _ = self.bus.publish_for_session(
-                session_id,
-                subtask_id.0,
-                EventKind::AgentThought {
-                    agent_id: "coordinator".into(),
-                    content: nudge.clone(),
-                    kind: ThinkingKind::Detail,
-                },
-            );
-            return Some(serde_json::json!({
-                "same_role_guard": "advisory",
-                "nudge": nudge,
-            }));
-        }
-
-        // Nudge budget exhausted (or no binding design): the ledger note above
-        // already carries the loop evidence; no state is forced.
-        Some(serde_json::json!({ "same_role_guard": "advisory" }))
+        ledger.notes.push(note.clone());
+        Some(serde_json::json!({ "same_role_guard": "cap_reached", "message": note }))
     }
 
     /// Handle ONE `call_specialist` tool call (ADR-35 amendment 2026-09-05):
@@ -10251,6 +12156,143 @@ impl CoordinatorAgent {
             });
         };
 
+        // ── Same-role repeat cap: escalate before any further dispatch ──
+        // The requested role already reached the consecutive-dispatch cap on
+        // this objective. Do NOT re-dispatch it: escalate through the agent
+        // axis (a different registered specialist that can cover the work) or,
+        // when none exists, surface the existing user-input decision point.
+        // This is escalation to a specialist or to the operator — never a
+        // reason for the coordinator to self-execute while a specialist
+        // remains (ADR-74).
+        let requested_agent = AgentId::new(&args.agent_id);
+        let effective_agent: AgentId = if state.capped_role.as_ref() == Some(&requested_agent) {
+            match self.takeover_candidate_for_capped_role(&requested_agent, &state.escalated_roles)
+            {
+                Some(candidate) => {
+                    state.escalated_roles.insert(requested_agent.clone());
+                    state.capped_role = None;
+                    state.last_role = Some(candidate.clone());
+                    state.consecutive_role_count = 1;
+                    let note = format!(
+                        "Same-role dispatch cap escalation: {requested_agent} reached the \
+                         consecutive-dispatch cap on this objective; the requested re-dispatch \
+                         was re-targeted to {candidate}, a different registered specialist that \
+                         can cover the same work. No coordinator self-execution is involved."
+                    );
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        task.id.0,
+                        EventKind::AgentThought {
+                            agent_id: "coordinator".into(),
+                            content: note.clone(),
+                            kind: ThinkingKind::Detail,
+                        },
+                    );
+                    ledger.notes.push(note);
+                    candidate
+                }
+                None => {
+                    let reason = format!(
+                        "Same-role dispatch cap: {requested_agent} reached the \
+                         consecutive-dispatch cap on this objective and no different registered \
+                         specialist can cover its stage. The run pauses for your decision: add \
+                         or enable a specialist that can take this work, or confirm the \
+                         objective is complete."
+                    );
+                    state.capped_role = None;
+                    self.requested_user_input = Some(reason.clone());
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        task.id.0,
+                        EventKind::AgentThought {
+                            agent_id: "coordinator".into(),
+                            content: reason.clone(),
+                            kind: ThinkingKind::Detail,
+                        },
+                    );
+                    ledger.notes.push(reason.clone());
+                    return serde_json::json!({
+                        "status": "awaiting_human_input",
+                        "same_role_guard": "cap_reached",
+                        "message": reason,
+                    });
+                }
+            }
+        } else {
+            requested_agent.clone()
+        };
+
+        // ── Duplicate-dispatch guard (pre-validator: no state mutation) ──
+        // After a provably impossible ACTION (a non-retryable tool-level
+        // diagnosis), re-dispatching a near copy of the failed work with no
+        // corrective delta is the model re-issuing that impossible action one
+        // level up. Refuse it HERE — before the decision journal, the policy
+        // gate and the graph materialization — as a structured tool error the
+        // model can act on: add corrective notes, target a different
+        // specialist, or change the action.
+        if let Some(reason) =
+            duplicate_dispatch_reason(graph, &self.failure_diagnoses, &effective_agent, &args)
+        {
+            warn!(
+                agent = %effective_agent,
+                "call_specialist refused as a duplicate dispatch (structured error, no \
+                 state mutation)"
+            );
+            let _ = self.bus.publish_for_session(
+                task.session_id,
+                task.id.0,
+                EventKind::AgentThought {
+                    agent_id: "coordinator".into(),
+                    content: reason.clone(),
+                    kind: ThinkingKind::Detail,
+                },
+            );
+            ledger.notes.push(reason.clone());
+            return serde_json::json!({
+                "error": "duplicate_dispatch",
+                "message": reason,
+            });
+        }
+
+        // ── Source-existence preflight (coordinator error invariant) ─────
+        // An objective that TRANSFORMS a named existing artifact (rename /
+        // move / edit) is only meaningful when that artifact exists. When it
+        // does not, dispatching invites the specialist to fabricate the
+        // source to satisfy the operation — the run reports the discrepancy
+        // instead, through the existing user-input path, naming the exact
+        // path it looked for. Pre-validator: nothing is journaled, gated or
+        // materialized, and any parse the preflight cannot pin down as ONE
+        // concrete source path fails OPEN, so a legitimate dispatch is never
+        // blocked by ambiguous wording.
+        let project_root =
+            camino::Utf8PathBuf::from_path_buf(base_ctx.session.project_dir.clone()).ok();
+        if let Some(reason) = project_root
+            .as_deref()
+            .and_then(|root| missing_source_preflight_reason(&args.task, root))
+        {
+            warn!(
+                agent = %effective_agent,
+                "call_specialist refused: the objective's named source path does not exist \
+                 (no dispatch; surfaced to user input)"
+            );
+            let _ = self.bus.publish_for_session(
+                task.session_id,
+                task.id.0,
+                EventKind::AgentThought {
+                    agent_id: "coordinator".into(),
+                    content: reason.clone(),
+                    kind: ThinkingKind::Detail,
+                },
+            );
+            ledger.notes.push(reason.clone());
+            self.requested_user_input = Some(reason.clone());
+            return serde_json::json!({
+                "error": "missing_source",
+                "status": "awaiting_human_input",
+                "message": reason,
+            });
+        }
+
         // ── Issue #52: validate the decision BEFORE any mutation ────────
         // The model output is a proposition, not an instruction. Evidence
         // existence is the real whiteboard-row check (dispatch-time, not
@@ -10269,7 +12311,7 @@ impl CoordinatorAgent {
         };
         let decision = match validator.validate(
             crate::decisions::DecisionKind::DispatchSpecialist,
-            Some(&args.agent_id),
+            Some(effective_agent.as_str()),
             &args.task,
             args.notes.as_deref(),
             &cited_ids,
@@ -10279,7 +12321,7 @@ impl CoordinatorAgent {
             Err(rejection) => {
                 warn!(
                     code = %rejection.code,
-                    agent = %args.agent_id,
+                    agent = %effective_agent,
                     "call_specialist rejected an invalid Coordinator decision (structured \
                      error, no state mutation)"
                 );
@@ -10287,6 +12329,10 @@ impl CoordinatorAgent {
             }
         };
         let decision_id = decision.id.clone();
+        // Mint the subtask id BEFORE the policy gate: every dispatch outcome
+        // below — including a denial that never materializes a graph node —
+        // correlates to this decision under one id in the run history.
+        let subtask_id = TaskId::new();
         // Issue #60: the deterministic task class for the suitability
         // record — derived from the task text + expected artifacts (never
         // model-judged), attributed to the REQUESTED specialist.
@@ -10334,7 +12380,7 @@ impl CoordinatorAgent {
             }
         }
 
-        let agent_id = AgentId::new(&args.agent_id);
+        let agent_id = effective_agent;
         let Some(agent) = self.registry.get(&agent_id) else {
             // Structural re-check (the roster can only shrink via
             // configuration): unreachable through the validator — fail
@@ -10365,6 +12411,7 @@ impl CoordinatorAgent {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: true,
+            path_facts: None,
         };
         match policy.evaluate(&action, cancel.clone()).await {
             Ok(PolicyVerdict::Allow) => {}
@@ -10384,6 +12431,15 @@ impl CoordinatorAgent {
                     suitability_now,
                     0,
                 );
+                // Run-history audit: never reached a specialist.
+                self.publish_dispatch_outcome(
+                    scope,
+                    subtask_id,
+                    &agent_id,
+                    false,
+                    "policy-denied",
+                    None,
+                );
                 return serde_json::json!({
                     "error": "policy_denied",
                     "message": "the run's policy denied this specialist dispatch",
@@ -10393,6 +12449,16 @@ impl CoordinatorAgent {
                 if matches!(error, concerto_core::error::PolicyError::Cancelled)
                     || cancel.is_cancelled()
                 {
+                    // Run-history audit: the stop landed before any
+                    // specialist call — an interrupt, not a failure.
+                    self.publish_dispatch_outcome(
+                        scope,
+                        subtask_id,
+                        &agent_id,
+                        false,
+                        "cancelled",
+                        Some(Self::cancelled_dispatch_reason(cancel, &error)),
+                    );
                     return serde_json::json!({ "error": "cancelled" });
                 }
                 self.suitability.record(
@@ -10402,6 +12468,16 @@ impl CoordinatorAgent {
                     None,
                     suitability_now,
                     0,
+                );
+                // Run-history audit: never reached a specialist; the reason
+                // carries the policy error text (sanitized on publish).
+                self.publish_dispatch_outcome(
+                    scope,
+                    subtask_id,
+                    &agent_id,
+                    false,
+                    "policy-denied",
+                    Some(error.to_string()),
                 );
                 return serde_json::json!({
                     "error": "policy_denied",
@@ -10413,7 +12489,6 @@ impl CoordinatorAgent {
         // ── Evidence-backed Decision event (ADR-65 §6/§7) ──────────────────
         let reason = args.notes.clone().unwrap_or_else(|| "coordinator_choice".to_owned());
         let description = specialist_task_description(&args.task, args.notes.as_deref());
-        let subtask_id = TaskId::new();
         self.append_dispatch_decision(
             task.session_id,
             &agent_id,
@@ -10479,10 +12554,13 @@ impl CoordinatorAgent {
             agent.stage().as_ref().is_some_and(|stage| stage.as_str() == implement_tag);
         if is_implement_role {
             if let Some(doc) = expected_artifact_doc(state) {
-                self.expected_artifacts
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .insert(subtask_id, doc.proposed_files.clone());
+                // Declaration boundary: `proposed_files` may hold
+                // `"<path>: <description>"` prose; store the PATHS so C-06
+                // verifies the delivered files (see `declared_artifacts`).
+                self.expected_artifacts.lock().unwrap_or_else(|error| error.into_inner()).insert(
+                    subtask_id,
+                    crate::declared_artifacts::declared_paths(&doc.proposed_files),
+                );
             }
         }
 
@@ -10534,6 +12612,16 @@ impl CoordinatorAgent {
             Ok(profile) => profile,
             Err(error) => {
                 if is_cancellation_error(&error) || cancel.is_cancelled() {
+                    // Run-history audit: the stop landed before any
+                    // specialist call — an interrupt, not a failure.
+                    self.publish_dispatch_outcome(
+                        scope,
+                        subtask_id,
+                        &agent_id,
+                        false,
+                        "cancelled",
+                        Some(Self::cancelled_dispatch_reason(cancel, &error)),
+                    );
                     return serde_json::json!({ "error": "cancelled" });
                 }
                 warn!(
@@ -10561,6 +12649,15 @@ impl CoordinatorAgent {
                     0,
                 );
                 self.settle_unresolved_dispatch(graph, ledger, &agent_id, subtask_id);
+                // Run-history audit: never reached a specialist.
+                self.publish_dispatch_outcome(
+                    scope,
+                    subtask_id,
+                    &agent_id,
+                    false,
+                    "model-selection-failed",
+                    Some(error.to_string()),
+                );
                 return serde_json::json!({
                     "error": "model_selection_failed",
                     "message": format!("no model could be selected for {agent_id}: {error}"),
@@ -10584,6 +12681,17 @@ impl CoordinatorAgent {
             Ok(result) => result,
             Err(error) => {
                 if is_cancellation_error(&error) || cancel.is_cancelled() {
+                    // Run-history audit: the specialist call WAS issued, then
+                    // interrupted — `attempted: true` keeps it distinct from
+                    // a pre-dispatch denial.
+                    self.publish_dispatch_outcome(
+                        scope,
+                        subtask_id,
+                        &agent_id,
+                        true,
+                        "cancelled",
+                        Some(Self::cancelled_dispatch_reason(cancel, &error)),
+                    );
                     return serde_json::json!({ "error": "cancelled" });
                 }
                 warn!(
@@ -10651,6 +12759,16 @@ impl CoordinatorAgent {
                         0,
                     );
                     self.settle_unresolved_dispatch(graph, ledger, &agent_id, subtask_id);
+                    // Run-history audit: the specialist call was issued and
+                    // did not settle (after any default-model failover).
+                    self.publish_dispatch_outcome(
+                        scope,
+                        subtask_id,
+                        &agent_id,
+                        true,
+                        "dispatch-failed",
+                        Some(error.to_string()),
+                    );
                     return serde_json::json!({
                         "error": "dispatch_failed",
                         "message": error.to_string(),
@@ -10877,6 +12995,7 @@ impl CoordinatorAgent {
             subtask_id,
             task.session_id,
             progress_guard_engaged,
+            suitability_class == crate::suitability::TaskClass::CodeEdit,
             ledger,
         );
 
@@ -11054,6 +13173,7 @@ impl CoordinatorAgent {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         match policy.evaluate(&action, cancel.clone()).await {
             Ok(PolicyVerdict::Allow) => {}
@@ -11275,6 +13395,7 @@ impl CoordinatorAgent {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: true,
+            path_facts: None,
         };
         match policy.evaluate(&action, cancel.clone()).await {
             Ok(PolicyVerdict::Allow) => {}
@@ -11736,6 +13857,7 @@ impl CoordinatorAgent {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         match policy.evaluate(&action, cancel.clone()).await {
             Ok(PolicyVerdict::Allow) => {}
@@ -12459,6 +14581,7 @@ impl CoordinatorAgent {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         match policy.evaluate(&action, cancel.clone()).await {
             Ok(PolicyVerdict::Allow) => {}
@@ -13050,6 +15173,58 @@ impl CoordinatorAgent {
         })
     }
 
+    /// C-06 evidence kind (3): handle ONE
+    /// [`DECLARE_VERIFICATION_EXEMPT_TOOL`] call — an explicit declaration
+    /// that no separate verification pass is required for this objective,
+    /// carrying the reason. The declaration must be DURABLY recorded (audit
+    /// row + whiteboard `Decision`) or it is refused: an unrecordable
+    /// declaration is not evidence. No policy gate applies (no workspace
+    /// mutation).
+    async fn handle_declare_no_verification(
+        &self,
+        session_id: Ulid,
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        // ── 1. Parse (no partial declaration) ────────────────────────────
+        let Some(reason) = arguments
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+        else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "declare_no_verification_required requires a non-empty reasoning string",
+            });
+        };
+        // ── 2. Durability gate: an unrecordable declaration is not
+        //      evidence, so refuse rather than let the model believe it
+        //      counted.
+        if self.review_store.is_none() && self.tool_executor.is_none() {
+            return serde_json::json!({
+                "error": "declaration_unrecordable",
+                "message": "no audit or whiteboard sink is attached; the declaration \
+                            cannot be recorded and is not valid verification evidence",
+            });
+        }
+        // ── 3. Record (fail-soft at the seam, but the call succeeded only
+        //      when a sink existed).
+        crate::bypass_decision::record_decision_row(
+            self.tool_executor.as_deref(),
+            self.review_store.as_ref(),
+            session_id,
+            VERIFICATION_EXEMPT_DECISION_CODE,
+            reason,
+        )
+        .await;
+        serde_json::json!({
+            "outcome": "declared",
+            "reason": reason,
+            "message": "Declared that no separate verification is required; the reason was \
+                        recorded and will satisfy the completion-time acceptance gate.",
+        })
+    }
+
     /// Issue #64: handle ONE `reconsider` tool call — supersede a decision
     /// whose assumptions proved wrong and freeze only the affected pending
     /// tasks. Same failure discipline as the sibling decision surfaces:
@@ -13440,6 +15615,14 @@ impl CoordinatorAgent {
         arguments: &serde_json::Value,
         tool_name: &str,
     ) -> serde_json::Value {
+        // Delegation-doctrine guard: the Coordinator's own MUTATING tools are
+        // refused while a non-empty roster has seen no delegation attempt.
+        // Read-only calls pass straight through.
+        if let Some(refusal) =
+            self.guard_self_execution(base_ctx.session.session_id, tool_name, arguments)
+        {
+            return refusal;
+        }
         let Some(executor) = self.tool_executor.clone() else {
             return serde_json::json!({
                 "error": "no_executor",
@@ -13845,14 +16028,6 @@ impl CoordinatorAgent {
                 prompt.push_str("\n\n");
             }
         }
-        // OS/shell identity card (custom-ai-shell plan, Phase C): the
-        // coordinator dispatches shell-capable specialists, so its decision
-        // prompt names the host OS and the selected agent shell. Only
-        // appended when the runtime supplied a card.
-        if !self.environment_card.is_empty() {
-            prompt.push_str(&self.environment_card);
-            prompt.push_str("\n\n");
-        }
         // ── Dispatch budget advisory (ADR-35 amendment 2026-09-16 §6) ────
         // The run-wide dispatch ceiling (ADR-52 `max_total_iterations`) is
         // the Coordinator's hard budget. Publishing it up front lets the
@@ -13866,9 +16041,11 @@ impl CoordinatorAgent {
                 let remaining = cap - used;
                 prompt.push_str(&format!(
                     "<dispatch_budget>\nRun-wide ceiling: {cap} specialist calls; {used} used, \
-                     {remaining} remaining. Budget them — prefer request_user_input when the \
-                     path ahead is low-confidence rather than spending the remaining calls on \
-                     speculative work.\n</dispatch_budget>\n\n"
+                     {remaining} remaining. Spend them deliberately: a specialist call is the \
+                     default way work advances, so do not hoard the budget by working in-house. \
+                     The ceiling exists to force prioritization, not to price a needed dispatch \
+                     against doing the work yourself. Prefer request_user_input only when the \
+                     path ahead is genuinely low-confidence.\n</dispatch_budget>\n\n"
                 ));
             }
         }
@@ -13885,7 +16062,59 @@ impl CoordinatorAgent {
             prompt.push_str("\n\n");
             prompt.push_str(&self.supplemental_prompt);
         }
+        // The OS/shell identity card and the working-memory block are added by
+        // the shared `PromptBuilder` seam in `build_dispatch_system_message`
+        // below. The template ends with the same `{working_memory}` separator
+        // the single-agent templates use, so an empty block removes it cleanly
+        // and a non-empty block is substituted in place (default) or appended
+        // as a volatile tail under `cache_stable_prefix`.
+        prompt.push_str(crate::prompts::WORKING_MEMORY_SEPARATOR_PLACEHOLDER);
         prompt
+    }
+
+    /// The working-memory block for the coordinator's dispatch prompt: the
+    /// active orchestration run state (the `WorkingMemorySnapshot` projection)
+    /// followed by the retrieved project-memory chunks, exactly the shape the
+    /// single-agent loop assembles from `format_working_memory` +
+    /// `format_retrieved_memory`.
+    fn dispatch_working_memory_block(&self, base_ctx: &AgentContext) -> String {
+        let active = crate::memory_prompt::format_run_memory(&base_ctx.working_memory);
+        let retrieved = crate::memory_prompt::format_retrieved_memory(&base_ctx.retrieved_chunks);
+        if retrieved.is_empty() {
+            active
+        } else {
+            format!("{active}\n{retrieved}")
+        }
+    }
+
+    /// Assemble the coordinator's dispatch system message through the SAME
+    /// [`crate::prompts::PromptBuilder`] path the single-agent loop uses: the
+    /// rendered dispatch template plus the working-memory block, with the
+    /// ADR-048 stable-head/volatile-tail discipline honoring
+    /// `[context].cache_stable_prefix`. Emitting a single `Role::System`
+    /// message matches the loop (`PromptBuilder::build`) and the
+    /// last-system-wins adapters.
+    fn build_dispatch_system_message(
+        &self,
+        template: String,
+        working_memory_block: &str,
+    ) -> Message {
+        let builder = crate::prompts::PromptBuilder::new(template)
+            .with_shell_profile(self.shell_profile.clone())
+            .with_cache_stable_prefix(self.cache_stable_prefix);
+        let request = builder.build(working_memory_block, &[], None, None);
+        // `PromptBuilder::build` always prepends exactly one system message;
+        // degrade to an empty system message rather than panicking if that
+        // ever changes.
+        request.messages.into_iter().next().unwrap_or_else(|| Message {
+            role: Role::System,
+            content: String::new(),
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: None,
+            tokens_in: None,
+            tokens_out: None,
+        })
     }
 
     /// The run's evidence/provenance section for the decision prompt: the
@@ -14322,6 +16551,7 @@ mod tests {
                     elapsed: std::time::Duration::from_secs(30),
                     last_error: "all retries failed".into(),
                     throttled: false,
+                    retry_after: None,
                 }
             )),
             SubtaskFailureClass::LimitReached
@@ -15096,6 +17326,7 @@ mod tests {
             name: "Architect".to_string(),
             role: "architect".to_string(),
             stage: Some(concerto_core::AgentStage::new("design")),
+            can_cover: Vec::new(),
             prompt_sections: concerto_config::PromptSections::default(),
             model_override: None,
             provider_id: None,
@@ -15114,7 +17345,7 @@ mod tests {
     #[async_trait::async_trait]
     impl concerto_core::traits::tool::Tool for TestWriteTool {
         fn name(&self) -> &str {
-            "test_write_file"
+            "write"
         }
         fn description(&self) -> &str {
             "writes a file into the project"
@@ -15163,11 +17394,12 @@ mod tests {
         Arc::new(ToolExecutor::new(Arc::new(registry), policy))
     }
 
-    /// A `test_write_file` tool call for the coordinator's own toolset.
+    /// A mutating `write` tool call for the coordinator's own toolset (the
+    /// real tool name, so the delegation guard recognizes it).
     fn test_write_tool_call(path: &str) -> ToolCall {
         ToolCall {
             id: format!("write-{path}"),
-            name: "test_write_file".to_string(),
+            name: "write".to_string(),
             arguments: serde_json::json!({ "path": path, "content": "// generated" }),
 
             ..Default::default()
@@ -17012,24 +19244,20 @@ mod tests {
         );
     }
 
-    /// ADR-35 §8 (stage absence) under the amended contract: with NO
-    /// implement-stage agent registered and the shared executor attached,
-    /// the Coordinator does the work itself — the decision loop offers the
-    /// executor's tools and the coordinator's own tool call performs the
-    /// write through the SAME policy engine, VirtualFs, and gates the
-    /// specialists use.
+    /// Delegation doctrine (COMMIT 2, allow branch): with an EMPTY roster
+    /// (none registered, or all disabled — disabled agents never register)
+    /// and the shared executor attached, the Coordinator does the work itself
+    /// — the decision loop offers the executor's tools and the coordinator's
+    /// own tool call performs the write through the SAME policy engine,
+    /// VirtualFs, and gates the specialists use. The lawful self-execution is
+    /// recorded via `CoordinatorSelfImplementing` with the reason.
     #[tokio::test]
-    async fn coordinator_self_executes_when_no_implement_agent_is_registered() {
+    async fn coordinator_self_executes_when_roster_is_empty() {
         let bus = EventBus::new(256);
-        // Deliberately NO implement-stage agent: the coordinator carries the
-        // work itself through its own executor tool.
-        let mocks = vec![
-            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
-            MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
-        ];
+        // Deliberately EMPTY roster: self-execution is the exhaustion case.
         let mut coordinator = coordinator_with_turns(
             bus.clone(),
-            Arc::new(AgentRegistry::from_mocks(mocks)),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
             vec![
                 CoordinatorTurn::Calls(vec![test_write_tool_call("src/hand.rs")]),
                 CoordinatorTurn::Text("implemented by the coordinator self".into()),
@@ -17037,7 +19265,7 @@ mod tests {
         );
         coordinator = coordinator.with_executor(self_execute_executor());
         let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
-        let (output, _events) =
+        let (output, events) =
             run_for_test_in_dir(coordinator, bus.clone(), project_dir.path()).await;
 
         assert_eq!(
@@ -17053,6 +19281,141 @@ mod tests {
             output.files_modified.iter().any(|path| path.as_str().ends_with("src/hand.rs")),
             "expected the coordinator's own tool write in files_modified: {:?}",
             output.files_modified
+        );
+        // Self-execution is no longer indistinguishable from delegation.
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::CoordinatorSelfImplementing { reason, .. }
+                    if reason == "roster-empty-or-disabled"
+            )),
+            "lawful self-execution records the exhaustion reason"
+        );
+    }
+
+    /// Delegation doctrine (COMMIT 2, refuse branch): while a non-empty
+    /// roster is registered and no delegation has been attempted, the
+    /// Coordinator's own MUTATING tool call is refused with a NAMED,
+    /// policy-visible verdict, the model reads back a `delegation_required`
+    /// error, and nothing is written.
+    #[tokio::test]
+    async fn coordinator_mutating_self_execution_is_refused_before_any_delegation() {
+        let bus = EventBus::new(256);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "implemented",
+        )]));
+        let (coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            registry,
+            vec![
+                CoordinatorTurn::Calls(vec![test_write_tool_call("src/nope.rs")]),
+                CoordinatorTurn::Text("finished".into()),
+            ],
+        );
+        let coordinator = coordinator.with_executor(self_execute_executor());
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let (output, events) =
+            run_for_test_in_dir(coordinator, bus.clone(), project_dir.path()).await;
+
+        assert!(
+            !output.files_modified.iter().any(|path| path.as_str().ends_with("src/nope.rs")),
+            "the refused write must not land: {:?}",
+            output.files_modified
+        );
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::PolicyVerdict { verdict, .. }
+                    if verdict.contains("delegation-required")
+            )),
+            "the refusal is a named, policy-visible verdict: {events:?}"
+        );
+        let tool_results = provider.tool_result_contents();
+        assert!(
+            tool_results.iter().any(|result| {
+                result.get("error").and_then(serde_json::Value::as_str)
+                    == Some("delegation_required")
+            }),
+            "the model reads back a named delegation_required refusal: {tool_results:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|kind| matches!(kind, EventKind::CoordinatorSelfImplementing { .. })),
+            "a refused self-execution is not recorded as self-implementing"
+        );
+    }
+
+    /// The mutating classification is precise: read-only calls stay
+    /// unrestricted under the guard.
+    #[test]
+    fn mutating_self_execution_classification_is_precise() {
+        for name in ["write", "shell", "git"] {
+            assert!(
+                is_mutating_self_execution_tool(name, &serde_json::json!({})),
+                "{name} mutates"
+            );
+        }
+        for operation in ["write", "delete", "move", "copy"] {
+            assert!(
+                is_mutating_self_execution_tool(
+                    "filesystem",
+                    &serde_json::json!({ "operation": operation })
+                ),
+                "filesystem {operation} mutates"
+            );
+        }
+        for operation in ["read", "list", "exists"] {
+            assert!(
+                !is_mutating_self_execution_tool(
+                    "filesystem",
+                    &serde_json::json!({ "operation": operation })
+                ),
+                "filesystem {operation} is read-only"
+            );
+        }
+        assert!(!is_mutating_self_execution_tool("consult_specialist", &serde_json::json!({})));
+        assert!(!is_mutating_self_execution_tool("call_specialist", &serde_json::json!({})));
+    }
+
+    /// Delegation is NEVER gated on which stage is staffed: a roster with a
+    /// single STAGE-LESS custom agent still accepts a `call_specialist`
+    /// dispatch to it (no implement-stage agent exists anywhere).
+    #[tokio::test]
+    async fn delegation_is_never_gated_on_stage_staffing() {
+        let bus = EventBus::new(256);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("misc"),
+            "did the work",
+        )]));
+        let (coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            registry,
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist("misc", "do the work")]),
+                CoordinatorTurn::Text("done".into()),
+            ],
+        );
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let (_output, events) =
+            run_for_test_in_dir(coordinator, bus.clone(), project_dir.path()).await;
+
+        assert!(
+            !events.iter().any(|kind| matches!(
+                kind,
+                EventKind::PolicyVerdict { verdict, .. }
+                    if verdict.contains("delegation-required")
+            )),
+            "delegation to a stage-less agent is never refused"
+        );
+        let tool_results = provider.tool_result_contents();
+        assert!(
+            tool_results
+                .iter()
+                .any(|result| result.get("outcome").and_then(serde_json::Value::as_str)
+                    == Some("success")),
+            "the stage-less agent actually ran the dispatch: {tool_results:?}"
         );
     }
 
@@ -17098,6 +19461,381 @@ mod tests {
         assert!(
             !events.iter().any(|kind| matches!(kind, EventKind::ValidationCycleStarted { .. })),
             "no validation-stage agent should mean no validation cycle runs"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // C-06 evidence gate: direct executed-tool evidence and declarations
+    // ------------------------------------------------------------------
+
+    /// A coder mock that reports one successful tool call and one produced
+    /// file — the shape of a real specialist that actually did work (so the
+    /// zero-work/vacuous guards stay out of the way of the C-06 assertions).
+    fn coder_with_tool_work() -> MockExpertAgent {
+        MockExpertAgent::sequence(
+            AgentId::new("coder"),
+            vec![Ok(AgentRunResult {
+                task_id: TaskId::new(),
+                role: AgentId::new("coder"),
+                outcome: AgentOutcome::Success,
+                summary: "implemented".to_owned(),
+                files_modified: vec![camino::Utf8PathBuf::from("src/a.rs")],
+                tool_call_count: 1,
+                cost_usd: 0.0,
+                latency_ms: 0,
+                provider: "mock".to_owned(),
+                model: "mock".to_owned(),
+                tokens_in: 0,
+                tokens_out: 0,
+            })],
+        )
+    }
+
+    /// Append one `ToolExecuted` fact attributed to `session_id` (no
+    /// `run_id`, so the gate's run filter accepts it), mirroring what a real
+    /// specialist's evidence writer records.
+    async fn append_evidence_tool_fact(
+        pool: &sqlx::SqlitePool,
+        session_id: Ulid,
+        tool: &str,
+        args: serde_json::Value,
+        success: bool,
+        paths: &[&str],
+    ) {
+        let payload = serde_json::json!({
+            "agent_id": "coder",
+            "tool": tool,
+            "args": args,
+            "success": success,
+            "paths": paths
+                .iter()
+                .map(|path| serde_json::json!({ "path": path }))
+                .collect::<Vec<_>>(),
+        });
+        let event = NewWhiteboardEvent {
+            event_id: Ulid::new().to_string(),
+            agent_id: "coder".to_owned(),
+            kind: WhiteboardKind::ToolExecuted,
+            scope: String::new(),
+            session_id: Some(session_id.to_string()),
+            plan_id: None,
+            causation: None,
+            payload,
+            pre_image_hash: None,
+            created_at: crate::tool_facts::unix_ms(),
+        };
+        append_whiteboard_event(pool, &event).await.expect("tool fact appended");
+    }
+
+    /// Build a declared-deliverable build run: architect (grounded DesignDoc
+    /// for `src/a.rs`) + coder that produced the file, over a real temp
+    /// workspace with a non-placeholder `src/a.rs` on disk. The caller
+    /// supplies the tool fact or declaration before invoking it.
+    fn c06_build_registry() -> AgentRegistry {
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
+            coder_with_tool_work(),
+        ];
+        let mut registry = AgentRegistry::from_mocks(mocks);
+        registry.attach_configs_for_test(
+            std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
+        );
+        registry
+    }
+
+    fn c06_build_turns() -> Vec<CoordinatorTurn> {
+        vec![
+            CoordinatorTurn::Calls(vec![
+                call_specialist("architect", "design it"),
+                call_specialist("coder", "implement"),
+            ]),
+            CoordinatorTurn::Text("done".into()),
+        ]
+    }
+
+    fn c06_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir for C-06 workspace");
+        std::fs::create_dir_all(dir.path().join("src")).expect("create src dir");
+        std::fs::write(dir.path().join("src/a.rs"), "// real implementation\npub fn main() {}\n")
+            .expect("write deliverable");
+        let root = dir.path().to_path_buf();
+        (dir, root)
+    }
+
+    /// (a) A build run whose declared deliverable was produced by a
+    /// successful mutating tool completes — no validator is dispatched and
+    /// the run is not downgraded by C-06. A fact attributed to another
+    /// session is ignored (sanity for the run/session filter).
+    #[tokio::test]
+    async fn c06_mutating_tool_evidence_completes_without_validator() {
+        let (_dir, root) = c06_workspace();
+        let (_log_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mut coordinator = coordinator_with_grounded_turns(
+            bus.clone(),
+            Arc::new(c06_build_registry()),
+            c06_build_turns(),
+            &["src/a.rs"],
+        )
+        .with_review_store(Some(pool.clone()));
+        let task = AgentTask::new(Ulid::new(), "build a main");
+        // A foreign-session fact must NOT satisfy the gate.
+        append_evidence_tool_fact(
+            &pool,
+            Ulid::new(),
+            "filesystem",
+            serde_json::json!({ "operation": "move", "path": "src/a.rs" }),
+            true,
+            &["src/a.rs"],
+        )
+        .await;
+        // The real fact, attributed to this run's session.
+        append_evidence_tool_fact(
+            &pool,
+            task.session_id,
+            "filesystem",
+            serde_json::json!({ "operation": "move", "path": "src/a.rs" }),
+            true,
+            &["src/a.rs"],
+        )
+        .await;
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            root.clone(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("coordinator run should succeed");
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "a successful mutating tool against the declared deliverable must complete: {}",
+            output.final_message
+        );
+        assert!(
+            !output.final_message.contains("Acceptance gate C-06"),
+            "unexpected C-06 downgrade: {}",
+            output.final_message
+        );
+    }
+
+    /// (c) A run whose only tool attempt FAILED does not complete: a failed
+    /// tool fact is never evidence.
+    #[tokio::test]
+    async fn c06_failed_tool_attempt_is_not_evidence() {
+        let (_dir, root) = c06_workspace();
+        let (_log_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mut coordinator = coordinator_with_grounded_turns(
+            bus.clone(),
+            Arc::new(c06_build_registry()),
+            c06_build_turns(),
+            &["src/a.rs"],
+        )
+        .with_review_store(Some(pool.clone()));
+        let task = AgentTask::new(Ulid::new(), "build a main");
+        append_evidence_tool_fact(
+            &pool,
+            task.session_id,
+            "filesystem",
+            serde_json::json!({ "operation": "move", "path": "src/a.rs" }),
+            false,
+            &["src/a.rs"],
+        )
+        .await;
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            root.clone(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("coordinator run should succeed");
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "a failed tool attempt must not satisfy the gate: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Acceptance gate C-06"),
+            "the no-evidence note must name the blocker: {}",
+            output.final_message
+        );
+    }
+
+    /// (2b) A successful build/test/lint command is verification evidence.
+    #[tokio::test]
+    async fn c06_successful_build_command_is_evidence() {
+        let (_dir, root) = c06_workspace();
+        let (_log_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mut coordinator = coordinator_with_grounded_turns(
+            bus.clone(),
+            Arc::new(c06_build_registry()),
+            c06_build_turns(),
+            &["src/a.rs"],
+        )
+        .with_review_store(Some(pool.clone()));
+        let task = AgentTask::new(Ulid::new(), "build a main");
+        append_evidence_tool_fact(
+            &pool,
+            task.session_id,
+            "shell",
+            serde_json::json!({ "command": "cargo", "args": ["test"] }),
+            true,
+            &[],
+        )
+        .await;
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            root.clone(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("coordinator run should succeed");
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "a successful build/test command must satisfy the gate: {}",
+            output.final_message
+        );
+    }
+
+    /// (d) A recorded coordinator declaration completes the run and the
+    /// recorded reason is visible after the fact.
+    #[tokio::test]
+    async fn c06_coordinator_declaration_completes_and_records_reason() {
+        let (_dir, root) = c06_workspace();
+        let (_log_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let reason =
+            "the declared deliverable is a mechanical rename; no separate verification applies";
+        let turns = vec![
+            CoordinatorTurn::Calls(vec![ToolCall {
+                id: "declare-verification".to_owned(),
+                name: DECLARE_VERIFICATION_EXEMPT_TOOL.to_owned(),
+                arguments: serde_json::json!({ "reason": reason }),
+                ..Default::default()
+            }]),
+            CoordinatorTurn::Calls(vec![call_specialist("coder", "implement")]),
+            CoordinatorTurn::Text("done".into()),
+        ];
+        // No architect/DesignDoc: the declaration must stand on its own
+        // (artifact checks are vacuous with no declared deliverable).
+        let mut registry = AgentRegistry::from_mocks(vec![coder_with_tool_work()]);
+        registry.attach_configs_for_test(std::collections::HashMap::new());
+
+        let mut coordinator = coordinator_with_turns(bus.clone(), Arc::new(registry), turns)
+            .with_review_store(Some(pool.clone()));
+        let task = AgentTask::new(Ulid::new(), "declare it done");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            root.clone(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("coordinator run should succeed");
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "a recorded declaration must satisfy the gate: {}",
+            output.final_message
+        );
+
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 200 },
+        )
+        .await
+        .expect("the log loads");
+        let declaration = logged
+            .iter()
+            .find(|event| {
+                event.kind == WhiteboardKind::Decision
+                    && event.payload["required_output"] == serde_json::json!("verification-exempt")
+            })
+            .expect("the declaration decision was recorded");
+        assert_eq!(
+            declaration.payload["reason"],
+            serde_json::json!(reason),
+            "the recorded reason is the one the coordinator declared"
+        );
+    }
+
+    #[test]
+    fn c06_build_or_test_command_classifier() {
+        assert!(is_build_or_test_command(
+            &serde_json::json!({ "command": "cargo", "args": ["test"] })
+        ));
+        assert!(is_build_or_test_command(&serde_json::json!({ "command": "cargo test" })));
+        assert!(is_build_or_test_command(&serde_json::json!({ "command": "make" })));
+        assert!(is_build_or_test_command(&serde_json::json!({ "command": "pytest" })));
+        assert!(is_build_or_test_command(
+            &serde_json::json!({ "command": "npm", "args": ["test"] })
+        ));
+        assert!(is_build_or_test_command(
+            &serde_json::json!({ "command": "./gradlew", "args": ["test"] })
+        ));
+        assert!(!is_build_or_test_command(
+            &serde_json::json!({ "command": "echo", "args": ["cargo test"] })
+        ));
+        assert!(!is_build_or_test_command(&serde_json::json!({ "command": "ls" })));
+        assert!(!is_build_or_test_command(&serde_json::json!({})));
+    }
+
+    #[test]
+    fn c06_mutating_fact_and_deliverable_matching() {
+        assert!(is_mutating_tool_fact("filesystem", &serde_json::json!({ "operation": "move" })));
+        assert!(is_mutating_tool_fact("write", &serde_json::json!({ "path": "x" })));
+        assert!(!is_mutating_tool_fact("filesystem", &serde_json::json!({ "operation": "read" })));
+        let paths = vec![];
+        // The move destination lives in the arguments, not the observed paths.
+        assert!(fact_touches_declared_deliverable(
+            &serde_json::json!({ "operation": "move", "path": "src/a.rs", "destination": "src/b.rs" }),
+            &paths,
+            &[camino::Utf8PathBuf::from("src/b.rs")],
+        ));
+        assert!(!fact_touches_declared_deliverable(
+            &serde_json::json!({ "operation": "move", "path": "src/a.rs" }),
+            &paths,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn c06_failed_fact_yields_no_evidence() {
+        let event = WhiteboardEvent {
+            event_id: "fact-1".to_owned(),
+            gate_seq: 1,
+            agent_id: "coder".to_owned(),
+            agent_seq: 1,
+            kind: WhiteboardKind::ToolExecuted,
+            scope: String::new(),
+            session_id: Some("s".to_owned()),
+            plan_id: None,
+            causation: None,
+            payload: serde_json::json!({
+                "tool": "filesystem",
+                "args": { "operation": "move", "path": "src/a.rs" },
+                "success": false,
+                "paths": [{ "path": "src/a.rs" }],
+            }),
+            content_hash: String::new(),
+            pre_image_hash: None,
+            created_at: 0,
+        };
+        assert!(
+            tool_fact_verification_evidence(
+                std::slice::from_ref(&event),
+                None,
+                &[camino::Utf8PathBuf::from("src/a.rs")]
+            )
+            .is_none(),
+            "a failed fact is never evidence"
         );
     }
 
@@ -17484,6 +20222,7 @@ mod tests {
             elapsed: std::time::Duration::from_secs(120),
             last_error: "transient HTTP status 429; maximum attempt count (8) reached".into(),
             throttled: true,
+            retry_after: None,
         }
     }
 
@@ -17495,6 +20234,20 @@ mod tests {
             elapsed: std::time::Duration::from_secs(30),
             last_error: last_error.to_owned(),
             throttled: false,
+            retry_after: None,
+        }
+    }
+
+    /// A throttled exhaustion that PRESERVED the provider's `Retry-After`
+    /// hint — the signal the ladder hold waits out before retrying the SAME
+    /// provider (owner doctrine, option b).
+    fn throttle_exhausted_with_retry_after(retry_after: std::time::Duration) -> ProviderError {
+        ProviderError::RetryExhausted {
+            attempts: 8,
+            elapsed: std::time::Duration::from_secs(120),
+            last_error: "transient HTTP status 429; maximum attempt count (8) reached".into(),
+            throttled: true,
+            retry_after: Some(retry_after),
         }
     }
 
@@ -17718,6 +20471,60 @@ mod tests {
 
         fn provider_name(&self) -> &'static str {
             "planning-failure"
+        }
+    }
+
+    /// A provider that fails the first `fail_first` requests with `error`,
+    /// then serves one plan text on every later request. Models a throttled
+    /// rung that recovers once its cooldown elapses — the ladder-hold subject.
+    struct FlakyThenPlanProvider {
+        error: ProviderError,
+        requests: Arc<std::sync::atomic::AtomicUsize>,
+        fail_first: usize,
+        plan: String,
+    }
+
+    impl FlakyThenPlanProvider {
+        fn new(
+            error: ProviderError,
+            requests: Arc<std::sync::atomic::AtomicUsize>,
+            fail_first: usize,
+            plan: &str,
+        ) -> Self {
+            Self { error, requests, fail_first, plan: plan.to_owned() }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl concerto_core::traits::provider::LlmProvider for FlakyThenPlanProvider {
+        async fn stream_completion(
+            &self,
+            _request: concerto_core::types::CompletionRequest,
+            _cancel: CancellationToken,
+        ) -> Result<concerto_core::traits::provider::CompletionStream, ProviderError> {
+            let seen = self.requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if seen <= self.fail_first {
+                return Err(self.error.clone());
+            }
+            Ok(Box::pin(futures::stream::iter(vec![Ok(concerto_core::types::CompletionChunk {
+                reasoning: None,
+                delta: self.plan.clone(),
+                tool_call: None,
+                is_final: true,
+                usage: None,
+            })])))
+        }
+
+        fn context_capacity(&self, _model: &str) -> concerto_core::types::TokenBudget {
+            concerto_core::types::TokenBudget::new(128_000, 4_096)
+        }
+
+        fn approximate_cost(&self, _tokens_in: u64, _tokens_out: u64) -> f64 {
+            0.0
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "flaky-then-plan"
         }
     }
 
@@ -18254,6 +21061,250 @@ mod tests {
         );
     }
 
+    /// Ladder hold (owner doctrine, option b): a throttled exhaustion that
+    /// preserved a known `Retry-After` HOLDS the rung — waits out the cooldown
+    /// and retries the SAME provider. When it recovers there is no bridge and
+    /// the rung is never abandoned.
+    #[tokio::test]
+    async fn planning_hold_recovers_on_same_provider_without_bridging() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(FlakyThenPlanProvider::new(
+                throttle_exhausted_with_retry_after(std::time::Duration::from_millis(1)),
+                requests.clone(),
+                1,
+                "# Held plan\nrecovered on the same provider",
+            ));
+        let fallback = Arc::new(TurnProvider::new(vec![CoordinatorTurn::Text(
+            "# Must not be used".to_owned(),
+        )]));
+        let coordinator = coordinator_for_ladder_with(
+            bus.clone(),
+            Arc::new(AgentRegistry::new()),
+            concerto_config::ModelPinConfig::default(),
+            primary.clone(),
+            Some((
+                fallback.clone() as Arc<dyn concerto_core::traits::provider::LlmProvider>,
+                fallback_profile("nim", "default-nim"),
+            )),
+        )
+        .with_orchestration_depth(OrchestrationDepth::PlanningOnly)
+        .with_review_store(Some(pool.clone()))
+        .with_planning_profile(Some(fallback_profile("google", "google-model")));
+
+        let (output, _events) = run_for_test(coordinator, bus.clone()).await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the held rung must recover the run: {:?}",
+            output.completion_status,
+        );
+        assert!(
+            output.final_message.contains("recovered on the same provider"),
+            "the SAME provider's plan is the run's final message: {}",
+            output.final_message,
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the held rung is retried exactly once on the same provider"
+        );
+        assert_eq!(fallback.turn_count(), 0, "a recovered rung never bridges");
+
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("the log loads");
+        let reasons: Vec<String> = operational_decisions(&logged)
+            .iter()
+            .filter_map(|decision| decision.payload["reason"].as_str().map(str::to_owned))
+            .collect();
+        assert!(
+            reasons.iter().any(|reason| reason == "planning-provider-hold"),
+            "the hold is recorded: {reasons:?}"
+        );
+        assert!(
+            reasons.iter().any(|reason| reason == "planning-provider-hold-recovered"),
+            "the same-provider recovery is recorded: {reasons:?}"
+        );
+        assert!(
+            !reasons.iter().any(|reason| reason.ends_with("-bridged-recovered")),
+            "no bridge is recorded when the held rung recovers: {reasons:?}"
+        );
+    }
+
+    /// Ladder hold is NOT one-shot: a rung that is still throttled after its
+    /// first cooldown is held again (bounded by [`MAX_PLANNING_HOLDS`]) before
+    /// any bridge is considered.
+    #[tokio::test]
+    async fn planning_hold_is_not_one_shot_and_can_hold_twice() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(FlakyThenPlanProvider::new(
+                throttle_exhausted_with_retry_after(std::time::Duration::from_millis(1)),
+                requests.clone(),
+                2,
+                "# Twice-held plan\nrecovered on the third request",
+            ));
+        let coordinator = coordinator_for_ladder_with(
+            bus.clone(),
+            Arc::new(AgentRegistry::new()),
+            concerto_config::ModelPinConfig::default(),
+            primary.clone(),
+            None,
+        )
+        .with_orchestration_depth(OrchestrationDepth::PlanningOnly)
+        .with_review_store(Some(pool.clone()))
+        .with_planning_profile(Some(fallback_profile("google", "google-model")));
+
+        let (output, _events) = run_for_test(coordinator, bus.clone()).await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the twice-held rung must recover the run: {:?}",
+            output.completion_status,
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "two held retries then a recovery on the SAME provider"
+        );
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("the log loads");
+        let holds = operational_decisions(&logged)
+            .iter()
+            .filter(|decision| decision.payload["reason"] == "planning-provider-hold")
+            .count();
+        assert_eq!(holds, 2, "the rung is held twice, proving recovery is not one-shot");
+    }
+
+    /// The hold observes cancellation: a cancelled run never completes the
+    /// wait and never dispatches the hold retry.
+    #[tokio::test]
+    async fn planning_hold_observes_cancellation() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(PlanningFailureProvider::new(
+                throttle_exhausted_with_retry_after(std::time::Duration::from_secs(3600)),
+                requests.clone(),
+            ));
+        let mut coordinator = coordinator_for_ladder_with(
+            bus.clone(),
+            Arc::new(AgentRegistry::new()),
+            concerto_config::ModelPinConfig::default(),
+            primary.clone(),
+            None,
+        )
+        .with_orchestration_depth(OrchestrationDepth::PlanningOnly)
+        .with_review_store(Some(pool.clone()))
+        .with_planning_profile(Some(fallback_profile("google", "google-model")));
+
+        let task = AgentTask::new(Ulid::new(), "build the thing");
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let cancel = CancellationToken::new();
+        let canceller = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            canceller.cancel();
+        });
+        let recovered = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            coordinator.hold_rung_and_retry(
+                &task,
+                &context,
+                &cancel,
+                std::time::Duration::from_secs(3600),
+            ),
+        )
+        .await
+        .expect("the hold must not outlive the cancellation");
+
+        assert!(recovered.is_none(), "a cancelled hold recovers nothing");
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the hold retry never dispatches after cancellation"
+        );
+        assert!(
+            coordinator.planning_recovery_note.as_deref().unwrap_or_default().contains("cancelled"),
+            "the cancellation is recorded: {:?}",
+            coordinator.planning_recovery_note
+        );
+    }
+
+    /// A non-throttle exhaustion that happens to carry a `Retry-After` hint is
+    /// NOT held: terminal classes keep the historical behaviour (no wait), and
+    /// the run pauses.
+    #[tokio::test]
+    async fn planning_hold_ignores_non_throttle_class_with_hint() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary: Arc<dyn concerto_core::traits::provider::LlmProvider> =
+            Arc::new(PlanningFailureProvider::new(
+                ProviderError::RetryExhausted {
+                    attempts: 4,
+                    elapsed: std::time::Duration::from_secs(30),
+                    last_error: "provider authentication failed".into(),
+                    throttled: false,
+                    retry_after: Some(std::time::Duration::from_millis(1)),
+                },
+                requests.clone(),
+            ));
+        let coordinator = coordinator_for_ladder_with(
+            bus.clone(),
+            Arc::new(AgentRegistry::new()),
+            concerto_config::ModelPinConfig::default(),
+            primary.clone(),
+            None,
+        )
+        .with_orchestration_depth(OrchestrationDepth::PlanningOnly)
+        .with_review_store(Some(pool.clone()))
+        .with_planning_profile(Some(fallback_profile("google", "google-model")));
+
+        let (output, _events) = run_for_test(coordinator, bus.clone()).await;
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "a non-throttle exhaustion pauses without a hold",
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a non-throttle class is never retried on the same provider"
+        );
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 100 },
+        )
+        .await
+        .expect("the log loads");
+        assert!(
+            !operational_decisions(&logged)
+                .iter()
+                .any(|decision| decision.payload["reason"] == "planning-provider-hold"),
+            "no hold is recorded for a terminal class"
+        );
+    }
+
     /// A `RetryExhausted` whose underlying cause was NOT throttling (auth)
     /// keeps the historical conservative skip: no recovery, no fallback
     /// dispatch, and the run pauses as Partial.
@@ -18626,6 +21677,518 @@ mod tests {
             "each escalation re-diagnosed the same permanent failure: {:?}",
             coordinator.failure_diagnoses
         );
+    }
+
+    /// The near-duplicate comparison: rephrased wording over the SAME target
+    /// paths and the SAME action is one dispatch request; a different target
+    /// or a different action verb is genuinely new work.
+    #[test]
+    fn near_duplicate_description_detects_a_rephrased_repeat() {
+        let first = "rename test_file.txt to file_test_pass.txt in the workspace root";
+        let rephrased = "rename test_file.txt to file_test_pass.txt using filesystem move \
+                         operation";
+        assert!(is_near_duplicate_description(first, first), "identical text duplicates itself");
+        assert!(is_near_duplicate_description(first, rephrased), "pathology pair: {rephrased}");
+
+        // Different target paths: not the same dispatch, no matter the prose.
+        assert!(
+            !is_near_duplicate_description(
+                first,
+                "rename other_file.txt to alt_test.txt in the workspace root",
+            ),
+            "different paths must stay dispatchable"
+        );
+        // Same paths, different verb: rename and copy are different work.
+        assert!(
+            !is_near_duplicate_description(
+                first,
+                "copy test_file.txt to file_test_pass.txt in the workspace root",
+            ),
+            "the verb is part of the intent"
+        );
+        // Empty text never duplicates anything (fail-open).
+        assert!(!is_near_duplicate_description("", first));
+        assert!(!is_near_duplicate_description(first, "   "));
+    }
+
+    /// A deterministic (non-retryable) TOOL diagnosis keeps the ADR-42
+    /// `Recoverable` class: the recovery machinery must not treat a provably
+    /// impossible action as a ladder/exit event — only the retryable flags the
+    /// model reads change.
+    #[test]
+    fn deterministic_diagnosis_keeps_the_recoverable_class() {
+        let diagnosis = crate::failure_diagnosis::diagnose(&OrchestratorError::Tool(
+            concerto_core::ToolError::ExecutionFailed {
+                message: "file not found: test_file.txt".into(),
+            },
+        ));
+        assert_eq!(diagnosis.code, "tool-precondition");
+        assert!(
+            matches!(SubtaskFailureClass::from(&diagnosis), SubtaskFailureClass::Recoverable),
+            "the deterministic diagnosis must not leave the Recoverable class: {diagnosis:?}"
+        );
+    }
+
+    /// Acceptance for the duplicate-dispatch guard: after a dispatch failed
+    /// PROVABLY (a deterministic tool precondition), a rephrased re-dispatch
+    /// of the same work with no corrective delta is refused as a structured
+    /// tool error — no second graph node, no second specialist run — while the
+    /// diagnosis stays on the audit trail.
+    #[tokio::test]
+    async fn near_duplicate_dispatch_after_a_deterministic_failure_is_refused() {
+        let bus = EventBus::new(256);
+        let coder = MockExpertAgent::sequence(
+            AgentId::new("coder"),
+            vec![
+                Err(OrchestratorError::Tool(concerto_core::ToolError::ExecutionFailed {
+                    message: "file not found: test_file.txt".into(),
+                })),
+                ok_result("coder", "would have run again without the guard"),
+            ],
+        );
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![coder]));
+        let (mut coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            registry,
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist(
+                    "coder",
+                    "rename test_file.txt to file_test_pass.txt in the workspace root",
+                )]),
+                // Rephrased rationale, same target paths, same verb, no notes
+                // — the pathological re-dispatch.
+                CoordinatorTurn::Calls(vec![call_specialist(
+                    "coder",
+                    "rename test_file.txt to file_test_pass.txt using filesystem move operation",
+                )]),
+                CoordinatorTurn::Text("stopped after the duplicate".into()),
+            ],
+        );
+        let mut rx = bus.subscribe();
+        let task = AgentTask::new(Ulid::new(), "test task");
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        // The rename SOURCE exists here: this test exercises the duplicate
+        // dispatch guard, so the source-existence preflight must let the
+        // first dispatch through (absence is covered by its own test).
+        std::fs::write(project_dir.path().join("test_file.txt"), b"seeded rename source\n")
+            .expect("seed the rename source");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("a refused duplicate must not crash the run");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert_eq!(provider.turn_count(), 3, "the loop served all three scripted turns");
+        let refusal = provider
+            .tool_result_contents()
+            .into_iter()
+            .find(|result| {
+                result.get("error").and_then(serde_json::Value::as_str)
+                    == Some("duplicate_dispatch")
+            })
+            .expect("the duplicate dispatch returns a structured tool error");
+        assert!(
+            refusal["message"].as_str().is_some_and(|message| message.contains("test_file.txt")),
+            "the refusal cites the prior dispatch: {refusal:?}"
+        );
+        let created: Vec<_> =
+            events.iter().filter(|kind| matches!(kind, EventKind::SubTaskCreated { .. })).collect();
+        assert_eq!(created.len(), 1, "only the first dispatch materialized a node: {events:?}");
+        assert!(
+            coordinator.failure_diagnoses.iter().any(|diagnosis| {
+                diagnosis.kind == crate::failure_diagnosis::FailureKind::Tool
+                    && diagnosis.code == "tool-precondition"
+            }),
+            "the provable failure is on the audit trail: {:?}",
+            coordinator.failure_diagnoses
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "the run ends with the unresolved dispatch visible"
+        );
+    }
+
+    /// The guard's escape hatch: the SAME task with corrective coordinator
+    /// notes is a genuine delta and must still dispatch (the specialist is
+    /// not starved of the correction it needs).
+    #[tokio::test]
+    async fn corrective_delta_dispatch_is_allowed_after_a_deterministic_failure() {
+        let bus = EventBus::new(256);
+        let coder = MockExpertAgent::sequence(
+            AgentId::new("coder"),
+            vec![
+                Err(OrchestratorError::Tool(concerto_core::ToolError::ExecutionFailed {
+                    message: "file not found: test_file.txt".into(),
+                })),
+                ok_result("coder", "created the missing file first, then renamed it"),
+            ],
+        );
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![coder]));
+        let (mut coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            registry,
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist(
+                    "coder",
+                    "rename test_file.txt to file_test_pass.txt in the workspace root",
+                )]),
+                CoordinatorTurn::Calls(vec![call_specialist_with(
+                    "coder",
+                    "rename test_file.txt to file_test_pass.txt in the workspace root",
+                    Some("create test_file.txt first, then perform the rename"),
+                    &[],
+                )]),
+                CoordinatorTurn::Text("corrected work finished".into()),
+            ],
+        );
+        let mut rx = bus.subscribe();
+        let task = AgentTask::new(Ulid::new(), "test task");
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        // The rename SOURCE exists here too: this test exercises the notes
+        // escape hatch of the duplicate-dispatch guard, so the
+        // source-existence preflight must stay out of its way.
+        std::fs::write(project_dir.path().join("test_file.txt"), b"seeded rename source\n")
+            .expect("seed the rename source");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("the corrected dispatch runs");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert!(
+            provider.tool_result_contents().iter().all(|result| {
+                result.get("error").and_then(serde_json::Value::as_str)
+                    != Some("duplicate_dispatch")
+            }),
+            "notes are a corrective delta: the dispatch must be allowed"
+        );
+        let created: Vec<_> =
+            events.iter().filter(|kind| matches!(kind, EventKind::SubTaskCreated { .. })).collect();
+        assert_eq!(created.len(), 2, "both dispatches materialize a node: {events:?}");
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::SubTaskCompleted { role, .. } if role == &AgentId::new("coder")
+            )),
+            "the corrected dispatch settled: {events:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Source-existence preflight (coordinator error invariant) — an
+    // objective that transforms a NAMED EXISTING artifact must never be
+    // satisfied by synthesizing that artifact when it is absent.
+    // ------------------------------------------------------------------
+
+    /// Pure parse coverage: only a concrete path between a source verb and
+    /// the destination separator is a candidate, and everything
+    /// inconclusive yields nothing to look up (the caller then fails open).
+    #[test]
+    fn source_preflight_names_only_transform_sources() {
+        assert_eq!(
+            named_source_paths("rename test.md to test_pass.md"),
+            vec!["test.md".to_owned()],
+            "the source is named; the destination never is"
+        );
+        assert_eq!(
+            named_source_paths("move notes.md to archive/notes.md"),
+            vec!["notes.md".to_owned()],
+            "a destination that does not exist yet is never a candidate"
+        );
+        assert_eq!(
+            named_source_paths("edit src/main.rs to add a guard"),
+            vec!["src/main.rs".to_owned()],
+            "an in-place edit names its source as well"
+        );
+        assert!(
+            named_source_paths("create notes.md with a short summary of the run").is_empty(),
+            "a creation objective names no source at all"
+        );
+        assert!(
+            named_source_paths("rename handle_call to handle_dispatch").is_empty(),
+            "a bare identifier is not a concrete workspace path"
+        );
+        assert!(
+            named_source_paths("implement the feature in the repository").is_empty(),
+            "no source verb, no candidate"
+        );
+        assert_eq!(
+            named_source_paths("rename alpha.txt to beta.txt and move gamma.txt to delta.txt")
+                .len(),
+            2,
+            "two sources in one objective are ambiguous — the caller fails open"
+        );
+    }
+
+    /// The preflight's contract end to end on a real directory: it reports
+    /// ONLY a single concrete source that is provably absent, and stays
+    /// silent for every fail-open case (creation, ambiguity, non-paths,
+    /// paths outside the workspace).
+    #[test]
+    fn missing_source_preflight_fires_only_for_one_absent_concrete_path() {
+        let workspace = tempfile::tempdir().expect("tempdir for test workspace");
+        let root =
+            camino::Utf8PathBuf::from_path_buf(workspace.path().to_path_buf()).expect("utf-8 dir");
+        std::fs::write(root.join("test.md"), b"present\n").expect("seed the source");
+
+        assert!(
+            missing_source_preflight_reason("rename test.md to test_pass.md", &root).is_none(),
+            "an existing source dispatches normally"
+        );
+        let reason = missing_source_preflight_reason("rename gone.md to here.md", &root)
+            .expect("one absent concrete source is reported");
+        assert!(reason.contains("gone.md"), "the reason names the path: {reason}");
+
+        // Fail-open conditions: none of these may block a dispatch.
+        assert!(
+            missing_source_preflight_reason("create gone.md with content", &root).is_none(),
+            "a creation objective is not a missing source"
+        );
+        assert!(
+            missing_source_preflight_reason(
+                "rename gone.md to other.md and move more.md to next.md",
+                &root
+            )
+            .is_none(),
+            "an ambiguous objective fails open"
+        );
+        assert!(
+            missing_source_preflight_reason("rename handle_call to handle_dispatch", &root)
+                .is_none(),
+            "a non-path token fails open"
+        );
+        assert!(
+            missing_source_preflight_reason("rename /etc/passwd to backup.txt", &root).is_none(),
+            "a path outside the workspace fails open"
+        );
+        assert!(
+            missing_source_preflight_reason("edit test.md to add a section", &root).is_none(),
+            "editing an existing source dispatches normally"
+        );
+    }
+
+    /// The defect's regression: a rename whose SOURCE does not exist is NOT
+    /// dispatched. The run pauses at the existing user-input path naming the
+    /// exact path it looked for, the refusal reaches the model as a
+    /// structured tool result, and the lookup is an event on the trail.
+    #[tokio::test]
+    async fn rename_of_a_missing_source_is_surfaced_instead_of_dispatched() {
+        let bus = EventBus::new(64);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "renamed",
+        )]));
+        let (coordinator, _provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            registry,
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist(
+                    "coder",
+                    "rename test.md to test_pass.md",
+                )]),
+                CoordinatorTurn::Text("never reached".into()),
+            ],
+        );
+        let workspace = tempfile::tempdir().expect("tempdir for test workspace");
+        // `test.md` is deliberately ABSENT: the workspace starts empty.
+        let (output, events) =
+            run_for_test_in_dir(coordinator, bus.clone(), workspace.path()).await;
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::AwaitingUser,
+            "a missing source pauses for the operator: {:?}",
+            output.completion_status
+        );
+        assert!(
+            output.final_message.contains("test.md"),
+            "the pause names the exact path looked for: {}",
+            output.final_message
+        );
+        let created: Vec<_> =
+            events.iter().filter(|kind| matches!(kind, EventKind::SubTaskCreated { .. })).collect();
+        assert!(created.is_empty(), "no dispatch may materialize: {events:?}");
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::AgentThought { content, .. } if content.contains("missing_source")
+            )),
+            "the structured refusal is published with the tool result: {events:?}"
+        );
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::AgentThought { content, .. } if content.contains("test.md")
+            )),
+            "the path lookup is observable in the trail, never silent: {events:?}"
+        );
+    }
+
+    /// The fail-open half: when the source EXISTS, the same rename
+    /// dispatches normally and settles.
+    #[tokio::test]
+    async fn rename_of_an_existing_source_dispatches_normally() {
+        let bus = EventBus::new(64);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "renamed",
+        )]));
+        let (coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            registry,
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist(
+                    "coder",
+                    "rename test.md to test_pass.md",
+                )]),
+                CoordinatorTurn::Text("renamed and done".into()),
+            ],
+        );
+        let workspace = tempfile::tempdir().expect("tempdir for test workspace");
+        std::fs::write(workspace.path().join("test.md"), b"present\n")
+            .expect("seed the rename source");
+        let (output, events) =
+            run_for_test_in_dir(coordinator, bus.clone(), workspace.path()).await;
+
+        assert_ne!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::AwaitingUser,
+            "an existing source must dispatch, not pause: {:?}",
+            output.completion_status
+        );
+        let created: Vec<_> =
+            events.iter().filter(|kind| matches!(kind, EventKind::SubTaskCreated { .. })).collect();
+        assert_eq!(created.len(), 1, "the rename dispatches: {events:?}");
+        assert!(
+            !provider.tool_result_contents().iter().any(|result| {
+                result.get("error").and_then(serde_json::Value::as_str) == Some("missing_source")
+            }),
+            "no missing-source refusal for an existing source"
+        );
+    }
+
+    /// An objective that CREATES a file is not a missing-source case: it
+    /// names no transform source, so it dispatches normally.
+    #[tokio::test]
+    async fn create_the_file_objective_dispatches_normally() {
+        let bus = EventBus::new(64);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "created",
+        )]));
+        let (coordinator, _provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            registry,
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist(
+                    "coder",
+                    "create notes.md with a short summary of the run",
+                )]),
+                CoordinatorTurn::Text("created and done".into()),
+            ],
+        );
+        let workspace = tempfile::tempdir().expect("tempdir for test workspace");
+        let (output, events) =
+            run_for_test_in_dir(coordinator, bus.clone(), workspace.path()).await;
+
+        assert_ne!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::AwaitingUser,
+            "a creation objective must not pause: {:?}",
+            output.completion_status
+        );
+        let created: Vec<_> =
+            events.iter().filter(|kind| matches!(kind, EventKind::SubTaskCreated { .. })).collect();
+        assert_eq!(created.len(), 1, "the creation dispatches: {events:?}");
+    }
+
+    /// A move's DESTINATION normally must not exist yet — it is never
+    /// preflighted, so the dispatch goes through.
+    #[tokio::test]
+    async fn move_to_a_nonexistent_destination_dispatches_normally() {
+        let bus = EventBus::new(64);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "moved",
+        )]));
+        let (coordinator, _provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            registry,
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist(
+                    "coder",
+                    "move notes.md to archive/notes.md",
+                )]),
+                CoordinatorTurn::Text("moved and done".into()),
+            ],
+        );
+        let workspace = tempfile::tempdir().expect("tempdir for test workspace");
+        std::fs::write(workspace.path().join("notes.md"), b"seeded move source\n")
+            .expect("seed the move source");
+        let (output, events) =
+            run_for_test_in_dir(coordinator, bus.clone(), workspace.path()).await;
+
+        assert_ne!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::AwaitingUser,
+            "a missing destination must never pause: {:?}",
+            output.completion_status
+        );
+        let created: Vec<_> =
+            events.iter().filter(|kind| matches!(kind, EventKind::SubTaskCreated { .. })).collect();
+        assert_eq!(created.len(), 1, "the move dispatches: {events:?}");
+    }
+
+    /// Fail-open on ambiguity: an objective naming more than one candidate
+    /// source is inconclusive, and an inconclusive preflight never blocks a
+    /// legitimate dispatch.
+    #[tokio::test]
+    async fn ambiguous_source_objective_fails_open_and_dispatches() {
+        let bus = EventBus::new(64);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "worked",
+        )]));
+        let (coordinator, _provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            registry,
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist(
+                    "coder",
+                    "rename alpha.txt to beta.txt and move gamma.txt to delta.txt",
+                )]),
+                CoordinatorTurn::Text("ambiguous but dispatched".into()),
+            ],
+        );
+        // Neither candidate exists — ambiguity, not proof, decides here.
+        let workspace = tempfile::tempdir().expect("tempdir for test workspace");
+        let (output, events) =
+            run_for_test_in_dir(coordinator, bus.clone(), workspace.path()).await;
+
+        assert_ne!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::AwaitingUser,
+            "an ambiguous objective fails OPEN: {:?}",
+            output.completion_status
+        );
+        let created: Vec<_> =
+            events.iter().filter(|kind| matches!(kind, EventKind::SubTaskCreated { .. })).collect();
+        assert_eq!(created.len(), 1, "the ambiguous dispatch still runs: {events:?}");
     }
 
     /// In the Coordinator's decision loop, a failed specialist dispatch
@@ -19684,35 +23247,28 @@ mod tests {
         drop(coordinator);
     }
 
-    /// ADR-42 (two-tier): the ladder NEVER reassigns a subtask to another
-    /// agent with the same declared stage. With multiple design-stage agents
-    /// registered, a hard `LimitReached` failure dispatches ONLY the original
-    /// role — tier 1 re-uses the same agent on the default model, and when
-    /// tier 2 (coordinator self-execution) also fails the run exits Partial
-    /// without the same-stage peer ever being dispatched. (The old three-tier
-    /// ladder reassigned to the lexicographically-first untried same-stage
-    /// agent; the peer's silence proves that tier is gone.)
+    /// Agent-axis takeover (owner doctrine): before escalating across
+    /// PROVIDERS, the coordinator takes over a hard-failed subtask with
+    /// ANOTHER registered specialist — here a same-stage peer — which rescues
+    /// the work. Choosing a different agent is a distinct axis from
+    /// re-targeting a provider, and is preferred over the provider ladder.
     #[tokio::test]
-    async fn ladder_hard_failure_never_reassigns_stages() {
+    async fn ladder_hard_failure_takes_over_to_same_stage_peer() {
         let bus = EventBus::new(256);
-        // The original design-stage role fails hard on the first dispatch, the
-        // tier-1 default-model re-dispatch, AND the tier-2 takeover dispatch
-        // (three auth errors) so the ladder exhausts to Partial. `architect-alt`
-        // shares the "design" stage and would succeed if dispatched — under the
-        // old three-tier ladder it was the tier-2 reassignment target, so its
-        // silence is the proof that no reassignment happens.
+        // The original design-stage role fails hard on the first dispatch and
+        // the tier-1 default-model re-dispatch. `architect-alt` shares the
+        // "design" stage and succeeds, so the agent-axis takeover rescues the
+        // subtask before any provider escalation.
         let architect = MockExpertAgent::sequence(
             AgentId::new("architect"),
             vec![err_auth(), err_auth(), err_auth()],
         );
         let alt = MockExpertAgent::sequence(
             AgentId::new("architect-alt"),
-            vec![ok_result("architect-alt", "peer must never run")],
+            vec![ok_result("architect-alt", "covered the design work")],
         )
         .with_stage(Some(AgentStage::new("design")));
         let session_id = Ulid::new();
-        // Tier 2 (takeover dispatch) also fails with the third auth error, so
-        // the ladder exhausts to Partial rather than rescuing the subtask.
         let planning: Arc<dyn concerto_core::traits::provider::LlmProvider> =
             Arc::new(MockProvider::default());
         let mut coordinator = coordinator_for_ladder(
@@ -19732,21 +23288,17 @@ mod tests {
 
         assert_eq!(
             output.completion_status,
-            concerto_core::types::AgentCompletionStatus::Partial,
-            "a hard failure with both ladder tiers exhausted must surface Partial, got: {:?}",
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the same-stage takeover must rescue the subtask, got: {:?}",
             output.completion_status,
         );
-        // Only the original role is ever dispatched (the runner dispatches it
-        // three times — first dispatch + tier-1 re-dispatch + tier-2 takeover —
-        // and every dispatch reuses the original role). No same-stage peer
-        // appears in any SubTaskStarted event.
         let alt_dispatched = events.iter().any(|kind| {
             matches!(
                 kind,
                 EventKind::SubTaskStarted { role, .. } if role == &AgentId::new("architect-alt")
             )
         });
-        assert!(!alt_dispatched, "the ladder must never dispatch a same-stage peer");
+        assert!(alt_dispatched, "the same-stage peer takes over before provider escalation");
         let started_roles: std::collections::HashSet<AgentId> = events
             .iter()
             .filter_map(|kind| match kind {
@@ -19756,11 +23308,14 @@ mod tests {
             .collect();
         assert_eq!(
             started_roles,
-            std::collections::HashSet::from([AgentId::new("architect")]),
-            "expected only the original role to be dispatched, got: {started_roles:?}",
+            std::collections::HashSet::from([
+                AgentId::new("architect"),
+                AgentId::new("architect-alt"),
+            ]),
+            "the original role plus its takeover peer were dispatched: {started_roles:?}",
         );
-        // The ladder really walked tier 1 (same agent, default model) then
-        // tier 2 (self-execution) before exhausting to Partial.
+        // The ladder really walked tier 1 (same agent, default model) before
+        // the agent-axis takeover.
         let tier1_failed = events.iter().any(|kind| {
             matches!(
                 kind,
@@ -19769,14 +23324,14 @@ mod tests {
             )
         });
         assert!(tier1_failed, "expected the tier-1 re-dispatch failure to be reported");
-        let exhausted_note = events.iter().any(|kind| {
+        let takeover_note = events.iter().any(|kind| {
             matches!(
                 kind,
                 EventKind::AgentThought { content, .. }
-                    if content.contains("Fallback ladder exhausted")
+                    if content.contains("Agent-axis takeover")
             )
         });
-        assert!(exhausted_note, "expected the ladder-exhaustion note to be published");
+        assert!(takeover_note, "expected the agent-axis takeover to be reported");
     }
 
     /// ADR-42 §4: a ladder tier may return an `Ok` result whose `outcome` is
@@ -20533,6 +24088,61 @@ mod tests {
 
         // No declared artifacts passes vacuously.
         assert!(verify_expected_artifacts(&root, &[]).is_ok());
+    }
+
+    /// A declaration that is prose (a description where a path was expected)
+    /// fails as `undeclared/unverifiable` — NEVER as `missing:` — while a
+    /// genuinely absent real path still reports `missing` (no
+    /// overcorrection).
+    #[test]
+    fn verify_expected_artifacts_labels_prose_as_unverifiable_not_missing() {
+        let dir = tempfile::tempdir().expect("tempdir for artifact check");
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .expect("tempdir path is valid UTF-8");
+        std::fs::create_dir_all(dir.path().join("src")).expect("create src dir");
+        // The delivered file EXISTS: an unsplit prose declaration must not
+        // turn delivered work into a missing-file claim.
+        std::fs::write(dir.path().join("DESIGN.md"), "# Design\n")
+            .expect("write declared design doc");
+
+        let prose = camino::Utf8PathBuf::from(
+            "DESIGN.md: Comprehensive design document as specified in the requirements.",
+        );
+        let violations = verify_expected_artifacts(&root, std::slice::from_ref(&prose))
+            .expect_err("prose is a violation");
+        assert_eq!(violations.len(), 1);
+        let (offender, reason) = &violations[0];
+        assert_eq!(offender, &prose);
+        assert!(
+            reason.contains(crate::declared_artifacts::UNVERIFIABLE_REASON),
+            "reason labels the declaration defect: {reason}"
+        );
+        assert!(
+            !reason.contains("missing"),
+            "prose must never be reported as a missing file: {reason}"
+        );
+
+        // A real, genuinely absent path keeps the `missing` reason.
+        let missing = root.join("src/missing.rs");
+        let violations = verify_expected_artifacts(&root, std::slice::from_ref(&missing))
+            .expect_err("missing is a violation");
+        assert_eq!(violations[0].0, missing);
+        assert!(
+            violations[0].1.contains("missing"),
+            "a real absent path still reports missing: {}",
+            violations[0].1
+        );
+
+        // After the declaration split, the same declaration verifies the
+        // delivered file itself.
+        let split = camino::Utf8PathBuf::from(
+            crate::declared_artifacts::path_without_description(prose.as_str()).into_owned(),
+        );
+        assert_eq!(split, camino::Utf8PathBuf::from("DESIGN.md"));
+        assert_eq!(
+            verify_expected_artifacts(&root, std::slice::from_ref(&split)).expect("delivered"),
+            vec![camino::Utf8PathBuf::from("DESIGN.md")]
+        );
     }
 
     #[test]
@@ -21316,10 +24926,12 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // ADR-55 Phase 2b: planning-only orchestration depth
+    // ADR-55 archived Phase 2b §1 (phase history: docs/adrs/archive/
+    // ADR-55-phase-history.md): planning-only orchestration depth
     // ------------------------------------------------------------------
 
-    /// ADR-55 Phase 2b + ADR-35 amendment (2026-09-05): a planning-only run
+    /// ADR-55 archived Phase 2b §1 + ADR-35 amendment (2026-09-05): a
+    /// planning-only run
     /// is the Coordinator's OWN plan (advisory prose — the plan is context,
     /// never a workload). It completes, surfaces the plan as the final
     /// message, and NEVER dispatches a subtask — zero tool calls, no
@@ -22926,6 +26538,206 @@ mod tests {
         );
     }
 
+    /// DEFERRED #18 / TODO.md "Coordinator restart/resume": the end-to-end
+    /// claim the row still owes. Phase A stalls and persists, then its
+    /// coordinator is dropped — the in-memory `checkpoint_json` it returns is
+    /// deliberately thrown away. Phase B is a FRESH coordinator + bus over the
+    /// same session store that reloads `state_json` from the durable row
+    /// itself (the production post-restart flow in `runtime_runner`), and it
+    /// must
+    ///
+    /// 1. never re-dispatch a subtask phase A already completed — the canary
+    ///    registry is derived from the persisted `Completed` set, so any
+    ///    re-dispatch fails the run — and
+    /// 2. reconcile the subtask that was still `Running` when the process
+    ///    died to `Pending` and dispatch it exactly once (once, not zero:
+    ///    a dropped step would hang the run).
+    ///
+    /// (2) is the hard-kill case only: the cooperative cancel path normalizes
+    /// `Running` → `Pending` *before* persisting, so an orphaned `Running`
+    /// row can only exist when a process died mid-dispatch. The test writes
+    /// that durable row explicitly and resumes through the production
+    /// `checkpoint::restore_graph` path.
+    ///
+    /// Boundary under test: the durable ROW, not the OS process — a second
+    /// process would need a second DB connection, and
+    /// `SqliteSessionStore::connect_path` is crate-private.
+    #[tokio::test]
+    async fn continue_after_restart_loads_durable_checkpoint_and_reconciles_running() {
+        let dir = tempfile::tempdir().expect("tempdir for restart test");
+
+        // ── Phase A: "process one" dispatches, stalls, persists ─────
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+            MockExpertAgent::always_succeed(AgentId::new("validator"), "valid"),
+        ];
+        let mut registry = AgentRegistry::from_mocks(mocks);
+        registry.attach_configs_for_test(
+            std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
+        );
+        registry.register(Arc::new(AlwaysRevise));
+        let registry = Arc::new(registry);
+        let (mut coordinator, store, session_id) = coordinator_with_store(
+            bus.clone(),
+            registry,
+            vec![
+                CoordinatorTurn::Calls(vec![
+                    call_specialist("architect", "design it"),
+                    call_specialist("coder", "implement"),
+                ]),
+                CoordinatorTurn::Calls(vec![call_specialist("reviewer", "review the work")]),
+                CoordinatorTurn::Calls(vec![call_specialist("validator", "validate the build")]),
+                CoordinatorTurn::Text("done".into()),
+            ],
+            dir.path(),
+        )
+        .await;
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            dir.path().to_path_buf(),
+        ));
+        coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("phase A run should succeed");
+        // Process one dies: nothing it held in memory reaches phase B.
+        drop(coordinator);
+
+        // ── The durable row, rewritten as a hard kill would leave it ─
+        let mut record = store
+            .load_orchestration_checkpoint(session_id)
+            .await
+            .expect("checkpoint store read")
+            .expect("the stalled run persisted a resumable checkpoint");
+        assert!(!record.completed, "phase A left the run resumable");
+        let mut graph =
+            checkpoint::GraphCheckpoint::from_json(&record.state_json).expect("state_json loads");
+        let statuses = graph
+            .subtasks
+            .iter()
+            .map(|st| format!("{}:{}:{:?}", st.id, st.role, st.status))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(
+            graph.subtasks.iter().any(|st| st.status == SubTaskStatus::Completed),
+            "phase A completed at least one subtask (persisted: {statuses})"
+        );
+        // The hard-kill row: process one died while this step was in flight,
+        // so the durable record carries `Running` and NO completion record
+        // for it — the same "an interrupted call has no durable completion
+        // record" rule the cooperative cancel path applies before persisting.
+        let in_flight_index = graph
+            .subtasks
+            .iter()
+            .position(|st| st.status == SubTaskStatus::Completed && st.role.as_str() != "architect")
+            .or_else(|| graph.subtasks.iter().position(|st| st.status == SubTaskStatus::Completed))
+            .unwrap_or_else(|| panic!("phase A completed at least one subtask ({statuses})"));
+        let in_flight_id = graph.subtasks[in_flight_index].id;
+        let in_flight_role = graph.subtasks[in_flight_index].role.clone();
+        graph.subtasks[in_flight_index].status = SubTaskStatus::Running;
+        graph.completed_results.remove(&in_flight_id);
+        record.state_json = serde_json::to_string(&graph).expect("checkpoint reserializes");
+        store.save_orchestration_checkpoint(&record).await.expect("rewrite the durable row");
+
+        // ── Phase B: "process two" continues off the STORE only ─────
+        let bus2 = EventBus::new(256);
+        let mut rx = bus2.subscribe();
+        // Canary registry derived from the persisted graph: a role whose
+        // subtasks are ALL completed is poisoned (a re-dispatch fails the
+        // run); every other role must be able to run.
+        let mut phase2_mocks = Vec::new();
+        let mut role_statuses: Vec<(AgentId, Vec<SubTaskStatus>)> = Vec::new();
+        for subtask in &graph.subtasks {
+            match role_statuses.iter_mut().find(|(role, _)| role == &subtask.role) {
+                Some((_, statuses)) => statuses.push(subtask.status),
+                None => role_statuses.push((subtask.role.clone(), vec![subtask.status])),
+            }
+        }
+        for (role, statuses) in role_statuses {
+            let only_completed = statuses.iter().all(|status| *status == SubTaskStatus::Completed);
+            phase2_mocks.push(if only_completed {
+                MockExpertAgent::always_fail(role, "completed step must not re-dispatch")
+            } else {
+                MockExpertAgent::always_succeed(role, "resumed work").with_artifact_writer()
+            });
+        }
+        let resumed = store
+            .load_orchestration_checkpoint(session_id)
+            .await
+            .expect("checkpoint store read")
+            .expect("phase B reloads the durable row");
+        assert_eq!(
+            resumed.sequence_num, record.sequence_num,
+            "phase B reads back the row phase A wrote"
+        );
+        let mut coordinator2 = coordinator_on_store(
+            bus2,
+            Arc::new(AgentRegistry::from_mocks(phase2_mocks)),
+            vec![CoordinatorTurn::Text(String::new())],
+            store.clone(),
+        );
+        let second = coordinator2
+            .run(
+                AgentTask::new(session_id, "continue"),
+                AgentContext::new(concerto_core::types::SessionContext::new(
+                    session_id,
+                    dir.path().to_path_buf(),
+                )),
+                CancellationToken::new(),
+                Some(resumed.state_json),
+            )
+            .await
+            .expect("resumed run should succeed");
+
+        assert_eq!(
+            second.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "the restarted run completes off the restored graph: {}",
+            second.final_message
+        );
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+        let started = |wanted: TaskId| {
+            events
+                .iter()
+                .filter(|kind| matches!(kind, EventKind::SubTaskStarted { task_id, .. } if *task_id == wanted))
+                .count()
+        };
+        for subtask in &graph.subtasks {
+            if subtask.status == SubTaskStatus::Completed {
+                assert_eq!(
+                    started(subtask.id),
+                    0,
+                    "completed subtask {} ({}) must not be re-dispatched after restart",
+                    subtask.id,
+                    subtask.role
+                );
+            }
+        }
+        assert_eq!(
+            started(in_flight_id),
+            1,
+            "the orphaned Running step {} ({}) is reconciled to Pending and dispatched once",
+            in_flight_id,
+            in_flight_role
+        );
+        assert!(
+            store
+                .load_orchestration_checkpoint(session_id)
+                .await
+                .expect("checkpoint store read")
+                .is_none(),
+            "the successful restarted run clears the checkpoint"
+        );
+    }
+
     /// Fail-soft fallback: a resume-shaped run with NO stored checkpoint
     /// decomposes fresh — the Coordinator's decision loop runs and its
     /// architect dispatch happens exactly once; the run completes like a
@@ -23713,6 +27525,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         let verdict = policy.evaluate(&action, CancellationToken::new()).await.unwrap();
         assert_eq!(
@@ -23780,7 +27593,7 @@ mod tests {
                 &CancellationToken::new(),
                 &mut ledger,
                 &arguments,
-                "test_write_file",
+                "write",
             )
             .await;
 
@@ -23797,7 +27610,7 @@ mod tests {
         // denied (the specialist path is unchanged).
         let denied = executor
             .execute(
-                "test_write_file",
+                "write",
                 serde_json::json!({ "path": "denied.rs", "content": "// nope" }),
                 &concerto_core::types::SessionContext::new(
                     session_id,
@@ -25131,6 +28944,665 @@ mod tests {
             !output.final_message.contains("Unattempted-implementation guard"),
             "the guard must not fire without a promised plan: {}",
             output.final_message
+        );
+    }
+
+    /// A v4-shaped checkpoint for the stop-before-coder case: the design step
+    /// settled (design-stage `dispatched`+`completed` rows only — ZERO
+    /// implement dispatches) and the implement step is still `Pending` on its
+    /// completed design dependency. No produced files, so nothing on disk
+    /// answers the promised implementation.
+    fn stop_before_coder_checkpoint_json(
+        project_id: &str,
+        session_id: Ulid,
+        design_id: TaskId,
+        coder_id: TaskId,
+    ) -> String {
+        let stamp = [2026, 254, 0, 0, 0, 0, 0, 0, 0];
+        serde_json::json!({
+            "schema_version": 4,
+            "run_id": Ulid::new().to_string(),
+            "session_id": session_id.to_string(),
+            "root_task_id": design_id.to_string(),
+            "project_id": project_id,
+            "objective": "build the thing",
+            "objective_hash": blake3::hash("build the thing".as_bytes()).to_hex().to_string(),
+            "stage": "Executing",
+            "completed": false,
+            "subtasks": [
+                {
+                    "id": design_id.to_string(),
+                    "parent_id": null,
+                    "session_id": session_id.to_string(),
+                    "role": "architect",
+                    "description": "design the thing",
+                    "status": "Completed",
+                    "dependencies": [],
+                    "deliverable": "designed",
+                },
+                {
+                    "id": coder_id.to_string(),
+                    "parent_id": design_id.to_string(),
+                    "session_id": session_id.to_string(),
+                    "role": "coder",
+                    "description": "implement the thing",
+                    "status": "Pending",
+                    "dependencies": [design_id.to_string()],
+                    "deliverable": null,
+                },
+            ],
+            "edges": [[design_id.to_string(), coder_id.to_string(), "MustFinishBefore"]],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+            "action_ledger": [
+                {
+                    "kind": "dispatched",
+                    "task_id": design_id.to_string(),
+                    "timestamp": stamp,
+                },
+                {
+                    "kind": "completed",
+                    "task_id": design_id.to_string(),
+                    "timestamp": stamp,
+                },
+            ],
+        })
+        .to_string()
+    }
+
+    /// Resume-drive regression (stop-before-coder): a freshly-restored run
+    /// whose graph still holds a PENDING implement step must ATTEMPT that
+    /// implement dispatch — not fall into the canned unattempted-implementation
+    /// Partial. Asserts on the dispatch attempt itself (`SubTaskStarted` for
+    /// the coder), never merely on the absence of the guard note.
+    #[tokio::test]
+    async fn resume_with_pending_implement_step_dispatches_the_coder() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mut rx = bus.subscribe();
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), "designed"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+        ];
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text(String::new())],
+        )
+        .with_review_store(Some(pool.clone()))
+        // The plan was approved: implementation is promised, so the completion
+        // guard is armed exactly as it is on the live run.
+        .with_run_shape_context(RunShapeContext { has_approved_plan: true, ..Default::default() });
+
+        let workspace = tempfile::tempdir().expect("tempdir for test workspace");
+        let session_id = Ulid::new();
+        let project_id = concerto_core::types::ProjectId::resolve(workspace.path()).0;
+        let cp_json = stop_before_coder_checkpoint_json(
+            &project_id,
+            session_id,
+            TaskId::new(),
+            TaskId::new(),
+        );
+
+        let task = AgentTask::new_action_required(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), Some(cp_json))
+            .await
+            .expect("resumed run should return an output");
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+        let coder_dispatched = events.iter().any(|kind| {
+            matches!(kind, EventKind::SubTaskStarted { role, .. } if role.as_str() == "coder")
+        });
+        assert!(
+            coder_dispatched,
+            "a restored PENDING implement step must be dispatched on resume; the run ended \
+             {:?} with message: {}",
+            output.completion_status, output.final_message
+        );
+        assert!(
+            !output.final_message.contains("Unattempted-implementation guard"),
+            "the unattempted-implementation guard must not fire when dispatch was attempted: {}",
+            output.final_message
+        );
+    }
+
+    /// Resume-drive regression (stop-before-coder, settled shape): the
+    /// durable row the stop actually leaves behind holds ONLY the settled
+    /// design step — zero implement dispatches, no code artifact, every node
+    /// Completed. The resumed run must dispatch the coder from the restored
+    /// decision loop, not fall into the canned unattempted-implementation
+    /// Partial. Asserts on the dispatch attempt itself (`SubTaskStarted` for
+    /// the coder), never merely on the absence of the guard note.
+    #[tokio::test]
+    async fn resume_with_design_only_checkpoint_dispatches_the_pending_implement_step() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mut rx = bus.subscribe();
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), "designed"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+        ];
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist("coder", "implement the plan")]),
+                CoordinatorTurn::Text("done".into()),
+            ],
+        )
+        .with_review_store(Some(pool.clone()))
+        .with_run_shape_context(RunShapeContext { has_approved_plan: true, ..Default::default() });
+
+        let workspace = tempfile::tempdir().expect("tempdir for test workspace");
+        let session_id = Ulid::new();
+        let project_id = concerto_core::types::ProjectId::resolve(workspace.path()).0;
+        let design_id = TaskId::new();
+        let cp_json = design_only_checkpoint_json(&project_id, session_id, design_id);
+
+        let task = AgentTask::new_action_required(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), Some(cp_json))
+            .await
+            .expect("resumed run should return an output");
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+        let coder_dispatched = events.iter().any(|kind| {
+            matches!(kind, EventKind::SubTaskStarted { role, .. } if role.as_str() == "coder")
+        });
+        assert!(
+            coder_dispatched,
+            "a fully-settled-but-unattempted implement stage must be dispatched on resume; the \
+             run ended {:?} with message: {}",
+            output.completion_status, output.final_message
+        );
+        assert!(
+            !output.final_message.contains("Unattempted-implementation guard"),
+            "the unattempted-implementation guard must not fire when dispatch was attempted: {}",
+            output.final_message
+        );
+        assert!(
+            !completion_guard_decision(&pool, "completion-blocked-unattempted-implementation")
+                .await,
+            "no unattempted-implementation verdict may be recorded once the dispatch was attempted"
+        );
+    }
+
+    /// Resume-drive end to end over REAL storage (two runs, ONE session row):
+    /// phase 1 is a deliberate operator stop while the coder dispatch is in
+    /// flight — the settle-persist wrote the design-only row and the stopped
+    /// coder never reaches one, exactly like a live stop mid-decision-loop.
+    /// Phase 2 is a FRESH coordinator resuming from that durable row: it must
+    /// dispatch the pending implement step from the restored decision loop
+    /// (the drive's `<resume_drive>` instruction reaches the provider), not
+    /// fall into the canned unattempted-implementation Partial. The architect
+    /// is registered as a canary that always fails, so a re-dispatch of the
+    /// settled design step cannot pass unnoticed.
+    ///
+    /// The two phases also pin the run-history audit: phase 1 publishes a
+    /// cancelled `SpecialistDispatchOutcome` (issued, then stopped) and a
+    /// `RunInterruptedByUser` under the SAME non-null run id, and phase 2
+    /// publishes `CheckpointRestored` naming the run it resumed.
+    #[tokio::test]
+    async fn interrupted_run_resumes_into_the_pending_implement_dispatch() {
+        let dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let (_log_dir, pool) = resume_log_pool().await;
+        let store = Arc::new(
+            concerto_sessions::SqliteSessionStore::connect_in_memory()
+                .await
+                .expect("in-memory session store"),
+        );
+        let project = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .expect("test project dir is UTF-8");
+        let session_id = store
+            .create_session(&project, "mock", "test-model", CancellationToken::new())
+            .await
+            .expect("create session row")
+            .id;
+        let session_context = |session_id: Ulid| {
+            AgentContext::new(concerto_core::types::SessionContext::new(
+                session_id,
+                dir.path().to_path_buf(),
+            ))
+        };
+
+        // ── Phase 1: the architect settles, then the operator stops the run
+        // while the coder dispatch is in flight, leaving the design-only
+        // durable row behind. ───────────────────────────────────────────────
+        let bus = EventBus::new(256);
+        let mut rx = bus.subscribe();
+        let stop = CancellationToken::new();
+        let provider = Arc::new(
+            TurnProvider::new(vec![
+                CoordinatorTurn::Calls(vec![call_specialist("architect", "design it")]),
+                CoordinatorTurn::Calls(vec![call_specialist("coder", "implement the plan")]),
+            ])
+            .with_terminal_error(ProviderError::Cancelled),
+        );
+        let mut coordinator = coordinator_with_turn_provider(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![
+                MockExpertAgent::always_succeed(AgentId::new("architect"), "designed"),
+                // The stop lands INSIDE the coder's call: the mock cancels the
+                // run token and reports the interrupted call, so the dispatch
+                // outcome is recorded as cancelled AND issued.
+                MockExpertAgent::sequence(
+                    AgentId::new("coder"),
+                    vec![Err(OrchestratorError::Cancelled)],
+                )
+                .cancel_on_run(stop.clone()),
+            ])),
+            provider,
+        )
+        .with_checkpoint_store(
+            Some(store.clone() as Arc<dyn concerto_sessions::SessionStore>),
+            None,
+        )
+        .with_review_store(Some(pool.clone()))
+        .with_run_shape_context(RunShapeContext { has_approved_plan: true, ..Default::default() });
+        let first = coordinator
+            .run(
+                AgentTask::new_action_required(session_id, "build the thing"),
+                session_context(session_id),
+                stop,
+                None,
+            )
+            .await
+            .expect("the interrupted run still returns an output");
+        assert_eq!(
+            first.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "a deliberate stop surfaces as Partial: {}",
+            first.final_message
+        );
+        let mut first_events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            first_events.push(event.kind.clone());
+        }
+        let (interrupt_run_id, interrupt_session_id, at_stage) = first_events
+            .iter()
+            .find_map(|kind| match kind {
+                EventKind::RunInterruptedByUser { run_id, session_id, at_stage, .. } => {
+                    Some((run_id.clone(), *session_id, at_stage.clone()))
+                }
+                _ => None,
+            })
+            .expect("the stop is recorded in the run history");
+        assert_eq!(at_stage, "planning", "the stop landed in the decision session");
+        let (outcome_run_id, outcome_session_id, attempted, reason) = first_events
+            .iter()
+            .find_map(|kind| match kind {
+                EventKind::SpecialistDispatchOutcome {
+                    run_id,
+                    session_id,
+                    role,
+                    attempted,
+                    outcome,
+                    reason,
+                    ..
+                } if role.as_str() == "coder" && outcome == "cancelled" => {
+                    Some((run_id.clone(), *session_id, *attempted, reason.clone()))
+                }
+                _ => None,
+            })
+            .expect("the stopped coder dispatch is recorded as a cancelled outcome");
+        assert!(attempted, "the coder call was issued before the stop");
+        assert_eq!(
+            reason.as_deref(),
+            Some("interrupted by user stop"),
+            "the cancelled outcome states the user-stop cause: {reason:?}"
+        );
+        let interrupt_run_id = interrupt_run_id
+            .as_deref()
+            .expect("the planning interrupt carries the session's run id");
+        let outcome_run_id =
+            outcome_run_id.as_deref().expect("the dispatch outcome carries a run id");
+        assert_eq!(
+            outcome_run_id, interrupt_run_id,
+            "the dispatch outcome and the interrupt name the same run"
+        );
+        assert_eq!(
+            outcome_session_id, interrupt_session_id,
+            "both events belong to the stopped session"
+        );
+        let record = store
+            .load_orchestration_checkpoint(session_id)
+            .await
+            .expect("checkpoint store read")
+            .expect("the stop leaves a resumable row behind");
+        let restored: crate::checkpoint::GraphCheckpoint =
+            serde_json::from_str(&record.state_json).expect("durable row loads");
+        assert_eq!(restored.subtasks.len(), 1, "the cancelled coder was never settled");
+        assert!(
+            restored.subtasks.iter().all(|sub| sub.status == SubTaskStatus::Completed),
+            "only the settled design step is durable"
+        );
+
+        // ── Phase 2: a fresh coordinator over the SAME session row resumes
+        // from that durable checkpoint. ─────────────────────────────────────
+        let bus = EventBus::new(256);
+        let mut rx = bus.subscribe();
+        let provider = Arc::new(TurnProvider::new(vec![
+            CoordinatorTurn::Calls(vec![call_specialist("coder", "implement the plan")]),
+            CoordinatorTurn::Text("done".into()),
+        ]));
+        let mut coordinator = coordinator_with_turn_provider(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![
+                // Canary: the settled design step must never re-dispatch.
+                MockExpertAgent::always_fail(AgentId::new("architect"), "must not be dispatched"),
+                MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                    .with_artifact_writer(),
+            ])),
+            provider.clone(),
+        )
+        .with_checkpoint_store(
+            Some(store.clone() as Arc<dyn concerto_sessions::SessionStore>),
+            None,
+        )
+        .with_review_store(Some(pool.clone()))
+        .with_run_shape_context(RunShapeContext { has_approved_plan: true, ..Default::default() });
+        let second = coordinator
+            .run(
+                AgentTask::new_action_required(session_id, "build the thing"),
+                session_context(session_id),
+                CancellationToken::new(),
+                Some(record.state_json),
+            )
+            .await
+            .expect("resumed run should return an output");
+
+        let mut second_events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            second_events.push(event.kind.clone());
+        }
+        assert!(
+            second_events.iter().any(|kind| matches!(
+                kind,
+                EventKind::SubTaskStarted { role, .. } if role.as_str() == "coder"
+            )),
+            "the resumed run must dispatch the pending implement step; it ended {:?}: {}",
+            second.completion_status,
+            second.final_message
+        );
+        let restored_run_id = second_events
+            .iter()
+            .find_map(|kind| match kind {
+                EventKind::CheckpointRestored { run_id, .. } => Some(run_id.clone()),
+                _ => None,
+            })
+            .expect("the resume restore is recorded in the run history");
+        assert!(
+            restored_run_id.as_deref().is_some_and(|id| !id.is_empty()),
+            "the restored checkpoint names the run it resumed: {restored_run_id:?}"
+        );
+        assert!(
+            provider.message_contents().iter().any(|content| content.contains("<resume_drive>")),
+            "the restored run re-entered the decision loop behind the drive's instruction"
+        );
+        assert!(
+            !second.final_message.contains("Unattempted-implementation guard"),
+            "the unattempted-implementation guard must not fire: {}",
+            second.final_message
+        );
+        assert!(
+            !completion_guard_decision(&pool, "completion-blocked-unattempted-implementation")
+                .await,
+            "no unattempted-implementation verdict may be recorded once the dispatch was attempted"
+        );
+    }
+
+    /// The design-only checkpoint as the decision loop actually persists it:
+    /// the stop landed after the design step settled but BEFORE the pending
+    /// coder was persisted (the settle-persist never ran), so the durable row
+    /// holds only the settled design step, ZERO implement dispatches on the
+    /// ledger, and no binding doc / expected artifacts. The shape behind the
+    /// completion guard's unattempted-implementation verdict.
+    fn design_only_checkpoint_json(
+        project_id: &str,
+        session_id: Ulid,
+        design_id: TaskId,
+    ) -> String {
+        let stamp = [2026, 254, 0, 0, 0, 0, 0, 0, 0];
+        serde_json::json!({
+            "schema_version": 4,
+            "run_id": Ulid::new().to_string(),
+            "session_id": session_id.to_string(),
+            "root_task_id": design_id.to_string(),
+            "project_id": project_id,
+            "objective": "build the thing",
+            "objective_hash": blake3::hash("build the thing".as_bytes()).to_hex().to_string(),
+            "stage": "Executing",
+            "completed": false,
+            "subtasks": [{
+                "id": design_id.to_string(),
+                "parent_id": null,
+                "session_id": session_id.to_string(),
+                "role": "architect",
+                "description": "design the thing",
+                "status": "Completed",
+                "dependencies": [],
+                "deliverable": "designed",
+            }],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+            "action_ledger": [
+                { "kind": "dispatched", "task_id": design_id.to_string(), "timestamp": stamp },
+                { "kind": "completed", "task_id": design_id.to_string(), "timestamp": stamp },
+            ],
+        })
+        .to_string()
+    }
+
+    /// A v4 checkpoint for a run that SETTLED one subtask which declared an
+    /// artifact — the exact shape Phase 6 M3c's drift investigation scopes to:
+    /// the `completed_results` entry (a settled node) plus the per-task
+    /// `expected_artifacts` declaration (what may drift), and the run-start
+    /// `snapshot_generation` the classified diff is baselined against.
+    fn settled_artifact_checkpoint_json(
+        project_id: &str,
+        session_id: Ulid,
+        design_id: TaskId,
+        artifact: &str,
+        snapshot_generation: &str,
+    ) -> String {
+        let stamp = [2026, 254, 0, 0, 0, 0, 0, 0, 0];
+        let result = success_result(design_id, "architect", "designed");
+        let mut completed_results = serde_json::Map::new();
+        completed_results.insert(
+            design_id.to_string(),
+            serde_json::to_value(&result).expect("agent run result serializes"),
+        );
+        let mut expected_artifacts = serde_json::Map::new();
+        expected_artifacts.insert(design_id.to_string(), serde_json::json!([artifact]));
+        serde_json::json!({
+            "schema_version": 4,
+            "run_id": Ulid::new().to_string(),
+            "session_id": session_id.to_string(),
+            "root_task_id": design_id.to_string(),
+            "project_id": project_id,
+            "objective": "build the thing",
+            "objective_hash": blake3::hash("build the thing".as_bytes()).to_hex().to_string(),
+            "stage": "Executing",
+            "completed": false,
+            "subtasks": [{
+                "id": design_id.to_string(),
+                "parent_id": null,
+                "session_id": session_id.to_string(),
+                "role": "architect",
+                "description": "design the thing",
+                "status": "Completed",
+                "dependencies": [],
+                "deliverable": "designed",
+            }],
+            "edges": [],
+            "completed_results": completed_results,
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": expected_artifacts,
+            "subtask_attempts": {},
+            "retry_feedback": {},
+            "action_ledger": [
+                { "kind": "dispatched", "task_id": design_id.to_string(), "timestamp": stamp },
+                { "kind": "completed", "task_id": design_id.to_string(), "timestamp": stamp },
+            ],
+            "snapshot_generation": snapshot_generation,
+        })
+        .to_string()
+    }
+
+    /// Run-history audit: a deliberate operator stop mid-planning is recorded
+    /// as its own event carrying the stage that was cancelled. The interrupt
+    /// here lands AFTER the architect dispatch settled — the exact moment the
+    /// design-only durable row is left behind — and the `Partial` output alone
+    /// cannot distinguish it from a provider failure.
+    #[tokio::test]
+    async fn run_interrupt_during_planning_is_recorded_with_its_stage() {
+        let bus = EventBus::new(256);
+        let (_dir, pool) = resume_log_pool().await;
+        let provider = Arc::new(
+            TurnProvider::new(vec![CoordinatorTurn::Calls(vec![call_specialist(
+                "architect",
+                "design it",
+            )])])
+            .with_terminal_error(ProviderError::Cancelled),
+        );
+        let coordinator = coordinator_with_turn_provider(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+                AgentId::new("architect"),
+                "designed",
+            )])),
+            provider,
+        )
+        .with_review_store(Some(pool))
+        .with_run_shape_context(RunShapeContext { has_approved_plan: true, ..Default::default() });
+
+        let workspace = tempfile::tempdir().expect("tempdir for test workspace");
+        let (output, events) =
+            run_for_test_in_dir(coordinator, bus.clone(), workspace.path()).await;
+
+        assert!(
+            events.iter().any(|kind| {
+                matches!(kind, EventKind::SubTaskStarted { role, .. } if role.as_str() == "architect")
+            }),
+            "the architect must dispatch and settle before the interrupt"
+        );
+        let (at_stage, run_id) = events
+            .iter()
+            .find_map(|kind| match kind {
+                EventKind::RunInterruptedByUser { at_stage, run_id, .. } => {
+                    Some((at_stage.clone(), run_id.clone()))
+                }
+                _ => None,
+            })
+            .expect("the interrupt must be recorded in the run history");
+        assert_eq!(at_stage, "planning", "the stop landed in the decision session");
+        assert!(
+            run_id.as_deref().is_some_and(|id| !id.is_empty()),
+            "a fresh run's planning interrupt carries the session's run id: {run_id:?}"
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "an interrupted run reports a Partial: {}",
+            output.final_message
+        );
+    }
+
+    /// Run-history audit: restoring a checkpoint records the shape the resume
+    /// received — pending/completed counts and whether an implementation was
+    /// promised — BEFORE any resume-evaluator outcome mutates it. These are
+    /// the completion guard's key inputs, so a later unattempted-
+    /// implementation verdict can be audited against what was restored.
+    #[tokio::test]
+    async fn checkpoint_restore_records_the_shape_the_resume_received() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mut rx = bus.subscribe();
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), "designed"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                .with_artifact_writer(),
+        ];
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text(String::new())],
+        )
+        .with_review_store(Some(pool))
+        .with_run_shape_context(RunShapeContext { has_approved_plan: true, ..Default::default() });
+
+        let workspace = tempfile::tempdir().expect("tempdir for test workspace");
+        let session_id = Ulid::new();
+        let project_id = concerto_core::types::ProjectId::resolve(workspace.path()).0;
+        let cp_json = design_only_checkpoint_json(&project_id, session_id, TaskId::new());
+
+        let task = AgentTask::new_action_required(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let _output = coordinator
+            .run(task, context, CancellationToken::new(), Some(cp_json))
+            .await
+            .expect("resumed run should return an output");
+
+        let mut restored = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let EventKind::CheckpointRestored {
+                run_id,
+                pending_nodes,
+                completed_nodes,
+                plan_present,
+                ..
+            } = &event.kind
+            {
+                restored.push((run_id.clone(), *pending_nodes, *completed_nodes, *plan_present));
+            }
+        }
+        let (run_id, pending, completed, plan_present) =
+            restored.first().expect("the restore must be recorded in the run history");
+        assert_eq!(*pending, 0, "the design-only row holds no unfinished subtask");
+        assert_eq!(*completed, 1, "the settled design step is completed");
+        assert!(
+            !*plan_present,
+            "no binding doc and no expected artifacts: nothing promised an implementation yet"
+        );
+        assert!(
+            run_id.as_deref().is_some_and(|id| !id.is_empty()),
+            "the restore is tied to its checkpoint run: {run_id:?}"
         );
     }
 
@@ -27081,6 +31553,255 @@ mod tests {
         );
     }
 
+    /// Delegation doctrine (owner spec, prompt inversion): the rendered
+    /// dispatch prompt makes delegation the DEFAULT, removes the
+    /// "you are a full agent" self-execution blanket license (permitting
+    /// self-execution only in the enumerated exhaustion cases), and derives
+    /// role selection from the runtime roster rather than hardcoded roles.
+    #[tokio::test]
+    async fn dispatch_prompt_makes_delegation_the_default_and_self_execution_an_exhaustion_case() {
+        let bus = EventBus::new(256);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "implemented",
+        )]));
+        let (mut coordinator, provider) = coordinator_with_turns_captured(
+            bus,
+            registry,
+            vec![CoordinatorTurn::Text("nothing to do".into())],
+        );
+        let task = AgentTask::new(Ulid::new(), "build the thing");
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let _ = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("the run should complete");
+
+        let prompt = provider.prompts().into_iter().next().expect("one dispatch-decision prompt");
+        assert!(
+            prompt.contains("Delegation is the DEFAULT action"),
+            "delegation is the default for implementation/review/validation work"
+        );
+        assert!(
+            prompt.contains("Self-execution is permitted ONLY when you have exhausted the roster"),
+            "self-execution is an enumerated exhaustion case"
+        );
+        assert!(
+            !prompt.contains("you are a full agent"),
+            "the self-execution blanket license is deleted"
+        );
+        assert!(
+            prompt.contains("Selecting a specialist")
+                && prompt.contains("this prompt hardcodes no roles"),
+            "role selection is derived from the runtime roster, not hardcoded"
+        );
+        assert!(
+            prompt.contains("A stage tag is context, not a dispatch rule"),
+            "the stage tag stays advisory context (:266 remains true)"
+        );
+    }
+
+    /// Coordinator error invariant (prompt half): the dispatch prompt carries
+    /// the no-synthesis doctrine for a MISSING transform source, and never
+    /// carries the blanket "create it first" fallback license that let a
+    /// fabricated source satisfy a rename objective.
+    #[tokio::test]
+    async fn dispatch_prompt_forbids_synthesizing_a_missing_source() {
+        let bus = EventBus::new(256);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "implemented",
+        )]));
+        let (mut coordinator, provider) = coordinator_with_turns_captured(
+            bus,
+            registry,
+            vec![CoordinatorTurn::Text("nothing to do".into())],
+        );
+        let task = AgentTask::new(Ulid::new(), "build the thing");
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let _ = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("the run should complete");
+
+        let prompt = provider.prompts().into_iter().next().expect("one dispatch-decision prompt");
+        assert!(
+            prompt.contains("Transforming an EXISTING artifact (no synthesis)"),
+            "the doctrine block is present"
+        );
+        assert!(
+            prompt.contains(
+                "you must NOT create, stub, placeholder, or synthesize it. Surface the \
+                 discrepancy to the user through the request_user_input path, naming the exact \
+                 path you looked for"
+            ),
+            "absence is surfaced through the user-input path, naming the path"
+        );
+        assert!(
+            prompt.contains("Creating a file to satisfy a rename is not a rename"),
+            "creation is never offered as a substitute for the transformation"
+        );
+        assert!(
+            prompt.contains("absence is information to report, not an obstacle to route around"),
+            "absence is reported, not routed around"
+        );
+        assert!(
+            !prompt.contains("create it first"),
+            "the blanket create-the-missing-source fallback license is gone"
+        );
+        // The pre-existing doctrines must survive the addition intact.
+        assert!(
+            prompt.contains("Delegation is the DEFAULT action")
+                && prompt.contains(
+                    "Self-execution is permitted ONLY when you have exhausted the roster"
+                ),
+            "ADR-74 delegation doctrine is untouched"
+        );
+    }
+
+    /// The coordinator dispatch prompt runs through the shared `PromptBuilder`
+    /// seam, so the working-memory block (active run state + retrieved chunks)
+    /// reaches the model exactly as it does in the single-agent loop.
+    #[tokio::test]
+    async fn dispatch_prompt_carries_the_working_memory_block() {
+        let bus = EventBus::new(256);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "implemented",
+        )]));
+        let (mut coordinator, provider) = coordinator_with_turns_captured(
+            bus,
+            registry,
+            vec![CoordinatorTurn::Text("nothing to do".into())],
+        );
+        let task = AgentTask::new(Ulid::new(), "build the thing");
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let mut context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            workspace.path().to_path_buf(),
+        ));
+        // Active run state: one projected task node.
+        context.working_memory.task_tree.push(concerto_core::memory::TaskNode {
+            id: concerto_core::memory::TaskNodeId(Ulid::new()),
+            session_id: task.session_id,
+            description: "wire the module".into(),
+            status: concerto_core::memory::TaskStatus::Pending,
+            parent_id: None,
+            children: Vec::new(),
+            blocking: Vec::new(),
+            created_at: time::OffsetDateTime::now_utc(),
+        });
+        // Retrieved project memory: one chunk.
+        let project_id = concerto_core::memory::ProjectId("project-a".into());
+        context.retrieved_chunks.push(concerto_core::memory::MemoryChunk {
+            id: "chunk-1".into(),
+            project_id: project_id.clone(),
+            namespace: concerto_core::memory::MemoryNamespace::Project(project_id),
+            content: "the module graph is documented here".into(),
+            file_path: Some(camino::Utf8PathBuf::from("src/lib.rs")),
+            start_line: Some(1),
+            end_line: Some(3),
+            chunk_type: concerto_core::memory::ChunkType::Function,
+            score: 1.0,
+            model_id: "test".into(),
+            model_version: "1".into(),
+            stale: false,
+        });
+        let _ = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("the run should complete");
+
+        let prompt = provider.prompts().into_iter().next().expect("one dispatch-decision prompt");
+        assert!(
+            prompt.contains("<orchestration_run_state>") && prompt.contains("wire the module"),
+            "the active run state must reach the coordinator prompt: {prompt}"
+        );
+        assert!(
+            prompt.contains("<retrieved_project_memory>")
+                && prompt.contains("the module graph is documented here"),
+            "retrieved chunks must reach the coordinator prompt: {prompt}"
+        );
+    }
+
+    /// An empty working-memory block degrades cleanly: no leaked placeholder
+    /// and no invented working-memory header, in both assembly modes.
+    #[tokio::test]
+    async fn dispatch_prompt_empty_working_memory_degrades_cleanly() {
+        let task = AgentTask::new(Ulid::new(), "build the thing");
+        let state = DispatchSessionState::default();
+        let ledger = DispatchLedger::default();
+
+        for stable in [false, true] {
+            let bus = EventBus::new(64);
+            let registry =
+                Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+                    AgentId::new("coder"),
+                    "implemented",
+                )]));
+            let coordinator =
+                coordinator_with_turns(bus, registry, vec![]).with_cache_stable_prefix(stable);
+            let template =
+                coordinator.render_dispatch_system_prompt(&task, "", true, &state, &ledger);
+            let message = coordinator.build_dispatch_system_message(template, "");
+            assert!(
+                !message.content.contains("{working_memory}"),
+                "the placeholder must never leak (stable={stable}): {}",
+                message.content
+            );
+            assert!(
+                !message.content.contains("<working_memory>")
+                    && !message.content.contains("<orchestration_run_state>"),
+                "no working-memory header may be invented (stable={stable})"
+            );
+        }
+    }
+
+    /// With `cache_stable_prefix` enabled, the system-message head is
+    /// byte-identical across builds whose only difference is the working
+    /// memory; the working memory rides the volatile tail.
+    #[tokio::test]
+    async fn dispatch_prompt_stable_head_is_identical_across_working_memory() {
+        let bus = EventBus::new(64);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "implemented",
+        )]));
+        let coordinator =
+            coordinator_with_turns(bus, registry, vec![]).with_cache_stable_prefix(true);
+        let task = AgentTask::new(Ulid::new(), "build the thing");
+        let state = DispatchSessionState::default();
+        let ledger = DispatchLedger::default();
+        let template = coordinator.render_dispatch_system_prompt(&task, "", true, &state, &ledger);
+        let builder = crate::prompts::PromptBuilder::new(template.clone())
+            .with_shell_profile(coordinator.shell_profile.clone())
+            .with_cache_stable_prefix(true);
+        let head = builder.stable_system_head(None);
+
+        let first = coordinator
+            .build_dispatch_system_message(template.clone(), "<working_memory>A</working_memory>");
+        let second = coordinator
+            .build_dispatch_system_message(template, "<working_memory>B</working_memory>");
+        assert!(
+            first.content.starts_with(&head) && second.content.starts_with(&head),
+            "the stable head must be a byte-identical prefix of both builds"
+        );
+        assert!(
+            !head.contains("<working_memory>A") && !head.contains("<working_memory>B"),
+            "the working memory must not sit inside the stable head: {head}"
+        );
+        assert!(first.content.contains("<working_memory>A"));
+        assert!(second.content.contains("<working_memory>B"));
+    }
+
     /// The verified-clean consumption: a decision whose expected artifacts
     /// were produced by the run's own completed work gets the deterministic
     /// skip-recommendation advisory attached to its tool result — the world
@@ -27096,6 +31817,9 @@ mod tests {
             bus.clone(),
             Arc::clone(&registry),
             vec![
+                // Delegation doctrine: a mutating self-write is lawful only
+                // after a delegation attempt, so dispatch first.
+                CoordinatorTurn::Calls(vec![call_specialist("coder", "first pass")]),
                 CoordinatorTurn::Calls(vec![test_write_tool_call("src/main.rs")]),
                 CoordinatorTurn::Calls(vec![call_specialist_with_artifacts(
                     "coder",
@@ -27121,8 +31845,8 @@ mod tests {
 
         let prompts = provider.prompts();
         assert!(
-            prompts.len() >= 3,
-            "two scripted tool turns plus the final text, got {}",
+            prompts.len() >= 4,
+            "three scripted tool turns plus the final text, got {}",
             prompts.len()
         );
         // The advisory rides the call_specialist TOOL RESULT the model reads
@@ -27597,6 +32321,7 @@ mod tests {
                 ("src/held-resume.rs".to_owned(), Some("ev-1".to_owned())),
                 ("src/other.rs".to_owned(), None),
             ],
+            plan_drift: Vec::new(),
         };
         coordinator
             .record_resume_external_changes(
@@ -28733,33 +33458,213 @@ mod tests {
         )
         .with_workspace_snapshot(snapshot);
 
-        let mut expected: HashMap<TaskId, Vec<camino::Utf8PathBuf>> = HashMap::new();
-        expected.insert(completed_id, vec![camino::Utf8PathBuf::from("src/gone.rs")]);
-        expected.insert(pending_id, vec![camino::Utf8PathBuf::from("src/not_yet.rs")]);
+        let mut expected_map: HashMap<TaskId, Vec<camino::Utf8PathBuf>> = HashMap::new();
+        expected_map.insert(completed_id, vec![camino::Utf8PathBuf::from("src/gone.rs")]);
+        expected_map.insert(pending_id, vec![camino::Utf8PathBuf::from("src/not_yet.rs")]);
         let mut completed_results: HashMap<TaskId, AgentRunResult> = HashMap::new();
         completed_results
             .insert(completed_id, success_result(completed_id, "coder", "wrote the module"));
+        let entries = coordinator
+            .workspace_snapshot
+            .as_ref()
+            .expect("workspace snapshot set")
+            .entries
+            .clone();
 
         let task = AgentTask::new(Ulid::new(), "resume the plan");
         let mut rx = bus.subscribe();
-        coordinator.emit_plan_drift(
-            Some("plan-7"),
-            &expected,
+        // Step 1–2 (no baseline: the log window carried no run-start
+        // inventory), then step 4 — the publish half of the production path.
+        let investigation = crate::external_change::investigate_plan_drift(
+            &completed_expected_artifacts(&expected_map, &completed_results),
             &[],
-            &completed_results,
-            &[],
+            &entries,
+            &own_write_paths(&[], &completed_results, &[], directory.path()),
             directory.path(),
+        );
+        coordinator.publish_plan_drift(
             &task,
+            Some("plan-7"),
+            &investigation,
+            &["coder".to_owned()],
         );
 
         let event = rx.try_recv().expect("PlanDrift published");
-        let EventKind::PlanDrift { task_id, plan_id, affected_paths } = &event.kind else {
+        let EventKind::PlanDrift { task_id, plan_id, affected_paths, diff, reverify, redispatched } =
+            &event.kind
+        else {
             panic!("expected PlanDrift, got a different event kind");
         };
         assert_eq!(*task_id, task.id);
         assert_eq!(plan_id.as_deref(), Some("plan-7"));
         assert_eq!(*affected_paths, vec!["src/gone.rs".to_owned()]);
+        assert_eq!(diff.len(), 1, "one classified finding: {:?}", diff);
+        assert_eq!(
+            reverify[0].status,
+            concerto_core::event::PlanDriftReverifyStatus::Gone,
+            "an absent file re-verifies as gone: {:?}",
+            reverify
+        );
+        assert_eq!(*redispatched, vec!["coder".to_owned()]);
         assert!(rx.try_recv().is_err(), "exactly one drift event per evaluation");
+    }
+
+    /// Phase 6 M3c end to end (tampered worktree → classify → re-verify →
+    /// re-arm → re-dispatch): a settled design step declared
+    /// `docs/design.md`, the file was rewritten behind the run's back, and
+    /// the resumed run must (1) publish ONE drift signal carrying the
+    /// classified divergence, the live re-read verdict, and the re-armed
+    /// role, and (2) actually dispatch that settled step again through the
+    /// normal ready batch — never a silent continued run, never a halt on the
+    /// raw signal.
+    ///
+    /// Both inventories come from the production walk: the run-start one is
+    /// the `WorkspaceSnapshot` event the baseline reader consults, the live
+    /// one is the resume barrier's capture. Without the run-start baseline in
+    /// the log the present-but-altered file is NOT drift, so the assertions
+    /// also pin the baseline plumbing.
+    #[tokio::test]
+    async fn confirmed_plan_drift_rearms_and_redispatches_the_settled_step() {
+        let (_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mut rx = bus.subscribe();
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), "redesigned"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let workspace = tempfile::tempdir().expect("tempdir for drift workspace");
+        let cancel = CancellationToken::new();
+        let artifact_rel = "docs/design.md";
+        let artifact = workspace.path().join(artifact_rel);
+        std::fs::create_dir_all(artifact.parent().expect("docs dir"))
+            .expect("docs directory created");
+
+        // Run-start state: the artifact exactly as the run recorded it.
+        std::fs::write(&artifact, b"# the design as the run left it\n")
+            .expect("run-start artifact written");
+        let run_start_entries =
+            crate::workspace_snapshot::capture_workspace_snapshot(workspace.path(), &cancel);
+        let run_start = crate::workspace_snapshot::WorkspaceSnapshotRecord {
+            generation: crate::workspace_snapshot::generation_for(&run_start_entries),
+            entries: run_start_entries,
+            captured_at_ms: 1,
+            project_root: camino::Utf8PathBuf::from_path_buf(workspace.path().to_path_buf())
+                .expect("tempdir path is utf8"),
+        };
+
+        let session_id = Ulid::new();
+        // The baseline lives in the whiteboard log the resume's log window
+        // reads — session-scoped, exactly as the barrier persists it.
+        append_whiteboard_event(
+            &pool,
+            &NewWhiteboardEvent {
+                event_id: Ulid::new().to_string(),
+                agent_id: "workspace-snapshot".to_owned(),
+                kind: WhiteboardKind::WorkspaceSnapshot,
+                scope: String::new(),
+                session_id: Some(session_id.to_string()),
+                plan_id: None,
+                causation: None,
+                payload: serde_json::to_value(run_start.as_payload()).expect("payload serializes"),
+                pre_image_hash: None,
+                created_at: 1,
+            },
+        )
+        .await
+        .expect("run-start baseline appended");
+
+        // The tamper: an external reviewer rewrites the artifact.
+        std::fs::write(&artifact, b"# rewritten by an external reviewer\n")
+            .expect("tampered artifact written");
+        let live_entries =
+            crate::workspace_snapshot::capture_workspace_snapshot(workspace.path(), &cancel);
+        let live = crate::workspace_snapshot::WorkspaceSnapshotRecord {
+            generation: crate::workspace_snapshot::generation_for(&live_entries),
+            entries: live_entries,
+            captured_at_ms: 2,
+            project_root: camino::Utf8PathBuf::from_path_buf(workspace.path().to_path_buf())
+                .expect("tempdir path is utf8"),
+        };
+
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text(String::new())],
+        )
+        .with_review_store(Some(pool.clone()))
+        .with_run_shape_context(RunShapeContext { has_approved_plan: true, ..Default::default() })
+        .with_workspace_snapshot(live);
+
+        let project_id = concerto_core::types::ProjectId::resolve(workspace.path()).0;
+        let design_id = TaskId::new();
+        let cp_json = settled_artifact_checkpoint_json(
+            &project_id,
+            session_id,
+            design_id,
+            artifact_rel,
+            &run_start.generation,
+        );
+
+        let task = AgentTask::new_action_required(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(task, context, CancellationToken::new(), Some(cp_json))
+            .await
+            .expect("resumed run should return an output");
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        // 1. ONE drift signal: classified divergence + live re-read + who was
+        //    re-dispatched (the wording both frontends render).
+        let drift = events
+            .iter()
+            .find_map(|kind| match kind {
+                EventKind::PlanDrift { affected_paths, diff, reverify, redispatched, .. } => Some(
+                    (affected_paths.clone(), diff.clone(), reverify.clone(), redispatched.clone()),
+                ),
+                _ => None,
+            })
+            .expect("a confirmed divergence must publish exactly one PlanDrift");
+        assert_eq!(drift.0, vec![artifact_rel.to_owned()], "names the drifted artifact");
+        assert_eq!(
+            drift.1[0].class,
+            concerto_core::event::PlanDriftDiffClass::AlteredHash,
+            "present-and-changed against the run-start baseline: {:?}",
+            drift.1
+        );
+        assert_eq!(
+            drift.2[0].status,
+            concerto_core::event::PlanDriftReverifyStatus::Diverged,
+            "the live re-read confirms the divergence: {:?}",
+            drift.2
+        );
+        assert_eq!(drift.3, vec!["architect".to_owned()], "the settled step is re-armed");
+        assert!(
+            events.iter().filter(|kind| matches!(kind, EventKind::PlanDrift { .. })).count() == 1,
+            "exactly one drift signal per resume"
+        );
+
+        // 2. The settled step is dispatched AGAIN — the re-dispatch is an
+        //    attempt on the normal policy-gated path, not a claim.
+        let re_dispatched = events.iter().any(|kind| {
+            matches!(kind, EventKind::SubTaskStarted { role, .. } if role.as_str() == "architect")
+        });
+        assert!(
+            re_dispatched,
+            "the drift-rearmed architect must be dispatched again; the run ended {:?} with: {}",
+            output.completion_status, output.final_message
+        );
+        assert!(
+            !output.final_message.contains("Plan-drift re-verification failed"),
+            "a confirmed divergence is not a re-verification failure: {}",
+            output.final_message
+        );
     }
 
     /// M3c: when every completed subtask's declared artifact is present in the
@@ -28790,25 +33695,127 @@ mod tests {
         )
         .with_workspace_snapshot(snapshot);
 
-        let mut expected: HashMap<TaskId, Vec<camino::Utf8PathBuf>> = HashMap::new();
-        expected.insert(completed_id, vec![camino::Utf8PathBuf::from("src/present.rs")]);
+        let mut expected_map: HashMap<TaskId, Vec<camino::Utf8PathBuf>> = HashMap::new();
+        expected_map.insert(completed_id, vec![camino::Utf8PathBuf::from("src/present.rs")]);
         let mut completed_results: HashMap<TaskId, AgentRunResult> = HashMap::new();
         completed_results
             .insert(completed_id, success_result(completed_id, "coder", "wrote the module"));
+        let entries = coordinator
+            .workspace_snapshot
+            .as_ref()
+            .expect("workspace snapshot set")
+            .entries
+            .clone();
 
         let task = AgentTask::new(Ulid::new(), "resume the plan");
         let mut rx = bus.subscribe();
-        coordinator.emit_plan_drift(
-            Some("plan-8"),
-            &expected,
+        let investigation = crate::external_change::investigate_plan_drift(
+            &completed_expected_artifacts(&expected_map, &completed_results),
             &[],
-            &completed_results,
-            &[],
+            &entries,
+            &own_write_paths(&[], &completed_results, &[], directory.path()),
             directory.path(),
-            &task,
         );
+        coordinator.publish_plan_drift(&task, Some("plan-8"), &investigation, &[]);
 
+        assert!(
+            investigation.is_empty(),
+            "present artifacts are not a finding: {:?}",
+            investigation
+        );
         assert!(rx.try_recv().is_err(), "present artifacts must not report drift");
+    }
+
+    /// The PlanDrift/C-06 existence-check fix: `"<path>: <description>"`
+    /// declarations are `undeclared/unverifiable`, not drift. Prose-only
+    /// expectations publish NO `PlanDrift` event (they are logged instead),
+    /// while a genuinely absent real path alongside them still publishes.
+    #[test]
+    fn plan_drift_never_publishes_for_prose_only_declarations() {
+        let bus = EventBus::new(64);
+        let directory = tempfile::tempdir().expect("tempdir for drift workspace");
+        let completed_id = TaskId::new();
+
+        let snapshot = crate::workspace_snapshot::WorkspaceSnapshotRecord {
+            generation: "gen-3".into(),
+            entries: vec![concerto_sessions::SnapshotEntry {
+                path: "src/untouched.rs".into(),
+                size_bytes: Some(1),
+                mtime_ms: Some(1),
+                content_hash: Some("h".into()),
+            }],
+            captured_at_ms: 3,
+            project_root: camino::Utf8PathBuf::from_path_buf(directory.path().to_path_buf())
+                .expect("tempdir path is utf8"),
+        };
+        let coordinator = coordinator_for_ladder(
+            bus.clone(),
+            Vec::new(),
+            concerto_config::ModelPinConfig::default(),
+            Arc::new(MockProvider::default()),
+        )
+        .with_workspace_snapshot(snapshot);
+
+        let descriptions = [
+            "DESIGN.md: Comprehensive design document as specified in the requirements.",
+            "src/components/StatusIndicator/StatusIcon.tsx: Component for rendering status icons.",
+        ];
+        let mut completed_results: HashMap<TaskId, AgentRunResult> = HashMap::new();
+        completed_results
+            .insert(completed_id, success_result(completed_id, "coder", "wrote the design"));
+
+        let task = AgentTask::new(Ulid::new(), "resume the plan");
+        let mut rx = bus.subscribe();
+
+        let entries = coordinator
+            .workspace_snapshot
+            .as_ref()
+            .expect("workspace snapshot set")
+            .entries
+            .clone();
+        let own_written = own_write_paths(&[], &completed_results, &[], directory.path());
+        let publish = |map: &HashMap<TaskId, Vec<camino::Utf8PathBuf>>| {
+            let investigation = crate::external_change::investigate_plan_drift(
+                &completed_expected_artifacts(map, &completed_results),
+                &[],
+                &entries,
+                &own_written,
+                directory.path(),
+            );
+            coordinator.publish_plan_drift(&task, Some("plan-9"), &investigation, &[]);
+            investigation
+        };
+
+        // Prose-only declarations: nothing is drift, so nothing is published.
+        let mut prose_only: HashMap<TaskId, Vec<camino::Utf8PathBuf>> = HashMap::new();
+        prose_only
+            .insert(completed_id, descriptions.iter().map(camino::Utf8PathBuf::from).collect());
+        let prose_investigation = publish(&prose_only);
+        assert_eq!(
+            prose_investigation.unverifiable.len(),
+            descriptions.len(),
+            "prose lands in the declaration-quality bucket: {:?}",
+            prose_investigation.unverifiable
+        );
+        assert!(prose_investigation.is_empty(), "prose is never a drift finding");
+        assert!(rx.try_recv().is_err(), "prose-only declarations must publish no event");
+
+        // Prose alongside a genuinely absent real path: exactly ONE event,
+        // naming ONLY the real path.
+        let mut mixed = prose_only;
+        mixed.insert(completed_id, {
+            let mut paths: Vec<camino::Utf8PathBuf> =
+                descriptions.iter().map(camino::Utf8PathBuf::from).collect();
+            paths.push(camino::Utf8PathBuf::from("src/gone.rs"));
+            paths
+        });
+        publish(&mixed);
+        let event = rx.try_recv().expect("real missing path publishes PlanDrift");
+        let EventKind::PlanDrift { affected_paths, .. } = &event.kind else {
+            panic!("expected PlanDrift, got a different event kind");
+        };
+        assert_eq!(*affected_paths, vec!["src/gone.rs".to_owned()]);
+        assert!(rx.try_recv().is_err(), "exactly one drift event per evaluation");
     }
 
     /// Phase 6 M3 (#2 + `kill_midrun_resume_produces_grounded_plan`): a run
@@ -30416,11 +35423,67 @@ mod tests {
     }
 
     /// Three consecutive `architect` dispatches on one objective with no
-    /// implement/code artifact: the guard fires as ADVICE and the run does NOT
-    /// force `AwaitingUser` — the Coordinator's next turn runs normally, while
-    /// the loop evidence surfaces via the ledger note (a `Partial` exit).
+    /// deliverable, then a FOURTH `architect` dispatch: instead of re-running
+    /// `architect`, the repeat-dispatch path escalates through the agent axis
+    /// to the same-stage peer `architect-alt`, which covers the work. The run
+    /// does not self-execute and does not pause.
     #[tokio::test]
-    async fn same_role_dispatch_cap_is_advisory_and_does_not_escalate() {
+    async fn same_role_cap_escalates_to_a_covering_specialist() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), "designed"),
+            MockExpertAgent::always_succeed(AgentId::new("architect-alt"), "covered the design")
+                .with_stage(Some(AgentStage::new("design"))),
+        ];
+        let registry = AgentRegistry::from_mocks(mocks);
+        let (output, events) = run_for_test(
+            coordinator_with_turns(
+                bus.clone(),
+                Arc::new(registry),
+                vec![
+                    CoordinatorTurn::Calls(vec![call_specialist("architect", "design it")]),
+                    CoordinatorTurn::Calls(vec![call_specialist("architect", "design it again")]),
+                    CoordinatorTurn::Calls(vec![call_specialist(
+                        "architect",
+                        "design it once more",
+                    )]),
+                    // The cap was reached: this fourth architect dispatch is
+                    // re-targeted to the covering peer, not re-run.
+                    CoordinatorTurn::Calls(vec![call_specialist(
+                        "architect",
+                        "design it yet again",
+                    )]),
+                    CoordinatorTurn::Text("escalated and done".into()),
+                ],
+            ),
+            bus.clone(),
+        )
+        .await;
+
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::SubTaskStarted { role, .. } if role == &AgentId::new("architect-alt")
+            )),
+            "the covering specialist must be dispatched after the cap: {events:?}"
+        );
+        assert!(
+            output.final_message.contains("Same-role dispatch cap escalation"),
+            "the escalation must be recorded: {}",
+            output.final_message
+        );
+        assert!(
+            !output.final_message.contains("coordinator self-execute"),
+            "escalation must not be a self-execution: {}",
+            output.final_message
+        );
+    }
+
+    /// Three consecutive `architect` dispatches and a fourth when NO other
+    /// specialist can cover the stage: the run stops at the user-input
+    /// decision point instead of looping the same role.
+    #[tokio::test]
+    async fn same_role_cap_stops_at_decision_point_without_alternative() {
         let bus = EventBus::new(256);
         let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("architect"), "designed")];
         let registry = AgentRegistry::from_mocks(mocks);
@@ -30435,23 +35498,26 @@ mod tests {
                         "architect",
                         "design it once more",
                     )]),
-                    // The advisory cap never forces a stop, so this turn runs.
-                    CoordinatorTurn::Text("the coordinator decides to stop here".into()),
+                    CoordinatorTurn::Calls(vec![call_specialist(
+                        "architect",
+                        "design it yet again",
+                    )]),
+                    CoordinatorTurn::Text("never reached".into()),
                 ],
             ),
             bus.clone(),
         )
         .await;
 
-        assert_ne!(
+        assert_eq!(
             output.completion_status,
             concerto_core::types::AgentCompletionStatus::AwaitingUser,
-            "the same-role cap is advisory and must not escalate: {:?}",
+            "with no covering specialist the cap must surface the decision point: {:?}",
             output.completion_status
         );
         assert!(
-            output.final_message.contains("Same-role dispatch guard"),
-            "the guard evidence must surface in the final message: {}",
+            output.final_message.contains("Same-role dispatch cap"),
+            "the cap evidence must surface in the final message: {}",
             output.final_message
         );
         assert!(output.checkpoint_json.is_some(), "the run must keep its checkpoint for resume");
@@ -30598,56 +35664,84 @@ mod tests {
         );
     }
 
-    /// With a BINDING (Verified) DesignDoc the guard returns a bounded
-    /// ADVISORY nudge recommending a different implement-stage role — it never
-    /// forces a role and never escalates; re-dispatching stays the
-    /// Coordinator's decision.
+    /// A rename-style objective delivers a FILE (here a `.txt`), not a code
+    /// artifact. Because the code-artifact expectation is derived from the
+    /// objective/subtask deliverable, the cap must NOT fire on it: the
+    /// presence of the file deliverable resets the streak and no
+    /// "no code artifact" claim is ever recorded.
     #[tokio::test]
-    async fn same_role_dispatch_cap_is_advisory_when_design_doc_binds() {
-        let bus = EventBus::new(256);
-        let mocks =
-            vec![MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON)];
-        let mut registry = AgentRegistry::from_mocks(mocks);
-        registry.attach_configs_for_test(
-            std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
-        );
-        let (coordinator, provider) = coordinator_with_turns_captured(
-            bus.clone(),
-            Arc::new(registry),
-            vec![
-                CoordinatorTurn::Calls(vec![call_specialist("architect", "design it")]),
-                CoordinatorTurn::Calls(vec![call_specialist("architect", "refine the design")]),
-                CoordinatorTurn::Calls(vec![call_specialist("architect", "revisit the design")]),
-                CoordinatorTurn::Text("stopping after the guard redirect".into()),
-            ],
-        );
-        let coord = coordinator.with_workspace_snapshot(grounded_snapshot(&["src/a.rs"]));
-        let (output, _events) = run_for_test(coord, bus.clone()).await;
+    async fn rename_objective_does_not_trip_the_code_artifact_cap() {
+        let bus = EventBus::new(64);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "renamed",
+        )]));
+        let mut coordinator = coordinator_with_turns(bus, registry, vec![]);
+        let coder = AgentId::new("coder");
+        let task_id = TaskId::new();
+        let session = Ulid::new();
+        let mut state = DispatchSessionState::default();
+        // The rename produced its file deliverable (a non-code extension).
+        let mut ledger = DispatchLedger {
+            all_files: vec![camino::Utf8PathBuf::from("test_pass.txt")],
+            ..Default::default()
+        };
 
-        assert_ne!(
-            output.completion_status,
-            concerto_core::types::AgentCompletionStatus::AwaitingUser,
-            "the advisory guard never escalates"
-        );
-        let nudge = provider
-            .tool_result_contents()
-            .into_iter()
-            .find_map(|result| {
-                let guard = result.get("guard")?;
-                (guard.get("same_role_guard").and_then(serde_json::Value::as_str)
-                    == Some("advisory"))
-                .then(|| guard.get("nudge").and_then(serde_json::Value::as_str).map(str::to_owned))
-                .flatten()
-            })
-            .expect("the advisory guard nudge must ride the tool result");
+        for _ in 0..3 {
+            let guard = coordinator.apply_same_role_dispatch_cap(
+                &mut state,
+                &coder,
+                task_id,
+                session,
+                false,
+                // Derived from the rename objective: no code artifact expected.
+                false,
+                &mut ledger,
+            );
+            assert!(guard.is_none(), "a produced file deliverable must reset the cap");
+        }
+        assert!(state.capped_role.is_none(), "the rename objective must never be capped");
         assert!(
-            nudge.contains("different implement-stage"),
-            "the nudge must recommend a different role: {nudge}"
+            !ledger.notes.iter().any(|note| note.contains("code artifact")),
+            "a rename must not be judged as a missing code artifact: {:?}",
+            ledger.notes
         );
-        assert!(
-            nudge.contains("remains") && nudge.contains("your decision"),
-            "the nudge must not force a role: {nudge}"
-        );
+    }
+
+    /// The cap records its loop evidence ONCE per episode even when the model
+    /// keeps re-dispatching the same role: the note is not duplicated verbatim
+    /// into the final message.
+    #[tokio::test]
+    async fn same_role_cap_note_is_recorded_once() {
+        let bus = EventBus::new(64);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "implemented",
+        )]));
+        let mut coordinator = coordinator_with_turns(bus, registry, vec![]);
+        let coder = AgentId::new("coder");
+        let task_id = TaskId::new();
+        let session = Ulid::new();
+        let mut state = DispatchSessionState::default();
+        let mut ledger = DispatchLedger::default();
+
+        // Three consecutive code-edit dispatches with no code artifact reach
+        // the cap; further settles must not repeat the note.
+        for _ in 0..5 {
+            let _ = coordinator.apply_same_role_dispatch_cap(
+                &mut state,
+                &coder,
+                task_id,
+                session,
+                false,
+                true,
+                &mut ledger,
+            );
+        }
+        let notes =
+            ledger.notes.iter().filter(|note| note.contains("Same-role dispatch cap")).count();
+        assert_eq!(notes, 1, "the cap note must be recorded exactly once: {:?}", ledger.notes);
+        assert!(state.capped_role.as_ref() == Some(&coder));
     }
 
     // ------------------------------------------------------------------
@@ -30951,6 +36045,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: true,
+            path_facts: None,
         };
         let plain_action =
             PolicyAction { orchestrator_authority: false, ..authority_action.clone() };

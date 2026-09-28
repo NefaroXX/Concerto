@@ -153,6 +153,12 @@ pub struct PlanDrift {
     /// are absent from the live inventory and unexplained by the run's own
     /// writes. Sorted and deduplicated.
     pub affected_paths: Vec<String>,
+    /// Declared entries with no parseable file path (prose a model emitted
+    /// where a path was expected). Logged as a malformed declaration, NEVER
+    /// counted as drift — see [`crate::declared_artifacts`]. Sorted and
+    /// deduplicated. Additive field: older records deserialize as empty.
+    #[serde(default)]
+    pub unverifiable: Vec<String>,
 }
 
 impl PlanDrift {
@@ -173,43 +179,297 @@ impl PlanDrift {
 ///
 /// Non-file expectations (empty, directory — trailing `/` — or glob patterns)
 /// cannot be verified against a file inventory and are skipped rather than
-/// reported as false drift.
+/// reported as false drift. Prose declarations (a description where a path
+/// was expected) are collected into [`PlanDrift::unverifiable`] instead —
+/// they are a malformed declaration, never workspace drift.
 pub fn detect_plan_drift(
     plan_id: Option<&str>,
     expected: &[camino::Utf8PathBuf],
     live: &[SnapshotEntry],
     own_written: &std::collections::HashSet<String>,
 ) -> PlanDrift {
-    let live_paths: std::collections::HashSet<&str> =
-        live.iter().map(|entry| entry.path.as_str()).collect();
-
-    let mut affected: Vec<String> = Vec::new();
-    for path in expected {
-        let normalized = normalize_relative_path(path.as_str());
-        if normalized.is_empty()
-            || normalized.ends_with('/')
-            || normalized.contains('*')
-            || normalized.contains('?')
-        {
-            // Not a concrete file path; the inventory cannot speak to it.
-            continue;
-        }
-        if live_paths.contains(normalized.as_str()) || own_written.contains(&normalized) {
-            continue;
-        }
-        affected.push(normalized);
+    let classification = classify_artifact_drift(expected, &[], live, own_written);
+    PlanDrift {
+        plan_id: plan_id.map(str::to_owned),
+        affected_paths: classification.affected_paths(),
+        unverifiable: classification.unverifiable,
     }
-    affected.sort();
-    affected.dedup();
-    PlanDrift { plan_id: plan_id.map(str::to_owned), affected_paths: affected }
 }
 
-/// Normalize a workspace-relative path for inventory comparison: forward
-/// slashes only, no leading `./`. The snapshot inventory stores paths in this
-/// canonical form.
-fn normalize_relative_path(path: &str) -> String {
-    let slash_normalized = path.replace('\\', "/");
-    slash_normalized.strip_prefix("./").unwrap_or(&slash_normalized).to_owned()
+// ---------------------------------------------------------------------------
+// Phase 6 M3c — classified diff, live re-verification, investigation
+// ---------------------------------------------------------------------------
+
+/// The Phase 6 M3c step-1 classification: every declared artifact of the
+/// COMPLETED subtasks sorted into a typed finding (or declared prose), with
+/// the run's own writes excluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriftClassification {
+    /// Findings, sorted and deduplicated by path.
+    pub diff: Vec<concerto_core::event::PlanDriftDiffEntry>,
+    /// Declared entries with no parseable file path (prose). Never drift.
+    pub unverifiable: Vec<String>,
+}
+
+impl DriftClassification {
+    /// The classified paths (the event's `affected_paths`), sorted.
+    pub fn affected_paths(&self) -> Vec<String> {
+        self.diff.iter().map(|entry| entry.path.clone()).collect()
+    }
+
+    /// Whether the classification found nothing to investigate.
+    pub fn is_empty(&self) -> bool {
+        self.diff.is_empty()
+    }
+}
+
+/// Phase 6 M3c step 1: classify the plan's expected artifacts against the
+/// run-start baseline AND the resume's live inventory.
+///
+/// - `expected` — plan-declared artifact paths of the COMPLETED subtasks.
+/// - `baseline` — the run-start workspace inventory (the checkpoint's
+///   `WorkspaceSnapshot` event payload). Empty when the log window no longer
+///   carries it: the classifier then degrades to the missing-only reading
+///   (an absent baseline can neither prove alteration nor addition).
+/// - `live` — the resume's fresh inventory.
+/// - `own_written` — paths the run recorded writing; an own write explains
+///   the divergence and is never drift.
+///
+/// Non-file expectations are skipped and prose declarations land in
+/// [`DriftClassification::unverifiable`], exactly as [`detect_plan_drift`]
+/// does.
+pub fn classify_artifact_drift(
+    expected: &[camino::Utf8PathBuf],
+    baseline: &[SnapshotEntry],
+    live: &[SnapshotEntry],
+    own_written: &std::collections::HashSet<String>,
+) -> DriftClassification {
+    use crate::declared_artifacts::{classify, DeclaredArtifact};
+
+    let live_by_path: std::collections::HashMap<&str, &SnapshotEntry> =
+        live.iter().map(|entry| (entry.path.as_str(), entry)).collect();
+    let baseline_by_path: std::collections::HashMap<&str, &SnapshotEntry> =
+        baseline.iter().map(|entry| (entry.path.as_str(), entry)).collect();
+
+    let mut diff: Vec<concerto_core::event::PlanDriftDiffEntry> = Vec::new();
+    let mut unverifiable: Vec<String> = Vec::new();
+    for path in expected {
+        let normalized = match classify(path.as_str()) {
+            // Not a concrete file path; the inventory cannot speak to it.
+            DeclaredArtifact::NonFile => continue,
+            // Prose — a declaration problem, reported separately.
+            DeclaredArtifact::Unverifiable => {
+                unverifiable.push(path.as_str().to_owned());
+                continue;
+            }
+            DeclaredArtifact::Path(normalized) => normalized,
+        };
+        // The run's own write explains any divergence: F3's domain, never
+        // plan drift (double-reporting is worse than under-reporting).
+        if own_written.contains(&normalized) {
+            continue;
+        }
+        let class = match live_by_path.get(normalized.as_str()) {
+            // Absent from the live inventory: planned-but-absent.
+            None => concerto_core::event::PlanDriftDiffClass::Missing,
+            Some(live_entry) => match baseline_by_path.get(normalized.as_str()) {
+                Some(base_entry) => {
+                    if identity_differs(base_entry, live_entry) {
+                        concerto_core::event::PlanDriftDiffClass::AlteredHash
+                    } else {
+                        // Present and unchanged since the run start: intact.
+                        continue;
+                    }
+                }
+                None => {
+                    // No run-start record for this path. Only a NON-EMPTY
+                    // baseline can prove the file is an addition: with no
+                    // baseline at all, presence alone is not a finding.
+                    if baseline.is_empty() {
+                        continue;
+                    }
+                    concerto_core::event::PlanDriftDiffClass::New
+                }
+            },
+        };
+        diff.push(concerto_core::event::PlanDriftDiffEntry { path: normalized, class });
+    }
+    diff.sort_by(|left, right| left.path.cmp(&right.path));
+    diff.dedup_by(|left, right| left.path == right.path);
+    unverifiable.sort();
+    unverifiable.dedup();
+    DriftClassification { diff, unverifiable }
+}
+
+/// Whether two inventory entries disagree on recorded identity. The content
+/// hash is authoritative when both sides captured one (files ≤ 64 KiB);
+/// otherwise a size disagreement stands in. A side with no comparable
+/// identity yields no opinion — an mtime-only touch is not content drift.
+fn identity_differs(left: &SnapshotEntry, right: &SnapshotEntry) -> bool {
+    match (&left.content_hash, &right.content_hash) {
+        (Some(left_hash), Some(right_hash)) => left_hash != right_hash,
+        _ => match (left.size_bytes, right.size_bytes) {
+            (Some(left_size), Some(right_size)) => left_size != right_size,
+            _ => false,
+        },
+    }
+}
+
+/// One plan-drift investigation (Phase 6 M3c steps 1–2): the classified
+/// snapshot-vs-checkpoint diff plus the live-filesystem re-read of every
+/// finding. Assembled by the resume path before the resume evaluation, so
+/// the evaluation can weigh confirmed drift as workspace-change evidence.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlanDriftInvestigation {
+    /// Classified findings for the plan's COMPLETED-subtask artifacts.
+    pub diff: Vec<concerto_core::event::PlanDriftDiffEntry>,
+    /// Live re-read of each finding, in `diff` order.
+    pub reverify: Vec<concerto_core::event::PlanDriftReverifyEntry>,
+    /// Declared prose — logged, never drift, never re-verified.
+    pub unverifiable: Vec<String>,
+}
+
+impl PlanDriftInvestigation {
+    /// Whether the classification found nothing to investigate.
+    pub fn is_empty(&self) -> bool {
+        self.diff.is_empty()
+    }
+
+    /// The classified paths (the event's `affected_paths`).
+    pub fn affected_paths(&self) -> Vec<String> {
+        self.diff.iter().map(|entry| entry.path.clone()).collect()
+    }
+
+    /// Step 2's clear verdict: findings existed but every one of them reads
+    /// back intact — the resume continues unchanged and publishes nothing.
+    pub fn is_cleared(&self) -> bool {
+        !self.diff.is_empty()
+            && self
+                .reverify
+                .iter()
+                .all(|entry| entry.status == concerto_core::event::PlanDriftReverifyStatus::Intact)
+    }
+
+    /// Whether at least one finding survived re-verification as real drift
+    /// (the step-3 replan trigger).
+    pub fn confirmed_paths(&self) -> Vec<String> {
+        self.reverify
+            .iter()
+            .filter(|entry| entry.status.is_confirmed_drift())
+            .map(|entry| entry.path.clone())
+            .collect()
+    }
+
+    /// Whether re-reading a finding failed for a reason other than absence —
+    /// step 5's "re-verification genuinely failed" halt.
+    pub fn reverify_failed(&self) -> bool {
+        self.reverify
+            .iter()
+            .any(|entry| entry.status == concerto_core::event::PlanDriftReverifyStatus::Unverified)
+    }
+}
+
+/// Phase 6 M3c steps 1–2 in one pass: classify, then re-read each finding
+/// from the live filesystem.
+///
+/// `project_root` resolves the relative paths; `baseline` is the run-start
+/// inventory the re-read compares against (`None` reference ⇒ presence-only
+/// read). Bounded and synchronous by design: the findings are the plan's
+/// declared artifacts (a small, known set) and each content read is capped
+/// at the snapshot's own 64 KiB hashing limit — the same bound the
+/// inventory walk applies to a whole tree.
+pub fn investigate_plan_drift(
+    expected: &[camino::Utf8PathBuf],
+    baseline: &[SnapshotEntry],
+    live: &[SnapshotEntry],
+    own_written: &std::collections::HashSet<String>,
+    project_root: &std::path::Path,
+) -> PlanDriftInvestigation {
+    let classification = classify_artifact_drift(expected, baseline, live, own_written);
+    let baseline_by_path: std::collections::HashMap<&str, &SnapshotEntry> =
+        baseline.iter().map(|entry| (entry.path.as_str(), entry)).collect();
+    let reverify = classification
+        .diff
+        .iter()
+        .map(|finding| {
+            let reference = baseline_by_path.get(finding.path.as_str()).copied();
+            let status = reverify_finding(project_root, &finding.path, finding.class, reference);
+            concerto_core::event::PlanDriftReverifyEntry { path: finding.path.clone(), status }
+        })
+        .collect();
+    PlanDriftInvestigation {
+        diff: classification.diff,
+        reverify,
+        unverifiable: classification.unverifiable,
+    }
+}
+
+/// Phase 6 M3c step 2: re-read one classified finding from the live
+/// filesystem.
+///
+/// - absent (or the expectation resolves to a directory) ⇒ [`Gone`] /
+///   [`Diverged`];
+/// - present, `appeared` (`New` finding) ⇒ [`Diverged`]: a file that
+///   post-dates the run start is a divergence by definition, its presence
+///   is not evidence of the run's own work;
+/// - present, with a baseline entry whose identity disagrees ⇒ [`Diverged`];
+/// - present otherwise ⇒ [`Intact`] (the finding is cleared silently);
+/// - any other I/O failure ⇒ [`Unverified`] (re-verification genuinely
+///   failed — the resume halts Partial with the diff rather than guessing).
+///
+/// [`Gone`]: concerto_core::event::PlanDriftReverifyStatus::Gone
+/// [`Diverged`]: concerto_core::event::PlanDriftReverifyStatus::Diverged
+/// [`Intact`]: concerto_core::event::PlanDriftReverifyStatus::Intact
+/// [`Unverified`]: concerto_core::event::PlanDriftReverifyStatus::Unverified
+pub fn reverify_finding(
+    project_root: &std::path::Path,
+    path: &str,
+    class: concerto_core::event::PlanDriftDiffClass,
+    reference: Option<&SnapshotEntry>,
+) -> concerto_core::event::PlanDriftReverifyStatus {
+    use concerto_core::event::PlanDriftReverifyStatus;
+    use std::io::ErrorKind;
+
+    let absolute = project_root.join(path);
+    match std::fs::metadata(&absolute) {
+        Err(error) if error.kind() == ErrorKind::NotFound => return PlanDriftReverifyStatus::Gone,
+        Err(_) => return PlanDriftReverifyStatus::Unverified,
+        // The plan expects a file: a directory (or a broken symlink's
+        // target) at that path is not the artifact the plan declared.
+        Ok(metadata) if !metadata.is_file() => return PlanDriftReverifyStatus::Diverged,
+        Ok(_) => {}
+    }
+    if class == concerto_core::event::PlanDriftDiffClass::New {
+        return PlanDriftReverifyStatus::Diverged;
+    }
+    let Some(fresh) =
+        crate::workspace_snapshot::snapshot_file_entry(project_root, absolute.as_path())
+    else {
+        // Stat'ed a file but could not inventory it (read/strip failure).
+        return PlanDriftReverifyStatus::Unverified;
+    };
+    match reference {
+        None => PlanDriftReverifyStatus::Intact,
+        Some(reference) if identity_differs(reference, &fresh) => PlanDriftReverifyStatus::Diverged,
+        Some(_) => PlanDriftReverifyStatus::Intact,
+    }
+}
+
+/// The Phase 6 M3c step-5 re-dispatch state a resume leaves behind: the
+/// confirmed drift, the completed subtasks it re-armed Pending, and their
+/// human role labels. Held by the coordinator until the completion tail so a
+/// re-dispatch that never settles can attach the diff to its Partial note.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanDriftRedispatch {
+    /// Confirmed drifted paths the re-dispatch exists to repair.
+    pub paths: Vec<String>,
+    /// Re-armed node ids (the affected COMPLETED subtasks).
+    pub nodes: Vec<concerto_core::TaskId>,
+    /// Role labels of [`Self::nodes`], for human reports.
+    pub labels: Vec<String>,
+    /// The full classification, carried so the completion tail can attach the
+    /// drift to its guard note if the re-dispatch never settles.
+    pub diff: Vec<concerto_core::event::PlanDriftDiffEntry>,
 }
 
 #[cfg(test)]
@@ -390,5 +650,263 @@ mod tests {
             &own,
         );
         assert_eq!(drift.affected_paths, vec!["src/b.rs".to_owned()]);
+    }
+
+    /// `unverifiable` is additive: a record serialized before the field
+    /// existed still deserializes as an empty list.
+    #[test]
+    fn plan_drift_unverifiable_field_is_additive() {
+        let legacy = serde_json::json!({
+            "plan_id": "plan-1",
+            "affected_paths": ["src/a.rs"],
+        });
+        let drift: PlanDrift = serde_json::from_value(legacy).expect("older records deserialize");
+        assert_eq!(drift.affected_paths, vec!["src/a.rs".to_owned()]);
+        assert!(drift.unverifiable.is_empty());
+    }
+
+    /// The regression this classification exists for: descriptions emitted
+    /// where file paths were declared are NEVER drift — and a genuinely
+    /// absent real path still is (no overcorrection).
+    #[test]
+    fn plan_drift_classifies_description_entries_as_unverifiable_not_missing() {
+        let live: Vec<SnapshotEntry> = vec![entry("src/present.rs", Some(1), Some(1), Some("h"))];
+        let own = std::collections::HashSet::new();
+        let descriptions = [
+            "DESIGN.md: Comprehensive design document as specified in the requirements.",
+            "src/components/StatusIndicator/StatusIcon.tsx: Component for rendering status icons.",
+        ];
+        let mut declared = expected(&["src/present.rs", "src/never_written.rs"]);
+        declared.extend(expected(&descriptions));
+
+        let drift = detect_plan_drift(Some("plan-1"), &declared, &live, &own);
+
+        assert_eq!(
+            drift.affected_paths,
+            vec!["src/never_written.rs".to_owned()],
+            "only the genuinely absent real path drifts"
+        );
+        let mut want_unverifiable = descriptions.map(str::to_owned).to_vec();
+        want_unverifiable.sort();
+        assert_eq!(drift.unverifiable, want_unverifiable, "descriptions are unverifiable");
+        assert!(!drift.is_empty(), "a real missing path still reports");
+
+        // Prose-only declarations emit NO drift at all.
+        let prose_only = detect_plan_drift(Some("plan-1"), &expected(&descriptions), &live, &own);
+        assert!(prose_only.is_empty(), "prose-only declarations are never drift");
+        assert_eq!(prose_only.unverifiable.len(), 2);
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 6 M3c steps 1–2 — classified diff + live re-verification
+    // ------------------------------------------------------------------
+
+    fn class_of(
+        classification: &DriftClassification,
+        path: &str,
+    ) -> Option<concerto_core::event::PlanDriftDiffClass> {
+        classification.diff.iter().find(|finding| finding.path == path).map(|finding| finding.class)
+    }
+
+    /// Step 1 against a run-start baseline: missing, altered-hash, and new
+    /// are distinct classes; intact paths and own writes produce no finding,
+    /// prose is declaration quality.
+    #[test]
+    fn classify_artifact_drift_separates_missing_altered_new_and_intact() {
+        use concerto_core::event::PlanDriftDiffClass;
+
+        let baseline = vec![
+            entry("src/intact.rs", Some(10), Some(1), Some("h-intact")),
+            entry("src/altered.rs", Some(10), Some(1), Some("h-old")),
+            entry("src/gone.rs", Some(7), Some(1), Some("h-gone")),
+        ];
+        let live = vec![
+            entry("src/intact.rs", Some(10), Some(2), Some("h-intact")),
+            entry("src/altered.rs", Some(11), Some(2), Some("h-new")),
+            entry("src/appeared.rs", Some(3), Some(2), Some("h-new-file")),
+        ];
+        let own: std::collections::HashSet<String> = ["src/own.rs".to_owned()].into();
+        let declared = expected(&[
+            "src/intact.rs",
+            "src/altered.rs",
+            "src/gone.rs",
+            "src/appeared.rs",
+            "src/own.rs",
+            "DESIGN.md: The design document.",
+        ]);
+
+        let classification = classify_artifact_drift(&declared, &baseline, &live, &own);
+
+        assert_eq!(
+            class_of(&classification, "src/gone.rs"),
+            Some(PlanDriftDiffClass::Missing),
+            "planned artifact absent from the live inventory"
+        );
+        assert_eq!(
+            class_of(&classification, "src/altered.rs"),
+            Some(PlanDriftDiffClass::AlteredHash),
+            "content hash diverged from the run-start baseline"
+        );
+        assert_eq!(
+            class_of(&classification, "src/appeared.rs"),
+            Some(PlanDriftDiffClass::New),
+            "present now but absent at run start"
+        );
+        assert_eq!(class_of(&classification, "src/intact.rs"), None, "unchanged is not drift");
+        assert_eq!(class_of(&classification, "src/own.rs"), None, "own writes are never drift");
+        assert_eq!(
+            classification.affected_paths(),
+            // Sorted and deduplicated by path — the canonical payload order.
+            vec![
+                "src/altered.rs".to_owned(),
+                "src/appeared.rs".to_owned(),
+                "src/gone.rs".to_owned(),
+            ]
+        );
+        assert_eq!(classification.unverifiable, vec!["DESIGN.md: The design document.".to_owned()]);
+    }
+
+    /// Without a run-start baseline the classification degrades to the
+    /// missing-only reading: presence alone can neither prove alteration
+    /// nor addition.
+    #[test]
+    fn classify_artifact_drift_without_baseline_degrades_to_missing_only() {
+        use concerto_core::event::PlanDriftDiffClass;
+
+        let live = vec![
+            entry("src/altered.rs", Some(11), Some(2), Some("h-new")),
+            entry("src/appeared.rs", Some(3), Some(2), Some("h-new-file")),
+        ];
+        let declared = expected(&["src/altered.rs", "src/appeared.rs", "src/gone.rs"]);
+
+        let classification =
+            classify_artifact_drift(&declared, &[], &live, &std::collections::HashSet::new());
+
+        assert_eq!(classification.affected_paths(), vec!["src/gone.rs".to_owned()]);
+        assert_eq!(class_of(&classification, "src/gone.rs"), Some(PlanDriftDiffClass::Missing));
+        assert!(classification.unverifiable.is_empty());
+    }
+
+    /// Step 2: the live filesystem decides — presence with the run-start
+    /// identity clears, a divergent identity or absence confirms.
+    #[test]
+    fn reverify_finding_reads_back_the_live_filesystem() {
+        use concerto_core::event::{PlanDriftDiffClass, PlanDriftReverifyStatus};
+
+        let directory = tempfile::tempdir().expect("tempdir for re-verification");
+        let root = directory.path();
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        std::fs::write(root.join("src/kept.rs"), b"fn main() {}\n").expect("write artifact");
+        let kept_hash = blake3::hash(b"fn main() {}\n").to_hex().to_string();
+        let kept_reference = entry("src/kept.rs", Some(13), None, Some(&kept_hash));
+        let stale_reference = entry("src/kept.rs", Some(13), None, Some("h-stale"));
+
+        assert_eq!(
+            reverify_finding(
+                root,
+                "src/kept.rs",
+                PlanDriftDiffClass::Missing,
+                Some(&kept_reference)
+            ),
+            PlanDriftReverifyStatus::Intact,
+            "present with the run-start hash clears the finding"
+        );
+        assert_eq!(
+            reverify_finding(
+                root,
+                "src/kept.rs",
+                PlanDriftDiffClass::AlteredHash,
+                Some(&stale_reference)
+            ),
+            PlanDriftReverifyStatus::Diverged,
+            "present but not the run-start content"
+        );
+        assert_eq!(
+            reverify_finding(root, "src/kept.rs", PlanDriftDiffClass::Missing, None),
+            PlanDriftReverifyStatus::Intact,
+            "no baseline entry: presence alone clears"
+        );
+        assert_eq!(
+            reverify_finding(root, "src/kept.rs", PlanDriftDiffClass::New, None),
+            PlanDriftReverifyStatus::Diverged,
+            "a file that post-dates the run start is a divergence"
+        );
+        assert_eq!(
+            reverify_finding(root, "src/never.rs", PlanDriftDiffClass::Missing, None),
+            PlanDriftReverifyStatus::Gone,
+            "absent from the live filesystem"
+        );
+        assert_eq!(
+            reverify_finding(root, "src", PlanDriftDiffClass::Missing, None),
+            PlanDriftReverifyStatus::Diverged,
+            "a directory where the plan declared a file"
+        );
+        // The read disagrees with a stale baseline entry ⇒ diverged.
+        assert_eq!(
+            reverify_finding(
+                root,
+                "src/kept.rs",
+                PlanDriftDiffClass::Missing,
+                Some(&stale_reference)
+            ),
+            PlanDriftReverifyStatus::Diverged
+        );
+    }
+
+    /// Steps 1–2 together: a tampered worktree confirms, a present artifact
+    /// the snapshot missed clears silently.
+    #[test]
+    fn investigate_plan_drift_confirms_tampered_and_clears_present_artifacts() {
+        use concerto_core::event::PlanDriftReverifyStatus;
+
+        let directory = tempfile::tempdir().expect("tempdir for investigation");
+        let root = directory.path();
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        std::fs::write(root.join("src/kept.rs"), b"fn main() {}\n").expect("write artifact");
+        let kept_hash = blake3::hash(b"fn main() {}\n").to_hex().to_string();
+
+        let baseline = vec![
+            entry("src/kept.rs", Some(13), None, Some(&kept_hash)),
+            entry("src/gone.rs", Some(7), None, Some("h-gone")),
+        ];
+        // The resume's snapshot missed `src/kept.rs` (skip-listed subtree)
+        // and never saw `src/gone.rs` (removed under it).
+        let live: Vec<SnapshotEntry> = Vec::new();
+        let declared = expected(&["src/kept.rs", "src/gone.rs"]);
+
+        let investigation = investigate_plan_drift(
+            &declared,
+            &baseline,
+            &live,
+            &std::collections::HashSet::new(),
+            root,
+        );
+
+        assert_eq!(
+            investigation.confirmed_paths(),
+            vec!["src/gone.rs".to_owned()],
+            "only the artifact actually gone survives re-verification"
+        );
+        assert!(!investigation.is_cleared(), "confirmed drift is never cleared");
+        assert!(!investigation.reverify_failed());
+        assert_eq!(investigation.reverify[0].status, PlanDriftReverifyStatus::Gone);
+        assert_eq!(investigation.reverify[1].status, PlanDriftReverifyStatus::Intact);
+
+        // Every finding intact ⇒ step 2 clears the whole investigation.
+        std::fs::write(root.join("src/gone.rs"), b"restored\n").expect("restore artifact");
+        let restored_hash = blake3::hash(b"restored\n").to_hex().to_string();
+        let baseline = vec![
+            entry("src/kept.rs", Some(13), None, Some(&kept_hash)),
+            entry("src/gone.rs", Some(9), None, Some(&restored_hash)),
+        ];
+        let cleared = investigate_plan_drift(
+            &declared,
+            &baseline,
+            &live,
+            &std::collections::HashSet::new(),
+            root,
+        );
+        assert!(cleared.is_cleared(), "present with the run-start hash clears");
+        assert!(cleared.confirmed_paths().is_empty());
     }
 }

@@ -19,7 +19,9 @@ pub mod lock;
 pub mod memory;
 pub mod policy;
 pub mod policy_presets;
+pub mod sandbox;
 pub mod sanitizer;
+pub mod secret;
 #[cfg(test)]
 pub mod testing;
 pub mod text;
@@ -40,6 +42,9 @@ pub use executor::ToolExecutor;
 pub use policy::SimplePolicyEngine;
 pub use policy::{RpmLimiter, SpendTracker};
 pub use policy_presets::{inject_intent_gate_rule, PolicyPresets};
+// Zero-on-drop holder for provider keys and credential-store material
+// (threat model §6 gap #9); redacts itself under Debug/Display.
+pub use secret::SecretString;
 
 pub use types::{
     AgentId, AgentOutput, AgentStage, AgentTask, McpServerState, ModelInfo, PluginState, ProjectId,
@@ -51,14 +56,14 @@ pub use types::{
 // `AuditLog::record_infra`.
 pub use traits::policy::{InfraAuditEntry, InfraVerdict, RULE_INFRA_FAILURE};
 
-// Phase 0 intent-routing vocabulary (ADR-55): types plus the confidence
+// Intent-routing vocabulary (ADR-55 §1): types plus the confidence
 // threshold the router uses for path selection.
 pub use intent::{
     PlanDecision, RequestedOutcome, RouterOutput, RouterRoute, RunStage, TaskScope,
     LOW_CONFIDENCE_THRESHOLD,
 };
 
-// ADR-55 batch 1c: intent tiers, the pure classifier, the verdict-source
+// ADR-55 §3: intent tiers, the pure classifier, the verdict-source
 // authorization seam the policy engine consults under
 // `Condition::IntentAuthorized`, and the audit rule-name vocabulary.
 pub use authorization::{

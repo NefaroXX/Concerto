@@ -4,31 +4,19 @@
 
 Composes with ADR-60 (process-per-agent supervisor, single write gate),
 ADR-58 (only the coordinator is hardcoded), ADR-64/65 (evidence spine and
-reuse as **coordinator context**, never a compiled authority), and ADR-66
-(harness fail-loud). **Partially supersedes** ADR-19, ADR-55, ADR-58, ADR-64,
-and ADR-65 on exactly the revoked points enumerated in §3's conflict table.
-None of those five records is moved to `archive/`: the supersession is
-scoped, not full, and each row in the ADR README carries a note to that
-effect. Supersedes: none in full.
+reuse as **coordinator context**, never a compiled authority), ADR-66
+(harness fail-loud), and ADR-74 (delegation doctrine — it *refines* this ADR
+and revokes nothing in §1–§6: supremacy settles **who** decides a run, ADR-74
+settles **what the Coordinator may decide with**, and every mechanism it adds
+is still a Coordinator decision). **Partially supersedes** ADR-19, ADR-55,
+ADR-58, ADR-64, and ADR-65 on exactly the revoked points enumerated in §3's
+conflict table. None of those five records is moved to `archive/`: the
+supersession is scoped, not full, and each row in the ADR README carries a
+note to that effect. Supersedes: none in full.
 
 **Date:** 2026-09-24
 
 **Deciders:** Concerto architecture + maintainer direction
-
-> **Reconciliation note (2026-09-24, commit `cbb09b0`):** §5 ("Intent routing —
-> `route()` retained as a deprecated pure advisor with inert keyword lists"),
-> the matching consequence ("Deprecated-but-retained `route()` ... carry a
-> small maintenance tax; removing them is a follow-up"), T4 ("`route()` and its
-> keyword lists remain inert"), and the verification note ("`route()` — pure;
-> zero non-test production callers") were superseded the same day: `route()`
-> and its keyword corpora were **deleted** from `crates/core/src/intent.rs`.
-> The module now retains only the intent **vocabulary** (`RequestedOutcome`,
-> `TaskScope`, `RouterOutput`, `RouterRoute`, `RunStage`, `PlanDecision`,
-> `LOW_CONFIDENCE_THRESHOLD`) — the decision to make it advisory evolved into
-> removing it entirely. T4 is satisfied trivially (no `route()` exists to
-> consult), and the "remove them as follow-up" tax no longer exists. The core
-> ADR-71 decision (no intent topology branching; Coordinator owns run shape)
-> is unaffected and remains in force.
 
 ## Context
 
@@ -72,7 +60,12 @@ else ends a run.
 1. **One run, one master.** The coordinator owns every execution decision for
    a run: what work exists, what is dispatched, in what order, to which agent,
    and when the run stops. No compiled scheduler, router, registry, planner, or
-   guard authoritatively decides any of those.
+   guard authoritatively decides any of those. Refining what the Coordinator
+   may decide *with* does not reopen this: ADR-74's delegation doctrine, its
+   self-execution guard, and its agent-axis-first recovery are all Coordinator
+   decisions the model or the Coordinator's own loop makes, and none of them
+   introduces a compiled authority that selects an agent, orders work, or ends
+   a run.
 2. **An instruction runs until (a) the work is done, (b) the user
    intervenes, or (c) the coordinator errors.** These are the only run-level
    endings. A completed objective is a **Coordinator decision** — even when a
@@ -125,7 +118,7 @@ Classification of the existing guards-that-end-runs, in one sentence each:
 | 1 | ADR-19 §6 "Cycle detection strategy" | Hardcoded cycle terminals: Rule A (`same (AgentRole, task_hash)` 3× no progress) and Rule B (same `Issue.description` 2× + zero net change) emit `OrchestratorCycleDetected` and return a `CycleDetected` error on their own. | **Hardcoded cycle terminals → coordinator-owned guards.** Cycle/loop limits are guard *signals* the Coordinator owns and reacts to (continue / reset / abort are Coordinator decisions, as ADR-19 already had at the UI). A guard never ends a run by itself. |
 | 2 | ADR-19 §10 "Task decomposition via LLM planning"; ADR-55 Phase-2b §1 (planner contract: "requires implement roles and at least one Coder task, which settles that registry-subsetting was refuted") | The planner's LLM plan (or its heuristic fallback) was treated as the binding task graph; its roster contract constrained who could be planned. | **Planner advisory-only.** A plan is advice to the Coordinator. The Coordinator decides the task graph it dispatches; planner output (and the planner's assumptions about the roster) never binds dispatch. |
 | 3 | ADR-58 amendment (2026-09-05) "registry is the roster", carried into the orchestration runtime-bridge plan | The config/registry built from `custom_agents` was treated as the complete binding roster the Coordinator mechanically follows. | **Registry-is-roster advisory.** Registration is an advisory roster the Coordinator consults. ADR-58's "only the coordinator is hardcoded" is **affirmed and extended**; only the registry-as-binding roster point is scoped-superseded. |
-| 4 | ADR-55 Phase-1e §2 (outcome → topology: `Execute` + `!read_only` → full topology; otherwise text-only / coordinator-only) | Intent routing branched orchestration topology: the routed outcome selected the run shape. | **No intent topology branching.** Intent never selects topology. The Coordinator owns the run shape; intent signals are advisory inputs (see §5). |
+| 4 | ADR-55 Phase-1e §2 (outcome → topology: `Execute` + `!read_only` → full topology; otherwise text-only / coordinator-only) | Intent routing branched orchestration topology: the routed outcome selected the run shape. | **No intent topology branching.** Intent never selects topology. The Coordinator owns the run shape; intent signals are advisory inputs (see §5). The revocation holds against later work too: ADR-74's takeover ordering is a Coordinator decision over registry data, not a branch on an intent classification. |
 | 5 | ADR-64 §3/§4/§7 — pre-dispatch resolver as dispatch authority (`should_dispatch` verdicts `Reassign`/`CoordinatorTakeover`, plan-reuse as a planner-skip authority, role-agnostic scheduling directives); ADR-65 §6 `evidence_scheduler` (compiled dispatch function, already removed by the 2026-09-05 amendment) | Compiled schedulers that select agents, order dispatch, or end runs from evidence. | **Compiled schedulers revoked EXCEPT the resolver-as-reuse-oracle.** `resolve_batch` / `should_dispatch` are codified as a **pure reuse oracle** — never selects between agents, never orders; `Reuse` skips identical settled work, all other verdicts flow to normal dispatch (ADR-65's `evidence_scheduler` removal is affirmed). This subset is **compatible-with-supremacy, not revoked** (§4). |
 | 6 | ADR-65 §5 (DesignDoc verifier lifecycle, quarantine); ADR-58 acceptance/run-once terminal stage kinds; ADR-61/67 context guard; ADR-60 D5 gate conflict; ADR-66 fail-loud | Mixed semantics for "guards that end runs". | **Guards-that-end-runs classified** per §2's taxonomy: verifier / acceptance / harness-fail-loud / context-guard-overflow / gate-conflict = genuine-error terminals; gate-Denied / policy-denial = coordinator-routed tool errors; design-doc quarantine = advisory. |
 
@@ -157,16 +150,28 @@ Coordinator uses to run its own loop, not an authority over it.
 The following are inputs the Coordinator may consult — and, in the current
 tree, are no longer the authorities the pre-ADR-71 design sometimes intended:
 
-- **Intent routing** — `route()` (`crates/core/src/intent.rs`) is retained as
-  a **deprecated pure advisor**: it is deterministic and pure, and currently
-  has **zero non-test production callers** (verified in tree on 2026-09-24).
-  The keyword lists it ships (`EXECUTE_KEYWORDS`, etc.) are **inert** — kept
-  for the pure function's contract and tests, not consulted as a routing
-  authority. `coordinator.rs::decide_run_shape` already treats the routing
-  hint as "an input, not a verdict" (advisor mode), with the Coordinator
-  overriding it from session context — affirmed here.
+- **Intent signals** — intent never selects topology, and no intent-derived
+  dispatch function exists to consult. `crates/core/src/intent.rs` retains only
+  the intent **vocabulary** the rest of the workspace still speaks
+  (`RequestedOutcome`, `TaskScope`, `RouterOutput`, `RouterRoute`, `RunStage`,
+  `PlanDecision`, `LOW_CONFIDENCE_THRESHOLD`) plus the audit rule-name
+  round-trip; the deterministic rule-based `route()` function and its keyword
+  corpora are **deleted** (`cbb09b0`), so there is no keyword dispatch and no
+  router for a routing table to survive as. The one remaining shape-selection
+  seam, `coordinator.rs::decide_run_shape`, is a pure function of a
+  `RunShapeHint` plus a `RunShapeContext` and is explicitly advisor-mode: the
+  hint is "an input, not a verdict", and the Coordinator overrides it from
+  session context and records the override (`coordinator_shape` audit row plus
+  an ADR-65 `Decision` event) so it is observable, never silent. Absent a hint,
+  the builder-set orchestration depth is the final shape — still recorded, with
+  `hint: "none"`. The intent gate's own use of the vocabulary (§7) is a
+  separate authority and is **not** advisory.
 - **Planner output** (ADR-19 §10 / ADR-55 Phase-2b) — advisory (§3.2).
-- **Registry / roster** (ADR-58 amendment) — advisory (§3.3).
+- **Registry / roster** (ADR-58 amendment) — advisory for *which* agent to
+  call (§3.3), and load-bearing for *mutation*: under ADR-74 a mutating
+  self-execution is refused while a roster exists and no delegation is
+  recorded, so "advisory" here is a statement about agent selection, never a
+  licence to bypass the roster.
 - **Evidence spine** (ADR-65) — facts, claims, snapshots, read dedupe, and
   resume remain the machine-recorded context the Coordinator acts on; they
   are advisory, never a compiled decision.
@@ -225,16 +230,18 @@ To forestall misreading, these stay fully in force:
   re-creating a scheduler.
 - **Costs / risks.** The Coordinator is a model and remains fallible; the
   mitigation is the immutable-safety layer plus machine-recorded advisory
-  facts, never a compiled scheduler. Deprecated-but-retained `route()` and its
-  inert keyword lists carry a small maintenance tax; removing them is a
-  follow-up, not part of this decision.
+  facts, never a compiled scheduler.
 
-## Verification notes (in tree, 2026-09-24)
+## Verification notes (in tree)
 
-- `route()` (`crates/core/src/intent.rs`) — pure; **zero non-test production
-  callers** (grep across `crates/`).
-- `coordinator.rs::decide_run_shape` — routing hint treated as "an input, not
-  a verdict" (advisor mode).
+- `crates/core/src/intent.rs` — intent **vocabulary only**
+  (`RequestedOutcome`, `TaskScope`, `RouterOutput`, `RouterRoute`, `RunStage`,
+  `PlanDecision`, `LOW_CONFIDENCE_THRESHOLD`); no `route()` function and no
+  keyword corpus exists in the tree (`cbb09b0` removed them).
+- `coordinator.rs::decide_run_shape` — pure `(RunShapeHint,
+  RunShapeContext) -> (RunShape, reason)`, advisor mode: the hint is an input
+  the Coordinator overrides from session context, and the resolved shape is
+  recorded either way (`hint: "none"` when absent).
 - `resolver.rs` — `DispatchDecision` closed over `{ Reuse, Refine, Reopen,
   Dispatch }`; `should_dispatch` pure. `resolver_integration.rs` —
   `resolve_batch` short-circuits `Reuse`, routes all other verdicts to normal
@@ -245,6 +252,11 @@ To forestall misreading, these stay fully in force:
   Coordinator-loop mechanism, not an authority).
 - `GateError::Conflict` → `IpcErrorCode::Conflict` retryable tool error
   (ADR-60 D5). `ContextGuardProvider` → typed context-overflow error.
+- Grep discipline: `intent.rs` mentions of "route" are the `RouterRoute` /
+  `RouterOutput` types and audit rule-name round-trip only; `axum::Router::route`
+  calls in `api-server` are unrelated. `suitability.rs`'s `KEYWORD_FAMILIES` is
+  a task-classification bucketing for the advisory suitability index, not intent
+  routing, and selects nothing.
 
 ## Acceptance criteria
 
@@ -255,11 +267,13 @@ To forestall misreading, these stay fully in force:
   short-circuits dispatch.
 - **T3** — A policy denial and a gate conflict do not end a run by
   themselves; they return to the Coordinator as routed tool results.
-- **T4** — `route()` and its keyword lists remain inert: no production code
-  path consults them as a topology or dispatch authority.
+- **T4** — No intent-derived topology branching exists in any form: there is no
+  `route()` function and no keyword corpus in the tree, `decide_run_shape` is
+  advisor-mode with a recorded override, and the intent gate's authorization
+  decisions are user-event-only (§7) — never a dispatch or run-shape authority.
 - **T5** — ADR-19/55/58/64/65 remain in place with scoped supersession
   status; none is archived.
 
 ---
 
-*Last updated: 2026-09-24*
+*Last updated: 2026-09-27*

@@ -1,5 +1,13 @@
 # UX Specification: Orchestration Studio Blueprint Editor (P4 Batch 3)
 
+> **Archived 2026-09-28.** This UX spec (stage cards, relationship rows,
+> splash-based init) was **superseded by the ADR-59 revision of 2026-08-15**,
+> which replaced it with the one-surface roster editor (full CRUD, locked
+> coordinator row, silent auto-seed, single-arm Save). Kept as the design
+> record for that batch; the shipped UI is in
+> `crates/desktop/src/views/orchestration_studio.rs` and
+> `docs/desktop-cli-parity.md`.
+
 > **Source:** designer UX pass for ADR-59 P4 Batch 3
 > (`docs/adrs/ADR-59-studio-blueprint-editor.md`)
 > **Date:** 2026-08-14

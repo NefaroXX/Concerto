@@ -70,9 +70,9 @@ cargo deny check
 | Check | Result | Notes |
 |---|---|---|
 | cargo fmt --check | | |
-| Clippy (-D warnings) | | Expected: zero warnings (24 crates, toolchain 1.96.0) |
+| Clippy (-D warnings) | | Expected: zero warnings (25 crates, toolchain 1.96.0) |
 | Workspace Build | | |
-| Nextest + Doc Tests | | Expected: 1998 passed / 0 failed (1 pre-existing `#[ignore]` eval test) |
+| Nextest + Doc Tests | | Expected: green. Most recent documented full-workspace count: 3421 passed / 0 failed (ROADMAP now-section evidence-spine check, 2026-09-24); the former lone `#[ignore]`d eval end-to-end test was un-ignored 2026-09-24 — refresh the exact count on this run |
 | Cargo Deny | | Expected: pass; 2 benign `advisory-not-detected` notes |
 
 ## Test Outcome

@@ -7,7 +7,7 @@
 **Date:** 2026-08-08
 **Deciders:** Concerto architecture
 **Supersedes:** Phase 4 of the provider-first redesign plan
-    (`docs/ARCHITECTURE-V2.md`) — the config-only endpoint / providers-as-data
+    (`docs/research/ARCHITECTURE-V2.md`) — the config-only endpoint / providers-as-data
     items this ADR finalizes.
 **Composes with:** ADR-42/ADR-45 (fallback ladder) — this ADR's resolved-model
     precedence is the tier-1/tier-1b pin source; ADR-46 (reasoning echo knob)
@@ -86,7 +86,7 @@ against the config (with the model-merit list as data, not hard-coded).
 
 The **flat schema flattening** — merging
 `ProviderConfig` / `ModelPinConfig` / `MultiAgentConfig` into a single
-catalog schema (`docs/ARCHITECTURE-V2.md` §8:
+catalog schema (`docs/research/ARCHITECTURE-V2.md` §8:
 "Full flattening of `ProviderConfig`/`ModelPinConfig`/
 `MultiAgentConfig` into one catalog schema remains deferred"). This ADR
 ratifies the catalog *orientation* (providers, their models, the resolution

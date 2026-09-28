@@ -50,7 +50,7 @@ pub trait ApprovalSink: Send + Sync {
     async fn request_ack(&self, session_id: Ulid, message: &str, cancel: CancellationToken)
         -> bool;
 
-    /// Ask the user to confirm a change of run intent (ADR-55 §1/§4).
+    /// Ask the user to confirm a change of run intent (ADR-55 §2/§5).
     ///
     /// Called with the requested outcome names for the confirmation question.
     /// The default returns `None` (no confirmation surface available), which
@@ -67,7 +67,7 @@ pub trait ApprovalSink: Send + Sync {
     }
 
     /// Ask the user whether to apply a previously approved plan or replan
-    /// first (ADR-55 Phase 1d).
+    /// first (ADR-55 §4).
     ///
     /// Called when an action-required Execute request matches a stored plan
     /// binding for the same objective. `Some(Apply)` authorizes running the

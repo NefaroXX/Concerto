@@ -14,7 +14,7 @@ use crate::plan_approval::{
 };
 use crate::registry::AgentRegistry;
 use crate::services::ProviderSummarizer;
-use crate::session_manager::{ProjectSessionManager, SessionManagerConfig};
+use crate::session_manager::{message_row_usage, ProjectSessionManager, SessionManagerConfig};
 use crate::{AgentRelationship, CollaborationRule};
 
 use async_trait::async_trait;
@@ -491,13 +491,14 @@ async fn maintain_context_after_run(
 const DEFAULT_MAX_ITERATIONS: u32 = 25;
 use concerto_eval::EvalEngine;
 use concerto_memory::embedder::{EmbeddingGenerator, ProviderEmbedder};
-use concerto_memory::entities::L1DedupJudge;
+use concerto_memory::entities::{L1DedupJudge, L1Extractor};
 use concerto_memory::fts::SqliteFullTextStore;
 use concerto_memory::indexer::{IndexConfig, ProjectIndexer};
 use concerto_memory::links::LinkStore;
 use concerto_memory::rag::{CascadeTier, LinkCascadeConfig};
 use concerto_memory::scoring::DECAY_FLOOR_DAYS;
 use concerto_memory::storage::MemoryDb;
+use concerto_memory::summarizer::LLMSummarizer;
 use concerto_memory::sync::ChunkSyncService;
 use concerto_memory::vector_store::SqliteVectorStore;
 use concerto_memory::watcher::{FileWatcher, ReindexQueueDrainer};
@@ -506,7 +507,7 @@ use concerto_memory::{
     vector_store::VectorStore,
 };
 
-/// Transition-only run-stage publisher (ADR-55 Phase 2a).
+/// Transition-only run-stage publisher (ADR-55 §9).
 ///
 /// Tracks the current [`RunStage`] of the active run and publishes
 /// [`EventKind::RunStageChanged`] to the bus *only when the stage actually
@@ -1010,7 +1011,9 @@ impl AuditLog for NoopAuditLog {
 
 /// Open (or create) the SQLite pool for the append-only audit log.
 /// Uses a separate connection from the session store so audit writes
-/// never block session operations.
+/// never block session operations — via `SqliteSessionStore::open_pool`
+/// so the same at-rest policy as the store applies: an encrypted
+/// `sessions.db` must not silently disable auditing (row 44).
 async fn create_audit_pool(
     data_dir: &std::path::Path,
 ) -> Result<sqlx::SqlitePool, OrchestratorError> {
@@ -1019,26 +1022,9 @@ async fn create_audit_pool(
     })?;
 
     let db_path = data_dir.join("sessions.db");
-    let options =
-        sqlx::sqlite::SqliteConnectOptions::new().filename(&db_path).create_if_missing(true);
-    let pool = sqlx::SqlitePool::connect_with(options).await.map_err(|e| {
+    concerto_sessions::SqliteSessionStore::open_pool(&db_path).await.map_err(|e| {
         OrchestratorError::AgentLoopError(format!("failed to connect to audit DB: {e}"))
-    })?;
-
-    sqlx::query("PRAGMA journal_mode=WAL;")
-        .execute(&pool)
-        .await
-        .map_err(|e| OrchestratorError::AgentLoopError(format!("audit PRAGMA error: {e}")))?;
-    sqlx::query("PRAGMA foreign_keys=ON;")
-        .execute(&pool)
-        .await
-        .map_err(|e| OrchestratorError::AgentLoopError(format!("audit PRAGMA error: {e}")))?;
-    sqlx::migrate!("../sessions/migrations")
-        .run(&pool)
-        .await
-        .map_err(|e| OrchestratorError::AgentLoopError(format!("audit migration error: {e}")))?;
-
-    Ok(pool)
+    })
 }
 
 /// Resolve the provider based on the selected ID and configuration.
@@ -1132,11 +1118,15 @@ fn resolve_provider(
     if let Ok(key) = std::env::var("OPENAI_API_KEY") {
         tracing::info!("no provider config; using OPENAI_API_KEY env fallback");
         return Ok((
-            Arc::new(concerto_providers::openai::OpenAiProvider::new(
-                key,
-                "gpt-4o".to_string(),
-                15,
-            )),
+            Arc::new(
+                concerto_providers::openai::OpenAiProvider::new(key, "gpt-4o".to_string(), 15)
+                    // ADR-48 §4: the same usage opt-in as the factory's
+                    // `openai` arm — a key-only fallback must report
+                    // provider usage too, or the columns stay 0 here.
+                    .with_usage_request(
+                        concerto_providers::openai::UsageRequest::IncludeStreamUsage,
+                    ),
+            ),
             None,
         ));
     }
@@ -1402,14 +1392,19 @@ pub async fn init_memory_system_with_handles(
         project_id.clone(),
         global_store,
     );
-    // L1 dedup judge (ADR-46 symbolic offload): attach it inside this
-    // initializer so EVERY runtime path that builds a project memory system
-    // gets it — desktop pre-init, the persistent runner, and
-    // `run_shared_agent` alike (the store is cached per project and reused).
+    // ADR-46 L1 symbolic pass: the dedup judge AND the typed extractor
+    // (TODO.md "L1 typed extraction") share ONE summarizer — one resolved
+    // provider/model — and the same `[memory] dedup_judge` gate, so no new
+    // config key is introduced. Attach both inside this initializer so EVERY
+    // runtime path that builds a project memory system gets them — desktop
+    // pre-init, the persistent runner, and `run_shared_agent` alike (the
+    // store is cached per project and reused).
     // Fail-open: dedup disabled by config or an unresolvable model provider
-    // leaves the judge off and stores behave exactly as before (plain writes).
-    let system = match build_dedup_judge(config, &lifecycle) {
-        Some(judge) => system.with_dedup_judge(judge),
+    // leaves both off and stores behave exactly as before (plain writes).
+    let system = match build_llm_summarizer(config, &lifecycle) {
+        Some(summarizer) => system
+            .with_dedup_judge(L1DedupJudge::new(Arc::clone(&summarizer)))
+            .with_l1_extractor(L1Extractor::new(summarizer)),
         None => system,
     };
     // ADR-69 slice 1 link store: attach it inside this initializer so EVERY
@@ -1512,21 +1507,27 @@ pub async fn init_memory_system_with_handles(
     Ok(MemorySystemHandles { store: system as Arc<dyn MemoryStore>, decision_store, task_tree })
 }
 
-/// Build the L1 dedup judge for project-namespace memory stores, or `None`.
+/// Build the shared summarizer behind the ADR-46 L1 symbolic pass, or `None`.
 ///
-/// The judge is wired from the *default* resolved model rather than the
-/// model a specific run selects: it is advisory (ADR-46 symbolic offload),
-/// so a cheap, stable judge model is preferable to chasing per-run parity.
+/// One summarizer serves BOTH consumers of the pass: the L1 dedup judge and
+/// the L1 typed extractor (TODO.md "L1 typed extraction"), so both always
+/// talk to the same resolved model. It is wired from the *default* resolved
+/// model rather than the model a specific run selects: the pass is advisory
+/// (ADR-46 symbolic offload), so a cheap, stable model is preferable to
+/// chasing per-run parity.
 ///
 /// Fail-open by construction:
-/// - `[memory] dedup_judge = false` disables the service entirely;
+/// - `[memory] dedup_judge = false` disables the whole pass;
 /// - a provider that cannot be resolved at init time (e.g. plugin-backed
 ///   only configs, or a missing model configuration) logs at debug and
 ///   yields `None`, leaving `MemorySystem` stores byte-identical to the
-///   pre-judge behavior.
-fn build_dedup_judge(config: &AppConfig, lifecycle: &CancellationToken) -> Option<L1DedupJudge> {
+///   pre-pass behavior.
+fn build_llm_summarizer(
+    config: &AppConfig,
+    lifecycle: &CancellationToken,
+) -> Option<Arc<dyn LLMSummarizer>> {
     if !config.memory.dedup_judge {
-        tracing::debug!("l1 dedup judge disabled by [memory] dedup_judge=false");
+        tracing::debug!("l1 symbolic pass disabled by [memory] dedup_judge=false");
         return None;
     }
     // No plugin providers are loaded inside memory init; resolution is
@@ -1538,16 +1539,12 @@ fn build_dedup_judge(config: &AppConfig, lifecycle: &CancellationToken) -> Optio
             Err(error) => {
                 tracing::debug!(
                     %error,
-                    "l1 dedup judge not attached: no resolvable model provider at memory init"
+                    "l1 symbolic pass not attached: no resolvable model provider at memory init"
                 );
                 return None;
             }
         };
-    Some(L1DedupJudge::new(Arc::new(ProviderSummarizer::new(
-        provider,
-        model,
-        lifecycle.child_token(),
-    ))))
+    Some(Arc::new(ProviderSummarizer::new(provider, model, lifecycle.child_token())))
 }
 
 /// Build the ADR-69 slice-1 symbolic link store over the project memory pool,
@@ -1924,7 +1921,7 @@ async fn setup_policy_and_audit(
     if mcp_has_enabled_server {
         policy_rules.push(PolicyRule::RequireApproval(Condition::ToolNamePrefix("mcp:".into())));
     }
-    // ADR-55 §2 (B-3): custom user policy rules replace default_rules()
+    // ADR-55 §3 (B-3): custom user policy rules replace default_rules()
     // wholesale and may drop the bare `IntentAuthorized` gate rule, which
     // would leave the gate inert — still prompting and auditing but never
     // deciding. Whenever the gate's authorization provider is attached,
@@ -1947,8 +1944,9 @@ async fn setup_policy_and_audit(
     };
     let spend_tracker = Arc::new(SpendTracker::new(spend_cap, None, None));
     // Approval deadline from `[policy] approval_timeout_secs` (default 30s).
-    // The deadline rides the policy verdict, so the executor uses the same
-    // value the audit row records; a timeout pauses the run, never denies it.
+    // The deadline rides the policy verdict for config/API compatibility, but
+    // the executor never enforces it: approvals park until answered (see
+    // `ToolExecutor::request_approval_decision`).
     let approval_timeout = std::time::Duration::from_secs(
         config.policy.as_ref().and_then(|policy| policy.approval_timeout_secs).unwrap_or(30),
     );
@@ -2088,7 +2086,7 @@ async fn execute_agent_loop(
     task: AgentTask,
     event_recorder: EventRecorderGuard,
     transcript_recorder: TranscriptRecorderGuard,
-    // ADR-55 Phase 2e §2: the run's permission envelope. Under full local
+    // ADR-55 §2: the run's permission envelope. Under full local
     // agency this is always `Acting`; the parameter is retained so the loop's
     // prompt selection stays explicit rather than implicit.
     envelope: RunEnvelope,
@@ -2139,7 +2137,18 @@ async fn execute_agent_loop(
         .with_shell_profile(services.config.resolved_shell_settings().selected_profile().cloned())
         // Run-scoped project AGENTS.md context (ADR-70): injected between the
         // skills section and the environment card.
-        .with_project_context(Some(project_context));
+        .with_project_context(Some(project_context))
+        // ADR-048: `[context].cache_stable_prefix` pins a byte-stable system
+        // head and appends the volatile working memory after it. Resolved
+        // through the engine's budget policy so the knob's default lives in
+        // exactly one place (`ContextBudgetPolicy::from_config`); unset or
+        // `false` keeps today's byte-identical assembly.
+        .with_cache_stable_prefix(
+            crate::context_engine::ContextBudgetPolicy::from_config(
+                services.config.context.as_ref(),
+            )
+            .cache_stable_prefix,
+        );
 
     // ADR-43: one audit record + `info` log per run proving which enabled
     // skill packs (and how many characters) were injected into this loop's
@@ -2174,7 +2183,7 @@ async fn execute_agent_loop(
     // `task` is moved into the loop below; Ulid is Copy so the task id is
     // captured up front for spend attribution (Phase 3, issue #93).
     let task_id = task.id.0;
-    // Run-stage signals (ADR-55 Phase 2a): the loop is about to start, so the
+    // Run-stage signals (ADR-55 §9): the loop is about to start, so the
     // run is Inspecting the workspace; a mutation-capable run then moves to
     // Execute. Complete is reported only after `run` returns Ok below — an Err
     // or cancellation never advances the stage. Under full local agency the
@@ -2401,7 +2410,7 @@ async fn select_or_init_memory_services(
     Ok(Some(mem.store))
 }
 
-/// ADR-55 Phase 2d §3: resolve the plan binding a confident Execute
+/// ADR-55 §4: resolve the plan binding a confident Execute
 /// auto-Applies — the coordinator decides, no clicks.
 ///
 /// Two sources, in order:
@@ -2437,14 +2446,14 @@ async fn resolve_auto_apply_binding(
         if raw.artifact_verifies() {
             return Ok(Some(raw));
         }
-        // ADR-55 Phase 2d §3: the approved plan for THIS objective drifted
+        // ADR-55 §4: the approved plan for THIS objective drifted
         // from its artifact hash. Executing anything else would be a silent
         // re-decompose — fail the run loudly instead.
         return Err(OrchestratorError::Unrecoverable {
             message: format!(
                 "approved plan binding for objective {objective_hash} drifted from its artifact \
                  hash (plan {}); refusing to silently re-decompose — re-plan explicitly to \
-                 replace it (ADR-55 Phase 2d §3)",
+                 replace it (ADR-55 §4)",
                 raw.plan_id(),
             ),
         });
@@ -2481,7 +2490,7 @@ pub fn dispatches_to_coordinator(force_single_agent: bool) -> bool {
     !force_single_agent
 }
 
-/// ADR-55 Phase 2b (M3, live-fix): an Apply run executes the APPROVED plan,
+/// ADR-55 §4 (M3, live-fix): an Apply run executes the APPROVED plan,
 /// not the approval phrase ("i approve"). The stored, capped plan text is
 /// what the user approved; the original ask rides in the transcript.
 fn approved_plan_task_description(binding: &PlanBinding) -> String {
@@ -2872,8 +2881,8 @@ async fn seed_run_continuity(
     }
 }
 
-/// Build the run's task from the gate and plan-binding state (ADR-55 Phase
-/// 2b, M3 live-fix).
+/// Build the run's task from the gate and plan-binding state (ADR-55 §4,
+/// M3 live-fix).
 ///
 /// An Apply run must describe the APPROVED plan rather than the approval
 /// phrase that armed the dialog ("i approve"); without this the coordinator's
@@ -3049,7 +3058,7 @@ pub async fn run_shared_agent(
     //
     // Full local agency: the run-scoped grant store is created fresh per call
     // and never derived from routing. Grants are per-run and non-durable
-    // (ADR-55 §4): a fresh store per call means they can never cross sessions.
+    // (ADR-55 §5): a fresh store per call means they can never cross sessions.
     // Deny-class rules and the approval sink remain the boundaries.
     let store = Arc::new(IntentGrantStore::new());
     let auth = Arc::new(SessionIntentAuth::new(store.clone()));
@@ -3101,7 +3110,7 @@ pub async fn run_shared_agent(
     // control flow: every message enters ONE unified loop that may act, with
     // the orchestrator authority (landed) bypassing intent restrictions while
     // deny-class rules still run first and Consequential actions still reach
-    // the approval sink. Grants remain per-run and non-durable (ADR-55 §4).
+    // the approval sink. Grants remain per-run and non-durable (ADR-55 §5).
     let plan_objective_hash = blake3::hash(req.input.as_bytes()).to_hex().to_string();
 
     // Carry forward previous session spend so the cap looks at cumulative
@@ -3115,7 +3124,7 @@ pub async fn run_shared_agent(
         }
     }
 
-    // ADR-55 Phase 2d §3 (plan→Execute auto-Apply): a stored plan binding for
+    // ADR-55 §4 (plan→Execute auto-Apply): a stored plan binding for
     // THIS exact objective executes the persisted plan outright — hash-verified,
     // loud-fail on drift, no `approve the plan` click and no keyword gate. A
     // binding for a different objective never intercepts. See
@@ -3134,9 +3143,9 @@ pub async fn run_shared_agent(
     // grant and no read-only-from-routing. The orchestrator authority (landed)
     // bypasses intent restrictions while deny-class rules run first and
     // Consequential actions still reach the approval sink. The auto-Apply
-    // additionally feeds the ADR-55 Phase 2b (M2) checkpoint suppression below.
+    // additionally feeds the ADR-55 §4 (M2) checkpoint suppression below.
     let mut plan_decision: Option<PlanDecision> = None;
-    // ADR-55 Phase 2b (M3, live-fix): the auto-Apply consumes the stored
+    // ADR-55 §4 (M3, live-fix): the auto-Apply consumes the stored
     // binding below, so capture it BEFORE that consumption — the Execute run's
     // task must be built from the approved plan text, which is only available
     // while the binding still exists.
@@ -3147,7 +3156,7 @@ pub async fn run_shared_agent(
     // divergence, never something a user saw.
     let mut approval_time_revision: Option<String> = None;
     if let Some(binding) = bound {
-        // ADR-55 Phase 2d §3: auto-Apply — no dialog. The binding was
+        // ADR-55 §4: auto-Apply — no dialog. The binding was
         // hash-verified at interception ([`resolve_auto_apply_binding`]);
         // consume it in both stores so a later run cannot re-apply an
         // already-executed plan.
@@ -3157,7 +3166,7 @@ pub async fn run_shared_agent(
         let binding_revision = binding.source_revision().unwrap_or("unknown");
         // The auto decision is audited under the synthetic `intent:plan`
         // identity with plan_id + source revision in the user response
-        // (`auto_apply`, ADR-55 Phase 2d §5).
+        // (`auto_apply`, ADR-55 §6).
         executor
             .record_plan_decision(
                 session_id,
@@ -3165,7 +3174,7 @@ pub async fn run_shared_agent(
                 binding.plan_id(),
                 objective_hash,
                 current_revision.as_deref(),
-                // ADR-55 Phase 2d §5: the plan-decision seam gains the
+                // ADR-55 §6: the plan-decision seam gains the
                 // `auto_apply` variant.
                 "auto_apply",
                 req.cancel_token.clone(),
@@ -3176,16 +3185,16 @@ pub async fn run_shared_agent(
             plan_id = %binding.plan_id(),
             plan_revision = %binding_revision,
             current_revision = %current_revision.as_deref().unwrap_or("unknown"),
-            "auto-Applying the hash-verified stored plan (ADR-55 Phase 2d §3, no dialog)"
+            "auto-Applying the hash-verified stored plan (ADR-55 §4, no dialog)"
         );
-        // The decision rides along for ADR-55 Phase 2b (M2) checkpoint
+        // The decision rides along for ADR-55 §4 (M2) checkpoint
         // suppression below.
         plan_decision = Some(PlanDecision::Apply);
         // The auto-Apply CONSUMES the stored plan: drop the session's
         // binding in the in-memory registry and in durable storage so a
         // later run cannot re-apply an already-executed plan. A missing
         // durable row is a no-op (fail-soft).
-        // ADR-55 Phase 2b (M3, live-fix): capture the binding BEFORE
+        // ADR-55 §4 (M3, live-fix): capture the binding BEFORE
         // consuming it so the Execute run below can describe the
         // approved plan.
         applied_plan = Some(binding.clone());
@@ -3201,7 +3210,7 @@ pub async fn run_shared_agent(
         let _ = apply_auto_plan_decision(&store);
     }
 
-    // ADR-55 Phase 2b (M2): an Apply decision authorizes the STORED plan for
+    // ADR-55 §4 (M2): an Apply decision authorizes the STORED plan for
     // this objective — the run must execute that plan, never silently resume
     // a stale partial-graph checkpoint from an earlier Execute of the same
     // objective (its input hash would otherwise match the implicit-resume
@@ -3325,7 +3334,7 @@ pub async fn run_shared_agent(
         if !req.force_single_agent {
             let resume_requested = is_resume_request(&req.input);
 
-            // ADR-55 Phase 2b (M2): an Apply executes the APPROVED plan for
+            // ADR-55 §4 (M2): an Apply executes the APPROVED plan for
             // this objective. A checkpoint left over from a previous partial
             // Execute of the same objective would match the input hash and
             // silently resume the old partial graph below — the approved
@@ -3544,7 +3553,7 @@ pub async fn run_shared_agent(
             return Err(OrchestratorError::Provider(refusal));
         }
     }
-    // ADR-55 Phase 2b (M3, live-fix): an Apply run executes the APPROVED plan,
+    // ADR-55 §4 (M3, live-fix): an Apply run executes the APPROVED plan,
     // not the approval phrase. `req.input` is still recorded in the transcript
     // and audit; only the task the agents execute is replaced. ADR-60 D7: a
     // whiteboard-verified approved plan swaps in the structured artifact +
@@ -3557,6 +3566,24 @@ pub async fn run_shared_agent(
         approved_context.as_ref(),
         &req.input,
     );
+
+    // Run-history audit: a checkpoint row governs this run, so record the
+    // resume intent BEFORE any restore or dispatch work — the history shows a
+    // deliberate resume (explicit `continue`/`resume` input OR an implicit
+    // objective match after a restart), not a fresh run, even when the resume
+    // later fails, replans, or is cleared. The checkpoint block above has
+    // already finalized the row (cleared/malformed ⇒ `None`), so `is_some()`
+    // is the decision. Fail-soft like every other publish.
+    if req.resume_checkpoint_json.is_some() {
+        let run_id = crate::coordinator::CoordinatorAgent::checkpoint_run_id_hint(
+            req.resume_checkpoint_json.as_deref(),
+        );
+        let _ = services.bus.publish_for_session(
+            session_id,
+            task.id.0,
+            EventKind::ResumeRequested { run_id, session_id, message: req.input.clone() },
+        );
+    }
 
     // ─── ADR-60 D7 run-continuity: a `continue`/resume run with no approved
     // plan binding still rehydrates the session's whiteboard ledger — files
@@ -3587,7 +3614,7 @@ pub async fn run_shared_agent(
         }
     }
 
-    // Run-stage tracking (ADR-55 Phase 2a). Created here, after routing, so
+    // Run-stage tracking (ADR-55 §9). Created here, after routing, so
     // the stage chip always starts from Understand; threaded down into the
     // single- and multi-agent paths below, which report the later stages.
     let stage_tracker =
@@ -3701,7 +3728,7 @@ pub async fn run_shared_agent(
 /// Run the multi-agent (coordinator) path: resolve role-specific providers,
 /// or launch a full multi-agent `CoordinatorAgent` with collaboration rules.
 ///
-/// ADR-55 Phase 2e §1: this path receives every non-forced run. Under full
+/// ADR-55 §1: this path receives every non-forced run. Under full
 /// local agency the coordinator's decision loop engages specialists on need,
 /// never by pre-scanning the user's words; `action_required` is always true.
 ///
@@ -3753,6 +3780,8 @@ async fn run_multi_agent(
 ) -> Result<AgentOutput, OrchestratorError> {
     let project_dir = req.project_dir.clone();
     if let Some(store) = &session_store {
+        // Run-start row: no provider call has happened yet, so there is no
+        // usage to record — tokens stay `None` by design.
         let user_message = Message {
             role: concerto_core::types::Role::User,
             content: req.input.clone(),
@@ -3872,7 +3901,7 @@ async fn run_multi_agent(
     // ADR-35 phase 4: the roles needing provider/model resolution mirror the
     // runtime topology (coordinator + built-ins not disabled + enabled custom
     // agents) instead of a hardcoded role list. The shape follows the intent
-    // gate's effective outcome (ADR-55 Phase 1e): Execute runs use the full
+    // gate's effective outcome (ADR-55 §7): Execute runs use the full
     // topology, everything else resolves only the coordinator.
     let roles_to_resolve: Vec<AgentId> = if action_required {
         topology_roles(&services.config.multi_agent)
@@ -4070,7 +4099,7 @@ async fn run_multi_agent(
     // the process supervisor (real `orchestrator-agent-process` children under
     // one write gate) instead of the in-process coordinator waves. Only
     // Execute-classified runs take this path — the text-only fork above was
-    // deleted with the unified agent loop (ADR-55 Phase 2e §1) and Plan still
+    // deleted with the unified agent loop (ADR-55 §1) and Plan still
     // runs on the coordinator at planning-only depth. Any preparation gap
     // (no session-DB pool, missing child binary, empty roster) degrades loudly
     // to the coordinator below rather than failing the run.
@@ -4095,6 +4124,14 @@ async fn run_multi_agent(
             memory.clone(),
             consolidation,
             supervised_plan_id,
+            // ADR-60 S5 (DEFERRED #49): hand the children the effective config
+            // (real provider rebuild), the parent-rendered skills section, the
+            // run's bus (approval audit events) and the SAME frontend approval
+            // sink the in-process paths use.
+            &services.config,
+            &services.skills,
+            &services.bus,
+            &services.approval_sink,
         ) {
             Some(supervised) => {
                 return drive_supervised_run(
@@ -4237,6 +4274,19 @@ async fn run_multi_agent(
     // OS/shell identity card (custom-ai-shell plan, Phase C), pre-rendered
     // above from the resolved shell settings; see the registry wiring.
     .with_environment_card(environment_card)
+    // The DISPATCH prompt receives its OS/shell identity card through the
+    // shared `PromptBuilder` seam, so hand it the same resolved profile the
+    // registry was built with (the self-implement persona keeps the
+    // pre-rendered card above).
+    .with_shell_profile(services.config.resolved_shell_settings().selected_profile().cloned())
+    // ADR-048: `[context].cache_stable_prefix` pins a byte-stable dispatch
+    // prompt head and appends the volatile working memory after it, matching
+    // the single-agent loop. Resolved through the engine's budget policy so
+    // the knob's default lives in exactly one place.
+    .with_cache_stable_prefix(
+        crate::context_engine::ContextBudgetPolicy::from_config(services.config.context.as_ref())
+            .cache_stable_prefix,
+    )
     // ADR-58 P2+P3 (Batch 1): the resolved blueprint facade backs the
     // stage-kind resolutions (`role_in_kind_stage`, `execution_stage_tag`,
     // `kind_stage_tag`). ADR-58 amendment (2026-09-05): the facade never
@@ -4412,7 +4462,7 @@ async fn run_multi_agent(
         None => multi_agent_task_with_history(task.clone(), &req.conversation_history),
     };
     let mut context = AgentContext::new(SessionContext::new(session_id, project_dir.clone()));
-    // Run-stage tracking (ADR-55 Phase 2a): the coordinator publishes
+    // Run-stage tracking (ADR-55 §9): the coordinator publishes
     // `SubTaskCreated` and gate-cycle (`ReviewCycleStarted` /
     // `ValidationCycleStarted`) events on the bus as the graph progresses, so
     // the stage chip can follow the actual lifecycle instead of the wrapper's
@@ -4499,6 +4549,11 @@ async fn run_multi_agent(
         Ok(output) => output,
         Err(error) => {
             stage_feed.abort();
+            // Settle the coordinator's usage first: it feeds both the failure
+            // row below and the metrics/spend tail, so one rate-limit
+            // exhaustion or cancellation records the same tokens everywhere
+            // (ADR-48 §4 — real usage when available, on the message row too).
+            let settled = coordinator.settled_metrics();
             if let Some(store) = &session_store {
                 let content = if matches!(
                     &error,
@@ -4509,14 +4564,15 @@ async fn run_multi_agent(
                 } else {
                     format!("Task failed: {error}")
                 };
+                let (tokens_in, tokens_out) = message_row_usage(settled);
                 let failure_message = Message {
                     role: concerto_core::types::Role::Assistant,
                     content,
                     tool_calls: None,
                     tool_results: None,
                     reasoning_content: None,
-                    tokens_in: None,
-                    tokens_out: None,
+                    tokens_in,
+                    tokens_out,
                 };
                 if let Err(store_error) = store
                     .append_messages(session_id, &[failure_message], req.cancel_token.clone())
@@ -4531,11 +4587,11 @@ async fn run_multi_agent(
             }
             transcript_recorder.stop().await;
             event_recorder.stop().await;
-            // Persist the coordinator's settled metrics before the error
-            // propagates: on a rate-limit exhaustion / cancellation the run
-            // consumed real tokens without any output — the audit trail must
-            // still record them. Best-effort like the success tail.
-            let settled = coordinator.settled_metrics();
+            // Persist the coordinator's settled metrics (bound above, before
+            // the failure row) before the error propagates: on a rate-limit
+            // exhaustion / cancellation the run consumed real tokens without
+            // any output — the audit trail must still record them. Best-effort
+            // like the success tail.
             persist_provider_metrics(
                 session_store.as_ref(),
                 session_id,
@@ -4556,7 +4612,7 @@ async fn run_multi_agent(
     };
     stage_feed.abort();
     stage_tracker.lock().unwrap_or_else(|error| error.into_inner()).set(RunStage::Complete);
-    // ADR-55 Phase 2b (M3): on a completed planning-only run, bind the
+    // ADR-55 §4 (M3): on a completed planning-only run, bind the
     // rendered plan (the coordinator's final message) to this objective,
     // keyed by the same plan_id the coordinator persisted as the durable
     // PlanArtifact (ADR-52), newest-wins.
@@ -4633,14 +4689,18 @@ async fn run_multi_agent(
     )
     .await;
     if let Some(store) = &session_store {
+        // ADR-48 §4: the assistant row records the same settled usage the
+        // `provider_metrics` and spend writes above record for this run. The
+        // run-start user row predates any provider call and stays `None`.
+        let (tokens_in, tokens_out) = message_row_usage(&output.provider_metrics);
         let assistant_message = Message {
             role: concerto_core::types::Role::Assistant,
             content: output.final_message.clone(),
             tool_calls: None,
             tool_results: None,
             reasoning_content: None,
-            tokens_in: None,
-            tokens_out: None,
+            tokens_in,
+            tokens_out,
         };
         if let Err(error) =
             store.append_messages(session_id, &[assistant_message], req.cancel_token.clone()).await
@@ -4731,6 +4791,12 @@ struct SupervisedRun {
     /// `GateRequest.plan_id` and its terminal events — write-applied rows and
     /// subtask completions then key into the plan's ledger (`fold_ledger`).
     plan_id: Option<String>,
+    /// ADR-60 S5 (DEFERRED #49): extra environment the parent stamps on every
+    /// child so it can rebuild the real provider and inject the same skills
+    /// section. Resolved once per run: the effective `AppConfig` as JSON
+    /// ([`crate::agent_process_config::CONFIG_ENV`], no secrets) and the
+    /// parent-rendered skills section (`CONCERTO_AGENT_SKILLS_SECTION`).
+    spawn_env: Vec<(String, String)>,
 }
 
 /// Prepare everything a supervised multi-agent run needs, or `None` (with a
@@ -4751,6 +4817,10 @@ fn prepare_supervised_run(
     memory: Arc<dyn MemoryStore>,
     consolidation: Option<Arc<crate::consolidation::Consolidator>>,
     plan_id: Option<String>,
+    config: &AppConfig,
+    skills: &crate::skills_context::SkillsContext,
+    bus: &EventBus,
+    approval_sink: &Arc<dyn ApprovalSink>,
 ) -> Option<SupervisedRun> {
     let tasks = supervised_agent_tasks(multi_agent, objective);
     if tasks.is_empty() {
@@ -4791,27 +4861,69 @@ fn prepare_supervised_run(
         project_id: ProjectId(concerto_core::helpers::project_id_hash(project_dir)),
         subscriptions: SubscriptionManager::new(log_pool),
         consolidation,
+        // ADR-60 S5 approval bridge: children route approvals to the SAME
+        // frontend sink the in-process paths use. `None` keeps the fail-closed
+        // deny default.
+        approval_sink: Some(approval_sink.clone()),
+        bus: Some(bus.clone()),
     };
+    let spawn_env = supervised_spawn_env(config, skills);
     // ADR-60 D3: every supervised worker subscribes to `Decision` topics so
     // sibling decisions stream to it as `whiteboard-slice` pushes (protocol
     // 0.2.0); the supervisor loop registers these on first sight of the child.
-    let mut config = SupervisorConfig::default();
+    let mut supervisor_config = SupervisorConfig::default();
     for (agent_id, _) in &tasks {
-        config = config.with_whiteboard_subscription(
+        supervisor_config = supervisor_config.with_whiteboard_subscription(
             agent_id.clone(),
             vec![concerto_sessions::whiteboard::WhiteboardKind::Decision],
         );
     }
     Some(SupervisedRun {
         services,
-        config,
+        config: supervisor_config,
         binary,
         project_root: project_dir.to_path_buf(),
         session_id,
         tasks,
         plan_id,
+        spawn_env,
     })
 }
+
+/// Build the per-run child environment carrying the effective config and the
+/// parent-rendered skills section (ADR-60 S5, DEFERRED #49).
+///
+/// Fail-soft on serialization: a config that cannot be serialized is logged
+/// and omitted — the child then fails closed with a named missing-config error
+/// rather than silently falling back to a mock. The values carry no secrets
+/// (provider metadata + skill *instructions*, which are local instruction
+/// packs by design).
+fn supervised_spawn_env(
+    config: &AppConfig,
+    skills: &crate::skills_context::SkillsContext,
+) -> Vec<(String, String)> {
+    use crate::agent_process_config::CONFIG_ENV;
+    let mut env = Vec::new();
+    match serde_json::to_string(config) {
+        Ok(json) => env.push((CONFIG_ENV.to_owned(), json)),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "supervised run: could not serialize the effective config for children; \
+                 children will fail closed on a missing provider"
+            );
+        }
+    }
+    let section = skills.section();
+    if !section.is_empty() {
+        env.push((SUPERVISED_SKILLS_ENV.to_owned(), section));
+    }
+    env
+}
+
+/// Environment variable carrying the parent-rendered skills section to each
+/// supervised child (`agent_process.rs` reads the same name).
+const SUPERVISED_SKILLS_ENV: &str = "CONCERTO_AGENT_SKILLS_SECTION";
 
 /// ADR-60 D6 (Phase 4): construct the supervised consolidation projection
 /// task over the project's memory DB (`<app data>/memory/memory.db`), the
@@ -4958,11 +5070,14 @@ async fn drive_supervised_run(
         command
             .env("CONCERTO_AGENT_ID", agent_id)
             .env("CONCERTO_PROJECT_ROOT", &run.project_root)
-            .env("CONCERTO_TASK_DESCRIPTION", description)
-            // Slice limitation (documented on the child entry): the
-            // agent-process binary wires the mock provider only today; real
-            // provider plumbing is a later ADR-60 chunk.
-            .env("CONCERTO_PROVIDER", "mock");
+            .env("CONCERTO_TASK_DESCRIPTION", description);
+        // ADR-60 S5 (DEFERRED #49): the effective config (no secrets) and the
+        // parent-rendered skills section are stamped once per run so each child
+        // rebuilds the real provider and injects the same skills. `mock` is an
+        // explicit opt-in only — the child never falls back to it implicitly.
+        for (name, value) in &run.spawn_env {
+            command.env(name, value);
+        }
         // ADR-60 D7 ledger enrichment: a plan-driven run stamps every child
         // write with the approved plan id (the child mirrors it onto
         // `GateRequest.plan_id` and its terminal whiteboard events).
@@ -5116,7 +5231,8 @@ async fn drive_supervised_run(
     // Per-child provider metrics/spend are not surfaced through the parent in
     // this slice (the mock-provider children consume none), so there is
     // nothing to persist here yet — the coordinator tail's metric writes are
-    // deliberately omitted rather than called with empty data.
+    // deliberately omitted rather than called with empty data, and the
+    // assistant row's token fields stay `None` for the same reason.
     if let Some(store) = session_store {
         let assistant_message = Message {
             role: Role::Assistant,
@@ -5253,7 +5369,7 @@ fn resume_scope_project_id(project_dir: &Path) -> String {
     ProjectId::resolve(project_dir).0
 }
 
-/// ADR-55 Phase 2b (M2): discard the session's orchestration checkpoint
+/// ADR-55 §4 (M2): discard the session's orchestration checkpoint
 /// before a plan-driven (Apply) Execute so the run re-plans from the
 /// approved plan instead of silently resuming an old partial graph — the
 /// same objective hash would otherwise trip the implicit-resume check.
@@ -5310,7 +5426,7 @@ mod runtime_runner_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // ===========================================================================
-    // ADR-55 Phase 2e: envelope + acceptance tests (A6-revised / A8 / A10).
+    // ADR-55 §2: envelope + acceptance tests (archived acceptance ids).
     // ===========================================================================
 
     // ===========================================================================
@@ -7145,7 +7261,7 @@ mod runtime_runner_tests {
     }
 
     // ------------------------------------------------------------------
-    // ADR-55 Phase 2b (M3, live-fix): an Apply run's task describes the
+    // ADR-55 §4 (M3, live-fix): an Apply run's task describes the
     // approved plan, never the approval phrase that armed the dialog.
     // ------------------------------------------------------------------
 
@@ -7914,7 +8030,7 @@ mod runtime_runner_tests {
     }
 
     // ------------------------------------------------------------------
-    // Run-stage tracking (ADR-55 Phase 2a): StageTracker transition-only
+    // Run-stage tracking (ADR-55 §9): StageTracker transition-only
     // emission and the single-agent wiring through execute_agent_loop.
     // ------------------------------------------------------------------
 
@@ -8164,7 +8280,7 @@ mod runtime_runner_tests {
     /// Live-fix (restart-safe auto-Apply): a durable binding in the session
     /// DB rehydrates into the once-empty in-process registry so a confident
     /// Execute after an app restart still auto-Applies the real persisted
-    /// plan (ADR-55 Phase 2d §3), with its original age preserved.
+    /// plan (ADR-55 §4), with its original age preserved.
     #[tokio::test]
     async fn durable_binding_rehydrates_for_auto_apply() {
         use concerto_sessions::{PlanBindingRecord, SqliteSessionStore};
@@ -8210,7 +8326,7 @@ mod runtime_runner_tests {
     }
 
     // ------------------------------------------------------------------
-    // ADR-55 Phase 2d §3 / A5: plan→Execute auto-Apply — a confident
+    // ADR-55 §4: plan→Execute auto-Apply — a confident
     // Execute over a stored binding executes the persisted plan outright,
     // hash-verified; drift on the exact-objective leg is a LOUD failure,
     // never a silent re-decompose.
@@ -8250,7 +8366,7 @@ mod runtime_runner_tests {
     /// A5 (loud-fail on drift): a stored binding whose plan text no longer
     /// matches its creation-time artifact hash must fail the run LOUDLY —
     /// never silently fall through to a fresh re-decompose of the same
-    /// objective (ADR-55 Phase 2d §3).
+    /// objective (ADR-55 §4).
     #[tokio::test]
     async fn a5_drifted_exact_objective_binding_loud_fails_never_redecomposes() {
         let session = Ulid::new();
@@ -8626,7 +8742,7 @@ mod runtime_runner_tests {
     }
 
     // ------------------------------------------------------------------
-    // ADR-55 Phase 2b (M2): plan-driven Execute must not silently resume a
+    // ADR-55 §4 (M2): plan-driven Execute must not silently resume a
     // stale partial-graph checkpoint
     // ------------------------------------------------------------------
 

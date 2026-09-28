@@ -832,6 +832,20 @@ pub enum L1MemoryType {
     WorkFact,
 }
 
+impl L1MemoryType {
+    /// Stable wire spelling of this kind — the same token the extraction
+    /// prompt accepts (`persona` / `episodic` / `instruction` / `work_fact`),
+    /// so persisted `l1_kind` metadata round-trips through the parser.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Persona => "persona",
+            Self::Episodic => "episodic",
+            Self::Instruction => "instruction",
+            Self::WorkFact => "work_fact",
+        }
+    }
+}
+
 /// A single L1-extracted, typed memory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct L1ExtractedMemory {

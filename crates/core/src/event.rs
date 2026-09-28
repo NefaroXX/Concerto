@@ -102,18 +102,23 @@ pub enum EventKind {
     },
 
     // --- policy (Phase 2) ---
+    /// An approval request has been raised and the run is now waiting on the
+    /// user. Published exactly once per request, before the requester parks;
+    /// `timeout_secs: 0` means the wait is unbounded (no deadline is armed).
     ApprovalRequested {
         tool_name: String,
         timeout_secs: u64,
     },
+    /// The approval request was answered: `approved` is true for
+    /// approve/approve-all, false for a denial or for a cancellation while
+    /// pending (fail-closed). Exactly one resolution per request.
     ApprovalResolved {
         tool_name: String,
         approved: bool,
     },
-    /// An approval request expired before the user responded.
-    ///
-    /// Emitted by the requester (tool executor) when the approval timeout
-    /// elapses; the action is denied by default and never executes.
+    /// Retained for event-schema compatibility; the approval flow no longer
+    /// arms a timer, so no request can expire and this variant is no longer
+    /// emitted (see `ToolExecutor::request_approval_decision`).
     ApprovalTimeout {
         tool_name: String,
         timeout_secs: u64,
@@ -309,6 +314,14 @@ pub enum EventKind {
     /// fires for the planned-but-absent class. `plan_id` is the plan artifact
     /// id (`plan-<plan_id>.json`), `affected_paths` are project-root-relative
     /// forward-slash paths.
+    ///
+    /// The signal carries the whole Phase 6 M3c investigation so a consumer
+    /// (desktop chat, CLI transcript, SSE) can render one human report:
+    /// `diff` is the classified snapshot-vs-checkpoint finding per path,
+    /// `reverify` is the live-filesystem re-verification of those findings,
+    /// and `redispatched` names the re-armed steps the resume re-dispatched.
+    /// All three are additive — a legacy producer (or a pre-M3c event row)
+    /// deserializes them as empty.
     PlanDrift {
         task_id: TaskId,
         /// Run-scoped id of the plan the drift is scoped to; `None` when the
@@ -317,6 +330,18 @@ pub enum EventKind {
         /// present.
         plan_id: Option<String>,
         affected_paths: Vec<String>,
+        /// Classified findings for every declared artifact that could not be
+        /// confirmed intact at the resume's snapshot. Additive field.
+        #[serde(default)]
+        diff: Vec<PlanDriftDiffEntry>,
+        /// Per-finding live-filesystem re-verification. Additive field.
+        #[serde(default)]
+        reverify: Vec<PlanDriftReverifyEntry>,
+        /// Role labels of the completed subtasks the resume re-armed and
+        /// re-dispatched; empty when the resume delegated to a fresh plan.
+        /// Additive field.
+        #[serde(default)]
+        redispatched: Vec<String>,
     },
     SubTaskCreated {
         task_id: TaskId,
@@ -374,6 +399,9 @@ pub enum EventKind {
     },
 
     // --- review + validation loops (Phase 5) ---
+    // Escalation is event-free: the coordinator escalates by verdict
+    // (`progress::CycleVerdict::Escalate`) and surfaces it as an informational
+    // `AgentThought`, so no dedicated escalation event kind is needed.
     ReviewCycleStarted {
         task_id: TaskId,
         cycle_num: u32,
@@ -383,17 +411,9 @@ pub enum EventKind {
         cycle_num: u32,
         verdict: String,
     },
-    ReviewCycleEscalated {
-        task_id: TaskId,
-        max_cycles: u32,
-    },
     ValidationCycleStarted {
         task_id: TaskId,
         cycle_num: u32,
-    },
-    ValidationEscalated {
-        task_id: TaskId,
-        max_cycles: u32,
     },
 
     // --- routing (Phase 5) ---
@@ -403,7 +423,7 @@ pub enum EventKind {
         provider: String,
         model: String,
         reason: String,
-        /// ADR-55 Phase 2d §5: the intent-routing decision payload, present
+        /// ADR-55 §6: the intent-routing decision payload, present
         /// only on the run loop's intent-routing emissions. The multi-agent
         /// model-routing rows (`crates/providers/src/routing.rs`) carry
         /// `None`. `#[serde(default)]` keeps pre-2d payloads deserializable.
@@ -601,10 +621,10 @@ pub enum EventKind {
         retry_after_ms: Option<u64>,
     },
 
-    // --- intent routing (ADR-55 Phase 0) ---
+    // --- intent routing (ADR-55 §9) ---
     /// A run advanced to a new [`crate::intent::RunStage`].
     ///
-    /// ADR-55 Phase 0 ships the type and the event kind only —
+    /// ADR-55 §9 ships the type and the event kind only —
     /// `RunStageChanged` is NEVER emitted in Phase 0; it is pure additive
     /// plumbing. Emission lands with the intent-router wiring in a later
     /// phase. Additive variant: consumers must tolerate its absence.
@@ -613,10 +633,94 @@ pub enum EventKind {
         task_id: TaskId,
         stage: crate::intent::RunStage,
     },
+
+    // --- run interrupt / resume audit (run-history continuity) ---
+    /// A run was interrupted by the operator (a deliberate stop), recorded at
+    /// the moment the `Cancelled` terminal class surfaces.
+    ///
+    /// The output alone cannot tell a user stop from a provider failure —
+    /// both normalize to `Partial` — so the run history carries this
+    /// explicit marker instead. `at_stage` names the stage that was
+    /// cancelled: `"planning"` (decompose / decision session) or
+    /// `"executing"` (graph dispatch).
+    RunInterruptedByUser {
+        run_id: Option<String>,
+        session_id: Ulid,
+        /// The stage the interrupt landed in (`"planning"` | `"executing"`).
+        at_stage: String,
+    },
+    /// A resume was requested for this session and an orchestration
+    /// checkpoint row was accepted to govern the run.
+    ///
+    /// Recorded before any restore or dispatch work so the intent survives
+    /// even when the resume later fails, replans, or is cleared.
+    ResumeRequested {
+        run_id: Option<String>,
+        session_id: Ulid,
+        /// The input that requested the resume (e.g. `continue`).
+        message: String,
+    },
+    /// A checkpoint graph was restored from the durable row: the shape the
+    /// resume received, before any resume-evaluator outcome applied.
+    ///
+    /// These are the completion guard's key inputs — a later
+    /// unattempted-implementation verdict can be audited against whether the
+    /// restored graph ever held implement work.
+    CheckpointRestored {
+        run_id: Option<String>,
+        session_id: Ulid,
+        /// Restored subtasks in a non-terminal state.
+        pending_nodes: usize,
+        /// Restored subtasks already `Completed`.
+        completed_nodes: usize,
+        /// Whether the checkpoint carried a binding design doc / declared
+        /// expected artifacts (a promised implementation).
+        plan_present: bool,
+    },
+    /// The outcome of ONE `call_specialist` dispatch attempt.
+    ///
+    /// Emitted at every point where the Coordinator's dispatch decision does
+    /// not reach a successful specialist run, so the run history separates
+    /// "attempted and blocked" (`attempted: true`) from "never attempted"
+    /// (`attempted: false`) — the input a completion guard needs to report
+    /// the real blocker instead of a generic unattempted verdict.
+    SpecialistDispatchOutcome {
+        run_id: Option<String>,
+        session_id: Ulid,
+        /// The (possibly not-yet-materialized) subtask the decision targeted.
+        task_id: TaskId,
+        role: AgentId,
+        /// `false` when the dispatch never reached a specialist call (policy
+        /// denial, model selection failure); `true` when a specialist call was
+        /// issued and then failed or was cancelled.
+        attempted: bool,
+        /// Machine-readable label: `policy-denied`, `model-selection-failed`,
+        /// `dispatch-failed`, or `cancelled`.
+        outcome: String,
+        /// Human-readable reason; `None` when the outcome needs none.
+        reason: Option<String>,
+    },
+    /// The Coordinator executed a MUTATING tool of its own instead of
+    /// delegating.
+    ///
+    /// Recorded only when self-execution is lawful: the roster is empty (or
+    /// disabled), or a delegation attempt was already recorded. The `reason`
+    /// names which exhaustion case permitted it, so coordinator self-work is
+    /// no longer indistinguishable from a delegated dispatch. Read-only
+    /// coordinator actions publish nothing here.
+    CoordinatorSelfImplementing {
+        run_id: Option<String>,
+        session_id: Ulid,
+        /// The coordinator's own tool that ran (e.g. `write`, `shell`, `git`).
+        tool_name: String,
+        /// Why self-execution was permitted: `roster-empty-or-disabled` or
+        /// `delegation-attempted`.
+        reason: String,
+    },
 }
 
 /// The intent-routing payload of an intent [`EventKind::RoutingDecided`]
-/// record (ADR-55 Phase 2d §5).
+/// record (ADR-55 §6).
 ///
 /// Mirrors the `{rule, confidence, route}` envelope of the matching
 /// `intent_router: auto_granted` audit row so the `session_events` record and
@@ -637,6 +741,124 @@ pub struct IntentRouteDecision {
     pub route: String,
     /// Whether the run auto-granted from this decision (2d §1).
     pub auto_granted: bool,
+}
+
+/// How a planned artifact diverged from the run-start workspace inventory
+/// (Phase 6 M3c, [`EventKind::PlanDrift::diff`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanDriftDiffClass {
+    /// The plan expects it, the resume's live inventory does not hold it,
+    /// and the run's own writes do not explain it.
+    Missing,
+    /// The live inventory holds it but with a different recorded identity
+    /// (content hash, or size when no hash was captured) than the run-start
+    /// baseline.
+    AlteredHash,
+    /// The live inventory holds it but the run-start baseline did not — it
+    /// appeared after the run began, written by something other than the run.
+    New,
+}
+
+impl PlanDriftDiffClass {
+    /// The kebab-free lowercase label used in human reports.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::AlteredHash => "altered",
+            Self::New => "new",
+        }
+    }
+}
+
+/// One classified planned-artifact finding of a [`EventKind::PlanDrift`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanDriftDiffEntry {
+    /// Project-root-relative forward-slash path.
+    pub path: String,
+    /// Why it is a finding.
+    pub class: PlanDriftDiffClass,
+}
+
+/// The outcome of re-reading one drift finding from the live filesystem
+/// (Phase 6 M3c, [`EventKind::PlanDrift::reverify`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanDriftReverifyStatus {
+    /// Present and unchanged against the run-start reference (or present
+    /// with no comparable reference): the finding is cleared silently.
+    Intact,
+    /// Present but diverged from the run-start reference.
+    Diverged,
+    /// Absent from the live filesystem.
+    Gone,
+    /// The file could not be read or stat'ed for a reason other than
+    /// absence — re-verification genuinely failed.
+    Unverified,
+}
+
+impl PlanDriftReverifyStatus {
+    /// The kebab-free lowercase label used in human reports.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Intact => "intact",
+            Self::Diverged => "diverged",
+            Self::Gone => "gone",
+            Self::Unverified => "unverified",
+        }
+    }
+
+    /// Whether the finding survived re-verification as real drift.
+    pub fn is_confirmed_drift(&self) -> bool {
+        matches!(self, Self::Diverged | Self::Gone)
+    }
+}
+
+/// One live-filesystem re-verification result of a [`EventKind::PlanDrift`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanDriftReverifyEntry {
+    /// Project-root-relative forward-slash path.
+    pub path: String,
+    /// What re-reading the file showed.
+    pub status: PlanDriftReverifyStatus,
+}
+
+/// The one-line human report both frontends render for an
+/// [`EventKind::PlanDrift`] (Phase 6 M3c step 4 — desktop chat activity and
+/// the CLI transcript must tell the same story).
+///
+/// Reports, in order: what drifted, what re-verification concluded, and what
+/// was re-dispatched. `affected_paths` are the classified findings' paths,
+/// `reverify` their live re-read, and `redispatched` the re-armed steps'
+/// role labels (empty when the resume delegated re-dispatch to a fresh plan).
+pub fn plan_drift_report(
+    affected_paths: &[String],
+    reverify: &[PlanDriftReverifyEntry],
+    redispatched: &[String],
+) -> String {
+    let listed =
+        if affected_paths.is_empty() { "<unlisted>".to_owned() } else { affected_paths.join(", ") };
+    let mut statuses: Vec<&'static str> = Vec::new();
+    for entry in reverify {
+        let label = entry.status.as_str();
+        if !statuses.contains(&label) {
+            statuses.push(label);
+        }
+    }
+    let reverified = if statuses.is_empty() {
+        "no re-verification".to_owned()
+    } else {
+        format!("re-verified: {}", statuses.join(", "))
+    };
+    let redispatch =
+        if reverify.iter().any(|entry| entry.status == PlanDriftReverifyStatus::Unverified) {
+            "no re-dispatch attempted".to_owned()
+        } else if redispatched.is_empty() {
+            "re-dispatch delegated to the resumed plan".to_owned()
+        } else {
+            format!("re-dispatched {}", redispatched.join(", "))
+        };
+    format!("Plan drift: {listed} ({reverified}); {redispatch}")
 }
 
 impl EventKind {
@@ -788,13 +1010,66 @@ impl EventKind {
                 project_id: sanitizer.sanitize(&project_id),
                 reason: sanitizer.sanitize(&reason),
             },
-            EventKind::PlanDrift { task_id, plan_id, affected_paths } => EventKind::PlanDrift {
+            EventKind::PlanDrift {
+                task_id,
+                plan_id,
+                affected_paths,
+                diff,
+                reverify,
+                redispatched,
+            } => EventKind::PlanDrift {
                 task_id,
                 plan_id: plan_id.map(|id| sanitizer.sanitize(&id)),
                 affected_paths: affected_paths
                     .into_iter()
                     .map(|path| sanitizer.sanitize(&path))
                     .collect(),
+                diff: diff
+                    .into_iter()
+                    .map(|entry| PlanDriftDiffEntry {
+                        path: sanitizer.sanitize(&entry.path),
+                        class: entry.class,
+                    })
+                    .collect(),
+                reverify: reverify
+                    .into_iter()
+                    .map(|entry| PlanDriftReverifyEntry {
+                        path: sanitizer.sanitize(&entry.path),
+                        status: entry.status,
+                    })
+                    .collect(),
+                redispatched: redispatched
+                    .into_iter()
+                    .map(|label| sanitizer.sanitize(&label))
+                    .collect(),
+            },
+            // Run-history audit: the resume input is verbatim user text and
+            // the dispatch reason can echo provider error strings.
+            EventKind::ResumeRequested { run_id, session_id, message } => {
+                EventKind::ResumeRequested {
+                    run_id,
+                    session_id,
+                    message: sanitizer.sanitize(&message),
+                }
+            }
+            EventKind::SpecialistDispatchOutcome {
+                run_id,
+                session_id,
+                task_id,
+                role,
+                attempted,
+                outcome,
+                reason,
+            } => EventKind::SpecialistDispatchOutcome {
+                run_id,
+                session_id,
+                task_id,
+                role,
+                attempted,
+                // `outcome` is a fixed caller-chosen label, never echoed
+                // provider text; only the reason carries free-form text.
+                outcome,
+                reason: reason.map(|reason| sanitizer.sanitize(&reason)),
             },
             // All other variants have no string fields or only non-sensitive strings
             other => other,
@@ -1521,11 +1796,11 @@ mod tests {
     }
 
     /// The run-stage transition event must survive serde round-trip with its
-    /// payload intact (ADR-55 Phase 2a: emitted from the run wrapper, consumed
+    /// payload intact (ADR-55 §9: emitted from the run wrapper, consumed
     /// by the desktop/cli bus adapters).
     #[test]
     fn run_stage_changed_serialization_roundtrip() {
-        let task_id = crate::types::TaskId::new();
+        let task_id = TaskId::new();
         let kind = EventKind::RunStageChanged { task_id, stage: crate::intent::RunStage::Execute };
         let json = serde_json::to_value(&kind).unwrap();
         let back: EventKind = serde_json::from_value(json).unwrap();
@@ -1536,6 +1811,82 @@ mod tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    /// The run-history audit variants (interrupt / resume / restore / dispatch
+    /// outcome) survive a serde round trip with their payload intact — the
+    /// session event recorder persists them verbatim and the run-history
+    /// reader must be able to reconstruct them.
+    #[test]
+    fn run_history_audit_events_roundtrip() {
+        let session_id = new_id();
+        let task_id = TaskId::new();
+        let kinds = vec![
+            EventKind::RunInterruptedByUser {
+                run_id: Some("run-1".into()),
+                session_id,
+                at_stage: "planning".into(),
+            },
+            EventKind::ResumeRequested { run_id: None, session_id, message: "continue".into() },
+            EventKind::CheckpointRestored {
+                run_id: Some("run-1".into()),
+                session_id,
+                pending_nodes: 1,
+                completed_nodes: 2,
+                plan_present: true,
+            },
+            EventKind::SpecialistDispatchOutcome {
+                run_id: None,
+                session_id,
+                task_id,
+                role: AgentId::new("coder"),
+                attempted: true,
+                outcome: "dispatch-failed".into(),
+                reason: Some("rate limited".into()),
+            },
+        ];
+        for kind in kinds {
+            let json = serde_json::to_string(&kind).expect("event must serialize");
+            let back: EventKind = serde_json::from_str(&json).expect("event must deserialize");
+            assert_eq!(
+                format!("{back:?}"),
+                format!("{kind:?}"),
+                "round trip must preserve the audit payload"
+            );
+        }
+    }
+
+    /// The two free-form string fields on the audit variants are sanitized
+    /// before broadcast, like every other user/provider text field.
+    #[test]
+    fn sanitizer_redacts_run_history_audit_text() {
+        let sanitizer = SecretSanitizer::default();
+        let resumed = EventKind::ResumeRequested {
+            run_id: None,
+            session_id: new_id(),
+            message: "use key sk-1234567890abcdef1234567890abcdef to continue".into(),
+        }
+        .sanitized(&sanitizer);
+        let EventKind::ResumeRequested { message, .. } = resumed else {
+            panic!("expected ResumeRequested");
+        };
+        assert!(message.contains("[REDACTED]"), "message must be redacted: {message}");
+
+        let outcome = EventKind::SpecialistDispatchOutcome {
+            run_id: None,
+            session_id: new_id(),
+            task_id: TaskId::new(),
+            role: AgentId::new("coder"),
+            attempted: false,
+            outcome: "policy-denied".into(),
+            reason: Some("denied for token sk-1234567890abcdef1234567890abcdef".into()),
+        }
+        .sanitized(&sanitizer);
+        let EventKind::SpecialistDispatchOutcome { outcome: label, reason, .. } = outcome else {
+            panic!("expected SpecialistDispatchOutcome");
+        };
+        assert_eq!(label, "policy-denied", "the fixed label must not be rewritten");
+        assert!(reason.as_deref().is_some_and(|r| r.contains("[REDACTED]")), "reason: {reason:?}");
     }
 
     #[test]
@@ -1636,5 +1987,80 @@ mod tests {
         let json = serde_json::to_value(&kind).unwrap();
         let back: EventKind = serde_json::from_value(json).unwrap();
         assert!(matches!(back, EventKind::AgentThought { kind: ThinkingKind::Headline, .. }));
+    }
+
+    /// Phase 6 M3c: the investigation payload on `PlanDrift` is additive —
+    /// a legacy row (or an older producer) that carries only the original
+    /// three fields still deserializes, with the payload defaulted empty.
+    #[test]
+    fn plan_drift_payload_is_additive() {
+        let legacy = serde_json::json!({
+            "PlanDrift": {
+                "task_id": "01J00000000000000000000000",
+                "plan_id": "plan-7",
+                "affected_paths": ["src/gone.rs"]
+            }
+        });
+        let back: EventKind = serde_json::from_value(legacy).expect("legacy row deserializes");
+        let EventKind::PlanDrift { plan_id, affected_paths, diff, reverify, redispatched, .. } =
+            &back
+        else {
+            panic!("expected PlanDrift");
+        };
+        assert_eq!(plan_id.as_deref(), Some("plan-7"));
+        assert_eq!(affected_paths, &vec!["src/gone.rs".to_owned()]);
+        assert!(diff.is_empty() && reverify.is_empty() && redispatched.is_empty());
+
+        // The full payload round-trips with its typed classification.
+        let full = EventKind::PlanDrift {
+            task_id: TaskId::new(),
+            plan_id: Some("plan-7".into()),
+            affected_paths: vec!["src/gone.rs".into()],
+            diff: vec![PlanDriftDiffEntry {
+                path: "src/gone.rs".into(),
+                class: PlanDriftDiffClass::Missing,
+            }],
+            reverify: vec![PlanDriftReverifyEntry {
+                path: "src/gone.rs".into(),
+                status: PlanDriftReverifyStatus::Gone,
+            }],
+            redispatched: vec!["coder".into()],
+        };
+        let json = serde_json::to_value(&full).expect("serializes");
+        let back: EventKind = serde_json::from_value(json).expect("deserializes");
+        let EventKind::PlanDrift { diff, reverify, redispatched, .. } = &back else {
+            panic!("expected PlanDrift");
+        };
+        assert_eq!(diff[0].class, PlanDriftDiffClass::Missing);
+        assert_eq!(reverify[0].status, PlanDriftReverifyStatus::Gone);
+        assert_eq!(redispatched, &vec!["coder".to_owned()]);
+    }
+
+    /// Both frontends render this single report line for a drift signal.
+    #[test]
+    fn plan_drift_report_tells_what_drifted_verified_and_redispatched() {
+        let paths = vec!["src/gone.rs".to_owned(), "src/new.rs".to_owned()];
+        let reverify = vec![
+            PlanDriftReverifyEntry {
+                path: "src/gone.rs".into(),
+                status: PlanDriftReverifyStatus::Gone,
+            },
+            PlanDriftReverifyEntry {
+                path: "src/new.rs".into(),
+                status: PlanDriftReverifyStatus::Diverged,
+            },
+        ];
+        let report = plan_drift_report(&paths, &reverify, &["coder".to_owned()]);
+        assert!(report.contains("src/gone.rs, src/new.rs"), "{report}");
+        assert!(report.contains("re-verified: gone, diverged"), "{report}");
+        assert!(report.contains("re-dispatched coder"), "{report}");
+
+        // A re-verification failure never claims a re-dispatch happened.
+        let failed = vec![PlanDriftReverifyEntry {
+            path: "src/gone.rs".into(),
+            status: PlanDriftReverifyStatus::Unverified,
+        }];
+        let report = plan_drift_report(&paths, &failed, &[]);
+        assert!(report.contains("no re-dispatch attempted"), "{report}");
     }
 }

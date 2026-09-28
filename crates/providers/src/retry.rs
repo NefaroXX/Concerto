@@ -26,7 +26,7 @@ pub enum RetryClass {
     GatewayFailure,
     Network,
     /// A transport fault while a completion stream was already in flight
-    /// (ADR-55 Phase 2e stream-retry): the connection broke mid-stream.
+    /// (stream-retry): the connection broke mid-stream.
     /// Retryable — tools execute only post-assembly, so re-issuing the
     /// request is side-effect-free within the bounded attempt budget.
     StreamTransport,
@@ -90,11 +90,11 @@ fn is_throttle_class(class: Option<RetryClass>) -> bool {
 /// Non-retryable conditions (auth failure, permission denied, invalid request,
 /// context overflow, malformed/invalid responses, cancellation, spend/policy
 /// rejection, and mid-stream idle timeouts after output has begun) return
-/// `retryable: false`. Transient conditions (rate limits, 5xx, timeouts before
-/// any output, network blips, and mid-stream TRANSPORT faults — ADR-55 Phase
-/// 2e stream-retry) return `retryable: true`.
+/// `retryable: false`. Transient conditions (rate limits, 5xx, timeouts
+/// before any output, network blips, and mid-stream TRANSPORT faults)
+/// return `retryable: true`.
 ///
-/// The mid-stream distinction (ADR-55 Phase 2e): a transport fault while a
+/// The mid-stream distinction (stream-retry): a transport fault while a
 /// stream was in flight ([`ProviderError::StreamTransport`]) IS retried —
 /// tools execute only after the stream is fully assembled, so re-issuing the
 /// request is side-effect-free within the bounded attempt budget. The
@@ -143,7 +143,7 @@ pub fn classify_provider_error(error: &ProviderError) -> RetryDecision {
             ),
         },
 
-        // ADR-55 Phase 2e stream-retry: the collector wraps a dropped
+        // Stream-retry: the collector wraps a dropped
         // mid-stream connection as `StreamTransport` (framing/parse failures
         // stay `Serialization`/`InvalidResponse` and fatal). Retrying is
         // side-effect-free: tools execute only after the stream is fully
@@ -516,6 +516,11 @@ where
                             elapsed,
                             last_error: reason,
                             throttled: is_throttle_class(decision.class),
+                            // Preserve the final attempt's raw provider wait
+                            // hint so a caller can HOLD the rung and retry the
+                            // SAME provider after the cooldown instead of
+                            // abandoning it (owner doctrine, ladder hold).
+                            retry_after: decision.provider_delay,
                         });
                     }
                 }
@@ -809,7 +814,7 @@ mod tests {
         );
     }
 
-    /// ADR-55 Phase 2e stream-retry: a transport fault while a completion
+    /// Stream-retry: a transport fault while a completion
     /// stream was already in flight is RETRYABLE. Deliberately reversing the
     /// previous conservative stance (`Other` → fatal) with this rationale:
     /// tools execute only after the stream is fully assembled, so re-issuing
@@ -824,7 +829,7 @@ mod tests {
         let d = classify_provider_error(&ProviderError::StreamTransport(
             "connection reset mid-stream".into(),
         ));
-        assert!(d.retryable, "a mid-stream transport fault must be retried (ADR-55 Phase 2e)");
+        assert!(d.retryable, "a mid-stream transport fault must be retried (ADR-55 §1)");
         assert_eq!(d.class, Some(RetryClass::StreamTransport));
         assert!(d.reason.contains("mid-stream"));
     }

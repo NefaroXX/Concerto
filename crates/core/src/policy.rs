@@ -3,6 +3,7 @@ use crate::authorization::{
     RULE_COORDINATOR_AUTHORITY,
 };
 use crate::error::PolicyError;
+use crate::sandbox::{is_container_routable_tool, ContainerRuntimeProbe, SystemContainerRuntime};
 use crate::traits::policy::{AuditEntry, AuditLog, PolicyEngine};
 use crate::types::{
     CodeCategory, Condition, PolicyAction, PolicyRule, PolicyVerdict, SandboxProfile,
@@ -23,17 +24,25 @@ pub struct SimplePolicyEngine {
     compiled: HashMap<String, regex::Regex>,
     spend_tracker: Option<Arc<SpendTracker>>,
     rate_limiter: Option<Arc<RpmLimiter>>,
-    /// ADR-55 §2: optional, session-scoped, non-durable source of
+    /// ADR-55 §3: optional, session-scoped, non-durable source of
     /// authorization state consulted by `Condition::IntentAuthorized`.
     /// `None` (the default) preserves exact pre-ADR-55 behavior.
     intent_auth: Option<Arc<dyn IntentAuthorization>>,
-    /// Effective approval deadline for approval-producing rules that do not
+    /// Approval deadline carried by approval-producing rules that do not
     /// carry an explicit timeout (`RequireApproval`,
     /// `RequireManagedToolApproval`, `RequireToolchainApproval`). Defaults to
-    /// 30s (pre-existing behavior); configurable through `[policy]
-    /// approval_timeout_secs`. A timeout now PAUSES the run awaiting the user
-    /// instead of denying it.
+    /// 30s; configurable through `[policy] approval_timeout_secs`.
+    ///
+    /// **Inert by design.** The value still rides the policy verdict so the
+    /// config format, the public API and audit payloads stay compatible, but
+    /// the executor no longer races any timer: an approval request parks until
+    /// permission is given or revoked (owner requirement — no auto-expiry).
+    /// See `ToolExecutor::request_approval_decision`.
     approval_timeout: std::time::Duration,
+    /// ADR-72: container-runtime availability probe used to admit or refuse the
+    /// `SandboxProfile::Containerized` profile. Defaults to the process-wide
+    /// system probe; injectable so tests never need a container runtime.
+    sandbox_runtime: Arc<dyn ContainerRuntimeProbe>,
 }
 
 impl SimplePolicyEngine {
@@ -47,13 +56,26 @@ impl SimplePolicyEngine {
             rate_limiter: None,
             intent_auth: None,
             approval_timeout: std::time::Duration::from_secs(30),
+            sandbox_runtime: Arc::new(SystemContainerRuntime::new()),
         }
     }
 
-    /// Override the default approval deadline (30s) used by approval-producing
-    /// rules that do not carry an explicit timeout. Wired from `[policy]
-    /// approval_timeout_secs`; `RequireApprovalWithTimeout` always keeps its
-    /// own per-rule value.
+    /// Override the container-runtime probe used by `check_sandbox` (ADR-72).
+    /// Injecting a stub keeps enforcement tests deterministic and free of any
+    /// container requirement.
+    pub fn with_sandbox_runtime(mut self, probe: Arc<dyn ContainerRuntimeProbe>) -> Self {
+        self.sandbox_runtime = probe;
+        self
+    }
+
+    /// Override the default approval deadline (30s) carried by
+    /// approval-producing rules that do not carry an explicit timeout. Wired
+    /// from `[policy] approval_timeout_secs`; `RequireApprovalWithTimeout`
+    /// always keeps its own per-rule value.
+    ///
+    /// The value is retained for config/API compatibility only — nothing
+    /// enforces it once the verdict leaves this engine (see the
+    /// `approval_timeout` field).
     pub fn with_approval_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.approval_timeout = timeout;
         self
@@ -71,7 +93,7 @@ impl SimplePolicyEngine {
         self
     }
 
-    /// Attach an intent-authorization state source (ADR-55 §2).
+    /// Attach an intent-authorization state source (ADR-55 §3).
     ///
     /// The provider returns the *full* policy outcome for each action:
     /// [`IntentVerdict::Allow`] upgrades `RequireApproval` → `Allow`,
@@ -234,7 +256,7 @@ impl SimplePolicyEngine {
         }
     }
 
-    /// ADR-55 §2 intent gate: apply the attached authorization's verdict
+    /// ADR-55 §3 intent gate: apply the attached authorization's verdict
     /// mechanically to the rule's normal outcome. `Allow` upgrades
     /// `RequireApproval` → `Allow` (audit `rule_matched` = the verdict's rule);
     /// `RequireApproval` keeps the action under the rule's approval path;
@@ -368,7 +390,18 @@ impl SimplePolicyEngine {
                 .and_then(|p| p.to_str())
                 .map(|p| self.compiled.get(&format!("wd:{glob}")).is_some_and(|re| re.is_match(p)))
                 .unwrap_or(false),
-            // ADR-55 §2: as a plain boolean predicate the intent condition
+            Condition::ResolvedPathGlob(glob) => {
+                let facts = action.path_facts.as_ref();
+                // Prefer the confined resolved path; fall back to the attempted
+                // path so a rejected traversal is still gate-able.
+                facts
+                    .and_then(|f| f.resolved_path.as_deref().or(f.attempted_path.as_deref()))
+                    .map(|p| {
+                        self.compiled.get(&format!("rpath:{glob}")).is_some_and(|re| re.is_match(p))
+                    })
+                    .unwrap_or(false)
+            }
+            // ADR-55 §3: as a plain boolean predicate the intent condition
             // matches only when an attached authorization allows the action.
             // Approval-producing rules handle the bare condition through
             // `eval_intent_gate` instead, so a compound condition can never
@@ -386,13 +419,63 @@ impl SimplePolicyEngine {
 
     /// Check the active sandbox profile against the requested tool operation.
     ///
-    /// Sandbox profiles are currently stubs and do not provide real runtime
-    /// isolation. Any non-`None` profile produces a deny verdict so callers
-    /// cannot accidentally rely on unimplemented sandboxing.
+    /// `ReadOnlyFs` and `NetworkIsolated` are still stubs and are denied so
+    /// callers cannot accidentally rely on unimplemented sandboxing.
+    ///
+    /// `Containerized` is admitted only when (ADR-72 §2):
+    /// 1. a container runtime (docker/podman) is available, **and**
+    /// 2. the action carries a container-routable plan (structured command
+    ///    facts for the shell tool with a working directory), **and**
+    /// 3. those facts assert [`crate::types::CommandRouting::Containerized`] —
+    ///    the explicit marker that the invocation was genuinely routed through
+    ///    a container.
+    ///
+    /// Otherwise it is denied fail-closed: a missing runtime, a plan that is
+    /// not container-routable, or a missing routing marker is an explicit
+    /// refusal, never a silent fallback to ambient authority. Admission here
+    /// means "not blocked by the sandbox gate"; the action still passes through
+    /// normal rule evaluation.
+    ///
+    /// The reverse direction is enforced too: command facts that assert
+    /// container routing while the active profile is *not* `Containerized` are
+    /// refused rather than silently ignored — the producer's routing claim and
+    /// the session's declared profile must agree.
     fn check_sandbox(&self, action: &PolicyAction<'_>) -> Option<(PolicyVerdict, String)> {
         match action.sandbox_profile {
-            None | Some(SandboxProfile::None) => None,
-            Some(_) => Some((PolicyVerdict::Deny, "sandbox_profiles_not_implemented".into())),
+            None | Some(SandboxProfile::None) => {
+                if container_routing_is_asserted(action) {
+                    Some((PolicyVerdict::Deny, "sandbox_container_routing_profile_mismatch".into()))
+                } else {
+                    None
+                }
+            }
+            Some(SandboxProfile::ReadOnlyFs) | Some(SandboxProfile::NetworkIsolated) => {
+                Some((PolicyVerdict::Deny, "sandbox_profiles_not_implemented".into()))
+            }
+            Some(SandboxProfile::Containerized) => self.check_containerized(action),
+        }
+    }
+
+    /// `SandboxProfile::Containerized` admission (ADR-72 §2).
+    ///
+    /// Ordering matters for diagnostics only; every arm is a denial, so no
+    /// ordering admits an unrouted invocation. Runtime detection comes first so
+    /// an absent runtime is reported as such, then plan shape (which also
+    /// refuses non-routable tools as unenforceable), then the routing marker,
+    /// which names the exact residual this check closes: a caller that selected
+    /// `Containerized` but forgot to route the invocation through a container.
+    fn check_containerized(&self, action: &PolicyAction<'_>) -> Option<(PolicyVerdict, String)> {
+        match self.sandbox_runtime.probe() {
+            unavailable if !unavailable.is_available() => {
+                Some((PolicyVerdict::Deny, "sandbox_containerized_runtime_unavailable".into()))
+            }
+            _ if !container_plan_is_well_formed(action) => {
+                Some((PolicyVerdict::Deny, "sandbox_containerized_unenforceable".into()))
+            }
+            _ if !container_routing_is_asserted(action) => {
+                Some((PolicyVerdict::Deny, "sandbox_containerized_routing_missing".into()))
+            }
+            _ => None,
         }
     }
 
@@ -451,6 +534,8 @@ impl SimplePolicyEngine {
             toolchain_version: None,
             plan_id: None,
             source_revision: None,
+            path_facts: action.path_facts.clone(),
+            result_facts: None,
         };
         self.record_audit(entry, cancel).await;
     }
@@ -625,6 +710,22 @@ fn collect_from_cond(cond: &Condition, map: &mut HashMap<String, regex::Regex>) 
                 }
             }
         }
+        Condition::ResolvedPathGlob(glob) => {
+            // Namespace like PathGlob/WorkingDir so the three glob namespaces
+            // can never collide on identical source text.
+            if let std::collections::hash_map::Entry::Vacant(e) = map.entry(format!("rpath:{glob}"))
+            {
+                let re_str = glob_to_regex(glob);
+                match regex::Regex::new(&re_str) {
+                    Ok(re) => {
+                        e.insert(re);
+                    }
+                    Err(err) => {
+                        error!(?glob, error = %err, "invalid glob in policy pattern");
+                    }
+                }
+            }
+        }
         Condition::Not(inner) => collect_from_cond(inner, map),
         Condition::All(conds) | Condition::Any(conds) => {
             for c in conds {
@@ -656,6 +757,11 @@ fn collect_invalid(cond: &Condition, problems: &mut Vec<String>) {
             }
         }
         Condition::WorkingDir(glob) => {
+            if regex::Regex::new(&glob_to_regex(glob)).is_err() {
+                problems.push(format!("invalid glob pattern: {glob}"));
+            }
+        }
+        Condition::ResolvedPathGlob(glob) => {
             if regex::Regex::new(&glob_to_regex(glob)).is_err() {
                 problems.push(format!("invalid glob pattern: {glob}"));
             }
@@ -784,6 +890,25 @@ fn cmd_is_network_op(cmd: &str) -> bool {
                 | "socat"
         )
     })
+}
+
+/// ADR-72 §2: whether `action` carries the plan needed to route execution
+/// through a container. Only the shell tool has such a route; it must carry
+/// structured command facts naming a working directory (the mount anchor).
+/// Any other tool under `Containerized` is refused as unenforceable rather
+/// than run unconfined.
+fn container_plan_is_well_formed(action: &PolicyAction<'_>) -> bool {
+    is_container_routable_tool(action.tool_name)
+        && action.command_facts.as_ref().is_some_and(|facts| facts.working_directory.is_some())
+}
+
+/// ADR-72 §2: whether `action` explicitly asserts that it was genuinely routed
+/// through a container (see [`crate::types::CommandRouting`]). Absence is never
+/// an admit: the `Containerized` gate requires this marker, and a marker
+/// without a matching profile is likewise refused, so the routing claim and the
+/// declared sandbox profile must agree exactly.
+fn container_routing_is_asserted(action: &PolicyAction<'_>) -> bool {
+    action.command_facts.as_ref().is_some_and(|facts| facts.container_routing.is_containerized())
 }
 
 #[async_trait]
@@ -1219,8 +1344,10 @@ mod tests {
     };
     use crate::ids::Ulid;
     use crate::policy_presets::inject_intent_gate_rule;
+    use crate::sandbox::{ContainerRuntime, ContainerRuntimeProbe, RuntimeAvailability};
     use crate::types::{
-        CapabilitySet, CommandPolicyFacts, DestructiveClass, FilesystemScope, SandboxProfile,
+        CapabilitySet, CommandPolicyFacts, CommandRouting, DestructiveClass, FilesystemScope,
+        PathPolicyFacts, SandboxProfile,
     };
     use std::path::PathBuf;
 
@@ -1255,6 +1382,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         }
     }
 
@@ -1603,6 +1731,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         let cond = Condition::Capability(rule_caps);
         let engine = SimplePolicyEngine::new(
@@ -1630,6 +1759,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         let cond = Condition::Capability(rule_caps);
         let engine = SimplePolicyEngine::new(
@@ -1772,6 +1902,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: Some(facts),
             orchestrator_authority: false,
+            path_facts: None,
         }
     }
 
@@ -1784,6 +1915,7 @@ mod tests {
             network_requested: false,
             filesystem_scope: FilesystemScope::ProjectOnly,
             destructive_classification: DestructiveClass::NonDestructive,
+            container_routing: CommandRouting::Direct,
         }
     }
 
@@ -1871,6 +2003,77 @@ mod tests {
         assert!(!engine.eval_cond(&Condition::ShellProfile("managed-bash".into()), &action));
         assert!(!engine.eval_cond(&Condition::ArgvPattern(".*".into()), &action));
         assert!(!engine.eval_cond(&Condition::WorkingDir("**".into()), &action));
+        assert!(!engine.eval_cond(&Condition::ResolvedPathGlob("**".into()), &action));
+    }
+
+    // ---- Path-shaped structured facts (filesystem observability) ------------
+
+    /// Build a `filesystem` action carrying the given path facts.
+    fn path_facts_action<'a>(
+        input: &'a serde_json::Value,
+        path_facts: PathPolicyFacts,
+    ) -> PolicyAction<'a> {
+        PolicyAction { path_facts: Some(path_facts), ..make_action("filesystem", input) }
+    }
+
+    #[test]
+    fn resolved_path_glob_matches_the_confined_path() {
+        let input = serde_json::json!({"operation": "write", "path": "src/../lib.rs"});
+        let facts = PathPolicyFacts {
+            operation: "write".into(),
+            attempted_path: Some("src/../lib.rs".into()),
+            resolved_path: Some("/proj/lib.rs".into()),
+            ..PathPolicyFacts::default()
+        };
+        let action = path_facts_action(&input, facts);
+        let engine = SimplePolicyEngine::new(
+            vec![PolicyRule::AutoDeny(Condition::ResolvedPathGlob("/proj/**".into()))],
+            Arc::new(TestAuditLog { entries: std::sync::Mutex::new(Vec::new()) }),
+        );
+
+        // The resolved path is matched, not the caller's spelling.
+        assert!(engine.eval_cond(&Condition::ResolvedPathGlob("/proj/**".into()), &action));
+        assert!(!engine.eval_cond(&Condition::ResolvedPathGlob("/proj/src/**".into()), &action));
+    }
+
+    #[test]
+    fn resolved_path_glob_falls_back_to_attempted_path() {
+        // A rejected traversal never resolves, yet must stay gate-able.
+        let input = serde_json::json!({"operation": "read", "path": "../outside.txt"});
+        let facts = PathPolicyFacts {
+            operation: "read".into(),
+            attempted_path: Some("../outside.txt".into()),
+            resolved_path: None,
+            ..PathPolicyFacts::default()
+        };
+        let action = path_facts_action(&input, facts);
+        let engine = SimplePolicyEngine::new(
+            vec![PolicyRule::AutoDeny(Condition::ResolvedPathGlob("../**".into()))],
+            Arc::new(TestAuditLog { entries: std::sync::Mutex::new(Vec::new()) }),
+        );
+
+        assert!(engine.eval_cond(&Condition::ResolvedPathGlob("../**".into()), &action));
+        assert!(!engine.eval_cond(&Condition::ResolvedPathGlob("/proj/**".into()), &action));
+    }
+
+    #[tokio::test]
+    async fn record_decision_carries_path_facts() {
+        let audit = Arc::new(TestAuditLog { entries: std::sync::Mutex::new(Vec::new()) });
+        let rules = vec![PolicyRule::AutoApprove(Condition::ToolName("filesystem".into()))];
+        let engine = SimplePolicyEngine::new(rules, audit.clone());
+        let input = serde_json::json!({"operation": "write", "path": "notes.txt"});
+        let facts = PathPolicyFacts {
+            operation: "write".into(),
+            attempted_path: Some("notes.txt".into()),
+            resolved_path: Some("/proj/notes.txt".into()),
+            ..PathPolicyFacts::default()
+        };
+        let action = path_facts_action(&input, facts.clone());
+
+        engine.evaluate(&action, CancellationToken::new()).await.unwrap();
+        let entries = audit.entries.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path_facts.as_ref(), Some(&facts));
     }
 
     // ---- Sandbox profiles (stub — all non-None profiles deny) ----------------
@@ -1891,6 +2094,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
         assert_eq!(verdict, PolicyVerdict::Allow);
@@ -1912,6 +2116,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
         assert_eq!(verdict, PolicyVerdict::Deny);
@@ -1933,16 +2138,47 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
         assert_eq!(verdict, PolicyVerdict::Deny);
     }
 
     #[tokio::test]
-    async fn sandbox_containerized_denies_as_stub() {
+    async fn sandbox_containerized_refuses_without_runtime() {
+        // ADR-72 §2: fail-closed. No runtime => explicit refusal, never a
+        // silent passthrough to ambient authority — even for a shell action
+        // that carries a well-formed container plan.
         let audit = Arc::new(TestAuditLog { entries: std::sync::Mutex::new(Vec::new()) });
-        let rules = vec![PolicyRule::AutoApprove(Condition::ToolName("filesystem".into()))];
-        let engine = SimplePolicyEngine::new(rules, audit);
+        let engine = SimplePolicyEngine::new(
+            vec![PolicyRule::AutoApprove(Condition::ToolName("shell".into()))],
+            audit.clone(),
+        )
+        .with_sandbox_runtime(Arc::new(StubRuntimeProbe(
+            RuntimeAvailability::Unavailable { reason: "test: no runtime".into() },
+        )));
+        let input = serde_json::json!({"command": "echo hello"});
+        let action = shell_container_action(&input);
+        let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
+        assert_eq!(verdict, PolicyVerdict::Deny);
+        assert_eq!(
+            audit.entries.lock().unwrap()[0].rule_matched.as_deref(),
+            Some("sandbox_containerized_runtime_unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_containerized_refuses_non_shell_tool_as_unenforceable() {
+        // A runtime exists, but the filesystem tool has no container route, so
+        // Containerized must refuse rather than run it unconfined.
+        let audit = Arc::new(TestAuditLog { entries: std::sync::Mutex::new(Vec::new()) });
+        let engine = SimplePolicyEngine::new(
+            vec![PolicyRule::AutoApprove(Condition::ToolName("filesystem".into()))],
+            audit.clone(),
+        )
+        .with_sandbox_runtime(Arc::new(StubRuntimeProbe(RuntimeAvailability::Available(
+            ContainerRuntime::Docker,
+        ))));
         let action = PolicyAction {
             tool_name: "filesystem",
             input: &serde_json::json!({}),
@@ -1953,9 +2189,152 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
         assert_eq!(verdict, PolicyVerdict::Deny);
+        assert_eq!(
+            audit.entries.lock().unwrap()[0].rule_matched.as_deref(),
+            Some("sandbox_containerized_unenforceable")
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_containerized_allows_with_runtime_and_shell_plan() {
+        // Both admission preconditions met: the sandbox gate passes the action
+        // through to normal rule evaluation, where the AutoApprove rule allows.
+        let audit = Arc::new(TestAuditLog { entries: std::sync::Mutex::new(Vec::new()) });
+        let engine = SimplePolicyEngine::new(
+            vec![PolicyRule::AutoApprove(Condition::ToolName("shell".into()))],
+            audit,
+        )
+        .with_sandbox_runtime(Arc::new(StubRuntimeProbe(RuntimeAvailability::Available(
+            ContainerRuntime::Podman,
+        ))));
+        let input = serde_json::json!({"command": "echo hello"});
+        let action = shell_container_action(&input);
+        let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
+        assert_eq!(verdict, PolicyVerdict::Allow);
+    }
+
+    #[tokio::test]
+    async fn sandbox_none_path_is_unchanged() {
+        // Selecting the default profile never consults the runtime probe and
+        // preserves the pre-ADR-72 behavior exactly.
+        let audit = Arc::new(TestAuditLog { entries: std::sync::Mutex::new(Vec::new()) });
+        let engine = SimplePolicyEngine::new(
+            vec![PolicyRule::AutoApprove(Condition::ToolName("shell".into()))],
+            audit,
+        )
+        .with_sandbox_runtime(Arc::new(StubRuntimeProbe(
+            RuntimeAvailability::Unavailable { reason: "test".into() },
+        )));
+        let input = serde_json::json!({"command": "echo hello"});
+        let action = PolicyAction {
+            tool_name: "shell",
+            input: &input,
+            session_id: Ulid::new(),
+            correlation_id: Ulid::new(),
+            capability_requirements: CapabilitySet::default(),
+            sandbox_profile: None,
+            estimated_cost_usd: None,
+            command_facts: None,
+            orchestrator_authority: false,
+            path_facts: None,
+        };
+        let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
+        assert_eq!(verdict, PolicyVerdict::Allow);
+    }
+
+    #[tokio::test]
+    async fn sandbox_containerized_refuses_without_routing_marker() {
+        // Row-36 fail-open residual: a caller that selects `Containerized` but
+        // forgets to route the invocation through a container produces shell
+        // facts with a working directory yet no container routing. A well-formed
+        // plan plus an available runtime is NOT enough; the gate must refuse
+        // with a named error, never admit.
+        let audit = Arc::new(TestAuditLog { entries: std::sync::Mutex::new(Vec::new()) });
+        let engine = SimplePolicyEngine::new(
+            vec![PolicyRule::AutoApprove(Condition::ToolName("shell".into()))],
+            audit.clone(),
+        )
+        .with_sandbox_runtime(Arc::new(StubRuntimeProbe(RuntimeAvailability::Available(
+            ContainerRuntime::Docker,
+        ))));
+        let input = serde_json::json!({"command": "echo hello"});
+        let action = shell_container_action_with_routing(&input, CommandRouting::Direct);
+        let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
+        assert_eq!(verdict, PolicyVerdict::Deny);
+        assert_eq!(
+            audit.entries.lock().unwrap()[0].rule_matched.as_deref(),
+            Some("sandbox_containerized_routing_missing")
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_container_routing_without_containerized_profile_is_refused() {
+        // Reverse direction: command facts assert container routing while the
+        // declared profile is `None`. The routing claim and the profile must
+        // agree; a mismatch is refused rather than silently ignored. No runtime
+        // probe is configured because the mismatch is decided before detection.
+        let audit = Arc::new(TestAuditLog { entries: std::sync::Mutex::new(Vec::new()) });
+        let engine = SimplePolicyEngine::new(
+            vec![PolicyRule::AutoApprove(Condition::ToolName("shell".into()))],
+            audit.clone(),
+        );
+        let input = serde_json::json!({"command": "echo hello"});
+        let mut action = shell_container_action_with_routing(&input, CommandRouting::Containerized);
+        action.sandbox_profile = None;
+        let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
+        assert_eq!(verdict, PolicyVerdict::Deny);
+        assert_eq!(
+            audit.entries.lock().unwrap()[0].rule_matched.as_deref(),
+            Some("sandbox_container_routing_profile_mismatch")
+        );
+    }
+
+    /// ADR-72 test double: a probe with a fixed verdict.
+    struct StubRuntimeProbe(RuntimeAvailability);
+
+    impl ContainerRuntimeProbe for StubRuntimeProbe {
+        fn probe(&self) -> RuntimeAvailability {
+            self.0.clone()
+        }
+    }
+
+    /// A shell action under `Containerized` carrying a well-formed plan and a
+    /// genuine container routing marker.
+    fn shell_container_action<'a>(input: &'a serde_json::Value) -> PolicyAction<'a> {
+        shell_container_action_with_routing(input, CommandRouting::Containerized)
+    }
+
+    /// A shell action under `Containerized` with an explicit routing marker, so
+    /// tests can exercise the missing-marker residual deterministically.
+    fn shell_container_action_with_routing<'a>(
+        input: &'a serde_json::Value,
+        container_routing: CommandRouting,
+    ) -> PolicyAction<'a> {
+        PolicyAction {
+            tool_name: "shell",
+            input,
+            session_id: Ulid::new(),
+            correlation_id: Ulid::new(),
+            capability_requirements: CapabilitySet::default(),
+            sandbox_profile: Some(SandboxProfile::Containerized),
+            estimated_cost_usd: None,
+            command_facts: Some(CommandPolicyFacts {
+                shell_profile_id: None,
+                resolved_executable: None,
+                argv: vec!["/bin/sh".into(), "-c".into(), "echo hello".into()],
+                working_directory: Some(PathBuf::from("/proj")),
+                network_requested: false,
+                filesystem_scope: FilesystemScope::ProjectOnly,
+                destructive_classification: DestructiveClass::NonDestructive,
+                container_routing,
+            }),
+            orchestrator_authority: false,
+            path_facts: None,
+        }
     }
 
     // ---- validate(): rule-shape validation ----------------------------------
@@ -2144,6 +2523,7 @@ mod tests {
             estimated_cost_usd: Some(0.6),
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
 
         // Preflight succeeds without charging the estimate.
@@ -2175,6 +2555,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
 
         // First 3 calls should succeed.
@@ -2205,6 +2586,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
 
         let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
@@ -2646,7 +3028,7 @@ mod tests {
         assert_eq!(denied, PolicyVerdict::Deny);
     }
 
-    // ---- ADR-55 1c: intent-gate (`Condition::IntentAuthorized`) ------------
+    // ---- ADR-55 §3: intent-gate (`Condition::IntentAuthorized`) ------------
 
     /// Stub authorization provider returning a fixed verdict for every action.
     #[derive(Clone, Copy)]
@@ -2673,7 +3055,7 @@ mod tests {
         // The gate maps each authorization verdict to the rule's normal policy
         // outcome and records the verdict's rule name as the audit
         // `rule_matched`. Every 1c verdict is pinned as a regression row
-        // (ADR-55 §2).
+        // (ADR-55 §3).
         let cases: &[(IntentVerdict, PolicyVerdict, &str)] = &[
             (IntentVerdict::Allow { rule: RULE_OBSERVE }, PolicyVerdict::Allow, RULE_OBSERVE),
             (
@@ -2738,7 +3120,7 @@ mod tests {
 
     #[tokio::test]
     async fn consequential_requires_approval_even_when_authorized() {
-        // Consequential-tier actions are never covered by a grant (ADR-55 §2):
+        // Consequential-tier actions are never covered by a grant (ADR-55 §3):
         // the gate keeps them under RequireApproval and labels the audit row
         // "consequential".
         let (engine, audit) = engine_with_auth(
@@ -2861,6 +3243,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();
         assert_eq!(verdict, PolicyVerdict::Deny);
@@ -2895,6 +3278,7 @@ mod tests {
             estimated_cost_usd: Some(0.6),
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         tracker.record(0.6);
         let verdict = engine.evaluate(&action, CancellationToken::new()).await.unwrap();

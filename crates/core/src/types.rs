@@ -339,6 +339,17 @@ pub struct PolicyAction<'a> {
     /// the producing tool has not populated them. Kept optional so existing
     /// call sites and non-shell tools are unaffected.
     pub command_facts: Option<CommandPolicyFacts>,
+    /// Structured, pre-resolved facts about a path-shaped tool operation
+    /// (filesystem, git, LSP, …). `None` for tools that do not operate on a
+    /// path (e.g. shell, provider) or when the producing tool has not populated
+    /// them. Kept optional so existing call sites and non-path tools are
+    /// unaffected.
+    ///
+    /// This is the path-shaped counterpart to [`CommandPolicyFacts`]: it records
+    /// the *operation* and the *target path* (attempted as supplied and resolved
+    /// after workspace containment) so the audit trail can attribute a
+    /// filesystem/git operation to a concrete target instead of a hash only.
+    pub path_facts: Option<PathPolicyFacts>,
     /// Orchestrator-authority marker (additive; default `false`).
     ///
     /// Set `true` ONLY at the orchestrator's own top-level call sites — the
@@ -422,6 +433,46 @@ impl DestructiveClass {
     }
 }
 
+/// ADR-72 §2: explicit execution-routing assertion carried on
+/// [`CommandPolicyFacts`].
+///
+/// This is the honest signal the policy engine requires before it will admit a
+/// `SandboxProfile::Containerized` action. A working directory alone proves
+/// nothing about routing — a shell invocation can carry a `cwd` and still be
+/// launched unconfined on the host — so `Containerized` admission requires this
+/// marker *in addition to* a well-formed plan and an available runtime.
+///
+/// Producer contract (every command-fact author must follow it):
+/// - Set [`CommandRouting::Direct`] (the default) when the argv launches
+///   directly on the host. This is always safe.
+/// - Set [`CommandRouting::Containerized`] **only** when the argv was produced
+///   by wrapping the inner invocation in `<runtime> run …` and will be spawned
+///   argv-direct through that runtime (see the shell tool's `with_container`
+///   route). Never set it from a bare working directory, or for an invocation
+///   that was planned but not actually routed.
+///
+/// The policy engine enforces both directions of the contract: a
+/// `Containerized` profile without this marker is denied
+/// (`sandbox_containerized_routing_missing`), and this marker without a
+/// `Containerized` profile is denied
+/// (`sandbox_container_routing_profile_mismatch`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum CommandRouting {
+    /// The invocation launches directly on the host (default, safe).
+    #[default]
+    Direct,
+    /// The invocation was wrapped in a container runtime and runs confined.
+    Containerized,
+}
+
+impl CommandRouting {
+    /// Whether this routing asserts genuine container confinement.
+    pub fn is_containerized(self) -> bool {
+        matches!(self, Self::Containerized)
+    }
+}
+
 /// Structured, pre-resolved facts about a command execution, presented to the
 /// policy engine and audit log (ADR-28 §6/§7).
 ///
@@ -449,6 +500,139 @@ pub struct CommandPolicyFacts {
     pub filesystem_scope: FilesystemScope,
     /// Destructive-operation classification.
     pub destructive_classification: DestructiveClass,
+    /// ADR-72 §2: explicit routing assertion. Defaults to
+    /// [`CommandRouting::Direct`]; a producer sets
+    /// [`CommandRouting::Containerized`] only when the `argv` above was
+    /// genuinely wrapped in a container runtime. See [`CommandRouting`] for the
+    /// full producer contract the policy engine enforces.
+    pub container_routing: CommandRouting,
+}
+
+/// Structured facts about a path-shaped tool operation (filesystem, git, LSP,
+/// …): the operation name and the target path as supplied by the caller and as
+/// resolved after workspace containment.
+///
+/// This is the path-shaped sibling of [`CommandPolicyFacts`]. It exists so a
+/// filesystem/git operation can be attributed in the audit log to a concrete
+/// target and operation instead of a hash only — the defect this carrier
+/// closes. Until it was added, `fs` operations recorded `command_facts: None`,
+/// leaving `argv`, `working_directory`, `filesystem_scope` and the target path
+/// empty and unrecoverable.
+///
+/// # Secret safety (documented rule)
+///
+/// Only paths and operation names are recorded here — never raw tool input,
+/// HTTP headers, or request bodies. A path may itself embed a secret (e.g. a
+/// URL query string), so URL-shaped actions MUST be built through
+/// [`PathPolicyFacts::for_url`], which strips userinfo, query, and fragment via
+/// [`strip_url_secrets`]. The filesystem producer records the attempted and
+/// resolved path, which are already confined to the workspace.
+///
+/// `attempted_*` and `resolved_*` are recorded separately on purpose: a
+/// difference between them is exactly what reveals a containment rewrite (a
+/// caller path re-anchored under the workspace root), which forensics needs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PathPolicyFacts {
+    /// The operation the tool attempted: `read`/`write`/`move`/`copy`/`delete`/
+    /// `exists`/`list` for the filesystem tool, the git subcommand for the git
+    /// tool, or the LSP method for an LSP tool.
+    pub operation: String,
+    /// The path/URL exactly as supplied by the caller (URL-shaped targets are
+    /// stripped of secrets before reaching this field).
+    pub attempted_path: Option<String>,
+    /// The resolved absolute path after workspace containment. `None` when
+    /// resolution failed (e.g. a traversal rejection); the attempted path is
+    /// still recorded so the rejection is attributable.
+    pub resolved_path: Option<String>,
+    /// Destination path as supplied by the caller (move/copy only).
+    pub attempted_destination: Option<String>,
+    /// Resolved absolute destination after containment (move/copy only).
+    pub resolved_destination: Option<String>,
+}
+
+impl PathPolicyFacts {
+    /// Build facts for a URL-shaped action, stripping secret-bearing URL
+    /// components (userinfo, query, fragment) so no secret can reach the audit
+    /// row. `resolved_path` is left empty: a URL is not resolved against the
+    /// workspace.
+    pub fn for_url(operation: impl Into<String>, url: &str) -> Self {
+        Self {
+            operation: operation.into(),
+            attempted_path: Some(strip_url_secrets(url)),
+            ..Self::default()
+        }
+    }
+
+    /// Whether any target path was recorded. Used to avoid writing an empty
+    /// carrier for an action that named no path.
+    pub fn has_target(&self) -> bool {
+        self.attempted_path.is_some()
+            || self.resolved_path.is_some()
+            || self.attempted_destination.is_some()
+            || self.resolved_destination.is_some()
+    }
+}
+
+/// Compact, content-free summary of what a **successful read-only** tool
+/// operation returned — persisted in `audit_log.result_facts` (migration 035)
+/// next to the migration-034 path facts.
+///
+/// Recorded so a post-hoc audit can tell what the agent *learned*, not only
+/// what it attempted: a `list` row reporting `entries=0` proves the agent
+/// knew the directory was empty before it acted on that knowledge.
+///
+/// # Safety rule (non-negotiable)
+///
+/// Only a boolean, a count, or a byte length is ever recorded. File content,
+/// directory entry names, and any other unbounded or secret-bearing value
+/// **never** reach this type — every variant renders to a fixed-shape,
+/// O(1)-sized string (`exists=true`, `entries=3`, `bytes=42`), so the column
+/// can never carry a payload. Producers must take these numbers from the
+/// result they already hold: deriving one must never re-read a file or add a
+/// second syscall on the hot path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadResultFacts {
+    /// `exists`: whether the target path was present.
+    Exists(bool),
+    /// `list`: how many entries the listing returned — what the agent saw,
+    /// so a tool-capped listing is recorded at its cap. `0` means empty.
+    Entries(i64),
+    /// `read`: byte length of the returned content — never the content.
+    Bytes(i64),
+}
+
+impl std::fmt::Display for ReadResultFacts {
+    /// The canonical rendering stored in `audit_log.result_facts` and shown
+    /// by `concerto audit`: fixed shape, bounded length, never content.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::Exists(exists) => write!(f, "exists={exists}"),
+            Self::Entries(count) => write!(f, "entries={count}"),
+            Self::Bytes(bytes) => write!(f, "bytes={bytes}"),
+        }
+    }
+}
+
+/// Strip secret-bearing components from a URL-shaped target, keeping only
+/// `scheme://host/path`.
+///
+/// Removes userinfo (`user:pass@`), the query string, and the fragment. A
+/// string with no `://` is treated as a plain filesystem path and returned
+/// unchanged, so a legitimate path is never mangled.
+pub fn strip_url_secrets(target: &str) -> String {
+    let Some(scheme_end) = target.find("://") else {
+        return target.to_string();
+    };
+    let scheme = &target[..scheme_end];
+    let rest = &target[scheme_end + 3..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let remainder = &rest[authority_end..];
+    let path_end = remainder.find(['?', '#']).unwrap_or(remainder.len());
+    let path = &remainder[..path_end];
+    // `rsplit('@').next()` drops any userinfo while keeping the host.
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    format!("{scheme}://{host}{path}")
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -456,8 +640,19 @@ pub struct CommandPolicyFacts {
 pub enum PolicyVerdict {
     Allow,
     Deny,
-    RequireApproval { timeout: std::time::Duration },
-    RequireApprovalWithTimeout { timeout: std::time::Duration },
+    /// An explicit user decision is required before the action may run.
+    ///
+    /// `timeout` is carried for config/API compatibility and is **not
+    /// enforced**: the executor parks on the approval request until it is
+    /// answered or the run is cancelled (no auto-expiry).
+    RequireApproval {
+        timeout: std::time::Duration,
+    },
+    /// Same as [`Self::RequireApproval`], with the deadline supplied by the
+    /// matched rule. Likewise not enforced by the executor.
+    RequireApprovalWithTimeout {
+        timeout: std::time::Duration,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -466,6 +661,9 @@ pub enum PolicyRule {
     AutoApprove(Condition),
     AutoDeny(Condition),
     RequireApproval(Condition),
+    /// Require approval, carrying a per-rule deadline in seconds. The deadline
+    /// is retained for config compatibility and is not enforced: approvals
+    /// never expire, they park until answered or cancelled.
     RequireApprovalWithTimeout {
         condition: Condition,
         timeout_secs: u64,
@@ -610,7 +808,14 @@ pub enum Condition {
     ArgvPattern(String),
     /// ADR-28 §6: match the working directory against a glob.
     WorkingDir(String),
-    /// ADR-55 §2: the intent gate. As the **top-level condition of an
+    /// Match, against a glob, the path a path-shaped tool action targets after
+    /// workspace containment (falling back to the attempted path when the
+    /// target did not resolve, e.g. a rejected traversal). Reads the resolved
+    /// path from [`PathPolicyFacts`] rather than the raw tool input, so a rule
+    /// can gate the path Concerto would actually touch — including a
+    /// containment rewrite — instead of the caller's spelling.
+    ResolvedPathGlob(String),
+    /// ADR-55 §3: the intent gate. As the **top-level condition of an
     /// approval-producing rule** (`RequireApproval`,
     /// `RequireApprovalWithTimeout`, `RequireManagedToolApproval`,
     /// `RequireToolchainApproval`) it applies the attached
@@ -721,14 +926,22 @@ pub enum TaskExecutionMode {
     },
 }
 
-// ---- System prompts (ADR-55 Phase 1e) --------------------------------------
+// ---- System prompts (ADR-55 §8) --------------------------------------
 
 /// Build-mode system prompt: write code/files to disk via tools. Used for
 /// [`RequestedOutcome::Execute`] runs.
 ///
 /// Formerly the `AgentMode::Build` prompt text; preserved verbatim when the
-/// mode picker was removed (ADR-55 Phase 1e) so intent-gated Execute runs keep
+/// mode picker was removed (ADR-55 §7) so intent-gated Execute runs keep
 /// the same behavior.
+///
+/// Carries the trailing `{working_memory}` placeholder
+/// ([`SYSTEM_PROMPT_CHAT`]/[`SYSTEM_PROMPT_PLAN`] do too): the orchestrator's
+/// `PromptBuilder` substitutes the volatile active-state + retrieved-chunks
+/// block there at build time. Without the placeholder the substitution is a
+/// no-op and that block never reaches the model on the default assembly path.
+/// An empty block removes the placeholder *and* its blank-line separator, so
+/// the rendered prompt is byte-identical to one without the placeholder.
 pub const SYSTEM_PROMPT_BUILD: &str =
     "You are a careful, capable software engineering assistant working \
     directly in the user's codebase. You can read and write files and run \
@@ -750,26 +963,38 @@ pub const SYSTEM_PROMPT_BUILD: &str =
     shell {\"command\": \"cargo test\"}\n\
     filesystem operations: read, write, delete, exists, list, move, copy \
     (write needs content; move/copy need destination). shell takes command \
-    (required) and optional cwd.";
+    (required) and optional cwd.\n\
+    \n\
+    {working_memory}";
 
 /// Chat-mode system prompt: conversational answer only, no tool use. Used for
 /// every non-Execute, non-Plan outcome (Answer, Diagnose, Review, Verify, and
 /// any future outcome).
+///
+/// Ends with the same `{working_memory}` placeholder as [`SYSTEM_PROMPT_BUILD`]
+/// so the working-memory block is delivered on every outcome, not just Execute.
 pub const SYSTEM_PROMPT_CHAT: &str =
     "You are Concerto, a helpful and concise conversational assistant. \
     Answer the user's questions clearly. Do not use tools and do not write \
-    or modify files; respond with text only.";
+    or modify files; respond with text only.\n\
+    \n\
+    {working_memory}";
 
 /// Plan-mode system prompt: produce a plan/design as text, no writes. Used for
 /// [`RequestedOutcome::Plan`] runs.
+///
+/// Ends with the same `{working_memory}` placeholder as [`SYSTEM_PROMPT_BUILD`]
+/// so the working-memory block is delivered on every outcome, not just Execute.
 pub const SYSTEM_PROMPT_PLAN: &str =
     "You are a senior software architect. Given the user's request, produce \
     a clear, concrete plan or design as text. Do not write files or run \
     commands. Outline the approach, the components involved, and the \
-    step-by-step steps you would take to implement it.";
+    step-by-step steps you would take to implement it.\n\
+    \n\
+    {working_memory}";
 
 /// Select the run's system prompt from the intent-gate outcome (ADR-55
-/// Phase 1e): the intent gate is now the ONLY routing path, so the prompt is
+/// §8): the intent gate is now the ONLY routing path, so the prompt is
 /// derived from the classified [`RequestedOutcome`] instead of a
 /// user-selectable mode picker.
 ///
@@ -1021,7 +1246,8 @@ pub struct PendingApprovalInfo {
     pub input_hash: String,
     /// Correlation id of the paused action.
     pub correlation_id: String,
-    /// Configured approval deadline in seconds (0 when unknown).
+    /// Configured approval deadline in seconds (0 when unknown). Retained for
+    /// checkpoint compatibility; no deadline is armed while the request waits.
     #[serde(default)]
     pub timeout_secs: u64,
 }
@@ -1854,10 +2080,12 @@ pub struct ModelInfo {
 
 /// Sandbox isolation level for tool execution.
 ///
-/// **This is currently a stub.** No variant provides OS-level isolation
-/// (no containers, seccomp, namespaces, or Landlock). All non-`None`
-/// profiles are rejected by the policy engine until real sandboxing is
-/// implemented.
+/// [`SandboxProfile::Containerized`] is enforced (ADR-72): it is admitted only
+/// when a container runtime (docker/podman) is detected, the action carries a
+/// container-routable plan, **and** its command facts assert
+/// [`CommandRouting::Containerized`]; it is refused otherwise (fail-closed).
+/// [`SandboxProfile::ReadOnlyFs`] and [`SandboxProfile::NetworkIsolated`] remain
+/// stubs and are rejected by the policy engine until implemented.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum SandboxProfile {
@@ -1867,7 +2095,8 @@ pub enum SandboxProfile {
     ReadOnlyFs,
     /// Network operations are denied (shell/http tools blocked). **Not implemented.**
     NetworkIsolated,
-    /// Full containerization. **Not implemented.**
+    /// OS-level container isolation (ADR-72). Admitted only when a runtime is
+    /// detected and the action has a container-routable plan.
     Containerized,
 }
 
@@ -2047,6 +2276,26 @@ mod tests {
     #[test]
     fn system_prompt_for_plan_is_plan() {
         assert_eq!(system_prompt_for(crate::intent::RequestedOutcome::Plan), SYSTEM_PROMPT_PLAN);
+    }
+
+    /// Every run prompt must ask for the working-memory block. `PromptBuilder`
+    /// delivers it by substituting `{working_memory}`; a template without the
+    /// placeholder silently drops the block, so the active-state +
+    /// retrieved-chunks payload never reaches the model on the default
+    /// (non `cache_stable_prefix`) assembly path.
+    #[test]
+    fn system_prompts_carry_the_working_memory_placeholder() {
+        for prompt in [SYSTEM_PROMPT_BUILD, SYSTEM_PROMPT_CHAT, SYSTEM_PROMPT_PLAN] {
+            assert_eq!(
+                prompt.matches("{working_memory}").count(),
+                1,
+                "exactly one placeholder (zero drops the block, many duplicate it): {prompt}"
+            );
+            assert!(
+                prompt.ends_with("{working_memory}"),
+                "placeholder at the tail: an empty block degrades to the bare prompt: {prompt}"
+            );
+        }
     }
 
     #[test]
@@ -2430,5 +2679,33 @@ mod tests {
         .unwrap();
         assert_eq!(partial.prompt_tokens, Some(7));
         assert_eq!(partial.completion_tokens, None);
+    }
+
+    // ---- Path-shaped structured facts -------------------------------------
+
+    #[test]
+    fn strip_url_secrets_removes_userinfo_query_and_fragment() {
+        let url = "https://user:sup3rsecret@example.com/a/b?token=abcdef#frag";
+        let stripped = strip_url_secrets(url);
+        assert_eq!(stripped, "https://example.com/a/b");
+        assert!(!stripped.contains("sup3rsecret"), "userinfo must be stripped");
+        assert!(!stripped.contains("abcdef"), "query must be stripped");
+        assert!(!stripped.contains("frag"), "fragment must be stripped");
+    }
+
+    #[test]
+    fn strip_url_secrets_leaves_a_plain_path_unchanged() {
+        // A filesystem path with no scheme must never be mangled.
+        assert_eq!(strip_url_secrets("/proj/src/main.rs"), "/proj/src/main.rs");
+        assert_eq!(strip_url_secrets("src/../lib.rs"), "src/../lib.rs");
+    }
+
+    #[test]
+    fn for_url_records_only_scheme_host_path() {
+        let facts = PathPolicyFacts::for_url("request", "https://h/a?secret=xyz#tok");
+        assert_eq!(facts.operation, "request");
+        assert_eq!(facts.attempted_path.as_deref(), Some("https://h/a"));
+        assert!(facts.has_target(), "the URL is the target");
+        assert!(facts.resolved_path.is_none(), "a URL is not workspace-resolved");
     }
 }

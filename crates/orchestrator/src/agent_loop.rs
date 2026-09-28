@@ -30,6 +30,7 @@ use concerto_tools::undo::UndoManager;
 use crate::cycle::CycleBudgetTracker;
 use crate::exec_backend::ToolExecutionBackend;
 use crate::prompts::PromptBuilder;
+use crate::session_manager::message_row_usage;
 use crate::shell_repair::{self, ShellFailure};
 use crate::state::AgentState;
 use crate::tool_driver::{self, DriverTurn, TextToolDriver};
@@ -72,6 +73,21 @@ pub struct AgentLoop {
     /// emitted again in a later turn — gets a fresh suffixed key so it
     /// re-evaluates instead of replaying a stale `write-rejected`.
     tool_attempts: HashMap<String, u32>,
+    /// DETERMINISTIC tool failures observed in the current run, keyed by
+    /// `(tool name, input hash)`. A failure whose precondition is provably
+    /// absent (missing path, denied permission, containment rejection — see
+    /// `ToolError::is_deterministic_failure`) cannot succeed for the
+    /// identical action, so a repeat of the same `(tool, input)` is refused
+    /// BEFORE the cycle-budget approval prompt with a terminal corrective
+    /// tool result telling the model to change the action instead of
+    /// re-issuing it. Cleared at run start, and cleared entirely by any
+    /// successful audited mutation: a workspace change makes the proof
+    /// stale, so a corrected pre-validated retry (create the missing file,
+    /// then rename again) runs normally. Fail-open by design — a mutation
+    /// made OUTSIDE this loop is not observed and may cost one extra
+    /// refused attempt; a spurious refusal is always recoverable by
+    /// changing the call, which is exactly what the message asks for.
+    deterministic_failures: HashMap<(String, String), String>,
     max_iterations: u32,
     state: AgentState,
     /// The project root directory — all file operations are scoped here.
@@ -415,6 +431,7 @@ impl AgentLoop {
             tool_guard_rejects: HashMap::new(),
             shell_repair_attempts: HashMap::new(),
             tool_attempts: HashMap::new(),
+            deterministic_failures: HashMap::new(),
             max_iterations,
             fast,
             state: AgentState::Idle,
@@ -500,6 +517,7 @@ impl AgentLoop {
         self.tool_guard_rejects.clear();
         self.shell_repair_attempts.clear();
         self.tool_attempts.clear();
+        self.deterministic_failures.clear();
         self.pending_approval = None;
         self.degraded.store(false, Ordering::Relaxed);
         self.persist_run_start(&task, cancel.clone()).await;
@@ -542,7 +560,7 @@ impl AgentLoop {
                         merge_run_progress(accumulated, &output);
                         output = accumulated.clone();
                     }
-                    // Truthful completion (ADR-55 Phase 2e, completion fix):
+                    // Truthful completion (ADR-55 §1, completion fix):
                     // `AgentOutput.completion_status` is the single source
                     // of truth. `finalize_completion` set it from the agent's
                     // own landing state (an eval failure stays `Partial`);
@@ -1216,7 +1234,7 @@ impl AgentLoop {
                     }
                     ack
                 };
-            // Audit seam (ADR-55 §5 / audit H-04): persist the ack outcome
+            // Audit seam (ADR-55 §6 / audit H-04): persist the ack outcome
             // through the same channel as approval decisions, sharing the run's
             // correlation_id chain. Pure observability — the ack bool still
             // drives the same abort branch below. A remembered (skipped) prompt
@@ -1924,6 +1942,8 @@ impl AgentLoop {
             tracing::warn!(error = %e, "failed to persist TaskStarted event");
         }
 
+        // Run-start row: no provider call has happened yet, so there is no
+        // usage to record — tokens stay `None` by design.
         let user_msg = Message {
             role: Role::User,
             content: task.description.clone(),
@@ -1987,14 +2007,19 @@ impl AgentLoop {
             tracing::warn!(error = %e, "failed to persist TaskCompleted event");
         }
 
+        // ADR-48 §4: the terminal assistant row carries the run's
+        // provider-reported usage, the same totals the `provider_metrics`
+        // rows record for this run. The run-start user row predates any
+        // provider call and keeps `None`.
+        let (tokens_in, tokens_out) = message_row_usage(&output.provider_metrics);
         let assistant_msg = Message {
             role: Role::Assistant,
             content: output.summary(),
             tool_calls: None,
             tool_results: None,
             reasoning_content: None,
-            tokens_in: None,
-            tokens_out: None,
+            tokens_in,
+            tokens_out,
         };
         if cancel.is_cancelled() {
             return;
@@ -2036,14 +2061,17 @@ impl AgentLoop {
             tracing::warn!(error = %e, "failed to persist TaskCompleted event");
         }
 
+        // Same accounting as `persist_run_success`: the partial landing still
+        // spent real tokens, so the assistant row records them (ADR-48 §4).
+        let (tokens_in, tokens_out) = message_row_usage(&output.provider_metrics);
         let assistant_msg = Message {
             role: Role::Assistant,
             content: output.summary(),
             tool_calls: None,
             tool_results: None,
             reasoning_content: None,
-            tokens_in: None,
-            tokens_out: None,
+            tokens_in,
+            tokens_out,
         };
         if cancel.is_cancelled() {
             return;
@@ -2276,6 +2304,82 @@ impl AgentLoop {
         };
 
         let input_hash = blake3::hash(arguments.to_string().as_bytes());
+        let input_key = input_hash.to_hex()[..16].to_string();
+
+        // DETERMINISTIC-FAILURE LEDGER (refusal): this exact
+        // `(tool, input)` pair already failed with a precondition that is
+        // provably absent (missing path, denied permission, containment
+        // rejection), so executing it again cannot succeed. The refusal runs
+        // BEFORE the cycle-budget approval prompt: asking the user to approve
+        // a provably impossible action is noise, and spending another attempt
+        // on it is pure cost. The tool result is terminal — it names the
+        // failure and tells the model to change the action — so a model that
+        // adapts keeps making progress, while a model that repeats the call
+        // costs zero executions per repeat.
+        if let Some(first_failure) =
+            self.deterministic_failures.get(&(tc.name.clone(), input_key.clone())).cloned()
+        {
+            let summary = format!(
+                "impossible action refused: '{}' with identical input already failed \
+                 ({first_failure}); change the action instead of repeating it",
+                tc.name
+            );
+            let content = format!(
+                "[IMPOSSIBLE ACTION] Tool '{}' with this exact input already failed as \
+                 impossible: {first_failure}. Do not re-issue this identical call — the \
+                 workspace state that made it fail has not changed. Fix the precondition \
+                 first (create the missing path, change permissions, or choose a \
+                 different action), then call again.",
+                tc.name
+            );
+            let payload = serde_json::json!({
+                "error": "impossible_action",
+                "tool": tc.name,
+                "message": first_failure,
+                "hint": "identical repeat refused: change the action or its input",
+            });
+            *tool_call_count += 1;
+            tool_events.push(ToolExecutionSummary {
+                tool_name: tc.name.clone(),
+                operation: None,
+                path: None,
+                success: false,
+                summary: summary.clone(),
+            });
+            let _ = self.bus.publish_for_session(
+                task.session_id,
+                correlation_id,
+                EventKind::ToolExecutionFinished {
+                    tool_name: tc.name.clone(),
+                    duration_ms: 0,
+                    success: false,
+                    detail: Some(summary),
+                },
+            );
+            let _ = self.bus.publish_for_session(
+                task.session_id,
+                correlation_id,
+                EventKind::AgentThought {
+                    agent_id: "single-agent".to_string(),
+                    content: content.clone(),
+                    kind: ThinkingKind::Detail,
+                },
+            );
+            messages.push(Message {
+                role: Role::Tool,
+                content,
+                tool_calls: None,
+                tool_results: Some(vec![concerto_core::types::ToolResult {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    content: payload,
+                }]),
+                reasoning_content: None,
+                tokens_in: None,
+                tokens_out: None,
+            });
+            return Ok(());
+        }
 
         // Check cycle budget — on repeat, pause and ask the user
         // rather than hard-failing (roadmap requirement 3.2).
@@ -2302,9 +2406,22 @@ impl AgentLoop {
                 estimated_cost_usd: None,
                 command_facts: None,
                 orchestrator_authority: false,
+                path_facts: None,
             };
 
-            match self.approval.request_approval(&action, cancel.clone()).await {
+            // No auto-expiry: this prompt parks until the user answers, and
+            // cancellation (stop / teardown) is the escape hatch — it unwinds
+            // the loop as cancelled (fail-closed: the call never runs) rather
+            // than waiting on a dialog for a run that is already dead.
+            let decision = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    self.state = AgentState::Failed;
+                    return Err(OrchestratorError::Cancelled);
+                }
+                decision = self.approval.request_approval(&action, cancel.clone()) => decision,
+            };
+            match decision {
                 ApprovalDecision::Approve | ApprovalDecision::ApproveAllForSession => {
                     // User wants to continue despite the repeat — reset the
                     // tracker for this (tool, input) pair so it doesn't
@@ -2494,6 +2611,15 @@ impl AgentLoop {
                 if audited_mutation {
                     *file_changing_tool_count += 1;
 
+                    // A successful audited mutation changed the workspace, so
+                    // every "provably impossible" proof recorded this run may
+                    // now be stale (the missing path may have just been
+                    // created). Drop the whole ledger so a corrected retry of
+                    // an earlier action executes normally; a plain successful
+                    // read does NOT clear it, so read/retry ping-pong against
+                    // an impossible action stays refused.
+                    self.deterministic_failures.clear();
+
                     if let Some(path) = arguments.get("path").and_then(|v| v.as_str()) {
                         let path = camino::Utf8PathBuf::from(path);
                         if !files_modified.contains(&path) {
@@ -2608,11 +2734,13 @@ impl AgentLoop {
                 correlation_id,
                 timeout_secs,
             }) => {
-                // A timeout is a PAUSE, not a denial: the executor already
-                // emitted the `ApprovalTimeout` event and recorded the
-                // `TimedOut` audit row. Record the preserved request and let
-                // `run_once` stop the loop AwaitingApproval — no model retry,
-                // no second identical call, no burned subtask retry.
+                // The executor no longer arms an approval timer (requests park
+                // until answered), so this shape is no longer produced by the
+                // live approval flow — it is retained for scripted/test and
+                // resume compatibility. Handle it as the pause it describes:
+                // record the preserved request and let `run_once` stop the
+                // loop AwaitingApproval — no model retry, no second identical
+                // call, no burned subtask retry.
                 tool_events.push(ToolExecutionSummary {
                     tool_name: tc.name.clone(),
                     operation: filesystem_operation.map(|s| s.to_string()),
@@ -2722,6 +2850,17 @@ impl AgentLoop {
                             CancellationToken::new(),
                         )
                         .await;
+                }
+                // DETERMINISTIC-FAILURE LEDGER (record): the precondition of
+                // this exact `(tool, input)` is provably absent, so any later
+                // identical repeat is refused before it executes (refusal arm
+                // above). Approval pauses, policy denials, cancellation and
+                // transient faults are NOT recorded — the first two have
+                // their own arms, and the rest may resolve on a re-run.
+                if e.is_deterministic_failure() {
+                    let bounded: String = e.to_string().chars().take(240).collect();
+                    self.deterministic_failures
+                        .insert((tc.name.clone(), input_key.clone()), bounded);
                 }
                 tool_events.push(ToolExecutionSummary {
                     tool_name: tc.name.clone(),
@@ -6209,6 +6348,63 @@ mod tests {
         }
     }
 
+    /// A completed run records the run's provider-reported usage on the
+    /// terminal assistant row (ADR-48 §4), while the run-start user row —
+    /// written before any provider call — carries no usage. Runs through the
+    /// real persistence seams against an in-memory store, so the asserted
+    /// values are the ones that actually land in the `messages` table.
+    #[tokio::test]
+    async fn persist_run_success_records_usage_on_the_assistant_row() {
+        let store = concerto_sessions::SqliteSessionStore::connect_in_memory()
+            .await
+            .expect("in-memory sessions store");
+        let session_id = store
+            .create_session(
+                camino::Utf8Path::new("/tmp/persist-usage"),
+                "openai",
+                "gpt-4",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("session")
+            .id;
+        let store: Arc<dyn SessionStore> = Arc::new(store);
+
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let loop_ = make_loop(provider, approval, 10).with_session_store(Some(store.clone()));
+        let cancel = CancellationToken::new();
+
+        let task = AgentTask::new(session_id, "test");
+        loop_.persist_run_start(&task, cancel.clone()).await;
+
+        let mut output = agent_output_base();
+        output.task_id = task.id;
+        output.session_id = session_id;
+        output.completion_status = concerto_core::types::AgentCompletionStatus::Completed;
+        output.provider_metrics = vec![ProviderMetrics {
+            provider: "openai".to_string(),
+            model: "gpt-4".to_string(),
+            tokens_in: 120,
+            tokens_out: 60,
+            cost_usd: 0.0,
+            latency_ms: 1,
+        }];
+        loop_.persist_run_success(session_id, &output, cancel.clone()).await;
+
+        let messages = store.load_messages(session_id, cancel).await.expect("load messages");
+        assert_eq!(messages.len(), 2, "run-start user row + terminal assistant row");
+        assert_eq!(messages[0].role, Role::User, "first row is the run-start user row");
+        assert_eq!(messages[0].tokens_in, None, "no provider call had happened yet");
+        assert_eq!(messages[1].role, Role::Assistant, "second row is the assistant summary");
+        assert_eq!(messages[1].tokens_in, Some(120), "provider-reported prompt tokens recorded");
+        assert_eq!(
+            messages[1].tokens_out,
+            Some(60),
+            "provider-reported completion tokens recorded"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // merge_run_progress — standalone unit tests
     // -----------------------------------------------------------------------
@@ -7118,6 +7314,236 @@ mod tests {
             messages[0].content.contains("[POLICY DENIED]"),
             "denial surfaces unchanged: {}",
             messages[0].content
+        );
+    }
+
+    /// Run ONE tool call through `execute_single_tool_call` with test-local
+    /// bookkeeping, so a test can drive several distinct calls in sequence
+    /// and read one shared `messages` / `tool_events` timeline.
+    async fn execute_one_tool_call(
+        loop_: &mut AgentLoop,
+        tc: &ToolCall,
+        task: &AgentTask,
+        session: &SessionContext,
+        messages: &mut Vec<Message>,
+        tool_events: &mut Vec<ToolExecutionSummary>,
+    ) {
+        let mut tool_call_count = 0;
+        let mut file_changing_tool_count = 0;
+        let mut files_modified = Vec::new();
+        loop_
+            .execute_single_tool_call(
+                tc,
+                task,
+                Ulid::new(),
+                session,
+                CancellationToken::new(),
+                &mut tool_call_count,
+                &mut file_changing_tool_count,
+                &mut files_modified,
+                tool_events,
+                messages,
+            )
+            .await
+            .expect("a tool failure never fails the loop itself");
+    }
+
+    /// Count the tool results the deterministic-failure refusal emitted.
+    fn impossible_action_results(messages: &[Message]) -> usize {
+        messages
+            .iter()
+            .filter(|message| {
+                message.tool_results.as_ref().is_some_and(|results| {
+                    results.iter().any(|result| {
+                        result.content.get("error").and_then(serde_json::Value::as_str)
+                            == Some("impossible_action")
+                    })
+                })
+            })
+            .count()
+    }
+
+    /// A deterministic failure records its `(tool, input)` pair: the identical
+    /// re-issue is refused with a TERMINAL corrective tool result and never
+    /// executes again — the model is told to change the action instead of
+    /// burning attempts (and an approval prompt) on a provably impossible one.
+    #[tokio::test]
+    async fn deterministic_failure_refuses_the_identical_repeat_without_executing() {
+        let (mut loop_, task, session, calls) =
+            shell_repair_harness(ScriptedShellOutcome::SpawnFailed(
+                "failed to spawn process: file not found: /usr/bin/missing-tool".into(),
+            ));
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+        let tc = ToolCall {
+            id: "call_missing".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({ "command": "missing-tool", "args": [] }),
+
+            ..Default::default()
+        };
+
+        for _ in 0..4 {
+            execute_one_tool_call(
+                &mut loop_,
+                &tc,
+                &task,
+                &session,
+                &mut messages,
+                &mut tool_events,
+            )
+            .await;
+        }
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "only the first attempt may execute: the three repeats are refused"
+        );
+        assert_eq!(impossible_action_results(&messages), 3, "one terminal result per repeat");
+        let refusal = messages
+            .iter()
+            .find(|message| message.content.contains("[IMPOSSIBLE ACTION]"))
+            .expect("the refusal tells the model what to do instead");
+        assert!(
+            refusal.content.contains("file not found: /usr/bin/missing-tool"),
+            "the refusal carries the original proof: {}",
+            refusal.content
+        );
+        assert_eq!(
+            tool_events
+                .iter()
+                .filter(|event| event.summary.starts_with("impossible action refused"))
+                .count(),
+            3,
+            "every refused repeat is observable on the event stream"
+        );
+    }
+
+    /// Transient faults keep their retry path: an identical TIMEOUT re-issue
+    /// still executes — only a provably impossible action is refused.
+    #[tokio::test]
+    async fn transient_failure_still_executes_every_identical_repeat() {
+        let (mut loop_, task, session, calls) =
+            shell_repair_harness(ScriptedShellOutcome::Timeout(5));
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+        let tc = ToolCall {
+            id: "call_slow".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({ "command": "sleep 100", "args": [] }),
+
+            ..Default::default()
+        };
+
+        for _ in 0..3 {
+            execute_one_tool_call(
+                &mut loop_,
+                &tc,
+                &task,
+                &session,
+                &mut messages,
+                &mut tool_events,
+            )
+            .await;
+        }
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "a timeout is not provably impossible: every identical repeat executes"
+        );
+        assert_eq!(impossible_action_results(&messages), 0, "{messages:?}");
+    }
+
+    /// A successful AUDITED MUTATION makes every recorded proof stale, so the
+    /// ledger is dropped: a corrected pre-validated retry (create the missing
+    /// file, then read it again) must execute normally.
+    #[tokio::test]
+    async fn audited_mutation_clears_the_deterministic_failure_ledger() {
+        let root = tempfile::tempdir().expect("root tempdir created");
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let (mut loop_, calls) =
+            make_loop_with_counting_fs_tool(root.path(), provider, approval, 10);
+        let task = AgentTask::new_action_required(Ulid::new(), "deterministic ledger");
+        let session = SessionContext::new(task.session_id, root.path().to_path_buf());
+        let read_missing = ToolCall {
+            id: "call_read".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::json!({ "operation": "read", "path": "missing.txt" }),
+
+            ..Default::default()
+        };
+        let write_note = ToolCall {
+            id: "call_write".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::json!({
+                "operation": "write",
+                "path": "other.txt",
+                "content": "created",
+            }),
+
+            ..Default::default()
+        };
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+
+        // The missing-path read fails deterministically and is recorded …
+        execute_one_tool_call(
+            &mut loop_,
+            &read_missing,
+            &task,
+            &session,
+            &mut messages,
+            &mut tool_events,
+        )
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "{messages:?}");
+        // … so the identical re-issue is refused without executing …
+        execute_one_tool_call(
+            &mut loop_,
+            &read_missing,
+            &task,
+            &session,
+            &mut messages,
+            &mut tool_events,
+        )
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the identical repeat is refused");
+        assert_eq!(impossible_action_results(&messages), 1);
+
+        // … until a successful audited mutation changes the workspace.
+        execute_one_tool_call(
+            &mut loop_,
+            &write_note,
+            &task,
+            &session,
+            &mut messages,
+            &mut tool_events,
+        )
+        .await;
+        assert!(root.path().join("other.txt").exists(), "the mutation materialized");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        execute_one_tool_call(
+            &mut loop_,
+            &read_missing,
+            &task,
+            &session,
+            &mut messages,
+            &mut tool_events,
+        )
+        .await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "the stale proof no longer blocks the corrected retry"
+        );
+        assert_eq!(
+            impossible_action_results(&messages),
+            1,
+            "only the pre-mutation repeat was refused"
         );
     }
 

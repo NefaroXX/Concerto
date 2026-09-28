@@ -414,8 +414,13 @@ impl VirtualFs {
     ///
     /// Returns an error if the source does not exist or the destination
     /// already exists.
+    ///
+    /// The source is resolved through the overlay onto disk (ADR-62 §4): a
+    /// staged entry wins, otherwise an existing on-disk file is loaded and
+    /// moved. Only a source absent from both is "file not found".
     pub fn move_file(&mut self, from: &Utf8Path, to: &Utf8Path) -> Result<(), ToolError> {
-        let content = self.read(from)?;
+        let source_key = self.resolve_transfer_source(from)?;
+        let content = self.read(&source_key)?;
 
         if self.entries.contains_key(to) || self.exists_on_disk(to) {
             return Err(ToolError::ExecutionFailed {
@@ -423,7 +428,7 @@ impl VirtualFs {
             });
         }
 
-        self.delete(from)?;
+        self.delete(&source_key)?;
         self.write(to, content)?;
 
         Ok(())
@@ -433,8 +438,12 @@ impl VirtualFs {
     ///
     /// Returns an error if the source does not exist or the destination
     /// already exists.
+    ///
+    /// Like [`VirtualFs::move_file`], the source is resolved through the
+    /// overlay onto disk so an existing unstaged file can be copied.
     pub fn copy_file(&mut self, from: &Utf8Path, to: &Utf8Path) -> Result<(), ToolError> {
-        let content = self.read(from)?;
+        let source_key = self.resolve_transfer_source(from)?;
+        let content = self.read(&source_key)?;
 
         if self.entries.contains_key(to) || self.exists_on_disk(to) {
             return Err(ToolError::ExecutionFailed {
@@ -444,6 +453,43 @@ impl VirtualFs {
 
         self.write(to, content)?;
         Ok(())
+    }
+
+    /// Resolve a move/copy source key, reading through the overlay onto disk.
+    ///
+    /// Returns the overlay key holding the source (the exact key when staged,
+    /// otherwise `path` after loading it from disk as an `Original`). A source
+    /// that is neither staged nor on disk reports "file not found"; a staged
+    /// deletion is returned as-is so it is never resurrected from disk.
+    fn resolve_transfer_source(&mut self, path: &Utf8Path) -> Result<Utf8PathBuf, ToolError> {
+        if let Some(key) = self.find_entry_key(path) {
+            return Ok(key);
+        }
+        // Not staged: reads resolve through the overlay onto disk (ADR-62 §4).
+        match self.read_disk(path) {
+            Ok(_) => Ok(path.to_path_buf()),
+            Err(ToolError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(ToolError::ExecutionFailed { message: format!("file not found: {path}") })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Find the overlay key addressing `path`.
+    ///
+    /// The exact key is preferred. On Windows, a file may have been staged
+    /// under the verbatim (`\\?\C:\...`) or plain (`C:\...`) spelling of the
+    /// same path depending on which resolution branch ran (protected Desktop
+    /// folders can make `canonicalize()` fail and fall back to lexical
+    /// resolution), so a form-normalized fallback lookup is tried. Elsewhere
+    /// this is an exact-key lookup.
+    fn find_entry_key(&self, path: &Utf8Path) -> Option<Utf8PathBuf> {
+        if self.entries.contains_key(path) {
+            return Some(path.to_path_buf());
+        }
+        let host = crate::common::current_host();
+        let wanted = crate::common::path_form_key(host, path);
+        self.entries.keys().find(|key| crate::common::path_form_key(host, key) == wanted).cloned()
     }
 
     /// Commits all virtual entries to the real filesystem.
@@ -986,6 +1032,51 @@ mod tests {
         fs.copy_file(Utf8Path::new("a.txt"), Utf8Path::new("b.txt")).unwrap();
         assert_eq!(fs.read(Utf8Path::new("a.txt")).unwrap(), "hello");
         assert_eq!(fs.read(Utf8Path::new("b.txt")).unwrap(), "hello");
+    }
+
+    // -----------------------------------------------------------------------
+    // Repro — move/copy of an on-disk source that was never staged in the
+    // overlay. Reproduces the Windows "file not found" bail: `read` consults
+    // only the overlay, so it never touches the filesystem.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn move_file_loads_unstaged_disk_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        std::fs::write(root.join("a.txt"), "from disk").unwrap();
+
+        let mut fs = VirtualFs::new();
+        fs.move_file(&root.join("a.txt"), &root.join("b.txt"))
+            .expect("an on-disk source absent from the overlay must move");
+
+        assert_eq!(fs.read(&root.join("b.txt")).unwrap(), "from disk");
+        assert!(matches!(fs.get(&root.join("a.txt")), Some(VirtualFsEntry::Deleted { .. })));
+    }
+
+    #[test]
+    fn copy_file_loads_unstaged_disk_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        std::fs::write(root.join("a.txt"), "from disk").unwrap();
+
+        let mut fs = VirtualFs::new();
+        fs.copy_file(&root.join("a.txt"), &root.join("b.txt"))
+            .expect("an on-disk source absent from the overlay must copy");
+
+        assert_eq!(fs.read(&root.join("b.txt")).unwrap(), "from disk");
+        assert_eq!(fs.read(&root.join("a.txt")).unwrap(), "from disk");
+    }
+
+    #[test]
+    fn move_file_missing_source_reports_file_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let mut fs = VirtualFs::new();
+        let error = fs
+            .move_file(&root.join("ghost.txt"), &root.join("ghost2.txt"))
+            .expect_err("a missing source must not move");
+        assert!(error.to_string().contains("file not found"), "got: {error}");
     }
 
     #[test]

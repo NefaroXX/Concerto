@@ -1,4 +1,4 @@
-//! Phase 0 intent-routing vocabulary (ADR-55).
+//! Intent-routing vocabulary (ADR-55 §1).
 //!
 //! This module retains the intent **vocabulary** the rest of the workspace
 //! still speaks: [`RequestedOutcome`], [`TaskScope`], [`RouterOutput`],
@@ -46,7 +46,7 @@ pub enum RequestedOutcome {
     Verify,
 }
 
-/// User decision on a previously approved plan (ADR-55 Phase 1d).
+/// User decision on a previously approved plan (ADR-55 §4).
 ///
 /// The run loop asks this through
 /// [`ApprovalSink::request_plan_approval`] when an action-required Execute

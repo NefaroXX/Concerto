@@ -1,34 +1,32 @@
 # Concerto test report
 
-Use one copy of this sheet per build, operating system, and provider/model
-combination. Mark each result **Pass**, **Fail**, **Blocked**, or **Not tested**.
-Attach sanitized logs and screenshots for failures. Never include credentials or
-private source content.
+This file is the **acceptance bar**: the automated-check commands, what has
+already been automated, and the standard desktop / multi-agent / retry /
+cancellation / memory / spend / shell-policy regression sheet. It is not a
+blank form.
 
-> Live-test forms: `docs/live-test-template.md` (generic template) and
-> ready-made copies such as `docs/live-test-skills-mcp.md` (Skills + MCP,
-> ADR-43 / PR #111).
+To run the sheet, **copy [`docs/live-test-template.md`](docs/live-test-template.md)
+per build, operating system, and provider/model combination** and fill it in.
+That template is the single form: it carries the per-run environment block, the
+feature-specific check rows, and the outcome section. Worked examples with
+recorded results are kept as `docs/live-test-*.md` (skills-MCP, multi-agent
+eval).
+
+Mark each result **Pass**, **Fail**, **Blocked**, or **Not tested**. Attach
+sanitized logs and screenshots for failures. Never include credentials or
+private source content.
 
 ## Test environment
 
-| Field | Value |
-|---|---|
-| Date/time and timezone | |
-| Tester | |
-| Concerto commit | |
-| Build type (`debug`/`release`) | |
-| Operating system/version | |
-| Desktop environment/terminal | |
-| Frontend (`desktop`/`CLI`) | |
-| Project path | |
-| Provider and model | |
-| Per-agent assignments | |
-| Selected shell profile | |
-| Multi-agent relationships changed? | |
-| Policy rules/preset | |
-| Memory enabled and TTL | |
+Record the per-run environment in the copied template. The fields that matter
+most for triage are commit, build type, OS/desktop environment, frontend,
+provider and model, per-agent assignments, selected shell profile, and policy
+rules/preset.
 
 ## Automated workspace checks
+
+These are the same checks CI runs; paste the output into the copied template's
+automated-checks table.
 
 CI uses Rust 1.96.0 and sets `CONCERTO_TEST_MODE=1`. The `CARGO_BUILD_JOBS=2` in the commands below caps build parallelism; CI does
 not currently set that variable.

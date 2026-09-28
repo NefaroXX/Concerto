@@ -31,7 +31,7 @@ struct PendingApproval {
 
 /// The intent confirmation question plus its selectable outcomes, exposed to
 /// the TUI so it can render the modal and translate keypresses back into a
-/// decision (ADR-55 §1).
+/// decision (ADR-55 §2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntentPrompt {
     pub question: String,
@@ -49,7 +49,7 @@ struct PendingIntent {
 
 /// The plan-approval question plus its identity, exposed to the TUI so it can
 /// render the modal and translate keypresses back into a decision (ADR-55
-/// Phase 1d). `session_id` + `plan_id` gate resolution so a stale or
+/// §4). `session_id` + `plan_id` gate resolution so a stale or
 /// cross-session request can never be answered by the wrong run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanPrompt {
@@ -343,7 +343,7 @@ impl ApprovalSink for CliApprovalSink {
         // Mirror the interactive approval prompt: queue the question and await
         // the TUI's keypress decision. `None` covers both a deliberate reject
         // (Esc/q) and a dropped/never-answered prompt, which the run loop
-        // treats as read-only (ADR-55 §1).
+        // treats as read-only (ADR-55 §2).
         match self.state.request_intent(question, options) {
             Some(receiver) => receiver.await.unwrap_or(None),
             None => None,
@@ -362,7 +362,7 @@ impl ApprovalSink for CliApprovalSink {
         // Mirror the intent confirmation: queue the prompt and await the TUI's
         // keypress decision. `None` covers a drop (no receiver — the occupied
         // slot / conservative reading) and a dismissed prompt, both of which
-        // the run loop treats as read-only (ADR-55 Phase 1d).
+        // the run loop treats as read-only (ADR-55 §4).
         match self.state.request_plan(session_id, plan_id, question, plan_text.to_string()) {
             Some(receiver) => receiver.await.unwrap_or(None),
             None => None,
@@ -450,6 +450,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         let summary = summarize_input(&action);
         assert_eq!(summary, "command: rm -rf /tmp/foo");
@@ -468,6 +469,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         let summary = summarize_input(&action);
         assert_eq!(summary, "path: /home/user/secret.txt");
@@ -486,6 +488,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         let summary = summarize_input(&action);
         assert!(summary.contains("foo"));
@@ -504,6 +507,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         let summary = summarize_input(&action);
         assert_eq!(summary, "operation: commit");
@@ -522,6 +526,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         let summary = summarize_input(&action);
         assert_eq!(summary, "command: ls");
@@ -540,6 +545,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         let summary = summarize_input(&action);
         // The truncated form takes the first 119 chars + Unicode ellipsis.
@@ -697,6 +703,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         let cancel = concerto_core::CancellationToken::new();
         let decision = sink.request_approval(&action, cancel.clone()).await;
@@ -760,8 +767,84 @@ mod tests {
         assert!(sink.auto_approve.load(Ordering::Relaxed));
     }
 
+    /// An `ApproveAllForSession` answer suppresses the FOLLOW-UP prompt: the
+    /// next request answers immediately instead of asking again, so an
+    /// approved-all run never stalls waiting for a second dialog.
+    #[tokio::test]
+    async fn approve_all_for_session_suppresses_the_next_prompt() {
+        let state = CliApprovalState::default();
+        let cancel = concerto_core::CancellationToken::new();
+        let sink_state = state.clone();
+
+        let handle = tokio::spawn(async move {
+            let sink = CliApprovalSink::with_state(sink_state);
+            let first_input = serde_json::json!({"command": "rm -rf build"});
+            let first = PolicyAction {
+                tool_name: "shell",
+                input: &first_input,
+                session_id: Ulid::new(),
+                correlation_id: Ulid::new(),
+                capability_requirements: CapabilitySet::default(),
+                sandbox_profile: None,
+                estimated_cost_usd: None,
+                command_facts: None,
+                orchestrator_authority: false,
+                path_facts: None,
+            };
+            let first_decision = sink.request_approval(&first, cancel.clone()).await;
+
+            let second_input = serde_json::json!({"command": "cargo publish"});
+            let second = PolicyAction {
+                tool_name: "shell",
+                input: &second_input,
+                session_id: Ulid::new(),
+                correlation_id: Ulid::new(),
+                capability_requirements: CapabilitySet::default(),
+                sandbox_profile: None,
+                estimated_cost_usd: None,
+                command_facts: None,
+                orchestrator_authority: false,
+                path_facts: None,
+            };
+            let second_decision = sink.request_approval(&second, cancel).await;
+            (first_decision, second_decision)
+        });
+
+        // Bounded wait for the first prompt (no timer: the prompt parks).
+        for _ in 0..500 {
+            if state.prompt().is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(state.prompt().is_some(), "the first request must install a prompt");
+        state.resolve(ApprovalDecision::ApproveAllForSession);
+
+        let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("the follow-up request must not wait for a second answer")
+            .expect("approval task panicked");
+        assert_eq!(first, ApprovalDecision::ApproveAllForSession);
+        assert_eq!(second, ApprovalDecision::Approve, "approve-all must cover the next call");
+        assert!(state.prompt().is_none(), "the suppressed request must not leave a prompt");
+    }
+
+    /// Fail-closed waiting primitive: a dropped decision channel (dialog torn
+    /// down with the run) resolves as a denial instead of hanging forever.
+    #[tokio::test]
+    async fn closed_decision_channel_denies_instead_of_hanging() {
+        let (sender, receiver) = tokio::sync::watch::channel::<Option<ApprovalDecision>>(None);
+        drop(sender);
+
+        let decision =
+            tokio::time::timeout(std::time::Duration::from_secs(5), await_decision(receiver))
+                .await
+                .expect("a closed decision channel must resolve, never hang");
+        assert_eq!(decision, ApprovalDecision::Deny, "an unanswerable request must deny");
+    }
+
     // ------------------------------------------------------------------
-    // request_intent_confirmation (ADR-55 §1)
+    // request_intent_confirmation (ADR-55 §2)
     // ------------------------------------------------------------------
 
     /// Wait until the spawned sink future has installed the pending intent so
@@ -855,7 +938,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // request_plan_approval (ADR-55 Phase 1d)
+    // request_plan_approval (ADR-55 §4)
     // ------------------------------------------------------------------
 
     /// Wait until the spawned sink future has installed the pending plan so

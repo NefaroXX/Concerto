@@ -201,7 +201,7 @@ impl RoutingEngine {
                         provider: profile.provider.clone(),
                         model: profile.model.clone(),
                         reason: format!("explicit provider/model assignment for {role}"),
-                        // Model-routing row: no intent payload (ADR-55 2d §5).
+                        // Model-routing row: no intent payload (ADR-55 §8).
                         intent: None,
                     },
                 );
@@ -235,7 +235,7 @@ impl RoutingEngine {
                 provider: selected.provider.clone(),
                 model: selected.model.clone(),
                 reason: format!("first capability-compatible unassigned model for {role}"),
-                // Model-routing row: no intent payload (ADR-55 2d §5).
+                // Model-routing row: no intent payload (ADR-55 §8).
                 intent: None,
             },
         );

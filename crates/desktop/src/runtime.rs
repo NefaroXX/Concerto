@@ -65,6 +65,11 @@ pub enum DesktopEvent {
         tool_name: String,
         error: String,
     },
+    /// A backend error surfaced to the user (e.g. an explicit acknowledgement
+    /// refusal when the bounded ack queue is full). Rendered as an error toast.
+    ErrorOccurred {
+        message: String,
+    },
     /// Policy requires user approval.
     ApprovalRequested {
         tool_name: String,
@@ -178,7 +183,7 @@ pub enum DesktopEvent {
         cap_usd: f64,
     },
 
-    // --- Run-stage chip (ADR-55 Phase 2a) ---
+    // --- Run-stage chip (ADR-55 §9) ---
     /// The active run advanced to a new intent-router stage. `task_id` is
     /// deliberately dropped: the desktop tracks one active run and the chip is
     /// guarded by `run_status == Running` at the App level.
@@ -348,7 +353,7 @@ fn translate_coordinator_event(event: &BackendEvent) -> Option<DesktopEvent> {
         }
         EventKind::RoutingDecided { task_id, role, provider, model, reason, intent } => {
             match intent {
-                // ADR-55 Phase 2d §5: an intent-routing record tells the routing
+                // ADR-55 §6: an intent-routing record tells the routing
                 // decision story instead of a model assignment.
                 Some(decision) => activity(
                     "Coordinator",
@@ -378,17 +383,9 @@ fn translate_coordinator_event(event: &BackendEvent) -> Option<DesktopEvent> {
             "Reviewer",
             format!("Review cycle {cycle_num} for subtask {task_id}: {verdict}"),
         ),
-        EventKind::ReviewCycleEscalated { task_id, max_cycles } => activity(
-            "Reviewer",
-            format!("Escalated subtask {task_id} after {max_cycles} review cycles."),
-        ),
         EventKind::ValidationCycleStarted { task_id, cycle_num } => activity(
             "Validator",
             format!("Started validation cycle {cycle_num} for subtask {task_id}."),
-        ),
-        EventKind::ValidationEscalated { task_id, max_cycles } => activity(
-            "Validator",
-            format!("Escalated subtask {task_id} after {max_cycles} validation cycles."),
         ),
         EventKind::BudgetDowngradeTriggered { role, from_model, to_model } => activity(
             "Coordinator",
@@ -397,6 +394,13 @@ fn translate_coordinator_event(event: &BackendEvent) -> Option<DesktopEvent> {
         EventKind::OrchestratorCycleDetected { task_id, sequence } => activity(
             "Coordinator",
             format!("Detected an orchestration cycle for {task_id}: {sequence:?}"),
+        ),
+        // Phase 6 M3c step 4: one human line — what drifted, what the live
+        // re-read concluded, and what was re-dispatched. The wording comes
+        // from the shared core helper, so the CLI renders the identical line.
+        EventKind::PlanDrift { affected_paths, reverify, redispatched, .. } => activity(
+            "Coordinator",
+            concerto_core::event::plan_drift_report(affected_paths, reverify, redispatched),
         ),
         _ => None,
     }
@@ -485,6 +489,9 @@ fn translate_misc_event(event: &BackendEvent) -> Option<DesktopEvent> {
             kind: *kind,
         }),
         EventKind::SessionSaved => Some(DesktopEvent::SessionSaved),
+        EventKind::ErrorOccurred { message } => {
+            Some(DesktopEvent::ErrorOccurred { message: message.clone() })
+        }
         EventKind::AssistantMessage { content, .. } => {
             Some(DesktopEvent::AssistantMessage { content: content.clone() })
         }
@@ -516,7 +523,7 @@ fn translate_misc_event(event: &BackendEvent) -> Option<DesktopEvent> {
     }
 }
 
-/// Translate intent-router run-stage transitions (ADR-55 Phase 2a).
+/// Translate intent-router run-stage transitions (ADR-55 §9).
 ///
 /// The backend event carries the correlation `task_id`; the desktop tracks one
 /// active run per window, so the task id is dropped here — the App chip is
@@ -690,6 +697,9 @@ pub fn route_event(
         DesktopEvent::ApprovalRequested { .. } => {
             // Handled by the capability dialog overlay
         }
+        DesktopEvent::ErrorOccurred { .. } => {
+            // Rendered as an App-level error toast.
+        }
         DesktopEvent::AssistantMessage { content } => {
             chat_state.update_last_assistant(content.clone());
         }
@@ -776,7 +786,7 @@ mod tests {
                 provider: "openrouter".into(),
                 model: "example/model".into(),
                 reason: "configured assignment".into(),
-                // Model-routing row: no intent payload (ADR-55 2d §5).
+                // Model-routing row: no intent payload (ADR-55 §8).
                 intent: None,
             },
         );
@@ -789,7 +799,7 @@ mod tests {
         ));
     }
 
-    /// ADR-55 Phase 2d §5: an intent-routing `RoutingDecided` record renders
+    /// ADR-55 §6: an intent-routing `RoutingDecided` record renders
     /// the routing decision story ({rule, route, confidence, outcome}) rather
     /// than a model assignment.
     #[test]
@@ -840,6 +850,40 @@ mod tests {
             Some(DesktopEvent::RunStageChanged { stage })
                 if stage == concerto_core::intent::RunStage::Execute
         ));
+    }
+
+    /// Phase 6 M3c step 4: the drift signal renders as ONE chat line naming
+    /// what drifted, what the live re-read concluded, and what was
+    /// re-dispatched — the wording the CLI shares via the core helper.
+    #[test]
+    fn plan_drift_renders_one_readable_activity_line() {
+        let event = Event::new(
+            Ulid::new(),
+            Ulid::new(),
+            EventKind::PlanDrift {
+                task_id: TaskId::new(),
+                plan_id: Some("plan-7".into()),
+                affected_paths: vec!["src/gone.rs".to_owned()],
+                diff: vec![concerto_core::event::PlanDriftDiffEntry {
+                    path: "src/gone.rs".to_owned(),
+                    class: concerto_core::event::PlanDriftDiffClass::Missing,
+                }],
+                reverify: vec![concerto_core::event::PlanDriftReverifyEntry {
+                    path: "src/gone.rs".to_owned(),
+                    status: concerto_core::event::PlanDriftReverifyStatus::Gone,
+                }],
+                redispatched: vec!["coder".to_owned()],
+            },
+        );
+
+        let desktop = translate_event(&event).expect("plan drift must reach chat");
+        let DesktopEvent::AgentThought { agent_id, content, .. } = desktop else {
+            panic!("plan drift renders as chat activity, got {desktop:?}");
+        };
+        assert_eq!(agent_id, "Coordinator");
+        assert!(content.contains("src/gone.rs"), "names the drifted artifact: {content}");
+        assert!(content.contains("re-verified: gone"), "reports the re-read: {content}");
+        assert!(content.contains("re-dispatched coder"), "reports the re-dispatch: {content}");
     }
 
     /// Thinking tiers survive translation, and `LowLevel` thoughts fold
@@ -899,5 +943,27 @@ mod tests {
         // Some events may or may not be translated — the key is no panic.
         // SessionSaved is typically handled, so this should return Some.
         assert!(result.is_some() || result.is_none());
+    }
+
+    /// A backend error (e.g. an ack-queue refusal) reaches the desktop as an
+    /// `ErrorOccurred` event carrying its message, so the App can surface the
+    /// named refusal to the user rather than dropping it (§ fail-closed).
+    #[test]
+    fn error_occurred_translates_with_its_message() {
+        let event = Event::new(
+            Ulid::new(),
+            Ulid::new(),
+            EventKind::ErrorOccurred {
+                message: "Acknowledgement refused: acknowledgement queue is full (2 pending); \
+                          refusing the new ack"
+                    .into(),
+            },
+        );
+
+        assert!(matches!(
+            translate_event(&event),
+            Some(DesktopEvent::ErrorOccurred { message })
+                if message.contains("acknowledgement queue is full")
+        ));
     }
 }

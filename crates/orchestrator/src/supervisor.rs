@@ -47,8 +47,10 @@ use crate::ipc::{
 };
 use crate::subscriptions::SubscriptionManager;
 use concerto_core::error::MemoryError;
+use concerto_core::event::EventBus;
 use concerto_core::ids::Ulid;
 use concerto_core::memory::{MemoryId, MemoryNamespace, MemoryQuery, ProjectId};
+use concerto_core::traits::approval::{ApprovalDecision, ApprovalSink};
 use concerto_core::traits::memory::MemoryStore;
 use concerto_core::CancellationToken;
 use concerto_sessions::whiteboard::{
@@ -754,6 +756,16 @@ pub struct SupervisorServices {
     /// a session DB). When attached, write-path handlers feed it append
     /// counts so it can detach an out-of-band fold pass onto the runtime.
     pub consolidation: Option<std::sync::Arc<crate::consolidation::Consolidator>>,
+    /// Frontend approval surface the supervised children bridge to
+    /// (ADR-60 S5 approval bridge). The supervisor holds the SAME sink the
+    /// in-process coordinator/single-agent paths use, so supervised approvals
+    /// route to the existing UI rather than a parallel system. `None` keeps
+    /// the fail-closed default: the bridge denies.
+    pub approval_sink: Option<std::sync::Arc<dyn ApprovalSink>>,
+    /// Event bus for the approval request/resolve audit events
+    /// ([`EventKind::ApprovalRequested`] / [`EventKind::ApprovalResolved`]).
+    /// `None` disables only the audit emission, never the decision path.
+    pub bus: Option<EventBus>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1264,6 +1276,27 @@ impl Supervisor {
                                             IpcParams::ListTools { .. } => {
                                                 handle_list_tools(&services, &agent_id, id).await
                                             }
+                                            IpcParams::ApprovalRequest { action } => {
+                                                handle_approval_request(
+                                                    &services, &agent_id, action, id, &cancel,
+                                                )
+                                                .await
+                                            }
+                                            IpcParams::ApprovalResolved { tool_name, .. } => {
+                                                handle_approval_resolved(tool_name, id)
+                                            }
+                                            IpcParams::AckRequest { session_id, message } => {
+                                                handle_ack_request(
+                                                    &services, session_id, message, id, &cancel,
+                                                )
+                                                .await
+                                            }
+                                            IpcParams::ApproveAllRequest { session_id } => {
+                                                handle_approve_all_request(
+                                                    &services, session_id, id, &cancel,
+                                                )
+                                                .await
+                                            }
                                             IpcParams::AckWhiteboard { end_gate_seq } => {
                                                 handle_ack_whiteboard(
                                                     &services,
@@ -1729,6 +1762,10 @@ fn dispatch_agent_line(
             | IpcMethod::StoreMemory
             | IpcMethod::InvalidateMemory
             | IpcMethod::ListTools
+            | IpcMethod::ApprovalRequest
+            | IpcMethod::ApprovalResolved
+            | IpcMethod::AckRequest
+            | IpcMethod::ApproveAllRequest
             | IpcMethod::AckWhiteboard => match services {
                 Some(_) => Dispatch::Async { id: request.id, params: Box::new(request.params) },
                 None => Dispatch::Reply(reply_error(
@@ -1888,6 +1925,205 @@ async fn handle_list_tools(
     id: u64,
 ) -> Box<IpcResponse> {
     reply_ok(id, IpcResult::ListTools { tools: services.gate.tool_definitions() })
+}
+
+/// Bridge a child's approval request to the supervisor's frontend approval
+/// surface (ADR-60 S5).
+///
+/// The supervisor holds the SAME [`ApprovalSink`] the in-process paths use, so
+/// a supervised approval reaches the existing UI rather than a parallel
+/// system. The bridge parks on the sink with **no auto-expiry**: the child
+/// stays paused for as long as the user needs to decide (owner requirement —
+/// permission is given or revoked, never aged out). Fail-closed by design:
+///
+/// - no sink configured → `deny` (the pre-bridge default is preserved, now
+///   because the channel said so);
+/// - the request was cancelled (run teardown) → `deny`, both before the sink
+///   is consulted and *while* the sink is still waiting, so teardown can
+///   never strand a child on a reply that would never come;
+/// - the sink itself cannot answer → `deny`.
+///
+/// An [`EventKind::ApprovalRequested`] audit event is emitted before the sink
+/// is consulted and an [`EventKind::ApprovalResolved`] after, whenever a bus
+/// is attached, so the supervised path's audit trail matches the in-process
+/// loop's.
+async fn handle_approval_request(
+    services: &SupervisorServices,
+    agent_id: &str,
+    action: ipc::ApprovalActionWire,
+    id: u64,
+    cancel: &CancellationToken,
+) -> Box<IpcResponse> {
+    use concerto_core::types::{CapabilitySet, PolicyAction};
+
+    // Identity is validated, never fabricated: a request whose session or
+    // correlation id does not parse cannot be attributed to a run, so it is
+    // denied (fail-closed) rather than approved under a synthesized id that
+    // would corrupt the audit trail.
+    let (Ok(session_id), Ok(correlation_id)) =
+        (Ulid::from_string(&action.session_id), Ulid::from_string(&action.correlation_id))
+    else {
+        tracing::warn!(
+            %agent_id,
+            "supervisor: approval request with malformed identity; denying (fail-closed)"
+        );
+        return reply_ok(
+            id,
+            IpcResult::ApprovalRequest {
+                decision: ipc::ApprovalDecisionWire::Deny.as_str().to_owned(),
+            },
+        );
+    };
+    let tool_name = action.tool_name.clone();
+
+    // Request audit first, so a request is visible even if the sink is slow.
+    publish_approval_event(services, session_id, &tool_name, None, correlation_id);
+
+    let decision = match &services.approval_sink {
+        None => {
+            tracing::warn!(
+                %agent_id,
+                %tool_name,
+                "supervisor: approval requested but no approval sink is configured; denying \
+                 (fail-closed)"
+            );
+            ApprovalDecision::Deny
+        }
+        Some(sink) if cancel.is_cancelled() => {
+            // The run is tearing down; do not surface a dialog for a dead run.
+            ApprovalDecision::Deny
+        }
+        Some(sink) => {
+            let policy_action = PolicyAction {
+                tool_name: &action.tool_name,
+                input: &action.input,
+                session_id,
+                correlation_id,
+                capability_requirements: CapabilitySet::default(),
+                sandbox_profile: None,
+                estimated_cost_usd: None,
+                command_facts: None,
+                // The child is untrusted by design; never an authority action.
+                orchestrator_authority: false,
+                path_facts: None,
+            };
+            // No deadline is raced here: the request parks on the sink until
+            // the user answers. Run teardown is the only escape hatch, and it
+            // resolves the request as a denial (fail-closed) instead of
+            // stranding the child on a reply that would never arrive.
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => ApprovalDecision::Deny,
+                decision = sink.request_approval(&policy_action, cancel.clone()) => decision,
+            }
+        }
+    };
+
+    let approved = !matches!(decision, ApprovalDecision::Deny);
+    publish_approval_event(services, session_id, &tool_name, Some(approved), correlation_id);
+
+    let wire = ipc::ApprovalDecisionWire::from_decision(decision);
+    reply_ok(id, IpcResult::ApprovalRequest { decision: wire.as_str().to_owned() })
+}
+
+/// Acknowledge a child's terminal approval-decision echo (ADR-60 S5).
+///
+/// The decision was already applied child-side, and the authoritative
+/// [`EventKind::ApprovalResolved`] audit event is emitted by
+/// [`handle_approval_request`] under the request's real session and
+/// correlation identity. This echo carries no identity on the wire, so it
+/// publishes nothing: re-emitting a resolve under fabricated ids would both
+/// duplicate the event and corrupt the run-scoped audit trail.
+fn handle_approval_resolved(tool_name: String, id: u64) -> Box<IpcResponse> {
+    reply_ok(id, IpcResult::ApprovalResolved { tool_name })
+}
+
+/// Bridge a child's user-acknowledgment request to the supervisor's sink
+/// (ADR-60 S5). Fail-closed: no sink, cancellation, or a sink that returns
+/// `false` all answer `false` (abort the current task).
+async fn handle_ack_request(
+    services: &SupervisorServices,
+    session_id: String,
+    message: String,
+    id: u64,
+    cancel: &CancellationToken,
+) -> Box<IpcResponse> {
+    // A malformed session id cannot be attributed, so the task aborts rather
+    // than acknowledging under a synthesized session (fail-closed).
+    let Ok(session_id) = Ulid::from_string(&session_id) else {
+        tracing::warn!("supervisor: ack request with malformed session id; aborting (fail-closed)");
+        return reply_ok(id, IpcResult::AckRequest { acknowledged: false });
+    };
+    let acknowledged = match &services.approval_sink {
+        Some(sink) if !cancel.is_cancelled() => {
+            sink.request_ack(session_id, &message, cancel.clone()).await
+        }
+        Some(_) => false,
+        None => {
+            tracing::warn!(
+                "supervisor: ack requested but no approval sink is configured; aborting \
+                 (fail-closed)"
+            );
+            false
+        }
+    };
+    reply_ok(id, IpcResult::AckRequest { acknowledged })
+}
+
+/// Bridge a child's approve-all request to the supervisor's sink (ADR-60 S5).
+/// Fail-closed: with no sink (or a cancelled run) the session is not widened
+/// and the reply still succeeds, naming the session so the child can log it.
+async fn handle_approve_all_request(
+    services: &SupervisorServices,
+    session_id: String,
+    id: u64,
+    cancel: &CancellationToken,
+) -> Box<IpcResponse> {
+    // A malformed session id cannot be attributed; never widen a synthesized
+    // session (fail-closed). The reply echoes the raw id so the child can log
+    // the rejection.
+    let Ok(session_id) = Ulid::from_string(&session_id) else {
+        tracing::warn!("supervisor: approve-all with malformed session id; ignoring (fail-closed)");
+        return reply_ok(id, IpcResult::ApproveAllRequest { session_id });
+    };
+    if let Some(sink) = &services.approval_sink {
+        if !cancel.is_cancelled() {
+            sink.approve_all_for_session(session_id, cancel.clone()).await;
+        }
+    } else {
+        tracing::warn!(
+            "supervisor: approve-all requested but no approval sink is configured; ignoring \
+             (fail-closed)"
+        );
+    }
+    reply_ok(id, IpcResult::ApproveAllRequest { session_id: session_id.to_string() })
+}
+
+/// Publish the approval request/resolve audit events (fail-soft: a publish
+/// error never changes the decision).
+fn publish_approval_event(
+    services: &SupervisorServices,
+    session_id: Ulid,
+    tool_name: &str,
+    approved: Option<bool>,
+    correlation_id: Ulid,
+) {
+    let Some(bus) = &services.bus else {
+        return;
+    };
+    let kind = match approved {
+        Some(approved) => concerto_core::event::EventKind::ApprovalResolved {
+            tool_name: tool_name.to_owned(),
+            approved,
+        },
+        None => concerto_core::event::EventKind::ApprovalRequested {
+            tool_name: tool_name.to_owned(),
+            timeout_secs: 0,
+        },
+    };
+    if let Err(error) = bus.publish_for_session(session_id, correlation_id, kind) {
+        tracing::warn!(%error, "supervisor: approval audit event publish failed (fail-soft)");
+    }
 }
 
 /// Query the memory spine off the loop (ADR-60 D6). The query is scoped to
@@ -2463,6 +2699,8 @@ mod write_path_tests {
             project_id: ProjectId("proj-d5-inject".to_owned()),
             subscriptions: SubscriptionManager::new(pool),
             consolidation: None,
+            approval_sink: None,
+            bus: None,
         }
     }
 
@@ -2950,6 +3188,8 @@ mod write_path_tests {
             project_id: ProjectId("proj-store-test".to_owned()),
             subscriptions: SubscriptionManager::new(pool),
             consolidation: None,
+            approval_sink: None,
+            bus: None,
         };
         (services, memory)
     }
@@ -3054,6 +3294,8 @@ mod write_path_tests {
             project_id: ProjectId("proj-store-test".to_owned()),
             subscriptions: SubscriptionManager::new(pool),
             consolidation: None,
+            approval_sink: None,
+            bus: None,
         };
         let cancel = CancellationToken::new();
         cancel.cancel();
@@ -3105,6 +3347,389 @@ mod write_path_tests {
                 Some(IpcErrorCode::Internal),
                 "{method:?} is answered Internal without services"
             );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // ADR-60 S5 approval bridge (DEFERRED #49).
+    // ---------------------------------------------------------------------
+
+    /// A scripted approval sink for the bridge tests.
+    #[derive(Default)]
+    struct ScriptedApprovalSink {
+        decision: std::sync::Mutex<Option<ApprovalDecision>>,
+        ack: std::sync::Mutex<Option<bool>>,
+        approve_all_calls: std::sync::atomic::AtomicUsize,
+        request_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScriptedApprovalSink {
+        fn with_decision(decision: ApprovalDecision) -> Self {
+            Self {
+                decision: std::sync::Mutex::new(Some(decision)),
+                ack: std::sync::Mutex::new(None),
+                approve_all_calls: std::sync::atomic::AtomicUsize::new(0),
+                request_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn with_ack(ack: bool) -> Self {
+            Self {
+                decision: std::sync::Mutex::new(None),
+                ack: std::sync::Mutex::new(Some(ack)),
+                approve_all_calls: std::sync::atomic::AtomicUsize::new(0),
+                request_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ApprovalSink for ScriptedApprovalSink {
+        async fn request_approval(
+            &self,
+            _action: &concerto_core::types::PolicyAction<'_>,
+            _cancel: CancellationToken,
+        ) -> ApprovalDecision {
+            self.request_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.decision
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .unwrap_or(ApprovalDecision::Deny)
+        }
+
+        async fn approve_all_for_session(&self, _session_id: Ulid, _cancel: CancellationToken) {
+            self.approve_all_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        async fn request_ack(
+            &self,
+            _session_id: Ulid,
+            _message: &str,
+            _cancel: CancellationToken,
+        ) -> bool {
+            self.ack.lock().unwrap_or_else(|poison| poison.into_inner()).unwrap_or(false)
+        }
+    }
+
+    fn approval_request_params() -> ipc::ApprovalActionWire {
+        ipc::ApprovalActionWire {
+            tool_name: "write_file".to_owned(),
+            input: json!({ "path": "hello.txt" }),
+            session_id: Ulid::new().to_string(),
+            correlation_id: Ulid::new().to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_request_without_a_sink_denies_fail_closed() {
+        let (_dir, pool) = test_pool().await;
+        let services = services(pool, std::env::temp_dir());
+        let response = handle_approval_request(
+            &services,
+            "agent-a",
+            approval_request_params(),
+            1,
+            &CancellationToken::new(),
+        )
+        .await;
+        match response.result {
+            Some(IpcResult::ApprovalRequest { decision }) => {
+                assert_eq!(decision, "deny", "no sink must fail closed to deny");
+            }
+            other => panic!("unexpected approval result: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_request_with_malformed_identity_denies_without_consulting_the_sink() {
+        let (_dir, pool) = test_pool().await;
+        let mut services = services(pool, std::env::temp_dir());
+        let sink = Arc::new(ScriptedApprovalSink::with_decision(ApprovalDecision::Approve));
+        let observed = Arc::clone(&sink);
+        services.approval_sink = Some(sink);
+        let mut action = approval_request_params();
+        action.session_id = "not-a-ulid".to_owned();
+        let response =
+            handle_approval_request(&services, "agent-a", action, 11, &CancellationToken::new())
+                .await;
+        match response.result {
+            Some(IpcResult::ApprovalRequest { decision }) => {
+                assert_eq!(decision, "deny", "malformed identity must fail closed");
+            }
+            other => panic!("unexpected approval result: {other:?}"),
+        }
+        assert_eq!(
+            observed.request_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "sink must never be consulted for an unattributable request"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_request_routes_to_the_configured_sink() {
+        let (_dir, pool) = test_pool().await;
+        let mut services = services(pool, std::env::temp_dir());
+        services.approval_sink =
+            Some(Arc::new(ScriptedApprovalSink::with_decision(ApprovalDecision::Approve)));
+        let response = handle_approval_request(
+            &services,
+            "agent-a",
+            approval_request_params(),
+            2,
+            &CancellationToken::new(),
+        )
+        .await;
+        match response.result {
+            Some(IpcResult::ApprovalRequest { decision }) => assert_eq!(decision, "approve"),
+            other => panic!("unexpected approval result: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_request_denies_when_the_run_is_cancelled() {
+        let (_dir, pool) = test_pool().await;
+        let mut services = services(pool, std::env::temp_dir());
+        // Even with an approve-all sink, a cancelled run must not surface a
+        // dialog for a dead run.
+        services.approval_sink =
+            Some(Arc::new(ScriptedApprovalSink::with_decision(ApprovalDecision::Approve)));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let response =
+            handle_approval_request(&services, "agent-a", approval_request_params(), 3, &cancel)
+                .await;
+        match response.result {
+            Some(IpcResult::ApprovalRequest { decision }) => {
+                assert_eq!(decision, "deny", "cancellation must fail closed");
+            }
+            other => panic!("unexpected approval result: {other:?}"),
+        }
+    }
+
+    /// A sink that never answers on its own: it parks forever, standing in
+    /// for a live dialog the user simply has not touched yet. Used to prove
+    /// the bridge has no deadline of its own and relies on teardown to
+    /// resolve a request nobody answered.
+    struct ParkedApprovalSink {
+        request_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ApprovalSink for ParkedApprovalSink {
+        async fn request_approval(
+            &self,
+            _action: &concerto_core::types::PolicyAction<'_>,
+            _cancel: CancellationToken,
+        ) -> ApprovalDecision {
+            self.request_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending::<ApprovalDecision>().await
+        }
+
+        async fn approve_all_for_session(&self, _session_id: Ulid, _cancel: CancellationToken) {}
+
+        async fn request_ack(
+            &self,
+            _session_id: Ulid,
+            _message: &str,
+            _cancel: CancellationToken,
+        ) -> bool {
+            false
+        }
+    }
+
+    /// The supervised bridge parks on the sink with no auto-expiry, and run
+    /// teardown while it waits resolves the request as `deny` instead of
+    /// stranding the child on a reply that would never come. The pending and
+    /// resolved events are emitted exactly once each.
+    #[tokio::test]
+    async fn approval_request_parks_until_cancelled_and_then_denies() {
+        let (_dir, pool) = test_pool().await;
+        let mut services = services(pool, std::env::temp_dir());
+        let bus = EventBus::default();
+        let mut receiver = bus.subscribe();
+        let sink =
+            Arc::new(ParkedApprovalSink { request_calls: std::sync::atomic::AtomicUsize::new(0) });
+        let observed = Arc::clone(&sink);
+        services.approval_sink = Some(sink);
+        services.bus = Some(bus);
+        let cancel = CancellationToken::new();
+
+        let handle = tokio::spawn({
+            let services = services.clone();
+            let cancel = cancel.clone();
+            async move {
+                handle_approval_request(&services, "agent-a", approval_request_params(), 7, &cancel)
+                    .await
+            }
+        });
+
+        // Deterministically reach the parked state: the bridge called the sink
+        // and is now waiting with no timer armed.
+        for _ in 0..1_000 {
+            if observed.request_calls.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            observed.request_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the bridge must consult the sink exactly once and then park"
+        );
+        assert!(
+            !handle.is_finished(),
+            "an unanswered supervised request must park, never expire on its own"
+        );
+
+        // Teardown while waiting: resolve fail-closed, promptly.
+        cancel.cancel();
+        let response = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("teardown must answer a pending approval request")
+            .expect("bridge task must not panic");
+        match response.result {
+            Some(IpcResult::ApprovalRequest { decision }) => {
+                assert_eq!(decision, "deny", "teardown must fail closed");
+            }
+            other => panic!("unexpected approval result: {other:?}"),
+        }
+
+        let requested = receiver.recv().await.expect("approval requested event");
+        assert!(matches!(
+            requested.kind,
+            concerto_core::event::EventKind::ApprovalRequested { .. }
+        ));
+        let resolved = receiver.recv().await.expect("approval resolved event");
+        assert!(matches!(
+            resolved.kind,
+            concerto_core::event::EventKind::ApprovalResolved { approved: false, .. }
+        ));
+        assert!(
+            receiver.try_recv().is_err(),
+            "one request, one resolution: no repeated waiting-state events"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_emits_request_and_resolve_events_with_session_identity() {
+        let (_dir, pool) = test_pool().await;
+        let mut services = services(pool, std::env::temp_dir());
+        let bus = EventBus::default();
+        let mut receiver = bus.subscribe();
+        let sink = Arc::new(ScriptedApprovalSink::with_decision(ApprovalDecision::Approve));
+        services.approval_sink = Some(sink);
+        services.bus = Some(bus);
+        let action = approval_request_params();
+        let session_id = Ulid::from_string(&action.session_id).expect("ulid");
+        let _ = handle_approval_request(&services, "agent-a", action, 4, &CancellationToken::new())
+            .await;
+
+        let requested = receiver.recv().await.expect("approval requested event");
+        assert_eq!(requested.session_id, session_id);
+        assert!(matches!(
+            requested.kind,
+            concerto_core::event::EventKind::ApprovalRequested { ref tool_name, .. }
+                if tool_name == "write_file"
+        ));
+        let resolved = receiver.recv().await.expect("approval resolved event");
+        assert_eq!(resolved.session_id, session_id);
+        assert!(matches!(
+            resolved.kind,
+            concerto_core::event::EventKind::ApprovalResolved { approved: true, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn ack_and_approve_all_bridge_to_the_sink() {
+        let (_dir, pool) = test_pool().await;
+        let mut services = services(pool, std::env::temp_dir());
+        let sink = Arc::new(ScriptedApprovalSink::with_ack(true));
+        let approve_all_calls = sink.clone();
+        services.approval_sink = Some(sink);
+        let session = Ulid::new();
+
+        let ack = handle_ack_request(
+            &services,
+            session.to_string(),
+            "destructive write".to_owned(),
+            5,
+            &CancellationToken::new(),
+        )
+        .await;
+        match ack.result {
+            Some(IpcResult::AckRequest { acknowledged }) => assert!(acknowledged),
+            other => panic!("unexpected ack result: {other:?}"),
+        }
+
+        let approve_all = handle_approve_all_request(
+            &services,
+            session.to_string(),
+            6,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(approve_all.error.is_none());
+        assert_eq!(
+            approve_all_calls.approve_all_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn ack_without_a_sink_fails_closed() {
+        let (_dir, pool) = test_pool().await;
+        let services = services(pool, std::env::temp_dir());
+        let response = handle_ack_request(
+            &services,
+            Ulid::new().to_string(),
+            "warning".to_owned(),
+            7,
+            &CancellationToken::new(),
+        )
+        .await;
+        match response.result {
+            Some(IpcResult::AckRequest { acknowledged }) => {
+                assert!(!acknowledged, "no sink must abort the task");
+            }
+            other => panic!("unexpected ack result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn approval_methods_dispatch_to_the_async_pool_with_services() {
+        // The dispatch policy is what routes the bridge methods to a handler;
+        // pin it so a future refactor cannot silently strand them.
+        let mut meta = AgentMeta::new("agent-a");
+        for method in [
+            IpcMethod::ApprovalRequest,
+            IpcMethod::ApprovalResolved,
+            IpcMethod::AckRequest,
+            IpcMethod::ApproveAllRequest,
+        ] {
+            let text = serde_json::to_string(&IpcRequest {
+                jsonrpc: "2.0".to_owned(),
+                id: 9,
+                method,
+                params: match method {
+                    IpcMethod::ApprovalRequest => {
+                        IpcParams::ApprovalRequest { action: approval_request_params() }
+                    }
+                    IpcMethod::ApprovalResolved => {
+                        IpcParams::ApprovalResolved { tool_name: "t".to_owned(), approved: false }
+                    }
+                    IpcMethod::AckRequest => IpcParams::AckRequest {
+                        session_id: "s".to_owned(),
+                        message: "m".to_owned(),
+                    },
+                    _ => IpcParams::ApproveAllRequest { session_id: "s".to_owned() },
+                },
+            })
+            .expect("serialize request");
+            // Without services: fail-closed `Internal`, never a dropped request.
+            let dispatch = dispatch_agent_line(&mut meta, &text, 1_000, None);
+            let reply = reply_of(dispatch);
+            assert_eq!(reply.id, 9);
+            assert_eq!(reply.error.map(|error| error.code), Some(IpcErrorCode::Internal));
         }
     }
 
@@ -3253,6 +3878,8 @@ mod write_path_tests {
             project_id: ProjectId("proj-smuggle".to_owned()),
             subscriptions: SubscriptionManager::new(pool.clone()),
             consolidation: None,
+            approval_sink: None,
+            bus: None,
         };
         let cancel = CancellationToken::new();
 

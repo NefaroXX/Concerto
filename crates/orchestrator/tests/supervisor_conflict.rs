@@ -449,6 +449,9 @@ async fn concurrent_same_file_writes_surface_durably_and_never_corrupt() {
         whiteboard_pool: pool.clone(),
         subscriptions: SubscriptionManager::new(pool.clone().clone()),
         consolidation: None,
+        // ADR-60 S5: fail-closed default (no approval sink, no audit bus) for this test.
+        approval_sink: None,
+        bus: None,
         memory: Arc::new(CountingMemoryStore::new()),
         project_id: ProjectId("proj-d5".to_owned()),
     };
@@ -517,6 +520,9 @@ async fn sequential_same_file_writes_by_two_agents_both_apply() {
             whiteboard_pool: pool.clone(),
             subscriptions: SubscriptionManager::new(pool.clone().clone()),
             consolidation: None,
+            // ADR-60 S5: fail-closed default (no approval sink, no audit bus) for this test.
+            approval_sink: None,
+            bus: None,
             memory: Arc::new(CountingMemoryStore::new()),
             project_id: ProjectId("proj-d5".to_owned()),
         };
@@ -578,6 +584,9 @@ async fn matching_base_version_applies_and_records_the_claimed_hash() {
         whiteboard_pool: pool.clone(),
         subscriptions: SubscriptionManager::new(pool.clone().clone()),
         consolidation: None,
+        // ADR-60 S5: fail-closed default (no approval sink, no audit bus) for this test.
+        approval_sink: None,
+        bus: None,
         memory: Arc::new(CountingMemoryStore::new()),
         project_id: ProjectId("proj-d5".to_owned()),
     };
@@ -628,6 +637,9 @@ async fn stale_base_version_is_surfaced_and_the_agent_continues_with_a_fresh_wri
         whiteboard_pool: pool.clone(),
         subscriptions: SubscriptionManager::new(pool.clone().clone()),
         consolidation: None,
+        // ADR-60 S5: fail-closed default (no approval sink, no audit bus) for this test.
+        approval_sink: None,
+        bus: None,
         memory: Arc::new(CountingMemoryStore::new()),
         project_id: ProjectId("proj-d5".to_owned()),
     };
@@ -707,6 +719,9 @@ async fn kill_mid_gated_write_restarts_and_replays_without_reexecuting() {
         whiteboard_pool: pool.clone(),
         subscriptions: SubscriptionManager::new(pool.clone().clone()),
         consolidation: None,
+        // ADR-60 S5: fail-closed default (no approval sink, no audit bus) for this test.
+        approval_sink: None,
+        bus: None,
         memory: Arc::new(CountingMemoryStore::new()),
         project_id: ProjectId("proj-d5".to_owned()),
     };
@@ -788,6 +803,9 @@ async fn identical_runs_replay_identical_logs_and_different_scripts_differ() {
             whiteboard_pool: pool.clone(),
             subscriptions: SubscriptionManager::new(pool.clone().clone()),
             consolidation: None,
+            // ADR-60 S5: fail-closed default (no approval sink, no audit bus) for this test.
+            approval_sink: None,
+            bus: None,
             memory: Arc::new(CountingMemoryStore::new()),
             project_id: ProjectId("proj-d5".to_owned()),
         };
@@ -867,6 +885,9 @@ async fn concurrent_moves_of_same_source_apply_exactly_once_and_never_corrupt() 
         whiteboard_pool: pool.clone(),
         subscriptions: SubscriptionManager::new(pool.clone().clone()),
         consolidation: None,
+        // ADR-60 S5: fail-closed default (no approval sink, no audit bus) for this test.
+        approval_sink: None,
+        bus: None,
         memory: Arc::new(CountingMemoryStore::new()),
         project_id: ProjectId("proj-d5".to_owned()),
     };
@@ -943,6 +964,9 @@ async fn stale_claimed_move_source_is_refused_and_a_fresh_move_recovers() {
         whiteboard_pool: pool.clone(),
         subscriptions: SubscriptionManager::new(pool.clone().clone()),
         consolidation: None,
+        // ADR-60 S5: fail-closed default (no approval sink, no audit bus) for this test.
+        approval_sink: None,
+        bus: None,
         memory: Arc::new(CountingMemoryStore::new()),
         project_id: ProjectId("proj-d5".to_owned()),
     };

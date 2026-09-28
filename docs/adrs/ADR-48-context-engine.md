@@ -4,7 +4,7 @@
 **Date:** 2026-08-07
 **Deciders:** Concerto architecture
 **Supersedes:** Phase 3 of the provider-first redesign plan
-    (`docs/ARCHITECTURE-V2.md`)
+    (`docs/research/ARCHITECTURE-V2.md`)
 **Composes with:** ADR-46 (reasoning-as-data), ADR-45/42 (fallback ladder) —
     these remain valid and unchanged.
 

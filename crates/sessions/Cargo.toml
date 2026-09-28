@@ -11,6 +11,9 @@ workspace = true
 [dependencies]
 fastrand = { workspace = true }
 concerto-core = { path = "../core", version = "0.1.0" }
+# `[audit]` settings (at-rest encryption, retention) are read by `connect()`
+# from the same layered config every frontend uses — see `src/at_rest.rs`.
+concerto-config = { path = "../config", version = "0.1.0" }
 
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -27,9 +30,24 @@ sqlx = { workspace = true }
 dirs = { workspace = true }
 camino = { workspace = true }
 
+# CSPRNG for the at-rest encryption key (`AtRestKey::generate`).
+getrandom = "0.3"
+# `log::LevelFilter` for `SqliteConnectOptions::log_statements` — keyed
+# connections silence statement logging so `PRAGMA key` never reaches logs.
+log = "0.4"
+
 # Deterministic content_hash for whiteboard events (ADR-60 D3); same workspace
 # dep used by core/config/memory/orchestrator/tools.
 blake3 = { workspace = true }
+
+# SQLCipher-enabled libsqlite3-sys. This crate never names its API: the whole
+# point is Cargo feature unification with sqlx's own libsqlite3-sys, which
+# compiles the vendored SQLCipher amalgamation so `PRAGMA key` works (row 44).
+# Target-gated off Windows, where libsqlite3-sys' build script requires
+# OPENSSL_DIR for `bundled-sqlcipher`; on such builds `connect()` fails closed
+# with an explicit "SQLCipher unavailable" error instead of running plaintext.
+[target.'cfg(not(windows))'.dependencies]
+libsqlite3-sys = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

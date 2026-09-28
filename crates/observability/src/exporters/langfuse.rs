@@ -1,6 +1,7 @@
 use concerto_config::credentials::CredentialStore;
 use concerto_config::ObservabilityConfig;
 use concerto_core::error::ObservabilityError;
+use concerto_core::secret::SecretString;
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
@@ -38,7 +39,7 @@ impl LangfuseExporter {
         // Build the Langfuse exporter.
         let exporter = opentelemetry_langfuse::ExporterBuilder::new()
             .with_host(host)
-            .with_basic_auth(&public_key, &secret_key)
+            .with_basic_auth(public_key.expose(), secret_key.expose())
             .build()
             .map_err(|e| ObservabilityError::LangfuseInitFailed(e.to_string()))?;
 
@@ -58,16 +59,16 @@ impl LangfuseExporter {
     ///
     /// If the value starts with `"keyring:"`, resolve it from the
     /// `CredentialStore`.  Otherwise return the value as-is.
-    fn resolve_key(value: &str, key_name: &str) -> Result<String, ObservabilityError> {
+    fn resolve_key(value: &str, key_name: &str) -> Result<SecretString, ObservabilityError> {
         if let Some(account) = value.strip_prefix("keyring:") {
             let store = CredentialStore::new();
-            store.get(account).map_err(|e| {
+            store.get_secret(account).map_err(|e| {
                 ObservabilityError::LangfuseInitFailed(format!(
                     "failed to resolve {key_name} from keyring: {e}"
                 ))
             })
         } else {
-            Ok(value.to_owned())
+            Ok(value.to_owned().into())
         }
     }
 

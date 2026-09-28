@@ -39,6 +39,7 @@ pub mod links;
 pub mod mermaid;
 pub mod prefs;
 pub mod rag;
+pub mod recall;
 pub mod scoring;
 pub mod short_term;
 pub mod storage;

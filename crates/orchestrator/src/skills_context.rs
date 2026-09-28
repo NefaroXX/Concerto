@@ -128,6 +128,28 @@ impl SkillsContext {
         )
     }
 
+    /// A context pre-loaded with an already-rendered section.
+    ///
+    /// Used by the supervised agent-process child (ADR-60 S5): the parent
+    /// renders the budgeted section once from its runtime-owned context and
+    /// hands the finished string over, so the child appends it to its system
+    /// prompt without running discovery itself (the child may not share the
+    /// parent's skill search paths or live toggle state). `None`/empty yields
+    /// [`SkillsContext::disabled`], so a parent that injected nothing produces
+    /// a byte-identical prompt to a run with skills off.
+    ///
+    /// The budget mirrors [`DEFAULT_SKILLS_BUDGET_CHARS`]; it is not re-applied
+    /// here because the section was already budgeted by the producing context.
+    pub fn from_rendered_section(section: Option<String>) -> Option<Arc<Self>> {
+        let section = section.filter(|section| !section.is_empty())?;
+        let context = Self::disabled();
+        {
+            let mut state = context.state.write().unwrap_or_else(|poison| poison.into_inner());
+            state.section = section;
+        }
+        Some(Arc::new(context))
+    }
+
     /// Re-run discovery and enablement resolution, then re-format the section.
     ///
     /// Effective ids = `enabled_ids` when `Some`; otherwise all discovered
@@ -339,6 +361,22 @@ mod tests {
     fn refresh_ids(context: &SkillsContext) -> Vec<String> {
         context.refresh().expect("refresh succeeds");
         context.descriptors().into_iter().map(|descriptor| descriptor.id).collect()
+    }
+
+    #[test]
+    fn from_rendered_section_none_or_empty_is_disabled() {
+        assert!(SkillsContext::from_rendered_section(None).is_none());
+        assert!(SkillsContext::from_rendered_section(Some(String::new())).is_none());
+    }
+
+    #[test]
+    fn from_rendered_section_serves_the_section_verbatim() {
+        let section = "## Skills\nDo the thing.".to_owned();
+        let context =
+            SkillsContext::from_rendered_section(Some(section.clone())).expect("section set");
+        assert_eq!(context.section(), section);
+        // No discovery state is invented.
+        assert!(context.descriptors().is_empty());
     }
 
     #[test]

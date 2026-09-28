@@ -16,9 +16,10 @@
 //! Defaults are the existing behavior (`trigger_tokens` 16000,
 //! `retain_user_turns` 4, `minimum_user_turns` 6), so a config without a
 //! `[context]` section — or with only some knobs set — is byte-identical to
-//! today's runtime. `cache_stable_prefix` resolves to `false` when unset; the
-//! resolved flag is exposed on the budget but not yet forwarded to a dialect
-//! cache op (additive label, see [`ContextBudgetPolicy`]).
+//! today's runtime. `cache_stable_prefix` resolves to `false` when unset and
+//! is consumed by [`crate::prompts::PromptBuilder`], which pins a byte-stable
+//! system head and appends the volatile working memory after it (see
+//! [`crate::prompts::PromptBuilder::stable_system_head`]).
 
 use std::sync::Arc;
 
@@ -44,12 +45,14 @@ pub struct ContextBudgetPolicy {
     pub retain_user_turns: usize,
     /// Minimum user turns before compaction may fire (default 6).
     pub minimum_user_turns: usize,
-    /// Request an explicit prefix-stability marker at the deterministic
-    /// checkpoint-frontier / recent-tail boundary (default `false` = today's
-    /// behavior). Resolved from `[context].cache_stable_prefix` but not yet
-    /// forwarded to a dialect cache op — the marker needs a `Message`-level
-    /// carrier before it can be consumed, so wiring is deferred
-    /// (TODO(ADR-048), additive only).
+    /// Pin a byte-stable system head and append the volatile working memory
+    /// after it (default `false` = today's byte-identical assembly). Resolved
+    /// from `[context].cache_stable_prefix` and consumed by
+    /// [`crate::prompts::PromptBuilder::with_cache_stable_prefix`], which the
+    /// single-agent run wires in `runtime_runner`; the stable head carries the
+    /// system prompt, skills block, project context, environment card and (via
+    /// `CompletionRequest::tools`) the tool schemas, so retrieved chunks and
+    /// per-turn content never sit inside it.
     pub cache_stable_prefix: bool,
 }
 

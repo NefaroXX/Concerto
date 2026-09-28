@@ -11,6 +11,7 @@ pub mod ui;
 pub mod update;
 
 use concerto_core::CancellationToken;
+use concerto_sessions::{AuditLogFilter, AuditLogRow};
 use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -82,10 +83,11 @@ fn run_cli_inner(
             "extensions" => return run_extensions_subcommand(&remaining[1..], &project_root),
             "health" => return run_health_subcommand(&remaining[1..], &project_root),
             "memory" => return run_memory_subcommand(&remaining[1..], &project_root),
+            "audit" => return run_audit_subcommand(&remaining[1..]),
             other => {
                 eprintln!("error: unknown subcommand '{other}'");
                 eprintln!(
-                    "available subcommands: config, providers, sessions, projects, plugin, extensions, health, memory, logs"
+                    "available subcommands: config, providers, sessions, projects, plugin, extensions, health, memory, audit, logs"
                 );
                 std::process::exit(1);
             }
@@ -1198,6 +1200,281 @@ fn run_logs_subcommand(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// `concerto audit <session-id>` — read one session's policy audit trail.
+//
+// The trail is written by `concerto-sessions` (`audit_log`, including the
+// migration-034 path/operation facts); this is the supported way to read it
+// without opening sqlite3 by hand. Read-only: it never writes to the store.
+// ---------------------------------------------------------------------------
+
+/// Usage line echoed on every `audit` argument error.
+const AUDIT_USAGE: &str = "usage: concerto audit <session-id> [--tool <name>] \
+                           [--operation <op>] [--failed] [--limit <n>] [--json]";
+
+/// Parsed `concerto audit` arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuditArgs {
+    /// Session whose trail is being read.
+    session_id: concerto_core::ids::Ulid,
+    /// Read filters backing `--tool`, `--operation`, `--failed`, `--limit`.
+    filter: AuditLogFilter,
+    /// `--json`: one JSON object on stdout instead of the text trail.
+    json: bool,
+}
+
+/// Consume the value that must follow `flag` (advancing `index`).
+fn audit_flag_value(args: &[String], index: &mut usize, flag: &str) -> anyhow::Result<String> {
+    *index += 1;
+    args.get(*index)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("missing value after {flag}; {AUDIT_USAGE}"))
+}
+
+/// Manually parse `audit` flags (no clap, matching the rest of the CLI).
+///
+/// The session id is the single positional argument and may appear anywhere
+/// among the flags.
+fn parse_audit_args(args: &[String]) -> anyhow::Result<AuditArgs> {
+    let mut session_id: Option<concerto_core::ids::Ulid> = None;
+    let mut filter = AuditLogFilter::default();
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        let raw = &args[index];
+        match raw.as_str() {
+            "--failed" => filter.failed = true,
+            "--json" => json = true,
+            "--tool" => {
+                filter.tool = Some(audit_flag_value(args, &mut index, raw.as_str())?);
+            }
+            "--operation" => {
+                filter.operation = Some(audit_flag_value(args, &mut index, raw.as_str())?);
+            }
+            "--limit" => {
+                let value = audit_flag_value(args, &mut index, raw.as_str())?;
+                let limit = value
+                    .parse::<u64>()
+                    .map_err(|_| anyhow::anyhow!("invalid limit '{value}'; {AUDIT_USAGE}"))?;
+                if limit == 0 {
+                    anyhow::bail!("--limit must be at least 1; {AUDIT_USAGE}");
+                }
+                filter.limit = Some(limit);
+            }
+            other if other.starts_with('-') => {
+                anyhow::bail!("unknown audit option '{other}'; {AUDIT_USAGE}");
+            }
+            other => {
+                if session_id.is_some() {
+                    anyhow::bail!("unexpected argument '{other}'; {AUDIT_USAGE}");
+                }
+                session_id = Some(parse_session_id(other)?);
+            }
+        }
+        index += 1;
+    }
+    let session_id =
+        session_id.ok_or_else(|| anyhow::anyhow!("missing session id; {AUDIT_USAGE}"))?;
+    Ok(AuditArgs { session_id, filter, json })
+}
+
+/// On-disk path of the sessions database (shared with the runtime).
+fn sessions_db_path() -> anyhow::Result<PathBuf> {
+    let data_dir = concerto_sessions::app_data_dir()
+        .map_err(|error| anyhow::anyhow!("could not resolve app data dir: {error}"))?;
+    Ok(data_dir.join("sessions.db"))
+}
+
+/// Whether a store error says "this file is encrypted".
+fn audit_is_encrypted_error(error: &concerto_sessions::SessionError) -> bool {
+    let text = error.to_string();
+    text.contains("at-rest encrypted")
+        || text.contains("file is not a database")
+        || text.contains("file is encrypted")
+        || text.contains("PRAGMA key")
+}
+
+/// Turn a store-open failure into an actionable message.
+///
+/// An at-rest encrypted database (marker sidecar present, or sqlite itself
+/// reporting an encrypted/unreadable file) needs the machine-wide
+/// `[audit] encrypt_at_rest` setting before `concerto audit` can read it —
+/// say so instead of leaking the raw driver error.
+fn audit_open_error(db_path: &Path, error: &concerto_sessions::SessionError) -> anyhow::Error {
+    if concerto_sessions::is_at_rest_encrypted(db_path) || audit_is_encrypted_error(error) {
+        return anyhow::anyhow!(
+            "{} is at-rest encrypted; enable [audit] encrypt_at_rest in the global config \
+             (or set CONCERTO_AUDIT_DB_ENCRYPTION_KEY) to read it: {error}",
+            db_path.display()
+        );
+    }
+    anyhow::anyhow!("could not open the sessions database {}: {error}", db_path.display())
+}
+
+/// `concerto audit <session-id>` — print one session's audit trail.
+fn run_audit_subcommand(args: &[String]) -> anyhow::Result<()> {
+    let options = parse_audit_args(args)?;
+    let db_path = sessions_db_path()?;
+    let rt = tokio::runtime::Runtime::new()?;
+    let rows = rt.block_on(async {
+        let store = concerto_sessions::SqliteSessionStore::connect()
+            .await
+            .map_err(|error| audit_open_error(&db_path, &error))?;
+        store
+            .load_audit_log(options.session_id, &options.filter, CancellationToken::new())
+            .await
+            .map_err(anyhow::Error::from)
+    })?;
+
+    if options.json {
+        let json = serde_json::json!({
+            "session_id": options.session_id.to_string(),
+            "entries": rows,
+        });
+        println!("{}", serde_json::to_string(&json)?);
+    } else {
+        print_audit_trail(options.session_id, &rows, &options.filter);
+    }
+    Ok(())
+}
+
+/// RFC 3339 (UTC) rendering of a stored unix timestamp; falls back to the
+/// raw seconds when the value is outside the representable range.
+fn format_audit_timestamp(unix_secs: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp(unix_secs)
+        .ok()
+        .and_then(|timestamp| timestamp.format(&time::format_description::well_known::Rfc3339).ok())
+        .unwrap_or_else(|| unix_secs.to_string())
+}
+
+/// Path shown on an entry's first line: what was attempted, and for a
+/// move/copy where it was headed.
+fn audit_path_target(row: &AuditLogRow) -> String {
+    let attempted = row.attempted_path.as_deref().unwrap_or("-");
+    match row.attempted_destination.as_deref().or(row.resolved_destination.as_deref()) {
+        Some(destination) => format!("{attempted} → {destination}"),
+        None => attempted.to_string(),
+    }
+}
+
+/// Render one trail entry as two lines: the decision, then the facts that
+/// qualify it (resolved path, destination, rule, error, duration).
+fn format_audit_entry(number: usize, row: &AuditLogRow) -> String {
+    let head = format!(
+        "{number:>3}  {}  {}  {}",
+        format_audit_timestamp(row.created_at),
+        row.tool_name,
+        row.verdict
+    );
+    let head = if row.has_path_facts() {
+        format!(
+            "{head}  {}  {}",
+            row.path_operation.as_deref().unwrap_or("-"),
+            audit_path_target(row)
+        )
+    } else {
+        format!("{head}  (no path facts recorded)")
+    };
+
+    let mut detail: Vec<String> = Vec::new();
+    if let Some(path) = &row.resolved_path {
+        detail.push(format!("resolved {path}"));
+    }
+    if let Some(destination) = &row.resolved_destination {
+        detail.push(format!("destination {destination}"));
+    }
+    // Migration 035: what a read-only operation RETURNED (boolean / count /
+    // size) — the "what the agent learned" half of the trail. Never content.
+    if let Some(result_facts) = &row.result_facts {
+        detail.push(format!("result {result_facts}"));
+    }
+    if let Some(rule) = &row.rule_matched {
+        detail.push(format!("rule {rule}"));
+    }
+    if let Some(error_kind) = &row.error_kind {
+        detail.push(format!("error {error_kind}"));
+    }
+    if let Some(duration_ms) = row.duration_ms {
+        detail.push(format!("{duration_ms}ms"));
+    }
+    if detail.is_empty() {
+        head
+    } else {
+        format!("{head}\n      {}", detail.join(" · "))
+    }
+}
+
+/// Space-separated summary of the active filters (`""` when none).
+fn audit_filter_summary(filter: &AuditLogFilter) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(tool) = &filter.tool {
+        parts.push(format!("tool={tool}"));
+    }
+    if let Some(operation) = &filter.operation {
+        parts.push(format!("operation={operation}"));
+    }
+    if filter.failed {
+        parts.push("failed".to_string());
+    }
+    if let Some(limit) = filter.limit {
+        parts.push(format!("limit={limit}"));
+    }
+    parts.join(" ")
+}
+
+/// Footer notes: how many entries were read, how many carry no path facts,
+/// whether `--limit` cut the trail short, and which filters were applied.
+fn print_audit_footer(rows: &[AuditLogRow], filter: &AuditLogFilter) {
+    let total = rows.len();
+    let without_path_facts = rows.iter().filter(|row| !row.has_path_facts()).count();
+    let mut summary = format!("{} {}", total, if total == 1 { "entry" } else { "entries" });
+    if without_path_facts > 0 {
+        summary = format!(
+            "{summary} ({without_path_facts} without path facts: written before path \
+             recording, or from a tool that names no path)"
+        );
+    }
+    println!("{summary}.");
+    if let Some(limit) = filter.limit {
+        if total as u64 >= limit {
+            println!(
+                "--limit {limit} reached: later entries were not read (raise --limit to see more)"
+            );
+        }
+    }
+    let filters = audit_filter_summary(filter);
+    if !filters.is_empty() {
+        println!("Filters: {filters}");
+    }
+}
+
+/// Print the text trail: header, one block per entry, then the footer notes.
+fn print_audit_trail(
+    session_id: concerto_core::ids::Ulid,
+    rows: &[AuditLogRow],
+    filter: &AuditLogFilter,
+) {
+    println!("=== Audit trail: session {session_id} ===");
+    if rows.is_empty() {
+        println!();
+        println!(
+            "No audit entries for session {session_id} (wrong id, or no tool decisions \
+             were recorded)."
+        );
+        let filters = audit_filter_summary(filter);
+        if !filters.is_empty() {
+            println!("Filters applied: {filters} — drop them to check the full trail.");
+        }
+        return;
+    }
+    println!();
+    for (index, row) in rows.iter().enumerate() {
+        println!("{}", format_audit_entry(index + 1, row));
+    }
+    println!();
+    print_audit_footer(rows, filter);
+}
+
 fn parse_session_id(value: &str) -> anyhow::Result<concerto_core::ids::Ulid> {
     value
         .parse::<ulid::Ulid>()
@@ -1210,7 +1487,10 @@ fn invocation_args(args: &[String]) -> anyhow::Result<(Vec<String>, Option<PathB
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
-            "--cli" | "-c" | "--multi-agent" | "-m" | "--fast" | "-f" | "--reconfigure" | "-r" => {}
+            // Startup flags the caller already parsed (see `parse_cli_args`)
+            // are stripped here so they never reach subcommand dispatch.
+            "--cli" | "-c" | "--multi-agent" | "-m" | "--fast" | "-f" | "--reconfigure" | "-r"
+            | "--reduced-motion" => {}
             "--project" | "-p" => {
                 index += 1;
                 let value = args
@@ -1280,7 +1560,7 @@ pub fn parse_cli_args<'a>(
                 eprintln!("                      flag beats CONCERTO_THEME env, which beats [display] theme");
                 eprintln!("  --project, -p DIR   Select the project used by chat and commands");
                 eprintln!("  --help, -h          Print this help");
-                eprintln!("  subcommands: config, providers, sessions, projects, plugin, extensions, health, logs");
+                eprintln!("  subcommands: config, providers, sessions, projects, plugin, extensions, health, audit, logs");
                 std::process::exit(0);
             }
             _ => remaining.push(arg.clone()),
@@ -1433,6 +1713,16 @@ mod tests {
         let args = ["--reconfigure".to_string(), "sessions".to_string(), "list".to_string()];
         let (remaining, _project) = invocation_args(&args).unwrap();
         assert_eq!(remaining, vec!["sessions", "list"]);
+    }
+
+    #[test]
+    fn invocation_args_reduced_motion_flag_is_stripped() {
+        // Regression: `--reduced-motion` was parsed by `parse_cli_args` but
+        // never stripped here, so it reached subcommand dispatch and failed
+        // as an unknown subcommand.
+        let args = ["--reduced-motion".to_string(), "providers".to_string(), "list".to_string()];
+        let (remaining, _project) = invocation_args(&args).unwrap();
+        assert_eq!(remaining, vec!["providers", "list"]);
     }
 
     #[test]
@@ -2003,6 +2293,15 @@ api_key = "sk-test-key-for-provider-list-1234567890"
         std::fs::create_dir_all(&xdg_data).unwrap();
         let old_data = std::env::var("XDG_DATA_HOME").ok();
         std::env::set_var("XDG_DATA_HOME", &xdg_data);
+        // `SqliteSessionStore::connect()` resolves the `[audit]` at-rest
+        // policy from the *global* config (row 44). Point XDG_CONFIG_HOME at
+        // an empty directory so these tests see pure defaults (encryption
+        // off) instead of a developer's real config, which could otherwise
+        // fail closed on keychain access.
+        let xdg_config = temp.path().join("xdg-config");
+        std::fs::create_dir_all(&xdg_config).unwrap();
+        let old_config = std::env::var("XDG_CONFIG_HOME").ok();
+        std::env::set_var("XDG_CONFIG_HOME", &xdg_config);
 
         let proj = temp.path().join("prune-project");
         std::fs::create_dir_all(&proj).unwrap();
@@ -2047,6 +2346,10 @@ api_key = "sk-test-key-for-provider-list-1234567890"
             Some(v) => std::env::set_var("XDG_DATA_HOME", v),
             None => std::env::remove_var("XDG_DATA_HOME"),
         }
+        match &old_config {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
 
         assert!(result.is_ok(), "dry run should succeed: {:?}", result.err());
         assert!(still_exists, "dry run must not delete sessions");
@@ -2060,6 +2363,15 @@ api_key = "sk-test-key-for-provider-list-1234567890"
         std::fs::create_dir_all(&xdg_data).unwrap();
         let old_data = std::env::var("XDG_DATA_HOME").ok();
         std::env::set_var("XDG_DATA_HOME", &xdg_data);
+        // `SqliteSessionStore::connect()` resolves the `[audit]` at-rest
+        // policy from the *global* config (row 44). Point XDG_CONFIG_HOME at
+        // an empty directory so these tests see pure defaults (encryption
+        // off) instead of a developer's real config, which could otherwise
+        // fail closed on keychain access.
+        let xdg_config = temp.path().join("xdg-config");
+        std::fs::create_dir_all(&xdg_config).unwrap();
+        let old_config = std::env::var("XDG_CONFIG_HOME").ok();
+        std::env::set_var("XDG_CONFIG_HOME", &xdg_config);
 
         let proj = temp.path().join("prune-project");
         std::fs::create_dir_all(&proj).unwrap();
@@ -2116,6 +2428,10 @@ api_key = "sk-test-key-for-provider-list-1234567890"
         match &old_data {
             Some(v) => std::env::set_var("XDG_DATA_HOME", v),
             None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        match &old_config {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
 
         assert!(result.is_ok(), "prune should succeed: {:?}", result.err());
@@ -2211,5 +2527,244 @@ api_key = "sk-test-key-for-provider-list-1234567890"
         let project_root = temp.path().join("project");
         std::fs::create_dir_all(&project_root).unwrap();
         assert!(run_memory_subcommand(&[], &project_root).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // audit subcommand (read path for `audit_log`)
+    // ------------------------------------------------------------------
+
+    /// Valid ULID used as the positional session id by the parse tests.
+    const AUDIT_TEST_SESSION_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+    /// Owned argv for the `&[String]` argument parsers.
+    fn audit_argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|value| value.to_string()).collect()
+    }
+
+    /// An `AuditLogRow` carrying no path facts (pre-034 / path-less tool).
+    fn audit_row() -> AuditLogRow {
+        AuditLogRow {
+            id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+            session_id: Some(AUDIT_TEST_SESSION_ID.to_string()),
+            created_at: 0,
+            tool_name: "filesystem".to_string(),
+            verdict: "Allow".to_string(),
+            rule_matched: Some("auto_approve".to_string()),
+            error_kind: None,
+            duration_ms: Some(7),
+            path_operation: None,
+            attempted_path: None,
+            resolved_path: None,
+            attempted_destination: None,
+            resolved_destination: None,
+            result_facts: None,
+        }
+    }
+
+    #[test]
+    fn parse_audit_args_defaults() {
+        let parsed = parse_audit_args(&audit_argv(&[AUDIT_TEST_SESSION_ID])).unwrap();
+        assert_eq!(parsed.session_id.to_string(), AUDIT_TEST_SESSION_ID);
+        assert_eq!(parsed.filter, AuditLogFilter::default());
+        assert!(!parsed.json);
+    }
+
+    #[test]
+    fn parse_audit_args_full_flags() {
+        let parsed = parse_audit_args(&audit_argv(&[
+            "--tool",
+            "filesystem",
+            "--operation",
+            "move",
+            "--failed",
+            "--limit",
+            "5",
+            "--json",
+            AUDIT_TEST_SESSION_ID,
+        ]))
+        .unwrap();
+        assert_eq!(parsed.session_id.to_string(), AUDIT_TEST_SESSION_ID);
+        assert_eq!(parsed.filter.tool.as_deref(), Some("filesystem"));
+        assert_eq!(parsed.filter.operation.as_deref(), Some("move"));
+        assert!(parsed.filter.failed);
+        assert_eq!(parsed.filter.limit, Some(5));
+        assert!(parsed.json);
+    }
+
+    #[test]
+    fn parse_audit_args_missing_session_id_is_error() {
+        let empty = parse_audit_args(&audit_argv(&[])).unwrap_err();
+        assert!(empty.to_string().contains("missing session id"), "{empty}");
+
+        // A flag where the id should have been still leaves no session id.
+        let flag_only = parse_audit_args(&audit_argv(&["--failed"])).unwrap_err();
+        assert!(flag_only.to_string().contains("missing session id"), "{flag_only}");
+
+        // A flag plus its value still leaves no session id.
+        let flag_with_value = parse_audit_args(&audit_argv(&["--tool", "filesystem"])).unwrap_err();
+        assert!(flag_with_value.to_string().contains("missing session id"), "{flag_with_value}");
+    }
+
+    #[test]
+    fn parse_audit_args_unknown_flag_is_error() {
+        let error = parse_audit_args(&audit_argv(&[AUDIT_TEST_SESSION_ID, "--bogus"])).unwrap_err();
+        assert!(error.to_string().contains("unknown audit option '--bogus'"), "{error}");
+    }
+
+    #[test]
+    fn parse_audit_args_missing_flag_value_is_error() {
+        for flag in ["--tool", "--operation", "--limit"] {
+            let error = parse_audit_args(&audit_argv(&[AUDIT_TEST_SESSION_ID, flag])).unwrap_err();
+            assert!(error.to_string().contains("missing value"), "{flag}: {error}");
+        }
+    }
+
+    #[test]
+    fn parse_audit_args_invalid_limit_is_error() {
+        let not_a_number =
+            parse_audit_args(&audit_argv(&[AUDIT_TEST_SESSION_ID, "--limit", "many"])).unwrap_err();
+        assert!(not_a_number.to_string().contains("invalid limit 'many'"), "{not_a_number}");
+
+        let zero =
+            parse_audit_args(&audit_argv(&[AUDIT_TEST_SESSION_ID, "--limit", "0"])).unwrap_err();
+        assert!(zero.to_string().contains("--limit must be at least 1"), "{zero}");
+    }
+
+    #[test]
+    fn parse_audit_args_invalid_session_id_is_error() {
+        let error = parse_audit_args(&audit_argv(&["not-a-ulid"])).unwrap_err();
+        assert!(error.to_string().contains("invalid session id 'not-a-ulid'"), "{error}");
+
+        let extra = parse_audit_args(&audit_argv(&[AUDIT_TEST_SESSION_ID, "extra"])).unwrap_err();
+        assert!(extra.to_string().contains("unexpected argument 'extra'"), "{extra}");
+    }
+
+    /// Argument errors surface before any database is touched: the runner
+    /// must fail on an empty argv without resolving the sessions path.
+    #[test]
+    fn run_audit_subcommand_requires_args_before_opening_db() {
+        let error = run_audit_subcommand(&[]).unwrap_err();
+        assert!(error.to_string().contains("missing session id"), "{error}");
+    }
+
+    #[test]
+    fn audit_open_error_reports_database_path() {
+        let db_path = std::path::PathBuf::from("/nonexistent-home/sessions.db");
+        let error = concerto_sessions::SessionError::Database("boom".to_string());
+        let message = audit_open_error(&db_path, &error).to_string();
+        assert!(message.contains("could not open the sessions database"), "{message}");
+        assert!(message.contains("/nonexistent-home/sessions.db"), "{message}");
+        assert!(!message.contains("encrypt_at_rest"), "{message}");
+    }
+
+    /// Marker sidecar present → the message points at the setting that would
+    /// let the CLI read the database, not at the raw driver error.
+    #[test]
+    fn audit_open_error_explains_at_rest_encrypted_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("sessions.db");
+        std::fs::write(&db_path, b"not really sqlite").unwrap();
+        std::fs::write(concerto_sessions::marker_path(&db_path), b"").unwrap();
+        assert!(concerto_sessions::is_at_rest_encrypted(&db_path));
+
+        let error = concerto_sessions::SessionError::Storage(
+            "sessions.db is at-rest encrypted (marker present)".to_string(),
+        );
+        let message = audit_open_error(&db_path, &error).to_string();
+        assert!(message.contains("[audit] encrypt_at_rest"), "{message}");
+        assert!(message.contains("CONCERTO_AUDIT_DB_ENCRYPTION_KEY"), "{message}");
+        assert!(message.contains(db_path.to_string_lossy().as_ref()), "{message}");
+    }
+
+    /// Encrypted-file errors reported by sqlite itself are recognised even
+    /// when no marker is visible to the caller.
+    #[test]
+    fn audit_open_error_recognises_sqlite_encryption_errors() {
+        let error = concerto_sessions::SessionError::Database("file is not a database".to_string());
+        assert!(audit_is_encrypted_error(&error));
+        let db_path = std::path::PathBuf::from("/var/lib/concerto/sessions.db");
+        let message = audit_open_error(&db_path, &error).to_string();
+        assert!(message.contains("[audit] encrypt_at_rest"), "{message}");
+
+        let unrelated = concerto_sessions::SessionError::Lock("database is locked".to_string());
+        assert!(!audit_is_encrypted_error(&unrelated));
+    }
+
+    #[test]
+    fn format_audit_entry_marks_rows_without_path_facts() {
+        let rendered = format_audit_entry(1, &audit_row());
+        assert!(rendered.contains("(no path facts recorded)"), "{rendered}");
+        assert!(rendered.contains("filesystem"), "{rendered}");
+        assert!(rendered.contains("Allow"), "{rendered}");
+        // The detail line still carries what the row does know.
+        assert!(rendered.contains("rule auto_approve"), "{rendered}");
+        assert!(rendered.contains("7ms"), "{rendered}");
+    }
+
+    #[test]
+    fn format_audit_entry_shows_move_with_destination() {
+        let row = AuditLogRow {
+            path_operation: Some("move".to_string()),
+            attempted_path: Some("c.txt".to_string()),
+            resolved_path: Some("/proj/c.txt".to_string()),
+            attempted_destination: Some("d.txt".to_string()),
+            resolved_destination: Some("/proj/d.txt".to_string()),
+            duration_ms: Some(12),
+            ..audit_row()
+        };
+        let rendered = format_audit_entry(3, &row);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines.len(), 2, "{rendered}");
+        assert!(lines[0].contains("  move  c.txt → d.txt"), "{}", lines[0]);
+        assert!(lines[1].contains("resolved /proj/c.txt"), "{}", lines[1]);
+        assert!(lines[1].contains("destination /proj/d.txt"), "{}", lines[1]);
+        assert!(lines[1].contains("12ms"), "{}", lines[1]);
+        assert!(!rendered.contains("no path facts"), "{rendered}");
+    }
+
+    #[test]
+    fn format_audit_timestamp_renders_rfc3339_utc() {
+        assert_eq!(format_audit_timestamp(0), "1970-01-01T00:00:00Z");
+    }
+
+    /// A read-only row carries its result summary on the detail line, and a
+    /// row without one (mutating op / pre-035) renders no result clause.
+    #[test]
+    fn format_audit_entry_shows_read_result_facts() {
+        let row = AuditLogRow {
+            path_operation: Some("list".to_string()),
+            attempted_path: Some(".".to_string()),
+            resolved_path: Some("/proj".to_string()),
+            result_facts: Some("entries=1".to_string()),
+            ..audit_row()
+        };
+        let rendered = format_audit_entry(2, &row);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines.len(), 2, "{rendered}");
+        assert!(lines[1].contains("resolved /proj"), "{}", lines[1]);
+        assert!(lines[1].contains("result entries=1"), "{}", lines[1]);
+
+        let plain = format_audit_entry(3, &audit_row());
+        assert!(!plain.contains("result "), "no recorded result, no clause: {plain}");
+    }
+
+    /// The `--json` envelope carries `result_facts` and deserialises back
+    /// into the same row (read side of the audit trail).
+    #[test]
+    fn audit_json_output_round_trips_result_facts() {
+        let row = AuditLogRow { result_facts: Some("exists=false".to_string()), ..audit_row() };
+        let envelope =
+            serde_json::json!({ "session_id": AUDIT_TEST_SESSION_ID, "entries": vec![row] });
+        let encoded = serde_json::to_string(&envelope).expect("envelope serialises");
+        assert!(
+            encoded.contains("\"result_facts\":\"exists=false\""),
+            "the new field must appear in --json: {encoded}"
+        );
+
+        let decoded: serde_json::Value = serde_json::from_str(&encoded).expect("valid JSON");
+        let entries: Vec<AuditLogRow> =
+            serde_json::from_value(decoded["entries"].clone()).expect("rows decode");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].result_facts.as_deref(), Some("exists=false"));
     }
 }

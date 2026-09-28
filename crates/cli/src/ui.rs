@@ -317,7 +317,7 @@ fn status_line(app: &App) -> String {
     )
 }
 
-/// User-facing label for an intent-router [`RunStage`] (ADR-55 Phase 2a),
+/// User-facing label for an intent-router [`RunStage`] (ADR-55 §9),
 /// mirroring the desktop status-bar chip wording.
 fn run_stage_label(stage: RunStage) -> &'static str {
     match stage {
@@ -427,7 +427,7 @@ fn draw_approval_modal(
     frame.render_widget(input, inner);
 }
 
-/// Render the intent-confirmation modal (ADR-55 §1): the question plus a
+/// Render the intent-confirmation modal (ADR-55 §2): the question plus a
 /// numbered list of the selectable outcomes. Mirrors `draw_approval_modal`:
 /// a cyan-bordered modal with a wrapped body. The height grows with the option
 /// list so all six choices are visible.
@@ -476,7 +476,7 @@ fn draw_intent_modal(
     frame.render_widget(input, inner);
 }
 
-/// Render the plan-approval modal (ADR-55 Phase 1d): the stored-plan question,
+/// Render the plan-approval modal (ADR-55 §4): the stored-plan question,
 /// a "Plan (plan_id)" label, and the plan body — up to 16 KiB — inside a
 /// scrollable viewport paged with `j/k` / arrow keys, plus Apply/Re-plan hints
 /// and Esc to dismiss. Mirrors `draw_intent_modal`'s cyan-bordered style.
@@ -837,7 +837,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
     // ------------------------------------------------------------------
-    // Plan modal helpers (ADR-55 Phase 1d)
+    // Plan modal helpers (ADR-55 §4)
     // ------------------------------------------------------------------
 
     #[test]
@@ -945,7 +945,7 @@ mod tests {
         app.screen = Screen::Settings;
         assert!(!app.multi_agent);
         // Navigate to MultiAgent (index 3; InteractionMode was removed in
-        // ADR-55 Phase 1e).
+        // ADR-55 §7).
         app.settings_index = 3;
         app.handle_key(key_event(KeyCode::Enter, KeyModifiers::empty()));
         assert!(app.multi_agent);
@@ -973,7 +973,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Run-stage status suffix (ADR-55 Phase 2a)
+    // Run-stage status suffix (ADR-55 §9)
     // ------------------------------------------------------------------
 
     #[test]

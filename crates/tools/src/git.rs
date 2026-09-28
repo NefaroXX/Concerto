@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use camino::Utf8PathBuf;
 use concerto_api_types::diff::{DiffLine, DiffResult};
 use concerto_core::traits::PolicyEngine;
-use concerto_core::types::{CapabilitySet, SessionContext, ToolOutput};
+use concerto_core::types::{CapabilitySet, PathPolicyFacts, SessionContext, ToolOutput};
 use concerto_core::{CancellationToken, ToolError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -719,6 +719,37 @@ impl concerto_core::traits::tool::Tool for GitTool {
         CapabilitySet::default().with_requirement("git")
     }
 
+    fn path_facts(
+        &self,
+        input: &serde_json::Value,
+        session: &SessionContext,
+    ) -> Option<PathPolicyFacts> {
+        let parsed: GitInput = coerce_git_input(input).ok()?;
+        let attempted = parsed
+            .repo_path
+            .clone()
+            .or_else(|| session.project_dir.to_str().map(str::to_string))
+            .unwrap_or_else(|| ".".to_string());
+        // Mirror `execute`'s containment resolution: the resolved repo path is
+        // recorded only when it stays inside the project root, so a rejected
+        // escape is visible as `resolved_path: None` next to the attempted path.
+        let project_root = Path::new(&session.project_dir)
+            .canonicalize()
+            .unwrap_or_else(|_| Path::new(&session.project_dir).to_path_buf());
+        let resolved = Path::new(&attempted)
+            .canonicalize()
+            .unwrap_or_else(|_| Path::new(&attempted).to_path_buf());
+        let resolved_path =
+            resolved.starts_with(&project_root).then(|| resolved.to_string_lossy().into_owned());
+        Some(PathPolicyFacts {
+            operation: parsed.operation,
+            attempted_path: Some(attempted),
+            resolved_path,
+            attempted_destination: None,
+            resolved_destination: None,
+        })
+    }
+
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -979,6 +1010,38 @@ mod tests {
 
     fn test_policy() -> AllowAllPolicy {
         AllowAllPolicy
+    }
+
+    // ---- Path-shaped structured facts (audit observability) ----------------
+
+    /// A repo_path inside the project records the operation and the confined
+    /// absolute repo path; with no repo_path the session project dir is used.
+    #[test]
+    fn path_facts_record_operation_and_confined_repo_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session = session(dir.path().to_path_buf());
+        let input = serde_json::json!({"operation": "status"});
+        let facts = GitTool.path_facts(&input, &session).expect("facts are produced");
+        assert_eq!(facts.operation, "status");
+        assert_eq!(facts.attempted_path.as_deref(), dir.path().to_str());
+        let expected = dir.path().canonicalize().unwrap();
+        assert_eq!(facts.resolved_path.as_deref(), expected.to_str());
+    }
+
+    /// A repo_path outside the project root keeps the attempted path but does
+    /// not resolve, so the rejected escape stays attributable.
+    #[test]
+    fn path_facts_leave_out_of_root_repo_path_unresolved() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session = session(dir.path().to_path_buf());
+        let outside = tempfile::TempDir::new().unwrap();
+        let input = serde_json::json!({
+            "operation": "status",
+            "repo_path": outside.path().to_str().unwrap(),
+        });
+        let facts = GitTool.path_facts(&input, &session).expect("facts are produced");
+        assert_eq!(facts.attempted_path.as_deref(), outside.path().to_str());
+        assert!(facts.resolved_path.is_none(), "an out-of-root repo_path must not resolve");
     }
 
     /// Stage worktree changes via the system `git` binary (used only in tests,

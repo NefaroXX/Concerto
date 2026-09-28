@@ -6,7 +6,7 @@
 **Date:** 2026-08-08
 **Deciders:** Concerto architecture
 **Supersedes:** Phase 5 of the provider-first redesign plan
-    (`docs/ARCHITECTURE-V2.md`) — the orchestration-polish items this ADR
+    (`docs/research/ARCHITECTURE-V2.md`) — the orchestration-polish items this ADR
     finalizes.
 **Composes with:** ADR-42/ADR-45 (fallback ladder, `Partial` machinery) — the
     run-cap exit reuses the ladder-exhaustion `Partial` path; ADR-46/ADR-48

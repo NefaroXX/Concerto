@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use camino::Utf8Path;
 use concerto_core::text::normalize_typographic;
 use concerto_core::traits::PolicyEngine;
-use concerto_core::types::{CapabilitySet, SessionContext, ToolOutput};
+use concerto_core::types::{CapabilitySet, PathPolicyFacts, SessionContext, ToolOutput};
 use concerto_core::{CancellationToken, ToolError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -245,6 +245,50 @@ fn check_cancel(cancel: &CancellationToken) -> Result<(), ToolError> {
     }
 }
 
+/// The root path used for containment, mirroring [`FilesystemTool::execute`]:
+/// the session's project dir when set, otherwise the tool's construction root.
+fn effective_root<'a>(tool_root: &'a Utf8Path, session: &'a SessionContext) -> &'a Utf8Path {
+    if !session.project_dir.as_os_str().is_empty() {
+        session.project_dir.to_str().map(Utf8Path::new).unwrap_or(tool_root)
+    } else {
+        tool_root
+    }
+}
+
+/// Build structured path facts for a filesystem action from its raw input.
+///
+/// Records the operation, the attempted path exactly as the caller supplied it,
+/// and the confined absolute path after workspace containment (recorded
+/// separately so a containment rewrite is visible). Move/copy also record the
+/// attempted and confined destination. Never records file content — only the
+/// operation and paths.
+///
+/// Returns `None` only when the input cannot be parsed as a filesystem action;
+/// a path that fails containment still yields facts with `resolved_path: None`
+/// so a rejected traversal remains attributable.
+fn filesystem_path_facts(root: &Utf8Path, input: &serde_json::Value) -> Option<PathPolicyFacts> {
+    let parsed = coerce_filesystem_input(input).ok()?;
+    let resolved_path = crate::common::resolve_path(root, Utf8Path::new(&parsed.path))
+        .ok()
+        .map(|path| path.to_string());
+    let (attempted_destination, resolved_destination) = match parsed.destination.as_deref() {
+        Some(destination) if !destination.is_empty() => (
+            Some(destination.to_string()),
+            crate::common::resolve_path(root, Utf8Path::new(destination))
+                .ok()
+                .map(|path| path.to_string()),
+        ),
+        _ => (None, None),
+    };
+    Some(PathPolicyFacts {
+        operation: parsed.operation,
+        attempted_path: Some(parsed.path),
+        resolved_path,
+        attempted_destination,
+        resolved_destination,
+    })
+}
+
 #[async_trait]
 impl concerto_core::traits::tool::Tool for FilesystemTool {
     fn name(&self) -> &str {
@@ -280,6 +324,15 @@ impl concerto_core::traits::tool::Tool for FilesystemTool {
         // enforcement is policy's job (default rules auto-approve reads and
         // require approval for writes), not the capability filter's.
         CapabilitySet::default().with_requirement("filesystem")
+    }
+
+    fn path_facts(
+        &self,
+        input: &serde_json::Value,
+        session: &SessionContext,
+    ) -> Option<PathPolicyFacts> {
+        let root = effective_root(&self.root, session);
+        filesystem_path_facts(root, input)
     }
 
     async fn execute(
@@ -661,6 +714,17 @@ impl concerto_core::traits::tool::Tool for WriteTool {
         // Canonical identity + operation-bearing input: full parity with a
         // direct filesystem write under every rule shape.
         ("filesystem".to_string(), Self::canonical_input(input))
+    }
+
+    fn path_facts(
+        &self,
+        input: &serde_json::Value,
+        session: &SessionContext,
+    ) -> Option<PathPolicyFacts> {
+        // The executor passes the canonical policy view (operation forced to
+        // `write`), so the shared filesystem fact builder sees the operation.
+        let root = effective_root(&self.inner.root, session);
+        filesystem_path_facts(root, input)
     }
 
     async fn execute(
@@ -1127,6 +1191,169 @@ mod tests {
         assert_eq!(copy.data["content"], "copy me");
     }
 
+    // -----------------------------------------------------------------------
+    // Reproduction — an existing in-root file that was never staged in the
+    // overlay must still move/copy (ADR-62 §4: reads resolve through the
+    // overlay onto disk). Observed on Windows: a file created on disk before
+    // the session made `move` return "file not found" in 0-1 ms — an early
+    // bail from the overlay-only source lookup, not a filesystem check.
+    // -----------------------------------------------------------------------
+
+    /// The reproducer: the file exists on disk but was never read or written
+    /// through the tool's `VirtualFs`, so it has no overlay entry. Before the
+    /// fix the move failed with "file not found"; after it must succeed and
+    /// rename on disk.
+    #[tokio::test]
+    async fn move_finds_existing_disk_file_absent_from_overlay() {
+        let (tool, dir) = tool_and_dir();
+        // Created on disk directly — exactly the "created on disk in the
+        // project dir" precondition (the overlay never saw it).
+        std::fs::write(dir.path().join("file_test.txt"), "").unwrap();
+        assert!(dir.path().join("file_test.txt").exists());
+
+        let output = tool
+            .execute(
+                serde_json::json!({
+                    "operation": "move",
+                    "path": "file_test.txt",
+                    "destination": "file_test_pass.txt"
+                }),
+                &test_policy(),
+                &session_for(dir.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("an existing in-root file must be movable even when absent from the overlay");
+        assert!(output.summary.contains("Moved"), "unexpected summary: {}", output.summary);
+        assert!(!dir.path().join("file_test.txt").exists(), "source must be gone after move");
+        assert!(dir.path().join("file_test_pass.txt").exists(), "destination must exist");
+    }
+
+    /// The `list` and `exists` operations already fall through to disk; prove
+    /// the directory is enumerable while the file is present, matching the
+    /// Windows evidence (`list .` succeeded seconds before `move` failed).
+    #[tokio::test]
+    async fn disk_file_is_listable_and_existing_before_move() {
+        let (tool, dir) = tool_and_dir();
+        std::fs::write(dir.path().join("file_test.txt"), "").unwrap();
+        let session = session_for(dir.path());
+
+        let listed = tool
+            .execute(
+                serde_json::json!({"operation": "list", "path": "."}),
+                &test_policy(),
+                &session,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("listing the workspace root must succeed");
+        assert!(
+            listed.data["entries"]
+                .as_array()
+                .is_some_and(|entries| entries.iter().any(|e| e["name"] == "file_test.txt")),
+            "the on-disk file must be listed: {}",
+            listed.data
+        );
+
+        let exists = tool
+            .execute(
+                serde_json::json!({"operation": "exists", "path": "file_test.txt"}),
+                &test_policy(),
+                &session,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("exists must succeed");
+        assert!(exists.data["exists"].as_bool().unwrap(), "the on-disk file must exist");
+    }
+
+    /// Fail-closed: when the source is genuinely absent (overlay and disk),
+    /// the move still reports "file not found".
+    #[tokio::test]
+    async fn move_missing_source_still_reports_not_found() {
+        let (tool, dir) = tool_and_dir();
+        let error = tool
+            .execute(
+                serde_json::json!({
+                    "operation": "move",
+                    "path": "ghost.txt",
+                    "destination": "ghost_pass.txt"
+                }),
+                &test_policy(),
+                &session_for(dir.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a missing source must not move");
+        assert!(
+            error.to_string().contains("file not found"),
+            "expected a not-found error, got: {error}"
+        );
+        assert!(!dir.path().join("ghost_pass.txt").exists(), "no destination may be created");
+    }
+
+    /// A staged deletion must not be resurrected from disk by the move fix.
+    #[tokio::test]
+    async fn move_does_not_resurrect_staged_deletion() {
+        let (tool, dir) = tool_and_dir();
+        std::fs::write(dir.path().join("doomed.txt"), "bye").unwrap();
+        let session = session_for(dir.path());
+
+        // Stage a delete (this loads the disk file as Original then marks it
+        // Deleted in the overlay).
+        tool.execute(
+            serde_json::json!({"operation": "delete", "path": "doomed.txt"}),
+            &test_policy(),
+            &session,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("delete of an on-disk file must succeed");
+
+        let error = tool
+            .execute(
+                serde_json::json!({
+                    "operation": "move",
+                    "path": "doomed.txt",
+                    "destination": "survivor.txt"
+                }),
+                &test_policy(),
+                &session,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a staged deletion must not be moved");
+        assert!(
+            error.to_string().contains("deleted"),
+            "expected a deleted-source error, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_finds_existing_disk_file_absent_from_overlay() {
+        let (tool, dir) = tool_and_dir();
+        std::fs::write(dir.path().join("file_test.txt"), "contents").unwrap();
+
+        let output = tool
+            .execute(
+                serde_json::json!({
+                    "operation": "copy",
+                    "path": "file_test.txt",
+                    "destination": "file_test_copy.txt"
+                }),
+                &test_policy(),
+                &session_for(dir.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("an existing in-root file must be copyable even when absent from the overlay");
+        assert!(output.summary.contains("Copied"), "unexpected summary: {}", output.summary);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("file_test_copy.txt")).unwrap(),
+            "contents"
+        );
+    }
+
     #[tokio::test]
     async fn write_rejects_empty_content() {
         let (tool, dir) = tool_and_dir();
@@ -1417,6 +1644,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         }
     }
 
@@ -1593,5 +1821,82 @@ mod tests {
             error.to_string().contains("missing 'content' field for write operation"),
             "unexpected error: {error}"
         );
+    }
+
+    // ---- Path-shaped structured facts (audit observability) ----------------
+
+    /// Every read/write/delete/exists/list operation records its operation name
+    /// and the attempted plus confined path.
+    #[test]
+    fn path_facts_records_operation_and_confined_path_for_each_operation() {
+        let (tool, dir) = tool_and_dir();
+        let session = session_for(dir.path());
+        for operation in ["read", "write", "delete", "exists", "list"] {
+            let input = serde_json::json!({"operation": operation, "path": "sub/file.txt"});
+            let facts = tool.path_facts(&input, &session).expect("facts are produced");
+            assert_eq!(facts.operation, operation);
+            assert_eq!(facts.attempted_path.as_deref(), Some("sub/file.txt"));
+            let resolved = facts.resolved_path.expect("the path resolves inside the workspace");
+            assert!(
+                resolved.ends_with("sub/file.txt"),
+                "resolved path {resolved} must be the confined target"
+            );
+        }
+    }
+
+    /// Move and copy also record the attempted and confined destination.
+    #[test]
+    fn path_facts_records_destination_for_move_and_copy() {
+        let (tool, dir) = tool_and_dir();
+        let session = session_for(dir.path());
+        for operation in ["move", "copy"] {
+            let input = serde_json::json!({"operation": operation, "path": "a.txt", "destination": "b.txt"});
+            let facts = tool.path_facts(&input, &session).expect("facts are produced");
+            assert_eq!(facts.operation, operation);
+            assert_eq!(facts.attempted_destination.as_deref(), Some("b.txt"));
+            let resolved =
+                facts.resolved_destination.expect("the destination resolves in the workspace");
+            assert!(resolved.ends_with("b.txt"), "resolved destination: {resolved}");
+        }
+    }
+
+    /// A containment rewrite is visible as attempted != resolved.
+    #[test]
+    fn path_facts_show_containment_rewrite() {
+        let (tool, dir) = tool_and_dir();
+        let session = session_for(dir.path());
+        let input = serde_json::json!({"operation": "read", "path": "nested/../target.txt"});
+        let facts = tool.path_facts(&input, &session).expect("facts are produced");
+        assert_eq!(facts.attempted_path.as_deref(), Some("nested/../target.txt"));
+        let resolved = facts.resolved_path.expect("resolved");
+        assert_ne!(resolved, "nested/../target.txt", "the resolved path is re-anchored");
+        assert!(resolved.ends_with("target.txt"), "resolved path: {resolved}");
+    }
+
+    /// A traversal rejection still records the attempted path, with no resolved
+    /// path, so the rejected target stays attributable.
+    #[test]
+    fn path_facts_record_rejected_traversal_without_resolved_path() {
+        let (tool, dir) = tool_and_dir();
+        let session = session_for(dir.path());
+        let input = serde_json::json!({"operation": "read", "path": "../../etc/passwd"});
+        let facts = tool.path_facts(&input, &session).expect("facts are produced");
+        assert_eq!(facts.attempted_path.as_deref(), Some("../../etc/passwd"));
+        assert!(facts.resolved_path.is_none(), "an escaping path must not resolve");
+    }
+
+    /// The `write` alias records the canonical filesystem write operation.
+    #[test]
+    fn write_alias_path_facts_report_canonical_write() {
+        let dir = TempDir::new().unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let write_tool = WriteTool::new(root);
+        let session = session_for(dir.path());
+        let raw = serde_json::json!({"path": "alias.txt", "content": "hi"});
+        let (_, canonical) = write_tool.policy_view(&raw);
+        let facts = write_tool.path_facts(&canonical, &session).expect("facts are produced");
+        assert_eq!(facts.operation, "write");
+        assert_eq!(facts.attempted_path.as_deref(), Some("alias.txt"));
+        assert!(facts.resolved_path.is_some());
     }
 }

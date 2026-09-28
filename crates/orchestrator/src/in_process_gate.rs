@@ -291,7 +291,7 @@ mod tests {
     use async_trait::async_trait;
     use concerto_core::error::PolicyError;
     use concerto_core::policy::SimplePolicyEngine;
-    use concerto_core::traits::policy::AuditLog;
+    use concerto_core::traits::policy::{AuditLog, PolicyEngine};
     use concerto_core::types::{Condition, PolicyRule, ToolRegistry};
     use concerto_tools::filesystem::FilesystemTool;
     use serde_json::json;
@@ -310,6 +310,24 @@ mod tests {
             _entry: concerto_core::traits::policy::AuditEntry,
             _cancel: CancellationToken,
         ) -> Result<(), PolicyError> {
+            Ok(())
+        }
+    }
+
+    /// Recording audit log so the ack seam's written rows can be asserted.
+    #[derive(Default)]
+    struct RecordingAudit {
+        entries: std::sync::Mutex<Vec<concerto_core::traits::policy::AuditEntry>>,
+    }
+
+    #[async_trait]
+    impl AuditLog for RecordingAudit {
+        async fn record(
+            &self,
+            entry: concerto_core::traits::policy::AuditEntry,
+            _cancel: CancellationToken,
+        ) -> Result<(), PolicyError> {
+            self.entries.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
             Ok(())
         }
     }
@@ -525,5 +543,69 @@ mod tests {
             "authoritative",
             "the authority write materialized"
         );
+    }
+
+    /// The ack audit seam is reachable through the in-process backend: a
+    /// resolved ack records a `RequestContinue` row and an overflow-refused ack
+    /// (surfaced as `acknowledged = false`) records a `RequestAbort` row. The
+    /// rows land in the same audit log the executor writes approvals to, so the
+    /// trail is real rather than an unwired method.
+    #[tokio::test]
+    async fn record_ack_decision_writes_request_continue_and_abort_rows() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let utf8_root =
+            camino::Utf8PathBuf::from_path_buf(root.path().to_path_buf()).expect("utf-8 tempdir");
+        let (_dir, pool) = test_pool().await;
+        let audit = Arc::new(RecordingAudit::default());
+        let allow_all = vec![PolicyRule::AutoApprove(Condition::Always)];
+        let policy: Arc<dyn PolicyEngine> =
+            Arc::new(SimplePolicyEngine::new(allow_all, audit.clone()));
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(FilesystemTool::new(utf8_root.clone())));
+        let executor = Arc::new(ToolExecutor::new(Arc::new(registry), policy.clone()));
+        let gate = Arc::new(WriteGate::new(
+            policy,
+            executor.clone(),
+            pool,
+            Arc::new(crate::gate::FilePreImageReader::new(utf8_root.as_std_path().to_path_buf())),
+            utf8_root.as_std_path().to_path_buf(),
+            1,
+        ));
+        let backend = InProcessGateBackend::new(gate, executor, "single-agent");
+        let session = SessionContext::new(Ulid::new(), root.path().to_path_buf());
+        let correlation_id = Ulid::new();
+
+        // Resolved ack → RequestContinue.
+        backend
+            .record_ack_decision(
+                session.session_id,
+                correlation_id,
+                "not a git repo — continue anyway?",
+                true,
+                CancellationToken::new(),
+            )
+            .await;
+        // Overflow-refused ack → RequestAbort.
+        backend
+            .record_ack_decision(
+                session.session_id,
+                correlation_id,
+                "acknowledgement queue is full (2 pending); refusing the new ack",
+                false,
+                CancellationToken::new(),
+            )
+            .await;
+
+        let entries = audit.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let ack_rows: Vec<_> =
+            entries.iter().filter(|entry| entry.tool_name == "request_ack").collect();
+        assert_eq!(ack_rows.len(), 2, "both ack outcomes must be recorded");
+        assert_eq!(ack_rows[0].verdict, "RequestContinue");
+        assert_eq!(ack_rows[1].verdict, "RequestAbort");
+        for row in &ack_rows {
+            assert_eq!(row.rule_matched.as_deref(), Some("user_ack"));
+            assert_eq!(row.session_id, session.session_id);
+            assert_eq!(row.correlation_id, correlation_id);
+        }
     }
 }

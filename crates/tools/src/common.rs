@@ -27,6 +27,66 @@ pub fn canonicalize_within(
     }
 }
 
+/// The platform whose path rules apply.
+///
+/// Passed explicitly into the pure path-form helpers rather than read from
+/// `cfg!` at each call site, so the Windows-only verbatim/plain branches are
+/// exercised on the Linux-only CI runner (same seam as `shell.rs`'s `Host`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Host {
+    Unix,
+    Windows,
+}
+
+/// The host this binary was compiled for.
+pub(crate) fn current_host() -> Host {
+    if cfg!(windows) {
+        Host::Windows
+    } else {
+        Host::Unix
+    }
+}
+
+/// Normalized comparison key for `path` under `host`'s rules.
+///
+/// On Windows, `canonicalize()` yields the extended-length ("verbatim") form
+/// (`\\?\C:\...`, `\\?\UNC\server\share`) while the lexical fallback used for
+/// protected Desktop folders yields the plain form (`C:\...`,
+/// `\\server\share`). Both address the *same* file, so the verbatim prefix is
+/// stripped and ASCII case is folded (Windows paths are case-insensitive;
+/// separators are normalized to `/`). Elsewhere the path string is returned
+/// unchanged. Pure and host-parameterized so this is unit-testable off
+/// Windows.
+pub(crate) fn path_form_key(host: Host, path: &Utf8Path) -> String {
+    let raw = path.as_str();
+    if host != Host::Windows {
+        return raw.to_string();
+    }
+    let un_verbatim = if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        raw.to_string()
+    };
+    un_verbatim.replace('\\', "/").to_ascii_lowercase()
+}
+
+/// Whether `candidate` is `root` or lies beneath it under `host`'s path-form
+/// rules, so a verbatim candidate and a plain root naming the same directory
+/// compare equal. The explicit separator guard prevents a sibling such as
+/// `/root_evil` from matching `/root`. Containment is never weakened: only the
+/// spelling of the same absolute path is normalized.
+pub(crate) fn is_within(host: Host, root: &Utf8Path, candidate: &Utf8Path) -> bool {
+    let root_key = path_form_key(host, root);
+    let candidate_key = path_form_key(host, candidate);
+    if candidate_key == root_key {
+        return true;
+    }
+    let prefixed = if root_key.ends_with('/') { root_key } else { format!("{root_key}/") };
+    candidate_key.starts_with(&prefixed)
+}
+
 /// Resolves a user-provided path against the workspace root, enforcing
 /// isolation. Handles absolute paths, `..` traversal, and symlink escapes.
 /// Returns a canonical absolute path within the root, or an error.
@@ -176,13 +236,15 @@ fn resolve_not_exists(
 ) -> Result<Utf8PathBuf, ToolError> {
     match candidate.canonicalize() {
         Ok(canonical) => {
-            // Path exists — normal case.
-            if canonical.starts_with(root_canonical) {
-                Ok(Utf8PathBuf::from_path_buf(canonical).map_err(|_| {
-                    ToolError::ExecutionFailed {
-                        message: "non-UTF-8 path after canonicalization".into(),
-                    }
-                })?)
+            let canonical =
+                Utf8PathBuf::from_path_buf(canonical).map_err(|_| ToolError::ExecutionFailed {
+                    message: "non-UTF-8 path after canonicalization".into(),
+                })?;
+            // Path exists — normal case. Compare forms tolerantly so a
+            // canonical (verbatim) candidate and a lexical (plain) root for
+            // the same directory are not misread as an escape on Windows.
+            if is_within(current_host(), root_canonical, &canonical) {
+                Ok(canonical)
             } else {
                 Err(ToolError::VirtualFsConflict {
                     path: Utf8PathBuf::from(user_path),
@@ -207,7 +269,7 @@ fn resolve_not_exists(
                                     message: "non-UTF-8 ancestor after canonicalization".into(),
                                 }
                             })?;
-                            if !canonical.starts_with(root_canonical) {
+                            if !is_within(current_host(), root_canonical, &canonical) {
                                 return Err(ToolError::VirtualFsConflict {
                                     path: Utf8PathBuf::from(user_path),
                                     reason: "path escapes workspace root".into(),
@@ -243,7 +305,7 @@ fn resolve_not_exists(
                     other => resolved = resolved.join(other),
                 }
             }
-            if !resolved.starts_with(root_canonical) {
+            if !is_within(current_host(), root_canonical, &resolved) {
                 return Err(ToolError::VirtualFsConflict {
                     path: Utf8PathBuf::from(user_path),
                     reason: "path escapes workspace root".into(),
@@ -328,5 +390,79 @@ mod tests {
         let result = resolve_lexically(&root, Utf8Path::new("../outside.txt"));
         assert!(matches!(result, Err(ToolError::VirtualFsConflict { .. })));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // -----------------------------------------------------------------------
+    // Pure path-form handling (Windows verbatim vs plain). Exercised on the
+    // Linux CI via the explicit `Host` seam, mirroring `shell.rs`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unix_path_form_key_is_identity() {
+        let key = path_form_key(Host::Unix, Utf8Path::new("/root/sub/file.txt"));
+        assert_eq!(key, "/root/sub/file.txt");
+    }
+
+    #[test]
+    fn windows_verbatim_and_plain_forms_compare_equal() {
+        let verbatim = path_form_key(Host::Windows, Utf8Path::new(r"\\?\C:\Root\Sub\file.txt"));
+        let plain = path_form_key(Host::Windows, Utf8Path::new(r"C:\Root\Sub\file.txt"));
+        assert_eq!(verbatim, plain);
+        // Separator and case differences from the same file are folded too.
+        assert_eq!(plain, path_form_key(Host::Windows, Utf8Path::new("c:/root/sub/FILE.TXT")));
+    }
+
+    #[test]
+    fn windows_verbatim_unc_maps_to_unc_form() {
+        let verbatim = path_form_key(Host::Windows, Utf8Path::new(r"\\?\UNC\server\share\f.txt"));
+        let plain = path_form_key(Host::Windows, Utf8Path::new(r"\\server\share\f.txt"));
+        assert_eq!(verbatim, plain);
+    }
+
+    #[test]
+    fn verbatim_candidate_is_within_plain_root() {
+        assert!(is_within(
+            Host::Windows,
+            Utf8Path::new(r"C:\root"),
+            Utf8Path::new(r"\\?\C:\root\file_test.txt"),
+        ));
+    }
+
+    #[test]
+    fn plain_candidate_is_within_verbatim_root() {
+        assert!(is_within(
+            Host::Windows,
+            Utf8Path::new(r"\\?\C:\root"),
+            Utf8Path::new(r"C:\root\file_test.txt"),
+        ));
+    }
+
+    #[test]
+    fn sibling_prefix_is_not_within_root() {
+        assert!(!is_within(
+            Host::Windows,
+            Utf8Path::new(r"C:\root"),
+            Utf8Path::new(r"\\?\C:\root_evil\file.txt"),
+        ));
+        assert!(!is_within(
+            Host::Unix,
+            Utf8Path::new("/root"),
+            Utf8Path::new("/root_evil/file.txt"),
+        ));
+    }
+
+    #[test]
+    fn path_form_key_does_not_widen_containment() {
+        // A genuinely outside path stays outside in every form.
+        assert!(!is_within(
+            Host::Windows,
+            Utf8Path::new(r"C:\root"),
+            Utf8Path::new(r"\\?\C:\other\file.txt"),
+        ));
+        assert!(!is_within(
+            Host::Windows,
+            Utf8Path::new(r"\\?\C:\root\sub"),
+            Utf8Path::new(r"C:\root\file.txt"),
+        ));
     }
 }

@@ -55,7 +55,25 @@ pub struct CapabilityScope {
     /// File glob patterns (for `FilesystemRead`/`FilesystemWrite`).
     #[serde(default)]
     pub globs: Vec<String>,
-    /// Allowed domains (for `NetworkOutbound`).
+    /// Network egress allowlist (for `NetworkOutbound`).
+    ///
+    /// Each entry is an egress rule of the form `[scheme://]host[:port]`:
+    ///
+    /// * `scheme` — omitted or `*` matches any scheme, otherwise an exact
+    ///   (case-insensitive) match. A URL without an explicit scheme is
+    ///   treated as `https` (same normalization the host extractor has
+    ///   always applied).
+    /// * `host` — exact match or parent-domain match: `example.com` covers
+    ///   `example.com` plus any `*.example.com`. A leading `*.` is accepted
+    ///   and means the same thing (`*.example.com` ≡ `example.com`).
+    /// * `port` — omitted matches any port, otherwise an exact match. Use
+    ///   the *effective* port (`url.port_or_known_default()`), so
+    ///   `https://host` compares against `443`.
+    ///
+    /// Entries are **default-deny**: once this list is non-empty, every
+    /// target that matches no entry is refused by `check_url_allowed`.
+    /// An empty list means *no allowlist configured* and keeps the
+    /// pre-existing fail-open behaviour (see [`check_url_allowed`]).
     #[serde(default)]
     pub domains: Vec<String>,
     /// Allowed shell commands — exact match only (for `ShellExecute`).
@@ -952,15 +970,143 @@ fn match_literal(pattern: &[u8], input: &[u8]) -> bool {
     glob_match_bytes(&pattern[1..], &input[1..], false)
 }
 
-/// Extract the hostname part from a URL string.
+/// Rule name recorded in every network-egress denial raised by
+/// [`check_url_allowed`] when the configured allowlist refuses a target.
 ///
-/// Uses the `url` crate for correct parsing (handles userinfo, encoding,
-/// internationalized domains, and other edge cases that a hand-rolled
-/// parser would miss).
+/// Snake-case, mirroring the policy engine's own rule identifiers
+/// (`deny_network_egress`, `auto_deny`, …) so audit rows and error strings
+/// can be correlated across subsystems (threat model §6 gap #7).
+pub const RULE_EGRESS_ALLOWLIST: &str = "egress_allowlist";
+
+/// Rule name recorded when the coarse `NetworkOutbound` capability was never
+/// granted at all — the gate that runs *before* the allowlist.
+pub const RULE_NETWORK_CAPABILITY: &str = "network_capability";
+
+/// Scheme / host / port triple parsed out of a target URL so an egress rule
+/// can be matched against every dimension it constrains.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EgressTarget {
+    /// Lowercased URL scheme (no trailing `:`).
+    scheme: String,
+    /// Lowercased host, IPv6 brackets stripped (`::1`, not `[::1]`).
+    host: String,
+    /// Effective port — `port_or_known_default()`, so `https://x` yields `443`.
+    /// `None` only for a non-special scheme with no explicit port.
+    port: Option<u16>,
+}
+
+/// One parsed egress allowlist entry: `[scheme://]host[:port]`.
 ///
-/// Returns the lowercased host portion, or an error if the URL cannot
-/// be parsed or has no host.
-fn extract_url_host(url: &str) -> Result<String, PluginError> {
+/// Parsing is deliberately strict and *fail-closed*: an entry that cannot be
+/// interpreted (empty host, non-numeric port, bare `*`) yields `None` and is
+/// never treated as a match. A malformed rule can therefore only narrow what
+/// is reachable, never widen it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EgressRule {
+    /// `None` = any scheme (omitted or `*`).
+    scheme: Option<String>,
+    /// Exact or parent-domain pattern, lowercased.
+    host: String,
+    /// `None` = any port.
+    port: Option<u16>,
+}
+
+impl EgressRule {
+    /// Parse a single allowlist entry. Returns `None` when the entry can
+    /// never match a well-formed target (see the type-level docs).
+    fn parse(entry: &str) -> Option<Self> {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return None;
+        }
+        let (scheme, rest) = match entry.split_once("://") {
+            Some((scheme, rest)) => {
+                let scheme = scheme.trim().to_ascii_lowercase();
+                if scheme.is_empty() {
+                    return None;
+                }
+                ((scheme != "*").then_some(scheme), rest.trim())
+            }
+            None => (None, entry),
+        };
+        let (host, port) = split_rule_host_port(rest)?;
+        let host = host.to_ascii_lowercase();
+        // `*` and `*.` are not host patterns — reject them outright so a
+        // wildcard-escape can never read as "allow every host".
+        let bare = host.strip_prefix("*.").unwrap_or(&host);
+        if bare.is_empty() || bare == "*" {
+            return None;
+        }
+        Some(Self { scheme, host, port })
+    }
+
+    /// Whether this rule admits `target`. Every dimension the rule names
+    /// must match; an unnamed dimension is unconstrained.
+    fn matches(&self, target: &EgressTarget) -> bool {
+        if let Some(scheme) = &self.scheme {
+            if *scheme != target.scheme {
+                return false;
+            }
+        }
+        if let Some(port) = self.port {
+            if target.port != Some(port) {
+                return false;
+            }
+        }
+        host_pattern_matches(&self.host, &target.host)
+    }
+}
+
+/// Split `[scheme://]host[:port]`'s host/port part.
+///
+/// Handles three shapes: bracketed IPv6 (`[::1]:8443`), a single `:` that
+/// must be a numeric port, and everything else treated as a bare host (which
+/// also covers an unbracketed IPv6 literal such as `::1`).
+fn split_rule_host_port(rest: &str) -> Option<(&str, Option<u16>)> {
+    if rest.is_empty() {
+        return None;
+    }
+    if let Some(inner) = rest.strip_prefix('[') {
+        let close = inner.find(']')?;
+        let host = &inner[..close];
+        let tail = &inner[close + 1..];
+        let port = match tail {
+            "" => None,
+            _ => Some(tail.strip_prefix(':')?.parse::<u16>().ok()?),
+        };
+        return (!host.is_empty()).then_some((host, port));
+    }
+    match rest.matches(':').count() {
+        0 => Some((rest, None)),
+        1 => {
+            let (host, port) = rest.split_once(':')?;
+            // A non-numeric or out-of-range port makes the whole entry
+            // unusable rather than silently dropping the port constraint.
+            let port = port.parse::<u16>().ok()?;
+            (!host.is_empty()).then_some((host, Some(port)))
+        }
+        // Two or more colons and no brackets → the literal is an IPv6
+        // address with no port component.
+        _ => Some((rest, None)),
+    }
+}
+
+/// Exact or parent-domain match: `example.com` covers `example.com` and any
+/// `sub.example.com`. A leading `*.` is normalized away (it used to be a
+/// dead entry that matched nothing).
+fn host_pattern_matches(pattern: &str, host: &str) -> bool {
+    let base = pattern.strip_prefix("*.").unwrap_or(pattern);
+    if base.is_empty() {
+        return false;
+    }
+    host == base || host.ends_with(&format!(".{base}"))
+}
+
+/// Split `url` into its scheme/host/port triple for egress matching.
+///
+/// Keeps the normalization this check has always applied: trim, treat a
+/// scheme-less `host/path` form as `https`, and lowercase the host.
+fn extract_egress_target(url: &str) -> Result<EgressTarget, PluginError> {
     let url = url.trim();
     if url.is_empty() {
         return Err(PluginError::CapabilityDenied("URL has no host: (empty)".into()));
@@ -975,19 +1121,79 @@ fn extract_url_host(url: &str) -> Result<String, PluginError> {
 
     let host = parsed
         .host_str()
-        .ok_or_else(|| PluginError::CapabilityDenied(format!("URL has no host: {url}")))?;
+        .ok_or_else(|| PluginError::CapabilityDenied(format!("URL has no host: {url}")))?
+        .to_lowercase();
+    // `host_str()` serializes IPv6 with brackets; strip them so targets and
+    // rule entries share one canonical host form.
+    let host =
+        host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(&host).to_string();
 
-    Ok(host.to_lowercase())
+    Ok(EgressTarget {
+        scheme: parsed.scheme().to_ascii_lowercase(),
+        host,
+        port: parsed.port_or_known_default(),
+    })
+}
+
+/// Extract the hostname part from a URL string.
+///
+/// Returns the lowercased host portion, or an error if the URL cannot
+/// be parsed or has no host. Test-only convenience over
+/// [`extract_egress_target`] (the production path needs scheme/port too).
+#[cfg(test)]
+fn extract_url_host(url: &str) -> Result<String, PluginError> {
+    extract_egress_target(url).map(|target| target.host)
+}
+
+/// Evaluate the configured egress allowlist against `target`.
+///
+/// Default-deny: at least one entry must admit the target. Entries that fail
+/// to parse are warned about once per check and never count as a match.
+fn match_egress_allowlist(
+    plugin_id: &str,
+    allowlist: &[String],
+    target: &EgressTarget,
+    url: &str,
+) -> Result<(), PluginError> {
+    let mut invalid: Vec<&str> = Vec::new();
+    for entry in allowlist {
+        match EgressRule::parse(entry) {
+            Some(rule) if rule.matches(target) => return Ok(()),
+            Some(_) => {}
+            None => invalid.push(entry.as_str()),
+        }
+    }
+    if !invalid.is_empty() {
+        tracing::warn!(
+            plugin_id,
+            ?invalid,
+            "invalid network egress allowlist entries never match; they grant nothing"
+        );
+    }
+    Err(PluginError::CapabilityDenied(format!(
+        "{RULE_EGRESS_ALLOWLIST}: network egress to '{url}' denied \
+         (scheme={} host={} port={:?}); allowlist: {allowlist:?}",
+        target.scheme, target.host, target.port,
+    )))
 }
 
 /// Check whether a URL is permitted by the granted capabilities.
 ///
 /// Enforcement steps:
-/// 1. Reject if the `NetworkOutbound` capability was never granted at all.
-/// 2. If the capability was granted with a non-empty `domains` allowlist,
-///    parse the URL's host and verify it matches one of the allowed domains
-///    (exact match or subdomain thereof).  An empty domains list means
-///    "all domains allowed" (backwards-compatible behaviour).
+/// 1. Reject if the `NetworkOutbound` capability was never granted at all
+///    (rule [`RULE_NETWORK_CAPABILITY`]).
+/// 2. If the grant carries an **empty** allowlist, no egress rules were
+///    configured for this plugin. **Documented choice: fail open with a
+///    warning.** Blanket `NetworkOutbound` grants (an empty `domains` list)
+///    are the pre-existing, user-approved behaviour, and silently turning
+///    them into a deny would break every already-approved plugin; a
+///    `tracing::warn!` records each unrestricted attempt so operators can
+///    find and tighten those grants. Configure at least one entry to get
+///    threat-model §6 gap #7 enforcement.
+/// 3. Otherwise the allowlist is **default-deny**: parse the target's
+///    scheme/host/port and require a rule match (rule
+///    [`RULE_EGRESS_ALLOWLIST`]). The returned error names the rule and the
+///    offending target so it can be matched by callers and audit rows.
 pub fn check_url_allowed(
     caps: &GrantedCapabilities,
     plugin_id: &str,
@@ -995,27 +1201,33 @@ pub fn check_url_allowed(
 ) -> Result<(), PluginError> {
     let request = CapabilityRequest::NetworkOutbound { domains: vec![] };
     if !caps.check(plugin_id, &request) {
-        return Err(PluginError::CapabilityDenied("NetworkOutbound".into()));
+        return Err(PluginError::CapabilityDenied(format!(
+            "{RULE_NETWORK_CAPABILITY}: the NetworkOutbound capability is not granted",
+        )));
     }
 
-    // Fine-grained domain check.
-    if let Some(scope) = caps.get_scope(plugin_id, &CapabilityDiscriminant::NetworkOutbound) {
-        if !scope.domains.is_empty() {
-            let host = extract_url_host(url)?;
-            let allowed = scope.domains.iter().any(|d| {
-                // Exact match or subdomain match (e.g. "api.example.com" matches "example.com").
-                host == *d || host.ends_with(&format!(".{d}"))
-            });
-            if !allowed {
-                return Err(PluginError::CapabilityDenied(format!(
-                    "NetworkOutbound: domain '{host}' not in allowed list {:?}",
-                    scope.domains,
-                )));
-            }
-        }
+    let Some(scope) = caps.get_scope(plugin_id, &CapabilityDiscriminant::NetworkOutbound) else {
+        // `check()` and `get_scope()` walk the same grant sets, so this is
+        // unreachable; fail open with a warning rather than inventing a
+        // denial the user never configured.
+        tracing::warn!(plugin_id, "NetworkOutbound granted without a scope; failing open");
+        return Ok(());
+    };
+
+    if scope.domains.is_empty() {
+        tracing::warn!(
+            plugin_id,
+            "plugin network egress is unrestricted: no allowlist configured for the \
+             NetworkOutbound grant; failing open"
+        );
+        return Ok(());
     }
 
-    Ok(())
+    // Parse only after the unconfigured fast path so an unconfigured grant
+    // keeps accepting exactly what it accepted before (including URLs that
+    // do not parse — reqwest rejects those later anyway).
+    let target = extract_egress_target(url)?;
+    match_egress_allowlist(plugin_id, &scope.domains, &target, url)
 }
 
 /// Check whether a shell command is permitted by the granted capabilities.
@@ -1581,6 +1793,145 @@ mod tests {
         // Empty string — becomes "https://" which has no host.
         let result = check_url_allowed(&caps, "p", "");
         assert!(result.is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Network egress allowlist (threat model §6 gap #7)
+    // ------------------------------------------------------------------
+
+    /// Grant `NetworkOutbound` with exactly `domains` as the egress allowlist.
+    fn granted_egress(domains: &[&str]) -> GrantedCapabilities {
+        let mut caps = GrantedCapabilities::new();
+        caps.grant_session(
+            CapabilityDiscriminant::NetworkOutbound,
+            CapabilityScope {
+                domains: domains.iter().map(|d| (*d).to_string()).collect(),
+                ..Default::default()
+            },
+        );
+        caps
+    }
+
+    /// A configured allowlist admits a target that matches on scheme, host
+    /// and port simultaneously.
+    #[test]
+    fn egress_allowlist_permits_listed_scheme_host_port() {
+        let caps = granted_egress(&["https://api.example.com:443"]);
+        assert!(check_url_allowed(&caps, "p", "https://api.example.com:443/v1").is_ok());
+    }
+
+    /// A target matching no entry is refused, and the error names the rule
+    /// that refused it plus the offending host.
+    #[test]
+    fn egress_allowlist_denies_unlisted_host_naming_rule() {
+        let caps = granted_egress(&["https://api.example.com:443"]);
+        let err = check_url_allowed(&caps, "p", "https://evil.example.net/exfil")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(RULE_EGRESS_ALLOWLIST), "error must name the rule, got: {err}");
+        assert!(err.contains("evil.example.net"), "error must name the target, got: {err}");
+    }
+
+    /// A scheme-qualified rule refuses the same host over another scheme.
+    #[test]
+    fn egress_allowlist_denies_scheme_mismatch() {
+        let caps = granted_egress(&["https://example.com"]);
+        let err = check_url_allowed(&caps, "p", "http://example.com/x").unwrap_err().to_string();
+        assert!(err.contains(RULE_EGRESS_ALLOWLIST), "error must name the rule, got: {err}");
+    }
+
+    /// A port-qualified rule refuses the same host on another port (targets
+    /// without an explicit port are compared against their effective port).
+    #[test]
+    fn egress_allowlist_denies_port_mismatch() {
+        let caps = granted_egress(&["example.com:8443"]);
+        let err = check_url_allowed(&caps, "p", "https://example.com/").unwrap_err().to_string();
+        assert!(err.contains(RULE_EGRESS_ALLOWLIST), "error must name the rule, got: {err}");
+    }
+
+    /// Unconfigured (`domains == []`) keeps today's fail-open behaviour: any
+    /// target passes, including ones a configured allowlist would refuse —
+    /// even when the target does not parse at all (parsing happens only
+    /// after the unconfigured fast path, exactly as before).
+    #[test]
+    fn egress_unconfigured_fails_open_for_any_target() {
+        let caps = granted_egress(&[]);
+        assert!(check_url_allowed(&caps, "p", "https://anything.example.org:8443/x").is_ok());
+        assert!(check_url_allowed(&caps, "p", "not a url at all").is_ok());
+    }
+
+    /// A bare-host entry keeps its pre-gap-#7 meaning: any scheme, any port,
+    /// apex or subdomain.
+    #[test]
+    fn egress_bare_host_rule_matches_any_scheme_and_port() {
+        let caps = granted_egress(&["example.com"]);
+        assert!(check_url_allowed(&caps, "p", "http://example.com:9999/x").is_ok());
+        assert!(check_url_allowed(&caps, "p", "https://api.example.com/").is_ok());
+        assert!(check_url_allowed(&caps, "p", "https://evil.com/").is_err());
+    }
+
+    /// A leading `*.` is accepted and means apex-or-subdomain (it used to be
+    /// a dead entry that matched nothing).
+    #[test]
+    fn egress_star_prefix_matches_apex_and_subdomains() {
+        let caps = granted_egress(&["*.example.com"]);
+        assert!(check_url_allowed(&caps, "p", "https://api.example.com/").is_ok());
+        assert!(check_url_allowed(&caps, "p", "https://example.com/").is_ok());
+        assert!(check_url_allowed(&caps, "p", "https://notexample.com/").is_err());
+    }
+
+    /// A bare `*` is not a wildcard: it never matches, so a malformed rule
+    /// stays fail-closed instead of widening to "allow everything".
+    #[test]
+    fn egress_bare_star_entry_denies_everything() {
+        let caps = granted_egress(&["*"]);
+        let err = check_url_allowed(&caps, "p", "https://example.com/").unwrap_err().to_string();
+        assert!(err.contains(RULE_EGRESS_ALLOWLIST), "error must name the rule, got: {err}");
+    }
+
+    /// Without the coarse capability the allowlist is never consulted; the
+    /// refusal names the capability rule instead.
+    #[test]
+    fn egress_ungranted_capability_names_network_capability_rule() {
+        let caps = GrantedCapabilities::new();
+        let err = check_url_allowed(&caps, "p", "https://example.com/").unwrap_err().to_string();
+        assert!(err.contains(RULE_NETWORK_CAPABILITY), "error must name the rule, got: {err}");
+    }
+
+    /// Malformed entries parse to `None` (never a match); well-formed ones
+    /// in every supported shape parse.
+    #[test]
+    fn egress_rule_parse_rejects_malformed_entries() {
+        for entry in ["", "   ", "example.com:", "example.com:notaport", "*", "*.", "://host"] {
+            assert!(EgressRule::parse(entry).is_none(), "expected {entry:?} to be rejected");
+        }
+        for entry in [
+            "example.com",
+            "*.example.com",
+            "https://example.com",
+            "*://example.com",
+            "example.com:8443",
+            "https://example.com:443",
+            "[::1]:8080",
+            "::1",
+        ] {
+            assert!(EgressRule::parse(entry).is_some(), "expected {entry:?} to parse");
+        }
+    }
+
+    /// Scheme/port constraints only apply when the rule names them.
+    #[test]
+    fn egress_rule_matching_dimensions() {
+        let target = extract_egress_target("https://example.com:443/x").expect("valid url");
+        let admits = |entry: &str| EgressRule::parse(entry).expect("valid rule").matches(&target);
+        assert!(admits("example.com"), "host-only rule ignores scheme and port");
+        assert!(admits("*.example.com"));
+        assert!(admits("https://example.com"));
+        assert!(admits("example.com:443"));
+        assert!(admits("*://example.com:443"));
+        assert!(!admits("http://example.com"), "scheme mismatch must refuse");
+        assert!(!admits("example.com:8443"), "port mismatch must refuse");
+        assert!(!admits("other.example.com"), "host mismatch must refuse");
     }
 
     // ------------------------------------------------------------------

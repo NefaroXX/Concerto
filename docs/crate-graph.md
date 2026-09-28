@@ -37,6 +37,7 @@ graph TD
 
     config --> core
     apitypes --> core
+    sessions --> config
     sessions --> core
     tools --> apitypes
     tools --> config
@@ -127,7 +128,7 @@ Each entry lists only internal workspace dependencies (external crates omitted f
 ### First layer (depend only on core or config)
 - **concerto-config** → `core`
 - **concerto-api-types** → `core`
-- **concerto-sessions** → `core`
+- **concerto-sessions** → `config`, `core`
 - **concerto-memory** → `core`
 - **concerto-plugin-sdk** — standalone (`#![no_std]`, no workspace dependencies)
 - **concerto-lsp** → `core`
@@ -174,6 +175,10 @@ Each entry lists only internal workspace dependencies (external crates omitted f
   agents are owned by the config roster (ADR-58/59 revised; the orchestrator
   derives them from config at startup).
 - `api-types` exists as a separate crate so `desktop` and `cli` can share request/response types without pulling in the Axum HTTP server framework.
+- `sessions` depends on `config` for the `[audit]` policy only (at-rest
+  encryption and retention, read from the **global** config file by
+  `SqliteSessionStore::connect` / `open_pool` — ADR-73). It stays in the first
+  layer because `config` depends only on `core`; the edge introduces no cycle.
 - `plugin-sdk` is `#![no_std]` and has no internal workspace dependencies.
 - `skills` and `mcp` are the ADR-43 extension crates. `skills` depends only on
   `api-types` for the shared manifest types (no `config` dependency), and `mcp`

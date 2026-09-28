@@ -256,7 +256,11 @@ fn dir_component_is_skipped(path: &Path) -> bool {
 /// One file's inventory entry: forward-slash relative path, byte size, mtime,
 /// and a blake3 content hash when the file is ≤ [`MAX_HASH_BYTES`] (and
 /// readable). Unreadable metadata drops the file from the inventory.
-fn snapshot_file_entry(project_dir: &Path, path: &Path) -> Option<SnapshotEntry> {
+///
+/// `pub(crate)` for the Phase 6 M3c drift re-read: the resume re-inventories
+/// one declared artifact with exactly the rules the walk applies, so a
+/// re-verified hash is comparable with a captured one.
+pub(crate) fn snapshot_file_entry(project_dir: &Path, path: &Path) -> Option<SnapshotEntry> {
     let relative = path.strip_prefix(project_dir).ok()?;
     let relative = relative.to_string_lossy().replace('\\', "/");
     let metadata = std::fs::metadata(path).ok()?;

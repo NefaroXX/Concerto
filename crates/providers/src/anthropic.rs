@@ -6,6 +6,7 @@ use concerto_core::types::{
     CompletionChunk, CompletionRequest, CompletionUsage, ModelInfo, TokenBudget, ToolCall,
 };
 use concerto_core::CancellationToken;
+use concerto_core::SecretString;
 use futures::stream::StreamExt;
 use reqwest::header::CONTENT_TYPE;
 use std::collections::{HashMap, VecDeque};
@@ -14,7 +15,7 @@ use crate::adapters::{AnthropicChatDialect, Dialect, ReasoningEcho};
 use crate::sse::BufferedSseParser;
 
 pub struct AnthropicProvider {
-    api_key: String,
+    api_key: SecretString,
     model: String,
     timeout_secs: u64,
     dialect: AnthropicChatDialect,
@@ -28,9 +29,9 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
-    pub fn new(api_key: String, model: String, timeout_secs: u64) -> Self {
+    pub fn new(api_key: impl Into<SecretString>, model: String, timeout_secs: u64) -> Self {
         Self {
-            api_key,
+            api_key: api_key.into(),
             model,
             timeout_secs,
             dialect: AnthropicChatDialect,
@@ -249,7 +250,7 @@ impl LlmProvider for AnthropicProvider {
         let client = crate::new_client(self.timeout_secs);
         let resp = client
             .get("https://api.anthropic.com/v1/models")
-            .header("x-api-key", &self.api_key)
+            .header("x-api-key", self.api_key.expose())
             .header("anthropic-version", "2023-06-01")
             .send()
             .await
@@ -275,7 +276,7 @@ impl LlmProvider for AnthropicProvider {
         let client = crate::new_client(self.timeout_secs);
         let resp = client
             .get("https://api.anthropic.com/v1/models")
-            .header("x-api-key", &self.api_key)
+            .header("x-api-key", self.api_key.expose())
             .header("anthropic-version", "2023-06-01")
             .send()
             .await
@@ -362,7 +363,7 @@ impl LlmProvider for AnthropicProvider {
             result = async {
                 let r = client
                     .post(url)
-                    .header("x-api-key", &self.api_key)
+                    .header("x-api-key", self.api_key.expose())
                     .header("anthropic-version", "2023-06-01")
                     .header(CONTENT_TYPE, "application/json")
                     .json(&body)
@@ -406,7 +407,7 @@ impl LlmProvider for AnthropicProvider {
                         }
                         items
                     }
-                    // ADR-55 Phase 2e stream-retry: a transport fault
+                    // Stream-retry: a transport fault
                     // mid-stream is retriable (tools execute only
                     // post-assembly — re-issue is side-effect-free within
                     // the bounded attempt budget); framing/parse failures
@@ -457,56 +458,56 @@ mod tests {
 
     #[test]
     fn approximate_cost_opus() {
-        let provider = AnthropicProvider::new("key".into(), "claude-3-opus".into(), 30);
+        let provider = AnthropicProvider::new("key".to_string(), "claude-3-opus".into(), 30);
         let cost = provider.approximate_cost(1_000_000, 100_000);
         assert!((cost - 22.5).abs() < 0.01, "expected 22.5, got {cost}");
     }
 
     #[test]
     fn approximate_cost_sonnet() {
-        let provider = AnthropicProvider::new("key".into(), "claude-3-sonnet".into(), 30);
+        let provider = AnthropicProvider::new("key".to_string(), "claude-3-sonnet".into(), 30);
         let cost = provider.approximate_cost(1_000_000, 100_000);
         assert!((cost - 4.5).abs() < 0.01, "expected 4.5, got {cost}");
     }
 
     #[test]
     fn approximate_cost_haiku() {
-        let provider = AnthropicProvider::new("key".into(), "claude-3-haiku".into(), 30);
+        let provider = AnthropicProvider::new("key".to_string(), "claude-3-haiku".into(), 30);
         let cost = provider.approximate_cost(2_000_000, 200_000);
         assert!((cost - 0.75).abs() < 0.01, "expected 0.75, got {cost}");
     }
 
     #[test]
     fn approximate_cost_unknown_defaults_to_sonnet() {
-        let provider = AnthropicProvider::new("key".into(), "claude-unknown-model".into(), 30);
+        let provider = AnthropicProvider::new("key".to_string(), "claude-unknown-model".into(), 30);
         let cost = provider.approximate_cost(1_000_000, 100_000);
         assert!((cost - 4.5).abs() < 0.01, "expected 4.5 (sonnet default), got {cost}");
     }
 
     #[test]
     fn approximate_cost_zero_tokens() {
-        let provider = AnthropicProvider::new("key".into(), "claude-3-sonnet".into(), 30);
+        let provider = AnthropicProvider::new("key".to_string(), "claude-3-sonnet".into(), 30);
         let cost = provider.approximate_cost(0, 0);
         assert_eq!(cost, 0.0);
     }
 
     #[test]
     fn context_capacity_returns_budget() {
-        let provider = AnthropicProvider::new("key".into(), "claude-3-sonnet".into(), 30);
+        let provider = AnthropicProvider::new("key".to_string(), "claude-3-sonnet".into(), 30);
         let budget = provider.context_capacity("claude-3-sonnet-20240229");
         assert!(budget.capacity > 0);
     }
 
     #[test]
     fn provider_name_is_anthropic() {
-        let provider = AnthropicProvider::new("key".into(), "model".into(), 30);
+        let provider = AnthropicProvider::new("key".to_string(), "model".into(), 30);
         assert_eq!(provider.provider_name(), "anthropic");
     }
 
     #[test]
     fn new_sets_fields() {
-        let provider = AnthropicProvider::new("test-key".into(), "claude-4".into(), 60);
-        assert_eq!(provider.api_key, "test-key");
+        let provider = AnthropicProvider::new("test-key".to_string(), "claude-4".into(), 60);
+        assert_eq!(provider.api_key.expose(), "test-key");
         assert_eq!(provider.model, "claude-4");
         assert_eq!(provider.timeout_secs, 60);
         assert!(!provider.cache_breakpoints, "cache breakpoints default to off");
@@ -542,7 +543,7 @@ mod tests {
         };
 
         // Off by default: a plain string system and no cache_control anywhere.
-        let off = AnthropicProvider::new("key".into(), "claude-4".into(), 30);
+        let off = AnthropicProvider::new("key".to_string(), "claude-4".into(), 30);
         assert!(!off.cache_breakpoints());
         let body = off.build_body(&request, "claude-4");
         assert_eq!(body["system"], "You are a test assistant.");
@@ -650,7 +651,7 @@ mod tests {
     /// Cost for unknown model falls back to a default (non-zero) estimate.
     #[test]
     fn approximate_cost_unknown_model_falls_back() {
-        let provider = AnthropicProvider::new("key".into(), "unknown-v1".into(), 30);
+        let provider = AnthropicProvider::new("key".to_string(), "unknown-v1".into(), 30);
         let cost = provider.approximate_cost(1000, 500);
         // Unknown models should produce some reasonable estimate.
         assert!(cost >= 0.0, "cost should not be negative");

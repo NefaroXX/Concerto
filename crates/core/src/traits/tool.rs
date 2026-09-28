@@ -1,7 +1,8 @@
 use crate::error::ToolError;
 use crate::traits::PolicyEngine;
 use crate::types::{
-    CapabilitySet, CommandPolicyFacts, RollbackSnapshot, SessionContext, ToolOutput,
+    CapabilitySet, CommandPolicyFacts, PathPolicyFacts, RollbackSnapshot, SessionContext,
+    ToolOutput,
 };
 use crate::CancellationToken;
 use async_trait::async_trait;
@@ -30,6 +31,23 @@ pub trait Tool: Send + Sync {
         _input: &serde_json::Value,
         _session: &SessionContext,
     ) -> Option<CommandPolicyFacts> {
+        None
+    }
+
+    /// Structured, pre-resolved facts about a path-shaped tool operation.
+    ///
+    /// Path-shaped tools (filesystem, git, LSP, …) override this to record the
+    /// operation and the target path — attempted as supplied and resolved after
+    /// workspace containment — so the audit log can attribute the action to a
+    /// concrete target rather than a hash only. The session is supplied so
+    /// relative paths can be resolved before approval. The default (`None`)
+    /// preserves existing behaviour for every other tool, so adding this method
+    /// is non-breaking.
+    fn path_facts(
+        &self,
+        _input: &serde_json::Value,
+        _session: &SessionContext,
+    ) -> Option<PathPolicyFacts> {
         None
     }
 

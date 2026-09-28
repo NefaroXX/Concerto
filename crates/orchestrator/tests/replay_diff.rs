@@ -315,6 +315,9 @@ async fn run_fixture() -> (Vec<Value>, BTreeMap<String, String>, Vec<(String, u6
         memory: std::sync::Arc::new(NullMemory),
         project_id: ProjectId("proj-replay".to_owned()),
         consolidation: None,
+        // ADR-60 S5: fail-closed default (no approval sink, no audit bus) for this test.
+        approval_sink: None,
+        bus: None,
     };
     // Both workers subscribe like production (Decision topics); neither
     // acks, so both cursors stay at 0 — still a compared surface.
@@ -473,6 +476,9 @@ async fn a_mutated_fixture_diverges_loudly() {
         memory: std::sync::Arc::new(NullMemory),
         project_id: ProjectId("proj-replay".to_owned()),
         consolidation: None,
+        // ADR-60 S5: fail-closed default (no approval sink, no audit bus) for this test.
+        approval_sink: None,
+        bus: None,
     };
     let config = SupervisorConfig::default().with_whiteboard_subscription("agent-a", vec![]);
     let mut supervisor = Supervisor::new(config);

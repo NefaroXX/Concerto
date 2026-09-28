@@ -206,6 +206,10 @@ pub struct AgentConfig {
     pub name: String,
     pub role: String,
     pub stage: Option<AgentStage>,
+    /// Additional stage tags this agent can cover beyond its own `stage`
+    /// (owner doctrine: agent-axis takeover before provider escalation).
+    /// Round-tripped verbatim; edited via config, not this first-pass UI.
+    pub can_cover: Vec<AgentStage>,
     /// Structured submission contract (Freeform = plain text output; the others
     /// tie the agent into the typed `submit_design_doc` / `submit_research_report`
     /// / `submit_review_report` contracts). Preserved across saves.
@@ -596,6 +600,11 @@ pub enum StudioMessage {
     OutputModeChanged(OutputMode),
     /// Selected agent's pipeline lifecycle stage changed (`None` = Freeform).
     StageChanged(Option<AgentStage>),
+    /// Toggle one known pipeline stage's membership in the selected agent's
+    /// `can_cover` set (present → removed, absent → appended). The agent's own
+    /// `stage` is always covered and is never stored in `can_cover`, so a
+    /// toggle of the own stage is ignored.
+    CanCoverToggled(AgentStage),
     AddFewShot,
     FewShotInputChanged {
         idx: usize,
@@ -652,6 +661,7 @@ fn agent_to_custom(a: &AgentConfig) -> CustomAgentConfig {
         name: a.name.clone(),
         role: a.role.clone(),
         stage: a.stage.clone(),
+        can_cover: a.can_cover.clone(),
         output_mode: a.output_mode,
         prompt_sections: a.prompt_sections.clone(),
         model_override: a.model_override.clone(),
@@ -668,6 +678,7 @@ fn custom_to_agent(c: &CustomAgentConfig) -> AgentConfig {
         name: c.name.clone(),
         role: c.role.clone(),
         stage: c.stage.clone(),
+        can_cover: c.can_cover.clone(),
         output_mode: c.output_mode,
         prompt_sections: c.prompt_sections.clone(),
         model_override: c.model_override.clone(),
@@ -719,6 +730,86 @@ fn badge<'a>(theme: &'a AppTheme, label: &'a str) -> Element<'a, Message> {
             ..iced::widget::container::Style::default()
         })
         .into()
+}
+
+/// The agent `can_cover` toggle control (owner doctrine: agent-axis takeover
+/// before provider escalation). Renders one chip per known lifecycle stage:
+/// the agent's own `stage` is shown as always-covered and is not removable;
+/// other known stages toggle membership in `can_cover` (add when absent,
+/// remove when present). Unknown/legacy tags already in `can_cover` are shown
+/// read-only and are left untouched, so a save never drops them.
+fn can_cover_control<'a>(agent: &'a AgentConfig, theme: &'a AppTheme) -> Element<'a, Message> {
+    let ts = &theme.type_scale;
+    let sp = &theme.spacing;
+
+    let mut chips: Vec<Element<'a, Message>> = Vec::new();
+    for option in known_stage_options() {
+        let Some(stage) = option.value else { continue };
+        let label = option.label;
+        if agent.stage.as_ref() == Some(&stage) {
+            chips.push(
+                row![
+                    badge(theme, label),
+                    text("always covered").size(ts.caption).color(theme.palette.text_muted),
+                ]
+                .spacing(sp.xs)
+                .align_y(Alignment::Center)
+                .into(),
+            );
+        } else if agent.can_cover.iter().any(|s| s == &stage) {
+            chips.push(
+                row![
+                    badge(theme, label),
+                    button("×").style(button::text).on_press(Message::OrchestrationStudio(
+                        StudioMessage::CanCoverToggled(stage),
+                    )),
+                ]
+                .spacing(sp.xs)
+                .align_y(Alignment::Center)
+                .into(),
+            );
+        } else {
+            chips.push(
+                button(text(format!("+ {label}")).size(ts.caption))
+                    .style(button::text)
+                    .on_press(Message::OrchestrationStudio(StudioMessage::CanCoverToggled(stage)))
+                    .into(),
+            );
+        }
+    }
+
+    // Unknown/legacy tags survive the save path verbatim; surface them so the
+    // user can see them without an edit that would silently drop them.
+    let unknown: Vec<Element<'a, Message>> = agent
+        .can_cover
+        .iter()
+        .filter(|s| !s.is_known())
+        .map(|s| badge(theme, s.as_str()))
+        .collect();
+
+    let mut content = column![
+        text("Additional coverage").size(ts.label),
+        row(chips).spacing(sp.sm).wrap(),
+        text(
+            "The agent's own lifecycle stage is always covered; add extra stages it can take over.",
+        )
+        .size(ts.caption)
+        .color(theme.palette.text_muted),
+    ]
+    .spacing(sp.xs);
+
+    if !unknown.is_empty() {
+        content = content.push(
+            row![
+                text("Preserved (unknown):").size(ts.caption).color(theme.palette.text_muted),
+                row(unknown).spacing(sp.sm),
+            ]
+            .spacing(sp.xs)
+            .align_y(Alignment::Center),
+        );
+    }
+
+    content.into()
 }
 
 /// Toolbar-badge label for blueprint validation errors (ADR-59 Decision 5):
@@ -784,6 +875,21 @@ fn feed_options() -> [FeedOption; 5] {
         FeedOption { value: Some(FeedLabel::Plan) },
         FeedOption { value: Some(FeedLabel::Execute) },
         FeedOption { value: Some(FeedLabel::Verify) },
+    ]
+}
+
+/// The five known lifecycle stages, in pipeline order, as picker options.
+/// Single-sourced so the agent inspector's "Lifecycle" pick_list and the
+/// `can_cover` toggle control can never disagree about the catalog. Unlike
+/// `stage` (which also admits a `None`/Freeform entry), coverage is only
+/// meaningful for real stages, so this list deliberately has no `None`.
+fn known_stage_options() -> [StageOption; 5] {
+    [
+        StageOption { value: Some(AgentStage::new(AgentStage::DESIGN)), label: "Design" },
+        StageOption { value: Some(AgentStage::new(AgentStage::RESEARCH)), label: "Research" },
+        StageOption { value: Some(AgentStage::new(AgentStage::IMPLEMENT)), label: "Implement" },
+        StageOption { value: Some(AgentStage::new(AgentStage::REVIEW)), label: "Review" },
+        StageOption { value: Some(AgentStage::new(AgentStage::VALIDATE)), label: "Validate" },
     ]
 }
 
@@ -965,6 +1071,7 @@ fn default_coordinator_agent() -> AgentConfig {
         name: "Coordinator".into(),
         role: "coordinator".into(),
         stage: None,
+        can_cover: Vec::new(),
         output_mode: OutputMode::Freeform,
         prompt_sections: PromptSections {
             system_instructions: "You are the Coordinator. Break the incoming task into a short plan, delegate each step to the right specialist (Architect, Researcher, Coder, Reviewer, Validator), and synthesize their outputs into a final answer. You do not write code or run commands yourself.".into(),
@@ -1000,6 +1107,7 @@ fn default_builtin_agents() -> Vec<AgentConfig> {
             name: "Architect".into(),
             role: "architect".into(),
             stage: Some(AgentStage::new(AgentStage::DESIGN)),
+            can_cover: Vec::new(),
             output_mode: OutputMode::DesignDoc,
             prompt_sections: PromptSections {
                 system_instructions: "You are the Software Architect. Produce a high-level design: goals, constraints, proposed files, interface sketch, risks.".into(),
@@ -1018,6 +1126,7 @@ fn default_builtin_agents() -> Vec<AgentConfig> {
             name: "Researcher".into(),
             role: "researcher".into(),
             stage: Some(AgentStage::new(AgentStage::RESEARCH)),
+            can_cover: Vec::new(),
             output_mode: OutputMode::ResearchReport,
             prompt_sections: PromptSections {
                 system_instructions: "You are the Researcher. Investigate the codebase and produce factual findings with citations.".into(),
@@ -1036,6 +1145,7 @@ fn default_builtin_agents() -> Vec<AgentConfig> {
             name: "Coder".into(),
             role: "coder".into(),
             stage: Some(AgentStage::new(AgentStage::IMPLEMENT)),
+            can_cover: Vec::new(),
             output_mode: OutputMode::Freeform,
             prompt_sections: PromptSections {
                 system_instructions: "You are the Coder. Implement the Architect's changes precisely and safely.".into(),
@@ -1061,6 +1171,7 @@ fn default_builtin_agents() -> Vec<AgentConfig> {
             name: "Reviewer".into(),
             role: "reviewer".into(),
             stage: Some(AgentStage::new(AgentStage::REVIEW)),
+            can_cover: Vec::new(),
             output_mode: OutputMode::ReviewReport,
             prompt_sections: PromptSections {
                 system_instructions: "You are the Reviewer. Check the Coder's output against the Architect's requirements and the Researcher's findings.".into(),
@@ -1079,6 +1190,7 @@ fn default_builtin_agents() -> Vec<AgentConfig> {
             name: "Validator".into(),
             role: "validator".into(),
             stage: Some(AgentStage::new(AgentStage::VALIDATE)),
+            can_cover: Vec::new(),
             output_mode: OutputMode::Freeform,
             prompt_sections: PromptSections {
                 system_instructions: "You are the Validator. Run the eval engine (build/tests/lint) and report whether acceptance criteria are met — you don't reason about correctness yourself, you report what actually ran.".into(),
@@ -1990,6 +2102,7 @@ impl State {
                             self.new_agent_role.trim().to_string()
                         },
                         stage: None,
+                        can_cover: Vec::new(),
                         output_mode: OutputMode::default(),
                         prompt_sections: PromptSections::default(),
                         model_override: None,
@@ -2331,6 +2444,23 @@ impl State {
                     if let Some(a) = self.agents.iter_mut().find(|a| &a.id == id) {
                         a.stage = stage;
                         self.mark_dirty();
+                    }
+                }
+            }
+            StudioMessage::CanCoverToggled(stage) => {
+                if let Some(id) = &self.selected_agent_id {
+                    if let Some(a) = self.agents.iter_mut().find(|a| &a.id == id) {
+                        // Own lifecycle stage is always covered via the
+                        // stage ∪ can_cover union; storing it here would be
+                        // redundant, so ignore toggles that target it.
+                        if a.stage.as_ref() != Some(&stage) {
+                            if let Some(pos) = a.can_cover.iter().position(|s| s == &stage) {
+                                a.can_cover.remove(pos);
+                            } else {
+                                a.can_cover.push(stage);
+                            }
+                            self.mark_dirty();
+                        }
                     }
                 }
             }
@@ -3946,7 +4076,11 @@ impl State {
         self.pipeline_view(theme, &self.validation())
     }
 
-    fn prompt_pane(&self, agent: &AgentConfig, theme: &AppTheme) -> Element<'_, Message> {
+    fn prompt_pane<'a>(
+        &'a self,
+        agent: &'a AgentConfig,
+        theme: &'a AppTheme,
+    ) -> Element<'a, Message> {
         let ts = &theme.type_scale;
         let sp = &theme.spacing;
         let p = &agent.prompt_sections;
@@ -3967,14 +4101,9 @@ impl State {
         // "Lifecycle" (pipeline stage) picker. Only known stages are mapped;
         // anything else (e.g. a stage the studio doesn't know) renders as
         // Freeform WITHOUT side effects — selection only mutates on a user pick.
-        let stage_options: Vec<StageOption> = vec![
-            StageOption { value: None, label: "Freeform (no lifecycle)" },
-            StageOption { value: Some(AgentStage::new(AgentStage::DESIGN)), label: "Design" },
-            StageOption { value: Some(AgentStage::new(AgentStage::RESEARCH)), label: "Research" },
-            StageOption { value: Some(AgentStage::new(AgentStage::IMPLEMENT)), label: "Implement" },
-            StageOption { value: Some(AgentStage::new(AgentStage::REVIEW)), label: "Review" },
-            StageOption { value: Some(AgentStage::new(AgentStage::VALIDATE)), label: "Validate" },
-        ];
+        let mut stage_options: Vec<StageOption> =
+            vec![StageOption { value: None, label: "Freeform (no lifecycle)" }];
+        stage_options.extend(known_stage_options());
         let stage_current = agent.stage.as_ref().filter(|s| s.is_known()).cloned();
         let stage_selected = stage_options.iter().find(|o| o.value == stage_current).cloned();
         let stage_pick = pick_list(stage_options, stage_selected, |s| {
@@ -4042,6 +4171,7 @@ impl State {
             )
             .size(ts.caption)
             .color(theme.palette.text_muted),
+            can_cover_control(agent, theme),
             sys,
             cons,
             out,
@@ -4972,6 +5102,96 @@ mod tests {
         let (custom, _, _) = state.persisted_parts();
         let saved = custom.iter().find(|a| a.id == id).expect("saved agent should exist");
         assert_eq!(saved.stage.as_ref().map(|s| s.as_str()), Some(AgentStage::REVIEW));
+    }
+
+    #[test]
+    fn can_cover_toggle_adds_then_removes_and_persists() {
+        let mut state = State::new();
+        let id = set_custom_agent(&mut state);
+        let implement = AgentStage::new(AgentStage::IMPLEMENT);
+
+        let _ = state.update(StudioMessage::CanCoverToggled(implement.clone()));
+        let agent = state.agents.iter().find(|a| a.id == id).expect("agent should exist");
+        assert_eq!(agent.can_cover, vec![implement.clone()]);
+        assert!(state.unsaved);
+
+        let (custom, _, _) = state.persisted_parts();
+        let saved = custom.iter().find(|a| a.id == id).expect("saved agent should exist");
+        assert_eq!(saved.can_cover, vec![implement.clone()]);
+
+        let _ = state.update(StudioMessage::CanCoverToggled(implement));
+        let agent = state.agents.iter().find(|a| a.id == id).expect("agent should exist");
+        assert!(agent.can_cover.is_empty(), "toggling a present stage removes it");
+    }
+
+    #[test]
+    fn can_cover_toggle_ignores_the_agents_own_stage() {
+        let mut state = State::new();
+        let id = set_custom_agent(&mut state);
+        let review = AgentStage::new(AgentStage::REVIEW);
+        let _ = state.update(StudioMessage::StageChanged(Some(review.clone())));
+
+        let _ = state.update(StudioMessage::CanCoverToggled(review));
+
+        let agent = state.agents.iter().find(|a| a.id == id).expect("agent should exist");
+        assert!(
+            agent.can_cover.is_empty(),
+            "own lifecycle stage is covered by `stage` and must not enter can_cover"
+        );
+    }
+
+    #[test]
+    fn can_cover_edit_preserves_known_and_unknown_values_on_save() {
+        let review = AgentStage::new(AgentStage::REVIEW);
+        let unknown = AgentStage::new("legacy-stage");
+        let config = AppConfig {
+            multi_agent: Some(concerto_config::MultiAgentConfig {
+                custom_agents: vec![CustomAgentConfig {
+                    id: "architect".into(),
+                    stage: Some(AgentStage::new(AgentStage::DESIGN)),
+                    can_cover: vec![review.clone(), unknown.clone()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut state = State::new();
+        state.load_from_config(&config);
+
+        // Add then remove a different known stage; both the pre-existing known
+        // value and the unknown/legacy tag must survive the save path.
+        let implement = AgentStage::new(AgentStage::IMPLEMENT);
+        let _ = state.update(StudioMessage::CanCoverToggled(implement.clone()));
+        let _ = state.update(StudioMessage::CanCoverToggled(implement));
+
+        let (custom, _, _) = state.persisted_parts();
+        let saved = custom.iter().find(|a| a.id == "architect").expect("saved agent");
+        assert_eq!(saved.can_cover, vec![review, unknown]);
+    }
+
+    #[test]
+    fn inspector_renders_can_cover_control_with_unknown_tag() {
+        let config = AppConfig {
+            multi_agent: Some(concerto_config::MultiAgentConfig {
+                custom_agents: vec![CustomAgentConfig {
+                    id: "architect".into(),
+                    stage: Some(AgentStage::new(AgentStage::DESIGN)),
+                    can_cover: vec![
+                        AgentStage::new(AgentStage::REVIEW),
+                        AgentStage::new("legacy-stage"),
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut state = State::new();
+        state.load_from_config(&config);
+        let _ = state.update(StudioMessage::SelectAgent(Some("architect".into())));
+        let theme = AppTheme::by_name("Midnight");
+        let _ = state.view(&theme);
     }
 
     #[test]

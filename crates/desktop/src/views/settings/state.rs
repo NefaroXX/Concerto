@@ -863,6 +863,9 @@ impl State {
             ConditionDef::PathGlob { path_glob } => {
                 format!("when a project path matches '{path_glob}'")
             }
+            ConditionDef::ResolvedPathGlob { resolved_path_glob } => {
+                format!("when a resolved project path matches '{resolved_path_glob}'")
+            }
             ConditionDef::CommandPattern { command_pattern } => {
                 format!("when a shell command matches /{command_pattern}/")
             }

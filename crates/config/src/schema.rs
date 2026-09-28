@@ -1,5 +1,6 @@
 use camino::Utf8PathBuf;
 use concerto_core::types::{AgentId, AgentStage, OutputMode};
+use concerto_core::SecretString;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -21,22 +22,22 @@ use crate::ConfigError;
 /// configs keep working via serde defaults (skills enabled with standard
 /// search paths, MCP disabled) and an insert-only migration step.
 ///
-/// v5 -> v6: drop `mode` and `[intent]` (ADR-55 Phase 1e) — the intent gate is
+/// v5 -> v6: drop `mode` and `[intent]` (ADR-55 §7) — the intent gate is
 /// now the only routing path and there is no user-selectable Build/Chat/Plan
 /// mode. The keys simply cease to exist; stale TOML keys are ignored at load
 /// because `AppConfig` has no `deny_unknown_fields`.
 ///
-/// v6 -> v7: re-add `[intent]` (ADR-55 Phase 2c) with the three classifier
+/// v6 -> v7: re-add `[intent]` (ADR-55 §10) with the three classifier
 /// keys only. This does NOT resurrect the `mode`/`enabled` keys dropped at v6 —
 /// the gate stays always-on; v7 adds only `classifier_enabled`,
 /// `classifier_model`, and `classifier_confidence_threshold`. Additive;
 /// `migrate_v6_to_v7` inserts the section with defaults when absent.
 ///
-/// v7 -> v8: drop the retired `[intent]` classifier surface (ADR-56, the
-/// 2026-09-11 clarification). With the classifier off the run hot path the
-/// three keys serve no reader; the section ceases to exist in the struct and
-/// stale TOML keys are ignored at load because `AppConfig` has no
-/// `deny_unknown_fields` (v5 -> v6 precedent).
+/// v7 -> v8: drop the retired `[intent]` classifier surface (ADR-56). With
+/// the classifier off the run hot path the three keys serve no reader; the
+/// section ceases to exist in the struct and stale TOML keys are ignored at
+/// load because `AppConfig` has no `deny_unknown_fields` (v5 -> v6
+/// precedent).
 ///
 /// ADR-56 supersedes the Phase 2c `classifier_enabled` default pin (off → on):
 /// the LLM classifier is the primary intent decider, so the omitted-key
@@ -239,11 +240,11 @@ fn default_classifier_confidence_threshold() -> f32 {
     // Bound to the gate's constant (not a literal) so no configured threshold
     // can create a [threshold, LOW_CONFIDENCE_THRESHOLD) band where a
     // classifier Execute re-route would miss the gate's arm-1 dialog
-    // (ADR-55 Phase 2c §2).
+    // (ADR-55 §10).
     concerto_core::LOW_CONFIDENCE_THRESHOLD
 }
 
-/// LLM intent classifier configuration (ADR-55 Phase 2c §2; ADR-56).
+/// LLM intent classifier configuration (ADR-55 §10; ADR-56).
 ///
 /// `[intent]` is additive and default-on. When the classifier is enabled it is
 /// the primary intent decider for every non-fast-path request (ADR-56 §1); a
@@ -261,7 +262,7 @@ pub struct IntentConfig {
     pub classifier_enabled: bool,
 
     /// Model used for the classifier call. `None` = the run's effective chat
-    /// model (ADR-55 Phase 2c §2, per §9 "same chat model").
+    /// model (ADR-55 §10 "same chat model").
     #[serde(default)]
     pub classifier_model: Option<String>,
 
@@ -269,7 +270,7 @@ pub struct IntentConfig {
     /// routing result to the suggested outcome. Default: 0.7 — validated at
     /// config load to be `>= concerto_core::LOW_CONFIDENCE_THRESHOLD` (the
     /// gate's constant), so a classifier Execute re-route always clears the
-    /// intent gate's arm-1 confirmation dialog (ADR-55 Phase 2c §2; ADR-56 §4
+    /// intent gate's arm-1 confirmation dialog (ADR-55 §10; ADR-56 §4
     /// keeps the invariant).
     #[serde(default = "default_classifier_confidence_threshold")]
     pub classifier_confidence_threshold: f32,
@@ -290,11 +291,11 @@ impl IntentConfig {
     /// [`RetryConfig::validate`].
     ///
     /// The threshold is bound to `concerto_core::LOW_CONFIDENCE_THRESHOLD`
-    /// (not a literal): the intent gate's auto-grant predicate (ADR-55 Phase
-    /// 2d §1) uses that constant, so a configured threshold below it could
+    /// (not a literal): the intent gate's auto-grant predicate (ADR-55 §1)
+    /// uses that constant, so a configured threshold below it could
     /// re-route a classifier Execute at a confidence the gate treats as
     /// ambiguous — landing it in the read-only wildcard instead of the
-    /// auto-grant (ADR-55 Phase 2c §2 invariant retained by the ADR-56
+    /// auto-grant (ADR-55 §10 invariant retained by the ADR-56
     /// amendment).
     pub fn validate(&self) -> Result<(), ConfigError> {
         if !self.classifier_confidence_threshold.is_finite()
@@ -538,6 +539,15 @@ pub struct AppConfig {
     #[serde(default)]
     pub tool_settings: Option<ToolSettings>,
 
+    /// `[audit]` — SQLCipher at-rest encryption and audit-log retention
+    /// (security threat model gap #5 / DEFERRED row 44 incl. row 19).
+    ///
+    /// `None` (no `[audit]` section) keeps the status quo: plaintext database,
+    /// grow-only audit log. Additive serde-default only — every pre-existing
+    /// config loads unchanged and needs no schema-version bump.
+    #[serde(default)]
+    pub audit: Option<AuditConfig>,
+
     /// ADR-58 `[orchestration]` — the Orchestration Blueprint pipeline.
     ///
     /// `None` (no `[orchestration]` table) keeps the engine's embedded
@@ -604,6 +614,7 @@ impl PartialEq for AppConfig {
             && self.project_roots == other.project_roots
             && self.context == other.context
             && self.tool_settings == other.tool_settings
+            && self.audit == other.audit
             && self.orchestration == other.orchestration
     }
 }
@@ -634,6 +645,7 @@ impl Default for AppConfig {
             project_roots: Vec::new(),
             context: None,
             tool_settings: None,
+            audit: None,
             orchestration: None,
             resolved_blueprint: None,
             agent_files_authoritative: false,
@@ -646,9 +658,10 @@ impl Default for AppConfig {
 /// Additive serde-default only: every knob is optional, and a missing
 /// `[context]` section (or missing knob) keeps the engine's embedded defaults
 /// from `context_compaction.rs` (`trigger_tokens` 16000, `retain_user_turns` 4,
-/// `minimum_user_turns` 6). `cache_stable_prefix` is the ADR-048 gap knob:
-/// it is resolved on the engine's budget policy but held as a label while the
-/// dialect cache-op wiring lands (additive, no behavior change when unset).
+/// `minimum_user_turns` 6). `cache_stable_prefix` is the ADR-048
+/// prefix-discipline knob: it is resolved on the engine's budget policy and
+/// consumed by the prompt builder's stable-head seam (additive, no behavior
+/// change when unset or `false`).
 /// No schema migration is required; this section is a first-class v5 field but
 /// defaults to `None` for old configs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -665,20 +678,18 @@ pub struct ContextConfig {
     /// (`6`) applies.
     #[serde(default)]
     pub minimum_user_turns: Option<usize>,
-    /// Request an explicit prefix-stability boundary between the deterministic
-    /// checkpoint head and the recent tail the engine materializes for the
-    /// next request. `true` asks the engine to mark the frontier/tail edge so
-    /// a provider dialect's prompt-cache op can break there — aligning the
-    /// cached prefix with the byte-stable head instead of the first user turn.
-    /// `false` or unset (`None`, the default) keeps today's behavior, where
-    /// the provider-level `[model_settings.providers].cache_breakpoints` dial
-    /// is the only cache-marker path.
+    /// Pin a byte-stable head on every single-agent system prompt and append
+    /// the volatile working memory (active state plus retrieved chunks) after
+    /// it, so per-turn content never lands inside the cached prefix.
+    /// `false` or unset (`None`, the default) keeps today's byte-identical
+    /// assembly. The provider-level
+    /// `[model_settings.providers].cache_breakpoints` dial remains the
+    /// separate, provider-level cache-marker path.
     ///
-    /// TODO(ADR-048): exposed and resolved on the engine's budget policy but
-    /// not yet forwarded to a dialect cache op — the marker needs a
-    /// `Message`-level carrier before `AnthropicChatDialect::apply_cache_breakpoints`
-    /// can consume it. Wiring deliberately deferred; `None` output is
-    /// byte-identical to today.
+    /// Consumed by `PromptBuilder::with_cache_stable_prefix` through the
+    /// engine's budget policy (`ContextBudgetPolicy::from_config`); the
+    /// discipline is applied at assembly time, so no dialect cache op and no
+    /// `Message`-level carrier are involved (ADR-048).
     #[serde(default)]
     pub cache_stable_prefix: Option<bool>,
 }
@@ -824,6 +835,47 @@ impl Default for ToolSettings {
     fn default() -> Self {
         Self { git_auto_init: true }
     }
+}
+
+// ---- [audit] : at-rest encryption + audit-log retention -----------------------
+
+/// `[audit]` — at-rest protection and lifetime of the audit log
+/// (security threat model gap #5, DEFERRED row 44 incl. row 19).
+///
+/// Additive serde-default only: a config without an `[audit]` section keeps
+/// today's behavior exactly (plaintext database, grow-only audit log), so no
+/// schema-version bump is needed (the `[skills]`/`[mcp]`/ADR-70 trajectory).
+/// Every knob below is explicit opt-in — nothing is ever deleted or encrypted
+/// behind the user's back.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AuditConfig {
+    /// Encrypt the sessions/audit SQLite database at rest with SQLCipher.
+    ///
+    /// Default: false (opt-in). When enabled the at-rest key is generated on
+    /// first use and stored in the OS keychain under the
+    /// `audit/db_encryption_key` account (`CONCERTO_AUDIT_DB_ENCRYPTION_KEY`
+    /// overrides it, which is also the supported way to provision a key on a
+    /// headless host without a keychain). The store refuses to start when the
+    /// build cannot provide SQLCipher or the key is unavailable — encryption
+    /// is never silently downgraded to plaintext.
+    #[serde(default)]
+    pub encrypt_at_rest: bool,
+
+    /// Days an `audit_log` row is retained before it is archived out of the
+    /// hot database and deleted. `None` (the default) or `0` keeps every row
+    /// forever, preserving ADR-40's "no age-based audit-only truncation"
+    /// until a user opts in. Rows strictly older than the cutoff are moved to
+    /// the archive first; a failed archive write aborts the prune, so rows are
+    /// never deleted un-archived.
+    #[serde(default)]
+    pub retention_days: Option<u64>,
+
+    /// Directory holding the encrypted `audit-archive.db` that pruned rows are
+    /// moved into. `None` = the Concerto data directory. The archive is
+    /// written with the same at-rest key as the hot database, so it is only
+    /// readable while `encrypt_at_rest` stays enabled with the same key.
+    #[serde(default)]
+    pub archive_dir: Option<Utf8PathBuf>,
 }
 
 // ---- Phase 8: observability export configuration ------------------------------
@@ -1246,8 +1298,13 @@ pub struct PolicyConfig {
     pub time_window: Option<PolicyTimeWindowConfig>,
     /// Approval deadline (seconds) for approval-producing rules that do not
     /// carry an explicit timeout. Additive/optional: absent configs default to
-    /// 30s, preserving pre-existing behavior. A timeout now PAUSES the run
-    /// awaiting the user instead of denying it.
+    /// 30s, preserving pre-existing behavior.
+    ///
+    /// **Retained but not enforced.** The value still travels with the policy
+    /// verdict (config and API compatibility), yet approvals never expire:
+    /// the session pauses until permission is given or revoked, and only a
+    /// user decision, an unanswerable sink, or run cancellation resolves the
+    /// request.
     #[serde(default)]
     pub approval_timeout_secs: Option<u64>,
 }
@@ -1287,12 +1344,15 @@ pub struct PolicyRuleDef {
 #[non_exhaustive]
 /// Policy condition definitions (ADR-43 §6): `ToolNamePrefix` matches any tool
 /// whose name starts with the prefix (e.g. `mcp:github:`), enabling
-/// server-level MCP policy rules.
+/// server-level MCP policy rules. `ResolvedPathGlob` matches a path-shaped
+/// action's resolved target path (after workspace containment) against a glob,
+/// unlike `PathGlob`, which matches the caller-supplied input path.
 pub enum ConditionDef {
     ToolOperation { tool_name: String, operation: String },
     ToolName { tool_name: String },
     ToolNamePrefix { tool_name_prefix: String },
     PathGlob { path_glob: String },
+    ResolvedPathGlob { resolved_path_glob: String },
     CommandPattern { command_pattern: String },
     GitOperation { git_operation: String },
     Always { always: bool },
@@ -1346,6 +1406,9 @@ impl ConditionDef {
                 Condition::Operation(operation.clone()),
             ]),
             ConditionDef::PathGlob { path_glob } => Condition::PathGlob(path_glob.clone()),
+            ConditionDef::ResolvedPathGlob { resolved_path_glob } => {
+                Condition::ResolvedPathGlob(resolved_path_glob.clone())
+            }
             ConditionDef::CommandPattern { command_pattern } => {
                 Condition::CommandPattern(command_pattern.clone())
             }
@@ -1477,8 +1540,13 @@ impl ProviderConfig {
     /// Runtime resolution additionally falls back to the `<PROVIDER>_API_KEY`
     /// env var; use [`Self::effective_api_key`] when the key the runtime would
     /// actually use must be known (e.g. `concerto health`).
-    pub fn api_key(&self, store: &CredentialStore) -> Result<String, ConfigError> {
-        store.get(&self.keyring_key)
+    ///
+    /// The key comes back in a zero-on-drop [`SecretString`]: the buffer is
+    /// wiped when the returned value drops and neither `Debug` nor `Display`
+    /// renders it, so a key held across a `.await` (or embedded in a struct
+    /// that gets logged) cannot leak.
+    pub fn api_key(&self, store: &CredentialStore) -> Result<SecretString, ConfigError> {
+        store.get_secret(&self.keyring_key)
     }
 
     /// Resolve the key the runtime would use: keyring first, then the
@@ -1488,13 +1556,13 @@ impl ProviderConfig {
     /// When both are missing, the original keyring error from
     /// [`Self::api_key`] is returned, preserving the credential-missing
     /// semantics callers rely on.
-    pub fn effective_api_key(&self, store: &CredentialStore) -> Result<String, ConfigError> {
+    pub fn effective_api_key(&self, store: &CredentialStore) -> Result<SecretString, ConfigError> {
         match self.api_key(store) {
             Ok(key) => Ok(key),
             Err(error) => {
                 let env_key = format!("{}_API_KEY", self.provider.to_uppercase());
                 match std::env::var(env_key) {
-                    Ok(key) => Ok(key),
+                    Ok(key) => Ok(SecretString::from(key)),
                     Err(_) => Err(error),
                 }
             }
@@ -2118,6 +2186,17 @@ pub struct CustomAgentConfig {
     /// the DAG with full context and no lifecycle behavior.
     #[serde(default)]
     pub stage: Option<AgentStage>,
+    /// Optional ADDITIONAL stage tags this agent can cover beyond its own
+    /// `stage` (e.g. an architect with `can_cover = ["implement"]`).
+    ///
+    /// Empty (the default) means the agent covers ONLY its own `stage`; a
+    /// stage-less agent therefore covers nothing unless it lists tags here.
+    /// Read by the coordinator's agent-axis takeover BEFORE it escalates a
+    /// failed subtask across providers, so an operator can make any agent able
+    /// to cover any stage without touching code (owner doctrine: the roster
+    /// stays completely customizable). Never a hardcoded role→stage table.
+    #[serde(default)]
+    pub can_cover: Vec<AgentStage>,
     #[serde(default)]
     pub prompt_sections: PromptSections,
     #[serde(default)]
@@ -2285,6 +2364,78 @@ mod tests {
             crate::schema::ToolSettings::deserialize(toml::Value::Table(toml::map::Map::new()))
                 .expect("omitted keys fall back to their serde defaults");
         assert!(from_toml.git_auto_init, "serde default must also be true");
+    }
+
+    // ------------------------------------------------------------------
+    // [audit] — at-rest encryption + audit-log retention (row 44 / row 19)
+    // ------------------------------------------------------------------
+
+    /// Every `[audit]` knob is opt-in: an empty section must behave exactly
+    /// like a config that never mentions `[audit]` (plaintext, grow-only).
+    #[test]
+    fn audit_config_defaults_keep_status_quo() {
+        let defaults = AuditConfig::default();
+        assert!(!defaults.encrypt_at_rest, "encryption must be opt-in");
+        assert_eq!(defaults.retention_days, None, "no retention until explicitly configured");
+        assert_eq!(defaults.archive_dir, None);
+
+        let empty: AuditConfig =
+            toml::from_str("").expect("an empty [audit] table must deserialize");
+        assert_eq!(empty, defaults, "serde defaults must match Default");
+    }
+
+    /// A config without `[audit]` keeps `audit == None` — the load seam never
+    /// invents a section, so no schema-version bump and no serialized churn.
+    #[test]
+    fn audit_section_absent_stays_none() {
+        let parsed: AppConfig = toml::from_str("schema_version = 8\n").expect("must parse");
+        assert_eq!(parsed.audit, None, "absent [audit] must stay None");
+    }
+
+    /// Partial sections fill the remaining knobs from their serde defaults, so
+    /// `[audit] encrypt_at_rest = true` alone is a valid, complete opt-in.
+    #[test]
+    fn audit_section_partial_parses() {
+        let parsed: AppConfig = toml::from_str(
+            "schema_version = 8\n\
+             [audit]\n\
+             encrypt_at_rest = true\n\
+             retention_days = 90\n",
+        )
+        .expect("must parse");
+        let audit = parsed.audit.expect("[audit] section present");
+        assert!(audit.encrypt_at_rest);
+        assert_eq!(audit.retention_days, Some(90));
+        assert_eq!(audit.archive_dir, None, "unset archive_dir falls back to the data dir");
+
+        // A bare `[audit]` table is also valid: nothing is enabled by it.
+        let bare: AppConfig = toml::from_str("schema_version = 8\n[audit]\n").expect("must parse");
+        assert_eq!(bare.audit, Some(AuditConfig::default()));
+    }
+
+    /// `retention_days = 0` means "keep forever" (same as omitting it) and
+    /// must round-trip, so a user can re-disarm retention explicitly.
+    #[test]
+    fn audit_retention_zero_disables() {
+        let parsed: AppConfig =
+            toml::from_str("schema_version = 8\n[audit]\nretention_days = 0\n").expect("parse");
+        let audit = parsed.audit.as_ref().expect("[audit] present");
+        assert_eq!(audit.retention_days, Some(0));
+        // Round-trips through TOML: `0` is a real value, not a skip-everything None.
+        let encoded = toml::to_string(&parsed).expect("serialize");
+        let back: AppConfig = toml::from_str(&encoded).expect("reparse");
+        assert_eq!(back, parsed, "[audit] must survive a settings round-trip");
+    }
+
+    /// Equality covers the new section: two configs that differ only in
+    /// `[audit]` must not compare equal (settings save relies on `PartialEq`).
+    #[test]
+    fn appconfig_equality_covers_audit() {
+        let base: AppConfig = toml::from_str("schema_version = 8\n").expect("must parse");
+        let mut encrypted = base.clone();
+        encrypted.audit = Some(AuditConfig { encrypt_at_rest: true, ..AuditConfig::default() });
+        assert_ne!(base, encrypted, "audit settings must participate in AppConfig equality");
+        assert_eq!(base, base.clone());
     }
 
     #[test]
@@ -3606,7 +3757,7 @@ mod tests {
         std::env::set_var("TESTPROVXYZ_API_KEY", "sk-test-xyz");
         assert!(provider.api_key(&store).is_err(), "keyring-only api_key must not read the env");
         assert_eq!(
-            provider.effective_api_key(&store).unwrap(),
+            provider.effective_api_key(&store).unwrap().expose(),
             "sk-test-xyz",
             "effective_api_key must fall back to the <PROVIDER>_API_KEY env var",
         );

@@ -89,6 +89,9 @@ fn merge_custom_over_seed(user: &CustomAgentConfig, seed: &CustomAgentConfig) ->
     if merged.stage.is_none() {
         merged.stage = seed.stage.clone();
     }
+    if merged.can_cover.is_empty() {
+        merged.can_cover = seed.can_cover.clone();
+    }
     if merged.output_mode == OutputMode::default() {
         merged.output_mode = seed.output_mode;
     }
@@ -382,6 +385,71 @@ impl AgentRegistry {
             .filter(|(_, agent)| agent.stage().as_ref() == Some(stage))
             .map(|(id, _)| id.clone())
             .collect()
+    }
+
+    /// The stage tags an agent can effectively COVER: its own `stage` (when
+    /// set) UNION its configured `can_cover` tags. Empty for a stage-less
+    /// agent with no configured coverage.
+    pub fn effective_coverage(&self, id: &AgentId) -> Vec<AgentStage> {
+        let mut coverage = Vec::new();
+        if let Some(stage) = self.agents.get(id).and_then(|agent| agent.stage()) {
+            coverage.push(stage);
+        }
+        if let Some(config) = self.configs.get(id) {
+            for stage in &config.can_cover {
+                if !coverage.contains(stage) {
+                    coverage.push(stage.clone());
+                }
+            }
+        }
+        coverage
+    }
+
+    /// The registered agents (in stable id order, excluding `exclude`) that
+    /// can take over `target_stage` work: agents staffed AT the same stage
+    /// first, then any agent whose effective coverage includes the stage.
+    /// Coverage is configuration data — never a hardcoded role→stage table.
+    pub(crate) fn takeover_candidates(
+        &self,
+        target_stage: &AgentStage,
+        exclude: &AgentId,
+    ) -> Vec<AgentId> {
+        let mut ids: Vec<AgentId> = self.ids();
+        ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        let mut candidates: Vec<AgentId> = Vec::new();
+        // 1. Agents staffed AT the same stage.
+        for id in &ids {
+            if id == exclude {
+                continue;
+            }
+            if self.agents.get(id).and_then(|agent| agent.stage()).as_ref() == Some(target_stage) {
+                candidates.push(id.clone());
+            }
+        }
+        // 2. Any agent whose configured coverage includes the stage (this
+        //    includes a stage-less agent that explicitly lists `can_cover`).
+        for id in &ids {
+            if id == exclude || candidates.contains(id) {
+                continue;
+            }
+            if self.effective_coverage(id).iter().any(|stage| stage == target_stage) {
+                candidates.push(id.clone());
+            }
+        }
+        candidates
+    }
+
+    /// The first registered agent (in stable id order, excluding `exclude`)
+    /// that can take over `target_stage` work: a second agent staffed AT the
+    /// same stage first, then any agent whose effective coverage includes the
+    /// stage. Coverage is configuration data — never a hardcoded role→stage
+    /// table (owner doctrine: the roster stays completely customizable).
+    pub fn takeover_candidate(
+        &self,
+        target_stage: &AgentStage,
+        exclude: &AgentId,
+    ) -> Option<AgentId> {
+        self.takeover_candidates(target_stage, exclude).into_iter().next()
     }
 
     /// Build the default set of specialist agents (no per-agent config).
@@ -841,6 +909,7 @@ mod tests {
                 name: "Docs Writer".into(),
                 role: "docs-writer".into(),
                 stage: Some(AgentStage::new("documentation")),
+                can_cover: Vec::new(),
                 prompt_sections: PromptSections::default(),
                 model_override: None,
                 provider_id: None,
@@ -858,6 +927,7 @@ mod tests {
                 name: "Evil Coordinator".into(),
                 role: "coordinator".into(),
                 stage: None,
+                can_cover: Vec::new(),
                 prompt_sections: PromptSections::default(),
                 model_override: None,
                 provider_id: None,
@@ -1577,5 +1647,100 @@ mod tests {
         let empty: HashMap<AgentId, CustomAgentConfig> = HashMap::new();
         let merged_empty = merged_agent_configs(&empty, false);
         assert!(merged_empty.is_empty(), "owned empty roster must register nothing");
+    }
+
+    /// Agent-axis takeover selection (owner doctrine): another agent at the
+    /// SAME stage is preferred, and the original role is never its own
+    /// candidate.
+    #[test]
+    fn takeover_candidate_prefers_same_stage_peer() {
+        let mut registry = AgentRegistry::new();
+        registry.register(Arc::new(TestAgent {
+            id: AgentId::new("coder-senior"),
+            stage: Some(AgentStage::new("implement")),
+        }));
+        registry.register(Arc::new(TestAgent {
+            id: AgentId::new("coder-junior"),
+            stage: Some(AgentStage::new("implement")),
+        }));
+        registry.register(Arc::new(TestAgent {
+            id: AgentId::new("reviewer"),
+            stage: Some(AgentStage::new("review")),
+        }));
+
+        let candidate = registry
+            .takeover_candidate(&AgentStage::new("implement"), &AgentId::new("coder-senior"))
+            .expect("a same-stage peer is a candidate");
+        assert_eq!(candidate, AgentId::new("coder-junior"));
+        assert_ne!(candidate, AgentId::new("coder-senior"), "never its own candidate");
+        assert_ne!(candidate, AgentId::new("reviewer"), "a non-covering stage is never used");
+    }
+
+    /// Coverage is CONFIG data, never a hardcoded role→stage table: a
+    /// stage-less agent whose config lists `can_cover = ["implement"]` is
+    /// eligible for implement work.
+    #[test]
+    fn takeover_candidate_uses_configured_can_cover() {
+        let mut registry = AgentRegistry::new();
+        registry.register(Arc::new(TestAgent {
+            id: AgentId::new("architect"),
+            stage: Some(AgentStage::new("design")),
+        }));
+        registry.register(Arc::new(TestAgent { id: AgentId::new("handy"), stage: None }));
+        registry.attach_configs_for_test(HashMap::from([(
+            AgentId::new("handy"),
+            CustomAgentConfig {
+                id: "handy".into(),
+                name: "Handy".into(),
+                role: "handy".into(),
+                stage: None,
+                can_cover: vec![AgentStage::new("implement")],
+                ..Default::default()
+            },
+        )]));
+
+        assert_eq!(
+            registry.takeover_candidate(&AgentStage::new("implement"), &AgentId::new("unused")),
+            Some(AgentId::new("handy")),
+            "a stage-less agent with can_cover=[implement] is eligible"
+        );
+        // Effective coverage also includes the agent's own stage when it has
+        // one, and defaults to the own stage when can_cover is empty.
+        assert_eq!(
+            registry.effective_coverage(&AgentId::new("architect")),
+            vec![AgentStage::new("design")]
+        );
+        assert_eq!(
+            registry.effective_coverage(&AgentId::new("handy")),
+            vec![AgentStage::new("implement")]
+        );
+    }
+
+    /// An agent that neither staffs the target stage nor lists it in
+    /// `can_cover` is never selected.
+    #[test]
+    fn takeover_candidate_rejects_non_covering_agents() {
+        let mut registry = AgentRegistry::new();
+        registry.register(Arc::new(TestAgent {
+            id: AgentId::new("reviewer"),
+            stage: Some(AgentStage::new("review")),
+        }));
+        registry.attach_configs_for_test(HashMap::from([(
+            AgentId::new("reviewer"),
+            CustomAgentConfig {
+                id: "reviewer".into(),
+                name: "Reviewer".into(),
+                role: "reviewer".into(),
+                stage: Some(AgentStage::new("review")),
+                can_cover: vec![AgentStage::new("validate")],
+                ..Default::default()
+            },
+        )]));
+
+        assert_eq!(
+            registry.takeover_candidate(&AgentStage::new("implement"), &AgentId::new("coder")),
+            None,
+            "a non-covering agent is never a takeover candidate"
+        );
     }
 }

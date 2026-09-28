@@ -34,6 +34,7 @@ use concerto_core::types::{
     CompletionChunk, CompletionRequest, CompletionUsage, ModelInfo, TokenBudget, ToolCall,
 };
 use concerto_core::CancellationToken;
+use concerto_core::SecretString;
 use futures::stream::StreamExt;
 use reqwest::header::CONTENT_TYPE;
 use std::collections::{HashMap, VecDeque};
@@ -129,14 +130,16 @@ fn is_muse_family_segment(segment: &str) -> bool {
 /// OpenCode Zen provider that automatically selects the correct wire dialect
 /// per model family.
 pub struct OpenCodeZenProvider {
-    api_key: String,
     model: String,
     timeout_secs: u64,
     api_base: String,
     /// Tool-schema presentation tier (adaptive tool schemas) for the
-    /// provider's own Anthropic-dialect path. The OpenAI-compatible path
-    /// delegates to `openai_inner`, which carries its own copy. `Auto`
-    /// (default) keeps every non-weak model on the verbatim strict schema.
+    /// provider's own Anthropic-dialect path. `Auto` (default) keeps every
+    /// non-weak model on the verbatim strict schema.
+    ///
+    /// The credential is *not* duplicated here: both wire paths read the
+    /// single copy owned by `openai_inner` (see `OpenAiProvider::api_key`),
+    /// so a long-lived provider keeps one zero-on-drop buffer, not two.
     tool_schema_mode: concerto_config::ToolSchemaMode,
     /// Pre-built inner OpenAI provider for OpenAI-compatible models.
     openai_inner: OpenAiProvider,
@@ -144,7 +147,7 @@ pub struct OpenCodeZenProvider {
 
 impl OpenCodeZenProvider {
     /// Build a provider targeting the OpenCode Zen endpoint.
-    pub fn new(api_key: String, model: String, timeout_secs: u64) -> Self {
+    pub fn new(api_key: impl Into<SecretString>, model: String, timeout_secs: u64) -> Self {
         Self::with_api_base(api_key, model, timeout_secs, OPENCODE_ZEN_API_BASE.to_string())
     }
 
@@ -152,22 +155,27 @@ impl OpenCodeZenProvider {
     ///
     /// Useful for self-hosted gateways, proxies, or tests.
     pub fn with_api_base(
-        api_key: String,
+        api_key: impl Into<SecretString>,
         model: String,
         timeout_secs: u64,
         api_base: String,
     ) -> Self {
-        let openai_inner = OpenAiProvider::new(api_key.clone(), model.clone(), timeout_secs)
+        let openai_inner = OpenAiProvider::new(api_key, model.clone(), timeout_secs)
             .with_api_base(api_base.clone())
             .with_reasoning_echo(ReasoningEcho::Always);
         Self {
-            api_key,
             model,
             timeout_secs,
             api_base,
             tool_schema_mode: concerto_config::ToolSchemaMode::default(),
             openai_inner,
         }
+    }
+
+    /// The credential both wire paths authenticate with — a borrow, so
+    /// callers never materialize a second copy of the key.
+    pub(crate) fn api_key(&self) -> &SecretString {
+        self.openai_inner.api_key()
     }
 
     /// Set the tool-schema presentation mode (adaptive tool schemas).
@@ -291,7 +299,7 @@ impl OpenCodeZenProvider {
             result = async {
                 let r = client
                     .post(&url)
-                    .bearer_auth(&self.api_key)
+                    .bearer_auth(self.api_key().expose())
                     .header(CONTENT_TYPE, "application/json")
                     .json(&body)
                     .send()
@@ -331,7 +339,7 @@ impl OpenCodeZenProvider {
                         }
                         items
                     }
-                    // ADR-55 Phase 2e stream-retry: a transport fault
+                    // Stream-retry: a transport fault
                     // mid-stream is retriable (tools execute only
                     // post-assembly — re-issue is side-effect-free within
                     // the bounded attempt budget); framing/parse failures
@@ -397,7 +405,7 @@ impl OpenCodeZenProvider {
             result = async {
                 let r = client
                     .post(&url)
-                    .header("x-api-key", &self.api_key)
+                    .header("x-api-key", self.api_key().expose())
                     .header("anthropic-version", "2023-06-01")
                     .header(CONTENT_TYPE, "application/json")
                     .json(&body)
@@ -441,7 +449,7 @@ impl OpenCodeZenProvider {
                         }
                         items
                     }
-                    // ADR-55 Phase 2e stream-retry: a transport fault
+                    // Stream-retry: a transport fault
                     // mid-stream is retriable (tools execute only
                     // post-assembly — re-issue is side-effect-free within
                     // the bounded attempt budget); framing/parse failures
@@ -1028,8 +1036,11 @@ mod tests {
 
     #[test]
     fn muse_model_renders_anthropic_body_via_dialect() {
-        let p =
-            OpenCodeZenProvider::new("key".into(), "muse-spark-1.2-contributor-free".into(), 30);
+        let p = OpenCodeZenProvider::new(
+            "key".to_string(),
+            "muse-spark-1.2-contributor-free".into(),
+            30,
+        );
         let request = CompletionRequest {
             messages: vec![concerto_core::types::Message {
                 role: concerto_core::types::Role::User,
@@ -1065,7 +1076,7 @@ mod tests {
     /// drop the tool declarations.
     #[tokio::test]
     async fn responses_path_refuses_tool_declarations() {
-        let p = OpenCodeZenProvider::new("key".into(), "muse-v2".into(), 30);
+        let p = OpenCodeZenProvider::new("key".to_string(), "muse-v2".into(), 30);
         let request = CompletionRequest {
             model: "muse-v2".into(),
             messages: vec![concerto_core::types::Message {
@@ -1103,7 +1114,7 @@ mod tests {
     #[tokio::test]
     async fn responses_path_accepts_tool_free_request_guard_only() {
         let p = OpenCodeZenProvider::with_api_base(
-            "key".into(),
+            "key".to_string(),
             "muse-v2".into(),
             30,
             // Unroutable local port: the connection fails fast and locally,

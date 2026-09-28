@@ -66,6 +66,22 @@ pub enum IpcMethod {
     /// Fetch the supervisor's tool registry — the single source of truth for
     /// the tools an agent may call (ADR-60 S5 agent-process entry).
     ListTools,
+    /// Request an interactive approval decision from the supervisor/UI
+    /// (ADR-60 S5 approval bridge). The child's approval sink forwards the
+    /// policy action here; the supervisor routes it to the configured
+    /// [`ApprovalSink`](concerto_core::traits::approval::ApprovalSink) and
+    /// answers with the decision.
+    ApprovalRequest,
+    /// Record that the child (re-)emitted its terminal approval-decision audit
+    /// signal supervisor-side — currently unused for the request path, kept
+    /// reserved for a future streamed-resolve surface.
+    ApprovalResolved,
+    /// Ask the supervisor to surface a non-blocking acknowledgment warning
+    /// (ADR-60 S5 approval bridge).
+    AckRequest,
+    /// Ask the supervisor to approve all remaining operations for a session
+    /// (ADR-60 S5 approval bridge).
+    ApproveAllRequest,
     /// Supervisor liveness/readiness signal (ADR-60 D1).
     Heartbeat,
     /// Versioned handshake at process startup.
@@ -90,6 +106,10 @@ impl IpcMethod {
             IpcMethod::StoreMemory => "store-memory",
             IpcMethod::InvalidateMemory => "invalidate-memory",
             IpcMethod::ListTools => "list-tools",
+            IpcMethod::ApprovalRequest => "approval-request",
+            IpcMethod::ApprovalResolved => "approval-resolved",
+            IpcMethod::AckRequest => "ack-request",
+            IpcMethod::ApproveAllRequest => "approve-all-request",
             IpcMethod::Heartbeat => "heartbeat",
             IpcMethod::Handshake => "handshake",
             IpcMethod::WhiteboardSlice => "whiteboard-slice",
@@ -186,6 +206,37 @@ pub enum IpcParams {
         /// binds it to the registered process like every other method).
         agent_id: String,
     },
+    /// Forward a policy action to the supervisor for an interactive approval
+    /// decision (ADR-60 S5 approval bridge).
+    ///
+    /// The action is projected to a resolution-free wire form
+    /// ([`ApprovalActionWire`]) because the loop's [`PolicyAction`] borrows
+    /// and carries non-serializable capability internals; the supervisor
+    /// renders the prompt from the projected fields.
+    ApprovalRequest {
+        /// The action as a wire projection.
+        action: ApprovalActionWire,
+    },
+    /// Record the child's terminal approval decision supervisor-side.
+    ApprovalResolved {
+        /// The tool the decision concerns.
+        tool_name: String,
+        /// Whether the action was approved.
+        approved: bool,
+    },
+    /// Forward a user-acknowledgment warning to the supervisor (ADR-60 S5).
+    AckRequest {
+        /// Session the warning belongs to.
+        session_id: String,
+        /// The warning text the user must acknowledge.
+        message: String,
+    },
+    /// Ask the supervisor to approve all remaining operations for a session
+    /// (ADR-60 S5).
+    ApproveAllRequest {
+        /// Session to widen.
+        session_id: String,
+    },
     /// Supervisor liveness/readiness heartbeat (ADR-60 D1).
     Heartbeat {
         /// Agent emitting the heartbeat.
@@ -277,6 +328,26 @@ pub enum IpcResult {
         /// Tool definitions the agent may present to the model.
         tools: Vec<ToolDefinition>,
     },
+    /// The decision the supervisor's approval surface returned (ADR-60 S5).
+    ApprovalRequest {
+        /// One of `approve` / `deny` / `approve-all`.
+        decision: String,
+    },
+    /// Echo of a recorded terminal approval decision (ADR-60 S5).
+    ApprovalResolved {
+        /// The tool the decision concerned.
+        tool_name: String,
+    },
+    /// The user's acknowledgment response (ADR-60 S5).
+    AckRequest {
+        /// `true` when the user acknowledged and wants to continue.
+        acknowledged: bool,
+    },
+    /// Echo that approve-all was applied (ADR-60 S5).
+    ApproveAllRequest {
+        /// The session that was widened.
+        session_id: String,
+    },
     /// Supervisor acknowledgement of a heartbeat.
     Heartbeat {
         /// `true` when the heartbeat was accepted.
@@ -298,6 +369,97 @@ pub enum IpcResult {
         /// The acknowledged consistent-cut coordinate.
         end_gate_seq: u64,
     },
+}
+
+/// Wire projection of a [`PolicyAction`](concerto_core::types::PolicyAction)
+/// crossing the approval bridge (ADR-60 S5).
+///
+/// The loop's action borrows the tool name/input and carries capability and
+/// command-fact internals that are not part of the approval prompt, so the
+/// child sends this resolution-free projection instead. The supervisor renders
+/// its approval surface from these fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalActionWire {
+    /// The tool the action invokes.
+    pub tool_name: String,
+    /// The tool input, rendered by the frontend's own summarizer.
+    pub input: serde_json::Value,
+    /// Session the action belongs to.
+    pub session_id: String,
+    /// Correlation id for the action.
+    pub correlation_id: String,
+}
+
+/// Wire projection of the frontends' [`ApprovalDecision`] enum.
+///
+/// The core enum is `#[non_exhaustive]`, so it is mapped through these stable
+/// string labels rather than trying to derive `Serialize` across the crate
+/// boundary. [`ApprovalDecisionWire::to_decision`] is the single decode point;
+/// an unknown label is a protocol violation the caller answers with a deny.
+///
+/// [`ApprovalDecision`]: concerto_core::traits::approval::ApprovalDecision
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApprovalDecisionWire {
+    /// Approve this action.
+    Approve,
+    /// Deny this action.
+    Deny,
+    /// Approve every remaining action for the session.
+    ApproveAll,
+}
+
+impl ApprovalDecisionWire {
+    /// Encode a frontend decision for the wire.
+    ///
+    /// [`ApprovalDecision`] is `#[non_exhaustive]`, so an unknown future
+    /// variant maps to [`Self::Deny`] — a decision this bridge does not
+    /// recognize must never be treated as approval.
+    ///
+    /// [`ApprovalDecision`]: concerto_core::traits::approval::ApprovalDecision
+    pub fn from_decision(
+        decision: concerto_core::traits::approval::ApprovalDecision,
+    ) -> ApprovalDecisionWire {
+        use concerto_core::traits::approval::ApprovalDecision;
+        match decision {
+            ApprovalDecision::Approve => Self::Approve,
+            ApprovalDecision::Deny => Self::Deny,
+            ApprovalDecision::ApproveAllForSession => Self::ApproveAll,
+            _ => Self::Deny,
+        }
+    }
+
+    /// Decode a decision from the wire.
+    ///
+    /// The core enum is `#[non_exhaustive]`; matching through the local wire
+    /// enum keeps the mapping total without a wildcard on the foreign enum.
+    pub fn to_decision(self) -> concerto_core::traits::approval::ApprovalDecision {
+        use concerto_core::traits::approval::ApprovalDecision;
+        match self {
+            Self::Approve => ApprovalDecision::Approve,
+            Self::Deny => ApprovalDecision::Deny,
+            Self::ApproveAll => ApprovalDecision::ApproveAllForSession,
+        }
+    }
+
+    /// The stable wire label (`approve` / `deny` / `approve-all`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Deny => "deny",
+            Self::ApproveAll => "approve-all",
+        }
+    }
+
+    /// Parse a wire label; unknown labels are a protocol violation.
+    pub fn parse(label: &str) -> Result<Self, String> {
+        match label {
+            "approve" => Ok(Self::Approve),
+            "deny" => Ok(Self::Deny),
+            "approve-all" => Ok(Self::ApproveAll),
+            other => Err(format!("unknown approval decision label: {other}")),
+        }
+    }
 }
 
 /// One retrieved memory chunk (ADR-60 D6).
@@ -1078,6 +1240,87 @@ mod tests {
     #[test]
     fn result_round_trip_heartbeat() {
         round_trip(&IpcResult::Heartbeat { accepted: true });
+    }
+
+    // --- S5 approval bridge (DEFERRED #49) ---
+
+    fn approval_action_wire() -> ApprovalActionWire {
+        ApprovalActionWire {
+            tool_name: "write_file".to_owned(),
+            input: json!({ "path": "hello.txt" }),
+            session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            correlation_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
+        }
+    }
+
+    #[test]
+    fn params_round_trip_approval_request() {
+        round_trip(&IpcParams::ApprovalRequest { action: approval_action_wire() });
+    }
+
+    #[test]
+    fn params_round_trip_approval_resolved() {
+        round_trip(&IpcParams::ApprovalResolved {
+            tool_name: "write_file".to_owned(),
+            approved: true,
+        });
+    }
+
+    #[test]
+    fn params_round_trip_ack_and_approve_all() {
+        round_trip(&IpcParams::AckRequest {
+            session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            message: "this write is destructive".to_owned(),
+        });
+        round_trip(&IpcParams::ApproveAllRequest {
+            session_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+        });
+    }
+
+    #[test]
+    fn result_round_trip_approval_request() {
+        round_trip(&IpcResult::ApprovalRequest { decision: "approve-all".to_owned() });
+    }
+
+    #[test]
+    fn approval_methods_have_kebab_case_wire_names() {
+        assert_eq!(IpcMethod::ApprovalRequest.as_str(), "approval-request");
+        assert_eq!(IpcMethod::ApprovalResolved.as_str(), "approval-resolved");
+        assert_eq!(IpcMethod::AckRequest.as_str(), "ack-request");
+        assert_eq!(IpcMethod::ApproveAllRequest.as_str(), "approve-all-request");
+        assert_eq!(
+            serde_json::to_string(&IpcMethod::ApprovalRequest).expect("serialize"),
+            "\"approval-request\""
+        );
+        assert_eq!(
+            serde_json::to_string(&IpcMethod::ApproveAllRequest).expect("serialize"),
+            "\"approve-all-request\""
+        );
+    }
+
+    #[test]
+    fn approval_decision_wire_round_trips_every_variant() {
+        use concerto_core::traits::approval::ApprovalDecision;
+        let cases = [
+            (ApprovalDecision::Approve, ApprovalDecisionWire::Approve, "approve"),
+            (ApprovalDecision::Deny, ApprovalDecisionWire::Deny, "deny"),
+            (
+                ApprovalDecision::ApproveAllForSession,
+                ApprovalDecisionWire::ApproveAll,
+                "approve-all",
+            ),
+        ];
+        for (decision, wire, label) in cases {
+            assert_eq!(ApprovalDecisionWire::from_decision(decision), wire);
+            assert_eq!(wire.as_str(), label);
+            assert_eq!(ApprovalDecisionWire::parse(label).expect("label parses"), wire);
+            round_trip(&wire);
+        }
+    }
+
+    #[test]
+    fn unknown_approval_decision_label_is_rejected() {
+        assert!(ApprovalDecisionWire::parse("maybe").is_err());
     }
 
     #[test]

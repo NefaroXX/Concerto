@@ -26,13 +26,16 @@
 //!
 //! 1. **Workspace objectively changed** — reconciliation (ADR-65 F3) shows
 //!    changed/vanished observed paths that the run's own recorded writes do
-//!    NOT explain:
+//!    NOT explain, OR the Phase 6 M3c plan-drift investigation re-verified a
+//!    planned artifact as changed/gone:
 //!    - material to the pending step (a pending decision or an open blocked
 //!      step exists) → **Replan**: the recorded decision delegates new
 //!      planning to the Phase-6 scheduler; the resume path itself dispatches
 //!      nothing.
 //!    - otherwise → **RefreshEvidence**: the evidence barrier is re-run
-//!      (already done at run start) and the run continues.
+//!      (already done at run start) and the run continues. With confirmed
+//!      drift the restore path then re-arms the affected COMPLETED subtasks
+//!      so the normal ready batch re-dispatches them (Phase 6 M3c step 3).
 //! 2. **Generation mismatch without external change** (the run's own writes
 //!    moved the workspace, or the mismatch is unexplained) →
 //!    **RefreshEvidence** — never a replan on the run's own progress.
@@ -139,8 +142,9 @@ impl TaskFacts {
 }
 
 /// The workspace-change verdict for a resume (ADR-65 §7 "objectively
-/// changed"). Computed by the caller from the fresh snapshot generation and
-/// the F3 reconciliation of the observed rows against the live filesystem.
+/// changed"). Computed by the caller from the fresh snapshot generation, the
+/// F3 reconciliation of the observed rows against the live filesystem, and
+/// (Phase 6 M3c) the plan-drift investigation's confirmed findings.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkspaceChange {
     /// Whether the fresh snapshot generation differs from the checkpoint's.
@@ -149,6 +153,11 @@ pub struct WorkspaceChange {
     /// explain, each cited by the REAL `resource_facts` event id of the last
     /// observation when one exists (never fabricated).
     pub externally_changed: Vec<(String, Option<String>)>,
+    /// Phase 6 M3c: planned artifacts that the resume's investigation
+    /// re-verified as drifted (changed or gone, own writes excluded). Empty
+    /// when no plan drift was detected or every finding read back intact.
+    /// Additive: pre-M3c evaluations leave it empty.
+    pub plan_drift: Vec<String>,
 }
 
 impl WorkspaceChange {
@@ -156,6 +165,13 @@ impl WorkspaceChange {
     /// run's own recorded writes.
     pub fn externally_changed(&self) -> bool {
         !self.externally_changed.is_empty()
+    }
+
+    /// Whether the plan-drift investigation confirmed real drift (Phase 6
+    /// M3c). Confirmed drift is workspace-change evidence for the same
+    /// policy rule: the plan's artifacts no longer describe reality.
+    pub fn plan_drift_confirmed(&self) -> bool {
+        !self.plan_drift.is_empty()
     }
 }
 
@@ -238,11 +254,15 @@ pub struct ResumeInput<'a> {
 /// policy and its rationale).
 pub fn evaluate(input: &ResumeInput<'_>) -> ResumeOutcome {
     // ── 1. Workspace objectively changed (outside the run's own writes). ──
-    if input.change.externally_changed() {
+    // F3's observed-path divergence and Phase 6 M3c's confirmed plan drift
+    // are the same class of evidence: reality no longer matches what the
+    // run recorded, so the same material/non-material split decides.
+    if input.change.externally_changed() || input.change.plan_drift_confirmed() {
         // Material to the pending step: any open work on the objective (a
         // pending dispatch or a blocked step) rests on evidence the changed
         // paths invalidate — replan via the scheduler. With no open work the
-        // change only invalidates the evidence view: refresh it.
+        // change only invalidates the evidence view: refresh it (the restore
+        // path then re-arms affected COMPLETED subtasks for re-dispatch).
         let material = input.pending_decision.is_some() || input.blocked_step.is_some();
         return if material { ResumeOutcome::Replan } else { ResumeOutcome::RefreshEvidence };
     }
@@ -798,6 +818,7 @@ mod tests {
         let change = WorkspaceChange {
             generation_mismatch: true,
             externally_changed: vec![("src/main.rs".to_owned(), Some("ev-obs".to_owned()))],
+            plan_drift: Vec::new(),
         };
         let outcome = evaluate(&input(Some(&step), &[], None, &TaskFacts::default(), &change));
         assert_eq!(outcome, ResumeOutcome::Replan);
@@ -808,9 +829,39 @@ mod tests {
         let change = WorkspaceChange {
             generation_mismatch: true,
             externally_changed: vec![("docs/notes.md".to_owned(), Some("ev-obs".to_owned()))],
+            plan_drift: Vec::new(),
         };
         let outcome = evaluate(&input(None, &[], None, &TaskFacts::default(), &change));
         assert_eq!(outcome, ResumeOutcome::RefreshEvidence);
+    }
+
+    /// Phase 6 M3c: confirmed plan drift is workspace-change evidence. With
+    /// open work on the objective it replans; with a settled graph it only
+    /// refreshes evidence (the restore path then re-arms the affected
+    /// COMPLETED subtasks). No drift ⇒ the existing outcomes are untouched.
+    #[test]
+    fn confirmed_plan_drift_follows_the_workspace_change_policy() {
+        let step = blocked_step("coder", StepClass::Implement, 0);
+        let drift = WorkspaceChange {
+            generation_mismatch: false,
+            externally_changed: Vec::new(),
+            plan_drift: vec!["src/gone.rs".to_owned()],
+        };
+        let outcome = evaluate(&input(Some(&step), &[], None, &TaskFacts::default(), &drift));
+        assert_eq!(outcome, ResumeOutcome::Replan, "drift is material to open work");
+
+        let outcome = evaluate(&input(None, &[], None, &TaskFacts::default(), &drift));
+        assert_eq!(
+            outcome,
+            ResumeOutcome::RefreshEvidence,
+            "with a settled graph the drift only invalidates the evidence view"
+        );
+
+        // Cleared (no confirmed findings): the ordinary blocked-step policy
+        // still decides — the investigation never hijacks an intact resume.
+        let cleared = WorkspaceChange::default();
+        let outcome = evaluate(&input(Some(&step), &[], None, &TaskFacts::default(), &cleared));
+        assert!(matches!(outcome, ResumeOutcome::ContinueBlocked { .. }), "{outcome:?}");
     }
 
     #[test]
@@ -819,7 +870,11 @@ mod tests {
         // the restored graph — the run's own progress must not trigger a
         // replan loop.
         let step = blocked_step("coder", StepClass::Implement, 0);
-        let change = WorkspaceChange { generation_mismatch: true, externally_changed: Vec::new() };
+        let change = WorkspaceChange {
+            generation_mismatch: true,
+            externally_changed: Vec::new(),
+            plan_drift: Vec::new(),
+        };
         let outcome = evaluate(&input(Some(&step), &[], None, &TaskFacts::default(), &change));
         assert_eq!(outcome, ResumeOutcome::RefreshEvidence);
     }

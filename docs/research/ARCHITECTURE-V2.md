@@ -1,5 +1,13 @@
 # Concerto Architecture V2 — Provider-First Redesign (Researched Plan)
 
+> **Moved to `docs/research/` 2026-09-28.** A researched draft (2026-08-07),
+> not accepted as a whole. Parts of it were adopted and shipped as ADRs
+> (46 reasoning-as-data, 47 message parts, 48 context engine, 49 config-first
+> catalog, 50 tool coercion, 52 safety gates, 53 dialect plugins) — those ADRs,
+> not this file, are the live decisions. Live architecture is
+> [`docs/architecture.md`](../architecture.md) and
+> [`docs/crate-graph.md`](../crate-graph.md).
+
 Status: **Draft for review** · Date: 2026-08-07 · Owner: sol
 Companion research: three external deep-dives (opencode internals, reasoning wire
 protocols, production harness orchestration/context) + current-code inventory.

@@ -7,9 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Coordinator no longer fabricates a missing source.** A rename/move/edit of a
+  named artifact that does not exist is now surfaced to the user instead of being
+  satisfied by creating the file first (`caadb2d`, doctrine in `bc40806`).
+- **Agent-loop retry guard.** An identical deterministic tool failure (missing
+  file, permission denied, containment rejection) is refused without
+  re-executing, and near-duplicate subtask dispatches are refused, instead of
+  re-issuing the same impossible call (`2228b4c`).
+- **Approval requests park until answered.** The 30 s auto-expiry is inert; a
+  pending approval blocks until answered, with cancellation as the only escape
+  and fail-closed deny on a closed channel (`0941215`).
+- **`move`/`copy` resolve sources through the overlay onto disk.** A file that
+  exists on disk but was never staged previously reported "file not found"
+  (`1ba7c1d`).
+- **The `cli` feature compiles again.** `cargo build -p concerto --features cli`
+  had been broken by a signature change, so `concerto --cli` was unavailable and
+  `--reduced-motion` was rejected as an unknown subcommand. Both fixed and now
+  built and smoke-run in CI (`c7f68a6`).
+
 ### Added
 
-- **Unified agent loop (ADR-55 Phase 2e):** every non-empty run enters the
+- **Auditable tool trail.** File operations record operation, attempted path,
+  resolved path and destinations (migration 034) and read-only operations record
+  what they returned — `exists=<bool>`, `entries=<count>`, `bytes=<size>`, never
+  content (migration 035). Read it with `concerto audit <session-id>`, with
+  `--tool`/`--operation`/`--failed`/`--limit`/`--json` filters.
+- **Bounded per-session acknowledgement queue** with explicit overflow refusal
+  and a wired audit seam (`8e3c350`).
+- **Verification evidence at the C-06 acceptance gate.** A run completes on a
+  successful mutating tool against a declared deliverable, a successful
+  build/test command, or a recorded coordinator declaration — not only on a
+  validator dispatch. No evidence still reports Partial (`8e5a20b`).
+- **Containerized sandbox on Linux/macOS** with runtime detection and a
+  fail-closed gate, plus a required routing marker (ADR-72, `d00582b`,
+  `3ae6ea5`, `fdf4800`).
+- **Security:** per-client API rate limiting, plugin network egress allowlist,
+  audit DB encryption at rest with bounded retention (ADR-73), zero-on-drop
+  secret holders, shell CPU budgets, Windows argv-direct launches with hardened
+  `cmd.exe` quoting, and a proxy tool-call parsing corpus.
+- **Delegation doctrine (ADR-74).** Delegation is the default; self-execution
+  requires roster exhaustion; a throttled provider rung is held and bridged
+  rather than abandoned; another specialist is tried before escalating across
+  providers, with agent coverage driven by config (`can_cover`).
+- **CI benchmark gate** with a deterministic compile-and-smoke tier on every PR
+  and a scheduled baseline-comparison tier (`10357cd`).
+
+### Changed
+
+- **Supervised agent-process is real.** Children build an actual provider and
+  route approvals over IPC to the same approval sink the in-process paths use
+  (`d62ebac`, `7859a0a`).
+- **Docs:** `docs/DEFERRED.md` is a single outstanding-work register (112
+  lines, 22 rows) with shipped work closed and evidenced. ADR amendments are
+  integrated into the decisions they amend rather than appended; ADR-55 went
+  from 1094 lines of phase accretions to 381 with the phase history archived
+  verbatim. Superseded and aspirational plans moved to `docs/research/`, session
+  history and resolved-stub audits to `docs/archive/`, and `docs/README.md` now
+  indexes the directory.
+
+- **Unified agent loop (ADR-55):** every non-empty run enters the
   loop and the model shapes it; outcomes are non-binding flavor hints; the
   text-only branch is deleted; the classifier left the hot path. Under full
   local agency the run envelope is always Acting (`auth.set_read_only(false)`);

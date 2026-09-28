@@ -252,9 +252,9 @@ pub enum Message {
     ToastExpiryTick,
     /// User decision on the acknowledgement (no-undo) dialog.
     AckDialog(capability_dialog::AckDialogMessage),
-    /// User decision on the intent confirmation dialog (ADR-55 §1).
+    /// User decision on the intent confirmation dialog (ADR-55 §2).
     IntentDialog(capability_dialog::IntentDialogMessage),
-    /// User decision on the plan approval dialog (ADR-55 Phase 1d).
+    /// User decision on the plan approval dialog (ADR-55 §4).
     PlanDialog(capability_dialog::PlanDialogMessage),
 }
 
@@ -295,9 +295,9 @@ pub struct App {
     // Capability approval dialog state
     pub cap_pending: capability_dialog::SharedPending,
     pub pending_ack: capability_dialog::SharedPendingAck,
-    /// Pending intent confirmations (ADR-55 §1), FIFO queue.
+    /// Pending intent confirmations (ADR-55 §2), FIFO queue.
     pub pending_intent: capability_dialog::SharedPendingIntent,
-    /// Pending plan approvals (ADR-55 Phase 1d), FIFO queue.
+    /// Pending plan approvals (ADR-55 §4), FIFO queue.
     pub pending_plan: capability_dialog::SharedPendingPlan,
 
     pub bus: concerto_core::event::EventBus,
@@ -316,7 +316,7 @@ pub struct App {
     pub plugin_manager: SharedPluginManager,
     pub cancel_token: concerto_core::CancellationToken,
     pub run_status: RunStatus,
-    /// Current intent-router stage of the active run (ADR-55 Phase 2a),
+    /// Current intent-router stage of the active run (ADR-55 §9),
     /// rendered as the status-bar run-stage chip. `Some` only while
     /// `run_status == RunStatus::Running`; it is set by
     /// `DesktopEvent::RunStageChanged` (guarded by the run status) and cleared
@@ -1783,7 +1783,7 @@ impl App {
                 // audit H-04).
                 let session_id = {
                     let guard = self.pending_ack.lock().unwrap_or_else(|e| e.into_inner());
-                    guard.as_ref().map(|ack| ack.session_id)
+                    guard.front().map(|ack| ack.session_id)
                 };
                 if let Some(session_id) = session_id {
                     let acknowledged =
@@ -1847,6 +1847,12 @@ impl App {
                         // arm is guarded on the run status, so a non-Running
                         // run falls through to the `_` catch-all.
                         self.run_stage = Some(*stage);
+                    }
+                    crate::runtime::DesktopEvent::ErrorOccurred { message } => {
+                        // A backend refusal (e.g. a full ack queue) must be
+                        // visible: surface it as an error toast rather than a
+                        // silent log line.
+                        self.toasts.push(ToastLevel::Error, message.clone());
                     }
                     _ => {}
                 }
@@ -2309,7 +2315,7 @@ impl App {
             return Some("no providers are configured".to_string());
         }
         let creds = CredentialStore::new();
-        // The intent gate is always on (ADR-55 Phase 1e): there is no mode
+        // The intent gate is always on (ADR-55 §7): there is no mode
         // picker, so every run is a potential Execute regardless of the chat
         // outcome the router eventually classifies. Validate the active
         // (composer) provider unconditionally and check every agent
@@ -2695,7 +2701,7 @@ impl App {
             async move {
                 concerto_providers::list_models_for_provider_async(
                     &provider_type,
-                    &api_key,
+                    api_key.expose(),
                     api_base.as_deref(),
                 )
                 .await
@@ -4268,7 +4274,7 @@ impl App {
                 });
             stack![after_subview, backdrop].into()
         } else if let Some(intent_dlg) = capability_dialog::intent_view(&self.pending_intent) {
-            // Intent confirmation modal (ADR-55 §1), mirroring the capability
+            // Intent confirmation modal (ADR-55 §2), mirroring the capability
             // and ack dialogs: a centered card over a dimmed palette backdrop.
             let backdrop = container(intent_dlg.map(Message::IntentDialog))
                 .width(Length::Fill)
@@ -4286,7 +4292,7 @@ impl App {
         } else if let Some(plan_dlg) =
             capability_dialog::plan_view(&self.pending_plan, &self.current_theme)
         {
-            // Plan approval modal (ADR-55 Phase 1d), mirroring the intent
+            // Plan approval modal (ADR-55 §4), mirroring the intent
             // dialog: a centered card over a dimmed palette backdrop.
             let backdrop = container(plan_dlg.map(Message::PlanDialog))
                 .width(Length::Fill)
@@ -4746,33 +4752,37 @@ impl ApprovalSink for DesktopApprovalSink {
         }
         let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
 
-        {
-            let mut guard = self.pending_ack.lock().unwrap_or_else(|e| e.into_inner());
-            if guard.is_some() {
-                // ADR-68 H-04 single-slot decision (this phase): the desktop
-                // renders one ack dialog at a time. A second concurrent ack is
-                // rejected as "busy" — the requester sees `false` (abort the
-                // task) and the conflict is logged. ADR-68 §6 records a bounded
-                // per-session queue as the follow-up; reject-busy avoids
-                // redesigning the shared cell here.
-                tracing::warn!(
-                    ?session_id,
-                    "request_ack rejected: another ack dialog is already pending (desktop is \
-                     single-slot; ADR-68 H-04)"
-                );
-                return false;
-            }
-            *guard = Some(crate::widgets::capability_dialog::PendingAck {
+        // Queue the ack for display. The queue is depth-bounded (ADR-68 §6,
+        // DEFERRED row 4): the active dialog plus at most one queued. A full
+        // queue or unreadable state is an EXPLICIT refusal — the request is
+        // never silently dropped, so the task aborts (fail-closed) rather than
+        // proceeding without the acknowledgement it asked for.
+        if let Err(error) = crate::widgets::capability_dialog::enqueue_ack(
+            &self.pending_ack,
+            crate::widgets::capability_dialog::PendingAck {
                 session_id,
                 message: message.to_string(),
                 sender: tx,
+            },
+        ) {
+            tracing::warn!(
+                ?session_id,
+                %error,
+                "request_ack refused; aborting the task (fail-closed, ADR-68 H-04)"
+            );
+            // Surface the named refusal to the UI (rendered as an error toast)
+            // so the user can tell "refused because the queue was full" from a
+            // user cancel.
+            let _ = self.bus.publish_raw(concerto_core::event::EventKind::ErrorOccurred {
+                message: format!("Acknowledgement refused: {error}"),
             });
+            return false;
         }
 
         // Surface the pending ack to the UI via the event bus so Iced redraws.
-        // Global event: the ack dialog is a single shared slot, so any window
-        // shows it; the pending entry now carries `session_id` so resolution
-        // is routed by session membership (`resolve_ack`).
+        // Global event: the ack queue is a single shared FIFO, so any window
+        // shows the front entry; the pending entry carries `session_id` so
+        // resolution is routed by session membership (`resolve_ack`).
         let _ = self.bus.publish_raw(concerto_core::event::EventKind::ApprovalRequested {
             tool_name: "ack".to_string(),
             timeout_secs: 0,
@@ -6105,7 +6115,7 @@ custom_agents = []
     }
 
     // -----------------------------------------------------------------------
-    // AgentMode tests (ADR-55 Phase 1e: the mode picker is gone; the intent
+    // AgentMode tests (ADR-55 §7: the mode picker is gone; the intent
     // gate derives the effective outcome instead of a persisted mode).
     // -----------------------------------------------------------------------
 
@@ -6283,7 +6293,7 @@ custom_agents = []
         assert_eq!(super::format_run_summary(&plain), "All done");
     }
 
-    // ── Run-stage chip (ADR-55 Phase 2a) ───────────────────────────────────
+    // ── Run-stage chip (ADR-55 §9) ───────────────────────────────────
 
     /// A `RunStageChanged` event while a run is in flight arms the chip.
     #[test]
@@ -6452,7 +6462,7 @@ custom_agents = []
             },
         ];
 
-        // The intent gate is always on (ADR-55 Phase 1e): every run is a
+        // The intent gate is always on (ADR-55 §7): every run is a
         // potential Execute, so an incomplete specialist assignment blocks
         // dispatch — there is no mode picker to narrow the check.
         assert!(
@@ -7206,6 +7216,7 @@ custom_agents = []
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         }
     }
 
@@ -7356,7 +7367,7 @@ custom_agents = []
     /// fails the test instead of hanging forever.
     async fn wait_for_pending_ack(shared: &crate::widgets::capability_dialog::SharedPendingAck) {
         for _ in 0..500 {
-            if shared.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+            if !shared.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
                 return;
             }
             tokio::task::yield_now().await;
@@ -7390,7 +7401,7 @@ custom_agents = []
         // confirm membership (ADR-68, audit H-04).
         let pending_session = {
             let guard = pending_ack.lock().unwrap_or_else(|e| e.into_inner());
-            guard.as_ref().expect("ack must be pending").session_id
+            guard.front().expect("ack must be pending").session_id
         };
         assert_eq!(pending_session, session_id, "pending ack must carry the session id");
 
@@ -7400,26 +7411,32 @@ custom_agents = []
         );
         assert!(handle.await.expect("ack task panicked"), "an approved ack continues");
         assert!(
-            pending_ack.lock().unwrap_or_else(|e| e.into_inner()).is_none(),
+            pending_ack.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
             "after resolve no ack should be pending"
         );
     }
 
+    /// Shown / queued / refused, end to end through the sink (ADR-68 §6,
+    /// DEFERRED row 4): the first ack is shown, a second is queued behind it,
+    /// and a third — beyond the bounded depth — is explicitly refused
+    /// (fail-closed, `false`) instead of being dropped or displacing an entry.
     #[tokio::test]
-    async fn approval_sink_request_ack_rejects_when_busy() {
+    async fn approval_sink_request_ack_queues_then_refuses_overflow() {
         let cap_pending = crate::widgets::capability_dialog::shared_pending();
         let pending_ack = crate::widgets::capability_dialog::shared_pending_ack();
+        let bus = EventBus::default();
+        let mut events = bus.subscribe();
         let sink = DesktopApprovalSink {
             cap_pending: cap_pending.clone(),
             pending_ack: pending_ack.clone(),
             pending_intent: crate::widgets::capability_dialog::shared_pending_intent(),
             pending_plan: crate::widgets::capability_dialog::shared_pending_plan(),
             auto_approve: Arc::new(AtomicBool::new(false)),
-            bus: EventBus::default(),
+            bus,
         };
         let cancel = CancellationToken::new();
 
-        // First request occupies the single ack slot.
+        // Shown: the first request occupies the active slot.
         let first_session = Ulid::new();
         let sink_first = sink.clone();
         let cancel_first = cancel.clone();
@@ -7428,17 +7445,61 @@ custom_agents = []
         });
         wait_for_pending_ack(&pending_ack).await;
 
-        // A second concurrent ack (any session) is rejected as busy without
-        // overwriting the pending one; the requester sees `false` (abort).
-        let second = sink.request_ack(Ulid::new(), "second warning", cancel.clone()).await;
-        assert!(!second, "concurrent ack while busy must be rejected");
+        // Queued: a second request (different session) waits behind the first
+        // rather than overwriting it.
+        let second_session = Ulid::new();
+        let sink_second = sink.clone();
+        let cancel_second = cancel.clone();
+        let second = tokio::spawn(async move {
+            sink_second.request_ack(second_session, "second warning", cancel_second).await
+        });
+        for _ in 0..500 {
+            if pending_ack.lock().unwrap_or_else(|e| e.into_inner()).len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            pending_ack.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            crate::widgets::capability_dialog::MAX_PENDING_ACKS,
+            "the second ack must be queued, not refused or overwritten"
+        );
 
-        // The owner can still resolve its ack.
+        // Refused: a third request exceeds the bound and fails closed.
+        let third = sink.request_ack(Ulid::new(), "third warning", cancel.clone()).await;
+        assert!(!third, "an ack beyond the bounded depth must be refused (abort)");
+        assert_eq!(
+            pending_ack.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            crate::widgets::capability_dialog::MAX_PENDING_ACKS,
+            "a refused ack must not grow the queue"
+        );
+
+        // The refusal is visible: an ErrorOccurred event carries the named error.
+        let mut refusal_seen = false;
+        while let Ok(event) = events.try_recv() {
+            if let EventKind::ErrorOccurred { message } = &event.kind {
+                if message.contains("queue is full") {
+                    refusal_seen = true;
+                }
+            }
+        }
+        assert!(refusal_seen, "a refused ack must publish an ErrorOccurred event");
+
+        // FIFO: the first, then the second, resolve in order.
         assert!(
             crate::widgets::capability_dialog::resolve_ack(&pending_ack, first_session, true),
-            "the owner's ack must still resolve"
+            "the active first ack resolves first"
         );
         assert!(first.await.expect("first ack task panicked"), "the first ack continues");
+        assert!(
+            crate::widgets::capability_dialog::resolve_ack(&pending_ack, second_session, false),
+            "the queued second ack resolves next"
+        );
+        assert!(!second.await.expect("second ack task panicked"), "the second ack aborts");
+        assert!(
+            pending_ack.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "the queue drains in order"
+        );
     }
 
     #[tokio::test]
@@ -7552,7 +7613,7 @@ custom_agents = []
     }
 
     // -----------------------------------------------------------------------
-    // request_intent_confirmation (ADR-55 §1)
+    // request_intent_confirmation (ADR-55 §2)
     // -----------------------------------------------------------------------
 
     /// Wait until the sink's request future has queued a dialog on
@@ -7706,7 +7767,7 @@ custom_agents = []
     }
 
     // -----------------------------------------------------------------------
-    // request_plan_approval (ADR-55 Phase 1d)
+    // request_plan_approval (ADR-55 §4)
     // -----------------------------------------------------------------------
 
     /// Wait until the sink's request future has queued a dialog on

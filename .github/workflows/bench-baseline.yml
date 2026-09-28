@@ -1,0 +1,198 @@
+# Second tier of the benchmark gate.
+#
+# The per-PR `bench` job in ci.yml proves only that every benchmark compiles
+# and runs (deterministic, no timing assertion). This workflow carries the
+# timing signal: it runs the full criterion suite on a shared runner and
+# compares each benchmark against a previously captured baseline.
+#
+# It deliberately does NOT run on pull requests. Criterion measurements on
+# shared GitHub runners are noisy enough that a percentage threshold on every
+# PR would produce red builds that mean nothing; the tier-1 job still catches
+# benchmark rot on every PR. This runs weekly and on demand, where a red run is
+# a signal to investigate rather than a merge blocker.
+#
+# Gate and tolerance
+#   * A benchmark counts as a regression when its mean change exceeds
+#     BENCH_REGRESSION_THRESHOLD_PCT (default 25%). The job fails on any
+#     regression past that tolerance and prints the offending benchmarks.
+#   * The generous tolerance is intentional: it filters runner noise while
+#     still catching large, real slowdowns. Lower it only once the measurements
+#     here are known to be stable.
+#
+# Baseline storage and how to update it
+#   * Baseline data is criterion's own output under target/criterion, which the
+#     root /target rule keeps out of git; it is persisted between runs by
+#     actions/cache and is never committed.
+#   * On a cache miss the job saves a fresh baseline and skips comparison.
+#   * To re-baseline after an intentional performance change, run this workflow
+#     manually (Actions -> "Benchmarks (baseline comparison)" -> Run workflow)
+#     with update_baseline checked; the run is saved as the new baseline.
+#   * Baseline and comparison must use identical criterion settings; this
+#     workflow always uses criterion's defaults for both.
+
+name: Benchmarks (baseline comparison)
+
+on:
+  schedule:
+    # Weekly, Monday 06:00 UTC.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      update_baseline:
+        description: Save this run as the new baseline instead of comparing against the old one
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental compilation artifacts are machine-local and must not poison
+  # shared caches; disabling keeps builds reproducible across runners.
+  CARGO_INCREMENTAL: "0"
+  # Criterion distinguishes saved baselines by name; keep it stable.
+  BENCH_BASELINE: ci-baseline
+  # Percent mean change above which a benchmark is reported as a regression.
+  BENCH_REGRESSION_THRESHOLD_PCT: "25"
+
+jobs:
+  bench-baseline:
+    name: Criterion baseline comparison
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.96.0)
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: wasm32-wasip2
+
+      - name: Install system dependencies (dbus, ssl, sqlite, pkg-config)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config libssl-dev libsqlite3-dev
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      # Criterion's estimates (including the saved baseline) live under
+      # target/criterion. Persist that subtree under a stable prefix; the run id
+      # in the primary key lets an update_baseline run write a fresh entry that
+      # later runs pick up through restore-keys.
+      - name: Restore criterion baseline
+        uses: actions/cache/restore@v4
+        with:
+          path: target/criterion
+          key: criterion-baseline-${{ env.BENCH_BASELINE }}-${{ github.run_id }}
+          restore-keys: |
+            criterion-baseline-${{ env.BENCH_BASELINE }}-
+
+      - name: Select benchmark mode
+        id: mode
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] \
+            && [ "${{ github.event.inputs.update_baseline }}" = "true" ]; then
+            echo "mode=save" >> "${GITHUB_OUTPUT}"
+            echo "update_baseline requested; saving a fresh baseline."
+          elif find target/criterion -type d -name "${BENCH_BASELINE}" -print -quit 2>/dev/null | grep -q .; then
+            echo "mode=compare" >> "${GITHUB_OUTPUT}"
+            echo "Cached baseline found; comparing against it."
+          else
+            echo "mode=save" >> "${GITHUB_OUTPUT}"
+            echo "No cached baseline found; saving a fresh one."
+          fi
+
+      # Bench targets are discovered from the workspace manifests rather than
+      # listed by hand, so a newly added [[bench]] is covered automatically.
+      # They are selected individually because a bare `cargo bench --workspace`
+      # also builds each crate's lib bench harness, which runs that crate's unit
+      # tests in bench mode — duplicating the `test` job and adding failures
+      # unrelated to the benchmarks.
+      - name: Compile and run benchmarks (save baseline)
+        if: steps.mode.outputs.mode == 'save'
+        run: |
+          set -euo pipefail
+          mapfile -t bench_names < <(
+            cargo metadata --no-deps --format-version 1 \
+              | python3 -c 'import json, sys; d = json.load(sys.stdin); print("\n".join(sorted({t["name"] for p in d["packages"] for t in p["targets"] if "bench" in t["kind"]})))'
+          )
+          bench_args=()
+          for name in "${bench_names[@]}"; do
+            bench_args+=(--bench "${name}")
+          done
+          echo "Saving baseline '${BENCH_BASELINE}' for: ${bench_names[*]}"
+          cargo bench --workspace "${bench_args[@]}" -- --save-baseline "${BENCH_BASELINE}"
+
+      - name: Compile and run benchmarks (compare against baseline)
+        if: steps.mode.outputs.mode == 'compare'
+        run: |
+          set -euo pipefail
+          mapfile -t bench_names < <(
+            cargo metadata --no-deps --format-version 1 \
+              | python3 -c 'import json, sys; d = json.load(sys.stdin); print("\n".join(sorted({t["name"] for p in d["packages"] for t in p["targets"] if "bench" in t["kind"]})))'
+          )
+          bench_args=()
+          for name in "${bench_names[@]}"; do
+            bench_args+=(--bench "${name}")
+          done
+          echo "Comparing against baseline '${BENCH_BASELINE}' for: ${bench_names[*]}"
+          cargo bench --workspace "${bench_args[@]}" -- --baseline "${BENCH_BASELINE}"
+
+      # Criterion writes one change/estimates.json per compared benchmark under
+      # target/criterion/<group>/<bench>/change/. Fail only when the mean change
+      # exceeds the tolerance; everything else is reported for context.
+      - name: Evaluate regressions against tolerance
+        if: steps.mode.outputs.mode == 'compare'
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          threshold = float(os.environ["BENCH_REGRESSION_THRESHOLD_PCT"])
+          changes = []
+          for path in pathlib.Path("target/criterion").rglob("change/estimates.json"):
+              mean = json.loads(path.read_text()).get("mean", {}).get("point_estimate")
+              if mean is None:
+                  continue
+              group = path.parent.parent.parent.name
+              bench = path.parent.parent.name
+              changes.append((group, bench, mean * 100.0))
+
+          if not changes:
+              print("No change estimates found; nothing to compare.")
+              sys.exit(0)
+
+          changes.sort(key=lambda c: c[2], reverse=True)
+          for group, bench, pct in changes[:20]:
+              print(f"{pct:+8.1f}%  {group}/{bench}")
+          print(f"\n{len(changes)} benchmarks compared; tolerance {threshold:.0f}%")
+
+          regressions = [c for c in changes if c[2] > threshold]
+          if regressions:
+              print(f"::error::{len(regressions)} benchmark(s) regressed beyond {threshold:.0f}%:")
+              for group, bench, pct in regressions:
+                  print(f"  {group}/{bench}: {pct:+.1f}%")
+              sys.exit(1)
+          print("All benchmarks within tolerance.")
+          PY
+
+      - name: Upload criterion report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-report
+          path: target/criterion
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Save criterion baseline
+        if: steps.mode.outputs.mode == 'save'
+        uses: actions/cache/save@v4
+        with:
+          path: target/criterion
+          key: criterion-baseline-${{ env.BENCH_BASELINE }}-${{ github.run_id }}

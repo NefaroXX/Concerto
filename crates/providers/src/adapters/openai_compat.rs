@@ -19,10 +19,87 @@
 //! present. Captured reasoning is always echoed verbatim; it is never rebuilt
 //! from prose.
 
-use concerto_core::types::{CompletionRequest, Message, Role, ToolChoice, ToolDefinition};
+use concerto_core::types::{
+    CompletionRequest, CompletionUsage, Message, Role, ToolChoice, ToolDefinition,
+};
 
 use super::schema_sanitize::sanitize_tool_schema;
 use super::{Dialect, ReasoningEcho};
+
+/// How an OpenAI-compatible connector asks its endpoint to report
+/// provider-reported usage (ADR-48 §4).
+///
+/// The family's *response* side is uniform — a top-level `usage` object — but
+/// the *request* side is not: OpenAI documents
+/// `stream_options: {"include_usage": true}`, OpenRouter documents a top-level
+/// `usage: {"include": true}`, and not every gateway in the family documents
+/// either. The policy therefore names an endpoint contract, so it is a
+/// connector-level concern applied **after** [`Dialect::render_chat_body`]
+/// rather than a dialect-level one: [`UsageRequest::Off`] (the default) leaves
+/// every uncovered endpoint byte-identical to the pre-wiring body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UsageRequest {
+    /// Send no usage-request member: the rendered body stays byte-identical
+    /// to the pre-wiring output. The connector still captures a `usage`
+    /// object whenever the endpoint reports one unsolicited (fail-soft — a
+    /// missing report keeps `None`, never an error).
+    #[default]
+    Off,
+    /// Streamed requests carry `stream_options: {"include_usage": true}`,
+    /// OpenAI's documented switch for the trailing usage chunk. Non-streamed
+    /// responses already carry `usage`, so nothing is added there.
+    IncludeStreamUsage,
+    /// OpenRouter's documented switch: top-level `usage: {"include": true}`.
+    /// OpenRouter's contract is the `usage` object, so `stream_options` is
+    /// deliberately not sent.
+    OpenRouter,
+}
+
+impl UsageRequest {
+    /// Apply this policy to a rendered request body.
+    ///
+    /// `streaming` is the body's own `stream` flag after any connector
+    /// rewrite (the weak-model tier forces `stream: false`), so a
+    /// non-streamed request is left byte-identical in every mode. Applying
+    /// the policy twice overwrites the same member with the same value.
+    pub fn apply(self, body: &mut serde_json::Value, streaming: bool) {
+        if !streaming {
+            return;
+        }
+        match self {
+            Self::Off => {}
+            Self::IncludeStreamUsage => {
+                body["stream_options"] = serde_json::json!({ "include_usage": true });
+            }
+            Self::OpenRouter => {
+                body["usage"] = serde_json::json!({ "include": true });
+            }
+        }
+    }
+}
+
+/// Map a top-level OpenAI-compatible `usage` object onto the canonical
+/// [`CompletionUsage`] (ADR-48 §4).
+///
+/// Shared by every connector in the family — OpenAI, OpenRouter, and the
+/// delegating gateways — because the response payload is uniformly
+/// `{prompt_tokens, completion_tokens, ...}`; extra members (OpenRouter's
+/// `cost`/`native_usage`, DeepSeek's `prompt_cache_hit_tokens`, ...) are
+/// ignored.
+///
+/// Fail-soft contract: `None` when the payload carries no `usage` object,
+/// when the object carries no token counts, or when a count is not a JSON
+/// unsigned integer — a missing count means "not reported", never an error.
+/// `None` and `0` are never coalesced: `0` is a legitimate measured value.
+pub fn map_usage(payload: &serde_json::Value) -> Option<CompletionUsage> {
+    let usage = payload.get("usage")?.as_object()?;
+    let prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64());
+    let completion_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64());
+    if prompt_tokens.is_none() && completion_tokens.is_none() {
+        return None;
+    }
+    Some(CompletionUsage { prompt_tokens, completion_tokens })
+}
 
 /// The OpenAI-compatible chat dialect (`/chat/completions`).
 ///
@@ -928,6 +1005,149 @@ mod tests {
         assert!(
             body.as_object().is_some_and(|obj| !obj.contains_key("cache_control")),
             "no cache_control may appear anywhere in an openai-compat body"
+        );
+    }
+
+    // -- ADR-48 §4: usage request policies ---------------------------------
+
+    /// Render a minimal streamed body so the usage-request tests assert the
+    /// real dialect output, not a synthetic object.
+    fn rendered_streaming_body() -> serde_json::Value {
+        let request = CompletionRequest {
+            stream: true,
+            messages: vec![Message {
+                role: Role::User,
+                content: "Hello".into(),
+                tool_calls: None,
+                tool_results: None,
+                reasoning_content: None,
+                tokens_in: None,
+                tokens_out: None,
+            }],
+            ..Default::default()
+        };
+        render(&request, ReasoningEcho::IfPresent)
+    }
+
+    /// The default policy must leave the wire body byte-for-byte unchanged:
+    /// endpoints that were never explicitly covered keep their pre-wiring bytes.
+    #[test]
+    fn usage_request_off_leaves_body_byte_identical() {
+        let mut body = rendered_streaming_body();
+        let before = serde_json::to_string(&body).expect("body serializes");
+        UsageRequest::Off.apply(&mut body, true);
+
+        assert_eq!(
+            serde_json::to_string(&body).expect("body serializes"),
+            before,
+            "UsageRequest::Off must not mutate the rendered body",
+        );
+        assert!(body.get("stream_options").is_none(), "no stream_options from Off");
+        assert!(body.get("usage").is_none(), "no usage request member from Off");
+    }
+
+    /// OpenAI's documented switch: streamed requests carry
+    /// `stream_options.include_usage`; the member is absent on non-streamed
+    /// requests (which already report `usage` in the response body).
+    #[test]
+    fn include_stream_usage_adds_stream_options_only_when_streaming() {
+        let mut streamed = rendered_streaming_body();
+        UsageRequest::IncludeStreamUsage.apply(&mut streamed, true);
+        assert_eq!(
+            streamed["stream_options"]["include_usage"], true,
+            "streamed OpenAI requests must ask for the trailing usage chunk"
+        );
+
+        let mut non_streamed = rendered_streaming_body();
+        UsageRequest::IncludeStreamUsage.apply(&mut non_streamed, false);
+        assert!(
+            non_streamed.get("stream_options").is_none(),
+            "non-streamed requests must stay byte-identical"
+        );
+    }
+
+    /// OpenRouter's documented switch: a top-level `usage.include`, and
+    /// deliberately no `stream_options` (OpenRouter's contract is `usage`).
+    #[test]
+    fn openrouter_mode_adds_usage_include_without_stream_options() {
+        let mut body = rendered_streaming_body();
+        UsageRequest::OpenRouter.apply(&mut body, true);
+
+        assert_eq!(body["usage"]["include"], true, "OpenRouter must ask for usage.include");
+        assert!(body.get("stream_options").is_none(), "OpenRouter must not receive stream_options");
+    }
+
+    /// Re-applying a policy is idempotent — the member is overwritten with
+    /// the same value, so a double-applied body equals a single-applied one.
+    #[test]
+    fn usage_request_apply_is_idempotent() {
+        let mut once = rendered_streaming_body();
+        UsageRequest::IncludeStreamUsage.apply(&mut once, true);
+        let mut twice = once.clone();
+        UsageRequest::IncludeStreamUsage.apply(&mut twice, true);
+
+        assert_eq!(once, twice, "applying a usage policy twice must be a no-op");
+    }
+
+    // -- ADR-48 §4: usage mapping ------------------------------------------
+
+    #[test]
+    fn map_usage_reads_openai_counts() {
+        let payload = serde_json::json!({"usage": {"prompt_tokens": 42, "completion_tokens": 7}});
+        assert_eq!(
+            map_usage(&payload),
+            Some(CompletionUsage { prompt_tokens: Some(42), completion_tokens: Some(7) })
+        );
+    }
+
+    /// Extra members (OpenRouter `cost`, DeepSeek cache counters, ...) are
+    /// ignored; the canonical pair is what survives.
+    #[test]
+    fn map_usage_ignores_extra_members() {
+        let payload = serde_json::json!({
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 0,
+                "total_tokens": 5,
+                "cost": 0.00042,
+                "native_usage": {"prompt_tokens": 5},
+            }
+        });
+        assert_eq!(
+            map_usage(&payload),
+            Some(CompletionUsage { prompt_tokens: Some(5), completion_tokens: Some(0) }),
+            "0 is a measured value and must survive; extra members must be dropped",
+        );
+    }
+
+    /// Fail-soft: no `usage` member at all means "not reported", never an
+    /// error and never a fabricated `0`.
+    #[test]
+    fn map_usage_missing_usage_returns_none() {
+        assert_eq!(map_usage(&serde_json::json!({"choices": []})), None);
+        assert_eq!(map_usage(&serde_json::json!({"usage": null})), None);
+        assert_eq!(map_usage(&serde_json::json!({"usage": "n/a"})), None);
+    }
+
+    /// Fail-soft: a counts-less `usage` object is not a measurement.
+    #[test]
+    fn map_usage_without_counts_returns_none() {
+        assert_eq!(map_usage(&serde_json::json!({"usage": {}})), None);
+        assert_eq!(map_usage(&serde_json::json!({"usage": {"reasoning_tokens": 3}})), None);
+    }
+
+    /// Fail-soft: a non-integer count is not parsed into one — `None` keeps
+    /// the adapter's "never error on a shape we don't recognise" contract.
+    #[test]
+    fn map_usage_non_integer_counts_returns_none() {
+        assert_eq!(map_usage(&serde_json::json!({"usage": {"prompt_tokens": "42"}})), None);
+        assert_eq!(map_usage(&serde_json::json!({"usage": {"prompt_tokens": 42.5}})), None);
+        assert_eq!(
+            map_usage(
+                &serde_json::json!({"usage": {"prompt_tokens": null, "completion_tokens": 7}})
+            ),
+            Some(CompletionUsage { prompt_tokens: None, completion_tokens: Some(7) }),
+            "one reported count is enough to surface usage",
         );
     }
 }

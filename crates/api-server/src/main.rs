@@ -102,7 +102,9 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("concerto-api-server listening on http://{oml}", oml = addr);
 
-    axum::serve(listener, app).await?;
+    // Connect info lets the rate-limit middleware key clients on their peer
+    // IP (per-client 429s); without it every request would be unkeyed.
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
 
     Ok(())
 }

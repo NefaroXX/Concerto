@@ -10,7 +10,7 @@
 
 ## 2. Context & motivation
 
-The original product vision was an "intelligent orchestrator" with a "fully configurable orchestration studio" (tool-calling is policy-gated; agents themselves are the product surface). `docs/ARCHITECTURE-V2.md` states the governing principle: **"Everything is config data"** — providers, models, roles, tools, permissions, budgets. `docs/STATUS.md` separately calls out "configurable directed relationships and cycle limits; per-role provider/model assignments." ADR-49 already ships the everything-is-data precedent (providers as data feed the model catalog); ADR-35 replaced hardcoded role IDs with *stage tags*, but only as a vocabulary — the semantics behind those tags stayed hardcoded.
+The original product vision was an "intelligent orchestrator" with a "fully configurable orchestration studio" (tool-calling is policy-gated; agents themselves are the product surface). `docs/research/ARCHITECTURE-V2.md` states the governing principle: **"Everything is config data"** — providers, models, roles, tools, permissions, budgets. `docs/STATUS.md` separately calls out "configurable directed relationships and cycle limits; per-role provider/model assignments." ADR-49 already ships the everything-is-data precedent (providers as data feed the model catalog); ADR-35 replaced hardcoded role IDs with *stage tags*, but only as a vocabulary — the semantics behind those tags stayed hardcoded.
 
 The five-stage model was a good first attempt. It shipped, however, as **hardcoded semantics with an inferior-era implementation**: exactly five strings have engine meaning, every other string silently degrades to "freeform run-once," and the coordinator branches on those strings in ~20 places. The drift is visible in the inverted authority layer: capability flags and stage tags are configured side by side, but the engine decides writing rights by role-tag identity (see §3), so config is ceremony around a hardcoded machine.
 
@@ -245,7 +245,7 @@ Studio / editors:
 
 Internal references quoted in §2/§3 (repo-local, at time of writing):
 
-- `docs/ARCHITECTURE-V2.md` (§3 "Everything is config data")
+- `docs/research/ARCHITECTURE-V2.md` (§3 "Everything is config data")
 - `docs/STATUS.md` ("configurable directed relationships and cycle limits")
 - `docs/adrs/ADR-35.md` (stage-tag vocabulary, §5 lifecycle), `docs/adrs/ADR-52-orchestration-safety-gates.md` (plan artifacts, run caps), `docs/adrs/ADR-44.md` (project-root consent), `docs/adrs/ADR-49-config-first-catalog.md` (providers-as-data precedent), `docs/adrs/ADR-57-config-change-propagation.md` (watcher + CLI reload)
 - Code anchors captured in §3.

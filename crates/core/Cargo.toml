@@ -22,6 +22,7 @@ schemars = "1"
 
 thiserror = { workspace = true }
 async-trait = { workspace = true }
+zeroize = { workspace = true }
 
 fd-lock = { workspace = true }
 

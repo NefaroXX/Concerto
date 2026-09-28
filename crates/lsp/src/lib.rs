@@ -28,6 +28,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_lsp_manager_get_or_start() {
+        // Serialise against every other test that touches the global manager map.
+        let _guard = crate::manager::MANAGER_TEST_LOCK.lock().await;
         let cancel = CancellationToken::new();
 
         // Create a test project directory
@@ -45,6 +47,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_lsp_manager_stop_all() {
+        // Serialise against every other test that touches the global manager map;
+        // `stop_all` drains the whole map, so it must not run concurrently with
+        // the cache assertions in `manager::tests`.
+        let _guard = crate::manager::MANAGER_TEST_LOCK.lock().await;
         let cancel = CancellationToken::new();
 
         // Initialize a client to ensure the manager has content
@@ -92,6 +98,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_lsp_manager_different_projects() {
+        // Serialise against every other test that touches the global manager map.
+        let _guard = crate::manager::MANAGER_TEST_LOCK.lock().await;
         let cancel = CancellationToken::new();
 
         // Create two different project directories

@@ -2,11 +2,11 @@
 
 **Status:** Minimal scope merged on `dev` (PR #49, 2026-07-24); medium scope
 merged on `dev` (PR #97, 2026-08-03); full scope pending
-(see [TODO.md](TODO.md))
+(see `docs/DEFERRED.md` row 37)
 **Author:** AI-assessed 2026-07-24; status refreshed 2026-08-03  
 **Target:** Pre-release or post-1.0 polish
 
-This document captures the architectural shift from flat page-based navigation to a chat-centric layout where supporting views become inline panels, modals, and sidebar sections. Minimal scope (SubView overlays for Diff, Agent Graph, Tool Log) is merged on `dev` via PR #49 (commit `9bfac84`, 2026-07-24). Medium scope is merged on `dev` via PR #97 (merge `19cf7e2`, 2026-08-03) — terminal bottom panel with drag resize, Memory Explorer as a compact quick-panel section, glass modals and overlay/panel animations, chat timestamps with transcript format v2, blinking streaming cursor. Full scope remains pending and is tracked in [TODO.md](TODO.md).
+This document captures the architectural shift from flat page-based navigation to a chat-centric layout where supporting views become inline panels, modals, and sidebar sections. Minimal scope (SubView overlays for Diff, Agent Graph, Tool Log) is merged on `dev` via PR #49 (commit `9bfac84`, 2026-07-24). Medium scope is merged on `dev` via PR #97 (merge `19cf7e2`, 2026-08-03) — terminal bottom panel with drag resize, Memory Explorer as a compact quick-panel section, glass modals and overlay/panel animations, chat timestamps with transcript format v2, blinking streaming cursor. Full scope remains pending and is tracked in `docs/DEFERRED.md` row 37.
 
 ---
 

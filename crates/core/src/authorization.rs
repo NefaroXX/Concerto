@@ -1,6 +1,6 @@
 //! ADR-55: intent tiers and the authorization seam for the policy gate.
 //!
-//! This is batch 1c of the three-generation gate (ADR-55 §2). It reworks the
+//! This is batch 1c of the three-generation gate (ADR-55 §3). It reworks the
 //! batch-1a seam into a *verdict source* the policy engine maps mechanically:
 //!
 //! - [`IntentTier`] — the three capability tiers (Observe / MutateLocal /
@@ -20,7 +20,7 @@
 use crate::types::PolicyAction;
 use std::borrow::Cow;
 
-/// The three capability tiers an action falls into (ADR-55 §2).
+/// The three capability tiers an action falls into (ADR-55 §3).
 ///
 /// `Observe` needs no authorization, `MutateLocal` is authorizable *in scope*
 /// only, and `Consequential` sits outside what any blanket grant can cover —
@@ -71,16 +71,16 @@ pub enum IntentVerdict {
 }
 
 /// Audit `rule_matched` value for Observe-tier actions auto-allowed through
-/// the gate (ADR-55 §2).
+/// the gate (ADR-55 §3).
 pub const RULE_OBSERVE: &str = "observe";
 
 /// Audit `rule_matched` value when the intent gate upgrades
-/// `RequireApproval` → `Allow` for an in-scope grantable mutation (ADR-55 §2).
+/// `RequireApproval` → `Allow` for an in-scope grantable mutation (ADR-55 §3).
 pub const RULE_INTENT_AUTHORIZED: &str = "intent_authorized";
 
 /// Audit `rule_matched` value when the intent gate upgrades
 /// `RequireApproval` → `Allow` for a project-bounded `shell` command under
-/// an Acting grant (ADR-55 shell scope amendment; F4 — security review 2026-
+/// an Acting grant (ADR-55 §3; F4 — security review 2026-
 /// 09-09). Deliberately DISTINCT from [`RULE_INTENT_AUTHORIZED`]: a shell
 /// auto-approval must be individually auditable, and filesystem upgrades
 /// keep the original shared rule.
@@ -88,7 +88,7 @@ pub const RULE_INTENT_AUTHORIZED_SHELL: &str = "intent_authorized_shell";
 
 /// Audit `rule_matched` value when the intent gate upgrades
 /// `RequireApproval` → `Allow` for an ORCHESTRATION/delegation tool call
-/// (`call_specialist`) under an Acting grant (ADR-55 scope amendment,
+/// (`call_specialist`) under an Acting grant (ADR-55 §3,
 /// delegation coverage). Deliberately DISTINCT from [`RULE_INTENT_AUTHORIZED`]
 /// (files/git) and [`RULE_INTENT_AUTHORIZED_SHELL`]: a delegation
 /// auto-approval is its own forensic row — the audit must be able to
@@ -104,7 +104,7 @@ pub const RULE_INTENT_AUTHORIZED_DELEGATION: &str = "intent_authorized_delegatio
 pub const RULE_CONSEQUENTIAL: &str = "consequential";
 
 /// Audit `rule_matched` value when a shell mutation requires approval:
-/// shell MutateLocal is never grantable (ADR-55 §2 shell scope hole).
+/// shell MutateLocal is never grantable (ADR-55 §3 shell scope hole).
 pub const RULE_SHELL_REQUIRES_APPROVAL: &str = "shell_requires_approval";
 
 /// Audit `rule_matched` value for the hard read-only-intent denial: any
@@ -130,7 +130,7 @@ pub const RULE_UN_GRANTED: &str = "un_granted";
 pub const RULE_COORDINATOR_AUTHORITY: &str = "coordinator_authority";
 
 /// Session-scoped, non-durable source of intent-authorization state (ADR-55
-/// §1/§4). Owned by the run loop, never persisted, re-confirmed on resume.
+/// §2/§5). Owned by the run loop, never persisted, re-confirmed on resume.
 ///
 /// This is a *state source, not a decision maker*: the `SimplePolicyEngine`
 /// stays deterministic. The default [`Self::verdict`] derives the full policy
@@ -154,7 +154,7 @@ pub trait IntentAuthorization: Send + Sync {
     /// True when an active grant covers `action`'s scope.
     ///
     /// Grants are session-scoped, non-durable, and bound to the run's
-    /// (objective, revision) scope (ADR-55 §4). Defaults to `false` (no
+    /// (objective, revision) scope (ADR-55 §5). Defaults to `false` (no
     /// grant).
     fn grant_covers(&self, _action: &PolicyAction<'_>) -> bool {
         false
@@ -166,7 +166,7 @@ pub trait IntentAuthorization: Send + Sync {
     /// hooks, so a run-loop provider only needs to override those; a provider
     /// MAY override this method entirely to express custom policy outcomes.
     ///
-    /// Per action class (ADR-55 §2):
+    /// Per action class (ADR-55 §3):
     /// - Observe → [`IntentVerdict::Allow`] (`rule = "observe"`).
     /// - Consequential → [`IntentVerdict::RequireApproval`]
     ///   (`rule = "consequential"`) — blanket grants never cover these.
@@ -178,8 +178,8 @@ pub trait IntentAuthorization: Send + Sync {
     ///   [`IntentVerdict::Allow`] (`rule = "intent_authorized"`); a grantable
     ///   class without a grant → [`IntentVerdict::RequireApproval`]
     ///   (`rule = "un_granted"`); and shell mutations (never blanket-granted,
-    ///   ADR-55 §2 shell scope hole — project-bounded shell commands are the
-    ///   scoped upgrade exception, ADR-55 shell scope amendment) →
+    ///   ADR-55 §3 shell scope hole — project-bounded shell commands are the
+    ///   scoped upgrade exception, ADR-55 §3) →
     ///   [`IntentVerdict::RequireApproval`]
     ///   (`rule = "shell_requires_approval"`).
     fn verdict(&self, action: &PolicyAction<'_>) -> IntentVerdict {
@@ -212,7 +212,7 @@ pub trait IntentAuthorization: Send + Sync {
                     // is a top-level flow (a new run), not a mid-run prompt.
                     IntentVerdict::Deny { rule: RULE_INTENT_READONLY_DENY }
                 } else if action.tool_name == "shell" {
-                    // Shell MutateLocal has no blanket grant (ADR-55 §2 shell
+                    // Shell MutateLocal has no blanket grant (ADR-55 §3 shell
                     // scope hole): the command stays under approval. The
                     // scoped project-bounded upgrade is layered by providers
                     // (see [`is_project_bounded_shell`]) on top of this
@@ -232,7 +232,7 @@ pub trait IntentAuthorization: Send + Sync {
     }
 }
 
-/// Classify an action into an [`IntentTier`] (ADR-55 §2).
+/// Classify an action into an [`IntentTier`] (ADR-55 §3).
 ///
 /// Deterministic and pure: no state, no I/O, no model. Consequential is
 /// evaluated first because it is the closed allowlist that blanket
@@ -378,7 +378,7 @@ const FORCE_FLAG_TOKENS: &[&str] = &["--force", "--forced"];
 const WRITE_REDIRECT_OPERATORS: &[&str] = &[">", ">>", "2>", "2>>", "&>", "&>>", ">|"];
 
 /// Secrets-adjacent file path markers: env files, credential/key stores
-/// (ADR-55 §2 "secrets access"). v1 set.
+/// (ADR-55 §3 "secrets access"). v1 set.
 const SECRETS_PATH_MARKERS: &[&str] = &[
     ".env",
     ".pem",
@@ -605,7 +605,7 @@ fn process_substitution_mutates(text: &str) -> bool {
 }
 
 /// Observe verdict of one whitespace-tokenized [`command_segments`] segment:
-/// either a git read-word form (ADR-55 §2), or a read-only verb invocation
+/// either a git read-word form (ADR-55 §3), or a read-only verb invocation
 /// ([`is_read_only_verb_invocation`]). Every other first verb — `tee`, a
 /// writer, an interpreter — is not observe.
 fn segment_is_read_only_observe(tokens: &[&str]) -> bool {
@@ -801,14 +801,14 @@ fn is_escaping_path(target: &str) -> bool {
 
 /// True when `action` belongs to a grantable mutation class: filesystem
 /// write/edit tools and git local-mutate tools. Shell MutateLocal is NEVER
-/// blanket-grantable (ADR-55 §2 shell scope hole); other tools are not
+/// blanket-grantable (ADR-55 §3 shell scope hole); other tools are not
 /// grantable either. Only meaningful within the MutateLocal tier arm, where
 /// the tier is already established.
 fn is_grantable_class(action: &PolicyAction<'_>) -> bool {
     matches!(action.tool_name, "filesystem" | "git")
 }
 
-/// ADR-55 shell scope amendment (2026-09-10 security recast): is `action`
+/// ADR-55 §3 (2026-09-10 security recast): is `action`
 /// a project-bounded `shell` command whose policy verdict may be
 /// auto-approved under an Acting grant, exactly like in-scope filesystem
 /// writes?
@@ -1134,6 +1134,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         }
     }
 
@@ -1216,7 +1217,7 @@ mod tests {
     #[test]
     fn shell_mutation_is_never_grantable() {
         // Even an active shell grant cannot upgrade a shell MutateLocal
-        // (ADR-55 §2 shell scope hole).
+        // (ADR-55 §3 shell scope hole).
         let auth = StatefulAuth::granted("shell");
         let input = serde_json::json!({"command": "touch", "args": ["src/main.rs"]});
         assert_eq!(
@@ -1301,7 +1302,7 @@ mod tests {
     #[test]
     fn mutation_intent_redirect_write_requires_approval_never_grantable() {
         // In a mutation-capable run the same redirect still requires approval:
-        // shell MutateLocal is never grantable (ADR-55 §2 shell scope hole).
+        // shell MutateLocal is never grantable (ADR-55 §3 shell scope hole).
         let redirect = serde_json::json!({"command": "echo", "args": ["x", ">", "src/main.rs"]});
         let auth = StatefulAuth::granted("shell");
         assert_eq!(
@@ -1806,6 +1807,7 @@ mod tests {
             network_requested: true,
             filesystem_scope: FilesystemScope::ProjectOnly,
             destructive_classification: DestructiveClass::NonDestructive,
+            ..Default::default()
         };
         let action = PolicyAction {
             tool_name: "shell",
@@ -1817,6 +1819,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: Some(facts),
             orchestrator_authority: false,
+            path_facts: None,
         };
         assert_eq!(classify_tier(&action), IntentTier::Consequential);
     }
@@ -1884,7 +1887,7 @@ mod tests {
         assert_eq!(full, IntentTier::Observe);
     }
 
-    // ---- ADR-55 batch 1c fixtures: classification + gate outcome -----------
+    // ---- ADR-55 §3 gate fixtures: classification + gate outcome -----------
 
     #[test]
     fn fixture_in_root_echo_redirect_is_mutate_local_and_never_grantable() {
@@ -1941,7 +1944,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // ADR-55 shell scope amendment: is_project_bounded_shell
+    // ADR-55 §3: is_project_bounded_shell
     // ------------------------------------------------------------------
 
     /// Shell facts as the tool itself derives them: the working directory
@@ -1963,6 +1966,7 @@ mod tests {
                 FilesystemScope::Anywhere
             },
             destructive_classification: DestructiveClass::NonDestructive,
+            ..Default::default()
         }
     }
 
@@ -1982,6 +1986,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: Some(facts),
             orchestrator_authority: false,
+            path_facts: None,
         }
     }
 
@@ -2124,6 +2129,7 @@ mod tests {
             estimated_cost_usd: None,
             command_facts: None,
             orchestrator_authority: false,
+            path_facts: None,
         };
         assert!(
             !is_project_bounded_shell(&no_facts),

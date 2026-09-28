@@ -74,6 +74,22 @@
 //! | G1 | issue #52 gate | `gate_52_invalid_decision_rejected_then_run_recovers` |
 //! | G2 | issue #53 gate | `gate_53_stall_detected_and_budget_recovered` |
 //! | G3 | issue #54 gate | `gate_54_diagnosis_selects_the_correct_recovery_path` |
+//!
+//! # Crash-window scenarios (row #21 rescope, 2026-09-26)
+//! The durable/child-boundary failure windows the first 16 scenarios do not
+//! express: a specialist child that dies mid-dispatch (issued but never
+//! settled), a provider disconnect at the settle boundary (after a dispatch
+//! settled, before the next decision), a supervisor/process restart resuming
+//! from a checkpoint persisted through a REAL session store (the durable-row
+//! path), and a cancellation racing a settle (the stop lands while the
+//! specialist call is in flight). All four stay in-process and deterministic.
+//!
+//! | # | scenario | test |
+//! |---|----------|------|
+//! | C1 | specialist child death mid-dispatch | `specialist_child_dies_mid_dispatch_audits_then_recovers` |
+//! | C2 | provider disconnect at the settle boundary | `provider_disconnect_at_the_settle_boundary_preserves_settled_work` |
+//! | C3 | restart from a durable checkpoint row | `restart_with_preserved_checkpoint_continues_the_pending_dispatch` |
+//! | C4 | cancellation racing a settle | `cancellation_racing_a_settle_re_pends_not_accepts` |
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -92,6 +108,7 @@ use concerto_core::{CancellationToken, OrchestratorError};
 use concerto_providers::model_registry::ModelRegistry;
 use concerto_providers::routing::RoutingEngine;
 use concerto_sessions::spend::SpendTracker;
+use concerto_sessions::SessionStore;
 
 use crate::agent_runner::AgentRunner;
 use crate::coordinator::{CoordinatorAgent, CALL_SPECIALIST_TOOL};
@@ -224,6 +241,11 @@ enum Turn {
     Calls(Vec<ToolCall>),
     /// The loop ends in prose.
     Text(String),
+    /// The provider pipe drops before any stream is produced — a network-loss
+    /// fault injected at THIS turn boundary (the crash-window scenarios pair
+    /// it with a disabled retry policy so it lands on its exact turn with no
+    /// backoff sleep and no retry consuming the next scripted turn).
+    Disconnect,
 }
 
 /// The scripted planning-provider decorator: serves one scripted
@@ -303,6 +325,11 @@ impl concerto_core::traits::provider::LlmProvider for ScriptedCoordModel {
             .pop_front()
             .unwrap_or_else(|| Turn::Text(String::new()));
         let chunks: Vec<concerto_core::types::CompletionChunk> = match turn {
+            // The provider-boundary fault: no stream is ever produced, so the
+            // caller's request fails exactly at this turn (network loss).
+            Turn::Disconnect => {
+                return Err(ProviderError::Network("live provider pipe dropped".into()));
+            }
             Turn::Text(text) => vec![concerto_core::types::CompletionChunk {
                 reasoning: None,
                 delta: text,
@@ -447,8 +474,19 @@ type RunEvents = Vec<EventKind>;
 /// here, returned to the scenario for file-level integrity checks), and
 /// collect every bus event the run produced.
 async fn run_coordinator(
+    coordinator: CoordinatorAgent,
+    bus: &EventBus,
+) -> (Result<AgentOutput, OrchestratorError>, RunEvents, tempfile::TempDir) {
+    run_coordinator_with_cancel(coordinator, bus, CancellationToken::new()).await
+}
+
+/// [`run_coordinator`] with an explicit run token — the cancellation-race
+/// scenario hands in the SAME token its in-flight specialist will cancel, so
+/// the stop and the settle race on one deterministic scripted turn.
+async fn run_coordinator_with_cancel(
     mut coordinator: CoordinatorAgent,
     bus: &EventBus,
+    cancel: CancellationToken,
 ) -> (Result<AgentOutput, OrchestratorError>, RunEvents, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("test workspace tempdir");
     let mut rx = bus.subscribe();
@@ -458,12 +496,48 @@ async fn run_coordinator(
         session,
         dir.path().to_owned(),
     ));
-    let outcome = coordinator.run(task, context, CancellationToken::new(), None).await;
+    let outcome = coordinator.run(task, context, cancel, None).await;
     let mut events: RunEvents = Vec::new();
     while let Ok(event) = rx.try_recv() {
         events.push(event.kind.clone());
     }
     (outcome, events, dir)
+}
+
+/// Run an explicitly-scoped coordinator over a workspace dir and session id,
+/// optionally restoring `cp_json`. The durable-row restart scenario drives
+/// phase 2 through this so the resumed task carries the SAME session id the
+/// checkpoint was persisted under (a resume must match its row).
+async fn run_scoped(
+    coordinator: &mut CoordinatorAgent,
+    bus: &EventBus,
+    session_id: concerto_core::ids::Ulid,
+    dir: &std::path::Path,
+    cp_json: Option<String>,
+) -> (Result<AgentOutput, OrchestratorError>, RunEvents) {
+    let mut rx = bus.subscribe();
+    let task =
+        concerto_core::types::AgentTask::new_action_required(session_id, "fault-injection restart");
+    let context =
+        AgentContext::new(concerto_core::types::SessionContext::new(session_id, dir.to_owned()));
+    let outcome = coordinator.run(task, context, CancellationToken::new(), cp_json).await;
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        events.push(event.kind.clone());
+    }
+    (outcome, events)
+}
+
+/// A retry policy with automatic provider retry DISABLED, so a scripted
+/// provider fault surfaces on its exact turn — no backoff sleep and no retry
+/// consuming the next scripted turn. The provider-disconnect scenario uses
+/// this to keep the crash window deterministic (the fault is a network fault,
+/// which the default policy would retry with real backoff).
+fn no_retry_policy() -> concerto_providers::retry::RetryPolicy {
+    concerto_providers::retry::RetryPolicy::new(concerto_config::RetryConfig {
+        enabled: false,
+        ..Default::default()
+    })
 }
 
 /// A resumed run over an explicit workspace dir (the checkpoint-resume
@@ -504,14 +578,22 @@ struct RunReport {
     needs_revision: usize,
     blocked_events: usize,
     review_cycles: u32,
-    review_escalated: bool,
     validation_cycles: u32,
-    validation_escalated: bool,
     /// Progress-guard thoughts (#53 stall nudges + escalations).
     guards: Vec<String>,
     tokens_in: u64,
     tokens_out: u64,
     files_modified: Vec<String>,
+    /// Every `SubTaskCompleted`: the settles that DID land. A crash window is
+    /// only meaningful against the settles that survived it, so the
+    /// child-death scenario pins exactly one settle for its recovered attempt.
+    subtask_completed: usize,
+    /// Every `SpecialistDispatchOutcome` audit row: (role, attempted, label).
+    /// `attempted: true` + `dispatch-failed`/`cancelled` IS the crash-window
+    /// evidence — the specialist call was issued and never settled.
+    dispatch_outcomes: Vec<(AgentId, bool, String)>,
+    /// Whether a `RunInterruptedByUser` was published (the operator-stop audit).
+    run_interrupted: bool,
 }
 
 impl RunReport {
@@ -534,9 +616,7 @@ impl RunReport {
             needs_revision: 0,
             blocked_events: 0,
             review_cycles: 0,
-            review_escalated: false,
             validation_cycles: 0,
-            validation_escalated: false,
             guards: Vec::new(),
             tokens_in: 0,
             tokens_out: 0,
@@ -545,6 +625,9 @@ impl RunReport {
                 .ok()
                 .map(|output| output.files_modified.iter().map(ToString::to_string).collect())
                 .unwrap_or_default(),
+            subtask_completed: 0,
+            dispatch_outcomes: Vec::new(),
+            run_interrupted: false,
         };
         if let Ok(output) = outcome {
             for metric in &output.provider_metrics {
@@ -569,12 +652,15 @@ impl RunReport {
             EventKind::SubTaskNeedsRevision { .. } => self.needs_revision += 1,
             EventKind::SubTaskBlocked { .. } => self.blocked_events += 1,
             EventKind::ReviewCycleStarted { .. } => self.review_cycles += 1,
-            EventKind::ReviewCycleEscalated { .. } => self.review_escalated = true,
             EventKind::ValidationCycleStarted { .. } => self.validation_cycles += 1,
-            EventKind::ValidationEscalated { .. } => self.validation_escalated = true,
             EventKind::AgentThought { content, .. } if content.contains("Progress guard") => {
                 self.guards.push(content.clone());
             }
+            EventKind::SubTaskCompleted { .. } => self.subtask_completed += 1,
+            EventKind::SpecialistDispatchOutcome { role, attempted, outcome, .. } => {
+                self.dispatch_outcomes.push((role.clone(), *attempted, outcome.clone()));
+            }
+            EventKind::RunInterruptedByUser { .. } => self.run_interrupted = true,
             _ => {}
         }
     }
@@ -582,6 +668,15 @@ impl RunReport {
     /// How many times the given role was dispatched.
     fn dispatches_of(&self, role: &str) -> usize {
         self.dispatches.iter().filter(|(dispatched, _)| dispatched.as_str() == role).count()
+    }
+
+    /// Whether a dispatch-outcome audit row was published for `role` with the
+    /// given `attempted` discriminator and outcome label. The crash-window
+    /// evidence for a call that was issued and never settled.
+    fn has_dispatch_outcome(&self, role: &str, attempted: bool, label: &str) -> bool {
+        self.dispatch_outcomes
+            .iter()
+            .any(|(r, a, o)| r.as_str() == role && *a == attempted && o == label)
     }
 
     /// Recovery latency in STEPS: the later dispatches of the faulted agent
@@ -1466,6 +1561,7 @@ fn design_doc_config(id: &str) -> concerto_config::CustomAgentConfig {
         name: "Architect".to_owned(),
         role: "architect".to_owned(),
         stage: Some(concerto_core::types::AgentStage::new("design")),
+        can_cover: Vec::new(),
         prompt_sections: concerto_config::PromptSections::default(),
         model_override: None,
         provider_id: None,
@@ -1627,6 +1723,280 @@ async fn repeated_identical_dispatch_stall_detected() {
         report.final_message
     );
 }
+// ---------------------------------------------------------------------------
+// Crash-window scenarios (row #21 rescope) — the child/settle/restart/stop
+// boundaries the first 16 scenarios do not exercise. Still fully in-process
+// and deterministic; no sleeps and no real provider anywhere.
+// ---------------------------------------------------------------------------
+
+/// C1 — specialist child death MID-DISPATCH: the child is issued the dispatch
+/// (a `SubTaskStarted` fires) and then dies before settling, which the
+/// coordinator audits as a `dispatch-failed` outcome with `attempted: true` —
+/// the crash-window evidence the first suite never asserted. The same agent is
+/// re-dispatched once and settles exactly once, so no partial work is
+/// double-counted or silently accepted.
+#[tokio::test]
+async fn specialist_child_dies_mid_dispatch_audits_then_recovers() {
+    let bus = EventBus::new(256);
+    let mocks = vec![MockExpertAgent::sequence(
+        AgentId::new("coder"),
+        vec![
+            Err(OrchestratorError::AgentLoopError(
+                "specialist child process died mid-dispatch (exit 137)".into(),
+            )),
+            ok_run_result("coder", "recovered after the child death", &["src/a.rs"], 90, 40, 2),
+        ],
+    )];
+    let model = ScriptedCoordModel::scripted(vec![
+        Turn::Calls(vec![dispatch_call("coder", "do the work")]),
+        Turn::Calls(vec![dispatch_call("coder", "do the work")]),
+        Turn::Text("recovered".into()),
+    ]);
+    let coordinator =
+        coordinator_with_model(&bus, Arc::new(AgentRegistry::from_mocks(mocks)), model.clone());
+    let (outcome, events, _dir) = run_coordinator(coordinator, &bus).await;
+    let report = RunReport::build(&outcome, &events, &model);
+
+    assert!(outcome.is_ok(), "a child death never crashes the coordinator: {outcome:?}");
+    // The crash window: the call WAS issued (attempted) and never settled.
+    assert!(
+        report.has_dispatch_outcome("coder", true, "dispatch-failed"),
+        "the mid-dispatch child death is audited as an attempted, unsettled dispatch: {report:?}"
+    );
+    // Exactly one settle survived the window: the recovery attempt.
+    assert_eq!(report.subtask_completed, 1, "exactly one settle, never a double: {report:?}");
+    assert_eq!(report.dispatches_of("coder"), 2, "{report:?}");
+    assert_eq!(report.recovery_steps("coder"), Some(1), "{report:?}");
+    assert!(!report.incorrect_acceptance(), "{report:?}");
+    assert!(report.ledger_state_is_coherent(), "no dispatch id settles twice: {report:?}");
+}
+
+/// C2 — provider disconnect AT THE SETTLE BOUNDARY: the specialist settles
+/// successfully, then the coordinator's provider pipe drops on the very next
+/// decision turn. The settled work survives the window (exactly one
+/// `SubTaskCompleted` for the coder), the run ends Partial with a truthful
+/// pause note, and the drop never produces a vacuous completion.
+#[tokio::test]
+async fn provider_disconnect_at_the_settle_boundary_preserves_settled_work() {
+    let bus = EventBus::new(256);
+    let mocks = vec![MockExpertAgent::sequence(
+        AgentId::new("coder"),
+        vec![ok_run_result("coder", "settled before the drop", &["src/settled.rs"], 90, 40, 2)],
+    )];
+    // Turn 0 dispatches and settles the coder; turn 1 is the provider pipe
+    // dropping on the next decision — the settle boundary.
+    let model = ScriptedCoordModel::scripted(vec![
+        Turn::Calls(vec![dispatch_call("coder", "do the work")]),
+        Turn::Disconnect,
+    ]);
+    let coordinator =
+        coordinator_with_model(&bus, Arc::new(AgentRegistry::from_mocks(mocks)), model.clone())
+            .with_retry_policy(no_retry_policy());
+    let (outcome, events, _dir) = run_coordinator(coordinator, &bus).await;
+    let report = RunReport::build(&outcome, &events, &model);
+
+    let output = outcome.expect("the disconnect degrades to a clean Partial, never a crash");
+    assert_eq!(
+        output.completion_status,
+        AgentCompletionStatus::Partial,
+        "the pipe drop after a settle downgrades the run: {}",
+        output.final_message
+    );
+    assert!(
+        output.final_message.contains("Automation paused"),
+        "the pause is explicit in the final message: {}",
+        output.final_message
+    );
+    // The window did NOT lose the settled work: the coder settled exactly once.
+    assert_eq!(
+        report.subtask_completed, 1,
+        "the pre-drop settle survives the crash window: {report:?}"
+    );
+    assert_eq!(
+        report.dispatches_of("coder"),
+        1,
+        "the settled coder is not re-dispatched: {report:?}"
+    );
+    // Terminal planning pause, no resumable record and no fake acceptance.
+    assert!(output.checkpoint_json.is_none(), "a terminal planning pause keeps no checkpoint");
+    assert!(!report.incorrect_acceptance(), "{report:?}");
+}
+
+/// C3 — supervisor/process restart with a PRESERVED checkpoint (the
+/// durable-row path): phase 1 persists a real orchestration row through a
+/// real `SessionStore` and leaves the pending implement step unsettled; phase
+/// 2 is a FRESH coordinator resuming from that durable row and dispatching
+/// the pending step. Distinct from scenario 11, which hand-builds the
+/// checkpoint JSON in-process: here the row is written, read back, and
+/// restored through the production store.
+#[tokio::test]
+async fn restart_with_preserved_checkpoint_continues_the_pending_dispatch() {
+    let (_pool_dir, pool) = resume_pool().await;
+    let workspace = tempfile::tempdir().expect("workspace dir");
+    let store = Arc::new(
+        concerto_sessions::SqliteSessionStore::connect_in_memory()
+            .await
+            .expect("in-memory session store"),
+    );
+    let project = camino::Utf8PathBuf::from_path_buf(workspace.path().to_path_buf())
+        .expect("workspace path is UTF-8");
+    let session_id = store
+        .create_session(&project, "mock", "mock-model", CancellationToken::new())
+        .await
+        .expect("session row")
+        .id;
+
+    // ── Phase 1: the architect settles; the stop lands INSIDE the coder's
+    // in-flight dispatch, so the durable row holds only the design step. ──
+    let bus = EventBus::new(256);
+    let stop = CancellationToken::new();
+    let model = ScriptedCoordModel::scripted(vec![
+        Turn::Calls(vec![dispatch_call("architect", "design it")]),
+        Turn::Calls(vec![dispatch_call("coder", "implement the plan")]),
+    ]);
+    let mocks = vec![
+        MockExpertAgent::always_succeed(AgentId::new("architect"), "designed"),
+        MockExpertAgent::sequence(AgentId::new("coder"), vec![Err(OrchestratorError::Cancelled)])
+            .cancel_on_run(stop.clone()),
+    ];
+    let mut first = coordinator_with_model(&bus, Arc::new(AgentRegistry::from_mocks(mocks)), model)
+        .with_checkpoint_store(
+            Some(store.clone() as Arc<dyn concerto_sessions::SessionStore>),
+            None,
+        )
+        .with_review_store(Some(pool.clone()))
+        .with_run_shape_context(crate::coordinator::RunShapeContext {
+            has_approved_plan: true,
+            ..Default::default()
+        });
+    let context = AgentContext::new(concerto_core::types::SessionContext::new(
+        session_id,
+        workspace.path().to_owned(),
+    ));
+    let interrupted = first
+        .run(
+            concerto_core::types::AgentTask::new_action_required(session_id, "build the thing"),
+            context,
+            stop,
+            None,
+        )
+        .await
+        .expect("the interrupted run still returns an output");
+    assert_eq!(
+        interrupted.completion_status,
+        AgentCompletionStatus::Partial,
+        "a deliberate stop surfaces as Partial: {}",
+        interrupted.final_message
+    );
+    let record = store
+        .load_orchestration_checkpoint(session_id)
+        .await
+        .expect("checkpoint store read")
+        .expect("the stop leaves a durable row behind");
+    let restored: crate::checkpoint::GraphCheckpoint =
+        serde_json::from_str(&record.state_json).expect("the durable row deserializes");
+    assert_eq!(restored.subtasks.len(), 1, "only the settled design step is durable");
+    assert!(
+        restored
+            .subtasks
+            .iter()
+            .all(|sub| sub.status == concerto_core::types::SubTaskStatus::Completed),
+        "the unsettled coder is never persisted as done: {restored:?}"
+    );
+
+    // ── Phase 2: a FRESH coordinator over the SAME session row resumes from
+    // the durable record and dispatches the pending implement step. ──
+    let bus = EventBus::new(256);
+    let model = ScriptedCoordModel::scripted(vec![
+        Turn::Calls(vec![dispatch_call("coder", "implement the plan")]),
+        Turn::Text("continued".into()),
+    ]);
+    let mocks = vec![
+        // Canary: the settled design step must never re-dispatch.
+        MockExpertAgent::always_fail(AgentId::new("architect"), "must not be dispatched"),
+        MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+    ];
+    let mut resumed =
+        coordinator_with_model(&bus, Arc::new(AgentRegistry::from_mocks(mocks)), model.clone())
+            .with_checkpoint_store(
+                Some(store.clone() as Arc<dyn concerto_sessions::SessionStore>),
+                None,
+            )
+            .with_review_store(Some(pool.clone()))
+            .with_run_shape_context(crate::coordinator::RunShapeContext {
+                has_approved_plan: true,
+                ..Default::default()
+            });
+    let (outcome, events) =
+        run_scoped(&mut resumed, &bus, session_id, workspace.path(), Some(record.state_json)).await;
+    let report = RunReport::build(&outcome, &events, &model);
+
+    assert!(outcome.is_ok(), "the resumed run returns an output: {outcome:?}");
+    assert_eq!(
+        report.dispatches_of("architect"),
+        0,
+        "the settled design step is never re-dispatched: {report:?}"
+    );
+    assert_eq!(
+        report.dispatches_of("coder"),
+        1,
+        "the pending implement step is dispatched exactly once: {report:?}"
+    );
+    assert!(
+        events.iter().any(|kind| matches!(kind, EventKind::CheckpointRestored { .. })),
+        "the durable-row resume is recorded in the run history"
+    );
+    assert!(
+        !report.final_message.contains("Unattempted-implementation guard"),
+        "the resume continued the work instead of hitting the guard: {}",
+        report.final_message
+    );
+}
+
+/// C4 — cancellation racing a settle: the operator stop fires WHILE the
+/// specialist call is in flight, then the call settles. The settle is audited
+/// as `cancelled` with `attempted: true` (re-pended, not failed), the run
+/// ends Partial through the interrupt audit — never a completion built on an
+/// interrupted dispatch.
+#[tokio::test]
+async fn cancellation_racing_a_settle_re_pends_not_accepts() {
+    let bus = EventBus::new(256);
+    let stop = CancellationToken::new();
+    let mocks = vec![MockExpertAgent::sequence(
+        AgentId::new("coder"),
+        vec![Err(OrchestratorError::Cancelled)],
+    )
+    .cancel_on_run(stop.clone())];
+    let model = ScriptedCoordModel::scripted(vec![
+        Turn::Calls(vec![dispatch_call("coder", "do the work")]),
+        Turn::Text("this turn is never reached — the stop wins".into()),
+    ]);
+    let coordinator =
+        coordinator_with_model(&bus, Arc::new(AgentRegistry::from_mocks(mocks)), model.clone());
+    let (outcome, events, _dir) = run_coordinator_with_cancel(coordinator, &bus, stop).await;
+    let report = RunReport::build(&outcome, &events, &model);
+
+    let output = outcome.expect("a raced stop degrades to a clean Partial, never a crash");
+    assert_eq!(
+        output.completion_status,
+        AgentCompletionStatus::Partial,
+        "the raced stop surfaces as Partial: {}",
+        output.final_message
+    );
+    assert!(report.run_interrupted, "the operator stop is recorded in the run history: {report:?}");
+    // The crash window: issued (attempted) then stopped — re-pended, not failed.
+    assert!(
+        report.has_dispatch_outcome("coder", true, "cancelled"),
+        "the raced settle is audited as an attempted, cancelled dispatch: {report:?}"
+    );
+    assert!(
+        !report.has_dispatch_outcome("coder", true, "dispatch-failed"),
+        "a stop is never misclassified as a dispatch failure: {report:?}"
+    );
+    assert!(!report.incorrect_acceptance(), "{report:?}");
+    assert!(report.ledger_state_is_coherent(), "{report:?}");
+}
+
 // ---------------------------------------------------------------------------
 // The P0 gate integration tests — #52 (invalid decisions rejected), #53
 // (stall detected + recovered), #54 (diagnosis → correct recovery path),

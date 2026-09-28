@@ -1,6 +1,6 @@
 use crate::error::PolicyError;
 use crate::ids::Ulid;
-use crate::types::{PolicyAction, PolicyVerdict};
+use crate::types::{PathPolicyFacts, PolicyAction, PolicyVerdict, ReadResultFacts};
 use crate::CancellationToken;
 use async_trait::async_trait;
 use time::OffsetDateTime;
@@ -223,9 +223,26 @@ pub struct AuditEntry {
     pub duration_ms: Option<i64>,
     /// Toolchain/runtime version that ran the command, if known.
     pub toolchain_version: Option<String>,
-    // ---- ADR-55 Phase 1d §4: schema-derived intent-decision columns ----
+    // ---- ADR-55 §6: schema-derived intent-decision columns ----
     /// Bound plan id of a plan-approval decision (`intent:plan`), if any.
     pub plan_id: Option<String>,
     /// Source revision the plan was approved at, if known.
     pub source_revision: Option<String>,
+    // ---- Path-shaped structured facts (additive) ----------------------------
+    /// Structured facts about a path-shaped tool operation (filesystem, git,
+    /// LSP): operation + attempted/resolved target path. `None` for tools that
+    /// do not operate on a path. Recorded alongside — not instead of — the
+    /// ADR-28 §6 command facts.
+    pub path_facts: Option<PathPolicyFacts>,
+    // ---- Read-only operation results (additive, migration 035) -------------
+    /// What a **successful read-only** operation returned: `exists` → boolean,
+    /// `list` → entry count, `read` → byte size. Set only on the
+    /// post-execution completion row, derived from the result the executor
+    /// already holds (no second read, no extra syscall). `None` for mutating
+    /// operations, failed executions, and every decision-time row.
+    ///
+    /// SAFETY: never file content, entry names, secrets, or any other
+    /// unbounded value — only a boolean / count / size, per the rule on
+    /// [`ReadResultFacts`].
+    pub result_facts: Option<ReadResultFacts>,
 }

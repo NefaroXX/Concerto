@@ -6,6 +6,7 @@ use concerto_core::types::{
     CompletionChunk, CompletionRequest, CompletionUsage, ModelInfo, TokenBudget, ToolCall,
 };
 use concerto_core::CancellationToken;
+use concerto_core::SecretString;
 use futures::stream::StreamExt;
 use std::collections::{HashMap, VecDeque};
 
@@ -20,8 +21,14 @@ use crate::sse::BufferedSseParser;
 /// for code that names it next to [`OpenAiProvider`] (e.g. `crate::opencode`).
 pub use crate::adapters::ReasoningEcho;
 
+/// Re-export of the usage-request policy (ADR-48 §4), mirroring
+/// [`ReasoningEcho`]: the enum names an endpoint contract, so it lives beside
+/// the dialect (`crate::adapters::openai_compat`) and is re-exported here for
+/// callers configuring [`OpenAiProvider`].
+pub use crate::adapters::UsageRequest;
+
 pub struct OpenAiProvider {
-    api_key: String,
+    api_key: SecretString,
     api_base: String,
     model: String,
     timeout_secs: u64,
@@ -30,18 +37,23 @@ pub struct OpenAiProvider {
     /// request against the actual model name; `Auto` (default) keeps every
     /// non-weak model on the verbatim strict schema.
     tool_schema_mode: concerto_config::ToolSchemaMode,
+    /// How this connector asks the endpoint to report usage (ADR-48 §4).
+    /// Defaults to [`UsageRequest::Off`] — the wire body stays byte-identical
+    /// to the pre-wiring output until a construction site opts an endpoint in.
+    usage_request: UsageRequest,
     dialect: OpenAiChatDialect,
 }
 
 impl OpenAiProvider {
-    pub fn new(api_key: String, model: String, timeout_secs: u64) -> Self {
+    pub fn new(api_key: impl Into<SecretString>, model: String, timeout_secs: u64) -> Self {
         Self {
-            api_key,
+            api_key: api_key.into(),
             api_base: "https://api.openai.com/v1".to_string(),
             model,
             timeout_secs,
             reasoning_echo: ReasoningEcho::IfPresent,
             tool_schema_mode: concerto_config::ToolSchemaMode::default(),
+            usage_request: UsageRequest::Off,
             dialect: OpenAiChatDialect,
         }
     }
@@ -49,6 +61,15 @@ impl OpenAiProvider {
     pub fn with_api_base(mut self, api_base: String) -> Self {
         self.api_base = api_base;
         self
+    }
+
+    /// The credential this connector authenticates with, borrowed.
+    ///
+    /// Callers that also need the key (e.g. `OpenCodeZenProvider`, which owns
+    /// this provider as its OpenAI-compatible inner path) read it through
+    /// here instead of keeping a second long-lived copy of the secret.
+    pub(crate) fn api_key(&self) -> &SecretString {
+        &self.api_key
     }
 
     /// Set the reasoning-content echo policy (ADR-46).
@@ -74,6 +95,36 @@ impl OpenAiProvider {
         self.tool_schema_mode = mode;
         self
     }
+
+    /// Set the usage-request policy (ADR-48 §4).
+    ///
+    /// Defaults to [`UsageRequest::Off`]: no usage-request member is written
+    /// and the wire body stays byte-identical to the pre-wiring output. The
+    /// connector still captures a `usage` object whenever the endpoint
+    /// reports one — a missing report keeps `None`, never an error.
+    pub fn with_usage_request(mut self, mode: UsageRequest) -> Self {
+        self.usage_request = mode;
+        self
+    }
+
+    /// The active usage-request policy (ADR-48 §4), exposed for tests and for
+    /// connectors that wrap this one (e.g. `crate::openrouter`).
+    pub fn usage_request(&self) -> UsageRequest {
+        self.usage_request
+    }
+
+    /// Render the exact wire body for `request`: the dialect's payload with
+    /// this connector's usage-request policy applied (ADR-48 §4).
+    ///
+    /// Called by [`LlmProvider::stream_completion`] *after* any adaptive
+    /// tool-schema rewrite, so the streaming flag applied matches the one
+    /// actually sent. Pure — no I/O — which keeps the body testable without a
+    /// transport.
+    fn render_body(&self, request: &CompletionRequest, model: &str) -> serde_json::Value {
+        let mut body = self.dialect.render_chat_body(request, model, self.reasoning_echo);
+        self.usage_request.apply(&mut body, request.stream);
+        body
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -93,6 +144,10 @@ struct PartialToolCall {
 /// `tool_calls` array; this sentinel, combined with the empty-`partial_tools`
 /// gate, guarantees the synthesized call can never collide with a real one.
 const ENVELOPE_CALL_INDEX: usize = usize::MAX;
+
+/// Row #38: bounded depth for unwrapping proxy double-encoded
+/// `arguments` (`"\"{…}\""` re-serializations). Iterative, never unbounded.
+const MAX_ARGUMENT_STRING_LAYERS: usize = 3;
 
 struct OpenAiStreamState {
     parser: BufferedSseParser,
@@ -143,23 +198,19 @@ impl OpenAiStreamState {
     }
 
     /// Capture a provider-reported `usage` object (top-level `usage` member of
-    /// an SSE event, as OpenAI/DeepSeek emit it). The first observation wins;
-    /// usage is only ever attached to the terminal chunk.
+    /// an SSE event, as OpenAI/DeepSeek/OpenRouter emit it). The first
+    /// observation wins; usage is only ever attached to the terminal chunk.
+    ///
+    /// The payload → [`CompletionUsage`] mapping is the family-shared
+    /// [`crate::adapters::openai_compat::map_usage`], so this connector
+    /// applies the same fail-soft rules as every other OpenAI-compatible
+    /// gateway: no `usage`, no counts, or a non-integer count all keep
+    /// `None` — never an error, never a fabricated `0`.
     fn capture_usage(&mut self, parsed: &serde_json::Value) {
         if self.usage.is_some() {
             return;
         }
-        let Some(usage) = parsed.get("usage").and_then(|u| u.as_object()) else {
-            return;
-        };
-        let usage = CompletionUsage {
-            prompt_tokens: usage.get("prompt_tokens").and_then(|v| v.as_u64()),
-            completion_tokens: usage.get("completion_tokens").and_then(|v| v.as_u64()),
-        };
-        // Only record usage that actually carries at least one token count.
-        if usage.prompt_tokens.is_some() || usage.completion_tokens.is_some() {
-            self.usage = Some(usage);
-        }
+        self.usage = crate::adapters::openai_compat::map_usage(parsed);
     }
 
     /// Emit a final chunk carrying the accumulated reasoning (if any) before
@@ -179,24 +230,43 @@ impl OpenAiStreamState {
     /// Strict, full-text-only parse of the turn's accumulated `content` as a
     /// proxy tool-call envelope (Fix 2 STRICT).
     ///
-    /// Accepted — the ENTIRE content must be exactly one JSON object of one of
-    /// these shapes (full-text parse only, no substring extraction):
+    /// Accepted — the ENTIRE content must decode to exactly one JSON object of
+    /// one of these shapes (full-text parse only, no substring extraction):
     ///
     ///   * `{"name": "<string>", "arguments": { … }}`       — object arguments
     ///   * `{"name": "<string>", "arguments": "<json …>"}`  — string arguments
     ///   * `{"name": "<string>", "input": { … }}`           — `input` alias
     ///     (object only, consistent with the Fix 1 flat path)
+    ///   * a canonical wire envelope whose `name`/`arguments` live under
+    ///     `function` (row #38: "missing name with inferable intent" — the
+    ///     name is looked up at top level first, then under `function`)
+    ///   * one bounded double-encoding layer: the content is a JSON *string*
+    ///     that itself contains one of the above envelopes (row #38 — proxies
+    ///     that re-serialize the envelope)
     ///
     /// An optional string `id` member is carried through when present. Anything
-    /// else — trailing prose (the parse must consume the whole payload), JSON
-    /// arrays, missing `name`/arguments, wrong member types, `input` as a
-    /// non-object — returns `None` and the content stays plain text with zero
-    /// behavioral change. No heuristic text mining here: loose recovery from
-    /// free text is the tool guard's / driver's job.
+    /// else — trailing/leading prose (the parse must consume the whole
+    /// payload), JSON arrays, missing `name`/`function`, wrong member types,
+    /// `input` as a non-object — returns `None` and the content stays plain
+    /// text with zero behavioral change. No heuristic text mining here: loose
+    /// recovery from free text is the tool guard's / driver's job.
     fn parse_content_envelope(content: &str) -> Option<PartialToolCall> {
         let parsed: serde_json::Value = serde_json::from_str(content).ok()?;
-        let object = parsed.as_object()?;
-        let name = object.get("name")?.as_str()?.to_string();
+        // One bounded double-encoding layer: the strictness invariant is
+        // unchanged — the complete content still has to decode (through at
+        // most this one extra string layer) to exactly one envelope object.
+        let value = match parsed {
+            serde_json::Value::String(inner) => serde_json::from_str(&inner).ok()?,
+            other => other,
+        };
+        let object = value.as_object()?;
+        let name = object
+            .get("name")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                object.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str())
+            })?
+            .to_string();
         let arguments = match object.get("arguments") {
             Some(serde_json::Value::Object(inner)) => {
                 serde_json::Value::Object(inner.clone()).to_string()
@@ -205,10 +275,21 @@ impl OpenAiStreamState {
             // `arguments` present but not Object|String → reject the envelope.
             Some(_) => return None,
             // `arguments` absent → `input` alias (object only, Fix 1-consistent).
-            None => {
-                let input = object.get("input")?.as_object()?;
-                serde_json::Value::Object(input.clone()).to_string()
-            }
+            None => match object.get("input") {
+                Some(serde_json::Value::Object(inner)) => {
+                    serde_json::Value::Object(inner.clone()).to_string()
+                }
+                Some(_) => return None,
+                // No top-level arguments member at all → the nested canonical
+                // `function.arguments` (Object|String, same rules as top level).
+                None => match object.get("function")?.get("arguments")? {
+                    serde_json::Value::Object(inner) => {
+                        serde_json::Value::Object(inner.clone()).to_string()
+                    }
+                    serde_json::Value::String(inner) => inner.clone(),
+                    _ => return None,
+                },
+            },
         };
         let id = object.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
         Some(PartialToolCall { id, name, arguments })
@@ -279,8 +360,21 @@ impl OpenAiStreamState {
     /// every parse fails, the tool call still emits with `Null` arguments and a
     /// `tracing::warn!` carries the tool name, the raw payload length (never
     /// the payload itself — avoids log injection) and the original parse error.
+    ///
+    /// Row #38: a slot that never received a name is dropped here with a
+    /// payload-free `warn!` instead of emitting an empty-name call the
+    /// executor could only reject downstream (explicit rejection, never
+    /// silent mangling).
     fn emit_tool_call(&mut self, index: usize) {
         if let Some(ptc) = self.partial_tools.remove(&index) {
+            if ptc.name.is_empty() {
+                tracing::warn!(
+                    index = index,
+                    raw_len = ptc.arguments.len(),
+                    "emit_tool_call: dropping tool call with no name (unclassifiable proxy shape)."
+                );
+                return;
+            }
             let mut args = if ptc.arguments.trim().is_empty() {
                 serde_json::Value::Null
             } else {
@@ -311,6 +405,26 @@ impl OpenAiStreamState {
                     }
                 }
             };
+            // Row #38: undo proxy double-encoding — `arguments` that parse to a
+            // JSON string containing more JSON (a re-serialized object) unwrap
+            // to the inner value instead of reaching the executor as a string
+            // (which `ensure_arguments_object` would coerce to `{}`).
+            let mut layers = 0usize;
+            while layers < MAX_ARGUMENT_STRING_LAYERS {
+                let inner = match &args {
+                    serde_json::Value::String(s) => s,
+                    _ => break,
+                };
+                match serde_json::from_str::<serde_json::Value>(inner.trim()) {
+                    Ok(inner_value) => {
+                        args = inner_value;
+                        layers += 1;
+                    }
+                    // Not re-parseable (e.g. a legitimate raw string like
+                    // `"ls"`) → keep the value exactly as parsed.
+                    Err(_) => break,
+                }
+            }
             // Adaptive tool schemas: when the request was rendered with loose
             // (weak-model) schemas, the model answers in the flattened
             // dot-notation shape — re-nest before the executor or the
@@ -382,6 +496,81 @@ impl OpenAiStreamState {
         });
     }
 
+    /// Reduce ONE `tool_calls` wire element (or a legacy `function_call`
+    /// envelope) into its partial-tool slot.
+    ///
+    /// Supported shapes — standard OpenAI `function` wrapper, the legacy /
+    /// proxy `function_call` wrapper key, and the Fix 1 flat shape
+    /// (`{id, name, arguments}` on the tool-call object). Row #38 relaxes the
+    /// Fix 1 gate the way real proxies actually fragment calls: a flat `name`
+    /// is taken whenever present (it may arrive in a different delta from the
+    /// arguments), while flat `arguments` still require a *known* name — this
+    /// object's flat `name`, its wrapper's `name`, or one accumulated in an
+    /// earlier delta — so an unrelated payload can never yield a nameless
+    /// call from nameless fragments. Nothing is ever extracted from `content`
+    /// or free text here.
+    fn apply_tool_call(&mut self, tc: &serde_json::Value) {
+        let index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let partial = self.partial_tools.entry(index).or_default();
+        if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+            partial.id = id.to_string();
+        }
+
+        // ── Structured path: `function` (canonical) or `function_call`
+        // (legacy/proxy alias) wrapper ──
+        let mut wrapper_args = false;
+        if let Some(func) = tc.get("function").or_else(|| tc.get("function_call")) {
+            if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                if !name.is_empty() {
+                    partial.name = name.to_string();
+                }
+            }
+            match func.get("arguments") {
+                // String fragments accumulate across deltas.
+                Some(serde_json::Value::String(args)) => {
+                    partial.arguments.push_str(args);
+                    wrapper_args = true;
+                }
+                // Object arguments are a complete one-shot (non-conforming
+                // proxy): replace rather than append, so fragments and a
+                // whole object can never concatenate into corrupt JSON.
+                Some(serde_json::Value::Object(obj)) => {
+                    partial.arguments = serde_json::Value::Object(obj.clone()).to_string();
+                    wrapper_args = true;
+                }
+                // Absent / null / wrong type → nothing to accumulate here.
+                Some(_) | None => {}
+            }
+        }
+
+        // ── Proxy fallback: flat format (name / arguments directly on the
+        // tool-call object, no `function` wrapper) ──
+        if let Some(name) = tc.get("name").and_then(|v| v.as_str()) {
+            if !name.is_empty() {
+                partial.name = name.to_string();
+            }
+        }
+        // The wrapper already contributed this element's arguments (no double
+        // push), or no name is known yet (never emit nameless fragments).
+        if wrapper_args || partial.name.is_empty() {
+            return;
+        }
+        match tc.get("arguments") {
+            Some(serde_json::Value::String(args)) => partial.arguments.push_str(args),
+            Some(serde_json::Value::Object(obj)) => {
+                partial.arguments = serde_json::Value::Object(obj.clone()).to_string()
+            }
+            // `input` alias: object only (Fix 1-consistent); anything else
+            // (number, null, string `input`) is ignored, not coerced.
+            None => {
+                if let Some(obj) = tc.get("input").and_then(|v| v.as_object()) {
+                    partial.arguments = serde_json::Value::Object(obj.clone()).to_string();
+                }
+            }
+            Some(_) => {}
+        }
+    }
+
     fn handle_event(&mut self, event: crate::sse::SseEvent) {
         if event.keepalive {
             // Liveness signal (SSE comment line): emit an empty chunk so the
@@ -451,58 +640,15 @@ impl OpenAiStreamState {
 
             if let Some(tc_arr) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                 for tc in tc_arr {
-                    let index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-
-                    let partial = self.partial_tools.entry(index).or_default();
-
-                    if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
-                        partial.id = id.to_string();
-                    }
-                    if let Some(func) = tc.get("function") {
-                        if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
-                            partial.name = name.to_string();
-                        }
-                        if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
-                            partial.arguments.push_str(args);
-                        }
-                    }
-
-                    // ── Proxy fallback: flat format (name / arguments directly
-                    // on the tool-call object, no `function` wrapper) ──
-                    //
-                    // Some proxy gateways translate a model's native tool-call
-                    // shape into `{id, name, arguments}` directly on the tool
-                    // call object. Both fallbacks are gated conservatively on
-                    // the same tool call carrying BOTH a string `name` AND
-                    // `arguments` (string or object) so unrelated payloads
-                    // cannot be misread as tool calls; nothing is extracted
-                    // from `content` or free text.
-                    //
-                    // (a) Flat string arguments: accumulate across deltas the
-                    // same way `function.arguments` fragments do.
-                    if let Some(name) = tc.get("name").and_then(|v| v.as_str()) {
-                        if let Some(args) = tc.get("arguments").and_then(|v| v.as_str()) {
-                            partial.name = name.to_string();
-                            partial.arguments.push_str(args);
-                        }
-                    }
-                    // (b) Flat object arguments (or an `input` alias): one-shot,
-                    // the complete object serializes directly and needs no chunk
-                    // accumulation. `emit_tool_call` parses it through the same
-                    // strict-parse / Fix 3 retry chain + loose-schema
-                    // un-flattening pipeline as every other shape.
-                    if let Some(name) = tc.get("name").and_then(|v| v.as_str()) {
-                        let object_args = match tc.get("arguments") {
-                            Some(v) => v.as_object(),
-                            None => tc.get("input").and_then(|v| v.as_object()),
-                        };
-                        if let Some(object_args) = object_args {
-                            partial.name = name.to_string();
-                            partial.arguments =
-                                serde_json::Value::Object(object_args.clone()).to_string();
-                        }
-                    }
+                    self.apply_tool_call(tc);
                 }
+            } else if let Some(function_call) = delta.get("function_call") {
+                // Legacy single-call transport (pre-`tool_calls` wire): the
+                // whole call sits at `delta.function_call` with no index or id.
+                // Fold it into the same pipeline as one implicit call at
+                // index 0 (row #38 — "nested under an unexpected key").
+                let synthetic = serde_json::json!({ "index": 0usize, "function": function_call });
+                self.apply_tool_call(&synthetic);
             }
         }
 
@@ -528,9 +674,13 @@ impl LlmProvider for OpenAiProvider {
     async fn test_connection(&self, _cancel: CancellationToken) -> Result<(), ProviderError> {
         let client = crate::new_client(self.timeout_secs);
         let url = format!("{}/models", self.api_base);
-        let resp = client.get(&url).bearer_auth(&self.api_key).send().await.map_err(|e| {
-            ProviderError::Other(format!("openai connection failed: {}", describe_error_chain(&e)))
-        })?;
+        let resp =
+            client.get(&url).bearer_auth(self.api_key.expose()).send().await.map_err(|e| {
+                ProviderError::Other(format!(
+                    "openai connection failed: {}",
+                    describe_error_chain(&e)
+                ))
+            })?;
         if resp.status().is_success() {
             Ok(())
         } else if resp.status().as_u16() == 401 {
@@ -546,9 +696,13 @@ impl LlmProvider for OpenAiProvider {
     ) -> Result<Vec<ModelInfo>, ProviderError> {
         let client = crate::new_client(self.timeout_secs);
         let url = format!("{}/models", self.api_base);
-        let resp = client.get(&url).bearer_auth(&self.api_key).send().await.map_err(|e| {
-            ProviderError::Other(format!("openai list_models failed: {}", describe_error_chain(&e)))
-        })?;
+        let resp =
+            client.get(&url).bearer_auth(self.api_key.expose()).send().await.map_err(|e| {
+                ProviderError::Other(format!(
+                    "openai list_models failed: {}",
+                    describe_error_chain(&e)
+                ))
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -628,14 +782,14 @@ impl LlmProvider for OpenAiProvider {
         }
         let non_streamed = !request.stream;
 
-        let body = self.dialect.render_chat_body(&request, &model, self.reasoning_echo);
+        let body = self.render_body(&request, &model);
 
         let response = tokio::select! {
             _ = cancel.cancelled() => Err(ProviderError::Cancelled),
             result = async {
                 client
                     .post(&url)
-                    .header("Authorization", format!("Bearer {}", self.api_key))
+                    .header("Authorization", format!("Bearer {}", self.api_key.expose()))
                     .header("Content-Type", "application/json")
                     .json(&body)
                     .send()
@@ -705,7 +859,7 @@ impl LlmProvider for OpenAiProvider {
                         }
                         items
                     }
-                    // ADR-55 Phase 2e stream-retry: a transport fault
+                    // Stream-retry: a transport fault
                     // mid-stream is retriable (tools execute only
                     // post-assembly — re-issue is side-effect-free within
                     // the bounded attempt budget); framing/parse failures
@@ -1188,6 +1342,59 @@ mod tests {
         let chunks: Vec<CompletionChunk> =
             state.pending.drain(..).map(|result| result.expect("chunk emitted")).collect();
         assert_eq!(chunks.last().unwrap().usage, None);
+    }
+
+    // -- ADR-48 §4: usage-request wiring -----------------------------------
+
+    /// The constructor must not opt any endpoint in: every construction site
+    /// that was not explicitly covered keeps byte-identical wire bodies.
+    #[test]
+    fn usage_request_defaults_to_off() {
+        let provider = OpenAiProvider::new("test-key".to_string(), "test-model".into(), 15);
+        assert_eq!(provider.usage_request(), UsageRequest::Off, "default policy must be Off");
+    }
+
+    #[test]
+    fn with_usage_request_sets_policy() {
+        let provider = OpenAiProvider::new("test-key".to_string(), "test-model".into(), 15)
+            .with_usage_request(UsageRequest::IncludeStreamUsage);
+        assert_eq!(provider.usage_request(), UsageRequest::IncludeStreamUsage);
+    }
+
+    /// The rendered wire body carries the policy: a streamed request opts in,
+    /// a non-streamed request stays byte-identical, and the default policy
+    /// writes nothing at all.
+    #[test]
+    fn render_body_applies_usage_request_policy() {
+        use concerto_core::types::{Message, Role};
+
+        let message = || Message {
+            role: Role::User,
+            content: "Hello".into(),
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: None,
+            tokens_in: None,
+            tokens_out: None,
+        };
+        let streamed =
+            CompletionRequest { messages: vec![message()], stream: true, ..Default::default() };
+        let non_streamed =
+            CompletionRequest { messages: vec![message()], stream: false, ..Default::default() };
+
+        let opted_in = OpenAiProvider::new("test-key".to_string(), "test-model".into(), 15)
+            .with_usage_request(UsageRequest::IncludeStreamUsage);
+        let body = opted_in.render_body(&streamed, "test-model");
+        assert_eq!(body["stream_options"]["include_usage"], true);
+        assert_eq!(body["stream"], true, "the stream flag itself is untouched");
+
+        let body = opted_in.render_body(&non_streamed, "test-model");
+        assert!(body.get("stream_options").is_none(), "non-streamed bodies stay untouched");
+        assert_eq!(body["stream"], false);
+
+        let default = OpenAiProvider::new("test-key".to_string(), "test-model".into(), 15);
+        let body = default.render_body(&streamed, "test-model");
+        assert!(body.get("stream_options").is_none(), "the default policy writes nothing");
     }
 
     /// A non-streamed completion body (`stream: false`, the weak-model
@@ -1680,5 +1887,533 @@ mod tests {
         assert_eq!(tool.arguments, serde_json::json!({"message": "it's fine"}));
         assert!(tool.arguments.is_object());
         assert_eq!(sink.warns().len(), 0, "valid JSON with apostrophes is untouched");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Row #38 — sanitized proxy fixture corpus.
+    //
+    // Every payload here is SYNTHESIZED from a shape class seen across
+    // OpenAI-compatible gateways (flat fragmentation, legacy keys,
+    // double-encoding, content envelopes, weak-model flat bodies). No API
+    // keys, no PII, no verbatim provider responses — shapes only.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Expected reduction outcome for one corpus fixture.
+    enum CorpusExpect {
+        /// Exactly one tool call with this name/arguments; nothing echoed as
+        /// text (envelope/content shapes must not double-represent).
+        Tool { name: &'static str, arguments: serde_json::Value },
+        /// No tool call — the content stays verbatim plain text.
+        Text,
+        /// Explicitly rejected: no tool call AND no text (the nameless drop
+        /// fires exactly one payload-free diagnostic).
+        Dropped,
+    }
+
+    /// One sanitized proxy tool-call shape plus its expected outcome.
+    struct CorpusFixture {
+        label: &'static str,
+        /// Ordered `choices[0].delta` payloads (a `[DONE]` is appended), or
+        /// one whole `stream: false` body when `whole_body` is set.
+        events: Vec<serde_json::Value>,
+        whole_body: bool,
+        tool_adapted: bool,
+        expect: CorpusExpect,
+    }
+
+    impl CorpusFixture {
+        fn stream(
+            label: &'static str,
+            events: Vec<serde_json::Value>,
+            expect: CorpusExpect,
+        ) -> Self {
+            Self { label, events, whole_body: false, tool_adapted: false, expect }
+        }
+
+        /// The weak-model (Mimo-class) transport: one whole body, loose
+        /// dot-notation arguments re-nested on the way out.
+        fn weak_whole_body(
+            label: &'static str,
+            events: Vec<serde_json::Value>,
+            expect: CorpusExpect,
+        ) -> Self {
+            Self { label, events, whole_body: true, tool_adapted: true, expect }
+        }
+
+        fn tool(name: &'static str, arguments: serde_json::Value) -> CorpusExpect {
+            CorpusExpect::Tool { name, arguments }
+        }
+    }
+
+    /// A `delta` event carrying a tool-call array.
+    fn tc_delta(tool_calls: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"choices": [{"delta": {"tool_calls": tool_calls}}]})
+    }
+
+    /// A `delta` event carrying `content` verbatim.
+    fn content_delta(content: &str) -> serde_json::Value {
+        serde_json::json!({"choices": [{"delta": {"content": content}}]})
+    }
+
+    /// The sanitized corpus: each shape parses to the correct `ToolCall` or
+    /// is explicitly rejected — never silently mangled.
+    fn proxy_corpus() -> Vec<CorpusFixture> {
+        let shell_args = "{\"command\":\"ls\"}"; // {"command":"ls"}
+        let args_head = "{\"command\":"; // {"command":
+        let args_tail = "\"ls\"}"; // "ls"}
+        let envelope = r#"{"name":"shell","arguments":{"command":"ls"}}"#;
+        // Re-serializations of the payload above (stringified-JSON
+        // double-encoding): `"{\"name\":…}"` as content, `"{\"command\":…}"`
+        // as an arguments value.
+        let double_envelope = format!("\"{}\"", envelope.replace('"', "\\\""));
+        let double_args = format!("\"{}\"", shell_args.replace('"', "\\\""));
+
+        vec![
+            // -- Accept: Fix 1 relaxed — flat name and flat arguments split
+            //    across DIFFERENT deltas (previously: nameless drop) ---------
+            CorpusFixture::stream(
+                "flat-name-then-arguments-split-across-deltas",
+                vec![
+                    tc_delta(serde_json::json!([{"index": 0, "id": "call_f", "name": "shell"}])),
+                    tc_delta(serde_json::json!([{"index": 0, "arguments": args_head}])),
+                    tc_delta(serde_json::json!([{"index": 0, "arguments": args_tail}])),
+                ],
+                CorpusFixture::tool("shell", serde_json::json!({"command": "ls"})),
+            ),
+            // -- Accept: mixed nesting — `function.name` with a flat
+            //    top-level `arguments` (previously: name kept, args lost) ----
+            CorpusFixture::stream(
+                "wrapper-name-with-flat-arguments",
+                vec![tc_delta(serde_json::json!([{"index": 0, "id": "call_m",
+                    "function": {"name": "shell"}, "arguments": shell_args}]))],
+                CorpusFixture::tool("shell", serde_json::json!({"command": "ls"})),
+            ),
+            // -- Accept: the WHOLE call nested under the unexpected legacy
+            //    `delta.function_call` key (no index, no tool_calls array) ---
+            CorpusFixture::stream(
+                "legacy-delta-function-call-key",
+                vec![serde_json::json!({"choices": [{"delta": {"function_call":
+                    {"name": "shell", "arguments": shell_args}}}]})],
+                CorpusFixture::tool("shell", serde_json::json!({"command": "ls"})),
+            ),
+            // -- Accept: `function.arguments` delivered as an object instead
+            //    of an incremental string (non-conforming proxy) -------------
+            CorpusFixture::stream(
+                "wrapper-object-arguments-one-shot",
+                vec![tc_delta(serde_json::json!([{"index": 0, "id": "call_w2",
+                    "function": {"name": "shell", "arguments": {"command": "ls"}}}]))],
+                CorpusFixture::tool("shell", serde_json::json!({"command": "ls"})),
+            ),
+            // -- Accept: stringified-JSON double-encoded arguments — the
+            //    arguments string parses to ANOTHER JSON string that holds the
+            //    object; unwrap instead of shipping a string downstream ------
+            CorpusFixture::stream(
+                "double-encoded-arguments-string",
+                vec![tc_delta(serde_json::json!([{"index": 0, "id": "call_d",
+                    "function": {"name": "shell", "arguments": double_args}}]))],
+                CorpusFixture::tool("shell", serde_json::json!({"command": "ls"})),
+            ),
+            // -- Accept: envelope fragmented across content deltas — the
+            //    strict whole-turn parse judges the REASSEMBLED text --------
+            CorpusFixture::stream(
+                "content-envelope-split-across-deltas",
+                vec![
+                    content_delta("{\"name\":\"shell\",\"argu"),
+                    content_delta("ments\":{\"command\":\"ls\"}}"),
+                ],
+                CorpusFixture::tool("shell", serde_json::json!({"command": "ls"})),
+            ),
+            // -- Accept: double-encoded content envelope (one string layer) --
+            CorpusFixture::stream(
+                "content-envelope-double-encoded",
+                vec![content_delta(&double_envelope)],
+                CorpusFixture::tool("shell", serde_json::json!({"command": "ls"})),
+            ),
+            // -- Accept: no top-level `name` — inferable from the nested
+            //    canonical `function` wrapper (whole-turn strictness holds) --
+            CorpusFixture::stream(
+                "content-envelope-nested-function-name",
+                vec![content_delta(
+                    r#"{"id":"call_w","type":"function","function":{"name":"shell","arguments":"{\"command\":\"ls\"}"}}"#,
+                )],
+                CorpusFixture::tool("shell", serde_json::json!({"command": "ls"})),
+            ),
+            // -- Accept: Mimo-class weak-model path — flat, id-less, whole
+            //    non-streamed body with loose dot-notation arguments ---------
+            CorpusFixture::weak_whole_body(
+                "mimo-class-flat-whole-body-loose-arguments",
+                vec![serde_json::json!({"choices": [{"message": {"role": "assistant",
+                    "tool_calls": [{"name": "runner",
+                        "arguments": {"config.mode": "fast", "config.retries": 2}}]},
+                    "finish_reason": "tool_calls"}]})],
+                CorpusFixture::tool(
+                    "runner",
+                    serde_json::json!({"config": {"mode": "fast", "retries": 2}}),
+                ),
+            ),
+            // -- Reject (stay text): prose around / instead of the envelope --
+            CorpusFixture::stream(
+                "content-leading-prose-then-envelope",
+                vec![content_delta(&format!("Sure: {envelope}"))],
+                CorpusExpect::Text,
+            ),
+            // -- Reject (drop): a tool-call element that never carries a name
+            //    anywhere — explicit diagnostic, no nameless ToolCall ships ---
+            CorpusFixture::stream(
+                "tool-call-element-without-name",
+                vec![tc_delta(serde_json::json!([{"index": 0, "arguments": shell_args}]))],
+                CorpusExpect::Dropped,
+            ),
+        ]
+    }
+
+    /// Run one fixture through the stream reducer (whole-body fixtures go
+    /// through the non-streamed transport) under a warn-capturing subscriber.
+    fn run_corpus_fixture(f: &CorpusFixture) -> (Vec<CompletionChunk>, WarnSink) {
+        let mut state = OpenAiStreamState::new();
+        state.tool_adapted = f.tool_adapted;
+        let subscriber = WarnSink::default();
+        let sink = subscriber.clone();
+        tracing::subscriber::with_default(subscriber, || {
+            if f.whole_body {
+                state.handle_non_stream_body(f.events[0].clone());
+            } else {
+                for event in &f.events {
+                    state.handle_event(sse(&event.to_string()));
+                }
+                state.handle_event(sse("[DONE]"));
+            }
+        });
+        (drain(&mut state), sink)
+    }
+
+    /// Fixture-driven corpus: every shape either parses to the correct
+    /// `ToolCall` (no text echo, no diagnostics) or is explicitly rejected
+    /// (text kept, or nameless drop with exactly one diagnostic).
+    #[test]
+    fn proxy_fixture_corpus_parses_or_rejects() {
+        for f in proxy_corpus() {
+            let (chunks, sink) = run_corpus_fixture(&f);
+            assert!(chunks.last().map(|c| c.is_final).unwrap_or(false), "{}", f.label);
+            let calls: Vec<&ToolCall> =
+                chunks.iter().filter_map(|c| c.tool_call.as_ref()).collect();
+            let text: String = chunks.iter().map(|c| c.delta.as_str()).collect();
+            match &f.expect {
+                CorpusExpect::Tool { name, arguments } => {
+                    assert_eq!(calls.len(), 1, "{}: exactly one tool call", f.label);
+                    assert_eq!(calls[0].name, *name, "{}: tool name", f.label);
+                    assert_eq!(&calls[0].arguments, arguments, "{}: arguments", f.label);
+                    assert!(text.is_empty(), "{}: must not be echoed as text", f.label);
+                    assert_eq!(sink.warns().len(), 0, "{}: clean parse is silent", f.label);
+                }
+                CorpusExpect::Text => {
+                    assert!(calls.is_empty(), "{}: must stay plain text", f.label);
+                    let expected: String = f
+                        .events
+                        .iter()
+                        .filter_map(|e| e["choices"][0]["delta"]["content"].as_str())
+                        .collect();
+                    assert_eq!(text, expected, "{}: content verbatim", f.label);
+                    assert_eq!(sink.warns().len(), 0, "{}: text path is silent", f.label);
+                }
+                CorpusExpect::Dropped => {
+                    assert!(calls.is_empty(), "{}: nameless call must be dropped", f.label);
+                    assert!(text.is_empty(), "{}: drop does not echo text", f.label);
+                    assert_eq!(sink.warns().len(), 1, "{}: one explicit diagnostic", f.label);
+                }
+            }
+        }
+    }
+
+    /// Fix 2 STRICTNESS REGRESSION (row #38): extending the accepted envelope
+    /// alias set (nested `function`, one double-encoding layer) must NOT
+    /// loosen the whole-turn semantics — anything that is not exactly one
+    /// envelope object still rejects, and the canonical shapes still accept.
+    #[test]
+    fn fix2_strict_envelope_semantics_hold() {
+        let rejects: &[&str] = &[
+            r#"{"name":"shell","arguments":{"command":"ls"}} and that's it"#, // trailing prose
+            "Sure: {\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}",  // leading prose
+            r#"[{"name":"shell","arguments":{"command":"ls"}}]"#,             // array
+            r#"{"arguments":{"command":"ls"}}"#,                              // no name/function
+            r#"{"name":"shell"}"#,                                            // no arguments
+            r#"{"name":"shell","arguments":42}"#,                             // wrong type
+            r#"{"name":"shell","arguments":null}"#,                           // null arguments
+            r#"{"name":"shell","input":"{\"command\":\"ls\"}"}"#,             // string input
+            r#"{"function":{"name":"shell"}}"#,                               // nested, no args
+            r#""{\"name\":\"shell\"} trailing""#,                             // bad double layer
+            "{}",
+            "",
+        ];
+        for content in rejects {
+            assert!(
+                OpenAiStreamState::parse_content_envelope(content).is_none(),
+                "must reject: {content}"
+            );
+        }
+
+        let accepts: &[(&str, &str)] = &[
+            (r#"{"name":"shell","arguments":{"command":"ls"}}"#, "shell"),
+            (r#"{"name":"shell","arguments":"{\"command\":\"ls\"}"}"#, "shell"),
+            (r#"{"name":"shell","input":{"command":"ls"}}"#, "shell"),
+            (r#"{"function":{"name":"shell","arguments":{"command":"ls"}}}"#, "shell"),
+            (
+                r#"{"id":"c","type":"function","function":{"name":"shell","arguments":"{\"command\":\"ls\"}"}}"#,
+                "shell",
+            ),
+        ];
+        for (content, name) in accepts {
+            let parsed = OpenAiStreamState::parse_content_envelope(content)
+                .unwrap_or_else(|| panic!("must accept: {content}"));
+            assert_eq!(parsed.name, *name, "envelope: {content}");
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Row #38 — pairwise verification against a REAL OpenAI-compatible
+    // proxy. Ignored by default AND env-gated: CI never sees a network.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Endpoint configuration for the live harness. Present only when both
+    /// `CONCERTO_LIVE_PROXY` (base URL) and `CONCERTO_LIVE_PROXY_KEY` are set;
+    /// `CONCERTO_LIVE_PROXY_MODEL` defaults to a cheap tool-calling model.
+    struct LiveProxy {
+        base: String,
+        key: SecretString,
+        model: String,
+    }
+
+    impl LiveProxy {
+        fn from_env() -> Option<Self> {
+            let base = std::env::var("CONCERTO_LIVE_PROXY").ok()?;
+            let key = std::env::var("CONCERTO_LIVE_PROXY_KEY").ok()?;
+            if base.trim().is_empty() || key.trim().is_empty() {
+                return None;
+            }
+            let model = std::env::var("CONCERTO_LIVE_PROXY_MODEL")
+                .unwrap_or_else(|_| "gpt-4o-mini".to_string());
+            Some(Self { base: base.trim_end_matches('/').to_string(), key: key.into(), model })
+        }
+
+        /// A forced single-tool request: `tool_choice` pins the outcome so the
+        /// assertion is deterministic across endpoints.
+        fn request_body(&self, stream: bool) -> serde_json::Value {
+            serde_json::json!({
+                "model": self.model,
+                "stream": stream,
+                "messages": [{"role": "user", "content": "Run `pwd` via the shell tool."}],
+                "tools": [{"type": "function", "function": {
+                    "name": "shell",
+                    "description": "Run a shell command.",
+                    "parameters": {"type": "object",
+                                   "properties": {"command": {"type": "string"}},
+                                   "required": ["command"]}
+                }}],
+                "tool_choice": {"type": "function", "function": {"name": "shell"}},
+            })
+        }
+    }
+
+    /// Wire-shape classes the corpus covers; anything else means the proxy
+    /// emitted a shape we have NO fixture for (add one, then re-run).
+    const LIVE_KNOWN_CLASSES: &[&str] =
+        &["function-wrapped", "flat", "legacy-function_call", "content-embedded"];
+
+    /// Classify tool-bearing wire shapes in one decoded payload (SSE event or
+    /// whole body) so the harness fails loudly on an uncovered shape class.
+    fn classify_wire_calls(
+        container: &serde_json::Value,
+        classes: &mut std::collections::BTreeSet<&'static str>,
+    ) {
+        let Some(calls) = container.get("tool_calls").and_then(|v| v.as_array()) else {
+            return;
+        };
+        for tc in calls {
+            if tc.get("function").is_some() || tc.get("function_call").is_some() {
+                classes.insert("function-wrapped");
+            } else if tc.get("name").is_some() {
+                classes.insert("flat");
+            } else {
+                classes.insert("UNCLASSIFIED");
+            }
+        }
+    }
+
+    fn classify_wire_shape(
+        payload: &serde_json::Value,
+        classes: &mut std::collections::BTreeSet<&'static str>,
+    ) {
+        let Some(choice) =
+            payload.get("choices").and_then(|v| v.as_array()).and_then(|v| v.first())
+        else {
+            return;
+        };
+        if let Some(delta) = choice.get("delta") {
+            classify_wire_calls(delta, classes);
+            if delta.get("function_call").is_some() {
+                classes.insert("legacy-function_call");
+            }
+        }
+        if let Some(message) = choice.get("message") {
+            classify_wire_calls(message, classes);
+        }
+    }
+
+    /// Assert the pairwise outcome: exactly one correctly parsed tool call,
+    /// and every observed wire-shape class is covered by the corpus.
+    fn assert_live_outcome(
+        chunks: &[CompletionChunk],
+        mut classes: std::collections::BTreeSet<&'static str>,
+        leg: &str,
+    ) {
+        let calls: Vec<&ToolCall> = chunks.iter().filter_map(|c| c.tool_call.as_ref()).collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "{leg}: expected exactly one parsed tool call, got {} (classes: {classes:?})",
+            calls.len()
+        );
+        assert_eq!(calls[0].name, "shell", "{leg}: tool name survives parsing");
+        assert!(
+            calls[0].arguments.is_object(),
+            "{leg}: arguments must land as an object: {}",
+            calls[0].arguments
+        );
+        if classes.is_empty() && !calls.is_empty() {
+            // No structured tool-call wire shape was observed, yet a call
+            // parsed — the proxy embedded it in `content`.
+            classes.insert("content-embedded");
+        }
+        for class in &classes {
+            assert!(
+                LIVE_KNOWN_CLASSES.contains(class),
+                "{leg}: proxy emitted tool-call shape `{class}` with no corpus fixture — \
+                 add a sanitized fixture to `proxy_corpus()`"
+            );
+        }
+    }
+
+    /// POST one chat-completion request to the live endpoint; a non-2xx
+    /// status panics WITH the response body (test-only diagnostics), and a
+    /// cancelled token yields `None` so the legs exit early.
+    async fn live_post(
+        proxy: &LiveProxy,
+        stream: bool,
+        cancel: &CancellationToken,
+    ) -> Option<reqwest::Response> {
+        let client = crate::new_client(60);
+        tokio::select! {
+            _ = cancel.cancelled() => None,
+            result = client
+                .post(format!("{}/chat/completions", proxy.base))
+                .bearer_auth(proxy.key.expose())
+                .json(&proxy.request_body(stream))
+                .send() => {
+                let response = result.expect("live proxy request sent");
+                let status = response.status();
+                assert!(
+                    status.is_success(),
+                    "live proxy HTTP {status}: {}",
+                    response.text().await.unwrap_or_default()
+                );
+                Some(response)
+            }
+        }
+    }
+
+    /// Streamed leg: replay raw SSE bytes through the same parser + reducer
+    /// the connector uses, classifying the wire shape as it arrives.
+    async fn live_streamed_leg(
+        proxy: &LiveProxy,
+        cancel: CancellationToken,
+    ) -> (Vec<CompletionChunk>, std::collections::BTreeSet<&'static str>) {
+        let Some(response) = live_post(proxy, true, &cancel).await else {
+            return (Vec::new(), std::collections::BTreeSet::new());
+        };
+
+        let mut state = OpenAiStreamState::new();
+        let mut parser = BufferedSseParser::new();
+        let mut classes = std::collections::BTreeSet::new();
+        let mut byte_stream = response.bytes_stream();
+        loop {
+            let next = tokio::select! {
+                _ = cancel.cancelled() => break,
+                next = byte_stream.next() => next,
+            };
+            let Some(next) = next else { break };
+            let bytes = next.expect("live proxy stream readable");
+            for event in parser.push_bytes(&bytes) {
+                if let Some(data) = event.data.as_deref() {
+                    if let Ok(payload) = serde_json::from_str::<serde_json::Value>(data) {
+                        classify_wire_shape(&payload, &mut classes);
+                    }
+                }
+                state.handle_event(event);
+            }
+        }
+        (drain(&mut state), classes)
+    }
+
+    /// Non-streamed leg: the `stream: false` body reduces through
+    /// `handle_non_stream_body` — the weak-model transport.
+    async fn live_non_streamed_leg(
+        proxy: &LiveProxy,
+        cancel: CancellationToken,
+    ) -> (Vec<CompletionChunk>, std::collections::BTreeSet<&'static str>) {
+        let Some(response) = live_post(proxy, false, &cancel).await else {
+            return (Vec::new(), std::collections::BTreeSet::new());
+        };
+        let body_text = tokio::select! {
+            _ = cancel.cancelled() => {
+                return (Vec::new(), std::collections::BTreeSet::new());
+            }
+            text = response.text() => text.expect("live proxy body readable"),
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body_text).expect("live proxy body is JSON");
+        let mut classes = std::collections::BTreeSet::new();
+        classify_wire_shape(&parsed, &mut classes);
+        let mut state = OpenAiStreamState::new();
+        state.handle_non_stream_body(parsed);
+        (drain(&mut state), classes)
+    }
+
+    /// Pairwise verification (row #38): replay a forced tool call against a
+    /// real OpenAI-compatible proxy in BOTH transports and assert the parse
+    /// outcome plus corpus coverage of the observed wire-shape class.
+    ///
+    /// Never runs in CI: `#[ignore]` plus the env gate below (a `--ignored`
+    /// run without env skips instead of failing).
+    ///
+    /// ```text
+    /// CONCERTO_LIVE_PROXY=https://host/v1     # endpoint base URL
+    /// CONCERTO_LIVE_PROXY_KEY=...             # per-session key, never committed
+    /// CONCERTO_LIVE_PROXY_MODEL=...           # optional (default gpt-4o-mini)
+    /// cargo test -p concerto-providers live_proxy_pairwise -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "live network: set CONCERTO_LIVE_PROXY + CONCERTO_LIVE_PROXY_KEY, run with --ignored"]
+    async fn live_proxy_pairwise_tool_call_parsing() {
+        let Some(proxy) = LiveProxy::from_env() else {
+            eprintln!("skipped: CONCERTO_LIVE_PROXY / CONCERTO_LIVE_PROXY_KEY not set");
+            return;
+        };
+        let cancel = CancellationToken::new();
+
+        let (streamed, stream_classes) = tokio::time::timeout(
+            std::time::Duration::from_secs(90),
+            live_streamed_leg(&proxy, cancel.clone()),
+        )
+        .await
+        .expect("streamed leg timed out");
+        assert_live_outcome(&streamed, stream_classes, "streamed");
+
+        let (whole, body_classes) = tokio::time::timeout(
+            std::time::Duration::from_secs(90),
+            live_non_streamed_leg(&proxy, cancel),
+        )
+        .await
+        .expect("non-streamed leg timed out");
+        assert_live_outcome(&whole, body_classes, "non-streamed");
     }
 }

@@ -1,5 +1,5 @@
 //! Dialect adapters — the provider-family seam of the provider-first design
-//! (Phase 2, `docs/ARCHITECTURE-V2.md`).
+//! (Phase 2, `docs/research/ARCHITECTURE-V2.md`).
 //!
 //! Providers are dialects of one canonical protocol: a [`Dialect`] lowers a
 //! canonical [`CompletionRequest`] onto the exact wire request body that a
@@ -26,7 +26,7 @@ pub mod schema_sanitize;
 pub use anthropic::AnthropicChatDialect;
 pub use google::GeminiChatDialect;
 pub use ollama::OllamaChatDialect;
-pub use openai_compat::OpenAiChatDialect;
+pub use openai_compat::{map_usage, OpenAiChatDialect, UsageRequest};
 
 /// Controls whether collected `reasoning_content` is echoed back to the
 /// provider on assistant messages (ADR-46).

@@ -5,12 +5,12 @@ use crate::traits::policy::{AuditEntry, PolicyEngine};
 use crate::traits::tool::Tool;
 use crate::traits::ApprovalSink;
 use crate::types::{
-    CapabilitySet, CommandPolicyFacts, PolicyAction, PolicyVerdict, SessionContext, ToolDefinition,
-    ToolOutput, ToolRegistry,
+    CapabilitySet, CommandPolicyFacts, PathPolicyFacts, PolicyAction, PolicyVerdict,
+    ReadResultFacts, SessionContext, ToolDefinition, ToolOutput, ToolRegistry,
 };
 use crate::CancellationToken;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use time::OffsetDateTime;
 
 /// Orchestrates policy-gated tool execution.
@@ -30,6 +30,7 @@ struct ExecutionAuditContext {
     correlation_id: crate::ids::Ulid,
     input_hash: String,
     facts: Option<CommandPolicyFacts>,
+    path_facts: Option<PathPolicyFacts>,
 }
 
 /// Construct the policy action for a tool call, shared by the executing path
@@ -59,9 +60,46 @@ fn build_action<'a>(
         // shell tool resolves executable/argv/cwd), so the policy engine
         // and audit log reason about what actually runs, not just a string.
         command_facts: tool.command_facts(input, session),
+        // Path-shaped counterpart: filesystem/git/LSP tools resolve the
+        // operation and target path (attempted + confined) so the audit trail
+        // can attribute the action to a concrete target.
+        path_facts: tool.path_facts(input, session),
         // Orchestrator-authority marker: only the authority execute path sets
         // this; every ordinary (specialist / gate / bridge) path passes false.
         orchestrator_authority,
+    }
+}
+
+/// Derive the audit-safe result summary of a read-only tool call from the
+/// result the executor already holds.
+///
+/// `operation` is the path-facts operation recorded alongside the attempt:
+/// `exists` / `list` / `read` are the filesystem read-only vocabulary, and no
+/// other producer emits them (git records subcommands, LSP records method
+/// names). Every value comes from `output.data`, produced by the execution
+/// that just finished — the boolean is already computed, the entry count is
+/// an array length, the size is a string length — so this derivation is
+/// O(1) and performs **no** additional I/O: it never re-reads the file and
+/// never adds a syscall to the hot path.
+///
+/// Returns `None` when the operation is not read-only, or when the expected
+/// field is absent or of the wrong type (e.g. a future tool reusing one of
+/// these operation names with a different result shape): an unknown result
+/// is recorded as "nothing learned", never guessed.
+fn read_result_facts(operation: &str, output: &ToolOutput) -> Option<ReadResultFacts> {
+    match operation {
+        "exists" => output
+            .data
+            .get("exists")
+            .and_then(serde_json::Value::as_bool)
+            .map(ReadResultFacts::Exists),
+        "list" => output.data.get("entries").and_then(serde_json::Value::as_array).map(|entries| {
+            ReadResultFacts::Entries(i64::try_from(entries.len()).unwrap_or(i64::MAX))
+        }),
+        "read" => output.data.get("content").and_then(serde_json::Value::as_str).map(|content| {
+            ReadResultFacts::Bytes(i64::try_from(content.len()).unwrap_or(i64::MAX))
+        }),
+        _ => None,
     }
 }
 
@@ -76,7 +114,8 @@ impl ToolExecutor {
     }
 
     /// Attach an event bus so the executor can publish approval lifecycle
-    /// events (e.g. [`EventKind::ApprovalTimeout`]) to subscribers.
+    /// events ([`EventKind::ApprovalRequested`] when a request starts waiting,
+    /// [`EventKind::ApprovalResolved`] once it is answered) to subscribers.
     pub fn with_event_bus(mut self, bus: EventBus) -> Self {
         self.event_bus = Some(bus);
         self
@@ -133,7 +172,7 @@ impl ToolExecutor {
         // its exit code, and its duration. The ADR-28 §6 shell fields are derived
         // from `command_facts` when present and stay `None` otherwise, so
         // non-shell tools get a minimal, truthful completion row.
-        let ExecutionAuditContext { correlation_id, input_hash, facts } = audit;
+        let ExecutionAuditContext { correlation_id, input_hash, facts, path_facts } = audit;
         let exit_code = result
             .as_ref()
             .ok()
@@ -146,6 +185,15 @@ impl ToolExecutor {
             (Err(error), _) => format!("ExecutionError({error})"),
         };
         let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+        // Read-only result facts: record what the operation RETURNED (the
+        // `exists` boolean, the `list` entry count, the `read` byte size)
+        // straight from the result already in hand — never the content, and
+        // never a second read. Mutating operations, failed executions and
+        // tools that name no operation stay `None`.
+        let result_facts = match (&result, &path_facts) {
+            (Ok(output), Some(facts)) => read_result_facts(&facts.operation, output),
+            _ => None,
+        };
         let entry = AuditEntry {
             tool_name: tool_name.to_owned(),
             verdict,
@@ -175,6 +223,8 @@ impl ToolExecutor {
             toolchain_version: None,
             plan_id: None,
             source_revision: None,
+            path_facts,
+            result_facts,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel.clone()).await {
             tracing::error!(%error, "post-execution audit write failed");
@@ -208,22 +258,10 @@ impl ToolExecutor {
         self.record_approval_outcome(action, verdict, user_response, cancel).await;
     }
 
-    /// Persist a timeout as its own approval-decision row (verdict `TimedOut`)
-    /// so the trail shows the request expired and the run paused — the
-    /// pre-fix path wrote no row at all on timeout.
-    async fn record_approval_timeout(
-        &self,
-        action: &PolicyAction<'_>,
-        timeout_secs: u64,
-        cancel: CancellationToken,
-    ) {
-        let response = format!("approval timed out after {timeout_secs}s; awaiting user");
-        self.record_approval_outcome(action, "TimedOut", &response, cancel).await;
-    }
-
     /// Shared builder for an approval-decision audit row. `verdict` is the
-    /// decision outcome (`Approved` / `ApprovedAllForSession` / `Denied` /
-    /// `TimedOut`); `user_response` is the human-readable detail.
+    /// decision outcome (`Approved` / `ApprovedAllForSession` / `Denied`);
+    /// `user_response` is the human-readable detail that records who or what
+    /// answered (the user, or the run's cancellation).
     async fn record_approval_outcome(
         &self,
         action: &PolicyAction<'_>,
@@ -269,6 +307,8 @@ impl ToolExecutor {
             toolchain_version: None,
             plan_id: None,
             source_revision: None,
+            path_facts: action.path_facts.clone(),
+            result_facts: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "approval-decision audit write failed");
@@ -280,18 +320,20 @@ impl ToolExecutor {
     /// [`Self::record_approval_decision`].
     ///
     /// `ApprovalSink::request_ack` returns a bare `bool` (acknowledged →
-    /// continue, or abort) and today leaves no audit trace (audit H-04). This
-    /// is the backend-agnostic record seam for that path: the verdict
-    /// vocabulary is extended with `RequestContinue` / `RequestAbort`, the
-    /// warning text is preserved as `user_response`, and `rule_matched` is
-    /// `"user_ack"`. Because an ack is not tied to any tool call, `tool_name`
-    /// is the synthetic `"request_ack"`, `input_hash` is the empty string (no
-    /// input exists), and the ADR-28 §6 execution fields stay `None`.
+    /// continue, or abort); this is the backend-agnostic record seam for that
+    /// path. The verdict vocabulary is extended with `RequestContinue` /
+    /// `RequestAbort`, the warning text is preserved as `user_response`, and
+    /// `rule_matched` is `"user_ack"`. Because an ack is not tied to any tool
+    /// call, `tool_name` is the synthetic `"request_ack"`, `input_hash` is the
+    /// empty string (no input exists), and the ADR-28 §6 execution fields stay
+    /// `None`.
     ///
-    /// Phase 0 ships the channel only: the live `request_ack` call site lives
-    /// in the orchestrator (`setup_undo_stash`), and wiring it here is a later,
-    /// explicitly additive phase. Until then nothing calls this method in
-    /// production, so this is zero-behavioral.
+    /// Wired in production through the single-agent loop
+    /// (`AgentLoop::setup_undo_stash` → `ToolExecutionBackend::record_ack_decision`),
+    /// so every ack decision point — a continuing ack, an aborted ack, and a
+    /// queue-full refusal (which surfaces to the sink as `false`) — records a
+    /// row. The in-process backend delegates here; the supervised agent-process
+    /// backend leaves the audit supervisor-side (ADR-60 D4/D5).
     pub async fn record_ack_decision(
         &self,
         session_id: crate::ids::Ulid,
@@ -321,6 +363,8 @@ impl ToolExecutor {
             toolchain_version: None,
             plan_id: None,
             source_revision: None,
+            path_facts: None,
+            result_facts: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "ack-decision audit write failed");
@@ -377,6 +421,8 @@ impl ToolExecutor {
             // A shape decision binds no plan and names no source revision.
             plan_id: None,
             source_revision: None,
+            path_facts: None,
+            result_facts: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "coordinator-shape audit write failed");
@@ -432,6 +478,8 @@ impl ToolExecutor {
             toolchain_version: None,
             plan_id: None,
             source_revision: None,
+            path_facts: None,
+            result_facts: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::warn!(%error, decision, "coordinator-decision audit write failed (fail-soft)");
@@ -440,7 +488,7 @@ impl ToolExecutor {
         }
     }
 
-    /// Persist a plan-approval decision (ADR-55 Phase 1d) as a distinct audit
+    /// Persist a plan-approval decision (ADR-55 §4) as a distinct audit
     /// entry.
     ///
     /// A plan decision is not tied to any tool call, so `tool_name` is the
@@ -450,7 +498,7 @@ impl ToolExecutor {
     /// back to the router's classification), and `user_response` is a compact
     /// JSON envelope with the bound `plan_id` and the source revision the plan
     /// was approved at. The same values are mirrored into the schema-derived
-    /// `plan_id` / `source_revision` columns (ADR-55 Phase 1d §4) so the log is
+    /// `plan_id` / `source_revision` columns (ADR-55 §6) so the log is
     /// queryable without JSON parsing; the envelope is retained for
     /// replay/backward compatibility. The ADR-28 §6 execution fields stay
     /// `None`: there is no command behind a plan decision.
@@ -492,6 +540,8 @@ impl ToolExecutor {
             toolchain_version: None,
             plan_id: Some(plan_id.to_owned()),
             source_revision: source_revision.map(str::to_owned),
+            path_facts: None,
+            result_facts: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "plan-decision audit write failed");
@@ -557,6 +607,8 @@ impl ToolExecutor {
             toolchain_version: None,
             plan_id: None,
             source_revision: None,
+            path_facts: None,
+            result_facts: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "capability-refusal audit write failed");
@@ -618,6 +670,8 @@ impl ToolExecutor {
             toolchain_version: None,
             plan_id: None,
             source_revision: None,
+            path_facts: None,
+            result_facts: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "tool-driver audit write failed");
@@ -679,6 +733,7 @@ impl ToolExecutor {
         let correlation_id = action.correlation_id;
         let input_hash = crate::policy::compute_input_hash(&input);
         let command_facts = action.command_facts.clone();
+        let path_facts = action.path_facts.clone();
 
         match self.policy.evaluate(&action, cancel.clone()).await {
             Ok(PolicyVerdict::Allow) => {
@@ -688,20 +743,29 @@ impl ToolExecutor {
                     input,
                     session,
                     cancel,
-                    ExecutionAuditContext { correlation_id, input_hash, facts: command_facts },
+                    ExecutionAuditContext {
+                        correlation_id,
+                        input_hash,
+                        facts: command_facts,
+                        path_facts,
+                    },
                 )
                 .await
             }
             Ok(PolicyVerdict::Deny) => {
                 Err(ToolError::PolicyDenied { rule: "policy_denied".into() })
             }
+            // The verdict's `timeout` is deliberately ignored here: an
+            // approval request has NO auto-expiry (owner requirement — the
+            // session pauses completely until permission is given or
+            // revoked). See `request_approval_decision`.
             Ok(
-                PolicyVerdict::RequireApproval { timeout }
-                | PolicyVerdict::RequireApprovalWithTimeout { timeout },
+                PolicyVerdict::RequireApproval { .. }
+                | PolicyVerdict::RequireApprovalWithTimeout { .. },
             ) => match &self.approval_sink {
                 Some(sink) => {
                     match self
-                        .request_approval_decision(sink.as_ref(), &action, timeout, cancel.clone())
+                        .request_approval_decision(sink.as_ref(), &action, cancel.clone())
                         .await
                     {
                         Ok(decision) => {
@@ -724,6 +788,7 @@ impl ToolExecutor {
                                             correlation_id,
                                             input_hash,
                                             facts: command_facts,
+                                            path_facts,
                                         },
                                     )
                                     .await
@@ -788,6 +853,7 @@ impl ToolExecutor {
             correlation_id: action.correlation_id,
             input_hash: crate::policy::compute_input_hash(&input),
             facts: action.command_facts.clone(),
+            path_facts: action.path_facts.clone(),
         };
         self.execute_allowed(tool, tool_name, input, session, cancel, audit).await
     }
@@ -824,8 +890,9 @@ impl ToolExecutor {
     /// Called only when the serve gate served a cached read *without* executing
     /// the tool, so no policy decision row precedes this entry: it gets a
     /// fresh `correlation_id` and leaves the ADR-28 §6 execution fields `None`.
-    /// The served path is recorded in `argv` — the [`AuditEntry`] schema has no
-    /// dedicated path column — and `rule_matched` is `"served_from_cache"`.
+    /// The served path is recorded in a dedicated path-facts carrier (and, for
+    /// backward compatibility with existing consumers, still in `argv`), and
+    /// `rule_matched` is `"served_from_cache"`.
     ///
     /// `ServedFromCache` rows count toward read-count grounding metrics exactly
     /// like a real `ExecutionSucceeded` read row (ADR-65 §3.2). Fail-soft: a
@@ -860,96 +927,114 @@ impl ToolExecutor {
             toolchain_version: None,
             plan_id: None,
             source_revision: None,
+            path_facts: Some(PathPolicyFacts {
+                operation: "read".to_owned(),
+                attempted_path: Some(path.to_owned()),
+                ..PathPolicyFacts::default()
+            }),
+            // No tool output at this seam: the serve path hands the caller the
+            // cached payload directly, so there is no result to summarise
+            // here without threading the payload through the API.
+            result_facts: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "served-read audit write failed");
         }
     }
 
-    /// Race the approval decision, cancellation, and the configured timeout
-    /// at the requester.
+    /// Park on the user's approval decision — **there is no auto-expiry**.
     ///
-    /// H-02 remediation: the timeout is enforced here, not by wrapping the
-    /// sink — a silent sink must not hang the caller. On timeout the action is
-    /// **paused**, not denied: the request is left with the sink (which owns
-    /// its pending entry, so dropping this future does not lose it), an
-    /// [`EventKind::ApprovalTimeout`] is published, the timeout is recorded as
-    /// an approval-decision audit row (`TimedOut`), and a
-    /// [`ToolError::PausedAwaitingApproval`] is returned. A late user decision
-    /// still fulfils the preserved request and a resume re-attaches to it — the
-    /// run stops `AwaitingUser` instead of burning identical retries. Only an
-    /// explicit `Deny` or a dropped/dismissed pending request denies.
+    /// Owner requirement: "There should be no timeout, the session is supposed
+    /// to pause completely until permission is given or revoked." The timeout
+    /// carried by `PolicyVerdict::RequireApproval{timeout}` (the knob behind
+    /// `[policy] approval_timeout_secs`) is therefore NOT raced here; it is
+    /// retained at the policy/config layer for compatibility and is inert
+    /// (documented at its definition). This is the single enforcement point:
+    /// once removed here, no approval anywhere in the run expires.
+    ///
+    /// * **Waiting primitive** — a park, never a poll: the sink awaits a
+    ///   channel (`watch`/`oneshot`) held by the live UI, and the cancellation
+    ///   arm awaits a notification. Nothing spins and nothing is logged while
+    ///   waiting.
+    /// * **Cancellation is the escape hatch** — user cancel / stop / session
+    ///   teardown while the request is pending resolves it as DENY
+    ///   (fail-closed): a `Denied` audit row records that the run's
+    ///   cancellation answered, an `ApprovalResolved { approved: false }`
+    ///   event is published, and `ToolError::Cancelled` lets the run unwind
+    ///   cleanly. The tool never executes.
+    /// * **Observability** — one `ApprovalRequested` event and one log line
+    ///   mark the pending state (exactly once per request, so a waiting run is
+    ///   distinguishable from a stuck one); resolution publishes one
+    ///   `ApprovalResolved` event, and the caller records the decision audit
+    ///   row naming who answered.
+    /// * **Fail-closed** — a sink that returns without a decision (closed
+    ///   channel, dismissed dialog) returns `Deny`; no sink at all denies at
+    ///   the call site (`requires_approval_no_sink`). The only unbounded wait
+    ///   is the legitimate one: a live UI that simply has not been clicked.
     async fn request_approval_decision(
         &self,
         sink: &dyn ApprovalSink,
         action: &PolicyAction<'_>,
-        timeout: Duration,
         cancel: CancellationToken,
     ) -> Result<ApprovalDecision, ToolError> {
+        // Pending state, emitted once before parking (never repeated).
+        self.publish_approval_event(
+            action,
+            EventKind::ApprovalRequested {
+                tool_name: action.tool_name.to_string(),
+                // 0 = unbounded wait: no configured deadline is being armed.
+                timeout_secs: 0,
+            },
+        );
+        tracing::info!(
+            tool_name = %action.tool_name,
+            correlation_id = %action.correlation_id,
+            "approval requested; pausing until the user answers (no timeout)"
+        );
+
         tokio::select! {
             biased;
-            decision = sink.request_approval(action, cancel.clone()) => Ok(decision),
-            _ = cancel.cancelled() => Err(ToolError::Cancelled),
-            _ = tokio::time::sleep(timeout) => {
-                if let Some(bus) = &self.event_bus {
-                    let _ = bus.publish_for_session(
-                        action.session_id,
-                        action.correlation_id,
-                        EventKind::ApprovalTimeout {
-                            tool_name: action.tool_name.to_string(),
-                            timeout_secs: timeout.as_secs(),
-                        },
-                    );
-                }
-                tracing::warn!(
-                    tool_name = %action.tool_name,
-                    timeout_secs = timeout.as_secs(),
-                    "approval timed out; run paused awaiting the user"
+            // Cancellation first: on a cancel/answer race the run resolves
+            // fail-closed (deny), never allow.
+            () = cancel.cancelled() => {
+                // A fresh (non-cancelled) token for the audit write: the
+                // deny row must not be cancellable, or it would go unrecorded
+                // on the exact path that needs it most.
+                self.record_approval_outcome(
+                    action,
+                    "Denied",
+                    "run cancelled while the approval was pending; denying (fail-closed)",
+                    CancellationToken::new(),
+                )
+                .await;
+                self.publish_approval_event(
+                    action,
+                    EventKind::ApprovalResolved {
+                        tool_name: action.tool_name.to_string(),
+                        approved: false,
+                    },
                 );
-                // Record the timeout on the same audit trail as the other
-                // approval outcomes (pre-fix, a timeout wrote no row at all).
-                self.record_approval_timeout(action, timeout.as_secs(), cancel.clone()).await;
-                Err(ToolError::PausedAwaitingApproval {
-                    tool_name: action.tool_name.to_string(),
-                    detail: action_detail(action.input),
-                    input_hash: crate::policy::compute_input_hash(action.input),
-                    correlation_id: action.correlation_id,
-                    timeout_secs: timeout.as_secs(),
-                })
+                Err(ToolError::Cancelled)
+            }
+            decision = sink.request_approval(action, cancel.clone()) => {
+                self.publish_approval_event(
+                    action,
+                    EventKind::ApprovalResolved {
+                        tool_name: action.tool_name.to_string(),
+                        approved: !matches!(decision, ApprovalDecision::Deny),
+                    },
+                );
+                Ok(decision)
             }
         }
     }
-}
 
-/// Compact human-readable detail for a paused approval action, used to carry
-/// the action identity onto the checkpoint without shipping the whole input.
-fn action_detail(input: &serde_json::Value) -> String {
-    if let Some(command) = input.get("command").and_then(serde_json::Value::as_str) {
-        let args = input
-            .get("args")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(serde_json::Value::as_str)
-            .collect::<Vec<_>>();
-        if args.is_empty() {
-            return format!("command: {command}");
+    /// Publish one approval lifecycle event for `action` when an event bus is
+    /// attached. Fail-soft: a bus error is logged, never surfaced.
+    fn publish_approval_event(&self, action: &PolicyAction<'_>, kind: EventKind) {
+        if let Some(bus) = &self.event_bus {
+            let _ = bus.publish_for_session(action.session_id, action.correlation_id, kind);
         }
-        return format!("command: {command} {}", args.join(" "));
-    }
-    let key = match input.get("path").and_then(serde_json::Value::as_str) {
-        Some(path) => return format!("path: {path}"),
-        None => input.get("operation").and_then(serde_json::Value::as_str),
-    };
-    if let Some(operation) = key {
-        return format!("operation: {operation}");
-    }
-    let json = serde_json::to_string(input).unwrap_or_default();
-    if json.chars().count() > 120 {
-        let truncated: String = json.chars().take(119).collect();
-        format!("{truncated}…")
-    } else {
-        json
     }
 }
 
@@ -963,6 +1048,7 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::time::Duration;
     struct AllowPolicy;
     struct DenyPolicy;
 
@@ -1071,6 +1157,7 @@ mod tests {
                 network_requested: false,
                 filesystem_scope: FilesystemScope::ProjectOnly,
                 destructive_classification: DestructiveClass::NonDestructive,
+                ..Default::default()
             })
         }
 
@@ -1085,6 +1172,54 @@ mod tests {
                 summary: "completed".to_owned(),
                 data: serde_json::json!({ "exit_code": 7 }),
             })
+        }
+    }
+
+    /// Path-shaped tool (filesystem-like) that produces structured path facts,
+    /// used to prove the carrier reaches both the policy and completion rows.
+    struct PathTool;
+
+    #[async_trait]
+    impl Tool for PathTool {
+        fn name(&self) -> &str {
+            "filesystem"
+        }
+        fn description(&self) -> &str {
+            "path-shaped test tool"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn capability_requirements(&self) -> CapabilitySet {
+            CapabilitySet::default()
+        }
+        fn path_facts(
+            &self,
+            input: &serde_json::Value,
+            _session: &SessionContext,
+        ) -> Option<PathPolicyFacts> {
+            Some(PathPolicyFacts {
+                operation: input
+                    .get("operation")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("read")
+                    .to_owned(),
+                attempted_path: input
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                resolved_path: Some("/proj/notes.txt".to_owned()),
+                ..PathPolicyFacts::default()
+            })
+        }
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _policy: &dyn PolicyEngine,
+            _session: &SessionContext,
+            _cancel: CancellationToken,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput { summary: "ok".to_owned(), data: serde_json::json!({}) })
         }
     }
 
@@ -1466,9 +1601,231 @@ mod tests {
         assert_eq!(entries[1].argv, None);
         assert_eq!(entries[1].network_requested, None);
         assert_eq!(entries[1].resolved_executable, None);
+        // A non-path tool records no path facts either.
+        assert_eq!(entries[0].path_facts, None);
+        assert_eq!(entries[1].path_facts, None);
         // Both rows share correlation_id and input_hash.
         assert_eq!(entries[0].correlation_id, entries[1].correlation_id);
         assert_eq!(entries[0].input_hash, entries[1].input_hash);
+    }
+
+    /// A path-shaped tool's structured facts reach both the policy decision row
+    /// and the post-execution completion row.
+    #[tokio::test]
+    async fn path_tool_records_path_facts_on_policy_and_completion_rows() {
+        let audit = Arc::new(RecordingAudit::default());
+        let policy = Arc::new(SimplePolicyEngine::new(
+            vec![PolicyRule::AutoApprove(Condition::Always)],
+            audit.clone(),
+        ));
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(PathTool));
+        let executor = ToolExecutor::new(Arc::new(registry), policy);
+
+        executor
+            .execute(
+                "filesystem",
+                serde_json::json!({"operation": "write", "path": "notes.txt"}),
+                &test_session(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("path tool executes");
+
+        let entries = audit.entries.lock().unwrap();
+        assert_eq!(entries.len(), 2, "policy row + completion row");
+        let decision_facts = entries[0].path_facts.as_ref().expect("policy row carries path facts");
+        assert_eq!(decision_facts.operation, "write");
+        assert_eq!(decision_facts.attempted_path.as_deref(), Some("notes.txt"));
+        assert_eq!(decision_facts.resolved_path.as_deref(), Some("/proj/notes.txt"));
+        assert_eq!(
+            entries[1].path_facts.as_ref(),
+            Some(decision_facts),
+            "the completion row carries the same path facts"
+        );
+    }
+
+    /// Read-only-shaped tool: reports the input operation in its path facts
+    /// and returns the matching filesystem result shape, so the completion
+    /// row's *result* facts can be observed end to end.
+    struct ReadOnlyShapeTool;
+
+    #[async_trait]
+    impl Tool for ReadOnlyShapeTool {
+        fn name(&self) -> &str {
+            "filesystem"
+        }
+        fn description(&self) -> &str {
+            "read-only shaped test tool"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn capability_requirements(&self) -> CapabilitySet {
+            CapabilitySet::default()
+        }
+        fn path_facts(
+            &self,
+            input: &serde_json::Value,
+            _session: &SessionContext,
+        ) -> Option<PathPolicyFacts> {
+            Some(PathPolicyFacts {
+                operation: input
+                    .get("operation")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("read")
+                    .to_owned(),
+                attempted_path: input
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                ..PathPolicyFacts::default()
+            })
+        }
+        async fn execute(
+            &self,
+            input: serde_json::Value,
+            _policy: &dyn PolicyEngine,
+            _session: &SessionContext,
+            _cancel: CancellationToken,
+        ) -> Result<ToolOutput, ToolError> {
+            let operation =
+                input.get("operation").and_then(serde_json::Value::as_str).unwrap_or("read");
+            let data = match operation {
+                "exists" => serde_json::json!({
+                    "path": "a.txt",
+                    "exists": input.get("exists").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                }),
+                "list" => serde_json::json!({
+                    "path": ".",
+                    "entries": input.get("entries").cloned().unwrap_or_else(|| serde_json::json!([])),
+                }),
+                "read" => serde_json::json!({
+                    "path": "a.txt",
+                    "content": input.get("content").and_then(serde_json::Value::as_str).unwrap_or(""),
+                }),
+                _ => serde_json::json!({ "path": "a.txt", "size": 12 }),
+            };
+            Ok(ToolOutput { summary: "ok".to_owned(), data })
+        }
+    }
+
+    /// The incident regression: a read-only operation's completion row
+    /// records what it RETURNED — the `exists` boolean, the `list` entry
+    /// count (so `entries=0` proves emptiness was learned), the `read` byte
+    /// size — while a mutating operation records nothing, and no content
+    /// ever reaches the row.
+    #[tokio::test]
+    async fn read_only_operations_record_result_facts_on_the_completion_row() {
+        let audit = Arc::new(RecordingAudit::default());
+        let policy = Arc::new(SimplePolicyEngine::new(
+            vec![PolicyRule::AutoApprove(Condition::Always)],
+            audit.clone(),
+        ));
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(ReadOnlyShapeTool));
+        let executor = ToolExecutor::new(Arc::new(registry), policy);
+
+        let content = "Hello, World!";
+        let cases: [(&str, serde_json::Value, Option<ReadResultFacts>); 6] = [
+            (
+                "exists present",
+                serde_json::json!({"operation": "exists", "path": "a.txt", "exists": true}),
+                Some(ReadResultFacts::Exists(true)),
+            ),
+            (
+                "exists absent",
+                serde_json::json!({"operation": "exists", "path": "b.txt", "exists": false}),
+                Some(ReadResultFacts::Exists(false)),
+            ),
+            (
+                "list one entry",
+                serde_json::json!({
+                    "operation": "list",
+                    "path": ".",
+                    "entries": [{"name": "file_test_pass.txt", "kind": "file"}],
+                }),
+                Some(ReadResultFacts::Entries(1)),
+            ),
+            (
+                "list empty",
+                serde_json::json!({"operation": "list", "path": ".", "entries": []}),
+                Some(ReadResultFacts::Entries(0)),
+            ),
+            (
+                "read size",
+                serde_json::json!({"operation": "read", "path": "a.txt", "content": content}),
+                Some(ReadResultFacts::Bytes(13)),
+            ),
+            (
+                "mutating write",
+                serde_json::json!({"operation": "write", "path": "a.txt", "content": content}),
+                None,
+            ),
+        ];
+
+        for (label, input, expected) in cases {
+            audit.entries.lock().expect("audit lock").clear();
+            executor
+                .execute("filesystem", input, &test_session(), CancellationToken::new())
+                .await
+                .expect("tool executes");
+
+            let entries = audit.entries.lock().expect("audit lock");
+            assert_eq!(entries.len(), 2, "{label}: policy row + completion row");
+            assert_eq!(
+                entries[0].result_facts, None,
+                "{label}: decision-time rows never record a result"
+            );
+            assert_eq!(entries[1].result_facts, expected, "{label}");
+
+            let rendered = entries[1].result_facts.map(|facts| facts.to_string());
+            assert!(!rendered.as_deref().unwrap_or_default().contains(content), "{label}");
+            assert!(
+                rendered.as_deref().unwrap_or_default().len() <= 24,
+                "{label}: bounded rendering, got {rendered:?}"
+            );
+            if let Some(ReadResultFacts::Entries(count)) = entries[1].result_facts {
+                assert_eq!(count == 0, label == "list empty", "{label}: emptiness");
+            }
+        }
+    }
+
+    /// `read_result_facts` records only safe scalars: unknown operations and
+    /// missing/mistyped fields yield nothing, and neither content nor entry
+    /// names nor paths can appear in the rendering.
+    #[test]
+    fn read_result_facts_never_carries_content_or_unknown_shapes() {
+        let content = "SUPER-SECRET-FILE-CONTENT";
+        let read = ToolOutput {
+            summary: "read".to_owned(),
+            data: serde_json::json!({ "path": "secrets.env", "content": content }),
+        };
+        let facts = read_result_facts("read", &read).expect("a read result is recorded");
+        assert_eq!(facts, ReadResultFacts::Bytes(i64::try_from(content.len()).unwrap_or(i64::MAX)));
+        let rendered = facts.to_string();
+        assert!(!rendered.contains("SUPER-SECRET"), "{rendered}");
+        assert!(!rendered.contains("secrets.env"), "{rendered}");
+        assert_eq!(rendered, "bytes=25");
+
+        let list = ToolOutput {
+            summary: "list".to_owned(),
+            data: serde_json::json!({ "path": ".", "entries": [{"name": "id_rsa"}] }),
+        };
+        assert_eq!(read_result_facts("list", &list), Some(ReadResultFacts::Entries(1)));
+
+        // Mutating operation, missing field, wrong type: record nothing.
+        let write = ToolOutput {
+            summary: "wrote".to_owned(),
+            data: serde_json::json!({ "path": "a.txt", "size": 12 }),
+        };
+        assert_eq!(read_result_facts("write", &write), None);
+        let no_bool =
+            ToolOutput { summary: "odd".to_owned(), data: serde_json::json!({ "exists": "yes" }) };
+        assert_eq!(read_result_facts("exists", &no_bool), None);
+        let no_entries =
+            ToolOutput { summary: "odd".to_owned(), data: serde_json::json!({ "path": "." }) };
+        assert_eq!(read_result_facts("list", &no_entries), None);
     }
 
     /// A tool whose execution returns an error must produce an
@@ -1500,10 +1857,13 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // H-02: approval timeouts enforced by the requester
+    // Approval requests: no auto-expiry, one pending event, fail-closed
+    // on cancellation, and no sink at all.
     // ------------------------------------------------------------------
 
-    /// Policy that returns `RequireApprovalWithTimeout` for every action.
+    /// Policy that returns `RequireApprovalWithTimeout` with a **configured**
+    /// timeout. The value is deliberately present: tests must prove the
+    /// executor ignores it entirely and parks regardless of the deadline.
     struct ApprovalPolicy {
         timeout: Duration,
     }
@@ -1548,8 +1908,8 @@ mod tests {
     /// Approval sink whose decision is delivered through a `watch` channel, so
     /// tests control exactly when — and whether — the "user" responds. The
     /// sink keeps its own receiver so a decision resolved AFTER the requester
-    /// dropped its awaiting future (a timeout) is still delivered — the
-    /// "no orphaned oneshot loss" property.
+    /// dropped its awaiting future (cancellation / teardown) is still
+    /// delivered — the "no orphaned oneshot loss" property.
     struct ControlledApprovalSink {
         pending: Mutex<Option<tokio::sync::watch::Sender<Option<ApprovalDecision>>>>,
         preserved: Mutex<Option<tokio::sync::watch::Receiver<Option<ApprovalDecision>>>>,
@@ -1609,7 +1969,7 @@ mod tests {
     }
 
     /// Tool that records how many times it actually executed, so tests can
-    /// prove a timed-out approval never reaches execution.
+    /// prove an unanswered approval never reaches execution.
     struct CallCountingTool {
         calls: Arc<AtomicUsize>,
     }
@@ -1648,8 +2008,8 @@ mod tests {
 
     /// Deterministically (under paused time) wait until the executor has
     /// polled the sink and registered the pending approval request. This
-    /// guarantees both the sink branch and the timeout timer are armed before
-    /// the test advances the clock.
+    /// guarantees the pending request exists before the test advances the
+    /// clock or cancels the run.
     async fn wait_for_approval_request(sink: &ControlledApprovalSink) {
         for _ in 0..1_000 {
             if sink.requests.load(Ordering::SeqCst) > 0 {
@@ -1660,8 +2020,25 @@ mod tests {
         panic!("approval request never reached the sink");
     }
 
+    /// Await the next bus event, bounded so a missing event fails the test
+    /// instead of hanging it (paused time auto-advances to the deadline).
+    async fn next_event(rx: &mut crate::event::EventReceiver) -> crate::event::Event {
+        let event = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("approval lifecycle event never arrived"))
+            .expect("event bus must stay alive");
+        (*event).clone()
+    }
+
+    /// No auto-expiry: an unanswered approval request parks indefinitely.
+    ///
+    /// The policy still carries a 10-second timeout; the executor must ignore
+    /// it. Far past that deadline the call is still pending — no pause
+    /// variant error, no denial, no re-prompt — and the tool has not run. The
+    /// pending state is emitted exactly once, not polled repeatedly, and only
+    /// an explicit answer completes the call.
     #[tokio::test(start_paused = true)]
-    async fn approval_timeout_pauses_without_executing_and_emits_event() {
+    async fn approval_request_parks_far_past_the_configured_timeout() {
         let bus = EventBus::default();
         let mut rx = bus.subscribe();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1685,51 +2062,56 @@ mod tests {
                 .await
         });
         wait_for_approval_request(&sink).await;
-        tokio::time::advance(Duration::from_secs(10)).await;
 
-        let error = handle
+        // The pending state is published once, before parking.
+        let requested = next_event(&mut rx).await;
+        match &requested.kind {
+            EventKind::ApprovalRequested { tool_name, timeout_secs } => {
+                assert_eq!(tool_name, "echo");
+                assert_eq!(*timeout_secs, 0, "0 = unbounded wait, no deadline armed");
+            }
+            other => panic!("expected ApprovalRequested event, got {other:?}"),
+        }
+
+        // Far past the configured 10s deadline the request is still pending.
+        tokio::time::advance(Duration::from_secs(3_600)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!handle.is_finished(), "an approval must park until answered, never auto-expire");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "an unanswered request never executes");
+        assert_eq!(
+            sink.requests.load(Ordering::SeqCst),
+            1,
+            "exactly one prompt: no retry, no re-prompt, no re-ask"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the waiting state must be emitted once, not polled repeatedly"
+        );
+
+        // The run completes only when the user answers.
+        sink.resolve(ApprovalDecision::Approve);
+        let output = handle
             .await
             .expect("executor task must not panic")
-            .expect_err("approval timeout must pause the action");
-        // The timeout PAUSES (resumable), it does NOT deny: the run must never
-        // burn a retry on a timed-out approval.
-        match &error {
-            ToolError::PausedAwaitingApproval { tool_name, input_hash, timeout_secs, .. } => {
-                assert_eq!(tool_name, "echo");
-                assert_eq!(*timeout_secs, 10);
-                assert!(!input_hash.is_empty(), "the paused action carries its input hash");
-            }
-            other => panic!("expected PausedAwaitingApproval, got {other:?}"),
-        }
-        assert!(
-            !matches!(&error, ToolError::PolicyDenied { .. }),
-            "a timeout must never be a policy denial"
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "tool must never execute after timeout");
+            .expect("an approved request must execute");
+        assert_eq!(output.data, serde_json::json!({"key": "value"}));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        // The timeout event is published before the executor returns.
-        let event = rx.recv().await.expect("timeout event must be emitted");
-        match &event.kind {
-            EventKind::ApprovalTimeout { tool_name, timeout_secs } => {
+        let resolved = next_event(&mut rx).await;
+        match &resolved.kind {
+            EventKind::ApprovalResolved { tool_name, approved } => {
                 assert_eq!(tool_name, "echo");
-                assert_eq!(*timeout_secs, 10);
+                assert!(*approved, "the answer was an approval");
             }
-            other => panic!("expected ApprovalTimeout event, got {other:?}"),
+            other => panic!("expected ApprovalResolved event, got {other:?}"),
         }
-
-        // Late resolve after the timeout STILL lands on the preserved request
-        // (the executor dropped its awaiting future, but the sink kept the
-        // channel open) — no orphaned oneshot loss.
-        sink.resolve(ApprovalDecision::Approve);
-        assert_eq!(
-            sink.preserved_decision(),
-            Some(ApprovalDecision::Approve),
-            "a late resolve must fulfil the preserved request"
-        );
+        assert!(rx.try_recv().is_err(), "one request, one resolution, no repeats");
     }
 
     #[tokio::test(start_paused = true)]
-    async fn approval_before_timeout_executes_normally() {
+    async fn approval_answered_executes_normally() {
         let sink = Arc::new(ControlledApprovalSink::new());
         let executor =
             ToolExecutor::new(test_registry(), Arc::new(ApprovalPolicy::with_timeout(30)))
@@ -1752,16 +2134,28 @@ mod tests {
         let output = handle
             .await
             .expect("executor task must not panic")
-            .expect("approval before the deadline must succeed");
+            .expect("an answered approval must succeed");
         assert_eq!(output.data, serde_json::json!({"key": "value"}));
     }
 
+    /// Cancellation while a request is pending resolves it as DENY
+    /// (fail-closed): the tool never runs, the audit trail records a `Denied`
+    /// row naming the run's cancellation as the answer, an
+    /// `ApprovalResolved { approved: false }` event is published, and the
+    /// caller unwinds as `Cancelled` instead of hanging.
     #[tokio::test(start_paused = true)]
-    async fn cancellation_aborts_pending_approval_cleanly() {
+    async fn cancellation_while_pending_denies_fail_closed_and_unwinds() {
+        let audit = Arc::new(RecordingAudit::default());
+        let policy = Arc::new(RecordingApprovalPolicy { audit: audit.clone() });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(CallCountingTool::new(calls.clone())));
+        let bus = EventBus::default();
+        let mut rx = bus.subscribe();
         let sink = Arc::new(ControlledApprovalSink::new());
-        let executor =
-            ToolExecutor::new(test_registry(), Arc::new(ApprovalPolicy::with_timeout(60)))
-                .with_approval_sink(sink.clone());
+        let executor = ToolExecutor::new(Arc::new(registry), policy)
+            .with_approval_sink(sink.clone())
+            .with_event_bus(bus.clone());
         let session = test_session();
         let cancel = CancellationToken::new();
 
@@ -1770,13 +2164,77 @@ mod tests {
             async move { executor.execute("echo", serde_json::json!({}), &session, cancel).await }
         });
         wait_for_approval_request(&sink).await;
-        cancel.cancel();
+        let requested = next_event(&mut rx).await;
+        assert!(
+            matches!(requested.kind, EventKind::ApprovalRequested { .. }),
+            "the pending state must precede the cancellation"
+        );
 
+        cancel.cancel();
         let error = handle
             .await
             .expect("executor task must not panic")
             .expect_err("cancellation must abort the pending approval");
         assert!(matches!(error, ToolError::Cancelled), "expected cancellation, got {error:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "a cancelled request never executes");
+
+        let resolved = next_event(&mut rx).await;
+        match &resolved.kind {
+            EventKind::ApprovalResolved { approved, .. } => {
+                assert!(!*approved, "cancellation must resolve the request as denied");
+            }
+            other => panic!("expected ApprovalResolved event, got {other:?}"),
+        }
+
+        // The sink — not the requester — owns the pending entry, so an answer
+        // that arrives after the requester dropped its future is not lost.
+        sink.resolve(ApprovalDecision::Approve);
+        assert_eq!(
+            sink.preserved_decision(),
+            Some(ApprovalDecision::Approve),
+            "a late answer must survive the requester's cancellation"
+        );
+
+        // Audit: the policy's `RequireApproval` row plus the fail-closed
+        // `Denied` row recording who answered.
+        let entries = audit.entries.lock().unwrap();
+        assert_eq!(
+            entries.len(),
+            2,
+            "expected RequireApproval + Denied rows, got: {:?}",
+            entries.iter().map(|entry| &entry.verdict).collect::<Vec<_>>()
+        );
+        assert_eq!(entries[0].verdict, "RequireApproval");
+        assert_eq!(entries[1].verdict, "Denied");
+        let response = entries[1].user_response.as_deref().unwrap_or_default();
+        assert!(
+            response.contains("cancelled"),
+            "the deny row must record that the run's cancellation answered, got {response:?}"
+        );
+    }
+
+    /// Fail-closed with no UI attached: `requires_approval_no_sink` denies
+    /// immediately instead of parking forever for an answer that can never
+    /// arrive.
+    #[tokio::test]
+    async fn missing_sink_denies_without_hanging() {
+        let executor =
+            ToolExecutor::new(test_registry(), Arc::new(ApprovalPolicy::with_timeout(30)));
+        let session = test_session();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(30),
+            executor.execute("echo", serde_json::json!({}), &session, CancellationToken::new()),
+        )
+        .await
+        .expect("a request with no sink must deny, never park")
+        .expect_err("approval with no sink must be denied");
+        match error {
+            ToolError::PolicyDenied { rule } => {
+                assert_eq!(rule, "requires_approval_no_sink");
+            }
+            other => panic!("expected PolicyDenied(requires_approval_no_sink), got {other:?}"),
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1819,6 +2277,8 @@ mod tests {
                 toolchain_version: None,
                 plan_id: None,
                 source_revision: None,
+                path_facts: None,
+                result_facts: None,
             };
             self.audit.entries.lock().unwrap().push(entry);
             Ok(PolicyVerdict::RequireApproval { timeout: Duration::from_secs(30) })
@@ -1962,7 +2422,7 @@ mod tests {
 
     // ------------------------------------------------------------------
     // Audit-log completeness: request_ack outcomes are recorded through the
-    // same channel as approval decisions (audit H-04; ADR-55 Phase 0).
+    // same channel as approval decisions (audit H-04; ADR-55 §6).
     // ------------------------------------------------------------------
 
     /// `request_ack` returning `true` (the user acknowledged and wants to
@@ -2114,7 +2574,7 @@ mod tests {
             "user_response envelope carries the bound plan id"
         );
         assert_eq!(response["source_revision"], "f00dcafe");
-        // ADR-55 Phase 1d §4: the values are mirrored into schema-derived
+        // ADR-55 §6: the values are mirrored into schema-derived
         // columns so the log is queryable without JSON parsing.
         assert_eq!(entries[0].plan_id.as_deref(), Some("01J4V6Q8X000000000000000001"));
         assert_eq!(entries[0].source_revision.as_deref(), Some("f00dcafe"));

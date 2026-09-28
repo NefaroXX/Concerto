@@ -357,8 +357,11 @@ mod tests {
         // approximate_cost(tokens_in, tokens_out).
         use crate::openai::OpenAiProvider;
 
-        let openai =
-            OpenAiProvider::new("test-key".into(), "gpt-4o".into(), crate::DEFAULT_TIMEOUT_SECS);
+        let openai = OpenAiProvider::new(
+            "test-key".to_string(),
+            "gpt-4o".into(),
+            crate::DEFAULT_TIMEOUT_SECS,
+        );
         let rate_in = openai.approximate_cost(1_000_000, 0) / 1_000_000.0;
         let rate_out = openai.approximate_cost(0, 1_000_000) / 1_000_000.0;
         assert!(rate_in > 0.0, "OpenAI input rate should be non-zero");
@@ -376,7 +379,7 @@ mod tests {
         // Also verify Anthropic's pricing decomposition.
         use crate::anthropic::AnthropicProvider;
         let anthropic = AnthropicProvider::new(
-            "test-key".into(),
+            "test-key".to_string(),
             "claude-sonnet-4-20250514".into(),
             crate::DEFAULT_TIMEOUT_SECS,
         );

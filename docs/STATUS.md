@@ -13,9 +13,13 @@ the automated workspace checks are the supported distribution path. The
 project is not published to crates.io and does not currently promise binary
 installer packages.
 
-> **Explicitly deferred** (see `ROADMAP.md`):
-> - **Sandbox / execution isolation** — `SandboxProfile::Containerized` is not
->   implemented; WASM capability enforcement is not complete OS-level isolation.
+> **Explicitly deferred** (see `ROADMAP.md` and `docs/DEFERRED.md`):
+> - **Sandbox / execution isolation** — `SandboxProfile::Containerized` **is**
+>   implemented and enforced on Linux/macOS (ADR-72 Accepted: `d00582b`,
+>   `3ae6ea5`, `fdf4800`). The open part is the Windows path, which fails
+>   closed because Job Objects need `unsafe` FFI (DEFERRED row 36). WASM
+>   capability enforcement remains *additional* to, not a replacement for, the
+>   container path.
 
 ## Implemented and testable
 
@@ -207,7 +211,8 @@ The expected manual release checks are maintained in [Testing](../TESTING.md).
 - **Codebase-world-class Phase 0 merged (PR #63):** `missing_docs` policy on
   crate roots, proptest for the shell parser, LSP integration tests, and
   `run_shared_agent` decomposition. Phases 1–5 are pending — see
-  [TODO.md](TODO.md).
+  [research/codebase-world-class-plan.md](research/codebase-world-class-plan.md)
+  and [`DEFERRED.md`](DEFERRED.md).
 - **Hybrid chat-centric layout (minimal scope):** Diff, Agent Graph, and Tool
   Log now open as overlay modals within the Chat canvas instead of switching
   pages. Keyboard shortcuts toggle: Ctrl+D (Diff), Ctrl+L (Tool Log). Tool Log
@@ -269,8 +274,10 @@ The expected manual release checks are maintained in [Testing](../TESTING.md).
   one transaction; the audit-log decision trail is preserved (ADR-40, migration
   021 detaches `session_id` via `ON DELETE SET NULL` instead of deleting).
 
-- `SandboxProfile::Containerized` is not implemented, and WASM capability
-  enforcement is not complete OS-level isolation.
+- `SandboxProfile::Containerized` is implemented and enforced on Linux/macOS
+  (ADR-72); Windows is unsupported and fails closed. `ReadOnlyFs` and
+  `NetworkIsolated` remain unimplemented stubs. WASM capability enforcement is
+  a second layer, not complete OS-level isolation on its own.
 - SQLite is the only vector-store backend.
 - The AI-native shell is not yet the desktop terminal runtime and does not yet
   implement the full self-improving workflow described in its plan.
@@ -317,19 +324,24 @@ actually work, in order of impact:
   Memory Explorer as a compact quick-panel section, glass modals and
   overlay/panel animations, chat timestamps and transcript format v2, blinking
   streaming cursor). See [hybrid-ui-plan.md](hybrid-ui-plan.md).
-- **`feat/codebase-world-class`** is closed — merged into `dev` via PR #63;
-  Phase 0 is complete and Phases 1–5 are pending (see [TODO.md](TODO.md)).
+- **`feat/codebase-world-class`** is closed — merged into `dev` via PR #63.
+  Phase 0 shipped there, and Phase 3 (criterion benchmarks + a two-tier CI
+  gate, `10357cd`) has since landed. The remaining Phase 1/2/4/5 themes are
+  tracked as register rows, not as plan phases:
+  [DEFERRED.md](DEFERRED.md) row 34 (module decomposition, duplicate error
+  names, cancellation audit). The plan itself is a research artifact:
+  [research/codebase-world-class-plan.md](research/codebase-world-class-plan.md).
 
 ## Tracked follow-ups
 
 Non-blocking work captured during the ADR-59 P4 close-out (2026-08-15).
 None are defects; each is tracked here so nothing found in review is lost.
 
-1. **Test-infra: `CONFIG_ENV_LOCK` env-restore race hardening** (low, ~30
-   min). A few guarded-init/save tests in `crates/desktop/src/app.rs` restore
-   `XDG_CONFIG_HOME` only at the end of the test, so an assertion panic can
-   leak the redirect into parallel tests. Fix: restore before assertions (the
-   panic-safe pattern the other tests already follow) or an RAII guard. No
+1. **Test-infra: `CONFIG_ENV_LOCK` env-restore race hardening** — ✅ Resolved
+   (verified 2026-09-28). The guarded-init/save tests in
+   `crates/desktop/src/app.rs` now restore `XDG_CONFIG_HOME` *before* their
+   assertions (e.g. `:5246-5248`, commented "Env restored before assertions so
+   a panic cannot leak the redirect"), which is the panic-safe pattern. No
    behavior change.
 2. **UI polish: glyph-font coverage** (non-blocking, verified). The Studio's
    Unicode glyphs (`🛡 ➜ ⛓ ⚠ ▴ ▾ ·` in
@@ -338,15 +350,19 @@ None are defects; each is tracked here so nothing found in review is lost.
    paired with text labels, so worst case is cosmetic tofu. Future options
    (ranked): swap orphan glyphs for text (S), load a symbol fallback font
    (M), bundle an icon set (L).
-3. **UI polish: multiline system-instructions** (non-blocking, documented).
-   The fallback-persona "System instructions" input is a single-line
-   `text_input` per the repo's long-text pattern (Inspector precedent); a
-   future slice could upgrade it to the iced `text_editor` widget with its
-   own edit plumbing + tests.
-4. **Deferred per ADR-59** (roadmap, not defects): TOML diff view of include
-   changes; canvas DAG editor (P6); Studio Simple tier + migration runner +
-   export-merge hardening (P5); run-one-stage simulation (P6). See the
-   ADR-59 Status record and ADR-58 phasing table.
+3. **UI polish: multiline system-instructions** (non-blocking, documented —
+   still open, verified 2026-09-28). The fallback-persona "System
+   Instructions" input is a single-line `text_input`
+   (`views/orchestration_studio.rs:3333,4114`) per the repo's long-text
+   pattern (Inspector precedent); a future slice could upgrade it to the iced
+   `text_editor` widget with its own edit plumbing + tests.
+4. **Cut, not deferred (2026-09-27):** TOML diff view of include changes;
+   canvas DAG editor (P6); Studio Simple tier + migration runner + export-merge
+   hardening (P5); run-one-stage simulation (P6). The register now records
+   these as **cut** with their scope preserved so a reversal needs no
+   re-investigation — see `docs/DEFERRED.md` closed row 27, plus the ADR-59
+   Status record and the ADR-58 phasing table. The P5 migration runner is real
+   standing debt independent of any UI.
 5. **Release readiness: orchestration-editor manual checklist** — six rows
    added to `docs/live-test-template.md` (auto-seed on first open, roster CRUD
    save round-trip after restart, deleted-seed persistence across restart,
@@ -364,6 +380,17 @@ None are defects; each is tracked here so nothing found in review is lost.
 5. Record failed scenarios as reproducible issues and keep the workspace checks
    green after each fix.
 
+These are live-verification items, not deferred work: they have no terminal
+state and are therefore not register rows (`docs/DEFERRED.md` closed row 29).
+The forms are [`../TESTING.md`](../TESTING.md) and
+[live-test-template.md](live-test-template.md). Work that is explicitly
+deferred is not listed here — it lives in `docs/DEFERRED.md`, whose Closed
+list records items that have since landed (audit-log retention and encryption
+`7351128`, containerized sandbox `d00582b`/`3ae6ea5`/`fdf4800`, shell CPU
+budgets `13cba1c`, API rate limiting `61f34b7`, plugin egress filtering
+`450cb58`, the live-runtime eval leg `5daf2e7`, and the Phase-3 benchmark CI
+gate `10357cd`).
+
 Longer-term work belongs in [ROADMAP.md](../ROADMAP.md), not in this status
 document.
 
@@ -373,4 +400,4 @@ document.
   flat page navigation to a chat-centric layout with inline panels and modals.
   Minimal scope (SubView overlays for Diff, Agent Graph, Tool Log) is merged on
   `dev` (PR #49) and medium scope via PR #97 (2026-08-03); full scope is
-  tracked in [TODO.md](TODO.md).
+  tracked in [`DEFERRED.md`](DEFERRED.md) row 37.

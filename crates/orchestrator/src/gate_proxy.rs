@@ -144,6 +144,82 @@ impl GateProxyClient {
         Ok(tools)
     }
 
+    /// Bridge one approval request to the supervisor (ADR-60 S5). The
+    /// supervisor answers with the frontend sink's decision; a supervisor error
+    /// or transport failure surfaces as [`GateProxyError`] so the caller can
+    /// fail closed.
+    pub async fn request_approval(
+        &mut self,
+        action: crate::ipc::ApprovalActionWire,
+    ) -> Result<crate::ipc::ApprovalDecisionWire, GateProxyError> {
+        let response =
+            self.request(IpcMethod::ApprovalRequest, IpcParams::ApprovalRequest { action }).await?;
+        if let Some(error) = response.error {
+            return Err(GateProxyError::Supervisor { code: error.code, message: error.message });
+        }
+        let decision = match response.result {
+            Some(IpcResult::ApprovalRequest { decision }) => {
+                crate::ipc::ApprovalDecisionWire::parse(&decision)
+                    .map_err(GateProxyError::Protocol)?
+            }
+            _ => {
+                return Err(GateProxyError::Protocol("approval-request result missing".to_owned()))
+            }
+        };
+        Ok(decision)
+    }
+
+    /// Echo a terminal approval decision to the supervisor for audit (ADR-60
+    /// S5). Best-effort: a failure is a warn, never a decision change.
+    pub async fn report_approval_resolved(
+        &mut self,
+        tool_name: String,
+        approved: bool,
+    ) -> Result<(), GateProxyError> {
+        let response = self
+            .request(
+                IpcMethod::ApprovalResolved,
+                IpcParams::ApprovalResolved { tool_name, approved },
+            )
+            .await?;
+        if let Some(error) = response.error {
+            return Err(GateProxyError::Supervisor { code: error.code, message: error.message });
+        }
+        Ok(())
+    }
+
+    /// Bridge a user-acknowledgment request to the supervisor (ADR-60 S5).
+    pub async fn request_ack(
+        &mut self,
+        session_id: String,
+        message: String,
+    ) -> Result<bool, GateProxyError> {
+        let response = self
+            .request(IpcMethod::AckRequest, IpcParams::AckRequest { session_id, message })
+            .await?;
+        if let Some(error) = response.error {
+            return Err(GateProxyError::Supervisor { code: error.code, message: error.message });
+        }
+        match response.result {
+            Some(IpcResult::AckRequest { acknowledged }) => Ok(acknowledged),
+            _ => Err(GateProxyError::Protocol("ack-request result missing".to_owned())),
+        }
+    }
+
+    /// Bridge an approve-all request to the supervisor (ADR-60 S5).
+    pub async fn approve_all_for_session(
+        &mut self,
+        session_id: String,
+    ) -> Result<(), GateProxyError> {
+        let response = self
+            .request(IpcMethod::ApproveAllRequest, IpcParams::ApproveAllRequest { session_id })
+            .await?;
+        if let Some(error) = response.error {
+            return Err(GateProxyError::Supervisor { code: error.code, message: error.message });
+        }
+        Ok(())
+    }
+
     /// Round-trip one request and return the matched response.
     async fn request(
         &mut self,
@@ -554,6 +630,100 @@ impl MemoryStore for GateProxyMemoryStore {
         match response.result {
             Some(IpcResult::InvalidateMemory { .. }) => Ok(()),
             _ => Err(MemoryError::Persistence("invalidate-memory result missing".to_owned())),
+        }
+    }
+}
+
+/// Child-side approval sink: forwards each approval request to the supervisor
+/// over the IPC transport and applies the answer (ADR-60 S5 approval bridge).
+///
+/// Fail-closed by design: with no run id in scope, a closed transport, a
+/// supervisor error, or a cancelled token all resolve to `Deny`. Approve-all
+/// and acknowledgments are bridged too; the sink never invents a decision it
+/// did not receive from the supervisor.
+pub struct ApprovalProxySink {
+    client: Arc<tokio::sync::Mutex<GateProxyClient>>,
+}
+
+impl ApprovalProxySink {
+    /// Bind the sink to the child's supervisor connection.
+    pub fn new(client: Arc<tokio::sync::Mutex<GateProxyClient>>) -> Self {
+        Self { client }
+    }
+
+    /// Project the loop's borrowed [`PolicyAction`] onto the wire.
+    fn project(action: &concerto_core::types::PolicyAction<'_>) -> crate::ipc::ApprovalActionWire {
+        crate::ipc::ApprovalActionWire {
+            tool_name: action.tool_name.to_owned(),
+            input: action.input.clone(),
+            session_id: action.session_id.to_string(),
+            correlation_id: action.correlation_id.to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl concerto_core::traits::approval::ApprovalSink for ApprovalProxySink {
+    async fn request_approval(
+        &self,
+        action: &concerto_core::types::PolicyAction<'_>,
+        cancel: CancellationToken,
+    ) -> concerto_core::traits::approval::ApprovalDecision {
+        use concerto_core::traits::approval::ApprovalDecision;
+
+        if cancel.is_cancelled() {
+            return ApprovalDecision::Deny;
+        }
+        let wire = Self::project(action);
+        let tool_name = wire.tool_name.clone();
+        let decision = {
+            let mut guard = self.client.lock().await;
+            guard.request_approval(wire).await
+        };
+        let decision = match decision {
+            Ok(decision) => decision.to_decision(),
+            Err(error) => {
+                // Fail-closed: no answer from the supervisor means deny.
+                tracing::warn!(%error, "agent process: approval bridge failed; denying");
+                ApprovalDecision::Deny
+            }
+        };
+        // Best-effort audit echo; a failed echo never changes the decision.
+        let approved = !matches!(decision, ApprovalDecision::Deny);
+        let mut guard = self.client.lock().await;
+        if let Err(error) = guard.report_approval_resolved(tool_name, approved).await {
+            tracing::warn!(%error, "agent process: approval audit echo failed (fail-soft)");
+        }
+        decision
+    }
+
+    async fn approve_all_for_session(&self, session_id: Ulid, cancel: CancellationToken) {
+        if cancel.is_cancelled() {
+            return;
+        }
+        let mut guard = self.client.lock().await;
+        if let Err(error) = guard.approve_all_for_session(session_id.to_string()).await {
+            tracing::warn!(%error, "agent process: approve-all bridge failed (fail-closed)");
+        }
+    }
+
+    async fn request_ack(
+        &self,
+        session_id: Ulid,
+        message: &str,
+        cancel: CancellationToken,
+    ) -> bool {
+        if cancel.is_cancelled() {
+            return false;
+        }
+        let mut guard = self.client.lock().await;
+        match guard.request_ack(session_id.to_string(), message.to_owned()).await {
+            Ok(acknowledged) => acknowledged,
+            Err(error) => {
+                // Fail-closed: no answer from the supervisor aborts the task.
+                tracing::warn!(%error, "agent process: ack bridge failed; aborting");
+                false
+            }
         }
     }
 }
