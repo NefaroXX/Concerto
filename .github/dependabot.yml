@@ -1,9 +1,16 @@
 version: 2
 updates:
+  # Bumps target `dev`, the integration branch, not the default branch `main`.
+  # `main` is a stable promotion target only, so a dependency PR landing there
+  # first would have to be reconciled by hand on every dev -> main merge.
+  # Targeting `dev` keeps drift inside the branch that is actually developed and
+  # lets promotion to `main` be a single reviewed merge.
+  #
   # Workspace crates (24 members, single root manifest). Weekly cadence keeps
   # dependency drift small; the 5-PR cap prevents a flood after quiet periods.
   - package-ecosystem: "cargo"
     directory: "/"
+    target-branch: "dev"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
@@ -17,6 +24,7 @@ updates:
   # so minor/patch bumps arrive as one reviewable PR.
   - package-ecosystem: "github-actions"
     directory: "/"
+    target-branch: "dev"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
