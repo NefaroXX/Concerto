@@ -1,6 +1,6 @@
 # Concerto
 
-A production-grade, local-first AI coding agent harness written in Rust.
+A pre-release, local-first AI coding agent harness written in Rust.
 Concerto runs single-agent loops and gated multi-agent orchestration entirely
 on your machine against your choice of LLM providers: every model-generated
 file write, shell command, and git operation passes through a policy engine
@@ -8,6 +8,11 @@ into a reversible filesystem overlay, and every decision is recorded on an
 append-only audit trail. Native Iced desktop and independent ratatui terminal
 frontends share one runtime, one configuration model, and one persistent
 project memory.
+
+Version 0.1.0, source builds only, nothing published yet — this README
+describes what is actually implemented. For what is still open, see
+[Honest boundaries](#honest-boundaries) and the 24-row
+[deferred register](docs/DEFERRED.md).
 
 [![CI](https://github.com/NefaroXX/Concerto/actions/workflows/ci.yml/badge.svg)](https://github.com/NefaroXX/Concerto/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE-MIT)
@@ -21,6 +26,37 @@ project memory.
 > path; nothing is published to crates.io yet. Read
 > [Current Status](docs/STATUS.md) and [Testing](TESTING.md) before reporting a
 > result.
+
+## Origins
+
+Concerto was renamed from `opencode-rs` — a Rust reimplementation inspired by
+[OpenCode](https://github.com/sst/opencode), whose fingerprints are still on
+the architecture. The core idea this project is built around — one unified agent
+loop where the model picks its own tools and acts on tool feedback, governed by
+per-tool permission rules instead of pre-classifying the request — comes from
+OpenCode's single-loop design together with Anthropic's *"Building Effective
+Agents"* augmented-LLM pattern; ADR-55
+([docs/adrs/ADR-55-intent-routing-and-authorization.md](docs/adrs/ADR-55-intent-routing-and-authorization.md))
+credits both. Legacy `opencode-rs` paths and config names still survive in the
+tree as migration shims (`~/.config/opencode-rs/`,
+`~/.local/share/opencode-rs/`, `.opencode-rs.toml`, the `opencode-rs` keyring
+service).
+
+What diverged is everything around the loop: a first-match policy engine whose
+unmatched verdict is *deny*, not ask; a `VirtualFs` overlay that preserves
+originals for review or rejection; a supervised multi-agent coordinator with a
+delegation doctrine instead of a flat agent list; WASM plugins; an append-only
+audit trail; and SQLite-backed project memory. Concerto is not a fork — it
+shares no code with OpenCode — but it would not exist in this shape without it.
+
+Concerto is not a fork of OpenCode and depends on no OpenCode code; the
+workspace has no `opencode` dependency and all of it is original. It would,
+though, not have this shape without OpenCode.
+
+*(A separate product with a similar name: **OpenCode Zen** is a hosted model
+gateway, and Concerto talks to it as one provider among many via
+`crates/providers/src/opencode.rs`. It is not the OpenCode agent discussed
+here.)*
 
 ## Why Concerto?
 
@@ -92,8 +128,11 @@ metering.
 
 **Policy governance.** Every file write, shell command, and git operation
 passes through `SimplePolicyEngine` and the `VirtualFs` overlay — there is no
-bypass. Rules are evaluated first-match; unmatched tools default to requiring
-approval. Filesystem changes are materialized immediately while the overlay
+bypass. Rules are evaluated first-match; anything unmatched is **denied** by
+the `default_deny` rule. (When MCP is enabled, the runtime appends an explicit
+`RequireApproval` rule for `mcp:*` after your own rules, so unmatched MCP tools
+ask rather than deny — an added rule, not the default.)
+Filesystem changes are materialized immediately while the overlay
 preserves original content for diff review and rejection. An approval request
 **parks until it is answered** — the previous 30 s auto-expiry is inert, and
 cancellation is the only escape. Every decision is recorded in an append-only
@@ -128,6 +167,46 @@ configuration.
 The API server binds loopback by default and refuses non-localhost binds
 without `CONCERTO_API_KEY`. Logs sanitize secrets, and there is no built-in
 telemetry (optional exporters are opt-in).
+
+## Honest boundaries
+
+What Concerto is not, stated plainly so nobody discovers it by surprise:
+
+- **Pre-release.** Version 0.1.0, every crate marked `publish = false`, so
+  nothing is on crates.io. A tag-triggered
+  [release workflow](.github/workflows/release.yml) can build and attach a
+  GitHub release, but no tagged release exists yet. The supported path today is
+  a source build plus the workspace checks below. It is entering wider live
+  testing, not finished testing.
+- **One project at a time.** Concerto opens a single project directory per
+  session. That is an accepted limitation, not a bug in progress
+  (`docs/DEFERRED.md` row 16).
+- **Sandboxing is Linux/macOS only.** The opt-in container profile routes
+  shell invocations through `docker`/`podman` with a fail-closed admission
+  gate; Windows has no container path and fails closed (row 36). WASM plugin
+  capability enforcement is a second layer, not OS-level isolation.
+- **The desktop UI is mid-polish.** Minimal and Medium rework stages are
+  merged; the hybrid-UI finish work is still open (row 37).
+- **No gateway layer.** No remote-execution gateway is built or scheduled;
+  native direct connections are the default and the config-first catalog can
+  already express a gateway as an OpenAI-compatible endpoint. Whether one is
+  ever wanted is explicitly *undecided*, not refused (row 8).
+- **Acceptance evidence is gated, acceptance itself is manual.** A mutating
+  run cannot report Success without checkable evidence (a mutating tool call,
+  a passing build/test command, or a recorded coordinator declaration), but
+  the build-then-accept/reject cycle on disk is still yours (row 34).
+- **macOS and Windows are not in the verified test matrix.** Linux is the
+  primary development platform.
+
+The bullets above are the highest-impact user-facing gaps. They are **not** the
+whole picture: the register also carries Tier-3 provider SDKs, memory and
+recall depth, eval breadth and flake quarantine, the plugin trust model and
+marketplace, shell CPU limiting, provider transport resilience, catalog and
+fallback controls, cross-process continue, and the unbuilt phases of the
+AI-native shell. The full list — 24 rows, each with its size, its evidence, and
+what unblocks it — lives in
+[docs/DEFERRED.md](docs/DEFERRED.md), which is the source of truth for
+"not done". This section is only a summary.
 
 ## Architecture
 
