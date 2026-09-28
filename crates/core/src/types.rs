@@ -600,8 +600,19 @@ pub fn strip_url_secrets(target: &str) -> String {
 pub enum PolicyVerdict {
     Allow,
     Deny,
-    RequireApproval { timeout: std::time::Duration },
-    RequireApprovalWithTimeout { timeout: std::time::Duration },
+    /// An explicit user decision is required before the action may run.
+    ///
+    /// `timeout` is carried for config/API compatibility and is **not
+    /// enforced**: the executor parks on the approval request until it is
+    /// answered or the run is cancelled (no auto-expiry).
+    RequireApproval {
+        timeout: std::time::Duration,
+    },
+    /// Same as [`Self::RequireApproval`], with the deadline supplied by the
+    /// matched rule. Likewise not enforced by the executor.
+    RequireApprovalWithTimeout {
+        timeout: std::time::Duration,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -610,6 +621,9 @@ pub enum PolicyRule {
     AutoApprove(Condition),
     AutoDeny(Condition),
     RequireApproval(Condition),
+    /// Require approval, carrying a per-rule deadline in seconds. The deadline
+    /// is retained for config compatibility and is not enforced: approvals
+    /// never expire, they park until answered or cancelled.
     RequireApprovalWithTimeout {
         condition: Condition,
         timeout_secs: u64,
@@ -1192,7 +1206,8 @@ pub struct PendingApprovalInfo {
     pub input_hash: String,
     /// Correlation id of the paused action.
     pub correlation_id: String,
-    /// Configured approval deadline in seconds (0 when unknown).
+    /// Configured approval deadline in seconds (0 when unknown). Retained for
+    /// checkpoint compatibility; no deadline is armed while the request waits.
     #[serde(default)]
     pub timeout_secs: u64,
 }

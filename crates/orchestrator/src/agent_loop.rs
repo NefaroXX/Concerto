@@ -2316,7 +2316,19 @@ impl AgentLoop {
                 path_facts: None,
             };
 
-            match self.approval.request_approval(&action, cancel.clone()).await {
+            // No auto-expiry: this prompt parks until the user answers, and
+            // cancellation (stop / teardown) is the escape hatch — it unwinds
+            // the loop as cancelled (fail-closed: the call never runs) rather
+            // than waiting on a dialog for a run that is already dead.
+            let decision = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    self.state = AgentState::Failed;
+                    return Err(OrchestratorError::Cancelled);
+                }
+                decision = self.approval.request_approval(&action, cancel.clone()) => decision,
+            };
+            match decision {
                 ApprovalDecision::Approve | ApprovalDecision::ApproveAllForSession => {
                     // User wants to continue despite the repeat — reset the
                     // tracker for this (tool, input) pair so it doesn't
@@ -2620,11 +2632,13 @@ impl AgentLoop {
                 correlation_id,
                 timeout_secs,
             }) => {
-                // A timeout is a PAUSE, not a denial: the executor already
-                // emitted the `ApprovalTimeout` event and recorded the
-                // `TimedOut` audit row. Record the preserved request and let
-                // `run_once` stop the loop AwaitingApproval — no model retry,
-                // no second identical call, no burned subtask retry.
+                // The executor no longer arms an approval timer (requests park
+                // until answered), so this shape is no longer produced by the
+                // live approval flow — it is retained for scripted/test and
+                // resume compatibility. Handle it as the pause it describes:
+                // record the preserved request and let `run_once` stop the
+                // loop AwaitingApproval — no model retry, no second identical
+                // call, no burned subtask retry.
                 tool_events.push(ToolExecutionSummary {
                     tool_name: tc.name.clone(),
                     operation: filesystem_operation.map(|s| s.to_string()),

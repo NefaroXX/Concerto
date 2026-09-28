@@ -1932,11 +1932,15 @@ async fn handle_list_tools(
 ///
 /// The supervisor holds the SAME [`ApprovalSink`] the in-process paths use, so
 /// a supervised approval reaches the existing UI rather than a parallel
-/// system. Fail-closed by design:
+/// system. The bridge parks on the sink with **no auto-expiry**: the child
+/// stays paused for as long as the user needs to decide (owner requirement —
+/// permission is given or revoked, never aged out). Fail-closed by design:
 ///
 /// - no sink configured → `deny` (the pre-bridge default is preserved, now
 ///   because the channel said so);
-/// - the request was cancelled (run teardown) → `deny`;
+/// - the request was cancelled (run teardown) → `deny`, both before the sink
+///   is consulted and *while* the sink is still waiting, so teardown can
+///   never strand a child on a reply that would never come;
 /// - the sink itself cannot answer → `deny`.
 ///
 /// An [`EventKind::ApprovalRequested`] audit event is emitted before the sink
@@ -2003,7 +2007,15 @@ async fn handle_approval_request(
                 orchestrator_authority: false,
                 path_facts: None,
             };
-            sink.request_approval(&policy_action, cancel.clone()).await
+            // No deadline is raced here: the request parks on the sink until
+            // the user answers. Run teardown is the only escape hatch, and it
+            // resolves the request as a denial (fail-closed) instead of
+            // stranding the child on a reply that would never arrive.
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => ApprovalDecision::Deny,
+                decision = sink.request_approval(&policy_action, cancel.clone()) => decision,
+            }
         }
     };
 
@@ -3492,6 +3504,110 @@ mod write_path_tests {
             }
             other => panic!("unexpected approval result: {other:?}"),
         }
+    }
+
+    /// A sink that never answers on its own: it parks forever, standing in
+    /// for a live dialog the user simply has not touched yet. Used to prove
+    /// the bridge has no deadline of its own and relies on teardown to
+    /// resolve a request nobody answered.
+    struct ParkedApprovalSink {
+        request_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ApprovalSink for ParkedApprovalSink {
+        async fn request_approval(
+            &self,
+            _action: &concerto_core::types::PolicyAction<'_>,
+            _cancel: CancellationToken,
+        ) -> ApprovalDecision {
+            self.request_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending::<ApprovalDecision>().await
+        }
+
+        async fn approve_all_for_session(&self, _session_id: Ulid, _cancel: CancellationToken) {}
+
+        async fn request_ack(
+            &self,
+            _session_id: Ulid,
+            _message: &str,
+            _cancel: CancellationToken,
+        ) -> bool {
+            false
+        }
+    }
+
+    /// The supervised bridge parks on the sink with no auto-expiry, and run
+    /// teardown while it waits resolves the request as `deny` instead of
+    /// stranding the child on a reply that would never come. The pending and
+    /// resolved events are emitted exactly once each.
+    #[tokio::test]
+    async fn approval_request_parks_until_cancelled_and_then_denies() {
+        let (_dir, pool) = test_pool().await;
+        let mut services = services(pool, std::env::temp_dir());
+        let bus = EventBus::default();
+        let mut receiver = bus.subscribe();
+        let sink =
+            Arc::new(ParkedApprovalSink { request_calls: std::sync::atomic::AtomicUsize::new(0) });
+        let observed = Arc::clone(&sink);
+        services.approval_sink = Some(sink);
+        services.bus = Some(bus);
+        let cancel = CancellationToken::new();
+
+        let handle = tokio::spawn({
+            let services = services.clone();
+            let cancel = cancel.clone();
+            async move {
+                handle_approval_request(&services, "agent-a", approval_request_params(), 7, &cancel)
+                    .await
+            }
+        });
+
+        // Deterministically reach the parked state: the bridge called the sink
+        // and is now waiting with no timer armed.
+        for _ in 0..1_000 {
+            if observed.request_calls.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            observed.request_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the bridge must consult the sink exactly once and then park"
+        );
+        assert!(
+            !handle.is_finished(),
+            "an unanswered supervised request must park, never expire on its own"
+        );
+
+        // Teardown while waiting: resolve fail-closed, promptly.
+        cancel.cancel();
+        let response = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("teardown must answer a pending approval request")
+            .expect("bridge task must not panic");
+        match response.result {
+            Some(IpcResult::ApprovalRequest { decision }) => {
+                assert_eq!(decision, "deny", "teardown must fail closed");
+            }
+            other => panic!("unexpected approval result: {other:?}"),
+        }
+
+        let requested = receiver.recv().await.expect("approval requested event");
+        assert!(matches!(
+            requested.kind,
+            concerto_core::event::EventKind::ApprovalRequested { .. }
+        ));
+        let resolved = receiver.recv().await.expect("approval resolved event");
+        assert!(matches!(
+            resolved.kind,
+            concerto_core::event::EventKind::ApprovalResolved { approved: false, .. }
+        ));
+        assert!(
+            receiver.try_recv().is_err(),
+            "one request, one resolution: no repeated waiting-state events"
+        );
     }
 
     #[tokio::test]

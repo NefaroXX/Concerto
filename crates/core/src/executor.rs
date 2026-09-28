@@ -10,7 +10,7 @@ use crate::types::{
 };
 use crate::CancellationToken;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use time::OffsetDateTime;
 
 /// Orchestrates policy-gated tool execution.
@@ -81,7 +81,8 @@ impl ToolExecutor {
     }
 
     /// Attach an event bus so the executor can publish approval lifecycle
-    /// events (e.g. [`EventKind::ApprovalTimeout`]) to subscribers.
+    /// events ([`EventKind::ApprovalRequested`] when a request starts waiting,
+    /// [`EventKind::ApprovalResolved`] once it is answered) to subscribers.
     pub fn with_event_bus(mut self, bus: EventBus) -> Self {
         self.event_bus = Some(bus);
         self
@@ -214,22 +215,10 @@ impl ToolExecutor {
         self.record_approval_outcome(action, verdict, user_response, cancel).await;
     }
 
-    /// Persist a timeout as its own approval-decision row (verdict `TimedOut`)
-    /// so the trail shows the request expired and the run paused — the
-    /// pre-fix path wrote no row at all on timeout.
-    async fn record_approval_timeout(
-        &self,
-        action: &PolicyAction<'_>,
-        timeout_secs: u64,
-        cancel: CancellationToken,
-    ) {
-        let response = format!("approval timed out after {timeout_secs}s; awaiting user");
-        self.record_approval_outcome(action, "TimedOut", &response, cancel).await;
-    }
-
     /// Shared builder for an approval-decision audit row. `verdict` is the
-    /// decision outcome (`Approved` / `ApprovedAllForSession` / `Denied` /
-    /// `TimedOut`); `user_response` is the human-readable detail.
+    /// decision outcome (`Approved` / `ApprovedAllForSession` / `Denied`);
+    /// `user_response` is the human-readable detail that records who or what
+    /// answered (the user, or the run's cancellation).
     async fn record_approval_outcome(
         &self,
         action: &PolicyAction<'_>,
@@ -716,13 +705,17 @@ impl ToolExecutor {
             Ok(PolicyVerdict::Deny) => {
                 Err(ToolError::PolicyDenied { rule: "policy_denied".into() })
             }
+            // The verdict's `timeout` is deliberately ignored here: an
+            // approval request has NO auto-expiry (owner requirement — the
+            // session pauses completely until permission is given or
+            // revoked). See `request_approval_decision`.
             Ok(
-                PolicyVerdict::RequireApproval { timeout }
-                | PolicyVerdict::RequireApprovalWithTimeout { timeout },
+                PolicyVerdict::RequireApproval { .. }
+                | PolicyVerdict::RequireApprovalWithTimeout { .. },
             ) => match &self.approval_sink {
                 Some(sink) => {
                     match self
-                        .request_approval_decision(sink.as_ref(), &action, timeout, cancel.clone())
+                        .request_approval_decision(sink.as_ref(), &action, cancel.clone())
                         .await
                     {
                         Ok(decision) => {
@@ -895,90 +888,99 @@ impl ToolExecutor {
         }
     }
 
-    /// Race the approval decision, cancellation, and the configured timeout
-    /// at the requester.
+    /// Park on the user's approval decision — **there is no auto-expiry**.
     ///
-    /// H-02 remediation: the timeout is enforced here, not by wrapping the
-    /// sink — a silent sink must not hang the caller. On timeout the action is
-    /// **paused**, not denied: the request is left with the sink (which owns
-    /// its pending entry, so dropping this future does not lose it), an
-    /// [`EventKind::ApprovalTimeout`] is published, the timeout is recorded as
-    /// an approval-decision audit row (`TimedOut`), and a
-    /// [`ToolError::PausedAwaitingApproval`] is returned. A late user decision
-    /// still fulfils the preserved request and a resume re-attaches to it — the
-    /// run stops `AwaitingUser` instead of burning identical retries. Only an
-    /// explicit `Deny` or a dropped/dismissed pending request denies.
+    /// Owner requirement: "There should be no timeout, the session is supposed
+    /// to pause completely until permission is given or revoked." The timeout
+    /// carried by `PolicyVerdict::RequireApproval{timeout}` (the knob behind
+    /// `[policy] approval_timeout_secs`) is therefore NOT raced here; it is
+    /// retained at the policy/config layer for compatibility and is inert
+    /// (documented at its definition). This is the single enforcement point:
+    /// once removed here, no approval anywhere in the run expires.
+    ///
+    /// * **Waiting primitive** — a park, never a poll: the sink awaits a
+    ///   channel (`watch`/`oneshot`) held by the live UI, and the cancellation
+    ///   arm awaits a notification. Nothing spins and nothing is logged while
+    ///   waiting.
+    /// * **Cancellation is the escape hatch** — user cancel / stop / session
+    ///   teardown while the request is pending resolves it as DENY
+    ///   (fail-closed): a `Denied` audit row records that the run's
+    ///   cancellation answered, an `ApprovalResolved { approved: false }`
+    ///   event is published, and `ToolError::Cancelled` lets the run unwind
+    ///   cleanly. The tool never executes.
+    /// * **Observability** — one `ApprovalRequested` event and one log line
+    ///   mark the pending state (exactly once per request, so a waiting run is
+    ///   distinguishable from a stuck one); resolution publishes one
+    ///   `ApprovalResolved` event, and the caller records the decision audit
+    ///   row naming who answered.
+    /// * **Fail-closed** — a sink that returns without a decision (closed
+    ///   channel, dismissed dialog) returns `Deny`; no sink at all denies at
+    ///   the call site (`requires_approval_no_sink`). The only unbounded wait
+    ///   is the legitimate one: a live UI that simply has not been clicked.
     async fn request_approval_decision(
         &self,
         sink: &dyn ApprovalSink,
         action: &PolicyAction<'_>,
-        timeout: Duration,
         cancel: CancellationToken,
     ) -> Result<ApprovalDecision, ToolError> {
+        // Pending state, emitted once before parking (never repeated).
+        self.publish_approval_event(
+            action,
+            EventKind::ApprovalRequested {
+                tool_name: action.tool_name.to_string(),
+                // 0 = unbounded wait: no configured deadline is being armed.
+                timeout_secs: 0,
+            },
+        );
+        tracing::info!(
+            tool_name = %action.tool_name,
+            correlation_id = %action.correlation_id,
+            "approval requested; pausing until the user answers (no timeout)"
+        );
+
         tokio::select! {
             biased;
-            decision = sink.request_approval(action, cancel.clone()) => Ok(decision),
-            _ = cancel.cancelled() => Err(ToolError::Cancelled),
-            _ = tokio::time::sleep(timeout) => {
-                if let Some(bus) = &self.event_bus {
-                    let _ = bus.publish_for_session(
-                        action.session_id,
-                        action.correlation_id,
-                        EventKind::ApprovalTimeout {
-                            tool_name: action.tool_name.to_string(),
-                            timeout_secs: timeout.as_secs(),
-                        },
-                    );
-                }
-                tracing::warn!(
-                    tool_name = %action.tool_name,
-                    timeout_secs = timeout.as_secs(),
-                    "approval timed out; run paused awaiting the user"
+            // Cancellation first: on a cancel/answer race the run resolves
+            // fail-closed (deny), never allow.
+            () = cancel.cancelled() => {
+                // A fresh (non-cancelled) token for the audit write: the
+                // deny row must not be cancellable, or it would go unrecorded
+                // on the exact path that needs it most.
+                self.record_approval_outcome(
+                    action,
+                    "Denied",
+                    "run cancelled while the approval was pending; denying (fail-closed)",
+                    CancellationToken::new(),
+                )
+                .await;
+                self.publish_approval_event(
+                    action,
+                    EventKind::ApprovalResolved {
+                        tool_name: action.tool_name.to_string(),
+                        approved: false,
+                    },
                 );
-                // Record the timeout on the same audit trail as the other
-                // approval outcomes (pre-fix, a timeout wrote no row at all).
-                self.record_approval_timeout(action, timeout.as_secs(), cancel.clone()).await;
-                Err(ToolError::PausedAwaitingApproval {
-                    tool_name: action.tool_name.to_string(),
-                    detail: action_detail(action.input),
-                    input_hash: crate::policy::compute_input_hash(action.input),
-                    correlation_id: action.correlation_id,
-                    timeout_secs: timeout.as_secs(),
-                })
+                Err(ToolError::Cancelled)
+            }
+            decision = sink.request_approval(action, cancel.clone()) => {
+                self.publish_approval_event(
+                    action,
+                    EventKind::ApprovalResolved {
+                        tool_name: action.tool_name.to_string(),
+                        approved: !matches!(decision, ApprovalDecision::Deny),
+                    },
+                );
+                Ok(decision)
             }
         }
     }
-}
 
-/// Compact human-readable detail for a paused approval action, used to carry
-/// the action identity onto the checkpoint without shipping the whole input.
-fn action_detail(input: &serde_json::Value) -> String {
-    if let Some(command) = input.get("command").and_then(serde_json::Value::as_str) {
-        let args = input
-            .get("args")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(serde_json::Value::as_str)
-            .collect::<Vec<_>>();
-        if args.is_empty() {
-            return format!("command: {command}");
+    /// Publish one approval lifecycle event for `action` when an event bus is
+    /// attached. Fail-soft: a bus error is logged, never surfaced.
+    fn publish_approval_event(&self, action: &PolicyAction<'_>, kind: EventKind) {
+        if let Some(bus) = &self.event_bus {
+            let _ = bus.publish_for_session(action.session_id, action.correlation_id, kind);
         }
-        return format!("command: {command} {}", args.join(" "));
-    }
-    let key = match input.get("path").and_then(serde_json::Value::as_str) {
-        Some(path) => return format!("path: {path}"),
-        None => input.get("operation").and_then(serde_json::Value::as_str),
-    };
-    if let Some(operation) = key {
-        return format!("operation: {operation}");
-    }
-    let json = serde_json::to_string(input).unwrap_or_default();
-    if json.chars().count() > 120 {
-        let truncated: String = json.chars().take(119).collect();
-        format!("{truncated}…")
-    } else {
-        json
     }
 }
 
@@ -992,6 +994,7 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::time::Duration;
     struct AllowPolicy;
     struct DenyPolicy;
 
@@ -1617,10 +1620,13 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // H-02: approval timeouts enforced by the requester
+    // Approval requests: no auto-expiry, one pending event, fail-closed
+    // on cancellation, and no sink at all.
     // ------------------------------------------------------------------
 
-    /// Policy that returns `RequireApprovalWithTimeout` for every action.
+    /// Policy that returns `RequireApprovalWithTimeout` with a **configured**
+    /// timeout. The value is deliberately present: tests must prove the
+    /// executor ignores it entirely and parks regardless of the deadline.
     struct ApprovalPolicy {
         timeout: Duration,
     }
@@ -1665,8 +1671,8 @@ mod tests {
     /// Approval sink whose decision is delivered through a `watch` channel, so
     /// tests control exactly when — and whether — the "user" responds. The
     /// sink keeps its own receiver so a decision resolved AFTER the requester
-    /// dropped its awaiting future (a timeout) is still delivered — the
-    /// "no orphaned oneshot loss" property.
+    /// dropped its awaiting future (cancellation / teardown) is still
+    /// delivered — the "no orphaned oneshot loss" property.
     struct ControlledApprovalSink {
         pending: Mutex<Option<tokio::sync::watch::Sender<Option<ApprovalDecision>>>>,
         preserved: Mutex<Option<tokio::sync::watch::Receiver<Option<ApprovalDecision>>>>,
@@ -1726,7 +1732,7 @@ mod tests {
     }
 
     /// Tool that records how many times it actually executed, so tests can
-    /// prove a timed-out approval never reaches execution.
+    /// prove an unanswered approval never reaches execution.
     struct CallCountingTool {
         calls: Arc<AtomicUsize>,
     }
@@ -1765,8 +1771,8 @@ mod tests {
 
     /// Deterministically (under paused time) wait until the executor has
     /// polled the sink and registered the pending approval request. This
-    /// guarantees both the sink branch and the timeout timer are armed before
-    /// the test advances the clock.
+    /// guarantees the pending request exists before the test advances the
+    /// clock or cancels the run.
     async fn wait_for_approval_request(sink: &ControlledApprovalSink) {
         for _ in 0..1_000 {
             if sink.requests.load(Ordering::SeqCst) > 0 {
@@ -1777,8 +1783,25 @@ mod tests {
         panic!("approval request never reached the sink");
     }
 
+    /// Await the next bus event, bounded so a missing event fails the test
+    /// instead of hanging it (paused time auto-advances to the deadline).
+    async fn next_event(rx: &mut crate::event::EventReceiver) -> crate::event::Event {
+        let event = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("approval lifecycle event never arrived"))
+            .expect("event bus must stay alive");
+        (*event).clone()
+    }
+
+    /// No auto-expiry: an unanswered approval request parks indefinitely.
+    ///
+    /// The policy still carries a 10-second timeout; the executor must ignore
+    /// it. Far past that deadline the call is still pending — no pause
+    /// variant error, no denial, no re-prompt — and the tool has not run. The
+    /// pending state is emitted exactly once, not polled repeatedly, and only
+    /// an explicit answer completes the call.
     #[tokio::test(start_paused = true)]
-    async fn approval_timeout_pauses_without_executing_and_emits_event() {
+    async fn approval_request_parks_far_past_the_configured_timeout() {
         let bus = EventBus::default();
         let mut rx = bus.subscribe();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1802,51 +1825,56 @@ mod tests {
                 .await
         });
         wait_for_approval_request(&sink).await;
-        tokio::time::advance(Duration::from_secs(10)).await;
 
-        let error = handle
+        // The pending state is published once, before parking.
+        let requested = next_event(&mut rx).await;
+        match &requested.kind {
+            EventKind::ApprovalRequested { tool_name, timeout_secs } => {
+                assert_eq!(tool_name, "echo");
+                assert_eq!(*timeout_secs, 0, "0 = unbounded wait, no deadline armed");
+            }
+            other => panic!("expected ApprovalRequested event, got {other:?}"),
+        }
+
+        // Far past the configured 10s deadline the request is still pending.
+        tokio::time::advance(Duration::from_secs(3_600)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!handle.is_finished(), "an approval must park until answered, never auto-expire");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "an unanswered request never executes");
+        assert_eq!(
+            sink.requests.load(Ordering::SeqCst),
+            1,
+            "exactly one prompt: no retry, no re-prompt, no re-ask"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the waiting state must be emitted once, not polled repeatedly"
+        );
+
+        // The run completes only when the user answers.
+        sink.resolve(ApprovalDecision::Approve);
+        let output = handle
             .await
             .expect("executor task must not panic")
-            .expect_err("approval timeout must pause the action");
-        // The timeout PAUSES (resumable), it does NOT deny: the run must never
-        // burn a retry on a timed-out approval.
-        match &error {
-            ToolError::PausedAwaitingApproval { tool_name, input_hash, timeout_secs, .. } => {
-                assert_eq!(tool_name, "echo");
-                assert_eq!(*timeout_secs, 10);
-                assert!(!input_hash.is_empty(), "the paused action carries its input hash");
-            }
-            other => panic!("expected PausedAwaitingApproval, got {other:?}"),
-        }
-        assert!(
-            !matches!(&error, ToolError::PolicyDenied { .. }),
-            "a timeout must never be a policy denial"
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "tool must never execute after timeout");
+            .expect("an approved request must execute");
+        assert_eq!(output.data, serde_json::json!({"key": "value"}));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        // The timeout event is published before the executor returns.
-        let event = rx.recv().await.expect("timeout event must be emitted");
-        match &event.kind {
-            EventKind::ApprovalTimeout { tool_name, timeout_secs } => {
+        let resolved = next_event(&mut rx).await;
+        match &resolved.kind {
+            EventKind::ApprovalResolved { tool_name, approved } => {
                 assert_eq!(tool_name, "echo");
-                assert_eq!(*timeout_secs, 10);
+                assert!(*approved, "the answer was an approval");
             }
-            other => panic!("expected ApprovalTimeout event, got {other:?}"),
+            other => panic!("expected ApprovalResolved event, got {other:?}"),
         }
-
-        // Late resolve after the timeout STILL lands on the preserved request
-        // (the executor dropped its awaiting future, but the sink kept the
-        // channel open) — no orphaned oneshot loss.
-        sink.resolve(ApprovalDecision::Approve);
-        assert_eq!(
-            sink.preserved_decision(),
-            Some(ApprovalDecision::Approve),
-            "a late resolve must fulfil the preserved request"
-        );
+        assert!(rx.try_recv().is_err(), "one request, one resolution, no repeats");
     }
 
     #[tokio::test(start_paused = true)]
-    async fn approval_before_timeout_executes_normally() {
+    async fn approval_answered_executes_normally() {
         let sink = Arc::new(ControlledApprovalSink::new());
         let executor =
             ToolExecutor::new(test_registry(), Arc::new(ApprovalPolicy::with_timeout(30)))
@@ -1869,16 +1897,28 @@ mod tests {
         let output = handle
             .await
             .expect("executor task must not panic")
-            .expect("approval before the deadline must succeed");
+            .expect("an answered approval must succeed");
         assert_eq!(output.data, serde_json::json!({"key": "value"}));
     }
 
+    /// Cancellation while a request is pending resolves it as DENY
+    /// (fail-closed): the tool never runs, the audit trail records a `Denied`
+    /// row naming the run's cancellation as the answer, an
+    /// `ApprovalResolved { approved: false }` event is published, and the
+    /// caller unwinds as `Cancelled` instead of hanging.
     #[tokio::test(start_paused = true)]
-    async fn cancellation_aborts_pending_approval_cleanly() {
+    async fn cancellation_while_pending_denies_fail_closed_and_unwinds() {
+        let audit = Arc::new(RecordingAudit::default());
+        let policy = Arc::new(RecordingApprovalPolicy { audit: audit.clone() });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(CallCountingTool::new(calls.clone())));
+        let bus = EventBus::default();
+        let mut rx = bus.subscribe();
         let sink = Arc::new(ControlledApprovalSink::new());
-        let executor =
-            ToolExecutor::new(test_registry(), Arc::new(ApprovalPolicy::with_timeout(60)))
-                .with_approval_sink(sink.clone());
+        let executor = ToolExecutor::new(Arc::new(registry), policy)
+            .with_approval_sink(sink.clone())
+            .with_event_bus(bus.clone());
         let session = test_session();
         let cancel = CancellationToken::new();
 
@@ -1887,13 +1927,77 @@ mod tests {
             async move { executor.execute("echo", serde_json::json!({}), &session, cancel).await }
         });
         wait_for_approval_request(&sink).await;
-        cancel.cancel();
+        let requested = next_event(&mut rx).await;
+        assert!(
+            matches!(requested.kind, EventKind::ApprovalRequested { .. }),
+            "the pending state must precede the cancellation"
+        );
 
+        cancel.cancel();
         let error = handle
             .await
             .expect("executor task must not panic")
             .expect_err("cancellation must abort the pending approval");
         assert!(matches!(error, ToolError::Cancelled), "expected cancellation, got {error:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "a cancelled request never executes");
+
+        let resolved = next_event(&mut rx).await;
+        match &resolved.kind {
+            EventKind::ApprovalResolved { approved, .. } => {
+                assert!(!*approved, "cancellation must resolve the request as denied");
+            }
+            other => panic!("expected ApprovalResolved event, got {other:?}"),
+        }
+
+        // The sink — not the requester — owns the pending entry, so an answer
+        // that arrives after the requester dropped its future is not lost.
+        sink.resolve(ApprovalDecision::Approve);
+        assert_eq!(
+            sink.preserved_decision(),
+            Some(ApprovalDecision::Approve),
+            "a late answer must survive the requester's cancellation"
+        );
+
+        // Audit: the policy's `RequireApproval` row plus the fail-closed
+        // `Denied` row recording who answered.
+        let entries = audit.entries.lock().unwrap();
+        assert_eq!(
+            entries.len(),
+            2,
+            "expected RequireApproval + Denied rows, got: {:?}",
+            entries.iter().map(|entry| &entry.verdict).collect::<Vec<_>>()
+        );
+        assert_eq!(entries[0].verdict, "RequireApproval");
+        assert_eq!(entries[1].verdict, "Denied");
+        let response = entries[1].user_response.as_deref().unwrap_or_default();
+        assert!(
+            response.contains("cancelled"),
+            "the deny row must record that the run's cancellation answered, got {response:?}"
+        );
+    }
+
+    /// Fail-closed with no UI attached: `requires_approval_no_sink` denies
+    /// immediately instead of parking forever for an answer that can never
+    /// arrive.
+    #[tokio::test]
+    async fn missing_sink_denies_without_hanging() {
+        let executor =
+            ToolExecutor::new(test_registry(), Arc::new(ApprovalPolicy::with_timeout(30)));
+        let session = test_session();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(30),
+            executor.execute("echo", serde_json::json!({}), &session, CancellationToken::new()),
+        )
+        .await
+        .expect("a request with no sink must deny, never park")
+        .expect_err("approval with no sink must be denied");
+        match error {
+            ToolError::PolicyDenied { rule } => {
+                assert_eq!(rule, "requires_approval_no_sink");
+            }
+            other => panic!("expected PolicyDenied(requires_approval_no_sink), got {other:?}"),
+        }
     }
 
     // ------------------------------------------------------------------

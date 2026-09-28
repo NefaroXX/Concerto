@@ -1298,8 +1298,13 @@ pub struct PolicyConfig {
     pub time_window: Option<PolicyTimeWindowConfig>,
     /// Approval deadline (seconds) for approval-producing rules that do not
     /// carry an explicit timeout. Additive/optional: absent configs default to
-    /// 30s, preserving pre-existing behavior. A timeout now PAUSES the run
-    /// awaiting the user instead of denying it.
+    /// 30s, preserving pre-existing behavior.
+    ///
+    /// **Retained but not enforced.** The value still travels with the policy
+    /// verdict (config and API compatibility), yet approvals never expire:
+    /// the session pauses until permission is given or revoked, and only a
+    /// user decision, an unanswerable sink, or run cancellation resolves the
+    /// request.
     #[serde(default)]
     pub approval_timeout_secs: Option<u64>,
 }

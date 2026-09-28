@@ -373,11 +373,13 @@ pub enum ToolError {
         rule: String,
     },
 
-    /// The approval request expired before the user responded. The action is
-    /// PAUSED, not denied: the pending request is preserved by the approval
-    /// sink so a late decision can still fulfil it, and the run resumes
-    /// awaiting the user. Distinct from [`Self::PolicyDenied`] so callers
-    /// never burn a retry on a timeout.
+    /// The approval request paused the run awaiting the user.
+    ///
+    /// Retained for the scripted/test/resume shape of an interrupted approval:
+    /// the executor no longer arms an approval timer, so no request can expire
+    /// and the live flow never produces this error — an unanswered request
+    /// parks indefinitely until it is answered or cancelled. Distinct from
+    /// [`Self::PolicyDenied`] so a paused run never burns a retry.
     #[error("awaiting approval for '{tool_name}' (timed out after {timeout_secs}s)")]
     PausedAwaitingApproval {
         /// Canonical tool name awaiting approval.
@@ -485,8 +487,9 @@ pub enum PolicyError {
 
     /// Approval request timed out.
     ///
-    /// The user did not respond to an approval request within the configured
-    /// timeout period. The operation was denied by default.
+    /// Retained for API compatibility: approval requests no longer time out
+    /// (they park until answered or cancelled), so no code path constructs
+    /// this error today. Callers keep the mapping purely as a defensive arm.
     #[error("approval timed out")]
     ApprovalTimeout,
 

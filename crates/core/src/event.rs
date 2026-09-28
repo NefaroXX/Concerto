@@ -102,18 +102,23 @@ pub enum EventKind {
     },
 
     // --- policy (Phase 2) ---
+    /// An approval request has been raised and the run is now waiting on the
+    /// user. Published exactly once per request, before the requester parks;
+    /// `timeout_secs: 0` means the wait is unbounded (no deadline is armed).
     ApprovalRequested {
         tool_name: String,
         timeout_secs: u64,
     },
+    /// The approval request was answered: `approved` is true for
+    /// approve/approve-all, false for a denial or for a cancellation while
+    /// pending (fail-closed). Exactly one resolution per request.
     ApprovalResolved {
         tool_name: String,
         approved: bool,
     },
-    /// An approval request expired before the user responded.
-    ///
-    /// Emitted by the requester (tool executor) when the approval timeout
-    /// elapses; the action is denied by default and never executes.
+    /// Retained for event-schema compatibility; the approval flow no longer
+    /// arms a timer, so no request can expire and this variant is no longer
+    /// emitted (see `ToolExecutor::request_approval_decision`).
     ApprovalTimeout {
         tool_name: String,
         timeout_secs: u64,

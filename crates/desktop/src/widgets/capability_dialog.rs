@@ -834,4 +834,19 @@ mod tests {
             "an unreadable queue must refuse, never silently accept"
         );
     }
+
+    /// Fail-closed waiting primitive: a dropped decision sender (the dialog
+    /// went away with the run) resolves the wait as `None` — which the sink
+    /// maps to a denial — instead of hanging forever.
+    #[tokio::test]
+    async fn await_decision_on_a_closed_channel_returns_none() {
+        let (sender, receiver) = tokio::sync::watch::channel::<Option<Vec<GrantDecision>>>(None);
+        drop(sender);
+
+        let decision =
+            tokio::time::timeout(std::time::Duration::from_secs(5), await_decision(receiver))
+                .await
+                .expect("a closed decision channel must resolve, never hang");
+        assert!(decision.is_none(), "an unanswerable capability dialog must deny");
+    }
 }

@@ -1944,8 +1944,9 @@ async fn setup_policy_and_audit(
     };
     let spend_tracker = Arc::new(SpendTracker::new(spend_cap, None, None));
     // Approval deadline from `[policy] approval_timeout_secs` (default 30s).
-    // The deadline rides the policy verdict, so the executor uses the same
-    // value the audit row records; a timeout pauses the run, never denies it.
+    // The deadline rides the policy verdict for config/API compatibility, but
+    // the executor never enforces it: approvals park until answered (see
+    // `ToolExecutor::request_approval_decision`).
     let approval_timeout = std::time::Duration::from_secs(
         config.policy.as_ref().and_then(|policy| policy.approval_timeout_secs).unwrap_or(30),
     );

@@ -767,6 +767,82 @@ mod tests {
         assert!(sink.auto_approve.load(Ordering::Relaxed));
     }
 
+    /// An `ApproveAllForSession` answer suppresses the FOLLOW-UP prompt: the
+    /// next request answers immediately instead of asking again, so an
+    /// approved-all run never stalls waiting for a second dialog.
+    #[tokio::test]
+    async fn approve_all_for_session_suppresses_the_next_prompt() {
+        let state = CliApprovalState::default();
+        let cancel = concerto_core::CancellationToken::new();
+        let sink_state = state.clone();
+
+        let handle = tokio::spawn(async move {
+            let sink = CliApprovalSink::with_state(sink_state);
+            let first_input = serde_json::json!({"command": "rm -rf build"});
+            let first = PolicyAction {
+                tool_name: "shell",
+                input: &first_input,
+                session_id: Ulid::new(),
+                correlation_id: Ulid::new(),
+                capability_requirements: CapabilitySet::default(),
+                sandbox_profile: None,
+                estimated_cost_usd: None,
+                command_facts: None,
+                orchestrator_authority: false,
+                path_facts: None,
+            };
+            let first_decision = sink.request_approval(&first, cancel.clone()).await;
+
+            let second_input = serde_json::json!({"command": "cargo publish"});
+            let second = PolicyAction {
+                tool_name: "shell",
+                input: &second_input,
+                session_id: Ulid::new(),
+                correlation_id: Ulid::new(),
+                capability_requirements: CapabilitySet::default(),
+                sandbox_profile: None,
+                estimated_cost_usd: None,
+                command_facts: None,
+                orchestrator_authority: false,
+                path_facts: None,
+            };
+            let second_decision = sink.request_approval(&second, cancel).await;
+            (first_decision, second_decision)
+        });
+
+        // Bounded wait for the first prompt (no timer: the prompt parks).
+        for _ in 0..500 {
+            if state.prompt().is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(state.prompt().is_some(), "the first request must install a prompt");
+        state.resolve(ApprovalDecision::ApproveAllForSession);
+
+        let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("the follow-up request must not wait for a second answer")
+            .expect("approval task panicked");
+        assert_eq!(first, ApprovalDecision::ApproveAllForSession);
+        assert_eq!(second, ApprovalDecision::Approve, "approve-all must cover the next call");
+        assert!(state.prompt().is_none(), "the suppressed request must not leave a prompt");
+    }
+
+    /// Fail-closed waiting primitive: a dropped decision channel (dialog torn
+    /// down with the run) resolves as a denial instead of hanging forever.
+    #[tokio::test]
+    async fn closed_decision_channel_denies_instead_of_hanging() {
+        let (sender, receiver) = tokio::sync::watch::channel::<Option<ApprovalDecision>>(None);
+        drop(sender);
+
+        let decision =
+            tokio::time::timeout(std::time::Duration::from_secs(5), await_decision(receiver))
+                .await
+                .expect("a closed decision channel must resolve, never hang");
+        assert_eq!(decision, ApprovalDecision::Deny, "an unanswerable request must deny");
+    }
+
     // ------------------------------------------------------------------
     // request_intent_confirmation (ADR-55 §1)
     // ------------------------------------------------------------------

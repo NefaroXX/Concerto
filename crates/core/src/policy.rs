@@ -28,12 +28,16 @@ pub struct SimplePolicyEngine {
     /// authorization state consulted by `Condition::IntentAuthorized`.
     /// `None` (the default) preserves exact pre-ADR-55 behavior.
     intent_auth: Option<Arc<dyn IntentAuthorization>>,
-    /// Effective approval deadline for approval-producing rules that do not
+    /// Approval deadline carried by approval-producing rules that do not
     /// carry an explicit timeout (`RequireApproval`,
     /// `RequireManagedToolApproval`, `RequireToolchainApproval`). Defaults to
-    /// 30s (pre-existing behavior); configurable through `[policy]
-    /// approval_timeout_secs`. A timeout now PAUSES the run awaiting the user
-    /// instead of denying it.
+    /// 30s; configurable through `[policy] approval_timeout_secs`.
+    ///
+    /// **Inert by design.** The value still rides the policy verdict so the
+    /// config format, the public API and audit payloads stay compatible, but
+    /// the executor no longer races any timer: an approval request parks until
+    /// permission is given or revoked (owner requirement — no auto-expiry).
+    /// See `ToolExecutor::request_approval_decision`.
     approval_timeout: std::time::Duration,
     /// ADR-72: container-runtime availability probe used to admit or refuse the
     /// `SandboxProfile::Containerized` profile. Defaults to the process-wide
@@ -64,10 +68,14 @@ impl SimplePolicyEngine {
         self
     }
 
-    /// Override the default approval deadline (30s) used by approval-producing
-    /// rules that do not carry an explicit timeout. Wired from `[policy]
-    /// approval_timeout_secs`; `RequireApprovalWithTimeout` always keeps its
-    /// own per-rule value.
+    /// Override the default approval deadline (30s) carried by
+    /// approval-producing rules that do not carry an explicit timeout. Wired
+    /// from `[policy] approval_timeout_secs`; `RequireApprovalWithTimeout`
+    /// always keeps its own per-rule value.
+    ///
+    /// The value is retained for config/API compatibility only — nothing
+    /// enforces it once the verdict leaves this engine (see the
+    /// `approval_timeout` field).
     pub fn with_approval_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.approval_timeout = timeout;
         self
