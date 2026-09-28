@@ -71,6 +71,7 @@ already-running terminal session if it was created under the old profile.
 | Shell appears twice | Remove the explicit custom duplicate; detected profiles are regenerated |
 | Shell is not detected | Add it as a custom profile with an absolute executable path |
 
-See [ADR-28](adrs/ADR-28.md) for the profile schema
-and [ADR-30](adrs/ADR-30.md) for the unified
-selection decision.
+See [ADR-30](adrs/ADR-30.md) for the unified selection decision and the profile
+schema (`ShellSettings`, `selected_profile`, and the detected-plus-custom
+catalog). The earlier ADR-28 profile schema is superseded — ADR-28 is now a
+pointer stub with no retained text.

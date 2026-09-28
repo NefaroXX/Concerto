@@ -29,7 +29,7 @@ pub struct SessionManagerConfig {
     /// Automatically `git init` a project directory at session start when it
     /// is not already inside a git repository (see
     /// `concerto_tools::git_init`). Defaults to true; opt out via
-    /// `[tools] git_auto_init = false` in the app config.
+    /// `[tool_settings] git_auto_init = false` in the app config.
     pub git_auto_init: bool,
 }
 
@@ -77,7 +77,7 @@ impl ProjectSessionManager {
         cancel: CancellationToken,
     ) -> Result<ActiveProjectSession, SessionError> {
         // Ensure a brand-new project directory is a git repository before the
-        // agent starts writing files (opt-out via `[tools] git_auto_init`,
+        // agent starts writing files (opt-out via `[tool_settings] git_auto_init`,
         // default on). Never fails session setup: git absence or a failed
         // `git init` is logged and ignored — repos stay the user's domain.
         match ensure_git_repo(project_dir, self.config.git_auto_init) {

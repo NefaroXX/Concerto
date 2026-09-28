@@ -123,8 +123,13 @@ they never fail to load.
 
 ## Agent assignments
 
-Valid roles are `coordinator`, `architect`, `researcher`, `coder`, `reviewer`,
-and `validator`.
+An assignment is keyed by agent id, and the ids are whatever the roster
+contains. The orchestrator does not validate them against a fixed role list:
+the five built-in seeds are `coordinator`, `architect`, `researcher`, `coder`,
+`reviewer`, and `validator`, but config owns the roster (ADR-58), so a
+`[[multi_agent.custom_agents]]` entry is assignable by its own `id` and an
+assignment naming an id that is not registered simply never matches. Per
+ADR-74 the dispatch prompt hardcodes no roles at all.
 
 ```toml
 [[model_settings.agent_assignments]]
@@ -142,14 +147,25 @@ multi-agent mode does not intentionally replace an explicit assignment. A role
 without an assignment inherits the session selection or uses compatible
 fallback routing when no explicit/session pair exists.
 
+`agent_role` is matched against the configured roster (ADR-58); it is not
+validated against a fixed role vocabulary. The examples above use the built-in
+seed ids, and a custom agent is assignable by the `id` given in its
+`[[multi_agent.custom_agents]]` block.
+
 ## Selection rules
 
 Concerto no longer uses subjective capability tiers.
 
 1. Resolve an explicit role assignment, otherwise the session provider/model.
 2. Validate that the referenced provider exists and the pair can be built.
-3. Enforce objective requirements. Researcher, Coder, and Validator require
-   tool-call support; other roles do not automatically require it.
+3. Enforce objective requirements. Tool-calling support is derived, not a
+   hardcoded role table (`BlueprintFacade::tool_calling_roles`): a built-in seed
+   requires it when staffed in a stage tagged `research`/`implement`/`validate`
+   or when its effective capabilities include `fs_write`/`shell`; a custom agent
+   holds the shared executor, so any capability implies tool calling; the
+   `coordinator` never requires it. On the default `standard` blueprint this
+   yields exactly `researcher`, `coder`, and `validator` — that set is the
+   default result, not a rule.
 4. Check the remaining spend budget.
 5. Only where no authoritative pair exists, select the lowest-cost compatible
    profile.
@@ -202,5 +218,8 @@ replacement for the OS credential store.
 | Rate-limit loop | Check provider limits and `[retry]`; retries preserve a run but cannot create quota |
 | Cost rejection | Check the session cap, multi-agent multiplier, and model cost override |
 
-There is no `concerto providers list` command. Use Settings/Quick Panel in the
-desktop application or inspect the configuration file.
+`concerto providers list` prints the configured provider ids, their provider
+kind, model, and whether a key is present, annotating the default model route.
+It is a CLI subcommand, so on a desktop-capable build invoke it as
+`concerto --cli providers list`. The desktop Settings/Quick Panel is the
+preferred surface; neither one lists credentials, only their presence.

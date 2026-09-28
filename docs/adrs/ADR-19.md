@@ -72,7 +72,7 @@ On detection, the coordinator returns `CycleDetected` error. The CLI/desktop off
 ### 7. Routing strategy
 
 > Routing portion superseded by [ADR-31](ADR-31.md) (model-first selection
-> with internal provider routing; archived predecessor [ADR-24](archive/ADR-24.md)).
+> with internal provider routing; predecessor [ADR-24](ADR-24.md)).
 > Capability tiers and heuristic role ranking are no longer part of Concerto's
 > routing design.
 
@@ -140,12 +140,12 @@ The original Phase 5 design used a fixed heuristic pipeline: Architect always ru
 
 - [Current architecture](../architecture.md)
 - [Current multi-agent guide](../agent-collaboration.md)
-- [ADR-10](archive/ADR-10.md) (archived): historical LanceDB vector-store
+- [ADR-10](ADR-10.md) (superseded): historical LanceDB vector-store
   decision, superseded by [ADR-63](ADR-63-memory-subsystem.md)
 - [ADR-16](ADR-16.md): context overflow strategy
 - [ADR-31](ADR-31.md): model-first selection with internal provider routing —
-  supersedes the routing portion of this ADR (archived predecessor:
-  [ADR-24](archive/ADR-24.md))
+  supersedes the routing portion of this ADR (predecessor:
+  [ADR-24](ADR-24.md))
 
 ---
 

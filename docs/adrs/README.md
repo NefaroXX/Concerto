@@ -13,8 +13,7 @@ successor so historical citations resolve, and nothing else is kept.
 | **Accepted (revised in place)** | Corrected by maintainer direction; no superseding ADR exists. |
 | **Deferred** | Design is recorded for future work; not implemented. |
 | **Active** | Approved and in force; may carry in-document revisions. |
-| **Superseded** | Replaced by a later ADR; the number is a pointer to the successor only. |
-| **Archived** | Historical record only; not current guidance. |
+| **Superseded** | Replaced by a later ADR; the number is a pointer to the successor only, and no full text is retained. |
 
 ## Consolidation note (2026-08-22)
 
@@ -97,7 +96,7 @@ the 2026 remediation wave (33–63) keeps its genuine recent dates. Numbers 09,
 | [64](./ADR-64-timeline-zero-waste-orchestration.md) | Timeline-driven zero-waste orchestration | 2026-09-02 | Proposed — compiled-scheduler authority partially superseded by [ADR-71](./ADR-71-coordinator-supremacy.md); the §3 pure-verdict reuse oracle is codified as compatible | Durable timeline + role-agnostic semantic keys + pre-dispatch resolver; plan reuse, gap-driven research, file capsules, agent-removability. |
 | [65](./ADR-65-evidence-spine.md) | Evidence spine — facts, claims, and decisions on one append-only chain | 2026-09-04 | Accepted — evidence-scheduler point partially superseded by [ADR-71](./ADR-71-coordinator-supremacy.md); design-doc quarantine advisory | Append-only evidence chain over the whiteboard log; tool facts, workspace snapshot, read cache, resume, resource facts. |
 | [66](./ADR-66-harness-tool-call-guarantee.md) | Harness-level tool-call guarantee — every model drives tools or fails loud | 2026-09-07 | Accepted | Tool use is a loop invariant; fail-loud at selection/request/parse seams; universal text-fallback driver; per-model capability resolution. |
-| [67](./ADR-67-m01-context-pool-consolidation.md) | M-01 — Consolidate context-overflow pools under a single owner per pool | 2026-09-18 | Accepted | One ContextEngine owns all budget pools; removes double-clip, deletes SummarizeOldest (NoOp retained), documents generic.rs:402 invariant. Gate-only S effort. |
+| [67](./ADR-67-m01-context-pool-consolidation.md) | M-01 — Consolidate context-overflow pools under a single owner per pool | 2026-09-18 | Accepted | One ContextEngine owns all budget pools; removes double-clip and removed `SummarizeOldest` from production (`NoOp` retained as the default). Note: `SummarizeOldest` was later re-introduced as an opt-in, unwired library strategy in `crates/memory/src/short_term.rs` — see `docs/DEFERRED.md` row 31. Gate-only S effort. |
 | [68](./ADR-68-h04-session-ack-breaking-param.md) | H-04 — Breaking parameter change for `request_ack` | 2026-09-18 | Accepted | New `request_ack` signature with session_id validation; PendingAck gains session_id; 6 impls + 5 doubles; desktop single-slot queues-or-rejects-busy. |
 | [69](./ADR-69-symbolic-cascade.md) | Symbolic cascade — link store, scoring, and observability in slices | 2026-09-18 | Accepted | Three slices: link store (M 3-5d), scoring+decay (M 5-8d), Mermaid+UI+eval (S-M 3-5d); fail-open, degree/TTL caps, cost-gated progression. |
 | [70](./ADR-70-project-agents-md-context-injection.md) | Project AGENTS.md context injection | 2026-09-20 | Accepted | Global + per-project AGENTS.md injected into every prompt path (skills → AGENTS → environment card); project-over-global, bounded/truncated, fail-soft, opt-in, coordinator maintenance nudge (text only). |
@@ -144,38 +143,27 @@ the 2026 remediation wave (33–63) keeps its genuine recent dates. Numbers 09,
 > ladder no longer refuses to reassign a hard-failed subtask to a same-stage
 > peer; that peer is now the preferred takeover target.
 
-## Archived ADRs ([`archive/`](./archive/))
-
-Full historical texts, retained verbatim; not active guidance. One entry is
-an appendix archive rather than a superseded full record — ADR-55's phase
-history, whose still-in-force decisions were consolidated into the live
-ADR-55/ADR-56 files in place.
-
-| ADR | Title | Superseded by / consolidated into |
-|---|---|---|
-| [ADR-10](./ADR-10.md) | Vector Store — LanceDB | [ADR-63](./ADR-63-memory-subsystem.md) — LanceDB removed entirely in pre-release cleanup; SQLite is the only vector store. |
-| [ADR-21](./ADR-21.md) | WASM Plugin Implementation — Runtime, Host ABI, Capability Model | [ADR-14](./ADR-14.md) (living design); async host functions in [ADR-38](./ADR-38.md). |
-| [ADR-24](./ADR-24.md) | Deterministic Provider/Model Routing | [ADR-31](./ADR-31.md) — capability-tier removal record, refined into model-first selection. |
-| [ADR-27](./ADR-27.md) | Integrated desktop terminal lifecycle | [ADR-30](./ADR-30.md) (shell selection); terminal lifecycle consolidated into [ADR-20](./ADR-20.md). |
-| [ADR-28](./ADR-28.md) | Shell Profiles and Integrated Toolchain | [ADR-30](./ADR-30.md) (unified shell selection, carries surviving profile/config decisions); runtime in [ADR-29](./ADR-29.md). |
-| [ADR-42](./ADR-42) | Coordinator resilience: failure-class fallback ladder (original) | The active [ADR-42](./ADR-42.md) replaced this file's content in place; original retained here. |
-| ADR-55 addenda 1d–2e; ADR-56 amendment blocks | Phase accretion and dated amendments | Consolidated into [ADR-55](./ADR-55-intent-routing-and-authorization.md) / [ADR-56](./ADR-56-model-first-intent-classification.md) in place (2026-09-28). |
-
-## Superseded stubs (live, full text in `archive/`)
+## Superseded stubs (live, no full text retained)
 
 These five files exist in `docs/adrs/` and are listed here so that reading the
-directory accounts for every file. Each is a short archived stub that points at
-its successor and at its own preserved full text; **none is active guidance**
-and none should be cited by line number — the text they replaced lives in
-`archive/`.
+directory accounts for every file. Each is a short stub that points at its
+successor and records no current design. **None is active guidance**, none
+should be cited by line number, and **no full text is preserved** — the
+superseded text was not retained when the `docs/adrs/archive/` tier was removed.
+If you need the reasoning behind a superseded decision, it survives in the
+successor ADR's Context section or in the commit history.
 
-| Stub in this directory | Full text | Superseded by |
+| Stub in this directory | Title carried by the stub | Superseded by |
 |---|---|---|
-| [ADR-10](./ADR-10.md) | [ADR-10](./ADR-10.md) | [ADR-63](./ADR-63-memory-subsystem.md) |
-| [ADR-21](./ADR-21.md) | [ADR-21](./ADR-21.md) | [ADR-14](./ADR-14.md); async host functions in [ADR-38](./ADR-38.md) |
-| [ADR-24](./ADR-24.md) | [ADR-24](./ADR-24.md) | [ADR-31](./ADR-31.md) |
-| [ADR-27](./ADR-27.md) | [ADR-27](./ADR-27.md) | [ADR-30](./ADR-30.md), [ADR-20](./ADR-20.md) |
-| [ADR-28](./ADR-28.md) | [ADR-28](./ADR-28.md) | [ADR-30](./ADR-30.md), [ADR-29](./ADR-29.md) |
+| [ADR-10](./ADR-10.md) | Vector Store — LanceDB | [ADR-63](./ADR-63-memory-subsystem.md) |
+| [ADR-21](./ADR-21.md) | WASM Plugin Implementation | [ADR-14](./ADR-14.md); async host functions in [ADR-38](./ADR-38.md) |
+| [ADR-24](./ADR-24.md) | Deterministic Provider/Model Routing | [ADR-31](./ADR-31.md) |
+| [ADR-27](./ADR-27.md) | Integrated Desktop Terminal Lifecycle | [ADR-30](./ADR-30.md) |
+| [ADR-28](./ADR-28.md) | Shell & Process Toolchain | [ADR-30](./ADR-30.md) |
+
+`ADR-55`'s phase history (addenda 1d–2e) and `ADR-56`'s amendment blocks are
+not stubs: they were consolidated into the live ADR-55/ADR-56 files in place on
+2026-09-28, with their still-in-force decisions restated there.
 
 ## Reading order suggestions
 

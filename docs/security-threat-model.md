@@ -341,13 +341,6 @@ Concerto is a local-first AI coding agent that executes model-generated actions 
 
 ### High-Priority Gaps
 
-4. **No Rate Limiting for API Server**
-   - **Risk**: Denial of service, brute force attacks
-   - **Impact**: Service unavailability
-   - **Mitigation**: Add per-client rate limiting (e.g., 100 req/min)
-   - **Priority**: Medium
-   - **Effort**: 4 hours
-
 5. **No Encryption for Audit Logs** — ✅ DONE (2026-09-26, opt-in)
    - SQLCipher at-rest encryption for the sessions/audit database plus
      age-based, operator-configured archive-then-delete retention

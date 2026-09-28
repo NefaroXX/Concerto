@@ -99,11 +99,27 @@ including for configs written before the field existed).
 Subtask failures are classified as `Recoverable` (retry same agent),
 `LimitReached` (retries exhausted, or provider/model-specific hard failure:
 auth, context overflow, no-affordable-model), or `NonRecoverable` (cancellation,
-structural). `LimitReached` walks a two-tier ladder — same agent re-dispatched
-on the global default model (same bound provider), then coordinator
-self-execution (only for subtasks with no expected file artifact) — before
-exiting the session gracefully with a partial/checkpoint outcome; hard failures
-never reassign to another agent. See ADR-42.
+structural). `LimitReached` walks a ladder with two independent axes — the agent
+axis is consulted *before* provider escalation:
+
+1. The same agent re-dispatched on the global default model (same bound
+   provider, no provider or agent change) — ADR-42 tier 1.
+2. **Agent-axis takeover** — a same-stage peer first, then any agent whose
+   effective coverage (own stage ∪ configured `can_cover`) includes the target
+   stage. The failing agent is never its own candidate. ADR-74.
+3. Default-provider re-target — ADR-45 tier 1b.
+4. Coordinator self-execution, only for subtasks with no expected file artifact
+   and only on roster exhaustion — ADR-45 tier 2, gated by the ADR-74
+   `delegation-required` guard.
+
+A successful takeover returns immediately and publishes a ladder note; a failed
+or unattributable takeover publishes a note and the ladder continues. The run
+then exits gracefully with a partial/checkpoint outcome.
+
+Note that ADR-74 **deliberately reverses** the earlier invariant that hard
+failures never reassign to another agent: a same-stage peer is now the preferred
+takeover target rather than a forbidden one. Tier numbering is otherwise
+unchanged. See ADR-42, ADR-45, and ADR-74.
 
 ### Evidence spine (ADR-65)
 
@@ -196,8 +212,10 @@ Memory is layered:
 
 - **Short-term (session) memory** — per-session context assembled by
   `ContextEngine` within the token budget, with overflow handled by
-  `NoOpOverflowStrategy` (ADR-67: one ContextEngine owns all budget pools; the
-  old `SummarizeOldest` strategy was deleted).
+  `NoOpOverflowStrategy` (ADR-67: one ContextEngine owns all budget pools).
+  `SummarizeOldest` also exists in `crates/memory/src/short_term.rs` as a
+  tested summarise-then-slide strategy, but it is opt-in and not wired into the
+  production path, so `NoOpOverflowStrategy` remains the default.
 - **Long-term (project) memory** — the active retrieval path:
 
   1. walk the selected project and filter supported files;
@@ -242,12 +260,18 @@ Current boundaries:
 - Tool, provider, and memory-adapter plugins all execute. `PluginBackedProvider`
   and `PluginBackedVectorStore` are the host-side wrappers; the `completion`
   host function routes through the configured LLM provider.
-- The workspace crates `test-plugin-wasm`, `test-provider-plugin-wasm`, and
-  `test-adapter-plugin-wasm` are the example/end-to-end test plugins, one per
-  plugin kind.
+- The workspace crates `test-plugin-wasm`, `test-provider-plugin-wasm`,
+  `test-adapter-plugin-wasm`, and `test-dialect-plugin-wasm` are the
+  example/end-to-end test plugins, one per plugin kind.
 - Fuel, size, time, and capability constraints reduce risk but are not complete
   OS-level isolation.
-- `SandboxProfile::Containerized` is not implemented.
+- `SandboxProfile::Containerized` **is** implemented and enforced on
+  Linux/macOS (ADR-72): opt-in `docker`/`podman` `PATH` detection, a
+  fail-closed policy admission gate, and shell invocations routed through
+  `<runtime> run` with a required `CommandRouting::Containerized` producer
+  marker. It is not a plugin sandbox — plugins still run under WASM capability
+  limits — and it is unsupported on Windows, where it fails closed. Selection
+  is programmatic only; there is no user-facing config key yet.
 
 ## Skills and MCP extensions
 
@@ -290,12 +314,20 @@ a specific task/environment, not proof of general correctness.
 
 `concerto-config` merges defaults, a platform global file, a project
 `.concerto.toml`, and environment variables. It owns schema migration (current
-version 5 — `[skills]` and `[mcp]` were added in v5 per ADR-43), keychain
-credential lookup, retry settings, providers/models,
-multi-agent relationships, policy definitions, and shell profiles.
+version 8 — `[skills]` and `[mcp]` were added in v5 per ADR-43, v6 dropped the
+retired `mode` key and the Build/Chat/Plan mode picker along with `[intent]`,
+v7 added `[intent]` classifier keys, and v8 dropped those again once ADR-56
+retired the classifier from the run hot path; the intent *gate* itself stays
+always-on), keychain credential lookup, retry settings,
+providers/models, multi-agent relationships, policy definitions, and shell
+profiles.
 
-Credentials are stored through the OS keychain. `CONCERTO_TEST_MODE=1` switches
-credential reads to derived environment variables for automated tests.
+Credentials are stored through the OS keychain. In automated tests, credential
+access is selected explicitly per call via `CredentialStore::from_env()`,
+which is environment-variable backed and touches no keyring — for example
+`anthropic/api_key` becomes `CONCERTO_ANTHROPIC_API_KEY`. There is no global
+test-mode switch: `CONCERTO_TEST_MODE=1` is documented for parity with CI but
+is not read by any code.
 
 ## Known architectural gaps
 
@@ -305,7 +337,9 @@ credential reads to derived environment variables for automated tests.
   embeddings and tree-sitter chunking; scale/quality measurements are still
   needed.
 - LSP integration is maturing but still limited; provider and memory-adapter
-  plugins are implemented. Container isolation and the full AI-native shell
-  remain incomplete.
+  plugins are implemented. Container isolation is implemented for Linux/macOS
+  command execution (ADR-72) but is not a plugin sandbox, is unsupported on
+  Windows, and has no user-facing config key; the full AI-native shell remains
+  incomplete.
 - Model catalogues, prices, and provider protocols evolve and require ongoing
   live verification.

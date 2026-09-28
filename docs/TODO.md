@@ -38,9 +38,13 @@ unstarted.
   cadence; summarization cadence in the orchestrator is cruder still.
 - **Shell profile slice 3 (cross-platform managed-runtime packaging).**
   ADR-28 slices 1–2 are landed (recorded in `DEFERRED.md` row 24). Slice 3 —
-  cross-platform packaging of the Concerto-managed Bash runtime — is described
-  in the archived ADR-28 §8 as a later slice and has no implementation and no
-  register row. Not a deferral; nobody has decided it out.
+  cross-platform packaging of the Concerto-managed Bash runtime — was
+  described in ADR-28 §8, which described a *later* slice. **That text is gone:**
+  ADR-28 is now a superseded stub retaining no full text, and ADR-30
+  supersedes only ADR-28 §§2, 4, and 5, so §8 was neither carried forward nor
+  archived. Slice 3 therefore has no implementation, no register row, and no
+  surviving specification. Not a deferral; nobody has decided it out. Recovering
+  it means rewriting the slice from scratch, not reading it back.
 - **Consent gate: persistent "always allow" (issue #22).** Not started
   (deferred in ADR-44 terms, but never registered) — the desktop out-of-root
   consent gate's Allow is process-lifetime; a persistent "always allow" was
@@ -52,12 +56,14 @@ unstarted.
   design; the server-side pending-approval flow (session created pending, event
   emitted over the bus/SSE, interactive client approves/rejects) has no in-tree
   interactive HTTP client to serve. Source: `docs/adrs/ADR-44.md:37`.
-- **Config for a shell CPU budget (gap #6 residual).** The portable CPU-budget
-  layer shipped (`13cba1c`) but `cpu_budget_secs` is `None` in every production
-  constructor (`crates/tools/src/shell.rs:220-231`) and there is no TOML key —
-  the env var is the only operator knob. The Windows and cgroup-v2 halves are
-  `DEFERRED.md` row 45; the missing config key is not, so it is listed here
-  until someone registers it.
+- **Config for a shell CPU budget (gap #6 residual).** *Registered — see
+  `DEFERRED.md` row 45, whose title is "Shell CPU limiting — Windows, cgroup v2,
+  config key" and whose body states the missing TOML key explicitly.* The
+  portable CPU-budget layer shipped (`13cba1c`) but `cpu_budget_secs` is `None`
+  in every production constructor (`crates/tools/src/shell.rs:220-231`) and
+  there is no TOML key for it — the env var is the only operator knob. This
+  item was listed here on the belief that the config key was unregistered; that
+  belief was wrong, and this bullet is kept only as a pointer.
 
 ## Audit cleanups (`DEFERRED.md` row 34)
 
@@ -76,9 +82,13 @@ lost. All six read Not started or Partial.
   resume (informational; models re-selected on resume). The lag is by
   construction, not a defect — see the note in
   `crates/orchestrator/src/checkpoint.rs` (`restore_yields_semantically_identical_state`).
-- **C-06 — acceptance-cycle manual verification.** Not started. Acceptance is
-  validator-owned with artifact/verification evidence, but a manual
-  build-then-accept/reject cycle on disk is still only recommended.
+- **C-06 — acceptance-cycle manual verification.** Not started. The *evidence*
+  half shipped in `8e5a20b`: the completion gate now accepts a successful
+  mutating tool against a declared deliverable, a successful build/test
+  command, or a recorded coordinator declaration, and stays fail-closed (no
+  evidence → Partial). What remains is the manual build-then-accept/reject
+  cycle on disk, which is still only recommended. Acceptance is validator-owned
+  with artifact/verification evidence.
 - **M-08 — duplicate public error names.** Not started (deferred as a breaking
   API change). `SessionError` (core + sessions) and `EvalError` (core + eval)
   are deliberate; note `MemoryError` exists only in core (the original audit

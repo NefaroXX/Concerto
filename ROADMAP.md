@@ -3,8 +3,9 @@
 This document describes active priorities. It is not a completion claim. The
 original phase plan is preserved by Git history and the architectural decisions
 in `docs/adrs/`; current behavior is documented in
-[Current Status](docs/STATUS.md), and the fine-grained pending-work list lives
-in [docs/TODO.md](docs/TODO.md).
+[Current Status](docs/STATUS.md), the outstanding-work register is
+[docs/DEFERRED.md](docs/DEFERRED.md), and the short list of unstarted work with
+no deferral decision is [docs/TODO.md](docs/TODO.md).
 
 ## Product direction
 
@@ -283,12 +284,12 @@ historical numbers. Files are uniformly named `docs/adrs/ADR-NN.md`.
 | [06](docs/adrs/ADR-06.md) | File watching | Accepted |
 | [07](docs/adrs/ADR-07.md) | Terminal UI — `ratatui` | Accepted |
 | [08](docs/adrs/ADR-08.md) | Desktop UI — `iced` | Accepted |
-| [10](docs/adrs/ADR-10.md) | Vector store — superseded | Superseded in implementation by SQLite vector/FTS store |
+| [10](docs/adrs/ADR-10.md) | Vector store — LanceDB (superseded) | Superseded in implementation by SQLite vector/FTS store |
 | [11](docs/adrs/ADR-11.md) | Multi-instance file locking | Accepted |
 | [12](docs/adrs/ADR-12.md) | Embedding versioning | Accepted |
 | [14](docs/adrs/ADR-14.md) | Plugin architecture — WASM | Accepted |
 | [16](docs/adrs/ADR-16.md) | Context overflow strategy | Accepted (updated for Phase 4) |
-| [19](docs/adrs/ADR-19.md) | Multi-agent orchestration | Accepted; routing superseded by ADR-24 |
+| [19](docs/adrs/ADR-19.md) | Multi-agent orchestration | Accepted; routing superseded by ADR-31 |
 | [20](docs/adrs/ADR-20.md) | Desktop UI architecture | Accepted |
 | [21](docs/adrs/ADR-21.md) | WASM plugin implementation | Partially superseded by implementation |
 | [22](docs/adrs/ADR-22.md) | Hybrid retrieval ranking — RRF | Accepted |
@@ -340,6 +341,9 @@ historical numbers. Files are uniformly named `docs/adrs/ADR-NN.md`.
 | [69](docs/adrs/ADR-69-symbolic-cascade.md) | Symbolic cascade — link store, scoring, and observability in slices | Accepted |
 | [70](docs/adrs/ADR-70-project-agents-md-context-injection.md) | Project AGENTS.md context injection | Accepted |
 | [71](docs/adrs/ADR-71-coordinator-supremacy.md) | Coordinator Supremacy — the coordinator is the sole master of a run | Accepted |
+| [72](docs/adrs/ADR-72-containerized-sandbox-profile.md) | Containerized sandbox profile — OS-level isolation via a container runtime | Accepted — implemented on Linux/macOS; Windows unsupported, fails closed |
+| [73](docs/adrs/ADR-73-audit-encryption-and-retention.md) | Audit-Log Encryption at Rest and Bounded Retention | Accepted — implemented; supersedes ADR-40 §Decision item 3 only |
+| [74](docs/adrs/ADR-74-delegation-doctrine-and-ladder-hold.md) | Delegation Doctrine — delegate by default, hold a rung before demoting it | Accepted — implemented; refines ADR-71, amends ADR-35 §8 |
 
 When current behavior supersedes an ADR decision, update that ADR's status or
 add a superseding ADR; do not silently rewrite its historical context.
