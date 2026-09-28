@@ -1,4 +1,4 @@
-//! Durable plan bindings (ADR-55 §4; phase history: docs/adrs/archive/ADR-55-phase-history.md).
+//! Durable plan bindings (ADR-55 §4).
 //!
 //! The in-run `/Apply|Replan` dialog is armed by the process-scoped
 //! [`concerto_orchestrator::plan_approval::PlanApprovalRegistry`], which is

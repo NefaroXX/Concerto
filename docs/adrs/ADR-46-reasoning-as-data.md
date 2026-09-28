@@ -3,8 +3,9 @@
 **Status:** Accepted (2026-08-07)
 **Date:** 2026-08-07
 **Deciders:** Concerto architecture
-**Supersedes:** Phase 0 of the reasoning-detection cleanup
-    (`docs/research/ARCHITECTURE-V2.md`)
+**Supersedes:** Phase 0 of the reasoning-detection cleanup, from the 2026-08
+    provider-first redesign plan (removed 2026-09-28 with the rest of
+    `docs/research/`)
 
 ## Context
 

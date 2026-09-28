@@ -2,15 +2,24 @@
 
 Status: **draft** (pre-implementation design; no code changes yet).
 
-Companion to `docs/adrs/ADR-58-configurable-orchestration.md` (accepted) and
-`docs/research/orchestration-blueprint.md` (research). P1 — blueprint data
-model, load-time validation, legacy equivalence, and the frontend parity test —
-has landed on `dev` (PR #148, squash `6691f15`; branch commits `7c78abd`,
-`58447d2`, `a887a34`, `f8e6e71`). This document is the P2+P3 **runtime-bridge**
-design: how the coordinator and runtime consume the *resolved* blueprint as
-their single dispatch authority, byte-identical on the default `standard`
-blueprint, with stage and relationship dispatch rewritten in one pass
-(ADR-58 D6, `docs/research/orchestration-blueprint.md` §5.12).
+Companion to `docs/adrs/ADR-58-configurable-orchestration.md` (accepted). P1 —
+blueprint data model, load-time validation, legacy equivalence, and the frontend
+parity test — has landed on `dev` (PR #148, squash `6691f15`; branch commits
+`7c78abd`, `58447d2`, `a887a34`, `f8e6e71`). This document is the P2+P3
+**runtime-bridge** design: how the coordinator and runtime consume the
+*resolved* blueprint as their single dispatch authority, byte-identical on the
+default `standard` blueprint, with stage and relationship dispatch rewritten in
+one pass (ADR-58 D6).
+
+The 2026-08 orchestration blueprint research that originally informed this plan
+was removed on 2026-09-28 with the rest of `docs/research/`. Its two
+requirements that still bind are recorded here rather than in a deleted file:
+**one apply path** — the Studio (ADR-59) and the config watcher (ADR-57) must
+share a single `apply_blueprint()` entry point, never a second divergent one —
+and the explicit stage→`RunStage` binding that the closed `EventKind` enum
+provides. `docs/adrs/ADR-65-evidence-spine.md` further revises the dispatch
+picture: compiled schedulers are removed, so "single dispatch authority" now
+means the Coordinator's `call_specialist` tool, not a scheduler.
 
 Every code anchor below was re-verified against the current tree.
 

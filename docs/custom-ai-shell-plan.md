@@ -6,13 +6,12 @@
 
 **Current home:** `crates/shell`; not yet exposed as the desktop terminal runtime
 
-**Research (2026-08-01):** [research brief](research/ai-native-shell-research-brief.md)
-(failure modes + prior art), [implementation plan](research/ai-native-shell-implementation-plan.md)
-(fresh phase plan starting with a `ToolManifest` schema system — its phase
-numbering must be reconciled with section 5 below before starting),
-[expanded reference](research/ai-native-shell-expanded-research.md)
-(concrete schemas, validation layer, provider-native schema conversion,
-hallucination benchmark spec).
+**Research (2026-08-01):** removed on 2026-09-28 with the rest of
+`docs/research/` (it was never a spec, and no plan phase was tracked by its
+phase numbers). What it contributed is kept where it still binds: the phase
+numbering it used is recorded in the conflict described in `DEFERRED.md` row 24,
+and the fact that the `ToolManifest` schema system is **not specified anywhere
+in-tree** is recorded in the same row.
 
 ## 1. Goal
 

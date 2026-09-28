@@ -106,7 +106,7 @@ partial-state preservation. For configuration changes, test migration and
 round-trip serialization. For shell changes, cover Windows and Unix behavior
 where the code is platform-specific.
 
-### Quality gates against useless tests (see `docs/concerto-test-quality-gates.md`)
+### Quality gates against useless tests
 
 - **Gate 2 — No test-count targets.** Never report "added N tests" as the
   primary justification. Report the specific (behavior, branch) pairs newly

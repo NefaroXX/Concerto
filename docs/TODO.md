@@ -105,22 +105,22 @@ its authority instead of re-opening the item.
 | Coordinator restart/resume | `DEFERRED.md` row 18 — checkpoints and `restore_graph` exist; no cross-process continue consumer yet |
 | M-01 context-management consolidation | `DEFERRED.md` row 11 — gated behind a superseding ADR to ADR-67 M-01 |
 | `request_ack` unscoped approval (H-04) | ADR-68 Accepted — `request_ack` now takes `session_id: Ulid` (`crates/core/src/traits/approval.rs:50`) |
-| FTS BM25 ranking (STUB-FINDINGS #6) | `DEFERRED.md` closed row 12; `ROADMAP.md` "Real FTS BM25 ranking"; `archive/STUB-FINDINGS.md` |
+| FTS BM25 ranking (STUB-FINDINGS #6) | `DEFERRED.md` closed row 12; `ROADMAP.md` "Real FTS BM25 ranking" (the 2026-08 stub audit it came from was removed on 2026-09-28) |
 | Symbolic short-term memory / context offload | `DEFERRED.md` rows 15 and 31 — topic hierarchy, backpressure, schedule-driven pushes; a scene-memory consumer beyond a label |
 | L1 typed extraction + LLM-judged dedup | `DEFERRED.md` row 31 — L1 typed extraction is wired (`entities.rs:851`, `system.rs:162`, `1702d4c`) |
 | Recall budget caps + timeout guard | `DEFERRED.md` closed row 20 — `92b0be4` (`RecallCostBounds`, `rag.rs:133,150-151`) |
 | PersonaMem-style long-horizon memory eval | Partly shipped: the `eval-runner` persona replay tests exist (`crates/eval-runner/tests/persona_mem_recall.rs`, listed in `../TESTING.md`); the remaining coverage breadth is `DEFERRED.md` row 17 |
 | `SandboxProfile::Containerized` | `DEFERRED.md` row 36 — shipped on Linux/macOS (`d00582b`, `3ae6ea5`, `fdf4800`, ADR-72 Accepted); Windows path open |
-| Plugin hot-reload, remote plugins, registry | `DEFERRED.md` rows 29 and 30. (The old cite `docs/adrs/ADR-21.md:29-31` was wrong on both counts — that ADR is archived at `docs/adrs/archive/ADR-21.md`, is superseded by ADR-14, and has no deferral list at those lines.) |
+| Plugin hot-reload, remote plugins, registry | `DEFERRED.md` rows 29 and 30. (The old cite pointed at ADR-21, which is superseded by ADR-14 and carries no deferral list.) |
 | AI-native shell Phases C–F | `DEFERRED.md` row 24 — prerequisite unmet: the two shell plans still disagree on phase numbering |
 | Hybrid UI medium / full scope | Medium merged (PR #97); full scope is `DEFERRED.md` row 37 |
-| Codebase-world-class Phases 1–5 | `research/codebase-world-class-plan.md` is an aspirational estimate; Phase 3 shipped (`10357cd`); the real residue is `DEFERRED.md` row 34 |
+| Codebase-world-class Phases 1–5 | The 2026-08 plan behind these phases was an aspirational estimate and was removed on 2026-09-28; Phase 3 shipped (`10357cd`) and the real residue is registered per-item in `DEFERRED.md` row 34 |
 | Editor integration ("open in editor") | `DEFERRED.md` closed row 26 — **cut**, not deferred. The in-app editor and diff viewer shipped; external-editor launch is a scope cut |
 | Stale parity document | Resolved in place: `docs/desktop-cli-parity.md` is marked complete as of 2026-08-03 |
 | Flat tool-call parsing for OpenAI-compatible proxies | Fixes 1–3 shipped (`docs/proxy-tool-call-fix.md`, 2026-09-20) plus long-tail hardening `3bc11db` (`DEFERRED.md` closed row 21) |
 | Additional OpenAI-compatible providers | Tier 1 + Tier 2 shipped — 22 provider ids (`DEFERRED.md` closed row 9). Tier 3 is row 6; Doubao/StepFun/Replicate is row 7 |
 | Model metadata / price freshness | `DEFERRED.md` row 27 — the SpendLog UI exists but nothing feeds it fresh prices. Explicit non-goal: no cost-based routing |
-| Un-ignore eval end-to-end test | `DEFERRED.md` closed row 10; `archive/STUB-FINDINGS.md` #8 |
+| Un-ignore eval end-to-end test | `DEFERRED.md` closed row 10 |
 | Fault-injection tests for multi-agent containment | Landed — `crates/orchestrator/src/fault_injection.rs:76-92` (C1–C4, `f4bdc4f`) plus the env-gated live leg (`5daf2e7`). Breadth is `DEFERRED.md` row 17 |
 | Forward-compat panic footgun in the agent loop | Fixed — `agent_loop.rs:707-711` returns a typed `AgentLoopError` |
 | LLM prompt-cache hit-rate optimization | Prefix-stability mechanism landed and is **opt-in** (`cache_stable_prefix`, `context_engine.rs:19,50-56`, default `false`; `DEFERRED.md` closed row 18). Measuring hit rate remains unstarted and unregistered |

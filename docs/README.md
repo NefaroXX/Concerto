@@ -54,52 +54,25 @@ These are **not** registers — for what is outstanding, use `DEFERRED.md`.
   design, no code changes yet
 - [proxy-tool-call-fix.md](proxy-tool-call-fix.md) — shipped parsing fixes plus
   the standing caveat that parsing fixes do not prove proxy support
-- [design/](design/) — reference design docs, not ADRs:
-  [outstanding-work.md](design/outstanding-work.md) (score accordion V2 +
-  signature text motion, 2026-09-18) and
-  [text-presentation-animation.md](design/text-presentation-animation.md)
-  (text presentation and animation guidance, 2026-09-03)
-
-## Research (`docs/research/`)
-
-Background, prior art, and analysis. Nothing here is a commitment or a status
-claim; do not cite it as evidence that something exists.
-
-- [ARCHITECTURE-V2.md](research/ARCHITECTURE-V2.md) — 2026-08-07
-  provider-first draft; the shipped parts became ADRs 46–53
-- [codebase-world-class-plan.md](research/codebase-world-class-plan.md) —
-  aspirational engineering estimate
-- [skills-mcp-extensions-plan.md](research/skills-mcp-extensions-plan.md) — the
-  plan ADR-43 accepted; shipped as [skills.md](skills.md) + [mcp.md](mcp.md)
-- [orchestration-blueprint.md](research/orchestration-blueprint.md) ·
-  [concurrent-agent-runtime.md](research/concurrent-agent-runtime.md) ·
-  [multi-provider-resilience.md](research/multi-provider-resilience.md) ·
-  `ai-native-shell-*.md` (research brief, implementation plan, expanded reference)
-
-## Historical (`docs/archive/`)
-
-Kept for provenance. **No live authority** — do not follow these for current
-behaviour, and do not cite them as evidence a feature exists.
-
-- [archive/STUB-FINDINGS.md](archive/STUB-FINDINGS.md) — stub audit; all 8 stubs
-  resolved. `STUB-FINDINGS.md` in this directory is a pointer to it
-- [archive/batch-3-studio-ux.md](archive/batch-3-studio-ux.md) — Studio UX spec
-  superseded by the ADR-59 revision of 2026-08-15
-- [archive/handoff-2026-08-14.md](archive/handoff-2026-08-14.md) — point-in-time
-  session handoff
-- [archive/provider-model-ux-implementation-notes.md](archive/provider-model-ux-implementation-notes.md)
 
 ## Rules for this directory
 
-1. A document is **live**, a **plan**, **research**, or **historical** — pick
-   one and say so at the top. Nothing sits in `docs/` root without a status
-   line.
+1. A document is **live** or a **plan** — pick one and say so at the top.
+   Nothing sits in `docs/` root without a status line. There is no research or
+   scratch tier: background analysis that does not describe current behaviour
+   and is not a plan either gets summarized into `DEFERRED.md` (if it is future
+   work) or dropped. Rationale that a live doc or ADR still depends on is
+   **moved into that doc**, not left in a research file (see rule 3).
 2. Deferred work is registered in [DEFERRED.md](DEFERRED.md) with a source, a
    re-entry condition, and a size. It does not live in a plan, an ADR, or
-   `TODO.md`.
+   `TODO.md`. A row must be readable on its own: quote the substance of any
+   source it cites rather than making the reader chase a file to learn what was
+   actually asked for.
 3. Do not delete a decision or a recorded result. Supersede, archive, or point
    at the replacement — and keep the old path resolving if anything links it.
-4. Never leave a dangling path. When a file moves, update its references,
-   including doc comments in source.
+   `adrs/archive/` is the one permitted exception to "no archive": superseded
+   ADRs keep their full text there, and the stub in place carries the pointer.
+4. Never leave a dangling path. When a file moves or is removed, update its
+   references, including doc comments in source.
 5. Every claim carries a checkable reference: a file, a line, a test name, or a
    commit SHA.

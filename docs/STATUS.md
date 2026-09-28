@@ -219,9 +219,10 @@ The expected manual release checks are maintained in [Testing](../TESTING.md).
   ADR.
 - **Codebase-world-class Phase 0 merged (PR #63):** `missing_docs` policy on
   crate roots, proptest for the shell parser, LSP integration tests, and
-  `run_shared_agent` decomposition. Phases 1–5 are pending — see
-  [research/codebase-world-class-plan.md](research/codebase-world-class-plan.md)
-  and [`DEFERRED.md`](DEFERRED.md).
+  `run_shared_agent` decomposition. Phases 1–5 are pending — the
+  [deferred register](DEFERRED.md) row 34 is the per-item home; the
+  phase-numbered 2026-08 plan they came from was an aspirational estimate and was
+  removed on 2026-09-28.
 - **Hybrid chat-centric layout (minimal scope):** Diff, Agent Graph, and Tool
   Log now open as overlay modals within the Chat canvas instead of switching
   pages. Keyboard shortcuts toggle: Ctrl+D (Diff), Ctrl+L (Tool Log). Tool Log
@@ -338,8 +339,9 @@ actually work, in order of impact:
   gate, `10357cd`) has since landed. The remaining Phase 1/2/4/5 themes are
   tracked as register rows, not as plan phases:
   [DEFERRED.md](DEFERRED.md) row 34 (module decomposition, duplicate error
-  names, cancellation audit). The plan itself is a research artifact:
-  [research/codebase-world-class-plan.md](research/codebase-world-class-plan.md).
+  names, cancellation audit). The phase-numbered plan itself was an
+  aspirational research artifact and was removed on 2026-09-28; nothing is
+  tracked by its phase numbers.
 
 ## Tracked follow-ups
 

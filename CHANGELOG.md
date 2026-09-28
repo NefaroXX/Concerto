@@ -79,14 +79,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Supervised agent-process is real.** Children build an actual provider and
   route approvals over IPC to the same approval sink the in-process paths use
   (`d62ebac`, `7859a0a`).
-- **Docs:** `docs/DEFERRED.md` is a single outstanding-work register (112
-  lines, 22 rows) with shipped work closed and evidenced. ADR amendments are
+- **Docs:** `docs/DEFERRED.md` is a single outstanding-work register (114
+  lines, 24 rows) with shipped work closed and evidenced. ADR amendments are
   integrated into the decisions they amend rather than appended; ADR-55 went
   from 1094 lines of phase accretions to 381 with the phase history archived
-  verbatim. Superseded and aspirational plans moved to `docs/research/`, session
-  history and resolved-stub audits to `docs/archive/`, and `docs/README.md` now
-  indexes the directory.
+  verbatim. Aspirational plans, session history and resolved-stub audits were
+  first moved aside, then removed outright (see the next bullet) once
+  `docs/DEFERRED.md` could carry the still-open residue on its own, and
+  `docs/README.md` now indexes the directory.
 
+- **Docs: no research or scratch tier.** `docs/archive/`, `docs/research/` and
+  `docs/design/` are gone, along with the `docs/STUB-FINDINGS.md` pointer. Nothing
+  load-bearing was dropped: `docs/README.md` rule 2 now requires a future-wish
+  summary to live in `DEFERRED.md` and load-bearing rationale to be moved into the
+  live doc that cites it. The two design docs turned out to be fully landed (V3
+  thinking-presentation gaps are all fixed in the tree), and the research findings
+  were either adopted as ADRs 46–53 or registered as new outstanding rows —
+  `DEFERRED.md` row 46 (provider circuit breaker + in-flight dedup) and row 47
+  (catalog flattening + per-role/per-tier fallback controls). `DEFERRED.md` rows 8
+  and 24 were rewritten to quote their substance instead of citing a deleted file.
+  Superseded ADRs in `docs/adrs/archive/` are untouched: their full text is a
+  decision record, so rule 3 keeps that one archive.
 - **Unified agent loop (ADR-55):** every non-empty run enters the
   loop and the model shapes it; outcomes are non-binding flavor hints; the
   text-only branch is deleted; the classifier left the hot path. Under full

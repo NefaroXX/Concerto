@@ -148,13 +148,13 @@ section keeps only the items that shape the roadmap.
 - **Hybrid UI full scope** (post-1.0): split Settings into tabbed sub-views,
   Studio split pane, drag-and-drop agent assignment, focus-trap system —
   `docs/hybrid-ui-plan.md`.
-- **Codebase-world-class Phases 1–5** (from
-  `docs/research/codebase-world-class-plan.md`, an aspirational estimate rather
-  than a schedule): Phase 3 shipped (`10357cd` — two-tier criterion gate in CI).
-  The rest of the real work is registered per-item, not per-phase: hotspot and
-  module decomposition, duplicate error types, and the cancellation audit are
-  `docs/DEFERRED.md` row 34; coverage breadth and the eval live leg are row 17;
-  the security/polish theme is `docs/security-threat-model.md` §6.
+- **Codebase-world-class Phases 1–5** (from a 2026-08 aspirational estimate,
+  since removed — it was never a schedule): Phase 3 shipped (`10357cd` — two-tier
+  criterion gate in CI). The rest of the real work is registered per-item, not
+  per-phase: hotspot and module decomposition, duplicate error types, and the
+  cancellation audit are `docs/DEFERRED.md` row 34; coverage breadth and the eval
+  live leg are row 17; the security/polish theme is
+  `docs/security-threat-model.md` §6.
 - **Coordinator restart/resume:** checkpoint persistence to the session
   database exists (`coordinator.rs::persist_checkpoint`); ADR-65 Phase 7
   (evidence-driven resume at the whiteboard cursor, checkpoint schema v4) is
@@ -166,8 +166,8 @@ section keeps only the items that shape the roadmap.
   rank-ordered (`crates/memory/src/fts.rs:148,160-163`;
   `crates/memory/src/rag.rs:412-459`); the stored `score: 1.0` is inert by
   construction (`crates/memory/src/sync.rs:61,130`), proven by
-  `crates/memory/src/fts.rs:404-450,458-498`. (archive/STUB-FINDINGS.md #6,
-  DEFERRED closed row 12.)
+  `crates/memory/src/fts.rs:404-450,458-498`. (2026-08 stub audit #6, removed
+  2026-09-28; `DEFERRED.md` closed row 12.)
 - **Provider reach follow-ups:** the named OpenAI-compatible wrappers are
   implemented (22 provider ids); remaining work is the *flat*/content-embedded
   tool-call parsing for proxies documented in `docs/proxy-tool-call-fix.md`
