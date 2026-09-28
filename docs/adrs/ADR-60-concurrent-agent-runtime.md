@@ -5,7 +5,9 @@
 **Deciders:** sol (product owner); architecture review pending per process
 **Supersedes:** none (new decision; ADR-35 §4/§5 coordinator contract is redefined below, not silently contradicted)
 **Relationship to prior ADRs:** ADR-35 (coordinator contract — amended: coordinator becomes supervisor), ADR-36 (transcript_entries — becomes a projection view of the whiteboard log), ADR-43 (MCP stdio lifecycle — transport precedent), ADR-58/59 (config-owned orchestration topology — orthogonal, unchanged), ADR-55 (intent/authorization — gate scope), ADR-57 (config change propagation — per-process startup config)
-**Research input:** `docs/research/concurrent-agent-runtime.md` (2026-08-18)
+**Research input:** the 2026-08-18 concurrent-agent-runtime research, commissioned
+specifically to establish the mechanisms below (removed 2026-09-28 with the rest of
+`docs/research/`; this ADR is now the sole record of that design).
 
 ## Context
 
@@ -22,7 +24,7 @@ Four structural facts define the limits of this design:
 
 ### Why a new architecture is being decided fresh
 
-Per owner decision (2026-08-18): this is a new decision, not recovered intent. No prior ADR or doc covers a shared workspace/whiteboard or concurrency (ADR-58/59 and `docs/research/orchestration-blueprint.md` are about configurable pipeline topology only). The earlier foundational research (`docs/research/concurrent-agent-runtime.md`) was commissioned specifically to establish the mechanisms for this decision.
+Per owner decision (2026-08-18): this is a new decision, not recovered intent. No prior ADR or doc covers a shared workspace/whiteboard or concurrency (ADR-58 and ADR-59 are about configurable pipeline topology only). The earlier foundational research was commissioned specifically to establish the mechanisms for this decision.
 
 ### Owner decisions (binding)
 

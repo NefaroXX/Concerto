@@ -1,6 +1,6 @@
 # Concerto
 
-A production-grade, local-first AI coding agent harness written in Rust.
+A pre-release, local-first AI coding agent harness written in Rust.
 Concerto runs single-agent loops and gated multi-agent orchestration entirely
 on your machine against your choice of LLM providers: every model-generated
 file write, shell command, and git operation passes through a policy engine
@@ -8,6 +8,11 @@ into a reversible filesystem overlay, and every decision is recorded on an
 append-only audit trail. Native Iced desktop and independent ratatui terminal
 frontends share one runtime, one configuration model, and one persistent
 project memory.
+
+Version 0.1.0, source builds only, nothing published yet — this README
+describes what is actually implemented. For what is still open, see
+[Honest boundaries](#honest-boundaries) and the 24-row
+[deferred register](docs/DEFERRED.md).
 
 [![CI](https://github.com/NefaroXX/Concerto/actions/workflows/ci.yml/badge.svg)](https://github.com/NefaroXX/Concerto/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE-MIT)
@@ -21,6 +26,37 @@ project memory.
 > path; nothing is published to crates.io yet. Read
 > [Current Status](docs/STATUS.md) and [Testing](TESTING.md) before reporting a
 > result.
+
+## Origins
+
+Concerto was renamed from `opencode-rs` — a Rust reimplementation inspired by
+[OpenCode](https://github.com/sst/opencode), whose fingerprints are still on
+the architecture. The core idea this project is built around — one unified agent
+loop where the model picks its own tools and acts on tool feedback, governed by
+per-tool permission rules instead of pre-classifying the request — comes from
+OpenCode's single-loop design together with Anthropic's *"Building Effective
+Agents"* augmented-LLM pattern; ADR-55
+([docs/adrs/ADR-55-intent-routing-and-authorization.md](docs/adrs/ADR-55-intent-routing-and-authorization.md))
+credits both. Legacy `opencode-rs` paths and config names still survive in the
+tree as migration shims (`~/.config/opencode-rs/`,
+`~/.local/share/opencode-rs/`, `.opencode-rs.toml`, the `opencode-rs` keyring
+service).
+
+What diverged is everything around the loop: a first-match policy engine whose
+unmatched verdict is *deny*, not ask; a `VirtualFs` overlay that preserves
+originals for review or rejection; a supervised multi-agent coordinator with a
+delegation doctrine instead of a flat agent list; WASM plugins; an append-only
+audit trail; and SQLite-backed project memory. Concerto is not a fork — it
+shares no code with OpenCode — but it would not exist in this shape without it.
+
+Concerto is not a fork of OpenCode and depends on no OpenCode code; the
+workspace has no `opencode` dependency and all of it is original. It would,
+though, not have this shape without OpenCode.
+
+*(A separate product with a similar name: **OpenCode Zen** is a hosted model
+gateway, and Concerto talks to it as one provider among many via
+`crates/providers/src/opencode.rs`. It is not the OpenCode agent discussed
+here.)*
 
 ## Why Concerto?
 
@@ -56,6 +92,32 @@ provider/model assignments. Tools are granted per confirmed policy decision,
 never by a chat/plan/build keyword: boundaries are enforced by deny-class
 policy rules and the approval sink.
 
+**Delegation doctrine (ADR-74).** Delegating is the default. The Coordinator
+self-executes a subtask only when the roster is exhausted, and an attempt to do
+so is refused by a named `delegation-required` policy rule and recorded as
+`CoordinatorSelfImplementing`. A hard-failed subtask is first offered to another
+registered specialist — an agent whose `can_cover` list includes the target
+stage is eligible — and only then does the ladder escalate across providers. A
+provider that is merely *throttled* is **held** (30 s × 2, three recovery
+rounds) and retried rather than abandoned; the fallback pipe bridges the run
+instead of demoting a rung that was only breathing. Agent coverage is
+configuration, not code: `can_cover` in `[[multi_agent.custom_agents]]` widens
+what an agent can do without a code change.
+
+**Auditable tool trail.** Every file, shell, and git decision is written to an
+append-only audit row recording the operation, the attempted and resolved
+paths, the destinations, and whether it succeeded. Read-only operations record
+what they returned — `exists`, entry counts, byte sizes, never content. Read a
+session's trail with `concerto --cli audit <session-id>`, filtered by
+`--tool`/`--operation`/`--failed`/`--limit`/`--json`.
+
+**Evidence-gated acceptance (C-06).** A mutating run does not report Success on
+a validator's say-so. It completes only on checkable evidence — a successful
+mutating tool call against a declared deliverable, a successful build/test
+command, or a recorded coordinator declaration. No evidence still reports
+Partial rather than Success. (The remaining C-06 work is the *manual*
+build-then-accept/reject cycle on disk, tracked in `docs/DEFERRED.md` row 34.)
+
 **Provider support.** OpenAI, Anthropic, Google Gemini, OpenRouter, Ollama,
 NVIDIA NIM, OpenCode-compatible endpoints, and a config-first catalog of
 OpenAI-compatible providers — Anthropic, OpenAI, OpenCode, Google, OpenRouter,
@@ -66,10 +128,20 @@ metering.
 
 **Policy governance.** Every file write, shell command, and git operation
 passes through `SimplePolicyEngine` and the `VirtualFs` overlay — there is no
-bypass. Rules are evaluated first-match; unmatched tools default to requiring
-approval. Filesystem changes are materialized immediately while the overlay
-preserves original content for diff review and rejection. Every decision is
-recorded in an append-only audit log.
+bypass. Rules are evaluated first-match; anything unmatched is **denied** by
+the `default_deny` rule. (When MCP is enabled, the runtime appends an explicit
+`RequireApproval` rule for `mcp:*` after your own rules, so unmatched MCP tools
+ask rather than deny — an added rule, not the default.)
+Filesystem changes are materialized immediately while the overlay
+preserves original content for diff review and rejection. An approval request
+**parks until it is answered** — the previous 30 s auto-expiry is inert, and
+cancellation is the only escape. Every decision is recorded in an append-only
+audit log.
+
+**Sandboxing.** An opt-in containerized profile runs shell invocations through
+`docker` or `podman` on Linux/macOS, with a fail-closed admission gate and a
+required routing marker (ADR-72). Windows is not supported and fails closed.
+WASM plugin capability enforcement is a second layer, not OS-level isolation.
 
 **Persistence.** SQLite-backed sessions with audit log, replay primitives, and
 shared token/USD spend tracking (`concerto-sessions`).
@@ -92,6 +164,46 @@ configuration.
 The API server binds loopback by default and refuses non-localhost binds
 without `CONCERTO_API_KEY`. Logs sanitize secrets, and there is no built-in
 telemetry (optional exporters are opt-in).
+
+## Honest boundaries
+
+What Concerto is not, stated plainly so nobody discovers it by surprise:
+
+- **Pre-release.** Version 0.1.0, every crate marked `publish = false`, so
+  nothing is on crates.io. A tag-triggered
+  [release workflow](.github/workflows/release.yml) can build and attach a
+  GitHub release, but no tagged release exists yet. The supported path today is
+  a source build plus the workspace checks below. It is entering wider live
+  testing, not finished testing.
+- **One project at a time.** Concerto opens a single project directory per
+  session. That is an accepted limitation, not a bug in progress
+  (`docs/DEFERRED.md` row 16).
+- **Sandboxing is Linux/macOS only.** The opt-in container profile routes
+  shell invocations through `docker`/`podman` with a fail-closed admission
+  gate; Windows has no container path and fails closed (row 36). WASM plugin
+  capability enforcement is a second layer, not OS-level isolation.
+- **The desktop UI is mid-polish.** Minimal and Medium rework stages are
+  merged; the hybrid-UI finish work is still open (row 37).
+- **No gateway layer.** No remote-execution gateway is built or scheduled;
+  native direct connections are the default and the config-first catalog can
+  already express a gateway as an OpenAI-compatible endpoint. Whether one is
+  ever wanted is explicitly *undecided*, not refused (row 8).
+- **Acceptance evidence is gated, acceptance itself is manual.** A mutating
+  run cannot report Success without checkable evidence (a mutating tool call,
+  a passing build/test command, or a recorded coordinator declaration), but
+  the build-then-accept/reject cycle on disk is still yours (row 34).
+- **macOS and Windows are not in the verified test matrix.** Linux is the
+  primary development platform.
+
+The bullets above are the highest-impact user-facing gaps. They are **not** the
+whole picture: the register also carries Tier-3 provider SDKs, memory and
+recall depth, eval breadth and flake quarantine, the plugin trust model and
+marketplace, shell CPU limiting, provider transport resilience, catalog and
+fallback controls, cross-process continue, and the unbuilt phases of the
+AI-native shell. The full list — 24 rows, each with its size, its evidence, and
+what unblocks it — lives in
+[docs/DEFERRED.md](docs/DEFERRED.md), which is the source of truth for
+"not done". This section is only a summary.
 
 ## Architecture
 
@@ -156,13 +268,22 @@ Launch the terminal UI:
 cargo run -p concerto-cli --release
 ```
 
-The top-level binary also selects a frontend. Desktop is the default; the CLI
-build is behind its feature:
+The top-level binary also selects a frontend. The `cli` feature is **not**
+enabled by default — `default = ["desktop"]` — so `--cli` is only recognized in
+a build that includes it:
 
 ```bash
-cargo run -p concerto -- --desktop
-cargo run -p concerto --features cli -- --cli
+cargo run -p concerto                          # desktop (default features)
+cargo run -p concerto --features cli -- --cli   # terminal UI
+cargo run -p concerto --features cli -- --help
 ```
+
+**Subcommands need `--cli`.** `concerto` itself only parses `--help`,
+`--version`, `--cli`/`--desktop`, and the CLI feature flags; every subcommand
+(`audit`, `health`, `sessions`, `providers`, `projects`, `config`, `logs`,
+`memory`, `plugin`, `extensions`) is dispatched by `concerto-cli`. On a desktop
+build, `concerto audit <id>` **launches the GUI and ignores the arguments** —
+`concerto --cli audit <id>` is the correct form.
 
 ## Quick start
 
@@ -175,6 +296,14 @@ example](docs/config.toml.example) for details.
 Select a project directory, choose a provider/model pair, and start with a
 Chat or Build prompt. Multi-agent mode can be toggled in the desktop Settings
 or enabled with `concerto --cli --multi-agent`.
+
+Useful read-only checks, each of which needs `--cli` on a desktop build:
+
+```bash
+concerto --cli health        # resolved provider stack, tier-1 default
+concerto --cli config doctor # config file, key presence
+concerto --cli audit <session-id>   # one session's policy/tool audit trail
+```
 
 ## Configuration
 
@@ -248,11 +377,11 @@ Separately, with `CONCERTO_TEST_MODE=1`, lookups derive env vars from
 **Verify the setup:**
 
 ```bash
-concerto health           # resolved provider stack, tier-1 default
-concerto config doctor    # config file, key presence
+concerto --cli health        # resolved provider stack, tier-1 default
+concerto --cli config doctor # config file, key presence
 ```
 
-Example (`concerto health`):
+Example (`concerto --cli health`):
 
 ```
 [my-openai] openai — model: deepseek-r1
@@ -264,7 +393,7 @@ Example (`concerto health`):
 In multi-agent mode the fallback ladder re-dispatches a failed role on
 `[multi_agent].default_model`, falling back to
 `model_settings.global_default_model` when unset (see "Tier-1 Default" in
-`concerto health`).
+`concerto --cli health`).
 
 ## Testing and verification
 

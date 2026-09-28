@@ -3,9 +3,9 @@
 **Status:** Accepted (2026-08-08) — implemented in the same-or-next commit.
 **Date:** 2026-08-08
 **Deciders:** Concerto architecture
-**Supersedes:** Phase 6 of the provider-first redesign plan
-    (`docs/research/ARCHITECTURE-V2.md`, §7 "Phase 6 (later) — plugins for novel
-    dialects, heartbeats, merge leftovers").
+**Supersedes:** Phase 6 (later) of the provider-first redesign plan (removed
+    2026-09-28 with the rest of `docs/research/`) — "plugins for novel dialects,
+    heartbeats, merge leftovers".
 **Composes with:** ADR-14 (WASM plugin architecture), ADR-37 (plugin
     capability lifecycle), ADR-46/ADR-48 (reasoning-as-data, ContextEngine —
     the Phase-2 dialect seam), ADR-26 (fault containment — heartbeat keepalive).
@@ -26,7 +26,7 @@ baked into the host.
 Two structural observations bound the fix:
 
 - **The request side is the open gap.** The Phase-2 dialect seam
-  (ARCHITECTURE-V2 §2.1, ADR-46/ADR-48) already defines the intended
+  (2026-08 V2 design §2.1, ADR-46/ADR-48) already defines the intended
   interface: a `Dialect` adapter *lowers* the canonical request to wire bytes
   and *parses* the stream back to canonical events, with transport (HTTP,
   SSE, retry, auth, keepalive) living in the host. A WASM plugin is the
@@ -133,7 +133,7 @@ Dialect and a user who configures none get today's exact code path.
   a liveness marker on that interval: `CompletionChunk::keepalive()` — an
   additive constructor producing an empty, non-terminal chunk that downstream
   consumers treat as a no-op, with zero delta (the canonical `KeepAlive` event
-  already foreseen by ARCHITECTURE-V2 §2.1).
+  already foreseen by the 2026-08 V2 design §2.1).
 - **No per-token streaming through WASM in this ADR** — streaming is
   deferred (§Consequences). The heartbeat only proves the host-side await is
   alive; it does not stream plugin output.

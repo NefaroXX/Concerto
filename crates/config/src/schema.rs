@@ -531,11 +531,11 @@ pub struct AppConfig {
 
     /// Tool-level runtime settings applied at session start.
     ///
-    /// `None` (a config without a `[tools]` section) keeps the embedded
+    /// `None` (a config without a `[tool_settings]` section) keeps the embedded
     /// defaults — currently `git_auto_init` is ON, so brand-new project
     /// directories get a bare `git init` before the agent writes files. See
     /// `concerto_tools::git_init`. Additive: no `deny_unknown_fields`, so a
-    /// config file carrying stale `[tools]` keys keeps loading.
+    /// config file carrying stale `[tool_settings]` keys keeps loading.
     #[serde(default)]
     pub tool_settings: Option<ToolSettings>,
 
@@ -815,7 +815,7 @@ impl AppConfig {
 
 /// Tool-level runtime settings applied at session start.
 ///
-/// `[tools]` is additive and default-on: a missing `[tools]` section keeps
+/// `[tool_settings]` is additive and default-on: a missing `[tool_settings]` section keeps
 /// every knob at its embedded default. The only knob today is `git_auto_init`
 /// — the session manager runs a bare `git init` for project directories that
 /// are not yet inside a git repository (see `concerto_tools::git_init`). No
@@ -825,7 +825,7 @@ impl AppConfig {
 pub struct ToolSettings {
     /// Automatically run a bare `git init` for a project directory at session
     /// start when it is not already inside a git repository. Default: true.
-    /// Set `[tools] git_auto_init = false` to disable the subprocess entirely
+    /// Set `[tool_settings] git_auto_init = false` to disable the subprocess entirely
     /// (e.g. host environments that manage repos themselves).
     #[serde(default = "default_true")]
     pub git_auto_init: bool,
@@ -2352,7 +2352,7 @@ mod tests {
         assert_eq!(rc.stream_idle_timeout_seconds, 300);
     }
 
-    /// `[tools] git_auto_init` defaults to true on both construction paths:
+    /// `[tool_settings] git_auto_init` defaults to true on both construction paths:
     /// the `Default` impl (what the session manager uses) and the serde
     /// default (what an omitted `git_auto_init` key loads).
     #[test]

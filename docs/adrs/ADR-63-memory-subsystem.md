@@ -4,7 +4,7 @@
 **Date:** 2026-08-19
 **Deciders:** Concerto architecture
 **Related crates:** `concerto-memory`, `concerto-core`
-**Supersedes:** [ADR-10](./archive/ADR-10.md) (LanceDB — archived; SQLite is
+**Supersedes:** [ADR-10](./ADR-10.md) (LanceDB — superseded; SQLite is
 the only vector store). Ranking method per [ADR-22](./ADR-22.md); degradation
 handling per [ADR-39](./ADR-39.md); embedding versioning per
 [ADR-12](./ADR-12.md).
@@ -16,7 +16,7 @@ codebase corpus: chunk the project's files, embed the chunks, index them, and
 answer hybrid queries — fully offline, per-project isolated, cancellable, and
 without an external database server or cloud embedding API.
 
-The original vector-store decision (archived ADR-10) chose an embedded
+The original vector-store decision (superseded ADR-10) chose an embedded
 columnar engine. Pre-release cleanup removed that dependency entirely:
 cold compile time dropped from ~8 minutes to ~30 seconds, and project-scale
 corpora never needed ANN indexing beyond what SQLite provides directly.
@@ -91,7 +91,7 @@ same store as a projection of the whiteboard log — never replacing it.
 
 ## Alternatives Considered
 
-- **Embedded columnar vector engine (archived ADR-10):** removed — dependency
+- **Embedded columnar vector engine (superseded ADR-10):** removed — dependency
   weight and build cost outweighed ANN capabilities never exercised at
   project scale.
 - **Qdrant/pgvector servers:** rejected — violate local-first single-binary
@@ -112,7 +112,7 @@ same store as a projection of the whiteboard log — never replacing it.
 - Related: ADR-06 (filesystem watch), ADR-11 (single-instance locking),
   ADR-12 (embedding versioning), ADR-16/48 (context budget consumption),
   ADR-22 (RRF), ADR-39 (degradation), ADR-54 (stub/global-memory hardening),
-  archived ADR-10 (superseded LanceDB decision)
+  superseded ADR-10 (LanceDB vector-store decision)
 
 ---
 

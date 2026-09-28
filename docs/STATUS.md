@@ -1,6 +1,6 @@
 # Concerto current status
 
-**Last reconciled with the source tree: 2026-09-24**
+**Last reconciled with the source tree: 2026-09-28**
 
 This is the public status source of truth. “Implemented” means the code path
 exists and has automated coverage; it does not mean every provider, model,
@@ -75,8 +75,16 @@ installer packages.
   earlier; the remaining v2 items landed via `3cb251d` (audit columns),
   `21d4d3e` (shell containment), `44f2deb` (dialog verification), `9ec27f3`
   (2c classifier).
+- **Delegation doctrine (ADR-74):** delegation is the Coordinator's default;
+  self-execution only on roster exhaustion, enforced by a named
+  `delegation-required` refusal plus a `CoordinatorSelfImplementing` record;
+  `can_cover` makes agent coverage config data and puts the agent axis ahead of
+  provider escalation; a throttled rung is held, not abandoned.
 - **Persistence:** SQLite sessions, append-only audit log, replay primitives,
-  shared token/USD spend tracking, and project-scoped state.
+  shared token/USD spend tracking, and project-scoped state. The audit trail
+  records operation, attempted/resolved paths, destinations, and what read-only
+  operations returned (never content); read it with `concerto --cli audit
+  <session-id>`.
 - **Memory:** SQLite FTS5/vector hybrid retrieval with reciprocal-rank fusion,
   local `fastembed` embeddings, tree-sitter AST chunking, project
   isolation, a debounced file watcher for re-indexing, and automatic
@@ -138,6 +146,31 @@ installer packages.
 The expected manual release checks are maintained in [Testing](../TESTING.md).
 
 ## What's new (unreleased)
+
+- 2026-09-28: **Delegation doctrine (ADR-74) + auditable tool trail.** ADR-74
+  makes delegation the Coordinator's default: self-execution is permitted only
+  on roster exhaustion and is refused by a named `delegation-required` policy
+  rule, recorded as `CoordinatorSelfImplementing`. A hard-failed subtask is
+  offered to another registered specialist — including a stage-less agent whose
+  `can_cover` list includes the target stage — before the ladder escalates
+  across providers. A throttled planning rung is held (30 s × 2, three recovery
+  rounds) and retried, with the fallback as a bridge rather than a demotion.
+  Agent coverage is now configuration (`can_cover` in
+  `[[multi_agent.custom_agents]]`, schema v8 unchanged; the Studio round-trips
+  the field but has no editor for it). Alongside it, the audit trail records
+  operation, attempted/resolved paths, destinations, and — for read-only
+  operations — what they returned (`exists`, entry counts, byte sizes, never
+  content; migrations 034–035), readable with `concerto --cli audit
+  <session-id>`. Approval requests now park until answered (the 30 s
+  auto-expiry is inert). Verification: 4839 tests, fmt/clippy/deny clean.
+
+- 2026-09-26: **Containerized sandbox (ADR-72) and audit encryption at rest
+  (ADR-73).** `SandboxProfile::Containerized` is implemented and enforced on
+  Linux/macOS with `PATH` runtime detection, a fail-closed admission gate, and
+  a required routing marker; Windows fails closed. `sessions.db` (including
+  `audit_log`) can be encrypted with SQLCipher and aged rows archived then
+  deleted, both opt-in. See the Outstanding rows 36 and the Closed list below
+  for what is still open.
 
 - 2026-09-24: **Coordinator supremacy (ADR-71) + routing carcass removal** —
   the Coordinator is the sole master of a run (all dispatch, ordering, agent
@@ -210,9 +243,10 @@ The expected manual release checks are maintained in [Testing](../TESTING.md).
   ADR.
 - **Codebase-world-class Phase 0 merged (PR #63):** `missing_docs` policy on
   crate roots, proptest for the shell parser, LSP integration tests, and
-  `run_shared_agent` decomposition. Phases 1–5 are pending — see
-  [research/codebase-world-class-plan.md](research/codebase-world-class-plan.md)
-  and [`DEFERRED.md`](DEFERRED.md).
+  `run_shared_agent` decomposition. Phases 1–5 are pending — the
+  [deferred register](DEFERRED.md) row 34 is the per-item home; the
+  phase-numbered 2026-08 plan they came from was an aspirational estimate and was
+  removed on 2026-09-28.
 - **Hybrid chat-centric layout (minimal scope):** Diff, Agent Graph, and Tool
   Log now open as overlay modals within the Chat canvas instead of switching
   pages. Keyboard shortcuts toggle: Ctrl+D (Diff), Ctrl+L (Tool Log). Tool Log
@@ -329,8 +363,9 @@ actually work, in order of impact:
   gate, `10357cd`) has since landed. The remaining Phase 1/2/4/5 themes are
   tracked as register rows, not as plan phases:
   [DEFERRED.md](DEFERRED.md) row 34 (module decomposition, duplicate error
-  names, cancellation audit). The plan itself is a research artifact:
-  [research/codebase-world-class-plan.md](research/codebase-world-class-plan.md).
+  names, cancellation audit). The phase-numbered plan itself was an
+  aspirational research artifact and was removed on 2026-09-28; nothing is
+  tracked by its phase numbers.
 
 ## Tracked follow-ups
 
@@ -384,12 +419,18 @@ These are live-verification items, not deferred work: they have no terminal
 state and are therefore not register rows (`docs/DEFERRED.md` closed row 29).
 The forms are [`../TESTING.md`](../TESTING.md) and
 [live-test-template.md](live-test-template.md). Work that is explicitly
-deferred is not listed here — it lives in `docs/DEFERRED.md`, whose Closed
-list records items that have since landed (audit-log retention and encryption
-`7351128`, containerized sandbox `d00582b`/`3ae6ea5`/`fdf4800`, shell CPU
-budgets `13cba1c`, API rate limiting `61f34b7`, plugin egress filtering
-`450cb58`, the live-runtime eval leg `5daf2e7`, and the Phase-3 benchmark CI
-gate `10357cd`).
+deferred is not listed here — it lives in `docs/DEFERRED.md`, whose **Outstanding**
+table (24 open rows) is the register and whose **Closed** list (items 1–31)
+records what has since landed: audit-log retention and encryption `7351128`
+(closed 15), API rate limiting `61f34b7` (closed 23), plugin egress filtering
+`450cb58` (closed 24), the Phase-3 benchmark CI gate `10357cd` (closed 25),
+and the Windows shell-quoting work `da611e4` (closed 22).
+
+Three shipped items are *partially* closed and therefore remain Outstanding
+rows rather than Closed entries — do not read them as still unshipped:
+containerized sandbox (row 36, Windows path open; Linux/macOS landed), shell
+CPU budgets (row 45, Windows/cgroup-v2/config-key residual), and the eval
+live-runtime leg (row 17, `5daf2e7` landed, breadth/quarantine outstanding).
 
 Longer-term work belongs in [ROADMAP.md](../ROADMAP.md), not in this status
 document.

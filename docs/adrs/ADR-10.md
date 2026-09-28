@@ -1,13 +1,11 @@
-# ADR-10: Vector Store — LanceDB
+# ADR-10: Vector Store — LanceDB — superseded
 
-> **Archived — superseded by ADR-63 (SQLite hybrid vector/FTS memory store;
-> consolidated 2026-08-22).** See
-> [docs/adrs/README.md](./README.md) for the current index.
+> **Superseded.** The decision this number carried is no longer in force; it is
+> consolidated in [ADR-63](./ADR-63-memory-subsystem.md). This entry exists only
+> so historical references to ADR-10 resolve, and records no current design. No
+> full text of the superseded decision is retained.
 >
-> The full historical text lives at [archive/ADR-10.md](./archive/ADR-10.md).
 > LanceDB support was removed entirely in pre-release cleanup; `SqliteVectorStore`
-> is the only vector store. This stub is not active guidance.
-
----
-
-*Last updated: 2026-08-22 (retrospective consolidation — see [README](./README.md)).*
+> is the only vector store.
+>
+> See [docs/adrs/README.md](./README.md) for the current index.

@@ -6,9 +6,9 @@
     config-only endpoint docs).
 **Date:** 2026-08-08
 **Deciders:** Concerto architecture
-**Supersedes:** Phase 4 of the provider-first redesign plan
-    (`docs/research/ARCHITECTURE-V2.md`) — the config-only endpoint / providers-as-data
-    items this ADR finalizes.
+**Supersedes:** Phase 4 of the provider-first redesign plan (removed 2026-09-28
+    with the rest of `docs/research/`) — the config-only endpoint /
+    providers-as-data items this ADR finalizes.
 **Composes with:** ADR-42/ADR-45 (fallback ladder) — this ADR's resolved-model
     precedence is the tier-1/tier-1b pin source; ADR-46 (reasoning echo knob)
     and ADR-48 (cache breakpoints) — both knobs live on `ProviderConfig`.
@@ -86,15 +86,15 @@ against the config (with the model-merit list as data, not hard-coded).
 
 The **flat schema flattening** — merging
 `ProviderConfig` / `ModelPinConfig` / `MultiAgentConfig` into a single
-catalog schema (`docs/research/ARCHITECTURE-V2.md` §8:
-"Full flattening of `ProviderConfig`/`ModelPinConfig`/
-`MultiAgentConfig` into one catalog schema remains deferred"). This ADR
+catalog schema — the 2026-08 design put it this way: "Full flattening of
+`ProviderConfig`/`ModelPinConfig`/`MultiAgentConfig` into one catalog schema
+remains deferred"). This ADR
 ratifies the catalog *orientation* (providers, their models, the resolution
 precedence, and the knobs as data on the existing tables) — it does **not**
 collapse the three config tables into one. That flattening plus the deferred
 feature-config surface (per-role fallback disable, per-tier retry/backoff
-counts, ladder-locked tier targeting) remains a separate decision, recorded
-in §7 of the plan and the deferred-feature-config style in
+counts, ladder-locked tier targeting) remains a separate decision, tracked as
+`docs/DEFERRED.md` row 47 in the deferred-feature-config style of
 `docs/adrs/ADR-52-orchestration-safety-gates.md` — not ratified here.
 
 ## Consequences
