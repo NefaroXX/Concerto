@@ -36,7 +36,7 @@ imara-diff = { workspace = true }
 # ---- Parent-death signal for the supervised child (ADR-60 D1, Linux-only) ----
 libc = "0.2"
 
-dirs = "5"
+dirs = "6"
 sqlx = { workspace = true }
 concerto-config = { path = "../config", version = "0.1.0" }
 concerto-plugins = { path = "../plugins", version = "0.1.0" }
