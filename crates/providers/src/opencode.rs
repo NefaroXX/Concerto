@@ -1,4 +1,18 @@
-//! OpenCode Zen provider.
+//! OpenCode provider (Zen + Go relays).
+//!
+//! OpenCode operates **two distinct relays** behind one connector:
+//!
+//! - **Zen** — [`OPENCODE_ZEN_BASE`], the `opencode` provider's default. Serves
+//!   the paid/free-tier Zen roster.
+//! - **Go** — [`OPENCODE_GO_BASE`], the `opencode-free` provider's default. A
+//!   *separate* endpoint with a *separate* model catalog (see
+//!   [`crate::provider_defs::OPENCODE_FREE_KNOWN`]): never assume a model id
+//!   exists on both relays, and never copy a catalog from one to the other.
+//!
+//! Neither relay serves completions to an unauthenticated client — Go answers
+//! `401 AuthError "Missing API key."`, Zen's free-tier gate answers
+//! `403 FreeTierError` — so neither provider type is keyless. A config-supplied
+//! `api_base` overrides either default (self-hosted gateways, proxies, tests).
 //!
 //! OpenCode Zen serves multiple model families through a single gateway:
 //!
@@ -43,8 +57,56 @@ use crate::adapters::{AnthropicChatDialect, Dialect, ReasoningEcho};
 use crate::openai::OpenAiProvider;
 use crate::sse::BufferedSseParser;
 
-/// Default OpenCode Zen API base URL.
-const OPENCODE_ZEN_API_BASE: &str = "https://opencode.ai/zen/v1";
+/// Default OpenCode **Zen** relay base URL — the `opencode` provider's target.
+///
+/// This is the ONE definition of the Zen base in this workspace (the previous
+/// duplicate in `lib.rs` was removed so the two can never diverge).
+pub(crate) const OPENCODE_ZEN_BASE: &str = "https://opencode.ai/zen/v1";
+
+/// Default OpenCode **Go** relay base URL — the `opencode-free` provider's
+/// target.
+///
+/// Go (`/zen/go`) is a **distinct relay with a distinct model catalog**, not a
+/// path alias of Zen (`/zen`): `GET https://opencode.ai/zen/go/v1/models`
+/// returns a roster that shares no assumptions with Zen's. Completions on Go
+/// answer `401 AuthError` without a valid API key, so `opencode-free` is *not*
+/// a keyless provider type. Kept as a constant so a future relay correction is
+/// a one-line change, never a scattered edit.
+pub(crate) const OPENCODE_GO_BASE: &str = "https://opencode.ai/zen/go/v1";
+
+/// Client-identity header OpenCode's relay reads on every request.
+///
+/// Upstream reads `x-opencode-session`
+/// (`packages/console/app/src/routes/zen/util/handler.ts`:
+/// `input.request.headers.get("x-opencode-session")`) as a **backend /
+/// prompt-cache affinity** token — it routes a process's requests to a warm
+/// backend so a conversation keeps its cache.
+///
+/// **This is NOT an authentication mechanism.** It carries no credential, it
+/// does not satisfy the relay's API-key check (`401 AuthError` still applies
+/// without a valid `Authorization`), and it does NOT grant free-tier access —
+/// Zen's free-tier gate (`403 FreeTierError`) rejects requests regardless of
+/// this header. The name `X-Session-ID` does not exist upstream and must never
+/// be reintroduced.
+pub(crate) const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
+
+/// Process-stable value of [`OPENCODE_SESSION_HEADER`].
+///
+/// Initialised exactly once per process so every request a process issues
+/// carries the same affinity token — the header only keeps a conversation's
+/// prompt cache warm if the value is stable for the whole session. Generated
+/// from the already-direct `fastrand` dependency (no new crate), guarded by
+/// [`OnceLock`] so concurrent first use cannot produce two different values.
+static OPENCODE_SESSION_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The stable, opaque, per-process `x-opencode-session` value.
+///
+/// Opaque by construction (`concerto-<128 random bits>`) — it identifies
+/// nothing and authorizes nothing; see [`OPENCODE_SESSION_HEADER`].
+pub(crate) fn opencode_session_id() -> &'static str {
+    OPENCODE_SESSION_ID
+        .get_or_init(|| format!("concerto-{:016x}{:016x}", fastrand::u64(..), fastrand::u64(..)))
+}
 
 /// Stable capability name used by every ADR-66 capability refusal.
 pub(crate) const TOOL_CALLING_CAPABILITY: &str = "tool_calling";
@@ -135,8 +197,8 @@ fn is_muse_family_segment(segment: &str) -> bool {
     bytes.first() == Some(&b'v') && bytes.get(1).is_some_and(u8::is_ascii_digit)
 }
 
-/// OpenCode Zen provider that automatically selects the correct wire dialect
-/// per model family.
+/// OpenCode provider (Zen or Go relay) that automatically selects the correct
+/// wire dialect per model family.
 pub struct OpenCodeZenProvider {
     model: String,
     timeout_secs: u64,
@@ -160,12 +222,30 @@ pub struct OpenCodeZenProvider {
 }
 
 impl OpenCodeZenProvider {
-    /// Build a provider targeting the OpenCode Zen endpoint.
-    pub fn new(api_key: impl Into<SecretString>, model: String, timeout_secs: u64) -> Self {
-        Self::with_api_base(api_key, model, timeout_secs, OPENCODE_ZEN_API_BASE.to_string())
+    /// Resolve the effective API base URL for an OpenCode-family provider
+    /// config.
+    ///
+    /// A config-supplied `api_base` always wins verbatim (self-hosted
+    /// gateways, proxies, tests); otherwise the relay default for the provider
+    /// type applies — **Go** ([`OPENCODE_GO_BASE`]) for `opencode-free`,
+    /// **Zen** ([`OPENCODE_ZEN_BASE`]) for `opencode`. Both factory arms and
+    /// the model-listing helper route through this one rule so the two
+    /// provider types can never disagree about which relay they target.
+    pub(crate) fn resolve_api_base(provider_type: &str, api_base: Option<&str>) -> String {
+        match api_base {
+            Some(base) => base.to_string(),
+            None if provider_type == "opencode-free" => OPENCODE_GO_BASE.to_string(),
+            None => OPENCODE_ZEN_BASE.to_string(),
+        }
     }
 
-    /// Build a provider with an explicit API base URL, overriding the Zen default.
+    /// Build a provider targeting the OpenCode Zen endpoint.
+    pub fn new(api_key: impl Into<SecretString>, model: String, timeout_secs: u64) -> Self {
+        Self::with_api_base(api_key, model, timeout_secs, OPENCODE_ZEN_BASE.to_string())
+    }
+
+    /// Build a provider with an explicit API base URL, overriding the relay
+    /// default (Zen for `new`).
     ///
     /// Useful for self-hosted gateways, proxies, or tests.
     pub fn with_api_base(
@@ -174,9 +254,14 @@ impl OpenCodeZenProvider {
         timeout_secs: u64,
         api_base: String,
     ) -> Self {
+        // Every wire path this provider owns — `/responses`, `/messages`, and
+        // the inner OpenAI-compatible `/chat/completions` + `/models` legs —
+        // carries the affinity header, so the relay sees one stable session
+        // across all three dialects (see `OPENCODE_SESSION_HEADER`).
         let openai_inner = OpenAiProvider::new(api_key, model.clone(), timeout_secs)
             .with_api_base(api_base.clone())
-            .with_reasoning_echo(ReasoningEcho::Always);
+            .with_reasoning_echo(ReasoningEcho::Always)
+            .with_extra_header(OPENCODE_SESSION_HEADER, opencode_session_id());
         Self {
             model,
             timeout_secs,
@@ -185,6 +270,17 @@ impl OpenCodeZenProvider {
             advertised_tool_support: None,
             openai_inner,
         }
+    }
+
+    /// The base URL this provider builds its request paths from.
+    ///
+    /// Crate-private accessor for callers outside this module (the relay a
+    /// provider actually targets is otherwise invisible from the
+    /// `LlmProvider` trait). Kept `#[cfg(test)]` until such a caller exists —
+    /// the crate denies dead code.
+    #[cfg(test)]
+    pub(crate) fn api_base(&self) -> &str {
+        &self.api_base
     }
 
     /// The credential both wire paths authenticate with — a borrow, so
@@ -398,6 +494,9 @@ impl OpenCodeZenProvider {
                     .post(&url)
                     .bearer_auth(self.api_key().expose())
                     .header(CONTENT_TYPE, "application/json")
+                    // Backend/prompt-cache affinity, not authentication —
+                    // see `OPENCODE_SESSION_HEADER`.
+                    .header(OPENCODE_SESSION_HEADER, opencode_session_id())
                     .json(&body)
                     .send()
                     .await
@@ -509,6 +608,9 @@ impl OpenCodeZenProvider {
                     .header("x-api-key", self.api_key().expose())
                     .header("anthropic-version", "2023-06-01")
                     .header(CONTENT_TYPE, "application/json")
+                    // Backend/prompt-cache affinity, not authentication —
+                    // see `OPENCODE_SESSION_HEADER`.
+                    .header(OPENCODE_SESSION_HEADER, opencode_session_id())
                     .json(&body)
                     .send()
                     .await
@@ -1766,6 +1868,157 @@ mod tests {
         assert!(
             !matches!(error, ProviderError::CapabilityRefused { .. }),
             "tool-carrying Responses request must not be capability-refused: {error:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Relay selection (Zen vs Go) and the session-affinity header
+    // -----------------------------------------------------------------------
+
+    /// The two relay bases are pinned, distinct, and resolved from the
+    /// provider type; a config-supplied `api_base` always wins for either
+    /// type (self-hosted gateways, proxies, tests).
+    #[test]
+    fn resolve_api_base_picks_relay_by_provider_type() {
+        assert_eq!(OPENCODE_ZEN_BASE, "https://opencode.ai/zen/v1");
+        assert_eq!(OPENCODE_GO_BASE, "https://opencode.ai/zen/go/v1");
+        assert_ne!(
+            OPENCODE_ZEN_BASE, OPENCODE_GO_BASE,
+            "Zen and Go are distinct relays, not path aliases"
+        );
+
+        assert_eq!(OpenCodeZenProvider::resolve_api_base("opencode", None), OPENCODE_ZEN_BASE);
+        assert_eq!(OpenCodeZenProvider::resolve_api_base("opencode-free", None), OPENCODE_GO_BASE);
+        // Only `opencode-free` targets Go; an unrelated type never picks it.
+        assert_eq!(OpenCodeZenProvider::resolve_api_base("openai", None), OPENCODE_ZEN_BASE);
+
+        let override_base = "http://127.0.0.1:9";
+        assert_eq!(
+            OpenCodeZenProvider::resolve_api_base("opencode", Some(override_base)),
+            override_base
+        );
+        assert_eq!(
+            OpenCodeZenProvider::resolve_api_base("opencode-free", Some(override_base)),
+            override_base
+        );
+    }
+
+    /// `api_base()` reports exactly the base the provider builds its request
+    /// paths from — the relay default, or the override when one is given.
+    #[test]
+    fn api_base_accessor_reflects_relay_and_override() {
+        let zen = OpenCodeZenProvider::new("key".to_string(), "minimax-m3".into(), 30);
+        assert_eq!(zen.api_base(), OPENCODE_ZEN_BASE);
+
+        let overridden = OpenCodeZenProvider::with_api_base(
+            "key".to_string(),
+            "minimax-m3".into(),
+            30,
+            "http://127.0.0.1:9".into(),
+        );
+        assert_eq!(overridden.api_base(), "http://127.0.0.1:9");
+    }
+
+    /// The affinity value is generated exactly once per process: identical on
+    /// every call (cache affinity only works with a stable token), namespaced
+    /// to this client, and opaque — it identifies nothing and authorizes
+    /// nothing (see [`OPENCODE_SESSION_HEADER`]).
+    #[test]
+    fn session_id_is_stable_and_opaque() {
+        let first = opencode_session_id();
+        let second = opencode_session_id();
+        assert_eq!(first, second, "one value per process, not one per call");
+
+        let prefix = "concerto-";
+        assert!(first.starts_with(prefix), "namespaced to this client: {first}");
+        let bits = &first[prefix.len()..];
+        assert_eq!(bits.len(), 32, "128 random bits, hex-encoded: {first}");
+        assert!(bits.chars().all(|c| c.is_ascii_hexdigit()), "hex only: {first}");
+        assert!(!first.contains(' '), "the header value must stay a single token");
+    }
+
+    /// Parse the captured request's header block (lowercased) plus request
+    /// line out of raw HTTP bytes.
+    fn captured_headers(raw: &[u8]) -> String {
+        crate::testing::mock_server::request_headers(raw)
+    }
+
+    /// Drive one streaming request against a one-shot mock and return the raw
+    /// captured request. The canned response is irrelevant: the assertion
+    /// target is the OUTBOUND request, so any completed body works.
+    async fn capture_wire_request(model: &str) -> Vec<u8> {
+        let (base, req_rx) = crate::testing::mock_server::spawn(String::new());
+        let provider =
+            OpenCodeZenProvider::with_api_base("test-key".to_string(), model.into(), 5, base);
+        let request = CompletionRequest {
+            model: model.into(),
+            messages: vec![concerto_core::types::Message {
+                role: concerto_core::types::Role::User,
+                content: "hello".into(),
+                tool_calls: None,
+                tool_results: None,
+                reasoning_content: None,
+                tokens_in: None,
+                tokens_out: None,
+            }],
+            ..Default::default()
+        };
+        // A zero-byte SSE body ends the stream immediately; whether the
+        // parser reports `Ok` or an EOF error is irrelevant here.
+        let _ = provider.stream_completion(request, concerto_core::CancellationToken::new()).await;
+        req_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the request reaches the mock")
+    }
+
+    /// Every wire leg this provider owns carries the affinity header, and the
+    /// upstream-nonexistent `X-Session-ID` never appears on any of them.
+    #[tokio::test]
+    async fn every_wire_leg_carries_the_session_header() {
+        // OpenAI-compatible `/chat/completions` (inner provider delegation).
+        let openai_compat = captured_headers(&capture_wire_request("minimax-m3").await);
+        assert!(
+            openai_compat.starts_with("post /chat/completions http/1.1"),
+            "the OpenAI-compat leg must hit /chat/completions: {openai_compat}"
+        );
+        assert_session_header(&openai_compat, "the /chat/completions leg");
+
+        // OpenAI Responses `/responses`.
+        let responses = captured_headers(&capture_wire_request("muse-v2").await);
+        assert!(
+            responses.starts_with("post /responses http/1.1"),
+            "the Responses leg must hit /responses: {responses}"
+        );
+        assert_session_header(&responses, "the /responses leg");
+        assert!(
+            responses.contains("authorization: bearer test-key"),
+            "the /responses leg authenticates with the resolved key: {responses}"
+        );
+
+        // Anthropic Messages `/messages` (x-api-key instead of Bearer).
+        let anthropic = captured_headers(&capture_wire_request("claude-3-5-sonnet").await);
+        assert!(
+            anthropic.starts_with("post /messages http/1.1"),
+            "the Anthropic leg must hit /messages: {anthropic}"
+        );
+        assert_session_header(&anthropic, "the /messages leg");
+        assert!(
+            anthropic.contains("x-api-key: test-key"),
+            "the /messages leg authenticates with the resolved key: {anthropic}"
+        );
+    }
+
+    /// Shared request contract for [`assert_session_header`]: the affinity
+    /// header is present and `X-Session-ID` — which does not exist upstream —
+    /// is absent.
+    fn assert_session_header(headers: &str, context: &str) {
+        assert!(
+            headers.contains("x-opencode-session:"),
+            "{context} must carry x-opencode-session: {headers}"
+        );
+        assert!(
+            !headers.contains("x-session-id"),
+            "{context} must not send X-Session-ID: {headers}"
         );
     }
 }

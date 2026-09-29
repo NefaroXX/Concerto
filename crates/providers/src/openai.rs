@@ -47,6 +47,13 @@ pub struct OpenAiProvider {
     /// Defaults to [`UsageRequest::Off`] — the wire body stays byte-identical
     /// to the pre-wiring output until a construction site opts an endpoint in.
     usage_request: UsageRequest,
+    /// Extra request headers attached to every wire call this connector makes
+    /// (model listing, connection test, and `/chat/completions`), in insertion
+    /// order. Empty by default, so every other provider's wire output stays
+    /// byte-identical. Wrappers set it for relay-specific client-identity
+    /// headers — `OpenCodeZenProvider` uses it for `x-opencode-session`
+    /// (backend/prompt-cache affinity, see `crate::opencode`).
+    extra_headers: Vec<(String, String)>,
     dialect: OpenAiChatDialect,
 }
 
@@ -61,6 +68,7 @@ impl OpenAiProvider {
             tool_schema_mode: concerto_config::ToolSchemaMode::default(),
             advertised_tool_support: None,
             usage_request: UsageRequest::Off,
+            extra_headers: Vec::new(),
             dialect: OpenAiChatDialect,
         }
     }
@@ -131,6 +139,32 @@ impl OpenAiProvider {
     /// connectors that wrap this one (e.g. `crate::openrouter`).
     pub fn usage_request(&self) -> UsageRequest {
         self.usage_request
+    }
+
+    /// Attach one extra header to every request this connector builds.
+    ///
+    /// Crate-private by design: only a wrapping connector needs it —
+    /// `OpenCodeZenProvider` sends `x-opencode-session` on the OpenAI-compatible
+    /// and model-listing legs through here, so the transport is not duplicated.
+    /// [`Self::extra_headers`] starts empty, so no other provider's wire
+    /// output changes.
+    pub(crate) fn with_extra_header(
+        mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.extra_headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Fold the configured extra headers into a request builder.
+    ///
+    /// Applied to every wire call (connection test, model listing, chat
+    /// completion) so a client-identity header never silently skips a leg.
+    fn apply_extra_headers(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        self.extra_headers
+            .iter()
+            .fold(request, |builder, (name, value)| builder.header(name.as_str(), value.as_str()))
     }
 
     /// Render the exact wire body for `request`: the dialect's payload with
@@ -673,8 +707,11 @@ impl LlmProvider for OpenAiProvider {
     async fn test_connection(&self, _cancel: CancellationToken) -> Result<(), ProviderError> {
         let client = crate::new_client(self.timeout_secs);
         let url = format!("{}/models", self.api_base);
-        let resp =
-            client.get(&url).bearer_auth(self.api_key.expose()).send().await.map_err(|e| {
+        let resp = self
+            .apply_extra_headers(client.get(&url).bearer_auth(self.api_key.expose()))
+            .send()
+            .await
+            .map_err(|e| {
                 ProviderError::Other(format!(
                     "openai connection failed: {}",
                     describe_error_chain(&e)
@@ -695,8 +732,11 @@ impl LlmProvider for OpenAiProvider {
     ) -> Result<Vec<ModelInfo>, ProviderError> {
         let client = crate::new_client(self.timeout_secs);
         let url = format!("{}/models", self.api_base);
-        let resp =
-            client.get(&url).bearer_auth(self.api_key.expose()).send().await.map_err(|e| {
+        let resp = self
+            .apply_extra_headers(client.get(&url).bearer_auth(self.api_key.expose()))
+            .send()
+            .await
+            .map_err(|e| {
                 ProviderError::Other(format!(
                     "openai list_models failed: {}",
                     describe_error_chain(&e)
@@ -790,14 +830,16 @@ impl LlmProvider for OpenAiProvider {
         let response = tokio::select! {
             _ = cancel.cancelled() => Err(ProviderError::Cancelled),
             result = async {
-                client
-                    .post(&url)
-                    .header("Authorization", format!("Bearer {}", self.api_key.expose()))
-                    .header("Content-Type", "application/json")
-                    .json(&body)
-                    .send()
-                    .await
-                    .map_err(|e| ProviderError::Network(format!("request failed: {}", describe_error_chain(&e))))
+                self.apply_extra_headers(
+                    client
+                        .post(&url)
+                        .header("Authorization", format!("Bearer {}", self.api_key.expose()))
+                        .header("Content-Type", "application/json")
+                        .json(&body),
+                )
+                .send()
+                .await
+                .map_err(|e| ProviderError::Network(format!("request failed: {}", describe_error_chain(&e))))
             } => result,
         }?;
 

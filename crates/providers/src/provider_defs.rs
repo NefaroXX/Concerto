@@ -125,30 +125,65 @@ const ZHIPU_KNOWN: &[&str] = &["glm-4.7", "glm-4.6", "glm-4.5", "glm-4-plus", "g
 // tail).
 const NOVITA_KNOWN: &[&str] = &[];
 
-/// Free-tier OpenCode Zen model IDs served by the Zen gateway.
+/// Model IDs served by the OpenCode **Go** relay (`https://opencode.ai/zen/go/v1`),
+/// the endpoint behind the `opencode-free` provider type.
 ///
-/// These were retrieved live from `GET https://opencode.ai/zen/v1/models` on
+/// Retrieved live from `GET https://opencode.ai/zen/go/v1/models` on
 /// 2026-09-29. The catalog is hand-maintained and refreshed periodically; it
-/// is deliberately free-tier-only so the picker never advertises models that
-/// would 401 without credits. Live discovery is intentionally NOT used for
-/// this provider type (`ModelDiscoverySupport::Unsupported`): the endpoint is
-/// ungated and returns the full paid roster too, which would leak paid IDs
-/// into a free-only picker.
+/// is deliberately a snapshot of the *Go* roster — a **distinct relay with a
+/// distinct catalog**, not Zen's (`opencode` type, `…/zen/v1/models`): of the
+/// old Zen free-tier ids only `longcat-2.5-preview-free` and
+/// `space-bunny-free` also appear on Go, while Go serves plenty of non-`free`
+/// ids (`minimax-m3`, `glm-5.3`, `mimo-v2.6-pro`, …). Never copy a catalog
+/// between the two relays.
 ///
-/// `big-pickle` is free-tier despite having no `-free` suffix; the other 11
-/// match a `free` substring.
+/// Live discovery is intentionally NOT used for this provider type
+/// (`ModelDiscoverySupport::Unsupported`): the Go listing endpoint is ungated
+/// and returns the full paid roster too, which would leak paid IDs into a
+/// free-only picker.
 pub const OPENCODE_FREE_KNOWN: &[&str] = &[
-    "big-pickle",
-    "deepseek-v4-flash-free",
-    "jev-1.13-free",
-    "ling-3.0-flash-fin-free",
+    "deepseek-flash",
+    "deepseek-v4-flash",
+    "deepseek-v4-flash-vision-exp",
+    "deepseek-v4-pro",
+    "deepseek-v4.1-flash",
+    "glm-5",
+    "glm-5.1",
+    "glm-5.2",
+    "glm-5.3",
+    "glm-5.3-flash",
+    "gpt-5.6-luna",
+    "gpt-6-luna",
+    "grok-4.5",
+    "grok-4.6",
+    "grok-4.7",
+    "hy3",
+    "hy3-preview",
+    "hy4-preview",
+    "kimi-k2.5",
+    "kimi-k2.6",
+    "kimi-k2.7-code",
+    "kimi-k3",
+    "longcat-2.0",
     "longcat-2.5-preview-free",
-    "mimo-v2.5-free",
-    "mimo-v2.6-flash-free",
-    "muse-spark-1.2-contributor-free",
-    "muse-spark-1.3-contributor-free",
-    "nemotron-3-ultra-free",
-    "nemotron-3.5-lightning-free",
+    "mimo-v2-omni",
+    "mimo-v2-pro",
+    "mimo-v2.5",
+    "mimo-v2.5-pro",
+    "mimo-v2.6-flash",
+    "mimo-v2.6-pro",
+    "minimax-m2.5",
+    "minimax-m2.7",
+    "minimax-m3",
+    "muse-spark-1.2-contributor",
+    "muse-spark-1.3-contributor",
+    "omen-alpha",
+    "qwen3.5-plus",
+    "qwen3.6-plus",
+    "qwen3.7-max",
+    "qwen3.7-plus",
+    "qwen3.8-flash",
+    "qwen3.8-max",
     "space-bunny-free",
 ];
 
@@ -222,21 +257,28 @@ pub fn provider_definition(provider_type: &str) -> ProviderDefinition {
             model_discovery: ModelDiscoverySupport::Supported,
             allows_custom_model: true,
         },
-        // Keyless sibling of `opencode`: same Zen gateway, same connector, but
-        // a free-only static catalog and no credential requirement, so the two
-        // entries stay independent (a paid `opencode` entry keeps its key).
+        // Sibling of `opencode`: same connector, but the **Go** relay and its
+        // own static catalog, so the two entries stay independent (a paid
+        // `opencode` entry keeps its key and its Zen base).
         "opencode-free" => ProviderDefinition {
             id: "opencode-free",
             display_name: String::from("OpenCode Zen (free)"),
-            // `big-pickle` routes to the OpenAI-compatible
-            // `/chat/completions` dialect, so it is not subject to the
-            // Responses-dialect tool-calling refusal that would make a
-            // Responses default unusable for tool-requiring tasks.
-            default_model: Some("big-pickle"),
+            // `minimax-m3` takes the OpenAI-compatible `/chat/completions`
+            // dialect (never Responses/Anthropic), escapes the weak-tool-
+            // calling heuristic — it tokenizes to `["minimax","m3"]`, and the
+            // heuristic only matches whole `mimo`/`mini` tokens (ADR-66 §5
+            // token bounding) — and resolves tool-capable, so it is usable as
+            // a tool-requiring default. Ranking it against the other 42 ids
+            // would need live probing; name resemblance is never used for
+            // capability decisions.
+            default_model: Some("minimax-m3"),
             known_models: OPENCODE_FREE_KNOWN,
-            credential_requirement: CredentialRequirement::None,
+            // The Go relay answers `401 AuthError "Missing API key."` when no
+            // `Authorization` header is sent, so this type requires a real
+            // credential exactly like `opencode`; it is not keyless.
+            credential_requirement: CredentialRequirement::Required,
             // Live discovery is intentionally unsupported: `GET
-            // https://opencode.ai/zen/v1/models` is ungated and returns the
+            // https://opencode.ai/zen/go/v1/models` is ungated and returns the
             // entire paid roster too, so advertising discovery here would let
             // paid IDs leak into a free-only picker.
             model_discovery: ModelDiscoverySupport::Unsupported,
@@ -656,38 +698,130 @@ mod tests {
         }
     }
 
-    /// The keyless `opencode-free` type is fully defined: free-only static
-    /// catalog, no credential requirement, discovery disabled, custom models
+    /// The `opencode-free` type is fully defined against the **Go** relay:
+    /// its static Go catalog, a required credential (the Go relay answers
+    /// `401 AuthError` without one), discovery disabled, custom models
     /// allowed, and an OpenAI-compat default model (see the arm's comments).
     #[test]
     fn opencode_free_definition_is_complete() {
         let def = provider_definition("opencode-free");
         assert_eq!(def.id, "opencode-free");
         assert_eq!(def.display_name, "OpenCode Zen (free)");
-        assert_eq!(def.default_model, Some("big-pickle"));
-        assert_eq!(def.credential_requirement, CredentialRequirement::None);
+        assert_eq!(def.default_model, Some("minimax-m3"));
+        // Inverted from the old keyless assertion: the Go relay requires a
+        // real API key, so this type is no more keyless than `opencode`.
+        assert_eq!(def.credential_requirement, CredentialRequirement::Required);
         assert_eq!(def.model_discovery, ModelDiscoverySupport::Unsupported);
         assert!(def.allows_custom_model);
 
+        // The 43 ids served by `GET https://opencode.ai/zen/go/v1/models`
+        // (2026-09-29), quoted verbatim in alphabetical order: this list is
+        // the contract for the Go roster, not Zen's — a wrong id here is a
+        // silent 404 at request time, so it is pinned byte for byte.
         let expected = [
-            "big-pickle",
-            "deepseek-v4-flash-free",
-            "jev-1.13-free",
-            "ling-3.0-flash-fin-free",
+            "deepseek-flash",
+            "deepseek-v4-flash",
+            "deepseek-v4-flash-vision-exp",
+            "deepseek-v4-pro",
+            "deepseek-v4.1-flash",
+            "glm-5",
+            "glm-5.1",
+            "glm-5.2",
+            "glm-5.3",
+            "glm-5.3-flash",
+            "gpt-5.6-luna",
+            "gpt-6-luna",
+            "grok-4.5",
+            "grok-4.6",
+            "grok-4.7",
+            "hy3",
+            "hy3-preview",
+            "hy4-preview",
+            "kimi-k2.5",
+            "kimi-k2.6",
+            "kimi-k2.7-code",
+            "kimi-k3",
+            "longcat-2.0",
             "longcat-2.5-preview-free",
-            "mimo-v2.5-free",
-            "mimo-v2.6-flash-free",
-            "muse-spark-1.2-contributor-free",
-            "muse-spark-1.3-contributor-free",
-            "nemotron-3-ultra-free",
-            "nemotron-3.5-lightning-free",
+            "mimo-v2-omni",
+            "mimo-v2-pro",
+            "mimo-v2.5",
+            "mimo-v2.5-pro",
+            "mimo-v2.6-flash",
+            "mimo-v2.6-pro",
+            "minimax-m2.5",
+            "minimax-m2.7",
+            "minimax-m3",
+            "muse-spark-1.2-contributor",
+            "muse-spark-1.3-contributor",
+            "omen-alpha",
+            "qwen3.5-plus",
+            "qwen3.6-plus",
+            "qwen3.7-max",
+            "qwen3.7-plus",
+            "qwen3.8-flash",
+            "qwen3.8-max",
             "space-bunny-free",
         ];
         assert_eq!(
             def.known_models,
             expected.as_slice(),
-            "the free-only catalog must ship exactly the 12 live-retrieved IDs"
+            "the Go catalog must ship exactly the 43 live-retrieved IDs"
         );
+        assert_eq!(expected.len(), 43, "the Go relay advertises exactly 43 models");
+    }
+
+    /// The default model is real, routable, and usable for tool-requiring
+    /// tasks: it must exist in the catalog, stay on the OpenAI-compatible
+    /// dialect (never Responses/Anthropic — those are property-driven, not
+    /// name-driven), and escape the weak-tier heuristic so its default schema
+    /// tier is strict.
+    #[test]
+    fn opencode_free_default_model_is_usable() {
+        let def = provider_definition("opencode-free");
+        let default_model = def.default_model.expect("opencode-free ships a default model");
+        assert!(
+            OPENCODE_FREE_KNOWN.contains(&default_model),
+            "the default `{default_model}` must be part of the Go catalog"
+        );
+        assert!(
+            !crate::opencode::needs_anthropic_dialect(default_model),
+            "the default must not route to the Anthropic /messages dialect"
+        );
+        assert!(
+            !crate::opencode::needs_responses_api(default_model),
+            "the default must ride the OpenAI-compatible /chat/completions dialect"
+        );
+        assert!(
+            !crate::adapters::schema_loose::last_resort_weak_tool_calling_model(default_model),
+            "the default must not fall to the weak tool-calling tier"
+        );
+        assert_eq!(
+            crate::capability::resolve_tool_schema_mode(
+                "opencode-free",
+                default_model,
+                concerto_config::ToolSchemaMode::default(),
+                None,
+            ),
+            concerto_config::ToolSchemaMode::Strict,
+            "an unknown-but-not-weak model defaults to the strict schema tier"
+        );
+        assert!(
+            crate::capability::require_tool_support("opencode-free", default_model, None, None)
+                .is_ok(),
+            "the default must pass the tool-support gate"
+        );
+    }
+
+    /// Prints the Go catalog verbatim (run with `--nocapture`) so a reviewer
+    /// can diff it against `GET https://opencode.ai/zen/go/v1/models` without
+    /// re-probing the network — the same 43 ids the previous test pins.
+    #[test]
+    fn opencode_free_catalog_prints_verbatim_for_review() {
+        println!("OPENCODE_FREE_KNOWN ({} ids):", OPENCODE_FREE_KNOWN.len());
+        for id in OPENCODE_FREE_KNOWN {
+            println!("{id}");
+        }
     }
 
     /// `opencode-free` is a first-class picker entry, registered immediately
@@ -703,10 +837,11 @@ mod tests {
         assert_eq!(position("opencode-free"), position("opencode") + 1);
     }
 
-    /// Pin the free catalog's wire routing and capability: none of the 12 IDs
+    /// Pin the Go catalog's wire routing and capability: none of the 43 IDs
     /// routes to the Anthropic `/messages` dialect; the two `muse-spark-*`
-    /// IDs route to the Responses dialect, which now carries native tool
-    /// declarations, so every ID resolves as tool-capable.
+    /// IDs route to the Responses dialect (explicit prefix entry, not name
+    /// resemblance), which now carries native tool declarations, so every ID
+    /// resolves as tool-capable.
     #[test]
     fn opencode_free_catalog_routing_is_pinned() {
         let mut responses_dialect: Vec<&str> = Vec::new();
@@ -747,8 +882,13 @@ mod tests {
         }
         assert_eq!(
             responses_dialect,
-            ["muse-spark-1.2-contributor-free", "muse-spark-1.3-contributor-free"],
+            ["muse-spark-1.2-contributor", "muse-spark-1.3-contributor"],
             "exactly the two muse-spark-* IDs ride the Responses dialect"
+        );
+        assert_eq!(
+            responses_dialect.len(),
+            2,
+            "the Responses dialect is entered only by the explicit prefix entry"
         );
     }
 

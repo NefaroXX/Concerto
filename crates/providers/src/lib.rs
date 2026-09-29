@@ -61,10 +61,6 @@ pub use concerto_core::types::ModelInfo;
 /// Default HTTP connect timeout (seconds) used where no per-provider config exists.
 pub(crate) const DEFAULT_TIMEOUT_SECS: u64 = 15;
 
-/// Default OpenCode Zen API base URL, used by the `opencode` provider and the
-/// model-listing helper.
-pub(crate) const OPENCODE_ZEN_API_BASE: &str = "https://opencode.ai/zen/v1";
-
 /// User-Agent presented to upstream APIs.
 ///
 /// MUST stay opencode-shaped (`opencode/<version>`). Verified 2026-08-13:
@@ -168,12 +164,15 @@ pub async fn list_models_for_provider_async(
             }
             p.list_models(cancel.clone()).await
         }
-        "opencode" => {
+        // Both OpenCode provider types share the connector; only the default
+        // relay differs (`opencode` → Zen, `opencode-free` → Go) and a config
+        // `api_base` overrides either.
+        "opencode" | "opencode-free" => {
             let p = opencode::OpenCodeZenProvider::with_api_base(
                 api_key.to_string(),
                 String::new(),
                 DEFAULT_TIMEOUT_SECS,
-                api_base.unwrap_or(OPENCODE_ZEN_API_BASE).to_string(),
+                opencode::OpenCodeZenProvider::resolve_api_base(provider_type, api_base),
             );
             p.list_models(cancel.clone()).await
         }
