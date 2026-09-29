@@ -263,12 +263,13 @@ pub fn provider_definition(provider_type: &str) -> ProviderDefinition {
         "opencode-free" => ProviderDefinition {
             id: "opencode-free",
             display_name: String::from("OpenCode Zen (free)"),
-            // `minimax-m3` takes the OpenAI-compatible `/chat/completions`
-            // dialect (never Responses/Anthropic), escapes the weak-tool-
-            // calling heuristic — it tokenizes to `["minimax","m3"]`, and the
-            // heuristic only matches whole `mimo`/`mini` tokens (ADR-66 §5
-            // token bounding) — and resolves tool-capable, so it is usable as
-            // a tool-requiring default. Ranking it against the other 42 ids
+            // `minimax-m3` takes the Anthropic Messages `/messages` dialect on
+            // the Go relay (`minimax-` is an Anthropic prefix in the upstream
+            // Go table), escapes the weak-tool-calling heuristic — it
+            // tokenizes to `["minimax","m3"]`, and the heuristic only matches
+            // whole `mimo`/`mini` tokens (ADR-66 §5 token bounding) — and
+            // resolves tool-capable on that path, so it is usable as a
+            // tool-requiring default. Ranking it against the other 42 ids
             // would need live probing; name resemblance is never used for
             // capability decisions.
             default_model: Some("minimax-m3"),
@@ -772,25 +773,23 @@ mod tests {
     }
 
     /// The default model is real, routable, and usable for tool-requiring
-    /// tasks: it must exist in the catalog, stay on the OpenAI-compatible
-    /// dialect (never Responses/Anthropic — those are property-driven, not
-    /// name-driven), and escape the weak-tier heuristic so its default schema
-    /// tier is strict.
+    /// tasks: it must exist in the catalog, take exactly the dialect the
+    /// upstream Go table assigns it (`minimax-*` → Anthropic Messages), and
+    /// escape the weak-tier heuristic so its default schema tier is strict.
     #[test]
     fn opencode_free_default_model_is_usable() {
+        use crate::opencode::{api_mode_for, ApiMode, OpenCodeRelay};
+
         let def = provider_definition("opencode-free");
         let default_model = def.default_model.expect("opencode-free ships a default model");
         assert!(
             OPENCODE_FREE_KNOWN.contains(&default_model),
             "the default `{default_model}` must be part of the Go catalog"
         );
-        assert!(
-            !crate::opencode::needs_anthropic_dialect(default_model),
-            "the default must not route to the Anthropic /messages dialect"
-        );
-        assert!(
-            !crate::opencode::needs_responses_api(default_model),
-            "the default must ride the OpenAI-compatible /chat/completions dialect"
+        assert_eq!(
+            api_mode_for(OpenCodeRelay::Go, default_model),
+            ApiMode::AnthropicMessages,
+            "on the Go relay `minimax-*` is served via the Anthropic Messages dialect"
         );
         assert!(
             !crate::adapters::schema_loose::last_resort_weak_tool_calling_model(default_model),
@@ -837,59 +836,73 @@ mod tests {
         assert_eq!(position("opencode-free"), position("opencode") + 1);
     }
 
-    /// Pin the Go catalog's wire routing and capability: none of the 43 IDs
-    /// routes to the Anthropic `/messages` dialect; the two `muse-spark-*`
-    /// IDs route to the Responses dialect (explicit prefix entry, not name
-    /// resemblance), which now carries native tool declarations, so every ID
-    /// resolves as tool-capable.
+    /// Pin the Go catalog's wire routing against the upstream `opencode-go`
+    /// prefix table and confirm every id stays tool-capable on its dialect
+    /// (the Responses converter carries native tools since ADR-75).
+    ///
+    /// This test was updated from the old assertion that *no* Go id routes to
+    /// Anthropic: the upstream Go table sends `minimax-*`/`qwen*` to
+    /// `/messages` and `gpt-*`/`grok-*`/`muse-spark*` to `/responses`.
     #[test]
     fn opencode_free_catalog_routing_is_pinned() {
-        let mut responses_dialect: Vec<&str> = Vec::new();
+        use crate::opencode::{api_mode_for, ApiMode, OpenCodeRelay};
+
+        let mut responses: Vec<&str> = Vec::new();
+        let mut anthropic: Vec<&str> = Vec::new();
+        let mut chat: Vec<&str> = Vec::new();
         for model in OPENCODE_FREE_KNOWN {
-            assert!(
-                !crate::opencode::needs_anthropic_dialect(model),
-                "{model} must not route to the Anthropic /messages dialect"
-            );
-            if crate::opencode::needs_responses_api(model) {
-                responses_dialect.push(*model);
-                // Inverted from the old assertion that the Responses dialect
-                // has no native tool declarations: the converter was
-                // completed (ADR-75), so these resolve tool-capable.
-                assert!(
-                    crate::capability::resolve_tool_support("opencode-free", model, None, None),
-                    "{model} routes to the Responses dialect, whose converter now carries tools"
-                );
-                assert!(
-                    crate::capability::require_tool_support("opencode-free", model, None, None)
-                        .is_ok(),
-                    "{model} must pass the tool-support gate"
-                );
-            } else {
-                assert!(
-                    !crate::opencode::needs_responses_api(model),
-                    "{model} must stay on the OpenAI-compatible dialect"
-                );
-                assert!(
-                    crate::capability::resolve_tool_support("opencode-free", model, None, None),
-                    "{model} must not be capability-blocked for tool calling"
-                );
-                assert!(
-                    crate::capability::require_tool_support("opencode-free", model, None, None)
-                        .is_ok(),
-                    "{model} must pass the tool-support gate"
-                );
+            match api_mode_for(OpenCodeRelay::Go, model) {
+                ApiMode::Responses => responses.push(*model),
+                ApiMode::AnthropicMessages => anthropic.push(*model),
+                ApiMode::ChatCompletions => chat.push(*model),
             }
+            assert!(
+                crate::capability::resolve_tool_support("opencode-free", model, None, None),
+                "{model} must not be capability-blocked for tool calling"
+            );
+            assert!(
+                crate::capability::require_tool_support("opencode-free", model, None, None).is_ok(),
+                "{model} must pass the tool-support gate regardless of wire dialect"
+            );
         }
+
         assert_eq!(
-            responses_dialect,
-            ["muse-spark-1.2-contributor", "muse-spark-1.3-contributor"],
-            "exactly the two muse-spark-* IDs ride the Responses dialect"
+            responses,
+            [
+                "gpt-5.6-luna",
+                "gpt-6-luna",
+                "grok-4.5",
+                "grok-4.6",
+                "grok-4.7",
+                "muse-spark-1.2-contributor",
+                "muse-spark-1.3-contributor",
+            ],
+            "exactly the gpt-/grok-/muse-spark Go ids ride the Responses dialect"
         );
         assert_eq!(
-            responses_dialect.len(),
-            2,
-            "the Responses dialect is entered only by the explicit prefix entry"
+            anthropic,
+            [
+                "minimax-m2.5",
+                "minimax-m2.7",
+                "minimax-m3",
+                "qwen3.5-plus",
+                "qwen3.6-plus",
+                "qwen3.7-max",
+                "qwen3.7-plus",
+                "qwen3.8-flash",
+                "qwen3.8-max",
+            ],
+            "exactly the minimax-/qwen Go ids ride the Anthropic Messages dialect"
         );
+        assert_eq!(chat.len(), 27, "every other Go id rides Chat Completions");
+        assert_eq!(
+            responses.len() + anthropic.len() + chat.len(),
+            OPENCODE_FREE_KNOWN.len(),
+            "each id lands in exactly one dialect bucket"
+        );
+        // `omen-alpha` is a live-roster near-miss of `union-alpha`; upstream
+        // lists only `union-alpha`, so `omen-alpha` stays on Chat Completions.
+        assert!(chat.contains(&"omen-alpha"), "omen-alpha must not be Anthropic");
     }
 
     #[test]

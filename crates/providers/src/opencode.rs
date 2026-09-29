@@ -14,31 +14,33 @@
 //! `403 FreeTierError` — so neither provider type is keyless. A config-supplied
 //! `api_base` overrides either default (self-hosted gateways, proxies, tests).
 //!
-//! OpenCode Zen serves multiple model families through a single gateway:
+//! Each relay dispatches on the **lowercased full model-id prefix** — the
+//! authoritative contract is the upstream consumer's
+//! `_OPENCODE_API_MODE_PREFIXES` table (`NousResearch/hermes-agent`,
+//! `hermes_cli/models.py`), which this module mirrors exactly. The first
+//! matching prefix wins; the default is the OpenAI-compatible Chat Completions
+//! path:
 //!
-//! - **OpenAI-compatible models** (e.g. `big-pickle`, DeepSeek): routed via
-//!   [`OpenAiProvider`] to `POST {base}/chat/completions`.
-//! - **Anthropic models** (`claude-*`): routed via the Anthropic Messages API
-//!   to `POST {base}/messages` with `x-api-key` + `anthropic-version` headers.
-//! - **Responses-API models** (genuine `muse-v*` family members, plus
-//!   explicit entries like `muse-spark-*`): routed via the OpenAI Responses
-//!   API to `POST {base}/responses`. These models 500 on both
-//!   `/chat/completions` and `/messages` upstream.
+//! - **OpenAI-compatible** (`big-pickle`, DeepSeek, Kimi, GLM, …): routed via [`OpenAiProvider`] to `POST {base}/chat/completions`.
+//! - **Anthropic Messages**: `POST {base}/messages` with `x-api-key` + `anthropic-version`; Zen prefixes `claude-*`, `union-alpha`, `qwen*`; Go prefixes `minimax-*`, `qwen*`, `union-alpha`.
+//! - **OpenAI Responses**: `POST {base}/responses`; both relays use `gpt-*`, `grok-*`, `muse-spark*`.
 //!
-//! The dialect is chosen per model id. The governing principle is
-//! **behavior over taxonomy** (ADR-66 §5 correction, 2026-09-08): the wire
-//! dialect follows what the endpoint *does*, not which family a model name
-//! resembles. Concretely, in precedence order:
+//! The dialect is chosen per **(relay, model id)** — see [`api_mode_for`]. The
+//! two relays have genuinely different tables: `claude-*` is Anthropic on Zen
+//! but falls through to Chat Completions on Go, and `minimax-*` is Anthropic
+//! on Go but Chat Completions on Zen. Treating one relay's rules as universal
+//! is the bug this table fixes. The table is deliberately **prefix-based**
+//! because that is the upstream relay contract (`str.startswith`) — do not
+//! "tidy" it into token matching or add/remove hyphens.
 //!
-//! 1. **Explicit full-id prefix entries** ([`RESPONSES_API_MODEL_PREFIXES`])
-//!    — endpoint behavior observed live (0d511f1: `muse-spark-*` 500s on
-//!    `/chat/completions` and only works via `/responses`), even though the
-//!    name is not a Muse family member.
-//! 2. **Whole family tokens** (ADR-66 §5) — the `claude` token selects the
-//!    Anthropic dialect, the Muse rule (`muse` + version segment) selects
-//!    the Responses API. Substring matches are forbidden — a name merely
-//!    *containing* `muse` or `claude` (e.g. `claudette-*`, `some-muse-model`)
-//!    never routes to that family's dialect without an explicit entry.
+//! The governing principle remains **behavior over taxonomy** (ADR-66 §5
+//! correction, 2026-09-08): the wire dialect follows what the endpoint *does*,
+//! not which family a model name resembles. Genuine `muse-v*` family members
+//! keep their token-bounded Responses rule (the upstream table does not list
+//! them, but Zen serves them only via `/responses`); `muse-spark*` is covered
+//! by the prefix table. Whole-token matching is preserved for the Muse family
+//! so a name merely *containing* `muse` (`some-muse-model`, `amuse-v2`) never
+//! routes to Responses.
 
 use async_stream::stream;
 use async_trait::async_trait;
@@ -73,6 +75,51 @@ pub(crate) const OPENCODE_ZEN_BASE: &str = "https://opencode.ai/zen/v1";
 /// a keyless provider type. Kept as a constant so a future relay correction is
 /// a one-line change, never a scattered edit.
 pub(crate) const OPENCODE_GO_BASE: &str = "https://opencode.ai/zen/go/v1";
+
+/// Which OpenCode relay a provider targets.
+///
+/// Both relays share one connector ([`OpenCodeZenProvider`]) but have
+/// **different per-model wire tables**, so the relay must participate in the
+/// dialect decision (see [`api_mode_for`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenCodeRelay {
+    /// `https://opencode.ai/zen/v1` — the `opencode` provider's default.
+    Zen,
+    /// `https://opencode.ai/zen/go/v1` — the `opencode-free` provider's default.
+    Go,
+}
+
+impl OpenCodeRelay {
+    /// The ONE provider-type → relay mapping, defined next to [`Self::for_base`]
+    /// and the [`OPENCODE_ZEN_BASE`] / [`OPENCODE_GO_BASE`] constants.
+    ///
+    /// A caller-supplied `api_base` is authoritative and detected from its URL
+    /// ([`Self::for_base`]); otherwise `opencode-free` targets Go and every
+    /// other type (notably `opencode`) targets Zen. Callers that already
+    /// resolved a base through [`OpenCodeZenProvider::resolve_api_base`] use
+    /// [`Self::for_base`] directly — the two agree on every base that function
+    /// can produce.
+    pub(crate) fn resolve(provider_type: &str, api_base: Option<&str>) -> Self {
+        match api_base {
+            Some(base) => Self::for_base(base),
+            None if provider_type == "opencode-free" => Self::Go,
+            None => Self::Zen,
+        }
+    }
+
+    /// Detect the relay from an effective base URL's path.
+    ///
+    /// Go is the `/zen/go` path; everything else is Zen. This is deliberately
+    /// URL-derived so a caller-supplied `api_base` can never silently select
+    /// the wrong per-relay table.
+    pub(crate) fn for_base(base: &str) -> Self {
+        if base.contains("/zen/go") {
+            Self::Go
+        } else {
+            Self::Zen
+        }
+    }
+}
 
 /// Client-identity header OpenCode's relay reads on every request.
 ///
@@ -111,60 +158,80 @@ pub(crate) fn opencode_session_id() -> &'static str {
 /// Stable capability name used by every ADR-66 capability refusal.
 pub(crate) const TOOL_CALLING_CAPABILITY: &str = "tool_calling";
 
-/// Detect whether a model name requires the Anthropic Messages API dialect.
+/// The wire dialect OpenCode serves a model with.
 ///
-/// Claude models served by the Zen gateway expect the Anthropic wire format
-/// (`POST /messages`, `x-api-key` header, Anthropic SSE events). All other
-/// non-Muse models use the OpenAI-compatible dialect.
-///
-/// Family matching is token-based (ADR-66 §5): a hyphen-separated token must
-/// *be* `claude` — a name where `claude` is merely a substring of another
-/// token (`claudette-1`, `declaude`, `claudeify-v2`) never matches.
-pub(crate) fn needs_anthropic_dialect(model: &str) -> bool {
-    tokenize_model_name(model).iter().any(|token| token == "claude")
-}
-/// Detect whether a model name requires the OpenAI Responses API dialect.
-///
-/// The dialect follows **endpoint behavior, not family taxonomy** (ADR-66
-/// §5 correction): models in [`RESPONSES_API_MODEL_PREFIXES`] are served
-/// only via `POST /responses` — they 500 on both `/chat/completions` and
-/// `/messages` — regardless of what family their name suggests. Genuine
-/// Muse family members (`muse` followed by a `v`-prefixed version segment,
-/// e.g. `muse-v2`, `muse-v2.1`, `v3-pro`) hit the same upstream behavior
-/// and are matched by the token rule.
-///
-/// The token rule stays deliberately strict (ADR-66 §5): a `muse` token
-/// alone is NOT sufficient — the token immediately after it must be a
-/// `v`-prefixed version token. Names that merely contain "muse"
-/// (`some-muse-model`, `amuse-v2`, `museum-2`) never match the token rule;
-/// they only take the Responses path via an explicit prefix entry, and only
-/// when endpoint behavior justifies it.
-pub(crate) fn needs_responses_api(model: &str) -> bool {
-    // Explicit full-id prefix entries override the token heuristic: they
-    // encode observed endpoint behavior (0d511f1), not name taxonomy.
-    let lowered = model.to_ascii_lowercase();
-    if RESPONSES_API_MODEL_PREFIXES.iter().any(|prefix| lowered.starts_with(prefix)) {
-        return true;
-    }
-    let tokens = tokenize_model_name(model);
-    tokens
-        .iter()
-        .zip(tokens.iter().skip(1))
-        .any(|(token, next)| token == "muse" && is_muse_family_segment(next))
+/// Replaces the former implicit `needs_anthropic_dialect` /
+/// `needs_responses_api` bool pair with one exhaustive decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApiMode {
+    /// `POST {base}/chat/completions` — OpenAI-compatible Chat Completions.
+    ChatCompletions,
+    /// `POST {base}/responses` — OpenAI Responses API.
+    Responses,
+    /// `POST {base}/messages` — Anthropic Messages API.
+    AnthropicMessages,
 }
 
-/// Explicit Responses-API dialect overrides, keyed by **full model-id
-/// prefix** (matched case-insensitively against the whole model id).
+/// Go-relay prefix table — mirrors `opencode-go` in the upstream consumer's
+/// `_OPENCODE_API_MODE_PREFIXES` (`hermes_cli/models.py:2453-2470`).
 ///
-/// These entries exist because the wire dialect follows endpoint behavior,
-/// not family taxonomy (ADR-66 §5 correction, 2026-09-08): Zen's
-/// `muse-spark-*` catalog family is not Muse, but its models 500 on
-/// `/chat/completions` and only work via `POST /responses` (the original
-/// fix, 0d511f1). Entries are exact prefixes with a trailing `-` so they
-/// respect token boundaries (`muse-sparkless` must not match). Add an entry
-/// only for an observed upstream endpoint behavior, never for a name
-/// resemblance.
-pub(crate) const RESPONSES_API_MODEL_PREFIXES: &[&str] = &["muse-spark-"];
+/// Each entry is `(prefixes, mode)`; the first matching prefix wins, exactly
+/// as upstream iterates its tuple. Note `muse-spark` has **no trailing
+/// hyphen** upstream: it is a prefix, not a whole token.
+const GO_API_MODE_PREFIXES: &[(&[&str], ApiMode)] = &[
+    (&["gpt-", "grok-", "muse-spark"], ApiMode::Responses),
+    (&["minimax-", "qwen", "union-alpha"], ApiMode::AnthropicMessages),
+];
+
+/// Zen-relay prefix table — mirrors `opencode-zen` in the upstream consumer's
+/// `_OPENCODE_API_MODE_PREFIXES`.
+///
+/// Order matters: `claude-`/`union-alpha` are checked before the Responses
+/// prefixes, and `qwen` last — the first matching prefix wins. `claude-` and
+/// `union-alpha` are Anthropic here but **not** on Go; `minimax-` is Anthropic
+/// on Go but **not** here.
+const ZEN_API_MODE_PREFIXES: &[(&[&str], ApiMode)] = &[
+    (&["claude-", "union-alpha"], ApiMode::AnthropicMessages),
+    (&["gpt-", "grok-", "muse-spark"], ApiMode::Responses),
+    (&["qwen"], ApiMode::AnthropicMessages),
+];
+
+/// Resolve the wire dialect for a `(relay, model id)` pair.
+///
+/// Matching is on the **lowercased full model id** with `starts_with`, and the
+/// first matching prefix wins. This mirrors the upstream relay contract
+/// exactly (`hermes_cli/models.py:2453-2470`), which dispatches on
+/// `str.startswith` rather than family tokens: `gpt-5.6-luna` is Responses
+/// while `omen-alpha` is Chat Completions even though both carry an `-alpha`
+/// segment. The default is [`ApiMode::ChatCompletions`].
+///
+/// `omen-alpha` is intentionally NOT treated as Anthropic: upstream lists only
+/// `union-alpha`, even though the live Go roster carries `omen-alpha`. That id
+/// therefore rides Chat Completions until upstream changes — do not "fix" the
+/// discrepancy here.
+///
+/// After the per-relay prefix table, the token-bounded Muse family rule is
+/// preserved for Zen (ADR-66 §5 correction): genuine `muse-v*` members are
+/// served only via `/responses` even though upstream's prefix list does not
+/// name them. Whole-token matching keeps `some-muse-model`/`amuse-v2` on Chat
+/// Completions. The Go table/roster has no genuine `muse-*` ids, so the rule
+/// is Zen-scoped to match upstream's Go dispatch.
+pub(crate) fn api_mode_for(relay: OpenCodeRelay, model: &str) -> ApiMode {
+    let normalized = model.to_ascii_lowercase();
+    let table = match relay {
+        OpenCodeRelay::Go => GO_API_MODE_PREFIXES,
+        OpenCodeRelay::Zen => ZEN_API_MODE_PREFIXES,
+    };
+    for (prefixes, mode) in table {
+        if prefixes.iter().any(|prefix| normalized.starts_with(*prefix)) {
+            return *mode;
+        }
+    }
+    if relay == OpenCodeRelay::Zen && is_genuine_muse_family(model) {
+        return ApiMode::Responses;
+    }
+    ApiMode::ChatCompletions
+}
 
 /// Split a model name into lowercase family tokens — the **shared**
 /// tokenizer of this crate.
@@ -175,24 +242,39 @@ pub(crate) const RESPONSES_API_MODEL_PREFIXES: &[&str] = &["muse-spark-"];
 /// impossible. Tokens are owned — callers keep them as a standalone list.
 ///
 /// Every name-based model-name decision in this crate routes through this
-/// one function: the dialect rules here ([`needs_anthropic_dialect`],
-/// [`needs_responses_api`]) and the tool-schema tier heuristic
+/// one function: the Muse family rule in [`api_mode_for`] and the tool-schema
+/// tier heuristic
 /// ([`crate::adapters::schema_loose::last_resort_weak_tool_calling_model`]). There
 /// must be exactly one tokenizer — do not copy this logic (ADR-66 §5:
 /// family heuristics match whole tokens, never bare substrings).
+///
+/// Note: the OpenCode **wire prefix table** in [`api_mode_for`] deliberately
+/// does NOT use this tokenizer — it mirrors the upstream relay's prefix
+/// contract, which is `str.startswith` on the full id.
 pub(crate) fn tokenize_model_name(model: &str) -> Vec<String> {
     model.to_ascii_lowercase().split('-').map(str::to_owned).collect()
 }
 
-/// Decide whether the token following a `muse` token identifies a genuine
-/// Muse family member.
+/// Whether `model` is a genuine Muse family member (token-bounded).
 ///
-/// Known Muse family segments are version tokens: a leading `v` followed by
-/// at least one ASCII digit (`v2`, `v2.1`, `v3`, `v3-pro`). Everything else
-/// (`spark`, `pro`, `vapor`) is not a known Muse family segment, so such
-/// names only reach the Responses dialect through an explicit
-/// [`RESPONSES_API_MODEL_PREFIXES`] entry — never via name resemblance.
-fn is_muse_family_segment(segment: &str) -> bool {
+/// A `muse` token immediately followed by a `v`-prefixed version token (`v2`,
+/// `v2.1`, `v3`, `v3-pro`) selects the Responses dialect on Zen (ADR-66 §5
+/// correction, 0d511f1). A bare `muse` token (`muse-pro`, `muse-latest`) or a
+/// name merely *containing* `muse` (`some-muse-model`, `amuse-v2`, `museum-2`)
+/// never matches — substring collisions are impossible because matching is on
+/// whole hyphen-delimited tokens.
+fn is_genuine_muse_family(model: &str) -> bool {
+    let tokens = tokenize_model_name(model);
+    tokens
+        .iter()
+        .zip(tokens.iter().skip(1))
+        .any(|(token, next)| token == "muse" && is_muse_version_segment(next))
+}
+
+/// Whether a token is a Muse version segment: a leading `v` followed by at
+/// least one ASCII digit (`v2`, `v2.1`, `v3`, `v3-pro`). Everything else
+/// (`spark`, `pro`, `vapor`) is not a version segment.
+fn is_muse_version_segment(segment: &str) -> bool {
     let bytes = segment.as_bytes();
     bytes.first() == Some(&b'v') && bytes.get(1).is_some_and(u8::is_ascii_digit)
 }
@@ -203,6 +285,10 @@ pub struct OpenCodeZenProvider {
     model: String,
     timeout_secs: u64,
     api_base: String,
+    /// Which relay [`Self::api_base`] targets. Derived once at construction
+    /// from the effective base URL ([`OpenCodeRelay::for_base`]) and consulted
+    /// by [`Self::stream_completion`] to pick the relay's dialect table.
+    relay: OpenCodeRelay,
     /// Tool-schema presentation tier (adaptive tool schemas) for the
     /// provider's own Anthropic-dialect path. `Auto` (default) keeps every
     /// non-weak model on the verbatim strict schema.
@@ -231,11 +317,17 @@ impl OpenCodeZenProvider {
     /// **Zen** ([`OPENCODE_ZEN_BASE`]) for `opencode`. Both factory arms and
     /// the model-listing helper route through this one rule so the two
     /// provider types can never disagree about which relay they target.
+    ///
+    /// The provider-type → relay mapping itself lives in exactly one place,
+    /// [`OpenCodeRelay::resolve`]; this function only turns the chosen relay
+    /// into its base URL.
     pub(crate) fn resolve_api_base(provider_type: &str, api_base: Option<&str>) -> String {
         match api_base {
             Some(base) => base.to_string(),
-            None if provider_type == "opencode-free" => OPENCODE_GO_BASE.to_string(),
-            None => OPENCODE_ZEN_BASE.to_string(),
+            None => match OpenCodeRelay::resolve(provider_type, None) {
+                OpenCodeRelay::Go => OPENCODE_GO_BASE.to_string(),
+                OpenCodeRelay::Zen => OPENCODE_ZEN_BASE.to_string(),
+            },
         }
     }
 
@@ -262,10 +354,16 @@ impl OpenCodeZenProvider {
             .with_api_base(api_base.clone())
             .with_reasoning_echo(ReasoningEcho::Always)
             .with_extra_header(OPENCODE_SESSION_HEADER, opencode_session_id());
+        // The effective base URL fully determines the relay: the Go base
+        // carries the `/zen/go` path, and `resolve_api_base` injects that
+        // default for `opencode-free`, so a caller-supplied base pointing at
+        // `/zen/go` selects the Go table even when the provider type is Zen.
+        let relay = OpenCodeRelay::for_base(&api_base);
         Self {
             model,
             timeout_secs,
             api_base,
+            relay,
             tool_schema_mode: concerto_config::ToolSchemaMode::default(),
             advertised_tool_support: None,
             openai_inner,
@@ -684,12 +782,13 @@ impl LlmProvider for OpenCodeZenProvider {
         cancel: CancellationToken,
     ) -> Result<CompletionStream, ProviderError> {
         let model = self.resolve_model(&request);
-        if needs_anthropic_dialect(&model) {
-            self.stream_completion_anthropic(request, cancel).await
-        } else if needs_responses_api(&model) {
-            self.stream_completion_responses(request, cancel).await
-        } else {
-            self.openai_inner.stream_completion(request, cancel).await
+        // The ONE dialect decision: (relay, model) -> wire mode. The relay is
+        // fixed at construction from the effective base URL, so the Go relay
+        // can never be routed with Zen's table (the 400 bug this fixes).
+        match api_mode_for(self.relay, &model) {
+            ApiMode::AnthropicMessages => self.stream_completion_anthropic(request, cancel).await,
+            ApiMode::Responses => self.stream_completion_responses(request, cancel).await,
+            ApiMode::ChatCompletions => self.openai_inner.stream_completion(request, cancel).await,
         }
     }
 
@@ -1152,94 +1251,220 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Dialect detection tests
+    // Dialect detection: the relay-aware upstream prefix table
     // -----------------------------------------------------------------------
 
+    /// Shorthand for the two relays under test.
+    const GO: OpenCodeRelay = OpenCodeRelay::Go;
+    const ZEN: OpenCodeRelay = OpenCodeRelay::Zen;
+
+    /// Pins the **Go** relay table verbatim (`opencode-go` in upstream
+    /// `hermes_cli/models.py`): `gpt-`/`grok-`/`muse-spark` → Responses,
+    /// `minimax-`/`qwen`/`union-alpha` → Anthropic, everything else → Chat
+    /// Completions. This is the relay the 400 bug came from: `gpt-*` and
+    /// `grok-*` were previously sent to `/chat/completions`.
     #[test]
-    fn muse_models_use_the_responses_dialect() {
-        // muse-spark-* routes via the explicit prefix entry (Responses), so
-        // it must not take the Anthropic dialect either.
-        assert!(!needs_anthropic_dialect("muse-spark-1.2-contributor-free"));
-        assert!(!needs_anthropic_dialect("Muse-Spark-1.2"));
-        assert!(!needs_anthropic_dialect("some-muse-model"));
-        assert!(needs_responses_api("MUSE-v2"));
-        assert!(needs_responses_api("muse-v2"));
-        assert!(needs_responses_api("muse-v3"));
-        assert!(needs_responses_api("muse-v2.1"));
-        assert!(needs_responses_api("muse-v3-pro"));
+    fn go_relay_prefix_table_is_pinned() {
+        for model in ["gpt-5.6-luna", "gpt-6-luna", "grok-4.7", "muse-spark-1.3-contributor"] {
+            assert_eq!(api_mode_for(GO, model), ApiMode::Responses, "{model}");
+        }
+        for model in ["minimax-m3", "minimax-m2.7", "qwen3.8-max", "union-alpha"] {
+            assert_eq!(api_mode_for(GO, model), ApiMode::AnthropicMessages, "{model}");
+        }
+        // Everything else — including `omen-alpha`, which upstream does NOT
+        // list (only `union-alpha`) — stays on Chat Completions.
+        for model in [
+            "space-bunny-free",
+            "kimi-k3",
+            "glm-5.3",
+            "deepseek-v4-pro",
+            "mimo-v2.6-pro",
+            "longcat-2.5-preview-free",
+            "hy3",
+            "omen-alpha",
+        ] {
+            assert_eq!(api_mode_for(GO, model), ApiMode::ChatCompletions, "{model}");
+        }
     }
 
-    /// ADR-66 §5 correction (2026-09-08): the wire dialect follows endpoint
-    /// behavior, not family taxonomy. `muse-spark-*` is not a Muse family
-    /// member, but the Zen gateway 500s on `/chat/completions` and only
-    /// serves it via `POST /responses` (the original fix, 0d511f1) — the
-    /// explicit full-id prefix entry overrides the token heuristic.
+    /// Pins the **Zen** relay table verbatim (`opencode-zen`): `claude-`/
+    /// `union-alpha` → Anthropic, `gpt-`/`grok-`/`muse-spark` → Responses,
+    /// `qwen` → Anthropic, else Chat Completions. The two relays genuinely
+    /// disagree: `minimax-` is Anthropic on Go but Chat here, and `claude-` is
+    /// Anthropic here but Chat on Go.
     #[test]
-    fn responses_prefix_table_routes_muse_spark_by_endpoint_behavior() {
-        assert!(
-            needs_responses_api("muse-spark-1.3-contributor-free"),
-            "explicit prefix entry: muse-spark-* 500s on /chat/completions"
+    fn zen_relay_prefix_table_is_pinned() {
+        assert_eq!(api_mode_for(ZEN, "claude-opus-5-5"), ApiMode::AnthropicMessages);
+        assert_eq!(api_mode_for(ZEN, "gpt-5.5"), ApiMode::Responses);
+        assert_eq!(api_mode_for(ZEN, "qwen3.8-max"), ApiMode::AnthropicMessages);
+        assert_eq!(api_mode_for(ZEN, "big-pickle"), ApiMode::ChatCompletions);
+        assert_eq!(api_mode_for(ZEN, "union-alpha"), ApiMode::AnthropicMessages);
+        assert_eq!(api_mode_for(ZEN, "muse-spark-1.2-contributor"), ApiMode::Responses);
+        assert_eq!(api_mode_for(ZEN, "grok-4.7"), ApiMode::Responses);
+
+        // Relay disagreement, both directions.
+        assert_eq!(api_mode_for(ZEN, "minimax-m3"), ApiMode::ChatCompletions);
+        assert_eq!(api_mode_for(GO, "claude-opus-5-5"), ApiMode::ChatCompletions);
+    }
+
+    /// Matching lowercases the full id first, so a mixed-case id resolves
+    /// exactly like its lowercase form.
+    #[test]
+    fn dialect_matching_is_case_insensitive() {
+        for (relay, model, expected) in [
+            (GO, "MUSE-SPARK-1.3-CONTRIBUTOR", ApiMode::Responses),
+            (GO, "MiniMax-M3", ApiMode::AnthropicMessages),
+            (GO, "QWEN3.8-MAX", ApiMode::AnthropicMessages),
+            (GO, "GPT-6-Luna", ApiMode::Responses),
+            (ZEN, "Claude-Opus-5-5", ApiMode::AnthropicMessages),
+            (ZEN, "GPT-5.5", ApiMode::Responses),
+            (ZEN, "Big-Pickle", ApiMode::ChatCompletions),
+        ] {
+            assert_eq!(api_mode_for(relay, model), expected, "{model}");
+        }
+    }
+
+    /// A caller-supplied `api_base` that points at the `/zen/go` path selects
+    /// the Go table; any other base selects Zen. Provider type only supplies
+    /// the default base when no override is given.
+    #[test]
+    fn custom_api_base_selects_relay_from_url() {
+        assert_eq!(OpenCodeRelay::for_base("https://opencode.ai/zen/go/v1"), OpenCodeRelay::Go);
+        assert_eq!(OpenCodeRelay::for_base("https://proxy.internal/zen/go"), OpenCodeRelay::Go);
+        assert_eq!(OpenCodeRelay::for_base("https://opencode.ai/zen/v1"), OpenCodeRelay::Zen);
+        assert_eq!(OpenCodeRelay::for_base("http://127.0.0.1:9"), OpenCodeRelay::Zen);
+
+        assert_eq!(OpenCodeRelay::resolve("opencode-free", None), OpenCodeRelay::Go);
+        assert_eq!(OpenCodeRelay::resolve("opencode", None), OpenCodeRelay::Zen);
+        assert_eq!(OpenCodeRelay::resolve("openai", None), OpenCodeRelay::Zen);
+        // An explicit non-Go override wins over the provider-type default...
+        assert_eq!(
+            OpenCodeRelay::resolve("opencode-free", Some("https://opencode.ai/zen/v1")),
+            OpenCodeRelay::Zen
         );
-        // Siblings and case-insensitivity of the full-id prefix match.
-        assert!(needs_responses_api("Muse-Spark-1.2"));
-        assert!(needs_responses_api("muse-spark-1.3"));
-        // The entry respects token boundaries: a longer name that merely
-        // starts with the prefix's characters (minus the trailing `-`)
-        // stays on the OpenAI-compatible dialect.
-        assert!(!needs_responses_api("muse-sparkless"));
+        // ...and a custom `/zen/go` base selects Go even for `opencode`.
+        assert_eq!(
+            OpenCodeRelay::resolve("opencode", Some("https://opencode.ai/zen/go/v1")),
+            OpenCodeRelay::Go
+        );
     }
 
-    /// ADR-66 §5 regression: the Responses token heuristic matches whole
-    /// Muse family tokens only. Every near-miss here stays on the
-    /// OpenAI-compatible dialect — no explicit prefix entry covers them, so
-    /// name resemblance alone must never select the Responses dialect.
+    /// ADR-66 §5 correction (2026-09-08): `muse-spark*` is not a Muse family
+    /// member, but the Zen gateway 500s on `/chat/completions` and only serves
+    /// it via `POST /responses` (the original fix, 0d511f1). The upstream
+    /// prefix table names `muse-spark` (no trailing hyphen), so the match is a
+    /// raw prefix — `muse-sparkless` matches upstream too. Do not "tidy" this
+    /// into a token-bounded rule.
+    #[test]
+    fn muse_spark_prefix_is_endpoint_behavior() {
+        for model in ["muse-spark-1.3-contributor-free", "Muse-Spark-1.2", "muse-spark-1.3"] {
+            assert_eq!(api_mode_for(ZEN, model), ApiMode::Responses, "{model}");
+        }
+        assert_eq!(
+            api_mode_for(ZEN, "muse-sparkless"),
+            ApiMode::Responses,
+            "the upstream table is prefix-based: `muse-spark` matches `muse-sparkless`"
+        );
+    }
+
+    /// ADR-66 §5 regression: the token-bounded Muse family rule matches whole
+    /// Muse tokens only. Every near-miss here stays on the OpenAI-compatible
+    /// dialect — no prefix entry covers them, so name resemblance alone must
+    /// never select the Responses dialect.
     #[test]
     fn muse_near_misses_never_route_to_responses() {
         // `muse` inside another token.
-        assert!(!needs_responses_api("some-muse-model"));
-        assert!(!needs_responses_api("amuse-v2"));
-        assert!(!needs_responses_api("museum-2"));
-        assert!(!needs_responses_api("musex-v2"));
-        // `muse-` prefix without a known family segment after it and
-        // without an explicit prefix entry.
-        assert!(!needs_responses_api("muse"));
-        assert!(!needs_responses_api("muse-pro"));
-        assert!(!needs_responses_api("muse-vapor"));
-        assert!(!needs_responses_api("muse-latest"));
+        assert_ne!(api_mode_for(ZEN, "some-muse-model"), ApiMode::Responses);
+        assert_ne!(api_mode_for(ZEN, "amuse-v2"), ApiMode::Responses);
+        assert_ne!(api_mode_for(ZEN, "museum-2"), ApiMode::Responses);
+        assert_ne!(api_mode_for(ZEN, "musex-v2"), ApiMode::Responses);
+        // `muse-` without a known version segment after it.
+        assert_ne!(api_mode_for(ZEN, "muse"), ApiMode::Responses);
+        assert_ne!(api_mode_for(ZEN, "muse-pro"), ApiMode::Responses);
+        assert_ne!(api_mode_for(ZEN, "muse-vapor"), ApiMode::Responses);
+        assert_ne!(api_mode_for(ZEN, "muse-latest"), ApiMode::Responses);
         // Empty / unrelated names stay on the OpenAI-compatible dialect.
-        assert!(!needs_responses_api(""));
-        assert!(!needs_responses_api("big-pickle"));
-        assert!(!needs_responses_api("deepseek-v4-flash-free"));
+        assert_ne!(api_mode_for(ZEN, ""), ApiMode::Responses);
+        assert_ne!(api_mode_for(ZEN, "big-pickle"), ApiMode::Responses);
+        assert_ne!(api_mode_for(ZEN, "deepseek-v4-flash-free"), ApiMode::Responses);
     }
 
-    /// ADR-66 §5 regression: the Anthropic heuristic matches the whole
-    /// `claude` family token, never a bare substring.
+    /// Genuine `muse-v*` family members keep the Responses dialect on Zen via
+    /// the token-bounded rule (the upstream prefix table does not name them,
+    /// but Zen serves them only via `/responses`).
+    #[test]
+    fn genuine_muse_family_uses_responses_on_zen() {
+        assert_eq!(api_mode_for(ZEN, "MUSE-v2"), ApiMode::Responses);
+        assert_eq!(api_mode_for(ZEN, "muse-v2"), ApiMode::Responses);
+        assert_eq!(api_mode_for(ZEN, "muse-v3"), ApiMode::Responses);
+        assert_eq!(api_mode_for(ZEN, "muse-v2.1"), ApiMode::Responses);
+        assert_eq!(api_mode_for(ZEN, "muse-v3-pro"), ApiMode::Responses);
+        // The Go relay has no genuine muse-* ids; unknown ones fall through to
+        // Chat Completions exactly as upstream's Go table dictates.
+        assert_eq!(api_mode_for(GO, "muse-v2"), ApiMode::ChatCompletions);
+    }
+
+    /// ADR-66 §5 regression: `claude-` matches as a prefix on Zen, so a name
+    /// where `claude` is merely a substring (`claudette-1`, `declaude`,
+    /// `claudeify-v2`) never routes to Anthropic.
     #[test]
     fn claude_near_misses_never_route_to_anthropic() {
-        assert!(needs_anthropic_dialect("claude-3-5-sonnet"));
-        assert!(needs_anthropic_dialect("Claude-3-opus"));
-        assert!(needs_anthropic_dialect("claude-4"));
-        assert!(needs_anthropic_dialect("claude-sonnet-4"));
-
+        for model in ["claude-3-5-sonnet", "Claude-3-opus", "claude-4", "claude-sonnet-4"] {
+            assert_eq!(api_mode_for(ZEN, model), ApiMode::AnthropicMessages, "{model}");
+        }
         // Substring near-misses must stay on the OpenAI-compatible dialect.
-        assert!(!needs_anthropic_dialect("claudette-1"));
-        assert!(!needs_anthropic_dialect("declaude"));
-        assert!(!needs_anthropic_dialect("claudeify-v2"));
-        assert!(!needs_anthropic_dialect("sub-claudeify"));
-        assert!(!needs_anthropic_dialect(""));
+        for model in ["claudette-1", "declaude", "claudeify-v2", "sub-claudeify", ""] {
+            assert_ne!(api_mode_for(ZEN, model), ApiMode::AnthropicMessages, "{model}");
+        }
     }
 
     #[test]
     fn openai_models_do_not_need_anthropic_dialect() {
-        assert!(!needs_anthropic_dialect("big-pickle"));
-        assert!(!needs_anthropic_dialect("deepseek-v4-flash-free"));
-        assert!(!needs_anthropic_dialect("gpt-4o"));
-        assert!(!needs_anthropic_dialect("MiMo-7B"));
+        assert_ne!(api_mode_for(ZEN, "big-pickle"), ApiMode::AnthropicMessages);
+        assert_ne!(api_mode_for(ZEN, "deepseek-v4-flash-free"), ApiMode::AnthropicMessages);
+        assert_ne!(api_mode_for(ZEN, "MiMo-7B"), ApiMode::AnthropicMessages);
+        // `gpt-` is Responses, never Anthropic.
+        assert_eq!(api_mode_for(ZEN, "gpt-4o"), ApiMode::Responses);
     }
 
     #[test]
     fn empty_model_defaults_to_openai() {
-        assert!(!needs_anthropic_dialect(""));
+        assert_eq!(api_mode_for(ZEN, ""), ApiMode::ChatCompletions);
+        assert_eq!(api_mode_for(GO, ""), ApiMode::ChatCompletions);
+    }
+
+    /// Runnable demonstration (run with `--nocapture`) printing the resolved
+    /// dialect for every id named in the upstream table contract, so the whole
+    /// table is visible in one place.
+    #[test]
+    fn dialect_table_demonstration_prints_for_review() {
+        let go_roster = [
+            "gpt-5.6-luna",
+            "gpt-6-luna",
+            "grok-4.7",
+            "muse-spark-1.3-contributor",
+            "minimax-m3",
+            "minimax-m2.7",
+            "qwen3.8-max",
+            "union-alpha",
+            "space-bunny-free",
+            "kimi-k3",
+            "glm-5.3",
+            "deepseek-v4-pro",
+            "mimo-v2.6-pro",
+            "longcat-2.5-preview-free",
+            "hy3",
+            "omen-alpha",
+        ];
+        let zen_roster = ["claude-opus-5-5", "gpt-5.5", "qwen3.8-max", "big-pickle"];
+        println!("=== opencode-free (Go relay) ===");
+        for model in go_roster {
+            println!("  {model:<34} -> {:?}", api_mode_for(GO, model));
+        }
+        println!("=== opencode (Zen relay) ===");
+        for model in zen_roster {
+            println!("  {model:<34} -> {:?}", api_mode_for(ZEN, model));
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1443,12 +1668,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn muse_model_renders_anthropic_body_via_dialect() {
-        let p = OpenCodeZenProvider::new(
-            "key".to_string(),
-            "muse-spark-1.2-contributor-free".into(),
-            30,
-        );
+    fn claude_model_renders_anthropic_body_via_dialect() {
+        // Updated from the old `muse_model_renders_anthropic_body_via_dialect`:
+        // `muse-spark-*` now routes to the Responses dialect (upstream prefix
+        // table), so the Anthropic body fixture uses a genuine Anthropic id.
+        let p = OpenCodeZenProvider::new("key".to_string(), "claude-3-5-sonnet".into(), 30);
         let request = CompletionRequest {
             messages: vec![concerto_core::types::Message {
                 role: concerto_core::types::Role::User,
@@ -1461,11 +1685,11 @@ mod tests {
             }],
             ..Default::default()
         };
-        let body = p.build_anthropic_body(&request, "muse-spark-1.2-contributor-free");
+        let body = p.build_anthropic_body(&request, "claude-3-5-sonnet");
         // Anthropic wire format: stream is always true, max_tokens defaults to 4096
         assert_eq!(body["stream"], true);
         assert_eq!(body["max_tokens"], 4096);
-        assert_eq!(body["model"], "muse-spark-1.2-contributor-free");
+        assert_eq!(body["model"], "claude-3-5-sonnet");
         // Messages use Anthropic content-array format
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs[0]["role"], "user");
@@ -1476,7 +1700,7 @@ mod tests {
     #[test]
     fn openai_model_body_not_affected_by_anthropic_path() {
         // big-pickle should not trigger the Anthropic path
-        assert!(!needs_anthropic_dialect("big-pickle"));
+        assert_ne!(api_mode_for(ZEN, "big-pickle"), ApiMode::AnthropicMessages);
     }
 
     // -----------------------------------------------------------------------
@@ -1946,10 +2170,18 @@ mod tests {
     /// Drive one streaming request against a one-shot mock and return the raw
     /// captured request. The canned response is irrelevant: the assertion
     /// target is the OUTBOUND request, so any completed body works.
-    async fn capture_wire_request(model: &str) -> Vec<u8> {
+    ///
+    /// `path_suffix` is appended to the mock base so a caller can point the
+    /// provider at the Go relay (`/zen/go/v1`) while still reaching the local
+    /// mock; the empty suffix is the Zen-shaped default.
+    async fn capture_wire_request_at(model: &str, path_suffix: &str) -> Vec<u8> {
         let (base, req_rx) = crate::testing::mock_server::spawn(String::new());
-        let provider =
-            OpenCodeZenProvider::with_api_base("test-key".to_string(), model.into(), 5, base);
+        let provider = OpenCodeZenProvider::with_api_base(
+            "test-key".to_string(),
+            model.into(),
+            5,
+            format!("{base}{path_suffix}"),
+        );
         let request = CompletionRequest {
             model: model.into(),
             messages: vec![concerto_core::types::Message {
@@ -1969,6 +2201,54 @@ mod tests {
         req_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("the request reaches the mock")
+    }
+
+    /// Drive one streaming request against a Zen-shaped mock base.
+    async fn capture_wire_request(model: &str) -> Vec<u8> {
+        capture_wire_request_at(model, "").await
+    }
+
+    /// The 400-bug fix, end to end: a base pointing at the Go `/zen/go` path
+    /// must select the Go table, so `minimax-*`/`qwen*` reach `/messages` and
+    /// `gpt-*`/`grok-*` reach `/responses`. The same id on the Zen base takes
+    /// Zen's table, proving the relay (not the model name alone) selected it.
+    #[tokio::test]
+    async fn go_relay_api_base_dispatches_with_the_go_table() {
+        let go_minimax =
+            captured_headers(&capture_wire_request_at("minimax-m3", "/zen/go/v1").await);
+        assert!(
+            go_minimax.starts_with("post /zen/go/v1/messages http/1.1"),
+            "minimax-* is Anthropic on Go: {go_minimax}"
+        );
+        // Credentials and the affinity header are unaffected by the relay.
+        assert_session_header(&go_minimax, "the Go /messages leg");
+        assert!(
+            go_minimax.contains("x-api-key: test-key"),
+            "the Go /messages leg authenticates with the resolved key: {go_minimax}"
+        );
+        let go_gpt = captured_headers(&capture_wire_request_at("gpt-5.6-luna", "/zen/go/v1").await);
+        assert!(
+            go_gpt.starts_with("post /zen/go/v1/responses http/1.1"),
+            "gpt-* is Responses on Go: {go_gpt}"
+        );
+        assert_session_header(&go_gpt, "the Go /responses leg");
+        assert!(
+            go_gpt.contains("authorization: bearer test-key"),
+            "the Go /responses leg authenticates with the resolved key: {go_gpt}"
+        );
+        let go_chat =
+            captured_headers(&capture_wire_request_at("deepseek-v4-pro", "/zen/go/v1").await);
+        assert!(
+            go_chat.starts_with("post /zen/go/v1/chat/completions http/1.1"),
+            "everything else is Chat Completions on Go: {go_chat}"
+        );
+
+        // Same id, Zen base: minimax-* stays Chat Completions.
+        let zen_minimax = captured_headers(&capture_wire_request("minimax-m3").await);
+        assert!(
+            zen_minimax.starts_with("post /chat/completions http/1.1"),
+            "minimax-* is Chat Completions on Zen: {zen_minimax}"
+        );
     }
 
     /// Every wire leg this provider owns carries the affinity header, and the
