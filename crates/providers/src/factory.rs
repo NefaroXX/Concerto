@@ -7,6 +7,7 @@ use concerto_config::{
 use concerto_core::error::ProviderError;
 use concerto_core::traits::provider::LlmProvider;
 use concerto_core::types::RoutingProfile;
+use concerto_core::SecretString;
 
 use crate::anthropic::AnthropicProvider;
 use crate::cerebras::CerebrasProvider;
@@ -109,15 +110,47 @@ impl ProviderFactory {
     /// Missing credentials and unknown provider types are configuration
     /// errors. Production execution must never silently substitute a mock
     /// model because that makes a failed setup look like a successful run.
+    ///
+    /// Provider-advertised tool-calling capability captured during model
+    /// discovery ([`ProviderConfig::advertised_tool_support_for`], ADR-66 §3
+    /// precedence level 2 / ADR-75) is threaded into the connector, so a
+    /// provider that advertises tool support is believed and advertised
+    /// absence selects the fallback/loose tier. Callers with a capability flag
+    /// from an out-of-band listing can use
+    /// [`ProviderFactory::build_with_capabilities`] to supply it directly.
     pub fn build(
         config: &ProviderConfig,
         creds: &CredentialStore,
+    ) -> Result<Arc<dyn LlmProvider>, ProviderError> {
+        Self::build_with_capabilities(
+            config,
+            creds,
+            config.advertised_tool_support_for(&config.model),
+        )
+    }
+
+    /// Build a single provider, threading a provider-**advertised** per-model
+    /// tool-calling capability into the connector (ADR-66 §3 precedence level
+    /// 2, ADR-75).
+    ///
+    /// `advertised` is the value from the provider's own model listing
+    /// ([`concerto_core::types::ModelInfo::supports_tool_calling`]) for the
+    /// configured model, when the caller has one. It participates in the
+    /// tool-schema/transport tier resolution so an advertised capability beats
+    /// the last-resort name heuristic. `None` means the caller knows of no
+    /// advertised metadata, leaving the family table and the conservative name
+    /// heuristic to decide.
+    pub fn build_with_capabilities(
+        config: &ProviderConfig,
+        creds: &CredentialStore,
+        advertised_tool_support: Option<bool>,
     ) -> Result<Arc<dyn LlmProvider>, ProviderError> {
         if !matches!(
             config.provider.as_str(),
             "anthropic"
                 | "openai"
                 | "opencode"
+                | "opencode-free"
                 | "google"
                 | "openrouter"
                 | "nim"
@@ -144,10 +177,40 @@ impl ProviderFactory {
         // Ollama doesn't use API keys.
         if config.provider == "ollama" {
             let mut provider = OllamaProvider::new(config.model.clone(), config.timeout_seconds)
-                .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                .with_tool_schema_mode(resolve_tool_schema_mode(config))
+                .with_advertised_tool_support(advertised_tool_support);
             if let Some(base) = &config.api_base {
                 provider = provider.with_base_url(base.clone());
             }
+            let provider: Arc<dyn LlmProvider> = Arc::new(provider);
+            return Ok(Self::with_context_guard(provider, &config.model));
+        }
+
+        // `opencode-free` is keyless: it serves the free-only Zen catalog with
+        // an EMPTY credential, so — exactly like `ollama` above — it returns
+        // BEFORE the shared `effective_api_key` resolution below and can never
+        // report `CredentialMissing` or touch the keyring / env. The wire path
+        // is identical to the `opencode` arm (same `OpenCodeZenProvider`
+        // construction via `with_api_base`, `config.api_base` honoured, the
+        // Zen base otherwise), so both entries stay interchangeable except for
+        // the credential requirement and the static catalog.
+        if config.provider == "opencode-free" {
+            let provider = if let Some(base) = &config.api_base {
+                OpenCodeZenProvider::with_api_base(
+                    SecretString::default(),
+                    config.model.clone(),
+                    config.timeout_seconds,
+                    base.clone(),
+                )
+            } else {
+                OpenCodeZenProvider::new(
+                    SecretString::default(),
+                    config.model.clone(),
+                    config.timeout_seconds,
+                )
+            }
+            .with_tool_schema_mode(resolve_tool_schema_mode(config))
+            .with_advertised_tool_support(advertised_tool_support);
             let provider: Arc<dyn LlmProvider> = Arc::new(provider);
             return Ok(Self::with_context_guard(provider, &config.model));
         }
@@ -177,7 +240,8 @@ impl ProviderFactory {
             "anthropic" => {
                 let mut provider =
                     AnthropicProvider::new(key, config.model.clone(), config.timeout_seconds)
-                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config))
+                        .with_advertised_tool_support(advertised_tool_support);
                 if config.cache_breakpoints {
                     provider = provider.with_cache_breakpoints(true);
                 }
@@ -191,7 +255,8 @@ impl ProviderFactory {
                         // opt-in every per-message usage column stays 0 on
                         // the OpenAI connector.
                         .with_usage_request(UsageRequest::IncludeStreamUsage)
-                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config))
+                        .with_advertised_tool_support(advertised_tool_support);
                 if let Some(base) = &config.api_base {
                     provider = provider.with_api_base(base.clone());
                 }
@@ -215,7 +280,8 @@ impl ProviderFactory {
                 } else {
                     OpenCodeZenProvider::new(key, config.model.clone(), config.timeout_seconds)
                 }
-                .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                .with_tool_schema_mode(resolve_tool_schema_mode(config))
+                .with_advertised_tool_support(advertised_tool_support);
                 Arc::new(provider)
             }
             "google" => {
@@ -225,13 +291,15 @@ impl ProviderFactory {
                 // is live here.
                 Arc::new(
                     GoogleProvider::new(key, config.model.clone(), config.timeout_seconds)
-                        .with_tool_schema_mode(resolve_tool_schema_mode(config)),
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config))
+                        .with_advertised_tool_support(advertised_tool_support),
                 )
             }
             "openrouter" => {
                 let mut provider =
                     OpenRouterProvider::new(key, config.model.clone(), config.timeout_seconds)
-                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config))
+                        .with_advertised_tool_support(advertised_tool_support);
                 if let Some(echo) = reasoning_echo {
                     provider = provider.with_reasoning_echo(echo);
                 }
@@ -240,7 +308,8 @@ impl ProviderFactory {
             "nim" => {
                 let mut provider =
                     NimProvider::new(key, config.model.clone(), config.timeout_seconds)
-                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config))
+                        .with_advertised_tool_support(advertised_tool_support);
                 if let Some(echo) = reasoning_echo {
                     provider = provider.with_reasoning_echo(echo);
                 }
@@ -260,13 +329,15 @@ impl ProviderFactory {
                 } else {
                     DeepSeekProvider::new(key, config.model.clone(), config.timeout_seconds)
                 }
-                .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                .with_tool_schema_mode(resolve_tool_schema_mode(config))
+                .with_advertised_tool_support(advertised_tool_support);
                 Arc::new(provider)
             }
             "groq" => {
                 let mut provider =
                     GroqProvider::new(key, config.model.clone(), config.timeout_seconds)
-                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config))
+                        .with_advertised_tool_support(advertised_tool_support);
                 if let Some(base) = &config.api_base {
                     provider = provider.with_api_base(base.clone());
                 }
@@ -278,7 +349,8 @@ impl ProviderFactory {
             "together" => {
                 let mut provider =
                     TogetherProvider::new(key, config.model.clone(), config.timeout_seconds)
-                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config))
+                        .with_advertised_tool_support(advertised_tool_support);
                 if let Some(base) = &config.api_base {
                     provider = provider.with_api_base(base.clone());
                 }
@@ -290,7 +362,8 @@ impl ProviderFactory {
             "mistral" => {
                 let mut provider =
                     MistralProvider::new(key, config.model.clone(), config.timeout_seconds)
-                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config))
+                        .with_advertised_tool_support(advertised_tool_support);
                 if let Some(base) = &config.api_base {
                     provider = provider.with_api_base(base.clone());
                 }
@@ -302,7 +375,8 @@ impl ProviderFactory {
             "xai" => {
                 let mut provider =
                     XaiProvider::new(key, config.model.clone(), config.timeout_seconds)
-                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config))
+                        .with_advertised_tool_support(advertised_tool_support);
                 if let Some(base) = &config.api_base {
                     provider = provider.with_api_base(base.clone());
                 }
@@ -314,7 +388,8 @@ impl ProviderFactory {
             "fireworks" => {
                 let mut provider =
                     FireworksProvider::new(key, config.model.clone(), config.timeout_seconds)
-                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config))
+                        .with_advertised_tool_support(advertised_tool_support);
                 if let Some(base) = &config.api_base {
                     provider = provider.with_api_base(base.clone());
                 }
@@ -326,7 +401,8 @@ impl ProviderFactory {
             "cerebras" => {
                 let mut provider =
                     CerebrasProvider::new(key, config.model.clone(), config.timeout_seconds)
-                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config))
+                        .with_advertised_tool_support(advertised_tool_support);
                 if let Some(base) = &config.api_base {
                     provider = provider.with_api_base(base.clone());
                 }
@@ -338,7 +414,8 @@ impl ProviderFactory {
             "cohere" => {
                 let mut provider =
                     CohereProvider::new(key, config.model.clone(), config.timeout_seconds)
-                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config))
+                        .with_advertised_tool_support(advertised_tool_support);
                 if let Some(base) = &config.api_base {
                     provider = provider.with_api_base(base.clone());
                 }
@@ -350,7 +427,8 @@ impl ProviderFactory {
             "deepinfra" => {
                 let mut provider =
                     DeepInfraProvider::new(key, config.model.clone(), config.timeout_seconds)
-                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config))
+                        .with_advertised_tool_support(advertised_tool_support);
                 if let Some(base) = &config.api_base {
                     provider = provider.with_api_base(base.clone());
                 }
@@ -362,7 +440,8 @@ impl ProviderFactory {
             "perplexity" => {
                 let mut provider =
                     PerplexityProvider::new(key, config.model.clone(), config.timeout_seconds)
-                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config))
+                        .with_advertised_tool_support(advertised_tool_support);
                 if let Some(base) = &config.api_base {
                     provider = provider.with_api_base(base.clone());
                 }
@@ -374,7 +453,8 @@ impl ProviderFactory {
             "sambanova" => {
                 let mut provider =
                     SambaNovaProvider::new(key, config.model.clone(), config.timeout_seconds)
-                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config))
+                        .with_advertised_tool_support(advertised_tool_support);
                 if let Some(base) = &config.api_base {
                     provider = provider.with_api_base(base.clone());
                 }
@@ -386,7 +466,8 @@ impl ProviderFactory {
             "dashscope" => {
                 let mut provider =
                     DashScopeProvider::new(key, config.model.clone(), config.timeout_seconds)
-                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config))
+                        .with_advertised_tool_support(advertised_tool_support);
                 if let Some(base) = &config.api_base {
                     provider = provider.with_api_base(base.clone());
                 }
@@ -398,7 +479,8 @@ impl ProviderFactory {
             "moonshot" => {
                 let mut provider =
                     MoonshotProvider::new(key, config.model.clone(), config.timeout_seconds)
-                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config))
+                        .with_advertised_tool_support(advertised_tool_support);
                 if let Some(base) = &config.api_base {
                     provider = provider.with_api_base(base.clone());
                 }
@@ -410,7 +492,8 @@ impl ProviderFactory {
             "zhipu" => {
                 let mut provider =
                     ZhipuProvider::new(key, config.model.clone(), config.timeout_seconds)
-                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config))
+                        .with_advertised_tool_support(advertised_tool_support);
                 if let Some(base) = &config.api_base {
                     provider = provider.with_api_base(base.clone());
                 }
@@ -422,7 +505,8 @@ impl ProviderFactory {
             "novita" => {
                 let mut provider =
                     NovitaProvider::new(key, config.model.clone(), config.timeout_seconds)
-                        .with_tool_schema_mode(resolve_tool_schema_mode(config));
+                        .with_tool_schema_mode(resolve_tool_schema_mode(config))
+                        .with_advertised_tool_support(advertised_tool_support);
                 if let Some(base) = &config.api_base {
                     provider = provider.with_api_base(base.clone());
                 }
@@ -549,20 +633,17 @@ impl ProviderFactory {
                     cost_per_1k_tokens,
                     avg_latency_ms,
                     context_window: 8192,
-                    // ADR-66 §3: per-model capability resolution. The
-                    // explicit-config override (level 1) is applied below
+                    // ADR-66 §3 / ADR-75: per-model capability resolution.
+                    // The explicit-config override (level 1) is applied below
                     // from `model_profile_overrides`, so it is passed as
-                    // `None` here to keep the override application at its
-                    // existing site. Advertised `list_models` flags (level
-                    // 2) are a runtime listing concept — the cached model
-                    // catalog carries names only, so the profile path
-                    // resolves via family table (level 3) and provider
-                    // default (level 4).
+                    // `None` here; provider-advertised metadata (level 2),
+                    // captured from the last discovery listing, is consulted
+                    // next and wins over the optimistic default (level 3).
                     supports_tool_calling: crate::capability::resolve_tool_support(
                         &config.provider,
                         &config.model,
                         None,
-                        None,
+                        config.advertised_tool_support_for(&config.model),
                     ),
                     base_url: config.api_base.clone(),
                     description: None,
@@ -1322,6 +1403,10 @@ mod tests {
     /// family via the explicit Responses dialect prefix entry (ADR-66 §5
     /// correction: endpoint behavior, not taxonomy). Other providers keep
     /// the provider default.
+    ///
+    /// Inverted from the old assertion that the Responses-dialect models have
+    /// no tool support: the converter was completed (ADR-75), so they resolve
+    /// natively like every other HTTP model — no name decides capability.
     #[test]
     fn build_profiles_resolves_tool_support_per_model() {
         let settings = ModelSettings {
@@ -1354,10 +1439,13 @@ mod tests {
                 .find(|profile| profile.provider_config_id == id)
                 .unwrap_or_else(|| panic!("missing profile {id}"))
         };
-        assert!(!by_id("zen-muse").supports_tool_calling, "genuine Muse has no tool support");
         assert!(
-            !by_id("zen-spark").supports_tool_calling,
-            "muse-spark-* rides the explicit Responses dialect entry: no NATIVE tool declarations"
+            by_id("zen-muse").supports_tool_calling,
+            "the Responses converter now carries native tools"
+        );
+        assert!(
+            by_id("zen-spark").supports_tool_calling,
+            "muse-spark-* rides the Responses dialect, whose converter now carries tools"
         );
         assert!(by_id("openai-main").supports_tool_calling);
     }
@@ -1383,7 +1471,75 @@ mod tests {
             },
         );
         let profiles = ProviderFactory::build_profiles(&settings);
-        assert!(profiles[0].supports_tool_calling, "explicit override must beat the family table");
+        assert!(
+            profiles[0].supports_tool_calling,
+            "explicit override must beat the optimistic default"
+        );
+    }
+
+    /// ADR-75: `build` reads provider-advertised metadata from the config's
+    /// discovery cache, so advertised capability actually reaches the
+    /// connector. `build_with_capabilities` stays the out-of-band entry point.
+    #[test]
+    fn build_reads_config_advertised_metadata() {
+        // Ollama needs no credential, so the test never touches the keyring.
+        let mut config = ProviderConfig {
+            id: "local".into(),
+            provider: "ollama".into(),
+            model: "mimo-v2.5".into(),
+            ..Default::default()
+        };
+        // A weak-looking name advertised as tool-capable.
+        config.cached_model_tool_support.insert("mimo-v2.5".into(), true);
+        assert_eq!(config.advertised_tool_support_for("mimo-v2.5"), Some(true));
+
+        // `build` must apply it (rather than the name heuristic) and still
+        // construct a working provider.
+        let creds = test_creds();
+        let provider = ProviderFactory::build(&config, &creds)
+            .expect("provider builds with config-advertised metadata");
+        assert_eq!(provider.provider_name(), "ollama");
+    }
+
+    /// ADR-75: `build_profiles` believes provider-advertised metadata over
+    /// the optimistic default, in both directions.
+    #[test]
+    fn build_profiles_honors_advertised_metadata() {
+        let mut advertised_absent = ProviderConfig {
+            id: "declared-absent".into(),
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            ..Default::default()
+        };
+        advertised_absent.cached_model_tool_support.insert("gpt-4o".into(), false);
+
+        let mut advertised_present = ProviderConfig {
+            id: "declared-present".into(),
+            provider: "openai".into(),
+            model: "mimo-v2.5".into(),
+            ..Default::default()
+        };
+        advertised_present.cached_model_tool_support.insert("mimo-v2.5".into(), true);
+
+        let settings = ModelSettings {
+            providers: vec![advertised_absent, advertised_present],
+            ..Default::default()
+        };
+        let profiles = ProviderFactory::build_profiles(&settings);
+        let by_id = |id: &str| {
+            profiles
+                .iter()
+                .find(|profile| profile.provider_config_id == id)
+                .unwrap_or_else(|| panic!("missing profile {id}"))
+        };
+        assert!(
+            !by_id("declared-absent").supports_tool_calling,
+            "advertised absence must beat the optimistic default"
+        );
+        assert!(
+            by_id("declared-present").supports_tool_calling,
+            "advertised support must beat the weak-looking name"
+        );
     }
 
     /// Plugin-backed provider configs (the plugins crate registers
@@ -1393,5 +1549,120 @@ mod tests {
     #[test]
     fn capability_resolution_plugin_backed_defaults_false() {
         assert!(!crate::capability::resolve_tool_support("plugin:my-llm", "any-model", None, None));
+    }
+
+    /// ADR-75: `build_with_capabilities` threads provider-advertised
+    /// tool-calling metadata into the connector, and `build` reads the
+    /// config's discovery cache by default. Both construct a working provider
+    /// for a free-route model without panicking.
+    #[test]
+    fn build_with_capabilities_threads_advertised_support() {
+        // Ollama needs no credential, so the test exercises only the tier
+        // threading and never touches the keyring.
+        let config = ProviderConfig {
+            id: "local".into(),
+            provider: "ollama".into(),
+            model: "space-bunny-free".into(),
+            ..Default::default()
+        };
+        let creds = test_creds();
+        let with_flag = ProviderFactory::build_with_capabilities(&config, &creds, Some(true))
+            .expect("provider builds with advertised metadata");
+        assert_eq!(with_flag.provider_name(), "ollama");
+        let without_flag =
+            ProviderFactory::build(&config, &creds).expect("plain build remains a None delegate");
+        assert_eq!(without_flag.provider_name(), "ollama");
+    }
+
+    // ------------------------------------------------------------------
+    // Keyless `opencode-free` build
+    // ------------------------------------------------------------------
+
+    /// Remove `name` for the duration of a test and restore whatever was
+    /// there afterwards, even across a panic — env vars are process-global,
+    /// so a leaked edit would race with tests running in parallel.
+    struct RestoreEnvVar {
+        name: &'static str,
+        saved: Option<String>,
+    }
+
+    impl RestoreEnvVar {
+        fn without(name: &'static str) -> Self {
+            let saved = std::env::var(name).ok();
+            std::env::remove_var(name);
+            Self { name, saved }
+        }
+    }
+
+    impl Drop for RestoreEnvVar {
+        fn drop(&mut self) {
+            match &self.saved {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
+    /// An `opencode-free` config with no resolvable credential anywhere: a
+    /// unique keyring account (so no `CONCERTO_*` env var can satisfy it) and
+    /// no `OPENCODE_API_KEY` (cleared by the caller's [`RestoreEnvVar`]).
+    fn keyless_opencode_free_config() -> ProviderConfig {
+        ProviderConfig {
+            id: "opencode-free-main".into(),
+            name: "OpenCode Zen (free)".into(),
+            provider: "opencode-free".into(),
+            model: "big-pickle".into(),
+            keyring_key: "test-keyless-opencode-free/api_key".into(),
+            ..ProviderConfig::default()
+        }
+    }
+
+    /// The `opencode-free` arm builds with NO credential available anywhere
+    /// and reports the shared `opencode` runtime name: it short-circuits
+    /// before key resolution (no `CredentialMissing`, no keyring/env read),
+    /// and it does so in a plain build — no feature flag involved.
+    #[test]
+    fn build_opencode_free_without_credential() {
+        let _restored = RestoreEnvVar::without("OPENCODE_API_KEY");
+        let config = keyless_opencode_free_config();
+        let creds = test_creds();
+
+        assert!(config.effective_api_key(&creds).is_err(), "no key may resolve for this config");
+
+        let provider = ProviderFactory::build(&config, &creds)
+            .expect("a keyless opencode-free config must build without any credential");
+        assert_eq!(provider.provider_name(), "opencode");
+
+        // ADR-75 capability threading stays consistent with the `opencode`
+        // arm: the keyless path is the same connector either way.
+        let with_flag = ProviderFactory::build_with_capabilities(&config, &creds, Some(true))
+            .expect("build_with_capabilities must stay keyless too");
+        assert_eq!(with_flag.provider_name(), "opencode");
+    }
+
+    /// The keyless arm weakens nothing else: a non-opencode provider with no
+    /// credential still fails closed with `CredentialMissing`.
+    #[test]
+    fn keyless_non_opencode_provider_still_requires_credential() {
+        let _restored = RestoreEnvVar::without("ZHIPU_API_KEY");
+        let config = ProviderConfig {
+            id: "zhipu-keyless".into(),
+            name: "Zhipu".into(),
+            provider: "zhipu".into(),
+            model: "glm-4.7".into(),
+            keyring_key: "test-keyless-zhipu/api_key".into(),
+            ..ProviderConfig::default()
+        };
+        let creds = test_creds();
+
+        assert!(config.effective_api_key(&creds).is_err(), "no key may resolve for this config");
+
+        let Err(error) = ProviderFactory::build(&config, &creds) else {
+            panic!("only opencode-free may build without a key");
+        };
+        assert!(
+            matches!(error, ProviderError::CredentialMissing { .. }),
+            "build must fail closed with CredentialMissing, got {error:?}"
+        );
     }
 }

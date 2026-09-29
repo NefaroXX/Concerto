@@ -56,10 +56,10 @@ pub use schema::{
     builtin_agent_seeds, default_global_agents_path, parse_tool_schema_mode,
     resolve_reduced_motion, resolve_terminal_title_enabled, AgentCapabilities,
     AgentModelAssignment, AgentRelationshipConfig, AppConfig, ConditionDef, ContextConfig,
-    CustomAgentConfig, DisplayConfig, FewShotExample, IntentConfig, McpConfig, McpServerConfig,
-    MemoryConfig, ModelPinConfig, ModelProfileOverride, ModelSettings, MultiAgentConfig,
-    ObservabilityConfig, PipelinePreset, PlanBindingSource, PolicyConfig, PolicyRuleDef,
-    ProjectContextConfig, PromptSections, ProviderConfig, RetryConfig, SkillsConfig,
+    CustomAgentConfig, DiscoveryOutcome, DisplayConfig, FewShotExample, IntentConfig, McpConfig,
+    McpServerConfig, MemoryConfig, ModelPinConfig, ModelProfileOverride, ModelSettings,
+    MultiAgentConfig, ObservabilityConfig, PipelinePreset, PlanBindingSource, PolicyConfig,
+    PolicyRuleDef, ProjectContextConfig, PromptSections, ProviderConfig, RetryConfig, SkillsConfig,
     ToolSchemaMode, ToolSettings, UpdatesConfig, SCHEMA_VERSION,
 };
 pub use setup::{PendingConfig, SetupError, SetupWizard};

@@ -37,6 +37,12 @@ pub struct OpenAiProvider {
     /// request against the actual model name; `Auto` (default) keeps every
     /// non-weak model on the verbatim strict schema.
     tool_schema_mode: concerto_config::ToolSchemaMode,
+    /// Provider-advertised per-model tool-calling capability (ADR-66 §3
+    /// precedence level 2; `ModelInfo::supports_tool_calling`). `None` when
+    /// the provider publishes no capability metadata. When set, it beats the
+    /// last-resort name heuristic in [`crate::capability::
+    /// resolve_tool_schema_mode`].
+    advertised_tool_support: Option<bool>,
     /// How this connector asks the endpoint to report usage (ADR-48 §4).
     /// Defaults to [`UsageRequest::Off`] — the wire body stays byte-identical
     /// to the pre-wiring output until a construction site opts an endpoint in.
@@ -53,6 +59,7 @@ impl OpenAiProvider {
             timeout_secs,
             reasoning_echo: ReasoningEcho::IfPresent,
             tool_schema_mode: concerto_config::ToolSchemaMode::default(),
+            advertised_tool_support: None,
             usage_request: UsageRequest::Off,
             dialect: OpenAiChatDialect,
         }
@@ -93,6 +100,19 @@ impl OpenAiProvider {
     /// output. See `crate::adapters::schema_loose`.
     pub fn with_tool_schema_mode(mut self, mode: concerto_config::ToolSchemaMode) -> Self {
         self.tool_schema_mode = mode;
+        self
+    }
+
+    /// Set the provider-advertised per-model tool-calling capability
+    /// (ADR-66 §3 precedence level 2).
+    ///
+    /// When the provider's listing API publishes `ModelInfo::
+    /// supports_tool_calling`, this flag participates in the tool-schema tier
+    /// resolution (see [`crate::capability::resolve_tool_schema_mode`]) so an
+    /// advertised capability beats the last-resort model-name heuristic. `None`
+    /// (the default) means the provider publishes no such metadata.
+    pub fn with_advertised_tool_support(mut self, advertised: Option<bool>) -> Self {
+        self.advertised_tool_support = advertised;
         self
     }
 
@@ -144,10 +164,6 @@ struct PartialToolCall {
 /// `tool_calls` array; this sentinel, combined with the empty-`partial_tools`
 /// gate, guarantees the synthesized call can never collide with a real one.
 const ENVELOPE_CALL_INDEX: usize = usize::MAX;
-
-/// Row #38: bounded depth for unwrapping proxy double-encoded
-/// `arguments` (`"\"{…}\""` re-serializations). Iterative, never unbounded.
-const MAX_ARGUMENT_STRING_LAYERS: usize = 3;
 
 struct OpenAiStreamState {
     parser: BufferedSseParser,
@@ -305,8 +321,8 @@ impl OpenAiStreamState {
     ///     competes with real deltas (no double-emit);
     ///   * otherwise a strict envelope match synthesizes a [`PartialToolCall`]
     ///     at [`ENVELOPE_CALL_INDEX`], emitted by the EXISTING
-    ///     [`Self::emit_tool_call`] pipeline (strict parse with the Fix 3 retry
-    ///     chain + `Null` fallback, plus loose-schema un-flattening);
+    ///     [`Self::emit_tool_call`] pipeline (the shared tool-argument
+    ///     integrity parse/repair, plus loose-schema un-flattening);
     ///   * otherwise the content is drained as plain text — same `delta`
     ///     payload as before, aggregated at turn end instead of per-delta.
     ///
@@ -347,19 +363,18 @@ impl OpenAiStreamState {
         }));
     }
 
-    /// Emit the accumulated arguments for a finished tool call (proxy Fix 3).
+    /// Emit the accumulated arguments for a finished tool call.
     ///
-    /// Empty accumulated arguments become `Null` silently. Non-empty arguments
-    /// parse strictly; if that parse fails, a short retry chain rescues the two
-    /// common proxy corruption classes — surrounding whitespace (re-parse after
-    /// trimming, the `double-wrap`/pad case) and single-quoted JSON (re-parse
-    /// after replacing `'` with `"`). The single-quote fixup is safe by
-    /// construction: it only runs after the strict parse already failed and
-    /// its result is still validated by `serde_json`, so legitimate apostrophes
-    /// inside string values that strict JSON accepts are never touched. If
-    /// every parse fails, the tool call still emits with `Null` arguments and a
-    /// `tracing::warn!` carries the tool name, the raw payload length (never
-    /// the payload itself — avoids log injection) and the original parse error.
+    /// Arguments are parsed through [`crate::tool_args::parse_tool_arguments`]:
+    /// valid JSON passes through untouched; the real truncation/proxy-format
+    /// corruption classes (unbalanced braces, an unterminated string, a
+    /// trailing comma, single-quoted keys, trailing garbage, double-encoding)
+    /// are repaired deterministically and model-agnostically. Empty
+    /// accumulated arguments become `Null` silently (the tool genuinely
+    /// received none). Unrepairable arguments yield an explicit
+    /// [`ProviderError::InvalidResponse`] on the stream — a tool call with
+    /// silently-empty arguments is never emitted, because the executor would
+    /// otherwise run the tool with `{}`.
     ///
     /// Row #38: a slot that never received a name is dropped here with a
     /// payload-free `warn!` instead of emitting an empty-name call the
@@ -375,56 +390,40 @@ impl OpenAiStreamState {
                 );
                 return;
             }
-            let mut args = if ptc.arguments.trim().is_empty() {
-                serde_json::Value::Null
+            // Empty accumulated arguments are a legitimate argument-less tool
+            // call. Any other payload must parse (after repair) or the stream
+            // surfaces a typed error — never a silent `Null`/`{}`.
+            let parsed = if ptc.arguments.trim().is_empty() {
+                Ok(serde_json::Value::Null)
             } else {
-                match serde_json::from_str(&ptc.arguments) {
-                    Ok(parsed) => parsed,
-                    Err(parse_err) => {
-                        // Proxy sent malformed JSON arguments. Try a few common
-                        // fixes before giving up.
-                        let cleaned = ptc.arguments.trim();
-                        // Some proxies double-wrap: "{"key": "val"}" → try as-is
-                        let result = serde_json::from_str(cleaned).or_else(|_| {
-                            // Some proxies send single-quoted keys
-                            let fixed = cleaned.replace('\'', "\"");
-                            serde_json::from_str(&fixed)
-                        });
-                        match result {
-                            Ok(parsed) => parsed,
-                            Err(_) => {
-                                tracing::warn!(
-                                    tool_name = %ptc.name,
-                                    raw_len = ptc.arguments.len(),
-                                    parse_error = %parse_err,
-                                    "emit_tool_call: failed to parse arguments, emitting null."
-                                );
-                                serde_json::Value::Null
-                            }
-                        }
-                    }
+                crate::tool_args::parse_tool_arguments(&ptc.arguments).map(
+                    |outcome| match outcome {
+                        crate::tool_args::ToolArgumentParse::Value(value) => value,
+                        crate::tool_args::ToolArgumentParse::Empty => serde_json::Value::Null,
+                    },
+                )
+            };
+            let mut args = match parsed {
+                Ok(args) => args,
+                Err(error) => {
+                    tracing::warn!(
+                        tool_name = %ptc.name,
+                        raw_len = error.raw_len,
+                        parse_error = %error,
+                        "emit_tool_call: unrepairable tool arguments; failing the stream loudly."
+                    );
+                    self.pending.push_back(Err(ProviderError::InvalidResponse(format!(
+                        "provider returned unparseable tool-call arguments for '{}': {}",
+                        ptc.name, error
+                    ))));
+                    return;
                 }
             };
             // Row #38: undo proxy double-encoding — `arguments` that parse to a
             // JSON string containing more JSON (a re-serialized object) unwrap
             // to the inner value instead of reaching the executor as a string
             // (which `ensure_arguments_object` would coerce to `{}`).
-            let mut layers = 0usize;
-            while layers < MAX_ARGUMENT_STRING_LAYERS {
-                let inner = match &args {
-                    serde_json::Value::String(s) => s,
-                    _ => break,
-                };
-                match serde_json::from_str::<serde_json::Value>(inner.trim()) {
-                    Ok(inner_value) => {
-                        args = inner_value;
-                        layers += 1;
-                    }
-                    // Not re-parseable (e.g. a legitimate raw string like
-                    // `"ls"`) → keep the value exactly as parsed.
-                    Err(_) => break,
-                }
-            }
+            args = crate::tool_args::unwrap_argument_string_layers(args);
             // Adaptive tool schemas: when the request was rendered with loose
             // (weak-model) schemas, the model answers in the flattened
             // dot-notation shape — re-nest before the executor or the
@@ -761,10 +760,14 @@ impl LlmProvider for OpenAiProvider {
         // arguments arrive whole. Strict models are untouched — their wire
         // output stays byte-identical (streamed).
         let mut request = request;
-        let tool_adapted = crate::adapters::schema_loose::non_streaming_transport_active(
-            self.tool_schema_mode,
+        let resolved_mode = crate::capability::resolve_tool_schema_mode(
+            self.provider_name(),
             &model,
+            self.tool_schema_mode,
+            self.advertised_tool_support,
         );
+        let tool_adapted =
+            crate::adapters::schema_loose::non_streaming_transport_active(resolved_mode, &model);
         if tool_adapted {
             if let Some(tools) = request.tools.as_mut() {
                 crate::adapters::schema_loose::adapt_tool_definitions(tools);
@@ -920,6 +923,12 @@ mod tests {
 
     fn drain(state: &mut OpenAiStreamState) -> Vec<CompletionChunk> {
         state.pending.drain(..).map(|result| result.expect("chunk emitted")).collect()
+    }
+
+    /// Unwrap a result sequence produced by [`tool_call_turn`] for the
+    /// success-path tests (any `Err` fails the test with its message).
+    fn ok_chunks(chunks: Vec<Result<CompletionChunk, ProviderError>>) -> Vec<CompletionChunk> {
+        chunks.into_iter().map(|result| result.expect("chunk emitted")).collect()
     }
 
     /// Assert that an event sequence left the content as verbatim plain text
@@ -1797,8 +1806,9 @@ mod tests {
 
     /// Reduce one whole tool-call turn — a single `arguments` fragment for
     /// `index 0` / `call_1` / `shell`, then `[DONE]` — under a [`WarnSink`]
-    /// subscriber, returning the emitted chunks and the captured warnings.
-    fn tool_call_turn(arguments: &str) -> (Vec<CompletionChunk>, WarnSink) {
+    /// subscriber, returning the emitted chunks (including any `Err`) and the
+    /// captured warnings.
+    fn tool_call_turn(arguments: &str) -> (Vec<Result<CompletionChunk, ProviderError>>, WarnSink) {
         let mut state = OpenAiStreamState::new();
         let subscriber = WarnSink::default();
         let sink = subscriber.clone();
@@ -1812,23 +1822,36 @@ mod tests {
             state.handle_event(sse(&start));
             state.handle_event(sse("[DONE]"));
         });
-        (drain(&mut state), sink)
+        (state.pending.drain(..).collect(), sink)
     }
 
-    /// Fix 3 — malformed arguments: every parse in the retry chain fails, so
-    /// the tool call still emits with `Null` arguments (no panic) and the
-    /// `tracing::warn!` fires with `tool_name`, `raw_len` and `parse_error`.
+    /// Fix 3 — malformed arguments that cannot be repaired: no tool call is
+    /// emitted with empty arguments (that would silently execute the tool with
+    /// `{}`); the stream instead surfaces an explicit `InvalidResponse` error,
+    /// and the `tracing::warn!` carries `tool_name`, `raw_len` and
+    /// `parse_error`.
     #[test]
-    fn stream_malformed_args_emit_null_and_warn() {
+    fn stream_malformed_args_fail_loudly_with_warn() {
         let payload = "this is not json";
         let (chunks, sink) = tool_call_turn(payload);
 
-        let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
-        assert_eq!(tool.id, "call_1");
-        assert_eq!(tool.name, "shell");
-        assert_eq!(tool.arguments, serde_json::Value::Null, "unrecoverable args emit Null");
-        assert!(chunks.len() >= 2, "tool-call chunk + terminal chunk");
-        assert!(chunks.last().unwrap().is_final, "terminal chunk still emitted");
+        let error = chunks
+            .iter()
+            .find_map(|item| item.as_ref().err())
+            .expect("unrecoverable args must fail the stream, not emit a tool call");
+        match error {
+            ProviderError::InvalidResponse(message) => {
+                assert!(message.contains("shell"), "error names the tool: {message}");
+            }
+            other => panic!("expected InvalidResponse, got: {other:?}"),
+        }
+        assert!(
+            chunks.iter().all(|chunk| match chunk {
+                Ok(chunk) => chunk.tool_call.is_none(),
+                Err(_) => true,
+            }),
+            "no tool call may be emitted for unrepairable arguments"
+        );
 
         let warns = sink.warns();
         assert_eq!(warns.len(), 1, "exactly one diagnostic warning");
@@ -1837,12 +1860,26 @@ mod tests {
         assert!(warns[0].parse_error.is_some(), "first strict-parse error attached");
     }
 
+    /// A truncated streamed fragment (unbalance + unterminated string) is
+    /// repaired deterministically and yields the intended argument object —
+    /// no error, no warning.
+    #[test]
+    fn stream_truncated_args_are_repaired() {
+        let (chunks, sink) = tool_call_turn(r#"{"command": "cargo test"#);
+        let chunks = ok_chunks(chunks);
+
+        let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
+        assert_eq!(tool.arguments, serde_json::json!({"command": "cargo test"}));
+        assert_eq!(sink.warns().len(), 0, "repair succeeds without a warning");
+    }
+
     /// Fix 3 — single-quote fixup recovery: the strict parse fails on
-    /// single-quoted JSON, the `'` → `"` fixup rescues it into a real object,
-    /// and no warning fires.
+    /// single-quoted JSON, the deterministic repair rescues it into a real
+    /// object, and no warning fires.
     #[test]
     fn stream_single_quote_args_are_recovered() {
         let (chunks, sink) = tool_call_turn("{'command': 'ls'}");
+        let chunks = ok_chunks(chunks);
 
         let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
         assert_eq!(tool.arguments, serde_json::json!({"command": "ls"}));
@@ -1856,6 +1893,7 @@ mod tests {
     #[test]
     fn stream_double_wrapped_trim_args_are_recovered() {
         let (chunks, sink) = tool_call_turn("  {'command': 'ls'}  ");
+        let chunks = ok_chunks(chunks);
 
         let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
         assert_eq!(tool.arguments, serde_json::json!({"command": "ls"}));
@@ -1868,6 +1906,7 @@ mod tests {
     #[test]
     fn stream_valid_json_arguments_unchanged() {
         let (chunks, sink) = tool_call_turn(r#"{"command":"ls"}"#);
+        let chunks = ok_chunks(chunks);
 
         let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
         assert_eq!(tool.arguments, serde_json::json!({"command": "ls"}));
@@ -1876,12 +1915,13 @@ mod tests {
     }
 
     /// NEG — legitimate apostrophes inside double-quoted string values are
-    /// valid JSON, so the strict parse succeeds and the single-quote fixup
+    /// valid JSON, so the strict parse succeeds and the single-quote repair
     /// never runs (the apostrophe-corruption risk identified in the spec is
     /// mitigated by construction). The payload is preserved verbatim.
     #[test]
     fn stream_string_values_with_apostrophes_are_preserved() {
         let (chunks, sink) = tool_call_turn(r#"{"message": "it's fine"}"#);
+        let chunks = ok_chunks(chunks);
 
         let tool = chunks.iter().find_map(|c| c.tool_call.as_ref()).expect("tool-call chunk");
         assert_eq!(tool.arguments, serde_json::json!({"message": "it's fine"}));

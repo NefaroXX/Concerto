@@ -125,6 +125,33 @@ const ZHIPU_KNOWN: &[&str] = &["glm-4.7", "glm-4.6", "glm-4.5", "glm-4-plus", "g
 // tail).
 const NOVITA_KNOWN: &[&str] = &[];
 
+/// Free-tier OpenCode Zen model IDs served by the Zen gateway.
+///
+/// These were retrieved live from `GET https://opencode.ai/zen/v1/models` on
+/// 2026-09-29. The catalog is hand-maintained and refreshed periodically; it
+/// is deliberately free-tier-only so the picker never advertises models that
+/// would 401 without credits. Live discovery is intentionally NOT used for
+/// this provider type (`ModelDiscoverySupport::Unsupported`): the endpoint is
+/// ungated and returns the full paid roster too, which would leak paid IDs
+/// into a free-only picker.
+///
+/// `big-pickle` is free-tier despite having no `-free` suffix; the other 11
+/// match a `free` substring.
+pub const OPENCODE_FREE_KNOWN: &[&str] = &[
+    "big-pickle",
+    "deepseek-v4-flash-free",
+    "jev-1.13-free",
+    "ling-3.0-flash-fin-free",
+    "longcat-2.5-preview-free",
+    "mimo-v2.5-free",
+    "mimo-v2.6-flash-free",
+    "muse-spark-1.2-contributor-free",
+    "muse-spark-1.3-contributor-free",
+    "nemotron-3-ultra-free",
+    "nemotron-3.5-lightning-free",
+    "space-bunny-free",
+];
+
 /// Return the [`ProviderDefinition`] for a provider type string.
 ///
 /// Unrecognized types fall back to a permissive "unknown" definition so the UI
@@ -193,6 +220,26 @@ pub fn provider_definition(provider_type: &str) -> ProviderDefinition {
             known_models: &[],
             credential_requirement: CredentialRequirement::Required,
             model_discovery: ModelDiscoverySupport::Supported,
+            allows_custom_model: true,
+        },
+        // Keyless sibling of `opencode`: same Zen gateway, same connector, but
+        // a free-only static catalog and no credential requirement, so the two
+        // entries stay independent (a paid `opencode` entry keeps its key).
+        "opencode-free" => ProviderDefinition {
+            id: "opencode-free",
+            display_name: String::from("OpenCode Zen (free)"),
+            // `big-pickle` routes to the OpenAI-compatible
+            // `/chat/completions` dialect, so it is not subject to the
+            // Responses-dialect tool-calling refusal that would make a
+            // Responses default unusable for tool-requiring tasks.
+            default_model: Some("big-pickle"),
+            known_models: OPENCODE_FREE_KNOWN,
+            credential_requirement: CredentialRequirement::None,
+            // Live discovery is intentionally unsupported: `GET
+            // https://opencode.ai/zen/v1/models` is ungated and returns the
+            // entire paid roster too, so advertising discovery here would let
+            // paid IDs leak into a free-only picker.
+            model_discovery: ModelDiscoverySupport::Unsupported,
             allows_custom_model: true,
         },
         "deepseek" => ProviderDefinition {
@@ -351,6 +398,7 @@ pub const PROVIDER_TYPE_IDS: &[&str] = &[
     "nim",
     "ollama",
     "opencode",
+    "opencode-free",
     "deepseek",
     "groq",
     "together",
@@ -606,6 +654,102 @@ mod tests {
             assert_eq!(def.id, *id);
             assert!(!def.display_name.is_empty());
         }
+    }
+
+    /// The keyless `opencode-free` type is fully defined: free-only static
+    /// catalog, no credential requirement, discovery disabled, custom models
+    /// allowed, and an OpenAI-compat default model (see the arm's comments).
+    #[test]
+    fn opencode_free_definition_is_complete() {
+        let def = provider_definition("opencode-free");
+        assert_eq!(def.id, "opencode-free");
+        assert_eq!(def.display_name, "OpenCode Zen (free)");
+        assert_eq!(def.default_model, Some("big-pickle"));
+        assert_eq!(def.credential_requirement, CredentialRequirement::None);
+        assert_eq!(def.model_discovery, ModelDiscoverySupport::Unsupported);
+        assert!(def.allows_custom_model);
+
+        let expected = [
+            "big-pickle",
+            "deepseek-v4-flash-free",
+            "jev-1.13-free",
+            "ling-3.0-flash-fin-free",
+            "longcat-2.5-preview-free",
+            "mimo-v2.5-free",
+            "mimo-v2.6-flash-free",
+            "muse-spark-1.2-contributor-free",
+            "muse-spark-1.3-contributor-free",
+            "nemotron-3-ultra-free",
+            "nemotron-3.5-lightning-free",
+            "space-bunny-free",
+        ];
+        assert_eq!(
+            def.known_models,
+            expected.as_slice(),
+            "the free-only catalog must ship exactly the 12 live-retrieved IDs"
+        );
+    }
+
+    /// `opencode-free` is a first-class picker entry, registered immediately
+    /// after the paid `opencode` entry.
+    #[test]
+    fn opencode_free_is_registered_immediately_after_opencode() {
+        let position = |id: &str| {
+            PROVIDER_TYPE_IDS
+                .iter()
+                .position(|candidate| *candidate == id)
+                .unwrap_or_else(|| panic!("{id} must be registered in PROVIDER_TYPE_IDS"))
+        };
+        assert_eq!(position("opencode-free"), position("opencode") + 1);
+    }
+
+    /// Pin the free catalog's wire routing and capability: none of the 12 IDs
+    /// routes to the Anthropic `/messages` dialect; the two `muse-spark-*`
+    /// IDs route to the Responses dialect, which now carries native tool
+    /// declarations, so every ID resolves as tool-capable.
+    #[test]
+    fn opencode_free_catalog_routing_is_pinned() {
+        let mut responses_dialect: Vec<&str> = Vec::new();
+        for model in OPENCODE_FREE_KNOWN {
+            assert!(
+                !crate::opencode::needs_anthropic_dialect(model),
+                "{model} must not route to the Anthropic /messages dialect"
+            );
+            if crate::opencode::needs_responses_api(model) {
+                responses_dialect.push(*model);
+                // Inverted from the old assertion that the Responses dialect
+                // has no native tool declarations: the converter was
+                // completed (ADR-75), so these resolve tool-capable.
+                assert!(
+                    crate::capability::resolve_tool_support("opencode-free", model, None, None),
+                    "{model} routes to the Responses dialect, whose converter now carries tools"
+                );
+                assert!(
+                    crate::capability::require_tool_support("opencode-free", model, None, None)
+                        .is_ok(),
+                    "{model} must pass the tool-support gate"
+                );
+            } else {
+                assert!(
+                    !crate::opencode::needs_responses_api(model),
+                    "{model} must stay on the OpenAI-compatible dialect"
+                );
+                assert!(
+                    crate::capability::resolve_tool_support("opencode-free", model, None, None),
+                    "{model} must not be capability-blocked for tool calling"
+                );
+                assert!(
+                    crate::capability::require_tool_support("opencode-free", model, None, None)
+                        .is_ok(),
+                    "{model} must pass the tool-support gate"
+                );
+            }
+        }
+        assert_eq!(
+            responses_dialect,
+            ["muse-spark-1.2-contributor-free", "muse-spark-1.3-contributor-free"],
+            "exactly the two muse-spark-* IDs ride the Responses dialect"
+        );
     }
 
     #[test]

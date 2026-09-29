@@ -5,8 +5,9 @@ use concerto_api_types::extension::{McpToolDescriptor, SkillDescriptor};
 use concerto_config::managed::ManagedRuntimeManager;
 use concerto_config::shell::ShellProfileConfig;
 use concerto_config::{
-    AgentRelationshipConfig, AppConfig, ConditionDef, ManagedEnvConfig, McpConfig, McpServerConfig,
-    PolicyConfig, PolicyRuleDef, ProjectContextConfig, ProviderConfig, ShellSettings, SkillsConfig,
+    AgentRelationshipConfig, AppConfig, ConditionDef, DiscoveryOutcome, ManagedEnvConfig,
+    McpConfig, McpServerConfig, PolicyConfig, PolicyRuleDef, ProjectContextConfig, ProviderConfig,
+    ShellSettings, SkillsConfig,
 };
 use concerto_providers::provider_defs::{
     picker_model_options, provider_definition, PROVIDER_TYPE_IDS,
@@ -18,8 +19,9 @@ use super::helpers::default_managed_source;
 use super::message::SectionId;
 use super::{
     readable_provider_label, CreateParentOption, ExtensionTab, Message, PolicyActionChoice,
-    PolicyConditionChoice, CUSTOM_MODEL_SENTINEL, FILESYSTEM_OPERATIONS, MAIN_SCROLL_ID,
-    POLICY_ACTIONS, POLICY_CONDITION_KINDS, POLICY_OPERATION_TOOLS, POLICY_TOOLS,
+    PolicyConditionChoice, CUSTOM_MODEL_SENTINEL, EMPTY_DISCOVERY_KEPT, EMPTY_DISCOVERY_NO_CACHE,
+    FILESYSTEM_OPERATIONS, MAIN_SCROLL_ID, POLICY_ACTIONS, POLICY_CONDITION_KINDS,
+    POLICY_OPERATION_TOOLS, POLICY_TOOLS,
 };
 
 /// A plugin installed in the canonical plugins directory, as listed by the
@@ -1444,22 +1446,33 @@ impl State {
                 self.end_provider_refresh(&provider_id);
                 match result {
                     Ok(models) => {
-                        if models.is_empty() {
-                            // The providers crate collapses every discovery
-                            // failure (network, auth, …) into an empty list.
-                            // Keep the previous cache so one offline refresh
-                            // cannot wipe the user's usable model list.
-                            self.provider_refresh_errors.insert(
-                                provider_id.clone(),
-                                "Discovery returned no models — check credentials/network."
-                                    .to_string(),
-                            );
+                        // `record_discovered_models` owns the no-clobber
+                        // contract: an empty (or blank-only) refresh never
+                        // overwrites an existing catalog and never advances
+                        // the fetch time. Judge emptiness on the same rule it
+                        // uses — after trimming — so a blank-only result is
+                        // not mistaken for a real discovery.
+                        let produced_nothing = models.iter().all(|m| m.id.trim().is_empty());
+                        let outcome = self
+                            .providers
+                            .iter_mut()
+                            .find(|p| p.id == provider_id)
+                            .map(|p| p.record_discovered_models(models));
+                        if produced_nothing {
+                            // Tell the user what actually happened instead of
+                            // letting the row read as a fresh, empty discovery:
+                            // the previous list is kept when there was one,
+                            // and the failure is reported either way.
+                            let message = if matches!(outcome, Some(DiscoveryOutcome::EmptyIgnored))
+                            {
+                                EMPTY_DISCOVERY_KEPT
+                            } else {
+                                EMPTY_DISCOVERY_NO_CACHE
+                            };
+                            self.provider_refresh_errors
+                                .insert(provider_id.clone(), message.to_string());
                         } else {
                             self.provider_refresh_errors.remove(&provider_id);
-                            if let Some(p) = self.providers.iter_mut().find(|p| p.id == provider_id)
-                            {
-                                p.record_discovered_models(models);
-                            }
                         }
                     }
                     Err(error) => {

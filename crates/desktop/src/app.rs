@@ -1543,6 +1543,12 @@ impl App {
                         return iced::Task::none();
                     }
                     self.pending_refresh.remove(provider_id);
+                    // Write the discovery into the config-side cache too. The
+                    // outcome matters here exactly as it does in the Settings
+                    // view: an empty refresh must not clobber a good catalog
+                    // in the persisted config, and the user has to be told // which happened instead of the row reading as a fresh, empty
+                    // discovery.
+                    let mut empty_ignored = false;
                     if let (Some(model_settings), Ok(models)) = (
                         self.config.as_mut().and_then(|config| config.model_settings.as_mut()),
                         result,
@@ -1550,8 +1556,20 @@ impl App {
                         if let Some(provider) =
                             model_settings.providers.iter_mut().find(|p| p.id == *provider_id)
                         {
-                            provider.record_discovered_models(models.clone());
+                            empty_ignored = matches!(
+                                provider.record_discovered_models(models.clone()),
+                                concerto_config::DiscoveryOutcome::EmptyIgnored
+                            );
                         }
+                    }
+                    if empty_ignored {
+                        // Same inline channel the Settings row renders (the
+                        // forwarded handler below writes it as well), so the // app layer itself guarantees the "previous list kept"
+                        // outcome reaches the user.
+                        self.settings.provider_refresh_errors.insert(
+                            provider_id.clone(),
+                            views::settings::EMPTY_DISCOVERY_KEPT.to_string(),
+                        );
                     }
                     let task = self
                         .settings
@@ -6750,6 +6768,69 @@ custom_agents = []
         assert!(
             app.settings.provider_refresh_errors.contains_key("prov1"),
             "an empty discovery result must be surfaced as a failure"
+        );
+    }
+
+    /// The App layer records discovery into the *config-side* cache as well as
+    /// the Settings rows. An empty refresh must not clobber that good catalog
+    /// or advance its fetch time, and the user must be told inline that the
+    /// previous list is being kept rather than seeing a fresh, empty discovery.
+    #[test]
+    fn empty_refresh_keeps_config_side_cache_and_reports_it() {
+        let (mut app, _) = App::new();
+        app.settings.providers.clear();
+        push_provider(&mut app, "prov1", "openai", "");
+        sync_config_providers(&mut app);
+
+        const SEED_FETCHED_AT: i64 = 1_700_000_000;
+        let seeded = vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()];
+        {
+            let ms = app
+                .config
+                .as_mut()
+                .expect("config present")
+                .model_settings
+                .as_mut()
+                .expect("model settings present");
+            let p = ms.providers.iter_mut().find(|p| p.id == "prov1").expect("config provider");
+            p.cached_models = seeded.clone();
+            p.cached_models_fetched_at = SEED_FETCHED_AT;
+        }
+        app.settings.providers[0].cached_models = seeded.clone();
+        app.settings.providers[0].cached_models_fetched_at = SEED_FETCHED_AT;
+
+        app.refresh_seq = 1;
+        app.pending_refresh.insert("prov1".into(), 1);
+        app.settings.begin_provider_refresh("prov1");
+        let _ = app.update(Message::Settings(SettingsMessage::ProviderModelsRefreshed {
+            provider_id: "prov1".into(),
+            request_id: 1,
+            result: Ok(Vec::new()),
+        }));
+
+        let p = app
+            .config
+            .as_ref()
+            .expect("config present")
+            .model_settings
+            .as_ref()
+            .expect("model settings present")
+            .providers
+            .iter()
+            .find(|p| p.id == "prov1")
+            .expect("config provider");
+        assert_eq!(
+            p.cached_models, seeded,
+            "an empty refresh must not clobber the config-side cached model list"
+        );
+        assert_eq!(
+            p.cached_models_fetched_at, SEED_FETCHED_AT,
+            "an ignored empty refresh must not advance the config-side fetch time"
+        );
+        assert_eq!(
+            app.settings.provider_refresh_errors.get("prov1").map(String::as_str),
+            Some(crate::views::settings::EMPTY_DISCOVERY_KEPT),
+            "the user must be told the refresh produced nothing and the previous list was kept"
         );
     }
 

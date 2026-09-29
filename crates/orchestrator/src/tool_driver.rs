@@ -260,22 +260,22 @@ struct ParsedCall {
 /// Decide whether the ADR-66 §4 text-fallback driver engages for a run.
 ///
 /// Engages automatically when the provider lacks native tool support for
-/// the model (the ADR-66 §3 resolution, no override at loop level) AND the
-/// provider is not plugin-backed — plugin providers are hard-gated to
-/// AnswerOnly tasks with an explicit error (decision (a)), so the fallback
-/// must not bypass that gate. Unknown models attempt native first and are
-/// never fallback-driven from selection time.
+/// the model (the ADR-66 §3 resolution) AND the provider is not plugin-backed
+/// — plugin providers are hard-gated to AnswerOnly tasks with an explicit
+/// error (decision (a)), so the fallback must not bypass that gate. Unknown
+/// models attempt native first and are never fallback-driven from selection
+/// time.
 ///
-/// Responses-dialect models (genuine `muse-v*` and `muse-spark-*` via the
-/// explicit dialect prefix entry, ADR-66 §5 correction) resolve to no
-/// native tool support, so the driver engages for them: it is
-/// prompt-text-based and works over any text completion, including the
-/// Responses SSE path.
-pub fn fallback_engaged(provider: &str, model: &str) -> bool {
+/// `advertised` is the provider-advertised capability for this model
+/// (ADR-66 §3 level 2), when known: `Some(false)` engages the driver even for
+/// a model whose name the last-resort heuristic would leave on the native
+/// path, so a provider that advertises its absence is not forced into native
+/// tools. `None` falls through to the optimistic provider default.
+pub fn fallback_engaged(provider: &str, model: &str, advertised: Option<bool>) -> bool {
     if concerto_providers::capability::is_plugin_backed(provider) {
         return false;
     }
-    !concerto_providers::capability::resolve_tool_support(provider, model, None, None)
+    !concerto_providers::capability::resolve_tool_support(provider, model, None, advertised)
 }
 
 /// Merge two provider-reported usage reports.
@@ -530,30 +530,32 @@ mod tests {
         assert!(request.messages[0].content.contains("## How to call a tool"));
     }
 
-    /// ADR-66 §4 engagement: engages for known tool-less families
-    /// (Zen-served Responses-dialect models — genuine Muse models and
-    /// `muse-spark-*` via the explicit prefix entry), never for plugin
-    /// providers (hard gate, decision (a)), never for capable models, and
-    /// never for near-misses without an explicit entry.
+    /// ADR-66 §4 engagement: engages when the provider/model resolves to no
+    /// native tool support — either by optimistic default or by
+    /// provider-advertised absence — never for plugin providers (hard gate,
+    /// decision (a)).
+    ///
+    /// Inverted from the old assertion that the Zen Responses-dialect models
+    /// (`muse-v2`, `muse-spark-*`) are fallback-driven: the Responses
+    /// converter now carries native tools, so they stay on the native path.
     #[test]
     fn fallback_engagement_follows_capability_resolution() {
-        assert!(fallback_engaged("opencode", "muse-v2"));
-        assert!(fallback_engaged("opencode", "muse-v3"));
-        assert!(
-            fallback_engaged("opencode", "muse-spark-1.3-contributor-free"),
-            "muse-spark-* rides the explicit Responses dialect entry: no native \
-             tool declarations, so the labeled fallback driver covers it"
-        );
-        assert!(!fallback_engaged("openai", "gpt-4o"));
-        assert!(!fallback_engaged("anthropic", "claude-sonnet-4"));
-        assert!(
-            !fallback_engaged("plugin:my-llm", "any"),
-            "plugin providers are hard-gated to AnswerOnly — the driver must not bypass it"
-        );
+        // Responses-dialect models now carry native tools: no fallback.
+        assert!(!fallback_engaged("opencode", "muse-v2", None));
+        assert!(!fallback_engaged("opencode", "muse-v3", None));
+        assert!(!fallback_engaged("opencode", "muse-spark-1.3-contributor-free", None));
+        assert!(!fallback_engaged("openai", "gpt-4o", None));
+        assert!(!fallback_engaged("anthropic", "claude-sonnet-4", None));
+        // Plugin providers are hard-gated to AnswerOnly — the driver must not
+        // bypass it, even when they advertise absence.
+        assert!(!fallback_engaged("plugin:my-llm", "any", None));
+        assert!(!fallback_engaged("plugin:my-llm", "any", Some(false)));
         // Unknown models attempt native first (provider default).
-        assert!(!fallback_engaged("opencode", "big-pickle"));
-        // Name-only near-misses without an explicit dialect entry keep
-        // native tools (provider default).
-        assert!(!fallback_engaged("opencode", "some-muse-model"));
+        assert!(!fallback_engaged("opencode", "big-pickle", None));
+        assert!(!fallback_engaged("opencode", "some-muse-model", None));
+        // Advertised absence engages the driver even for a capable-looking
+        // name — a provider that advertises its absence is believed.
+        assert!(fallback_engaged("openai", "gpt-4o", Some(false)));
+        assert!(fallback_engaged("opencode", "muse-v2", Some(false)));
     }
 }

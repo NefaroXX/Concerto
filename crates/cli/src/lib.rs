@@ -145,7 +145,9 @@ fn run_cli_inner(
                 &api_key,
                 None,
             );
-            wizard.set_available_models(models);
+            // The wizard only needs names; provider-advertised capability
+            // metadata is preserved by the config cache path, not here.
+            wizard.set_available_models(models.into_iter().map(|model| model.id).collect());
 
             // Step 4: Model picker (free-text or live list)
             let model = wizard.prompt_model(&provider_kind)?;

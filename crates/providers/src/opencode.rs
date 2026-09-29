@@ -104,13 +104,21 @@ pub(crate) fn needs_responses_api(model: &str) -> bool {
 /// resemblance.
 pub(crate) const RESPONSES_API_MODEL_PREFIXES: &[&str] = &["muse-spark-"];
 
-/// Split a model name into lowercase family tokens.
+/// Split a model name into lowercase family tokens — the **shared**
+/// tokenizer of this crate.
 ///
 /// Model ids are hyphen-delimited (`muse-v2`, `claude-sonnet-4`); the
 /// hyphen is the only family separator honored. A token is the whole
 /// dash-delimited word, so substring collisions inside larger tokens are
 /// impossible. Tokens are owned — callers keep them as a standalone list.
-fn tokenize_model_name(model: &str) -> Vec<String> {
+///
+/// Every name-based model-name decision in this crate routes through this
+/// one function: the dialect rules here ([`needs_anthropic_dialect`],
+/// [`needs_responses_api`]) and the tool-schema tier heuristic
+/// ([`crate::adapters::schema_loose::last_resort_weak_tool_calling_model`]). There
+/// must be exactly one tokenizer — do not copy this logic (ADR-66 §5:
+/// family heuristics match whole tokens, never bare substrings).
+pub(crate) fn tokenize_model_name(model: &str) -> Vec<String> {
     model.to_ascii_lowercase().split('-').map(str::to_owned).collect()
 }
 
@@ -141,6 +149,12 @@ pub struct OpenCodeZenProvider {
     /// single copy owned by `openai_inner` (see `OpenAiProvider::api_key`),
     /// so a long-lived provider keeps one zero-on-drop buffer, not two.
     tool_schema_mode: concerto_config::ToolSchemaMode,
+    /// Provider-advertised per-model tool-calling capability (ADR-66 §3
+    /// precedence level 2). `None` when the provider publishes no such
+    /// metadata. Beats the last-resort name heuristic for the Anthropic-
+    /// dialect path and is forwarded to `openai_inner` for the
+    /// OpenAI-compatible path.
+    advertised_tool_support: Option<bool>,
     /// Pre-built inner OpenAI provider for OpenAI-compatible models.
     openai_inner: OpenAiProvider,
 }
@@ -168,6 +182,7 @@ impl OpenCodeZenProvider {
             timeout_secs,
             api_base,
             tool_schema_mode: concerto_config::ToolSchemaMode::default(),
+            advertised_tool_support: None,
             openai_inner,
         }
     }
@@ -180,11 +195,11 @@ impl OpenCodeZenProvider {
 
     /// Set the tool-schema presentation mode (adaptive tool schemas).
     ///
-    /// Applies to both wire paths: the Anthropic Messages path handled here
-    /// and the OpenAI-compatible path delegated to the inner provider. The
-    /// Responses API path (Responses-dialect models, e.g. Muse and
-    /// `muse-spark-*`) carries no tool declarations at all, so there is
-    /// nothing to adapt there.
+    /// Applies to the Anthropic Messages path handled here and the
+    /// OpenAI-compatible path delegated to the inner provider. The Responses
+    /// API path renders tool declarations verbatim (strict schema): its
+    /// converter is complete, but loose-schema flattening is not applied there
+    /// — a weak model on that dialect simply keeps the verbatim schema.
     ///
     /// Defaults to [`concerto_config::ToolSchemaMode::Auto`]: weak
     /// tool-calling models (name heuristic) get loose schemas and the
@@ -194,6 +209,14 @@ impl OpenCodeZenProvider {
     pub fn with_tool_schema_mode(mut self, mode: concerto_config::ToolSchemaMode) -> Self {
         self.tool_schema_mode = mode;
         self.openai_inner = self.openai_inner.with_tool_schema_mode(mode);
+        self
+    }
+
+    /// Set the provider-advertised per-model tool-calling capability
+    /// (ADR-66 §3 precedence level 2), forwarded to both wire paths.
+    pub fn with_advertised_tool_support(mut self, advertised: Option<bool>) -> Self {
+        self.advertised_tool_support = advertised;
+        self.openai_inner = self.openai_inner.with_advertised_tool_support(advertised);
         self
     }
 
@@ -215,7 +238,11 @@ impl OpenCodeZenProvider {
     /// Build the Responses API request body for Responses-dialect models.
     ///
     /// Uses the easy input format: an array of `{role, content}` items, with
-    /// system messages carried as instructions.
+    /// system messages carried as instructions. Tool declarations are rendered
+    /// in the Responses **flat** function shape (see
+    /// [`Self::render_responses_tools`]); assistant tool calls and tool
+    /// results round-trip as `function_call` / `function_call_output` input
+    /// items so the conversation stays replayable across turns.
     fn build_responses_body(request: &CompletionRequest, model: &str) -> serde_json::Value {
         let mut instructions = String::new();
         let mut input: Vec<serde_json::Value> = Vec::new();
@@ -231,13 +258,58 @@ impl OpenCodeZenProvider {
                     input.push(serde_json::json!({"role": "user", "content": msg.content}));
                 }
                 concerto_core::types::Role::Assistant => {
-                    input.push(serde_json::json!({"role": "assistant", "content": msg.content}));
+                    let has_tool_calls =
+                        msg.tool_calls.as_ref().is_some_and(|calls| !calls.is_empty());
+                    if !has_tool_calls {
+                        // Tool-free assistant turns keep the historical shape
+                        // byte-for-byte.
+                        input
+                            .push(serde_json::json!({"role": "assistant", "content": msg.content}));
+                    } else {
+                        if !msg.content.is_empty() {
+                            input.push(serde_json::json!({
+                                "role": "assistant",
+                                "content": msg.content,
+                            }));
+                        }
+                        for call in msg.tool_calls.iter().flatten() {
+                            // Responses function-call items carry `arguments`
+                            // as a JSON-encoded string, like Chat
+                            // Completions.
+                            let arguments = serde_json::to_string(
+                                &crate::protocol::ensure_arguments_object(call.arguments.clone()),
+                            )
+                            .unwrap_or_else(|_| "{}".to_string());
+                            input.push(serde_json::json!({
+                                "type": "function_call",
+                                "call_id": call.id,
+                                "name": call.name,
+                                "arguments": arguments,
+                            }));
+                        }
+                    }
                 }
                 concerto_core::types::Role::Tool => {
-                    input.push(serde_json::json!({
-                        "role": "user",
-                        "content": format!("[tool result]\n{}", msg.content),
-                    }));
+                    let has_results =
+                        msg.tool_results.as_ref().is_some_and(|results| !results.is_empty());
+                    if !has_results {
+                        input.push(serde_json::json!({
+                            "role": "user",
+                            "content": format!("[tool result]\n{}", msg.content),
+                        }));
+                    } else {
+                        for result in msg.tool_results.iter().flatten() {
+                            let output = match &result.content {
+                                serde_json::Value::String(text) => text.clone(),
+                                other => other.to_string(),
+                            };
+                            input.push(serde_json::json!({
+                                "type": "function_call_output",
+                                "call_id": result.id,
+                                "output": output,
+                            }));
+                        }
+                    }
                 }
                 // Future `#[non_exhaustive]` variants: drop rather than fail.
                 _ => {}
@@ -254,7 +326,39 @@ impl OpenCodeZenProvider {
         if let Some(max_tokens) = request.max_tokens {
             body["max_output_tokens"] = serde_json::json!(max_tokens);
         }
+        // Tool declarations use the Responses flat function shape. Omit the
+        // key entirely when there are no tools so text-only requests stay
+        // byte-identical to before.
+        let tools = Self::render_responses_tools(request);
+        if !tools.is_empty() {
+            body["tools"] = serde_json::Value::Array(tools);
+        }
         body
+    }
+
+    /// Render `request.tools` into the OpenAI Responses **flat** function
+    /// shape: `{"type":"function","name":...,"description":...,
+    /// "parameters":{...JSON Schema...}}`.
+    ///
+    /// This is deliberately NOT the nested Chat-Completions shape
+    /// (`{"type":"function","function":{...}}`); sending the nested form to
+    /// `/responses` is rejected upstream. Returns an empty vec when the
+    /// request carries no tools.
+    fn render_responses_tools(request: &CompletionRequest) -> Vec<serde_json::Value> {
+        request
+            .tools
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "function",
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                })
+            })
+            .collect()
     }
 
     /// Stream a completion using the OpenAI Responses API dialect.
@@ -269,18 +373,11 @@ impl OpenCodeZenProvider {
         cancel: CancellationToken,
     ) -> Result<CompletionStream, ProviderError> {
         let model = self.resolve_model(&request);
-        // ADR-66 §2(b) fail-loud seam: the Responses body builder carries no
-        // tool declarations at all, so a tool-carrying request routed here
-        // would be silently degraded to text-only. Refuse instead — the
-        // harness routes tool tasks to a capable path (native or the ADR-66
-        // §4 text-fallback driver) or fails before spend.
-        if request.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
-            return Err(ProviderError::CapabilityRefused {
-                provider: "opencode".to_string(),
-                model,
-                capability: TOOL_CALLING_CAPABILITY.to_string(),
-            });
-        }
+        // The Responses body builder now renders `request.tools` natively
+        // (flat function shape) and the stream parser accumulates function
+        // calls, so there is no capability seam to guard here. The former
+        // `CapabilityRefused` guard was removed with ADR-75: it converted a
+        // converter gap into a permanent model exclusion.
         let span = tracing::info_span!(
             "provider.stream_completion",
             provider = "opencode",
@@ -388,10 +485,14 @@ impl OpenCodeZenProvider {
         // place before the dialect renders the body. Strict models are
         // untouched — their wire output stays byte-identical.
         let mut request = request;
-        let tool_adapted = crate::adapters::schema_loose::adaptive_tool_schemas_active(
-            self.tool_schema_mode,
+        let resolved_mode = crate::capability::resolve_tool_schema_mode(
+            "opencode",
             &model,
+            self.tool_schema_mode,
+            self.advertised_tool_support,
         );
+        let tool_adapted =
+            crate::adapters::schema_loose::adaptive_tool_schemas_active(resolved_mode, &model);
         if tool_adapted {
             if let Some(tools) = request.tools.as_mut() {
                 crate::adapters::schema_loose::adapt_tool_definitions(tools);
@@ -544,16 +645,73 @@ struct AnthropicStreamState {
     /// `message_delta` reports the cumulative `usage.output_tokens`. Attached
     /// to the `message_stop` terminal chunk only.
     usage: Option<CompletionUsage>,
+    /// Set when a completed tool_use block carried unrepairable arguments.
+    /// The typed error is deferred to `message_stop` so the stream still
+    /// terminates with a real error instead of silently emitting a tool call
+    /// with empty arguments (which the executor would run as `{}`).
+    tool_parse_error: Option<ProviderError>,
 }
 
+/// One in-flight function-call item in a Responses SSE stream.
+///
+/// Accumulates the metadata from `response.output_item.added`/`.done` and the
+/// argument fragments from `response.function_call_arguments.delta`, then
+/// produces exactly one [`ToolCall`] chunk.
+#[derive(Default, Clone)]
+struct ResponsesToolAccum {
+    name: String,
+    call_id: String,
+    arguments: String,
+    /// Whether a `ToolCall` chunk was already emitted for this item, so the
+    /// two event shapes (`output_item.done` AND
+    /// `function_call_arguments.done`) cannot double-emit the same call.
+    emitted: bool,
+}
+
+/// Responses-dialect SSE state.
+///
+/// Handles text streaming (`response.output_text.delta`), function-call
+/// items (`response.output_item.added`/`.done`) and their streamed arguments
+/// (`response.function_call_arguments.delta`/`.done`), and the terminal
+/// `response.completed`/`response.done`. Text-only streams see no tool events
+/// and behave byte-identically to before.
 struct ResponsesStreamState {
     parser: BufferedSseParser,
     pending: VecDeque<Result<CompletionChunk, ProviderError>>,
+    /// In-flight function-call items, keyed by the item id (falling back to
+    /// the stream's `output_index` or `item_id` when an id is absent).
+    tool_acc: HashMap<String, ResponsesToolAccum>,
+    /// Set when a completed function-call item carried unrepairable
+    /// arguments. The typed error is deferred to the terminal event so the
+    /// stream fails loudly instead of emitting a tool call with empty
+    /// arguments (which the executor would run as `{}`).
+    tool_parse_error: Option<ProviderError>,
 }
 
 impl ResponsesStreamState {
     fn new() -> Self {
-        Self { parser: BufferedSseParser::new(), pending: VecDeque::new() }
+        Self {
+            parser: BufferedSseParser::new(),
+            pending: VecDeque::new(),
+            tool_acc: HashMap::new(),
+            tool_parse_error: None,
+        }
+    }
+
+    /// A stable per-item key: the item id when present, else the event's
+    /// `item_id`, else the `output_index` (the three identifiers OpenAI
+    /// Responses events use to correlate a call with its argument deltas).
+    fn item_key(data: &serde_json::Value, item: Option<&serde_json::Value>) -> String {
+        if let Some(id) = item.and_then(|item| item["id"].as_str()).filter(|id| !id.is_empty()) {
+            return id.to_string();
+        }
+        if let Some(id) = data["item_id"].as_str().filter(|id| !id.is_empty()) {
+            return id.to_string();
+        }
+        if let Some(index) = data["output_index"].as_i64() {
+            return format!("index:{index}");
+        }
+        "function_call".to_string()
     }
 
     fn handle_event(&mut self, event: crate::sse::SseEvent) {
@@ -582,17 +740,143 @@ impl ResponsesStreamState {
                     }));
                 }
             }
-            "response.completed" | "response.done" => {
+            "response.output_item.added" => self.capture_item(&data, false),
+            "response.output_item.done" => self.capture_item(&data, true),
+            "response.function_call_arguments.delta" => self.append_arguments_delta(&data),
+            "response.function_call_arguments.done" => self.finish_arguments(&data),
+            "response.completed" | "response.done" => self.finish(),
+            _ => {}
+        }
+    }
+
+    /// Capture a `function_call` item from `response.output_item.added` or
+    /// `.done`. On `.done` the full arguments are authoritative, so the
+    /// accumulated fragments are replaced before emitting.
+    fn capture_item(&mut self, data: &serde_json::Value, done: bool) {
+        let item = &data["item"];
+        if item["type"].as_str() != Some("function_call") {
+            return;
+        }
+        let key = Self::item_key(data, Some(item));
+        let entry = self.tool_acc.entry(key.clone()).or_default();
+        if let Some(name) = item["name"].as_str().filter(|name| !name.is_empty()) {
+            entry.name = name.to_string();
+        }
+        if let Some(call_id) = item["call_id"].as_str().filter(|id| !id.is_empty()) {
+            entry.call_id = call_id.to_string();
+        }
+        if let Some(arguments) = item["arguments"].as_str() {
+            if done || entry.arguments.is_empty() {
+                entry.arguments = arguments.to_string();
+            }
+        }
+        if done {
+            self.emit_tool_call(&key);
+        }
+    }
+
+    /// Append a `response.function_call_arguments.delta` fragment.
+    fn append_arguments_delta(&mut self, data: &serde_json::Value) {
+        let key = Self::item_key(data, None);
+        let entry = self.tool_acc.entry(key).or_default();
+        if let Some(delta) = data["delta"].as_str() {
+            entry.arguments.push_str(delta);
+        }
+    }
+
+    /// Handle `response.function_call_arguments.done`: its `arguments` field
+    /// is the complete JSON, so it replaces the accumulated fragments, then
+    /// the call is emitted. This is also the emit point for providers that
+    /// send argument deltas without an `output_item.done`.
+    fn finish_arguments(&mut self, data: &serde_json::Value) {
+        let key = Self::item_key(data, None);
+        let entry = self.tool_acc.entry(key.clone()).or_default();
+        if let Some(arguments) = data["arguments"].as_str() {
+            entry.arguments = arguments.to_string();
+        }
+        if let Some(name) = data["name"].as_str().filter(|name| !name.is_empty()) {
+            entry.name = name.to_string();
+        }
+        self.emit_tool_call(&key);
+    }
+
+    /// Emit exactly one [`ToolCall`] chunk for `key`, if the accumulated
+    /// arguments can be parsed (directly or after repair). Unrepairable
+    /// arguments set [`Self::tool_parse_error`] and are surfaced as a typed
+    /// error on the terminal event — never a silent `Value::Null` tool call.
+    fn emit_tool_call(&mut self, key: &str) {
+        let Some(entry) = self.tool_acc.get(key) else { return };
+        if entry.emitted || entry.name.is_empty() {
+            return;
+        }
+        let name = entry.name.clone();
+        let id = if entry.call_id.is_empty() { key.to_string() } else { entry.call_id.clone() };
+        let arguments = entry.arguments.clone();
+        let outcome = crate::tool_args::parse_tool_arguments(&arguments);
+        if let Some(entry) = self.tool_acc.get_mut(key) {
+            entry.emitted = true;
+        }
+        match outcome {
+            Ok(crate::tool_args::ToolArgumentParse::Value(value)) => {
+                let arguments = crate::protocol::ensure_arguments_object(value);
                 self.pending.push_back(Ok(CompletionChunk {
                     reasoning: None,
                     delta: String::new(),
-                    tool_call: None,
-                    is_final: true,
+                    tool_call: Some(ToolCall { id, name, arguments, ..Default::default() }),
+                    is_final: false,
                     usage: None,
                 }));
             }
-            _ => {}
+            Ok(crate::tool_args::ToolArgumentParse::Empty) => {
+                // Argument-less tool call: coerce to `{}` as the executor
+                // contract requires (never `Null`).
+                let arguments = crate::protocol::ensure_arguments_object(serde_json::Value::Null);
+                self.pending.push_back(Ok(CompletionChunk {
+                    reasoning: None,
+                    delta: String::new(),
+                    tool_call: Some(ToolCall { id, name, arguments, ..Default::default() }),
+                    is_final: false,
+                    usage: None,
+                }));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    tool_name = %name,
+                    raw_len = error.raw_len,
+                    parse_error = %error,
+                    "tool args unrepairable; failing the stream loudly"
+                );
+                self.tool_parse_error = Some(ProviderError::InvalidResponse(format!(
+                    "provider returned unparseable tool-call arguments for '{name}': {error}"
+                )));
+            }
         }
+    }
+
+    /// Flush any remaining function-call items (a stream that only sent
+    /// `output_item.added`), then emit the terminal chunk — or the deferred
+    /// typed error if an argument object was unrepairable.
+    fn finish(&mut self) {
+        let unemitted: Vec<String> = self
+            .tool_acc
+            .iter()
+            .filter(|(_, entry)| !entry.emitted && !entry.name.is_empty())
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in unemitted {
+            self.emit_tool_call(&key);
+        }
+        if let Some(error) = self.tool_parse_error.take() {
+            self.pending.push_back(Err(error));
+            return;
+        }
+        self.pending.push_back(Ok(CompletionChunk {
+            reasoning: None,
+            delta: String::new(),
+            tool_call: None,
+            is_final: true,
+            usage: None,
+        }));
     }
 }
 
@@ -604,6 +888,7 @@ impl AnthropicStreamState {
             pending: VecDeque::new(),
             tool_adapted: false,
             usage: None,
+            tool_parse_error: None,
         }
     }
 
@@ -693,40 +978,61 @@ impl AnthropicStreamState {
                         usage: None,
                     }));
                 } else if let Some((id, name, args_str)) = self.parse.tool_acc.remove(&index) {
-                    let args_json = if args_str.trim().is_empty() {
-                        serde_json::Value::Null
-                    } else {
-                        serde_json::from_str(&args_str).unwrap_or(serde_json::Value::Null)
-                    };
-                    let mut args = crate::protocol::ensure_arguments_object(args_json);
-                    // Adaptive tool schemas: re-nest dot-notation arguments
-                    // from loose-schema streams before the executor or the
-                    // tool-call guard validates against the nested schema.
-                    if self.tool_adapted {
-                        crate::adapters::schema_loose::unflatten_tool_arguments(&mut args);
+                    match crate::tool_args::parse_tool_arguments(&args_str) {
+                        Ok(outcome) => {
+                            let args_json = match outcome {
+                                crate::tool_args::ToolArgumentParse::Value(value) => value,
+                                crate::tool_args::ToolArgumentParse::Empty => {
+                                    serde_json::Value::Null
+                                }
+                            };
+                            let mut args = crate::protocol::ensure_arguments_object(args_json);
+                            // Adaptive tool schemas: re-nest dot-notation
+                            // arguments from loose-schema streams before the
+                            // executor or the tool-call guard validates
+                            // against the nested schema.
+                            if self.tool_adapted {
+                                crate::adapters::schema_loose::unflatten_tool_arguments(&mut args);
+                            }
+                            self.pending.push_back(Ok(CompletionChunk {
+                                reasoning: None,
+                                delta: String::new(),
+                                tool_call: Some(ToolCall {
+                                    id,
+                                    name,
+                                    arguments: args,
+                                    ..Default::default()
+                                }),
+                                is_final: false,
+                                usage: None,
+                            }));
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                tool_name = %name,
+                                raw_len = error.raw_len,
+                                parse_error = %error,
+                                "tool args unrepairable; failing the stream loudly"
+                            );
+                            self.tool_parse_error = Some(ProviderError::InvalidResponse(format!(
+                                "provider returned unparseable tool-call arguments for '{name}': {error}"
+                            )));
+                        }
                     }
-                    self.pending.push_back(Ok(CompletionChunk {
-                        reasoning: None,
-                        delta: String::new(),
-                        tool_call: Some(ToolCall {
-                            id,
-                            name,
-                            arguments: args,
-                            ..Default::default()
-                        }),
-                        is_final: false,
-                        usage: None,
-                    }));
                 }
             }
             "message_stop" => {
-                self.pending.push_back(Ok(CompletionChunk {
-                    reasoning: None,
-                    delta: String::new(),
-                    tool_call: None,
-                    is_final: true,
-                    usage: self.usage.take(),
-                }));
+                if let Some(error) = self.tool_parse_error.take() {
+                    self.pending.push_back(Err(error));
+                } else {
+                    self.pending.push_back(Ok(CompletionChunk {
+                        reasoning: None,
+                        delta: String::new(),
+                        tool_call: None,
+                        is_final: true,
+                        usage: self.usage.take(),
+                    }));
+                }
             }
             _ => {}
         }
@@ -1071,13 +1377,21 @@ mod tests {
         assert!(!needs_anthropic_dialect("big-pickle"));
     }
 
-    /// ADR-66 §2(b) fail-loud seam: a tool-carrying request routed to the
-    /// Responses dialect must error before any network I/O — never silently
-    /// drop the tool declarations.
-    #[tokio::test]
-    async fn responses_path_refuses_tool_declarations() {
-        let p = OpenCodeZenProvider::new("key".to_string(), "muse-v2".into(), 30);
-        let request = CompletionRequest {
+    // -----------------------------------------------------------------------
+    // Responses-dialect tool converter (ADR-75)
+    // -----------------------------------------------------------------------
+
+    fn responses_event(event_type: &str, data: &str) -> crate::sse::SseEvent {
+        crate::sse::SseEvent {
+            event: Some(event_type.to_string()),
+            data: Some(data.to_string()),
+            id: None,
+            keepalive: false,
+        }
+    }
+
+    fn tool_request() -> CompletionRequest {
+        CompletionRequest {
             model: "muse-v2".into(),
             messages: vec![concerto_core::types::Message {
                 role: concerto_core::types::Role::User,
@@ -1089,51 +1403,369 @@ mod tests {
                 tokens_out: None,
             }],
             tools: Some(vec![concerto_core::types::ToolDefinition {
-                name: "filesystem".into(),
-                description: "File ops.".into(),
-                parameters: serde_json::json!({"type": "object", "properties": {}}),
+                name: "shell".into(),
+                description: "Run a command.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                }),
             }]),
             ..Default::default()
-        };
-        let result = p.stream_completion(request, concerto_core::CancellationToken::new()).await;
-        let Err(error) = result else {
-            panic!("tool-carrying Responses request must be refused");
-        };
-        match error {
-            ProviderError::CapabilityRefused { provider, model, capability } => {
-                assert_eq!(provider, "opencode");
-                assert_eq!(model, "muse-v2");
-                assert_eq!(capability, "tool_calling");
-            }
-            other => panic!("expected CapabilityRefused, got: {other:?}"),
         }
     }
 
-    /// A tool-free request to a Muse model does NOT hit the refusal seam
-    /// (the guard must not fire on absent or empty tool lists).
+    /// The Responses request body renders tools in the **flat** function
+    /// shape (`{"type":"function","name":...,"parameters":...}`), NOT the
+    /// nested Chat-Completions shape (`{"function":{...}}`).
+    #[test]
+    fn responses_body_renders_flat_function_tools() {
+        let request = tool_request();
+        let body = OpenCodeZenProvider::build_responses_body(&request, "muse-v2");
+        let tools = body["tools"].as_array().expect("tools array present");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "shell");
+        assert_eq!(tools[0]["description"], "Run a command.");
+        assert_eq!(tools[0]["parameters"]["required"][0], "command");
+        assert!(tools[0].get("function").is_none(), "Responses uses the flat shape");
+    }
+
+    /// No tools ⇒ the `tools` key is omitted entirely (text-only body stays
+    /// byte-identical to before the converter was completed).
+    #[test]
+    fn responses_body_omits_tools_key_when_absent() {
+        let request = CompletionRequest {
+            model: "muse-v2".into(),
+            messages: vec![concerto_core::types::Message {
+                role: concerto_core::types::Role::User,
+                content: "hello".into(),
+                tool_calls: None,
+                tool_results: None,
+                reasoning_content: None,
+                tokens_in: None,
+                tokens_out: None,
+            }],
+            ..Default::default()
+        };
+        let body = OpenCodeZenProvider::build_responses_body(&request, "muse-v2");
+        assert!(body.get("tools").is_none(), "no tools => no tools key");
+        assert_eq!(body["input"][0]["role"], "user");
+        assert_eq!(body["input"][0]["content"], "hello");
+    }
+
+    /// Assistant tool calls and tool results round-trip as Responses
+    /// `function_call` / `function_call_output` input items.
+    #[test]
+    fn responses_body_round_trips_tool_call_and_output() {
+        let request = CompletionRequest {
+            model: "muse-v2".into(),
+            messages: vec![
+                concerto_core::types::Message {
+                    role: concerto_core::types::Role::Assistant,
+                    content: String::new(),
+                    tool_calls: Some(vec![ToolCall {
+                        id: "call_1".into(),
+                        name: "shell".into(),
+                        arguments: serde_json::json!({"command": "ls"}),
+                        ..Default::default()
+                    }]),
+                    tool_results: None,
+                    reasoning_content: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                },
+                concerto_core::types::Message {
+                    role: concerto_core::types::Role::Tool,
+                    content: "file-a\nfile-b".into(),
+                    tool_calls: None,
+                    tool_results: Some(vec![concerto_core::types::ToolResult {
+                        id: "call_1".into(),
+                        name: "shell".into(),
+                        content: serde_json::json!("file-a\nfile-b"),
+                    }]),
+                    reasoning_content: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let body = OpenCodeZenProvider::build_responses_body(&request, "muse-v2");
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[0]["call_id"], "call_1");
+        assert_eq!(input[0]["name"], "shell");
+        assert_eq!(input[0]["arguments"], "{\"command\":\"ls\"}");
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[1]["call_id"], "call_1");
+        assert_eq!(input[1]["output"], "file-a\nfile-b");
+    }
+
+    /// A scripted Responses SSE stream (output_item.done carrying the
+    /// function_call) yields exactly one `ToolCall` with the accumulated
+    /// arguments, then the terminal chunk.
+    #[test]
+    fn responses_stream_emits_tool_call_from_output_item_done() {
+        let mut state = ResponsesStreamState::new();
+        state.handle_event(responses_event(
+            "response.output_item.added",
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"shell","arguments":""}}"#,
+        ));
+        state.handle_event(responses_event(
+            "response.function_call_arguments.delta",
+            r#"{"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"command\":"}"#,
+        ));
+        state.handle_event(responses_event(
+            "response.function_call_arguments.delta",
+            r#"{"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"\"ls\"}"}"#,
+        ));
+        state.handle_event(responses_event(
+            "response.output_item.done",
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"shell","arguments":"{\"command\":\"ls\"}"}}"#,
+        ));
+        state.handle_event(responses_event(
+            "response.completed",
+            r#"{"type":"response.completed"}"#,
+        ));
+
+        let chunks: Vec<CompletionChunk> = state.pending.drain(..).map(|r| r.unwrap()).collect();
+        assert_eq!(chunks.len(), 2, "one tool call + terminal chunk");
+        let call = chunks[0].tool_call.as_ref().expect("tool call emitted");
+        assert_eq!(call.id, "call_1");
+        assert_eq!(call.name, "shell");
+        assert_eq!(call.arguments, serde_json::json!({"command": "ls"}));
+        assert!(chunks[1].is_final);
+    }
+
+    /// Argument deltas accumulate to the whole JSON when the stream emits
+    /// `function_call_arguments.done` (no `output_item.done`).
+    #[test]
+    fn responses_stream_accumulates_argument_deltas() {
+        let mut state = ResponsesStreamState::new();
+        state.handle_event(responses_event(
+            "response.output_item.added",
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_2","call_id":"call_2","name":"write","arguments":""}}"#,
+        ));
+        for delta in
+            [r#"{"path":"#.to_string(), r#""a.txt","content":"#.to_string(), r#""hi"}"#.to_string()]
+        {
+            let data = serde_json::json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_2",
+                "delta": delta,
+            })
+            .to_string();
+            state.handle_event(responses_event("response.function_call_arguments.delta", &data));
+        }
+        state.handle_event(responses_event(
+            "response.function_call_arguments.done",
+            r#"{"type":"response.function_call_arguments.done","item_id":"fc_2","arguments":"{\"path\":\"a.txt\",\"content\":\"hi\"}"}"#,
+        ));
+
+        let chunks: Vec<CompletionChunk> = state.pending.drain(..).map(|r| r.unwrap()).collect();
+        let call = chunks[0].tool_call.as_ref().unwrap();
+        assert_eq!(call.arguments, serde_json::json!({"path": "a.txt", "content": "hi"}));
+    }
+
+    /// Truncated streamed arguments are repaired by `tool_args` before the
+    /// `ToolCall` is emitted (never a `Value::Null` with an empty object).
+    #[test]
+    fn responses_stream_repairs_truncated_arguments() {
+        let mut state = ResponsesStreamState::new();
+        state.handle_event(responses_event(
+            "response.output_item.added",
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_3","call_id":"call_3","name":"shell","arguments":""}}"#,
+        ));
+        state.handle_event(responses_event(
+            "response.output_item.done",
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_3","call_id":"call_3","name":"shell","arguments":"{\"command\":\"cargo te"}}"#,
+        ));
+
+        let chunks: Vec<CompletionChunk> = state.pending.drain(..).map(|r| r.unwrap()).collect();
+        let call = chunks[0].tool_call.as_ref().unwrap();
+        assert_eq!(call.name, "shell");
+        assert_eq!(call.arguments, serde_json::json!({"command": "cargo te"}));
+    }
+
+    /// Unrepairable arguments surface as `ProviderError::InvalidResponse` on
+    /// the terminal event — never a tool call with silently-empty arguments.
+    #[test]
+    fn responses_stream_unrepairable_arguments_fail_loudly() {
+        let mut state = ResponsesStreamState::new();
+        state.handle_event(responses_event(
+            "response.output_item.added",
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_4","call_id":"call_4","name":"shell","arguments":""}}"#,
+        ));
+        state.handle_event(responses_event(
+            "response.function_call_arguments.done",
+            r#"{"type":"response.function_call_arguments.done","item_id":"fc_4","arguments":"this is not json at all"}"#,
+        ));
+        state.handle_event(responses_event(
+            "response.completed",
+            r#"{"type":"response.completed"}"#,
+        ));
+
+        let chunks: Vec<Result<CompletionChunk, ProviderError>> = state.pending.drain(..).collect();
+        assert!(
+            chunks.iter().all(|chunk| chunk.as_ref().map_or(true, |c| c.tool_call.is_none())),
+            "no tool call may be emitted from unparseable arguments: {chunks:?}"
+        );
+        let error = chunks.last().unwrap().as_ref().expect_err("terminal chunk is an error");
+        assert!(matches!(error, ProviderError::InvalidResponse(_)), "got: {error:?}");
+    }
+
+    /// The two event shapes describing the same call (`function_call_arguments
+    /// .done` AND `output_item.done`) must not double-emit.
+    #[test]
+    fn responses_stream_does_not_double_emit() {
+        let mut state = ResponsesStreamState::new();
+        state.handle_event(responses_event(
+            "response.output_item.added",
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_5","call_id":"call_5","name":"shell","arguments":""}}"#,
+        ));
+        state.handle_event(responses_event(
+            "response.function_call_arguments.done",
+            r#"{"type":"response.function_call_arguments.done","item_id":"fc_5","arguments":"{\"command\":\"ls\"}"}"#,
+        ));
+        state.handle_event(responses_event(
+            "response.output_item.done",
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_5","call_id":"call_5","name":"shell","arguments":"{\"command\":\"ls\"}"}}"#,
+        ));
+
+        let tool_calls: Vec<_> =
+            state.pending.iter().flatten().filter(|chunk| chunk.tool_call.is_some()).collect();
+        assert_eq!(tool_calls.len(), 1, "the same call must be emitted exactly once");
+    }
+
+    /// Text-only Responses streaming is unchanged: text deltas pass through
+    /// and a tool-free completion yields only the terminal chunk.
+    #[test]
+    fn responses_text_only_stream_unchanged() {
+        let mut state = ResponsesStreamState::new();
+        state.handle_event(responses_event(
+            "response.output_text.delta",
+            r#"{"type":"response.output_text.delta","delta":"Hello"}"#,
+        ));
+        state.handle_event(responses_event(
+            "response.output_text.delta",
+            r#"{"type":"response.output_text.delta","delta":" world"}"#,
+        ));
+        state.handle_event(responses_event(
+            "response.completed",
+            r#"{"type":"response.completed"}"#,
+        ));
+
+        let chunks: Vec<CompletionChunk> = state.pending.drain(..).map(|r| r.unwrap()).collect();
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].delta, "Hello");
+        assert_eq!(chunks[1].delta, " world");
+        assert!(chunks.iter().all(|chunk| chunk.tool_call.is_none()));
+        assert!(chunks[2].is_final);
+    }
+
+    /// Contract fixture: the full Responses tool round trip — tools rendered
+    /// in, a recorded SSE tool call parsed out, and the result rendered back as
+    /// a `function_call_output` on the next request. A converter that silently
+    /// drops any leg fails this test.
+    #[test]
+    fn responses_dialect_tool_round_trip_contract_fixture() {
+        // Leg 1 — tools in: the flat function shape is on the wire.
+        let first = tool_request();
+        let body = OpenCodeZenProvider::build_responses_body(&first, "muse-v2");
+        let tools = body["tools"].as_array().expect("tools declared");
+        assert_eq!(tools[0]["name"], "shell");
+        assert!(tools[0].get("function").is_none(), "flat Responses shape");
+
+        // Leg 2 — tool call out: a recorded SSE function-call stream yields
+        // one ToolCall with the accumulated arguments.
+        let mut state = ResponsesStreamState::new();
+        for (event_type, data) in [
+            (
+                "response.output_item.added",
+                r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_9","call_id":"call_9","name":"shell","arguments":""}}"#,
+            ),
+            (
+                "response.function_call_arguments.delta",
+                r#"{"type":"response.function_call_arguments.delta","item_id":"fc_9","delta":"{\"command\":"}"#,
+            ),
+            (
+                "response.function_call_arguments.delta",
+                r#"{"type":"response.function_call_arguments.delta","item_id":"fc_9","delta":"\"ls\"}"}"#,
+            ),
+            (
+                "response.output_item.done",
+                r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_9","call_id":"call_9","name":"shell","arguments":"{\"command\":\"ls\"}"}}"#,
+            ),
+            ("response.completed", r#"{"type":"response.completed"}"#),
+        ] {
+            state.handle_event(responses_event(event_type, data));
+        }
+        let chunks: Vec<CompletionChunk> = state.pending.drain(..).map(|r| r.unwrap()).collect();
+        let call = chunks[0].tool_call.clone().expect("tool call parsed from SSE");
+        assert_eq!(call.id, "call_9");
+        assert_eq!(call.name, "shell");
+        assert_eq!(call.arguments, serde_json::json!({"command": "ls"}));
+
+        // Leg 3 — result back in: the assistant call and its tool result
+        // render as function_call / function_call_output items.
+        let follow_up = CompletionRequest {
+            model: "muse-v2".into(),
+            messages: vec![
+                concerto_core::types::Message {
+                    role: concerto_core::types::Role::Assistant,
+                    content: String::new(),
+                    tool_calls: Some(vec![call.clone()]),
+                    tool_results: None,
+                    reasoning_content: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                },
+                concerto_core::types::Message {
+                    role: concerto_core::types::Role::Tool,
+                    content: "file-a".into(),
+                    tool_calls: None,
+                    tool_results: Some(vec![concerto_core::types::ToolResult {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                        content: serde_json::json!("file-a"),
+                    }]),
+                    reasoning_content: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                },
+            ],
+            tools: first.tools.clone(),
+            ..Default::default()
+        };
+        let body = OpenCodeZenProvider::build_responses_body(&follow_up, "muse-v2");
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[0]["call_id"], "call_9");
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[1]["call_id"], "call_9");
+    }
+
+    /// Inverted from the removed `responses_path_refuses_tool_declarations`:
+    /// a tool-carrying request routed to the Responses dialect no longer
+    /// refuses. With an unroutable local base it fails at the network
+    /// boundary (never `CapabilityRefused`), proving the converter is reached.
     #[tokio::test]
-    async fn responses_path_accepts_tool_free_request_guard_only() {
+    async fn responses_path_no_longer_refuses_tool_declarations() {
         let p = OpenCodeZenProvider::with_api_base(
             "key".to_string(),
             "muse-v2".into(),
             30,
-            // Unroutable local port: the connection fails fast and locally,
-            // keeping this test network-free.
             "http://127.0.0.1:1".into(),
         );
-        let request = CompletionRequest {
-            model: "muse-v2".into(),
-            messages: Vec::new(),
-            tools: None,
-            ..Default::default()
-        };
+        let request = tool_request();
         let result = p.stream_completion(request, concerto_core::CancellationToken::new()).await;
         let Err(error) = result else {
             panic!("no server in tests — the request must fail");
         };
         assert!(
             !matches!(error, ProviderError::CapabilityRefused { .. }),
-            "tool-less request must not be capability-refused: {error:?}"
+            "tool-carrying Responses request must not be capability-refused: {error:?}"
         );
     }
 }

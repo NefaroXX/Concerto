@@ -19,6 +19,11 @@ pub struct OllamaProvider {
     /// request against the actual model name; `Auto` (default) keeps every
     /// non-weak model on the verbatim strict schema.
     tool_schema_mode: concerto_config::ToolSchemaMode,
+    /// Provider-advertised per-model tool-calling capability (ADR-66 §3
+    /// precedence level 2) — Ollama publishes `capabilities` containing
+    /// `"tools"` in its model listing. `None` when unknown; beats the
+    /// last-resort name heuristic.
+    advertised_tool_support: Option<bool>,
 }
 
 impl OllamaProvider {
@@ -29,6 +34,7 @@ impl OllamaProvider {
             timeout_secs,
             dialect: OllamaChatDialect,
             tool_schema_mode: concerto_config::ToolSchemaMode::default(),
+            advertised_tool_support: None,
         }
     }
 
@@ -47,6 +53,13 @@ impl OllamaProvider {
     /// output. See `crate::adapters::schema_loose`.
     pub fn with_tool_schema_mode(mut self, mode: concerto_config::ToolSchemaMode) -> Self {
         self.tool_schema_mode = mode;
+        self
+    }
+
+    /// Set the provider-advertised per-model tool-calling capability
+    /// (ADR-66 §3 precedence level 2).
+    pub fn with_advertised_tool_support(mut self, advertised: Option<bool>) -> Self {
+        self.advertised_tool_support = advertised;
         self
     }
 }
@@ -143,10 +156,14 @@ impl LlmProvider for OllamaProvider {
         // arguments arrive whole. Strict models are untouched — their wire
         // output stays byte-identical (streamed).
         let mut request = request;
-        let tool_adapted = crate::adapters::schema_loose::non_streaming_transport_active(
-            self.tool_schema_mode,
+        let resolved_mode = crate::capability::resolve_tool_schema_mode(
+            "ollama",
             &model,
+            self.tool_schema_mode,
+            self.advertised_tool_support,
         );
+        let tool_adapted =
+            crate::adapters::schema_loose::non_streaming_transport_active(resolved_mode, &model);
         if tool_adapted {
             if let Some(tools) = request.tools.as_mut() {
                 crate::adapters::schema_loose::adapt_tool_definitions(tools);
@@ -284,9 +301,12 @@ impl LlmProvider for OllamaProvider {
 /// Both transports share this shape: streaming emits one NDJSON object per
 /// line, and a non-streamed response (`stream: false`, the weak-model tier)
 /// is a single JSON object carrying the full `message` and `done: true`.
-/// Tool-call arguments arrive as complete JSON values in both cases, so
-/// loose-schema dot-notation keys are re-nested here whenever the request
-/// was rendered with adapted schemas.
+/// Tool-call arguments arrive as complete, already-parsed JSON values in both
+/// cases (Ollama never accumulates a JSON *string* from fragments), so this
+/// connector has no string-parse failure path and cannot exhibit
+/// streamed-argument truncation; the shared [`crate::tool_args`] repair module
+/// is therefore not wired here. Loose-schema dot-notation keys are re-nested
+/// whenever the request was rendered with adapted schemas.
 ///
 /// `usage` accumulates the provider-reported token counts (ADR-48 §4) across
 /// lines: Ollama emits `prompt_eval_count` / `eval_count` on every streamed
