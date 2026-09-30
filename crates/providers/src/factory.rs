@@ -185,6 +185,31 @@ impl ProviderFactory {
             return Ok(Self::with_context_guard(provider, &config.model));
         }
 
+        // `opencode-free-tier` port of OpenCode's unauthenticated `opencode`
+        // provider: a key is optional. When one resolves it is used verbatim;
+        // when none does the connector carries the literal `public`
+        // credential (see `crate::credential`). This returns BEFORE the shared
+        // key resolution so a keyless config cannot fail closed. Compiled out
+        // entirely when the feature is off, where `opencode-free` keeps the
+        // Go-relay, required-credential behaviour below.
+        #[cfg(feature = "opencode-free-tier")]
+        if config.provider == "opencode-free" {
+            let key = config.effective_api_key(creds).unwrap_or_default();
+            let base =
+                OpenCodeZenProvider::resolve_api_base(&config.provider, config.api_base.as_deref());
+            let provider = OpenCodeZenProvider::with_api_base(
+                key,
+                config.model.clone(),
+                config.timeout_seconds,
+                base,
+            )
+            .with_free_tier(true)
+            .with_tool_schema_mode(resolve_tool_schema_mode(config))
+            .with_advertised_tool_support(advertised_tool_support);
+            let provider: Arc<dyn LlmProvider> = Arc::new(provider);
+            return Ok(Self::with_context_guard(provider, &config.model));
+        }
+
         // Key-based providers. The keyring-then-`<PROVIDER>_API_KEY` resolution
         // lives in `ProviderConfig::effective_api_key` so `concerto health`
         // and the run path agree on whether a key is present. The original
@@ -1635,6 +1660,10 @@ mod tests {
     /// first network call — the silent-unusable failure. It now resolves the
     /// key through the shared path and fails closed with `CredentialMissing`,
     /// exactly like every other key-based type.
+    ///
+    /// Feature-off only: with `opencode-free-tier` ON, keyless is the whole
+    /// point (see `build_opencode_free_keyless_free_tier_builds`).
+    #[cfg(not(feature = "opencode-free-tier"))]
     #[test]
     fn build_opencode_free_without_credential_fails_closed() {
         // `blocking_lock` is safe here: this is a plain `#[test]`, outside
@@ -1663,6 +1692,39 @@ mod tests {
         assert!(
             matches!(error, ProviderError::CredentialMissing { .. }),
             "capability build must fail closed with CredentialMissing, got {error:?}"
+        );
+    }
+
+    /// Feature-on: a keyless `opencode-free` config builds (that is the free
+    /// tier), and its requests carry the literal `Bearer public` credential
+    /// that the server maps to its anonymous path.
+    #[cfg(feature = "opencode-free-tier")]
+    #[tokio::test]
+    async fn build_opencode_free_keyless_free_tier_builds() {
+        let _env = OPENCODE_FREE_ENV_LOCK.lock().await;
+        let _restored = RestoreEnvVar::without(OPENCODE_FREE_ENV_KEY);
+        let (base, req_rx) = crate::testing::mock_server::spawn(String::new());
+        let mut config = uncredentialed_opencode_free_config();
+        config.api_base = Some(base.clone());
+        let creds = test_creds();
+
+        assert!(config.effective_api_key(&creds).is_err(), "no key may resolve for this config");
+
+        let provider = ProviderFactory::build(&config, &creds)
+            .expect("a keyless opencode-free config must build in free-tier mode");
+        assert_eq!(provider.provider_name(), "opencode");
+
+        provider
+            .test_connection(concerto_core::CancellationToken::new())
+            .await
+            .expect("the connection test must reach the overridden api_base");
+        let raw = req_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the mock endpoint must capture exactly one request");
+        let headers = crate::testing::mock_server::request_headers(&raw);
+        assert!(
+            headers.contains("authorization: bearer public"),
+            "keyless free-tier requests must carry the literal `public` credential: {headers}"
         );
     }
 

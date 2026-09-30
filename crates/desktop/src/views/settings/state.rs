@@ -10,7 +10,7 @@ use concerto_config::{
     ShellSettings, SkillsConfig,
 };
 use concerto_providers::provider_defs::{
-    picker_model_options, provider_definition, PROVIDER_TYPE_IDS,
+    picker_model_options_for, provider_definition, PROVIDER_TYPE_IDS,
 };
 
 use crate::theme::AppTheme;
@@ -964,8 +964,12 @@ impl State {
     /// Model options for a provider: the shared picker resolver (selected /
     /// default / static known models, plus discovered `cached_models` and
     /// config-first `extra_models`) [ADR-57 §3d].
-    fn model_options_with_discovered(p: &ProviderConfig) -> Vec<String> {
-        picker_model_options(p)
+    ///
+    /// `credential_present` drives the keyless free-tier gate: a keyless
+    /// `opencode-free` picker lists only catalog-free models (see
+    /// `picker_model_options_for`). It is a no-op with the feature off.
+    fn model_options_with_discovered(p: &ProviderConfig, credential_present: bool) -> Vec<String> {
+        picker_model_options_for(p, credential_present)
     }
 
     fn rebuild_cache(&mut self) {
@@ -980,12 +984,17 @@ impl State {
         self.cached_provider_ids = providers.iter().map(|p| p.id.clone()).collect();
         self.cached_provider_labels = providers.iter().map(readable_provider_label).collect();
 
+        // One credential store for the whole rebuild: the free-tier picker
+        // gate needs to know whether each provider has a usable key.
+        let creds = concerto_config::CredentialStore::new();
+        let credential_present = |p: &ProviderConfig| creds.exists(&p.keyring_key);
+
         // Precompute the shared model-option lists so the `pick_list` widgets
         // can borrow them for the view lifetime `'a`.
         self.cached_provider_model_options = providers
             .iter()
             .map(|p| {
-                let mut opts = Self::model_options_with_discovered(p);
+                let mut opts = Self::model_options_with_discovered(p, credential_present(p));
                 opts.push(CUSTOM_MODEL_SENTINEL.to_string());
                 opts
             })
@@ -998,7 +1007,8 @@ impl State {
         self.cached_models_by_provider.clear();
         self.cached_model_names.clear();
         for provider in providers {
-            let models = Self::model_options_with_discovered(provider);
+            let models =
+                Self::model_options_with_discovered(provider, credential_present(provider));
             self.cached_models_by_provider
                 .entry(provider.id.clone())
                 .or_default()

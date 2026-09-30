@@ -26,6 +26,7 @@ pub mod anthropic;
 pub mod capability;
 pub mod cerebras;
 pub mod cohere;
+pub(crate) mod credential;
 pub mod dashscope;
 pub mod deepinfra;
 pub mod deepseek;

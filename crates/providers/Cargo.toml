@@ -8,6 +8,16 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# Opt-in port of OpenCode's unauthenticated ("free tier") provider behaviour.
+#
+# OFF by default: with the flag off every code path is byte-identical to the
+# shipped behaviour. ON, `opencode-free` targets the Zen relay, resolves a
+# keyless credential to the literal `public`, classifies free-ness from the
+# catalog's `cost.input == 0`, and lists only free models while keyless.
+opencode-free-tier = []
+
 [dependencies]
 concerto-core = { path = "../core", version = "0.1.0" }
 concerto-config = { path = "../config", version = "0.1.0" }

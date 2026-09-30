@@ -54,6 +54,14 @@ pub struct OpenAiProvider {
     /// headers — `OpenCodeZenProvider` uses it for `x-opencode-session`
     /// (backend/prompt-cache affinity, see `crate::opencode`).
     extra_headers: Vec<(String, String)>,
+    /// Whether this connector is serving OpenCode's unauthenticated free tier.
+    ///
+    /// `false` for every provider by default, which keeps the wire output
+    /// byte-identical. When `true` and no key is configured, the request
+    /// carries the literal `public` credential and free-tier HTTP failures get
+    /// their own honest states — see [`crate::credential`]. Set only by
+    /// `OpenCodeZenProvider` under the `opencode-free-tier` feature.
+    free_tier: bool,
     dialect: OpenAiChatDialect,
 }
 
@@ -69,6 +77,7 @@ impl OpenAiProvider {
             advertised_tool_support: None,
             usage_request: UsageRequest::Off,
             extra_headers: Vec::new(),
+            free_tier: false,
             dialect: OpenAiChatDialect,
         }
     }
@@ -76,6 +85,25 @@ impl OpenAiProvider {
     pub fn with_api_base(mut self, api_base: String) -> Self {
         self.api_base = api_base;
         self
+    }
+
+    /// Enable OpenCode's unauthenticated free-tier wire behaviour on this
+    /// connector (see [`crate::credential`]).
+    ///
+    /// Only `OpenCodeZenProvider` sets this, under the `opencode-free-tier`
+    /// feature. The default is `false`, so every other provider — and the
+    /// feature-off OpenCode path — is unchanged. Feature-gated so the
+    /// feature-off build has no unused method.
+    #[cfg(feature = "opencode-free-tier")]
+    pub(crate) fn with_free_tier(mut self, free_tier: bool) -> Self {
+        self.free_tier = free_tier;
+        self
+    }
+
+    /// The wire credential this request should carry (see
+    /// [`crate::credential::resolve_wire_credential`]).
+    fn wire_credential(&self) -> crate::credential::WireCredential<'_> {
+        crate::credential::resolve_wire_credential(self.api_key.expose(), self.free_tier)
     }
 
     /// The credential this connector authenticates with, borrowed.
@@ -707,8 +735,9 @@ impl LlmProvider for OpenAiProvider {
     async fn test_connection(&self, _cancel: CancellationToken) -> Result<(), ProviderError> {
         let client = crate::new_client(self.timeout_secs);
         let url = format!("{}/models", self.api_base);
+        let credential = self.wire_credential();
         let resp = self
-            .apply_extra_headers(client.get(&url).bearer_auth(self.api_key.expose()))
+            .apply_extra_headers(client.get(&url).bearer_auth(credential.expose()))
             .send()
             .await
             .map_err(|e| {
@@ -732,8 +761,9 @@ impl LlmProvider for OpenAiProvider {
     ) -> Result<Vec<ModelInfo>, ProviderError> {
         let client = crate::new_client(self.timeout_secs);
         let url = format!("{}/models", self.api_base);
+        let credential = self.wire_credential();
         let resp = self
-            .apply_extra_headers(client.get(&url).bearer_auth(self.api_key.expose()))
+            .apply_extra_headers(client.get(&url).bearer_auth(credential.expose()))
             .send()
             .await
             .map_err(|e| {
@@ -826,6 +856,11 @@ impl LlmProvider for OpenAiProvider {
         let non_streamed = !request.stream;
 
         let body = self.render_body(&request, &model);
+        // The credential is resolved once for the request so the auth header
+        // and the error mapping agree on whether this is the anonymous
+        // free-tier path (see `crate::credential`).
+        let credential = self.wire_credential();
+        let anonymous = credential.is_anonymous();
 
         let response = tokio::select! {
             _ = cancel.cancelled() => Err(ProviderError::Cancelled),
@@ -833,7 +868,7 @@ impl LlmProvider for OpenAiProvider {
                 self.apply_extra_headers(
                     client
                         .post(&url)
-                        .header("Authorization", format!("Bearer {}", self.api_key.expose()))
+                        .bearer_auth(credential.expose())
                         .header("Content-Type", "application/json")
                         .json(&body),
                 )
@@ -847,7 +882,13 @@ impl LlmProvider for OpenAiProvider {
             let status = response.status();
             let retry_after = crate::retry::parse_retry_after(response.headers());
             let text = response.text().await.unwrap_or_default();
-            return Err(crate::retry::map_http_error(status, &text, retry_after));
+            return Err(crate::credential::map_opencode_http_error(
+                status,
+                &text,
+                retry_after,
+                self.free_tier,
+                anonymous,
+            ));
         }
 
         let mut state = OpenAiStreamState::new();

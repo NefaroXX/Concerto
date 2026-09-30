@@ -176,6 +176,23 @@ pub fn classify_provider_error(error: &ProviderError) -> RetryDecision {
             reason: format!("provider {phase} timeout"),
         },
 
+        // Free-tier refusal is a policy decision, not a throttle: the
+        // anonymous daily cap (429 + `retry-after`) cannot succeed by
+        // retrying, and a per-model eligibility refusal (403) will not heal
+        // either. Non-retryable by construction, with the provider's wait
+        // hint preserved for the user-facing message. Treating the cap as a
+        // retryable `RateLimit` would clamp its multi-hour `retry-after` to
+        // the local max and hammer a daily budget that cannot be refreshed.
+        ProviderError::FreeTierRefused { retry_after, .. } => RetryDecision {
+            retryable: false,
+            class: None,
+            provider_delay: *retry_after,
+            reason: match retry_after {
+                Some(_) => "OpenCode free-tier anonymous daily limit reached".into(),
+                None => "OpenCode free-tier model requires an OpenCode-signed session".into(),
+            },
+        },
+
         ProviderError::Cancelled => RetryDecision {
             retryable: false,
             class: None,
@@ -933,6 +950,37 @@ mod tests {
         });
         assert!(d.retryable, "429 should be retryable");
         assert_eq!(d.class, Some(RetryClass::RateLimited));
+    }
+
+    /// The OpenCode free-tier anonymous daily cap (429 + a ~13.5h
+    /// `retry-after`) must NOT be retried: clamping its hint to the local
+    /// max and hammering cannot succeed. Its wait hint is preserved.
+    #[test]
+    fn free_tier_daily_cap_is_not_retried() {
+        let error = ProviderError::FreeTierRefused {
+            retry_after: Some(Duration::from_secs(48_700)),
+            message: "FreeUsageLimitError".into(),
+        };
+        let decision = classify_provider_error(&error);
+        assert!(!decision.retryable, "the daily cap must not burn retries");
+        assert_eq!(decision.provider_delay, Some(Duration::from_secs(48_700)));
+
+        let policy = RetryPolicy::new(RetryConfig { jitter: false, ..RetryConfig::default() });
+        let state = RetryState { attempt: 1, started_at: Instant::now() };
+        match policy.evaluate(&state, &decision) {
+            RetryOutcome::DoNotRetry { .. } => {}
+            other => panic!("expected do-not-retry, got {other:?}"),
+        }
+    }
+
+    /// The per-model free-tier eligibility refusal (403) is likewise fatal.
+    #[test]
+    fn free_tier_model_unavailable_is_not_retried() {
+        let error =
+            ProviderError::FreeTierRefused { retry_after: None, message: "FreeTierError".into() };
+        let decision = classify_provider_error(&error);
+        assert!(!decision.retryable);
+        assert_eq!(decision.provider_delay, None);
     }
 
     /// The throttle allowlist is exactly the rate-limit / overload / 5xx
