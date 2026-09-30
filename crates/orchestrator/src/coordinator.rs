@@ -11431,7 +11431,25 @@ impl CoordinatorAgent {
         };
         let model = profile.model_name().to_string();
 
-        let mut messages = vec![system_message];
+        // Seed the objective as the first user turn. The coordinator's system
+        // prompt already carries `Objective: {task.description}`, but a
+        // system-only conversation is rejected by strict OpenAI-compatible
+        // gateways (`HTTP 400 invalid_request_error`), and on iteration 0
+        // neither conditional nudge below has fired yet. Reusing the exact
+        // objective text keeps the model's first turn aligned with the
+        // objective it was instructed on — this is not new prompt text.
+        let mut messages = vec![
+            system_message,
+            Message {
+                role: Role::User,
+                content: task.description.clone(),
+                tool_calls: None,
+                tool_results: None,
+                reasoning_content: None,
+                tokens_in: None,
+                tokens_out: None,
+            },
+        ];
         // ── Issue #63: resume one-shot WAIT re-evaluation ────────────────
         // A checkpoint-restored in-flight wait is NEVER re-entered into the
         // park loop; instead it is re-evaluated exactly once against the
@@ -27407,6 +27425,71 @@ mod tests {
             "a rejected dispatch mutates nothing: {ledger:?}"
         );
         assert_eq!(graph.len(), 1, "no new node materializes: only the open parent");
+    }
+
+    /// Regression for the system-only first planning request: the dispatch
+    /// session's FIRST model request (iteration 0, before either conditional
+    /// nudge can fire — `project_context` is `None` in this fixture, so
+    /// `project_context_nudge` returns `None`) must carry the objective as a
+    /// real user turn alongside the system prompt. A strict OpenAI-compatible
+    /// gateway rejects the old `messages:[system]`-only shape with
+    /// `HTTP 400 invalid_request_error`.
+    #[tokio::test]
+    async fn first_dispatch_request_carries_the_objective_as_a_user_turn() {
+        let bus = EventBus::new(256);
+        let provider = Arc::new(TurnProvider::new(vec![CoordinatorTurn::Text("done".into())]));
+        let mut coordinator = coordinator_with_provider_and_policy(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+                AgentId::new("coder"),
+                "implemented",
+            )])),
+            provider.clone(),
+            coordinator_allow_all_policy(),
+        );
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let session_id = Ulid::new();
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let mut graph = TaskGraph::new();
+        let mut ledger = DispatchLedger::default();
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+        let mut state = DispatchSessionState::default();
+
+        coordinator
+            .run_dispatch_session(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                None,
+                "",
+            )
+            .await
+            .expect("dispatch session succeeds");
+
+        let requests = provider.requests.lock().unwrap();
+        let first = requests.first().expect("at least one planning request");
+        assert!(
+            first.messages.iter().any(|message| message.role != Role::System),
+            "the first planning request must carry a non-system turn, got roles: {:?}",
+            first.messages.iter().map(|message| message.role.clone()).collect::<Vec<_>>()
+        );
+        let objective = first
+            .messages
+            .iter()
+            .find(|message| message.role == Role::User)
+            .expect("the objective user turn is present");
+        assert_eq!(
+            objective.content, "build the thing",
+            "the seeded user turn must be the exact task objective"
+        );
     }
 
     /// Orchestrator-authority regression (the bug this change fixes): the
