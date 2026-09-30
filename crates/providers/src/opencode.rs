@@ -9,10 +9,12 @@
 //!   [`crate::provider_defs::OPENCODE_FREE_KNOWN`]): never assume a model id
 //!   exists on both relays, and never copy a catalog from one to the other.
 //!
-//! Neither relay serves completions to an unauthenticated client — Go answers
-//! `401 AuthError "Missing API key."`, Zen's free-tier gate answers
-//! `403 FreeTierError` — so neither provider type is keyless. A config-supplied
-//! `api_base` overrides either default (self-hosted gateways, proxies, tests).
+//! Neither relay serves completions to a plain unauthenticated client — Go
+//! answers `401 AuthError "Missing API key."`, and Zen's zero-cost models are
+//! gated by a server-side client attestation (a real client session id plus an
+//! accepted client version) that only a running `opencode serve` provides (see
+//! [`crate::opencode_local`]). A config-supplied `api_base` overrides either
+//! default (self-hosted gateways, proxies, tests).
 //!
 //! Each relay dispatches on the **lowercased full model-id prefix** — the
 //! authoritative contract is the upstream consumer's
@@ -129,12 +131,13 @@ impl OpenCodeRelay {
 /// prompt-cache affinity** token — it routes a process's requests to a warm
 /// backend so a conversation keeps its cache.
 ///
-/// **This is NOT an authentication mechanism.** It carries no credential, it
+/// **This is NOT an authentication mechanism.** It carries no credential and it
 /// does not satisfy the relay's API-key check (`401 AuthError` still applies
-/// without a valid `Authorization`), and it does NOT grant free-tier access —
-/// Zen's free-tier gate (`403 FreeTierError`) rejects requests regardless of
-/// this header. The name `X-Session-ID` does not exist upstream and must never
-/// be reintroduced.
+/// without a valid `Authorization`). Zen's zero-cost models are gated by a
+/// server-side client attestation (a real client session id plus an accepted
+/// client version) that this header alone does not satisfy; a running
+/// `opencode serve` provides it (see [`crate::opencode_local`]). The name
+/// `X-Session-ID` does not exist upstream and must never be reintroduced.
 pub(crate) const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
 
 /// Process-stable value of [`OPENCODE_SESSION_HEADER`].
