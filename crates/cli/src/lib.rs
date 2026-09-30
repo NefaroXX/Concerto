@@ -137,6 +137,7 @@ fn run_cli_inner(
                 ProviderKind::Nvidianim => "nim",
                 ProviderKind::OpenRouter => "openrouter",
                 ProviderKind::OpenCodeZen => "opencode",
+                ProviderKind::OpenCodeLocal => "opencode-local",
                 ProviderKind::Other => "other",
                 _ => "other",
             };

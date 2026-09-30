@@ -14,6 +14,45 @@ use concerto_core::CancellationToken;
 use futures::stream;
 use std::collections::VecDeque;
 
+/// Remove or set an environment variable for the duration of a test and
+/// restore whatever was there afterwards, even across a panic.
+///
+/// Env vars are process-global and cargo runs tests in parallel, so a leaked
+/// edit would race with other tests. Callers must hold the relevant lock (for
+/// the `opencode-local` vars, `crate::credential::OPENCODE_LOCAL_ENV_LOCK`).
+#[cfg(test)]
+pub(crate) struct RestoreEnvVar {
+    name: &'static str,
+    saved: Option<String>,
+}
+
+#[cfg(test)]
+impl RestoreEnvVar {
+    pub(crate) fn without(name: &'static str) -> Self {
+        let saved = std::env::var(name).ok();
+        std::env::remove_var(name);
+        Self { name, saved }
+    }
+
+    /// Set `name` to `value` for the duration of a test and restore whatever
+    /// was there afterwards (present or absent), even across a panic.
+    pub(crate) fn set(name: &'static str, value: &str) -> Self {
+        let saved = std::env::var(name).ok();
+        std::env::set_var(name, value);
+        Self { name, saved }
+    }
+}
+
+#[cfg(test)]
+impl Drop for RestoreEnvVar {
+    fn drop(&mut self) {
+        match &self.saved {
+            Some(value) => std::env::set_var(self.name, value),
+            None => std::env::remove_var(self.name),
+        }
+    }
+}
+
 /// A pre-configured response from the scripted provider.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -244,6 +283,49 @@ pub mod mock_server {
             }
         });
         (base, req_rx)
+    }
+
+    /// Like [`spawn_scripted`], but the server records the request at
+    /// `gate_index` and then **withholds its response** until the returned gate
+    /// sender fires. This holds a request in flight so a caller can observe a
+    /// cancellation deterministically (the client's `send()` future stays
+    /// pending while the server waits).
+    pub fn spawn_scripted_gated(
+        responses: Vec<(u16, String)>,
+        gate_index: usize,
+    ) -> (String, mpsc::Receiver<Vec<u8>>, mpsc::Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local mock server");
+        let port = listener.local_addr().expect("local address").port();
+        let base = format!("http://127.0.0.1:{port}");
+        let (req_tx, req_rx) = mpsc::channel();
+        let (gate_tx, gate_rx) = mpsc::channel();
+        let _ = std::thread::spawn(move || {
+            for (index, (status, body)) in responses.into_iter().enumerate() {
+                let (mut stream, _) = listener.accept().expect("accept one request");
+                let request = read_request(&mut stream);
+                let _ = req_tx.send(request);
+                if index == gate_index {
+                    // Hold the connection open (and the response unwritten) so
+                    // the client's request future cannot complete.
+                    let _ = gate_rx.recv();
+                }
+                let reason = match status {
+                    200 => "OK",
+                    401 => "Unauthorized",
+                    403 => "Forbidden",
+                    404 => "Not Found",
+                    _ => "Error",
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (base, req_rx, gate_tx)
     }
 
     /// Parse the captured request's JSON body out of its raw HTTP bytes.

@@ -529,7 +529,11 @@ pub fn provider_definition(provider_type: &str) -> ProviderDefinition {
         "opencode-local" => ProviderDefinition {
             id: "opencode-local",
             display_name: String::from("OpenCode (local server)"),
-            default_model: None,
+            // A zero-cost model the local server serves (verified live), so a
+            // first-time user has a usable choice before discovery runs. Live
+            // discovery supersedes it and its result is merged, not replaced;
+            // free-ness is still cost-based, never inferred from this id.
+            default_model: Some("big-pickle"),
             known_models: &[],
             known_model_costs: &[],
             credential_requirement: CredentialRequirement::Required,
@@ -1122,7 +1126,11 @@ mod tests {
         let def = provider_definition("opencode-local");
         assert_eq!(def.id, "opencode-local");
         assert_eq!(def.display_name, "OpenCode (local server)");
-        assert_eq!(def.default_model, None, "the catalog is discovered, not hard-coded");
+        assert_eq!(
+            def.default_model,
+            Some("big-pickle"),
+            "a zero-cost default lets a first-time user run before discovery"
+        );
         assert!(def.known_models.is_empty());
         assert!(def.known_model_costs.is_empty());
         // The server password is a real credential; the API answers 401

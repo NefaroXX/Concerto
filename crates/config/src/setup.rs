@@ -44,6 +44,9 @@ pub enum ProviderKind {
     Nvidianim,
     OpenRouter,
     OpenCodeZen,
+    /// A local `opencode serve` instance (`opencode-local`). The credential is
+    /// the server's HTTP Basic password, not a hosted API key.
+    OpenCodeLocal,
     Other,
 }
 
@@ -56,6 +59,9 @@ impl ProviderKind {
             ProviderKind::Nvidianim => "meta/llama-3.3-70b-instruct",
             ProviderKind::OpenRouter => "openai/gpt-4o",
             ProviderKind::OpenCodeZen => "deepseek-v4-flash",
+            // A zero-cost model the local server serves; discovery replaces it
+            // with the server's real catalog when it runs.
+            ProviderKind::OpenCodeLocal => "big-pickle",
             ProviderKind::Other => "custom",
         }
     }
@@ -254,6 +260,7 @@ impl<R: BufRead, W: Write> SetupWizard<R, W> {
                 ProviderKind::Nvidianim => "nim".to_string(),
                 ProviderKind::OpenRouter => "openrouter".to_string(),
                 ProviderKind::OpenCodeZen => "opencode".to_string(),
+                ProviderKind::OpenCodeLocal => "opencode-local".to_string(),
                 ProviderKind::Other => "other".to_string(),
             },
             api_key,
@@ -294,9 +301,10 @@ impl<R: BufRead, W: Write> SetupWizard<R, W> {
         self.writeln("  4) NVIDIA NIM")?;
         self.writeln("  5) OpenRouter")?;
         self.writeln("  6) OpenCode Zen")?;
-        self.writeln("  7) Other")?;
+        self.writeln("  7) OpenCode (local `opencode serve` server)")?;
+        self.writeln("  8) Other")?;
         loop {
-            self.write("Choice [1-7]: ")?;
+            self.write("Choice [1-8]: ")?;
             let input = self.read_line()?;
             match input.as_str() {
                 "1" => return Ok(ProviderKind::OpenAI),
@@ -305,8 +313,9 @@ impl<R: BufRead, W: Write> SetupWizard<R, W> {
                 "4" => return Ok(ProviderKind::Nvidianim),
                 "5" => return Ok(ProviderKind::OpenRouter),
                 "6" => return Ok(ProviderKind::OpenCodeZen),
-                "7" => return Ok(ProviderKind::Other),
-                _ => self.writeln("Invalid choice, please enter 1-7.")?,
+                "7" => return Ok(ProviderKind::OpenCodeLocal),
+                "8" => return Ok(ProviderKind::Other),
+                _ => self.writeln("Invalid choice, please enter 1-8.")?,
             }
         }
     }
@@ -458,6 +467,19 @@ mod tests {
         assert_eq!(config.api_key, "");
         assert_eq!(config.model, "llama3");
         assert_eq!(config.policy_mode, "strict");
+    }
+
+    /// `opencode-local` is selectable from the wizard and maps to the
+    /// `opencode-local` provider type with its zero-cost default model. The
+    /// "API key" prompt carries the local server's HTTP Basic password.
+    #[test]
+    fn wizard_selects_opencode_local() {
+        let input = "7\nserver-password\n\n\n1\n";
+        let mut wiz = wizard_with_input(input);
+        let config = wiz.run().expect("wizard failed");
+        assert_eq!(config.provider, "opencode-local");
+        assert_eq!(config.api_key, "server-password");
+        assert_eq!(config.model, "big-pickle");
     }
 
     #[test]

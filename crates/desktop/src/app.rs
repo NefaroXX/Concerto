@@ -40,6 +40,7 @@ use concerto_orchestrator::runtime_runner::{
 use concerto_orchestrator::services::{RequestBuilder, ServicesBuilder};
 use concerto_plugins::manager::SharedPluginManager;
 use concerto_providers::factory::ProviderFactory;
+use concerto_providers::provider_credential_present;
 use concerto_providers::provider_defs::{
     picker_model_options_for, provider_definition, provider_readiness,
 };
@@ -737,8 +738,7 @@ fn provider_discovery_ready(
 ) -> bool {
     let definition = provider_definition(&provider.provider);
     definition.supports_discovery()
-        && (!definition.requires_credential()
-            || provider.api_key(credentials).map(|key| !key.is_empty()).unwrap_or(false))
+        && (!definition.requires_credential() || provider_credential_present(provider, credentials))
 }
 
 impl App {

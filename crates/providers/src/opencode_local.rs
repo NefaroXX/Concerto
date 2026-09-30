@@ -8,7 +8,7 @@
 //! (`Authorization: Bearer public`). Live testing proved the relay refuses it
 //! server-side (`403 FreeTierError` for 7 of the 8 zero-cost models, `429` for
 //! the rest). The mechanism that actually works is a headless `opencode serve`
-//! process: all eight free models return completions and tool calling works.
+//! process: all eight free models return completions.
 //!
 //! # Contract (verified live)
 //!
@@ -16,13 +16,30 @@
 //!   `OPENCODE_SERVER_PASSWORD`. Unauthenticated and Bearer requests get `401`.
 //! - **Models**: `GET {base}/provider` → `{all, default, connected}`. `all` is
 //!   an array of provider objects; the `opencode` entry carries `models`, a map
-//!   of id → model with `cost: {input, output}`, `tool_call`, `limit`, …
-//! - **Create session**: `POST {base}/session` body `{"directory": "<abs>"}` →
-//!   `{id}`.
+//!   of id → model with `cost: {input, output}`, `limit`, ….
+//! - **Create session**: `POST {base}/session?directory=<abs>` with body
+//!   `{"model":{"providerID":"opencode","id":"<model>"}}` → `{id}`. The
+//!   directory is a **query parameter**; a `directory` field in the JSON body
+//!   is ignored by the server (the session silently runs in `/`).
 //! - **Send message**: `POST {base}/session/{id}/message` body
-//!   `{"providerID":"opencode","modelID":"<model>","parts":[{"type":"text",
-//!   "text":"…"}]}` → `{info, parts, tokens?}` where each part has `type` in
-//!   `text` | `reasoning` | `tool` | `step-start` | `step-finish` | ….
+//!   `{"model":{"providerID":"opencode","modelID":"<model>"},"system":"…",
+//!   "parts":[{"type":"text","text":"…"}]}` → `{info, parts, tokens?}` where
+//!   each part has `type` in `text` | `reasoning` | `step-start` | `step-finish`
+//!   | …. The model MUST be nested under a top-level `model` **object**; a
+//!   root-level `providerID`/`modelID` pair is ignored and the server serves its
+//!   own default (`muse-spark-1.3-contributor-free`).
+//! - **Delete session**: `DELETE {base}/session/{id}`.
+//!
+//! # System prompt
+//!
+//! The message endpoint's top-level `system` field **is honoured**: upstream
+//! `packages/opencode/src/session/llm/request.ts` appends
+//! `input.user.system` to the system array before the model call (verified
+//! live — a codeword planted in `system` is reproduced by the model). System
+//! messages are therefore sent in `system`, and `parts` carries only the
+//! conversation. Earlier revisions of this module folded everything into one
+//! flat text part because they assumed `toModelMessages` ignored `system`; that
+//! assumption was wrong.
 //!
 //! # Free-ness is cost, never a name
 //!
@@ -51,10 +68,12 @@
 //! `<tool_calls>` block. The server is used as a **text/reasoning completion
 //! backend only**.
 //!
-//! `tool` parts the server returns (it may have executed its own tools) are
-//! still mapped to [`CompletionChunk::tool_call`] so the wire is not silently
-//! dropped. Because the fallback driver discards provider-native tool calls in
-//! favour of its parsed text calls, they do not drive a second execution.
+//! Live probing confirms the eight zero-cost models do not advertise
+//! `tool_call`, and a tool-using prompt against the default agent returns only
+//! `step-start`/`text`/`step-finish` parts — no `tool` part. The connector
+//! therefore does not parse `tool` parts: there is no reachable wire shape to
+//! map, and pretending otherwise produced dead code. If a server build does
+//! emit one it is skipped like any other unknown part type.
 //!
 //! **Limitation**: because the `tools` map only sets permissions, the connector
 //! cannot reliably disable the server's own toolset. If the model chooses to
@@ -62,32 +81,51 @@
 //! `opencode serve` with an agent/config that exposes no tools when strict
 //! isolation is required.
 //!
-//! # Conversation history
+//! # Conversation history and session lifetime
 //!
-//! Each completion creates a fresh server session, so the connector must carry
-//! the whole conversation itself. The server's own `SystemPrompt` builds only
-//! its environment/model prompt and its `toModelMessages` ignores the request's
-//! `system` field, so the system prompt and the full message history are folded
-//! into the single `text` part (see [`render_conversation`]). A lone user
-//! message is sent verbatim so simple requests stay clean.
+//! Each completion creates a fresh server session, so the connector carries the
+//! conversation itself. The session is deleted (`DELETE /session/{id}`) after
+//! the message round-trip — on success, on error, and on cancellation — so the
+//! server does not accumulate one session per request. A `Drop` guard issues a
+//! detached best-effort delete if the future is dropped before the inline
+//! cleanup runs.
+//!
+//! # Working directory
+//!
+//! The `LlmProvider` trait carries no working-directory context and the factory
+//! has no such mechanism, so the process's current directory is sent as the
+//! session's `directory` query parameter. The server executes any of its own
+//! tools relative to that directory.
 
 use async_trait::async_trait;
 use concerto_core::error::{describe_error_chain, ProviderError};
 use concerto_core::traits::{CompletionStream, LlmProvider};
 use concerto_core::types::{
     CompletionChunk, CompletionRequest, CompletionUsage, Message, ModelInfo, Role, TokenBudget,
-    ToolCall,
 };
 use concerto_core::{CancellationToken, SecretString};
 use futures::stream;
 use reqwest::header::CONTENT_TYPE;
 use reqwest::StatusCode;
 use serde_json::Value;
+use std::time::Duration;
 
 /// Default base URL of a local `opencode serve` instance.
 ///
 /// Matches the server's own default (`opencode serve --port 4096`).
 pub const OPENCODE_LOCAL_DEFAULT_BASE: &str = "http://127.0.0.1:4096";
+
+/// Default per-request timeout for a local `opencode serve` instance.
+///
+/// A live reasoning completion took ~120s, so the shared 30s
+/// [`ProviderConfig`](concerto_config::ProviderConfig) default is too short for
+/// this backend. An explicitly configured `timeout_seconds` (anything other
+/// than the shared default or `0`) overrides this value.
+pub const OPENCODE_LOCAL_DEFAULT_TIMEOUT_SECS: u64 = 300;
+
+/// The generic [`ProviderConfig::timeout_seconds`](concerto_config::ProviderConfig)
+/// default that [`resolve_timeout_secs`] upgrades for this provider.
+const GENERIC_PROVIDER_DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 /// The HTTP Basic username the server expects. Upstream defaults to `opencode`
 /// (`packages/opencode/src/server/auth.ts`).
@@ -98,6 +136,23 @@ const OPENCODE_PROVIDER_ID: &str = "opencode";
 
 /// Response-side token reservation used with the shared capacity table.
 const DEFAULT_RESERVED_FOR_RESPONSE: u64 = 4_000;
+
+/// Bound on the best-effort session deletion so a dead server cannot hang the
+/// caller during cancellation.
+const SESSION_DELETE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Resolve the effective request timeout for a local `opencode serve` instance.
+///
+/// The shared config default (30s) is too short for this backend, so it — and
+/// an unset `0` — are upgraded to [`OPENCODE_LOCAL_DEFAULT_TIMEOUT_SECS`]. Any
+/// other value is treated as an explicit user choice and returned unchanged.
+pub fn resolve_timeout_secs(configured: u64) -> u64 {
+    if configured == 0 || configured == GENERIC_PROVIDER_DEFAULT_TIMEOUT_SECS {
+        OPENCODE_LOCAL_DEFAULT_TIMEOUT_SECS
+    } else {
+        configured
+    }
+}
 
 /// First-class provider for a local `opencode serve` instance.
 ///
@@ -132,6 +187,11 @@ impl OpenCodeLocalProvider {
     /// The base URL this provider builds its request paths from.
     pub fn api_base(&self) -> &str {
         &self.api_base
+    }
+
+    /// The request timeout this provider applies, in seconds.
+    pub fn timeout_secs(&self) -> u64 {
+        self.timeout_secs
     }
 
     /// Attach HTTP Basic authentication.
@@ -194,20 +254,140 @@ impl OpenCodeLocalProvider {
         })
     }
 
+    /// Create a server session bound to the process working directory and the
+    /// resolved model.
+    ///
+    /// `directory` is a **query parameter** on `POST /session`; sending it in
+    /// the JSON body is silently ignored by the server (the session then runs
+    /// in `/`). The body's model uses the `id` key — the message endpoint's
+    /// `modelID` key is not accepted here.
+    async fn create_session(
+        &self,
+        client: &reqwest::Client,
+        model: &str,
+        cancel: &CancellationToken,
+    ) -> Result<String, ProviderError> {
+        let directory = working_directory();
+        let mut body = serde_json::Map::new();
+        if !model.trim().is_empty() {
+            body.insert(
+                "model".to_string(),
+                serde_json::json!({ "providerID": OPENCODE_PROVIDER_ID, "id": model }),
+            );
+        }
+        let response = tokio::select! {
+            _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
+            result = self
+                .basic(client.post(self.session_url()))
+                .query(&[("directory", directory.as_str())])
+                .header(CONTENT_TYPE, "application/json")
+                .timeout(Duration::from_secs(self.timeout_secs))
+                .json(&Value::Object(body))
+                .send() => result.map_err(|error| self.connection_error(&error))?,
+        };
+        let session_json = Self::decode_json(response, "/session").await?;
+        session_json.get("id").and_then(Value::as_str).map(str::to_string).ok_or_else(|| {
+            ProviderError::InvalidResponse(
+                "opencode-local: `/session` response has no `id`".to_string(),
+            )
+        })
+    }
+
+    /// Post the message body and read the complete response.
+    async fn send_message(
+        &self,
+        client: &reqwest::Client,
+        session_id: &str,
+        body: &Value,
+        cancel: &CancellationToken,
+    ) -> Result<Value, ProviderError> {
+        let response = tokio::select! {
+            _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
+            result = self
+                .basic(client.post(self.message_url(session_id)))
+                .header(CONTENT_TYPE, "application/json")
+                .timeout(Duration::from_secs(self.timeout_secs))
+                .json(body)
+                .send() => result.map_err(|error| self.connection_error(&error))?,
+        };
+        Self::decode_json(response, "/session/{id}/message").await
+    }
+
     /// Build the `POST /session/{id}/message` body.
     ///
-    /// `providerID`/`modelID` are top-level per the verified server contract;
-    /// the whole conversation is rendered into a single text part (see the
-    /// module docs for why the `system` field is not used).
+    /// The model is a top-level `model` **object** (`providerID` + `modelID`);
+    /// a root-level pair is ignored by the server. The system prompt is a
+    /// top-level `system` string and `parts` carries only the conversation.
     fn build_message_body(request: &CompletionRequest, model: &str) -> Value {
-        serde_json::json!({
-            "providerID": OPENCODE_PROVIDER_ID,
-            "modelID": model,
-            "parts": [{
+        let mut body = serde_json::Map::new();
+        body.insert(
+            "model".to_string(),
+            serde_json::json!({ "providerID": OPENCODE_PROVIDER_ID, "modelID": model }),
+        );
+        body.insert(
+            "parts".to_string(),
+            serde_json::json!([{
                 "type": "text",
                 "text": render_conversation(&request.messages),
-            }],
-        })
+            }]),
+        );
+        if let Some(system) = render_system_prompt(&request.messages) {
+            body.insert("system".to_string(), Value::String(system));
+        }
+        Value::Object(body)
+    }
+}
+
+/// Best-effort deletion of a server session.
+///
+/// The message round-trip is wrapped by an explicit [`SessionGuard::delete`]
+/// call on every return path (success, error, cancellation). If the future is
+/// dropped before that call, [`Drop`] spawns a detached delete so the session
+/// is still reclaimed when a runtime handle is available.
+struct SessionGuard {
+    delete_url: String,
+    password: SecretString,
+    armed: bool,
+}
+
+impl SessionGuard {
+    fn new(api_base: &str, session_id: &str, password: SecretString) -> Self {
+        Self {
+            delete_url: format!("{}/session/{}", api_base.trim_end_matches('/'), session_id),
+            password,
+            armed: true,
+        }
+    }
+
+    /// Await the delete (bounded) and disarm the drop fallback.
+    ///
+    /// `armed` is cleared only after the send completes, so a future dropped
+    /// mid-delete still leaves the detached `Drop` path armed as a backstop.
+    async fn delete(mut self, client: &reqwest::Client) {
+        let request = client
+            .delete(&self.delete_url)
+            .basic_auth(OPENCODE_BASIC_USER, Some(self.password.expose()));
+        let _ = tokio::time::timeout(SESSION_DELETE_TIMEOUT, request.send()).await;
+        self.armed = false;
+    }
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let url = self.delete_url.clone();
+        let password = self.password.clone();
+        handle.spawn(async move {
+            let client = crate::new_client(5);
+            let request =
+                client.delete(url).basic_auth(OPENCODE_BASIC_USER, Some(password.expose()));
+            let _ = tokio::time::timeout(SESSION_DELETE_TIMEOUT, request.send()).await;
+        });
     }
 }
 
@@ -222,24 +402,44 @@ fn working_directory() -> String {
         .unwrap_or_else(|_| ".".to_string())
 }
 
-/// Render Concerto's messages into the single text part the server accepts.
+/// Join every non-empty system message into the single top-level `system`
+/// string the server honours. `None` when there is no system prompt.
+fn render_system_prompt(messages: &[Message]) -> Option<String> {
+    let parts: Vec<&str> = messages
+        .iter()
+        .filter(|message| message.role == Role::System)
+        .map(|message| message.content.trim())
+        .filter(|content| !content.is_empty())
+        .collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
+    }
+}
+
+/// Render Concerto's non-system messages into the single text part the server
+/// accepts.
 ///
-/// A lone user message is sent verbatim; otherwise each message is labelled by
-/// role so the model can follow the conversation. This is required because the
-/// server ignores the request's `system` field and keeps no history across the
-/// fresh session created per completion.
+/// System messages are carried by the top-level `system` field (see
+/// [`render_system_prompt`]). A lone user message is sent verbatim; otherwise
+/// each message is labelled by role so the model can follow the conversation.
+/// The server keeps no history across the fresh session created per completion,
+/// so the connector carries the whole conversation itself.
 fn render_conversation(messages: &[Message]) -> String {
-    if messages.len() == 1 && messages[0].role == Role::User {
-        return messages[0].content.clone();
+    let conversation: Vec<&Message> =
+        messages.iter().filter(|message| message.role != Role::System).collect();
+    if conversation.len() == 1 && conversation[0].role == Role::User {
+        return conversation[0].content.clone();
     }
     let mut out = String::new();
-    for message in messages {
+    for message in conversation {
         let label = match message.role {
-            Role::System => "system",
             Role::User => "user",
             Role::Assistant => "assistant",
             Role::Tool => "tool result",
-            // Future `#[non_exhaustive]` variants: drop rather than fail.
+            // System is extracted into the top-level `system` field; future
+            // `#[non_exhaustive]` variants are dropped rather than failed.
             _ => continue,
         };
         if !out.is_empty() {
@@ -328,66 +528,16 @@ fn parse_usage(json: &Value) -> Option<CompletionUsage> {
     Some(CompletionUsage { prompt_tokens, completion_tokens })
 }
 
-/// Parse a tool part's arguments.
-///
-/// The server exposes the model's raw argument string on a pending state
-/// (`state.raw`) and the parsed object on a completed one (`state.input`). A
-/// string form is routed through [`crate::tool_args::parse_tool_arguments`] so
-/// malformed arguments fail loudly instead of becoming `Null`; an object is
-/// passed through [`crate::protocol::ensure_arguments_object`].
-fn parse_tool_part_arguments(part: &Value, tool_name: &str) -> Result<Value, ProviderError> {
-    let state = part.get("state");
-    if let Some(raw) = state.and_then(|state| state.get("raw")).and_then(Value::as_str) {
-        if !raw.trim().is_empty() {
-            return parse_raw_arguments(raw, tool_name);
-        }
-    }
-    if let Some(input) = state.and_then(|state| state.get("input")) {
-        return match input {
-            Value::String(raw) => parse_raw_arguments(raw, tool_name),
-            Value::Object(_) => Ok(crate::protocol::ensure_arguments_object(input.clone())),
-            Value::Null => Ok(serde_json::json!({})),
-            other => parse_raw_arguments(&other.to_string(), tool_name),
-        };
-    }
-    if let Some(raw) = part.get("arguments").and_then(Value::as_str) {
-        return parse_raw_arguments(raw, tool_name);
-    }
-    Ok(serde_json::json!({}))
-}
-
-fn parse_raw_arguments(raw: &str, tool_name: &str) -> Result<Value, ProviderError> {
-    match crate::tool_args::parse_tool_arguments(raw) {
-        Ok(crate::tool_args::ToolArgumentParse::Value(value)) => {
-            Ok(crate::protocol::ensure_arguments_object(value))
-        }
-        Ok(crate::tool_args::ToolArgumentParse::Empty) => Ok(serde_json::json!({})),
-        Err(error) => Err(ProviderError::InvalidResponse(format!(
-            "opencode-local: unparseable tool-call arguments for '{tool_name}': {error}"
-        ))),
-    }
-}
-
-/// Map one server `tool` part to a canonical [`ToolCall`].
-fn tool_call_from_part(part: &Value) -> Result<ToolCall, ProviderError> {
-    let name = part.get("tool").and_then(Value::as_str).unwrap_or_default().to_string();
-    let id = part
-        .get("callID")
-        .and_then(Value::as_str)
-        .or_else(|| part.get("id").and_then(Value::as_str))
-        .unwrap_or_default()
-        .to_string();
-    let arguments = parse_tool_part_arguments(part, &name)?;
-    Ok(ToolCall { id, name, arguments, ..Default::default() })
-}
-
 /// Map the server's response `parts` to canonical [`CompletionChunk`]s.
 ///
-/// `text` → text, `reasoning` → `reasoning`, `tool` → a [`ToolCall`] with
-/// parsed arguments; `step-start`/`step-finish`/`file`/`patch`/… carry no
-/// completion content and are skipped. Usage is attached to the terminal chunk
-/// only (ADR-48 §4). A malformed tool argument surfaces as
-/// [`ProviderError::InvalidResponse`] rather than a `Null` argument.
+/// `text` → text, `reasoning` → `reasoning`; `step-start`/`step-finish`/… carry
+/// no completion content and are skipped. Usage is attached to the terminal
+/// chunk only (ADR-48 §4).
+///
+/// `tool` parts are intentionally not mapped: live probing shows the zero-cost
+/// models this connector exposes emit none (they do not advertise `tool_call`),
+/// and the server's own tool registry cannot carry Concerto's schemas anyway.
+/// See the module docs.
 fn map_response_parts(json: &Value) -> Result<Vec<CompletionChunk>, ProviderError> {
     let parts = json.get("parts").and_then(Value::as_array).ok_or_else(|| {
         ProviderError::InvalidResponse(
@@ -425,15 +575,6 @@ fn map_response_parts(json: &Value) -> Result<Vec<CompletionChunk>, ProviderErro
                     }
                 }
             }
-            Some("tool") => {
-                chunks.push(CompletionChunk {
-                    delta: String::new(),
-                    reasoning: None,
-                    tool_call: Some(tool_call_from_part(part)?),
-                    is_final: false,
-                    usage: None,
-                });
-            }
             _ => {}
         }
     }
@@ -463,37 +604,18 @@ impl LlmProvider for OpenCodeLocalProvider {
         let client = crate::new_client(self.timeout_secs);
 
         // 1. Create a fresh session bound to the working directory.
-        let session_body = serde_json::json!({ "directory": working_directory() });
-        let session_response = tokio::select! {
-            _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
-            result = self
-                .basic(client.post(self.session_url()))
-                .header(CONTENT_TYPE, "application/json")
-                .json(&session_body)
-                .send() => result.map_err(|error| self.connection_error(&error))?,
-        };
-        let session_json = Self::decode_json(session_response, "/session").await?;
-        let session_id =
-            session_json.get("id").and_then(Value::as_str).map(str::to_string).ok_or_else(
-                || {
-                    ProviderError::InvalidResponse(
-                        "opencode-local: `/session` response has no `id`".to_string(),
-                    )
-                },
-            )?;
+        let session_id = self.create_session(&client, &model, &cancel).await?;
+        // From here on every return path must delete the session.
+        let guard = SessionGuard::new(&self.api_base, &session_id, self.password.clone());
 
         // 2. Post the message and read the complete response.
         let body = Self::build_message_body(&request, &model);
-        let message_response = tokio::select! {
-            _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
-            result = self
-                .basic(client.post(self.message_url(&session_id)))
-                .header(CONTENT_TYPE, "application/json")
-                .json(&body)
-                .send() => result.map_err(|error| self.connection_error(&error))?,
-        };
-        let json = Self::decode_json(message_response, "/session/{id}/message").await?;
+        let result = self.send_message(&client, &session_id, &body, &cancel).await;
 
+        // 3. Reclaim the session on success, error, and cancellation alike.
+        guard.delete(&client).await;
+
+        let json = result?;
         let chunks = map_response_parts(&json)?;
         Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
     }
@@ -566,7 +688,7 @@ impl LlmProvider for OpenCodeLocalProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use concerto_core::types::{CompletionChunk, Message, Role};
+    use concerto_core::types::CompletionChunk;
     use futures::TryStreamExt;
     use serde_json::json;
     use std::time::Duration;
@@ -661,6 +783,14 @@ mod tests {
         assert!(!ids.contains(&"no-cost-data"), "no cost data means not free");
     }
 
+    /// A model with no `free` marker but a zero cost IS free: free-ness is the
+    /// cost, never the name. (`big-pickle` is exactly that shape.)
+    #[test]
+    fn zero_cost_without_a_free_marker_is_free() {
+        let models = parse_free_models(&provider_fixture()).expect("fixture parses");
+        assert!(models.iter().any(|model| model.id == "big-pickle"));
+    }
+
     /// Runnable demonstration: prints the free-model list discovered from the
     /// recorded `/provider` fixture (no live server required).
     ///
@@ -680,9 +810,14 @@ mod tests {
 
     // ---- HTTP: auth, request shape, response mapping -----------------------
 
-    /// Build a two-response script (session then message) for `spawn_scripted`.
-    fn session_then_message(message: Value) -> Vec<(u16, String)> {
-        vec![(200, json!({"id": "ses_test"}).to_string()), (200, message.to_string())]
+    /// Build a three-response script (session, message, delete) for
+    /// `spawn_scripted`.
+    fn session_message_delete(message: Value) -> Vec<(u16, String)> {
+        vec![
+            (200, json!({"id": "ses_test"}).to_string()),
+            (200, message.to_string()),
+            (200, "{}".to_string()),
+        ]
     }
 
     #[tokio::test]
@@ -710,11 +845,37 @@ mod tests {
         );
     }
 
+    /// The message body must nest the model under a top-level `model` object.
+    /// A root-level `providerID`/`modelID` pair is ignored by the server, which
+    /// then serves its own default — the bug this pins.
+    #[test]
+    fn message_body_nests_the_model_object_exactly() {
+        let messages = vec![
+            Message { role: Role::System, content: "be terse".into(), ..user_message("") },
+            user_message("hello"),
+        ];
+        let body = OpenCodeLocalProvider::build_message_body(
+            &request("big-pickle", messages),
+            "big-pickle",
+        );
+        assert_eq!(
+            body,
+            json!({
+                "model": {"providerID": "opencode", "modelID": "big-pickle"},
+                "parts": [{"type": "text", "text": "hello"}],
+                "system": "be terse",
+            }),
+            "the request body must carry the model object, the conversation part, and system"
+        );
+        assert!(body.get("providerID").is_none(), "no root-level providerID may leak");
+        assert!(body.get("modelID").is_none(), "no root-level modelID may leak");
+    }
+
     #[tokio::test]
-    async fn message_body_has_provider_model_and_parts_shape() {
-        let message = json!({"info": {"tokens": {"input": 3, "output": 4}}, "parts": [{"type": "text", "text": "hi"}]});
+    async fn session_create_uses_query_directory_and_id_key() {
+        let message = json!({"info": {"tokens": {"input": 1, "output": 1}}, "parts": [{"type": "text", "text": "hi"}]});
         let (base, requests) =
-            crate::testing::mock_server::spawn_scripted(session_then_message(message));
+            crate::testing::mock_server::spawn_scripted(session_message_delete(message));
         let provider = provider(base);
         let stream = provider
             .stream_completion(
@@ -725,28 +886,116 @@ mod tests {
             .expect("stream");
         let _ = stream.try_collect::<Vec<_>>().await.expect("collect");
 
-        // Request 1: session creation.
         let session_raw = requests.recv_timeout(Duration::from_secs(5)).expect("session request");
         let session_headers = crate::testing::mock_server::request_headers(&session_raw);
         assert!(
-            session_headers.starts_with("post /session http/1.1"),
-            "the first request creates a session: {session_headers}"
+            session_headers.starts_with("post /session?directory="),
+            "the directory must be a query parameter: {session_headers}"
         );
         let session_body = crate::testing::mock_server::request_body(session_raw);
-        assert!(session_body.get("directory").and_then(Value::as_str).is_some());
-
-        // Request 2: the message.
-        let message_raw = requests.recv_timeout(Duration::from_secs(5)).expect("message request");
-        let message_headers = crate::testing::mock_server::request_headers(&message_raw);
-        assert!(
-            message_headers.starts_with("post /session/ses_test/message http/1.1"),
-            "the second request posts to the created session: {message_headers}"
+        assert_eq!(session_body["model"]["providerID"], "opencode");
+        assert_eq!(
+            session_body["model"]["id"], "big-pickle",
+            "session creation uses the `id` key, not `modelID`"
         );
-        let body = crate::testing::mock_server::request_body(message_raw);
-        assert_eq!(body["providerID"], "opencode");
-        assert_eq!(body["modelID"], "big-pickle");
-        assert_eq!(body["parts"][0]["type"], "text");
-        assert_eq!(body["parts"][0]["text"], "hello");
+        assert!(session_body["model"].get("modelID").is_none());
+    }
+
+    #[tokio::test]
+    async fn session_is_deleted_after_a_successful_message() {
+        let message = json!({"info": {"tokens": {"input": 3, "output": 4}}, "parts": [{"type": "text", "text": "hi"}]});
+        let (base, requests) =
+            crate::testing::mock_server::spawn_scripted(session_message_delete(message));
+        let provider = provider(base);
+        let stream = provider
+            .stream_completion(
+                request("big-pickle", vec![user_message("hello")]),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("stream");
+        let _ = stream.try_collect::<Vec<_>>().await.expect("collect");
+
+        let _session = requests.recv_timeout(Duration::from_secs(5)).expect("session request");
+        let _message = requests.recv_timeout(Duration::from_secs(5)).expect("message request");
+        let delete_raw = requests.recv_timeout(Duration::from_secs(5)).expect("delete request");
+        let delete_headers = crate::testing::mock_server::request_headers(&delete_raw);
+        assert!(
+            delete_headers.starts_with("delete /session/ses_test http/1.1"),
+            "the session must be deleted after the message: {delete_headers}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_is_deleted_after_a_message_error() {
+        let (base, requests) = crate::testing::mock_server::spawn_scripted(vec![
+            (200, json!({"id": "ses_test"}).to_string()),
+            (500, json!({"error": "boom"}).to_string()),
+            (200, "{}".to_string()),
+        ]);
+        let provider = provider(base);
+        let error = provider
+            .stream_completion(
+                request("big-pickle", vec![user_message("hello")]),
+                CancellationToken::new(),
+            )
+            .await
+            .err()
+            .expect("a 500 message must fail");
+        assert!(matches!(error, ProviderError::HttpStatus { status: 500, .. }), "got {error:?}");
+
+        let _session = requests.recv_timeout(Duration::from_secs(5)).expect("session request");
+        let _message = requests.recv_timeout(Duration::from_secs(5)).expect("message request");
+        let delete_raw = requests.recv_timeout(Duration::from_secs(5)).expect("delete request");
+        let delete_headers = crate::testing::mock_server::request_headers(&delete_raw);
+        assert!(
+            delete_headers.starts_with("delete /session/ses_test http/1.1"),
+            "the session must be deleted after an error: {delete_headers}"
+        );
+    }
+
+    // Multi-threaded so the spawned completion task keeps running while the
+    // test thread blocks on the mock server's request channel.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_after_session_creation_deletes_the_session() {
+        // The message request is held open by the mock server until the gate
+        // fires, so cancellation is observed deterministically while the
+        // message future is still pending.
+        let (base, requests, gate) = crate::testing::mock_server::spawn_scripted_gated(
+            session_message_delete(json!({"parts": [{"type": "text", "text": "never"}]})),
+            1,
+        );
+        let provider = provider(base);
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
+        let handle = tokio::spawn(async move {
+            provider
+                .stream_completion(
+                    request("big-pickle", vec![user_message("hello")]),
+                    cancel_for_task,
+                )
+                .await
+        });
+
+        let _session = requests.recv_timeout(Duration::from_secs(5)).expect("session request");
+        let _message = requests.recv_timeout(Duration::from_secs(5)).expect("message request");
+        cancel.cancel();
+        // Let the spawned task observe the cancellation and issue its delete
+        // before the server is released to answer the held message.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        let _ = gate.send(());
+
+        let error =
+            handle.await.expect("task joins").err().expect("cancellation must surface as an error");
+        assert!(matches!(error, ProviderError::Cancelled), "got {error:?}");
+
+        let delete_raw = requests.recv_timeout(Duration::from_secs(5)).expect("delete request");
+        let delete_headers = crate::testing::mock_server::request_headers(&delete_raw);
+        assert!(
+            delete_headers.starts_with("delete /session/ses_test http/1.1"),
+            "cancellation must delete the session: {delete_headers}"
+        );
     }
 
     #[tokio::test]
@@ -762,7 +1011,7 @@ mod tests {
             ]
         });
         let (base, _requests) =
-            crate::testing::mock_server::spawn_scripted(session_then_message(message));
+            crate::testing::mock_server::spawn_scripted(session_message_delete(message));
         let provider = provider(base);
         let stream = provider
             .stream_completion(
@@ -776,12 +1025,12 @@ mod tests {
         let text: String = chunks.iter().map(|chunk| chunk.delta.as_str()).collect();
         assert_eq!(text, "answer");
         assert_eq!(chunks.iter().find_map(|chunk| chunk.reasoning.as_deref()), Some("thinking"));
-
-        let call =
-            chunks.iter().find_map(|chunk| chunk.tool_call.as_ref()).expect("tool call chunk");
-        assert_eq!(call.id, "call_1");
-        assert_eq!(call.name, "bash");
-        assert_eq!(call.arguments, json!({"command": "ls"}));
+        // `tool` parts are not mapped (no reachable shape for the exposed
+        // models); they are skipped without failing the response.
+        assert!(
+            chunks.iter().all(|chunk| chunk.tool_call.is_none()),
+            "tool parts must not produce a tool-call chunk"
+        );
 
         let terminal = chunks.last().expect("terminal chunk");
         assert!(terminal.is_final);
@@ -791,33 +1040,6 @@ mod tests {
         );
         // ADR-48 §4: usage only on the terminal chunk.
         assert_eq!(chunks.iter().filter(|chunk| chunk.usage.is_some()).count(), 1);
-    }
-
-    #[tokio::test]
-    async fn malformed_tool_arguments_surface_an_error_not_null() {
-        let message = json!({
-            "parts": [
-                {"type": "tool", "callID": "call_bad", "tool": "bash",
-                 "state": {"status": "pending", "raw": "this is not json", "input": {}}}
-            ]
-        });
-        let (base, _requests) =
-            crate::testing::mock_server::spawn_scripted(session_then_message(message));
-        let provider = provider(base);
-        let error = provider
-            .stream_completion(
-                request("big-pickle", vec![user_message("go")]),
-                CancellationToken::new(),
-            )
-            .await
-            .err()
-            .expect("malformed arguments must fail the request");
-        match error {
-            ProviderError::InvalidResponse(message) => {
-                assert!(message.contains("unparseable tool-call arguments"), "{message}");
-            }
-            other => panic!("expected InvalidResponse, got {other:?}"),
-        }
     }
 
     #[tokio::test]
@@ -879,7 +1101,7 @@ mod tests {
     }
 
     #[test]
-    fn system_and_history_are_folded_into_the_text_part() {
+    fn system_messages_are_extracted_and_history_is_labelled() {
         let mut assistant = user_message("prior answer");
         assistant.role = Role::Assistant;
         let messages = vec![
@@ -888,11 +1110,36 @@ mod tests {
             assistant,
             user_message("second"),
         ];
+        assert_eq!(render_system_prompt(&messages).as_deref(), Some("be terse"));
         let rendered = render_conversation(&messages);
-        assert!(rendered.contains("[system]\nbe terse"), "{rendered}");
+        assert!(!rendered.contains("[system]"), "system must not be folded into parts: {rendered}");
         assert!(rendered.contains("[user]\nfirst"), "{rendered}");
         assert!(rendered.contains("[assistant]\nprior answer"), "{rendered}");
         assert!(rendered.trim_end().ends_with("[user]\nsecond"), "{rendered}");
+    }
+
+    #[test]
+    fn multiple_system_messages_join_and_blank_ones_drop() {
+        let messages = vec![
+            Message { role: Role::System, content: "  ".into(), ..user_message("") },
+            Message { role: Role::System, content: "first".into(), ..user_message("") },
+            Message { role: Role::System, content: "second".into(), ..user_message("") },
+            user_message("hi"),
+        ];
+        assert_eq!(render_system_prompt(&messages).as_deref(), Some("first\n\nsecond"));
+    }
+
+    #[test]
+    fn no_system_message_means_no_system_field() {
+        assert_eq!(render_system_prompt(&[user_message("hi")]), None);
+    }
+
+    #[test]
+    fn configured_timeout_upgrades_only_the_generic_default() {
+        assert_eq!(resolve_timeout_secs(0), OPENCODE_LOCAL_DEFAULT_TIMEOUT_SECS);
+        assert_eq!(resolve_timeout_secs(30), OPENCODE_LOCAL_DEFAULT_TIMEOUT_SECS);
+        assert_eq!(resolve_timeout_secs(45), 45);
+        assert_eq!(resolve_timeout_secs(600), 600);
     }
 
     #[test]

@@ -206,10 +206,14 @@ impl ProviderFactory {
                 .api_base
                 .clone()
                 .unwrap_or_else(|| crate::opencode_local::OPENCODE_LOCAL_DEFAULT_BASE.to_string());
+            // A local reasoning completion routinely outlives the shared 30s
+            // default; `resolve_timeout_secs` upgrades only that default, so an
+            // explicit `timeout_seconds` still wins.
+            let timeout_secs = crate::opencode_local::resolve_timeout_secs(config.timeout_seconds);
             let provider = OpenCodeLocalProvider::with_api_base(
                 password,
                 config.model.clone(),
-                config.timeout_seconds,
+                timeout_secs,
                 base,
             );
             let provider: Arc<dyn LlmProvider> = Arc::new(provider);
@@ -728,6 +732,7 @@ fn parse_reasoning_echo(value: Option<&str>) -> Option<ReasoningEcho> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::RestoreEnvVar;
     use concerto_config::AgentModelAssignment;
 
     fn test_creds() -> CredentialStore {
@@ -1612,40 +1617,6 @@ mod tests {
     /// (concerto-cli).
     static OPENCODE_FREE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    /// Remove `name` for the duration of a test and restore whatever was
-    /// there afterwards, even across a panic — env vars are process-global,
-    /// so a leaked edit would race with tests running in parallel.
-    struct RestoreEnvVar {
-        name: &'static str,
-        saved: Option<String>,
-    }
-
-    impl RestoreEnvVar {
-        fn without(name: &'static str) -> Self {
-            let saved = std::env::var(name).ok();
-            std::env::remove_var(name);
-            Self { name, saved }
-        }
-
-        /// Set `name` to `value` for the duration of a test and restore
-        /// whatever was there afterwards (present or absent), even across a
-        /// panic. Same race-avoidance contract as [`Self::without`].
-        fn set(name: &'static str, value: &str) -> Self {
-            let saved = std::env::var(name).ok();
-            std::env::set_var(name, value);
-            Self { name, saved }
-        }
-    }
-
-    impl Drop for RestoreEnvVar {
-        fn drop(&mut self) {
-            match &self.saved {
-                Some(value) => std::env::set_var(self.name, value),
-                None => std::env::remove_var(self.name),
-            }
-        }
-    }
-
     /// The exact env fallback name [`ProviderConfig::effective_api_key`]
     /// looks up for an `opencode-free` config: the name is built from
     /// `provider.to_uppercase()`, so the hyphen survives —
@@ -1768,11 +1739,6 @@ mod tests {
     // `opencode-local` credential resolution
     // ------------------------------------------------------------------
 
-    /// Serializes the tests that mutate the `OPENCODE_SERVER_PASSWORD` env
-    /// var. Kept separate from [`OPENCODE_FREE_ENV_LOCK`] because it is a
-    /// different variable; both are process-global.
-    static OPENCODE_LOCAL_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     /// An `opencode-local` config with a unique keyring account so no
     /// `CONCERTO_*` env var can satisfy it.
     fn opencode_local_config() -> ProviderConfig {
@@ -1786,14 +1752,26 @@ mod tests {
         }
     }
 
-    /// Without a keyring entry, an `<PROVIDER>_API_KEY` env var, or
-    /// `OPENCODE_SERVER_PASSWORD`, construction fails closed: the local server
-    /// answers 401 without a password, so a build that deferred the failure
-    /// would be silently unusable.
+    /// Clear both password env vars for a test, holding the shared
+    /// `opencode-local` env lock. All tests in this module that mutate those
+    /// process-global vars take the same lock so they cannot race the
+    /// credential and discovery tests.
+    fn clear_local_password_env(
+    ) -> (std::sync::MutexGuard<'static, ()>, RestoreEnvVar, RestoreEnvVar) {
+        let lock = crate::credential::OPENCODE_LOCAL_ENV_LOCK
+            .lock()
+            .expect("opencode-local env lock poisoned");
+        let server = RestoreEnvVar::without(crate::credential::OPENCODE_SERVER_PASSWORD_ENV);
+        let local = RestoreEnvVar::without(crate::credential::OPENCODE_LOCAL_API_KEY_ENV);
+        (lock, server, local)
+    }
+
+    /// Without a keyring entry or either password env var, construction fails
+    /// closed: the local server answers 401 without a password, so a build that
+    /// deferred the failure would be silently unusable.
     #[test]
     fn build_opencode_local_without_credential_fails_closed() {
-        let _env = OPENCODE_LOCAL_ENV_LOCK.blocking_lock();
-        let _restored = RestoreEnvVar::without(crate::credential::OPENCODE_SERVER_PASSWORD_ENV);
+        let (_lock, _server, _local) = clear_local_password_env();
         let config = opencode_local_config();
         let creds = test_creds();
 
@@ -1807,10 +1785,11 @@ mod tests {
     }
 
     /// `OPENCODE_SERVER_PASSWORD` — the variable the server itself reads — is
-    /// honoured as the credential fallback, and the provider builds.
+    /// honoured as the credential fallback, and the provider builds. It is not
+    /// shadowed by the unexportable `OPENCODE-LOCAL_API_KEY` name.
     #[test]
     fn build_opencode_local_with_server_password_env_builds() {
-        let _env = OPENCODE_LOCAL_ENV_LOCK.blocking_lock();
+        let (_lock, _server, _local) = clear_local_password_env();
         let _password = RestoreEnvVar::set(
             crate::credential::OPENCODE_SERVER_PASSWORD_ENV,
             "test-server-password",
@@ -1823,12 +1802,26 @@ mod tests {
         assert_eq!(provider.provider_name(), "opencode-local");
     }
 
+    /// `OPENCODE_LOCAL_API_KEY` — the exportable provider-scoped form — is
+    /// honoured too.
+    #[test]
+    fn build_opencode_local_with_local_api_key_env_builds() {
+        let (_lock, _server, _local) = clear_local_password_env();
+        let _key =
+            RestoreEnvVar::set(crate::credential::OPENCODE_LOCAL_API_KEY_ENV, "test-local-api-key");
+        let config = opencode_local_config();
+        let creds = test_creds();
+
+        let provider = ProviderFactory::build(&config, &creds)
+            .expect("the exportable local-api-key env var must satisfy the credential");
+        assert_eq!(provider.provider_name(), "opencode-local");
+    }
+
     /// A keyring-backed credential also satisfies construction (resolved
-    /// through the shared `effective_api_key` path).
+    /// through the keyring path, not the unexportable derived env name).
     #[test]
     fn build_opencode_local_with_keyring_credential_builds() {
-        let _env = OPENCODE_LOCAL_ENV_LOCK.blocking_lock();
-        let _password = RestoreEnvVar::without(crate::credential::OPENCODE_SERVER_PASSWORD_ENV);
+        let (_lock, _server, _local) = clear_local_password_env();
         let _key = RestoreEnvVar::set(
             "CONCERTO_TEST_UNCREDENTIALED_OPENCODE_LOCAL_SERVER_PASSWORD",
             "from-keyring",

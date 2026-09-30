@@ -22,7 +22,8 @@
 //!   generic auth failure.
 //! - [`resolve_opencode_local_password`] — the HTTP Basic password a local
 //!   `opencode serve` instance expects, resolved keyring-first with the
-//!   server's own `OPENCODE_SERVER_PASSWORD` env var as the fallback.
+//!   provider-scoped `OPENCODE_LOCAL_API_KEY` and the server's own
+//!   `OPENCODE_SERVER_PASSWORD` env vars as fallbacks.
 
 use std::time::Duration;
 
@@ -38,33 +39,75 @@ use reqwest::StatusCode;
 /// `OPENCODE_SERVER_PASSWORD` and defaults the username to `opencode`.
 pub(crate) const OPENCODE_SERVER_PASSWORD_ENV: &str = "OPENCODE_SERVER_PASSWORD";
 
+/// The provider-scoped env var for the same password.
+///
+/// The shared [`ProviderConfig::effective_api_key`] path builds the name from
+/// `provider.to_uppercase()`, so for `opencode-local` it looks for
+/// `OPENCODE-LOCAL_API_KEY` — a hyphenated name a shell cannot export. This
+/// underscored, exportable form is read explicitly instead.
+pub(crate) const OPENCODE_LOCAL_API_KEY_ENV: &str = "OPENCODE_LOCAL_API_KEY";
+
+/// Serializes every test that mutates the process-global `opencode-local`
+/// password env vars, across the credential, factory, and discovery test
+/// modules. A test that must observe them absent cannot race one that sets
+/// them.
+#[cfg(test)]
+pub(crate) static OPENCODE_LOCAL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Pick the password from an already-resolved explicit credential, falling
+/// back to the provider env vars when it is empty.
+///
+/// The env order is most-specific first: [`OPENCODE_LOCAL_API_KEY_ENV`] then
+/// the server's own [`OPENCODE_SERVER_PASSWORD_ENV`]. The latter is never
+/// shadowed by the unexportable hyphenated name because that name is not read
+/// at all.
+pub(crate) fn opencode_local_password(explicit: &str) -> Option<SecretString> {
+    if !explicit.trim().is_empty() {
+        return Some(SecretString::from(explicit));
+    }
+    password_from_env()
+}
+
+/// The first non-empty provider env var, in priority order.
+fn password_from_env() -> Option<SecretString> {
+    for name in [OPENCODE_LOCAL_API_KEY_ENV, OPENCODE_SERVER_PASSWORD_ENV] {
+        if let Ok(value) = std::env::var(name) {
+            if !value.is_empty() {
+                return Some(SecretString::from(value));
+            }
+        }
+    }
+    None
+}
+
 /// Resolve the password for a local `opencode serve` instance.
 ///
-/// Resolution order mirrors [`ProviderConfig::effective_api_key`]:
+/// Resolution order:
 ///
 /// 1. the config's `keyring_key` in the OS keychain (or, in test mode, the
 ///    derived `CONCERTO_<KEY>` / `OPENCODE_RS_<KEY>` env var);
-/// 2. the `<PROVIDER>_API_KEY` env var (built from `provider.to_uppercase()`,
-///    so for `opencode-local` it is the unexportable `OPENCODE-LOCAL_API_KEY`);
+/// 2. [`OPENCODE_LOCAL_API_KEY_ENV`] — the exportable provider-scoped var;
 /// 3. [`OPENCODE_SERVER_PASSWORD_ENV`] — the variable the server itself reads,
 ///    and the practical way to configure this provider from a shell.
 ///
-/// The server answers `401` without a valid password, so a missing credential
-/// is reported as [`ProviderError::CredentialMissing`] at build time rather
-/// than deferred to the first request.
+/// Step 1 deliberately uses [`ProviderConfig::api_key`] rather than
+/// [`ProviderConfig::effective_api_key`]: the latter's derived name
+/// (`OPENCODE-LOCAL_API_KEY`) cannot be exported, so relying on it would make
+/// the env fallback unreachable. The server answers `401` without a valid
+/// password, so a missing credential is reported as
+/// [`ProviderError::CredentialMissing`] at build time rather than deferred to
+/// the first request.
 pub(crate) fn resolve_opencode_local_password(
     config: &ProviderConfig,
     creds: &CredentialStore,
 ) -> Result<SecretString, ProviderError> {
-    if let Ok(secret) = config.effective_api_key(creds) {
+    if let Ok(secret) = config.api_key(creds) {
         if !secret.expose().is_empty() {
             return Ok(secret);
         }
     }
-    if let Ok(password) = std::env::var(OPENCODE_SERVER_PASSWORD_ENV) {
-        if !password.is_empty() {
-            return Ok(SecretString::from(password));
-        }
+    if let Some(password) = password_from_env() {
+        return Ok(password);
     }
     Err(ProviderError::CredentialMissing {
         provider: if config.name.trim().is_empty() {
@@ -106,12 +149,53 @@ pub(crate) fn map_opencode_http_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::RestoreEnvVar;
 
-    /// `OPENCODE_SERVER_PASSWORD` is the server's own variable name; the client
-    /// must read exactly it.
+    /// Both env var names are pinned: the server reads
+    /// `OPENCODE_SERVER_PASSWORD`; the exportable provider-scoped form is the
+    /// underscored `OPENCODE_LOCAL_API_KEY`.
     #[test]
-    fn server_password_env_var_name_is_pinned() {
+    fn password_env_var_names_are_pinned() {
         assert_eq!(OPENCODE_SERVER_PASSWORD_ENV, "OPENCODE_SERVER_PASSWORD");
+        assert_eq!(OPENCODE_LOCAL_API_KEY_ENV, "OPENCODE_LOCAL_API_KEY");
+    }
+
+    /// An explicit credential always wins over either env var.
+    #[test]
+    fn explicit_password_wins_over_env() {
+        let _lock = OPENCODE_LOCAL_ENV_LOCK.lock().expect("env lock");
+        let _server = RestoreEnvVar::set(OPENCODE_SERVER_PASSWORD_ENV, "from-server");
+        let _local = RestoreEnvVar::set(OPENCODE_LOCAL_API_KEY_ENV, "from-local");
+        let selected = opencode_local_password("explicit").expect("explicit wins");
+        assert_eq!(selected.expose(), "explicit");
+    }
+
+    /// With no explicit credential, the exportable provider-scoped var is used.
+    #[test]
+    fn local_api_key_env_is_used_when_explicit_is_empty() {
+        let _lock = OPENCODE_LOCAL_ENV_LOCK.lock().expect("env lock");
+        let _server = RestoreEnvVar::without(OPENCODE_SERVER_PASSWORD_ENV);
+        let _local = RestoreEnvVar::set(OPENCODE_LOCAL_API_KEY_ENV, "from-local");
+        assert_eq!(opencode_local_password("").expect("env fallback").expose(), "from-local");
+    }
+
+    /// The server's own variable is reachable when the provider-scoped var is
+    /// absent — it is not shadowed by the unexportable hyphenated name.
+    #[test]
+    fn server_password_env_is_reachable_when_local_api_key_is_absent() {
+        let _lock = OPENCODE_LOCAL_ENV_LOCK.lock().expect("env lock");
+        let _local = RestoreEnvVar::without(OPENCODE_LOCAL_API_KEY_ENV);
+        let _server = RestoreEnvVar::set(OPENCODE_SERVER_PASSWORD_ENV, "from-server");
+        assert_eq!(opencode_local_password("").expect("env fallback").expose(), "from-server");
+    }
+
+    /// No explicit credential and neither env var set: no password.
+    #[test]
+    fn no_password_anywhere_is_none() {
+        let _lock = OPENCODE_LOCAL_ENV_LOCK.lock().expect("env lock");
+        let _server = RestoreEnvVar::without(OPENCODE_SERVER_PASSWORD_ENV);
+        let _local = RestoreEnvVar::without(OPENCODE_LOCAL_API_KEY_ENV);
+        assert!(opencode_local_password("").is_none());
     }
 
     /// A free-tier `403 FreeTierError` is surfaced as an eligibility refusal
