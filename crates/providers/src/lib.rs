@@ -26,7 +26,6 @@ pub mod anthropic;
 pub mod capability;
 pub mod cerebras;
 pub mod cohere;
-pub(crate) mod credential;
 pub mod dashscope;
 pub mod deepinfra;
 pub mod deepseek;
@@ -40,7 +39,6 @@ pub mod novita;
 pub mod ollama;
 pub mod openai;
 pub mod opencode;
-pub mod opencode_local;
 pub mod openrouter;
 pub mod perplexity;
 pub mod sambanova;
@@ -178,31 +176,6 @@ pub async fn list_models_for_provider_async(
             );
             p.list_models(cancel.clone()).await
         }
-        // A local `opencode serve` instance: discovery reads `/provider` and
-        // returns the zero-cost models it advertises. The credential is the
-        // server password. Callers that only hold a keyring-backed key pass it
-        // as `api_key`; when that is empty (e.g. an `OPENCODE_SERVER_PASSWORD`-
-        // only setup), the provider-scoped env fallback is resolved here so the
-        // desktop picker still populates.
-        "opencode-local" => match credential::opencode_local_password(api_key) {
-            Some(password) => {
-                let p = opencode_local::OpenCodeLocalProvider::with_api_base(
-                    password,
-                    String::new(),
-                    DEFAULT_TIMEOUT_SECS,
-                    api_base.unwrap_or(opencode_local::OPENCODE_LOCAL_DEFAULT_BASE).to_string(),
-                );
-                p.list_models(cancel.clone()).await
-            }
-            None => {
-                tracing::warn!(
-                    provider_type,
-                    "no OPENCODE_SERVER_PASSWORD or OPENCODE_LOCAL_API_KEY is set; \
-                     returning an empty model list"
-                );
-                Ok(Vec::new())
-            }
-        },
         "deepseek" => {
             let p = deepseek::DeepSeekProvider::with_api_base(
                 api_key.to_string(),
@@ -376,25 +349,6 @@ pub async fn list_models_for_provider_async(
     }
 }
 
-/// Whether a usable credential is currently resolvable for `provider` on the
-/// model-discovery path.
-///
-/// Keyring-first, matching [`ProviderConfig::api_key`](concerto_config::ProviderConfig::api_key).
-/// For `opencode-local` the exportable env fallbacks
-/// (`OPENCODE_LOCAL_API_KEY`, `OPENCODE_SERVER_PASSWORD`) are also honoured, so
-/// an env-only local-server setup is discovery-ready and the picker populates
-/// without a manual step. Other providers keep the keyring-only behaviour their
-/// discovery path expects.
-pub fn provider_credential_present(
-    provider: &concerto_config::ProviderConfig,
-    store: &concerto_config::CredentialStore,
-) -> bool {
-    let keyring = provider.api_key(store).map(|key| !key.expose().is_empty()).unwrap_or(false);
-    keyring
-        || (provider.provider == "opencode-local"
-            && credential::opencode_local_password("").is_some())
-}
-
 /// Blocking helper: list available models for a given provider configuration.
 ///
 /// Creates a single-threaded tokio runtime internally for the API call.
@@ -431,7 +385,7 @@ pub fn list_models_for_provider_blocking(
 
 #[cfg(test)]
 mod discovery_tests {
-    use super::{list_models_for_provider_async, provider_credential_present};
+    use super::list_models_for_provider_async;
 
     /// One captured WARN event: its rendered message plus its fields.
     #[derive(Clone, Debug, Default)]
@@ -552,98 +506,6 @@ mod discovery_tests {
             warns[0].message.contains("model discovery failed"),
             "the warning must describe the failure: {}",
             warns[0].message
-        );
-    }
-
-    /// The `opencode-local` discovery path resolves the server password from
-    /// `OPENCODE_SERVER_PASSWORD` when the caller passes an empty credential,
-    /// and actually hits `GET /provider`. This is the desktop picker's path: it
-    /// resolves the credential keyring-only, so an env-password-only setup used
-    /// to build but never populate the picker.
-    #[test]
-    fn opencode_local_discovery_uses_the_env_password_and_hits_provider() {
-        use crate::testing::mock_server::{request_headers, spawn_scripted};
-        use crate::testing::RestoreEnvVar;
-
-        let _lock = crate::credential::OPENCODE_LOCAL_ENV_LOCK.lock().expect("env lock");
-        let _local = RestoreEnvVar::without(crate::credential::OPENCODE_LOCAL_API_KEY_ENV);
-        let _server = RestoreEnvVar::set(crate::credential::OPENCODE_SERVER_PASSWORD_ENV, "pw");
-
-        let (base, requests) = spawn_scripted(vec![(
-            200,
-            serde_json::json!({
-                "all": [{"id": "opencode", "models": {
-                    "big-pickle": {"cost": {"input": 0}},
-                    "paid-model": {"cost": {"input": 3}}
-                }}]
-            })
-            .to_string(),
-        )]);
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("test runtime");
-        let models =
-            runtime.block_on(list_models_for_provider_async("opencode-local", "", Some(&base)));
-        assert_eq!(models.len(), 1, "only the zero-cost model is returned: {models:?}");
-        assert_eq!(models[0].id, "big-pickle");
-
-        let raw =
-            requests.recv_timeout(std::time::Duration::from_secs(5)).expect("one request captured");
-        let headers = request_headers(&raw);
-        assert!(headers.starts_with("get /provider http/1.1"), "{headers}");
-        // The env password must have been used for Basic auth.
-        let text = String::from_utf8_lossy(&raw);
-        let auth = text
-            .lines()
-            .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
-            .expect("an Authorization header is present");
-        assert_eq!(
-            auth.split_once(':').expect("header value").1.trim(),
-            "Basic b3BlbmNvZGU6cHc=",
-            "Basic auth must be base64(\"opencode:pw\")"
-        );
-    }
-
-    /// The discovery-readiness gate honours the `opencode-local` env fallback
-    /// (so an env-only setup auto-discovers) while other providers keep the
-    /// keyring-only semantics their discovery path expects.
-    #[test]
-    fn provider_credential_present_honours_the_local_env_fallback() {
-        use crate::testing::RestoreEnvVar;
-        use concerto_config::{CredentialStore, ProviderConfig};
-
-        let _lock = crate::credential::OPENCODE_LOCAL_ENV_LOCK.lock().expect("env lock");
-        let _local = RestoreEnvVar::without(crate::credential::OPENCODE_LOCAL_API_KEY_ENV);
-        let _server = RestoreEnvVar::without(crate::credential::OPENCODE_SERVER_PASSWORD_ENV);
-        let store = CredentialStore::from_env();
-
-        let local = ProviderConfig {
-            provider: "opencode-local".into(),
-            keyring_key: "test-discovery-present/server_password".into(),
-            ..ProviderConfig::default()
-        };
-        assert!(
-            !provider_credential_present(&local, &store),
-            "no credential anywhere must not be ready"
-        );
-
-        let _set = RestoreEnvVar::set(crate::credential::OPENCODE_SERVER_PASSWORD_ENV, "pw");
-        assert!(
-            provider_credential_present(&local, &store),
-            "the server-password env var must make the provider discovery-ready"
-        );
-
-        // A stray env var is not a keyring credential for other providers.
-        let openai = ProviderConfig {
-            provider: "openai".into(),
-            keyring_key: "test-discovery-present/openai".into(),
-            ..ProviderConfig::default()
-        };
-        assert!(
-            !provider_credential_present(&openai, &store),
-            "non-local providers keep keyring-only readiness"
         );
     }
 }

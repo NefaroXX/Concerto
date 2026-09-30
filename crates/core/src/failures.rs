@@ -288,28 +288,6 @@ impl From<OrchestratorError> for ClassifiedFailure {
                          does not support the '{capability}' capability. Choose a tool-capable \
                          model for this task."
                     );
-                }
-                ProviderError::FreeTierRefused { retry_after, message } => {
-                    audience = FailureAudience::User;
-                    match retry_after {
-                        Some(wait) => {
-                            code = "PROVIDER_FREE_TIER_DAILY_LIMIT".to_string();
-                            user_message = format!(
-                                "The OpenCode free tier's anonymous daily limit is reached. \
-                                 It resets in about {} seconds; retrying now cannot succeed. \
-                                 Add an OpenCode API key for uninterrupted access. ({message})",
-                                wait.as_secs()
-                            );
-                        }
-                        None => {
-                            code = "PROVIDER_FREE_TIER_MODEL_UNAVAILABLE".to_string();
-                            user_message = format!(
-                                "This model is not available through the OpenCode free tier: it \
-                                 requires an OpenCode-signed session. Add an OpenCode API key, or \
-                                 choose a different free model. ({message})"
-                            );
-                        }
-                    }
                 } // No `_` arm on purpose (ADR-54): every current variant maps to
                   // a specific code, and adding a new variant must fail
                   // compilation so its classification is decided consciously.
@@ -444,35 +422,6 @@ mod tests {
             }));
         assert_eq!(failure.code, "PROVIDER_CONTEXT_OVERFLOW");
         assert!(failure.user_message.contains("automatic compaction"));
-    }
-
-    #[test]
-    fn free_tier_daily_limit_is_actionable_and_carries_the_wait() {
-        let failure =
-            ClassifiedFailure::from(OrchestratorError::Provider(ProviderError::FreeTierRefused {
-                retry_after: Some(std::time::Duration::from_secs(48_700)),
-                message: "FreeUsageLimitError".into(),
-            }));
-        assert_eq!(failure.audience, FailureAudience::User);
-        assert_eq!(failure.code, "PROVIDER_FREE_TIER_DAILY_LIMIT");
-        assert!(failure.user_message.contains("daily limit"));
-        assert!(failure.user_message.contains("48700"));
-        assert!(!failure.user_message.contains("provider error"));
-    }
-
-    #[test]
-    fn free_tier_model_unavailable_requires_a_signed_session() {
-        let failure =
-            ClassifiedFailure::from(OrchestratorError::Provider(ProviderError::FreeTierRefused {
-                retry_after: None,
-                message:
-                    "FreeTierError: OpenCode's free tier can only be used from within OpenCode"
-                        .into(),
-            }));
-        assert_eq!(failure.audience, FailureAudience::User);
-        assert_eq!(failure.code, "PROVIDER_FREE_TIER_MODEL_UNAVAILABLE");
-        assert!(failure.user_message.contains("OpenCode-signed session"));
-        assert!(failure.user_message.contains("API key"));
     }
 
     #[test]
@@ -635,11 +584,6 @@ mod tests {
                 throttled: false,
                 retry_after: None,
             },
-            ProviderError::FreeTierRefused {
-                retry_after: Some(std::time::Duration::from_secs(48_700)),
-                message: "FreeUsageLimitError".into(),
-            },
-            ProviderError::FreeTierRefused { retry_after: None, message: "FreeTierError".into() },
         ];
         for error in errors {
             let failure = ClassifiedFailure::from(OrchestratorError::Provider(error));

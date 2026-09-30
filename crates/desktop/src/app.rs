@@ -40,9 +40,8 @@ use concerto_orchestrator::runtime_runner::{
 use concerto_orchestrator::services::{RequestBuilder, ServicesBuilder};
 use concerto_plugins::manager::SharedPluginManager;
 use concerto_providers::factory::ProviderFactory;
-use concerto_providers::provider_credential_present;
 use concerto_providers::provider_defs::{
-    picker_model_options_for, provider_definition, provider_readiness,
+    picker_model_options, provider_definition, provider_readiness,
 };
 use concerto_tools::diff::compute_diffs_from_virtual_fs;
 use concerto_tools::virtual_fs::VirtualFs;
@@ -738,7 +737,8 @@ fn provider_discovery_ready(
 ) -> bool {
     let definition = provider_definition(&provider.provider);
     definition.supports_discovery()
-        && (!definition.requires_credential() || provider_credential_present(provider, credentials))
+        && (!definition.requires_credential()
+            || provider.api_key(credentials).map(|key| !key.is_empty()).unwrap_or(false))
 }
 
 impl App {
@@ -2321,11 +2321,10 @@ impl App {
     /// resolved through the shared picker resolver (selected / default / known
     /// / discovered / config-first `extra_models`) so every picker agrees.
     fn runtime_model_names(&self, provider_id: &str) -> Vec<String> {
-        let creds = CredentialStore::new();
         self.runtime_providers()
             .iter()
             .find(|provider| provider.id == provider_id)
-            .map(|provider| picker_model_options_for(provider, creds.exists(&provider.keyring_key)))
+            .map(picker_model_options)
             .unwrap_or_default()
     }
 

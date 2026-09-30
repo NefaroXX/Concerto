@@ -438,18 +438,6 @@ pub fn diagnose_provider(error: &concerto_core::error::ProviderError) -> Failure
         ProviderError::CapabilityRefused { .. } => {
             (FailureKind::Provider, "capability-refused".to_owned())
         }
-        // Free-tier policy decision: the anonymous daily cap or a per-model
-        // eligibility refusal. Not transient and not a credential problem, so
-        // it gets its own diagnosis rather than falling through to the generic
-        // retry classifier.
-        ProviderError::FreeTierRefused { retry_after, .. } => {
-            let code = if retry_after.is_some() {
-                "free-tier-daily-limit"
-            } else {
-                "free-tier-model-unavailable"
-            };
-            (FailureKind::Provider, code.to_owned())
-        }
         // A broken wire format will not heal on retry.
         ProviderError::Serialization(_) | ProviderError::InvalidResponse(_) => {
             (FailureKind::Provider, "malformed-provider-response".to_owned())

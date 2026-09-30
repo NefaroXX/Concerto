@@ -286,30 +286,6 @@ pub enum ProviderError {
         /// The missing capability (always `"tool_calling"` today).
         capability: String,
     },
-
-    /// The OpenCode free tier refused an unauthenticated request.
-    ///
-    /// Distinct from a generic [`ProviderError::AuthFailure`] or
-    /// [`ProviderError::RateLimit`] because it is a **free-tier policy
-    /// decision**, not a credential problem and not a transient throttle:
-    ///
-    /// - `retry_after: Some(_)` — the IP-keyed anonymous daily cap (HTTP 429,
-    ///   `FreeUsageLimitError`). The server's `Retry-After` is preserved, but
-    ///   retrying before the window resets cannot succeed, so this variant is
-    ///   never retried (the existing `RateLimit` variant *is* retryable and
-    ///   would hammer the cap).
-    /// - `retry_after: None` — a per-model eligibility refusal (HTTP 403,
-    ///   `FreeTierError`): the model is served only to an OpenCode-signed
-    ///   session, so a real API key is required.
-    #[error("OpenCode free tier refused the request: {message}")]
-    FreeTierRefused {
-        /// The server's wait hint for the anonymous daily cap; `None` for a
-        /// per-model eligibility refusal.
-        retry_after: Option<Duration>,
-        /// Verbatim server explanation (the `FreeUsageLimitError` /
-        /// `FreeTierError` payload).
-        message: String,
-    },
 }
 
 impl ProviderError {
@@ -339,10 +315,6 @@ impl ProviderError {
             // A capability refusal is a permanent wire-path fact — retrying
             // cannot add a capability the path lacks (ADR-66).
             ProviderError::CapabilityRefused { .. } => false,
-            // A free-tier refusal is a policy decision (daily cap or
-            // per-model eligibility), not a transient condition: retrying
-            // cannot make it succeed.
-            ProviderError::FreeTierRefused { .. } => false,
             // Everything below here is configuration, auth, or cancellation
             ProviderError::NotConfigured
             | ProviderError::CredentialMissing { .. }
@@ -377,7 +349,6 @@ impl ProviderError {
             ProviderError::RateLimit { retry_after } => Some(*retry_after),
             ProviderError::HttpStatus { retry_after, .. } => *retry_after,
             ProviderError::RetryExhausted { retry_after, .. } => *retry_after,
-            ProviderError::FreeTierRefused { retry_after, .. } => *retry_after,
             _ => None,
         }
     }

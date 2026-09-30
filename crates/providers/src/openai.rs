@@ -54,16 +54,6 @@ pub struct OpenAiProvider {
     /// headers — `OpenCodeZenProvider` uses it for `x-opencode-session`
     /// (backend/prompt-cache affinity, see `crate::opencode`).
     extra_headers: Vec<(String, String)>,
-    /// Whether this connector is serving the OpenCode free tier.
-    ///
-    /// `false` for every provider by default, which keeps the wire output
-    /// byte-identical. When `true`, a `403 FreeTierError` gets its own honest
-    /// [`ProviderError::FreeTierRefused`] state instead of collapsing to a
-    /// generic auth failure — see [`crate::credential`]. The anonymous
-    /// `Bearer public` credential this once implied was removed (the relay
-    /// refuses it server-side). Set only by `OpenCodeZenProvider` under the
-    /// `opencode-free-tier` feature.
-    free_tier: bool,
     dialect: OpenAiChatDialect,
 }
 
@@ -79,26 +69,12 @@ impl OpenAiProvider {
             advertised_tool_support: None,
             usage_request: UsageRequest::Off,
             extra_headers: Vec::new(),
-            free_tier: false,
             dialect: OpenAiChatDialect,
         }
     }
 
     pub fn with_api_base(mut self, api_base: String) -> Self {
         self.api_base = api_base;
-        self
-    }
-
-    /// Mark this connector as serving the OpenCode free tier, enabling the
-    /// dedicated `403 FreeTierError` mapping (see [`crate::credential`]).
-    ///
-    /// Only `OpenCodeZenProvider` sets this, under the `opencode-free-tier`
-    /// feature. The default is `false`, so every other provider — and the
-    /// feature-off OpenCode path — is unchanged. Feature-gated so the
-    /// feature-off build has no unused method.
-    #[cfg(feature = "opencode-free-tier")]
-    pub(crate) fn with_free_tier(mut self, free_tier: bool) -> Self {
-        self.free_tier = free_tier;
         self
     }
 
@@ -857,7 +833,7 @@ impl LlmProvider for OpenAiProvider {
                 self.apply_extra_headers(
                     client
                         .post(&url)
-                        .bearer_auth(self.api_key.expose())
+                        .header("Authorization", format!("Bearer {}", self.api_key.expose()))
                         .header("Content-Type", "application/json")
                         .json(&body),
                 )
@@ -871,12 +847,7 @@ impl LlmProvider for OpenAiProvider {
             let status = response.status();
             let retry_after = crate::retry::parse_retry_after(response.headers());
             let text = response.text().await.unwrap_or_default();
-            return Err(crate::credential::map_opencode_http_error(
-                status,
-                &text,
-                retry_after,
-                self.free_tier,
-            ));
+            return Err(crate::retry::map_http_error(status, &text, retry_after));
         }
 
         let mut state = OpenAiStreamState::new();
