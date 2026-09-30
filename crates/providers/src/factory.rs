@@ -25,6 +25,7 @@ use crate::novita::NovitaProvider;
 use crate::ollama::OllamaProvider;
 use crate::openai::{OpenAiProvider, ReasoningEcho, UsageRequest};
 use crate::opencode::OpenCodeZenProvider;
+use crate::opencode_local::OpenCodeLocalProvider;
 use crate::openrouter::OpenRouterProvider;
 use crate::perplexity::PerplexityProvider;
 use crate::sambanova::SambaNovaProvider;
@@ -150,6 +151,7 @@ impl ProviderFactory {
                 | "openai"
                 | "opencode"
                 | "opencode-free"
+                | "opencode-local"
                 | "google"
                 | "openrouter"
                 | "nim"
@@ -185,27 +187,31 @@ impl ProviderFactory {
             return Ok(Self::with_context_guard(provider, &config.model));
         }
 
-        // `opencode-free-tier` port of OpenCode's unauthenticated `opencode`
-        // provider: a key is optional. When one resolves it is used verbatim;
-        // when none does the connector carries the literal `public`
-        // credential (see `crate::credential`). This returns BEFORE the shared
-        // key resolution so a keyless config cannot fail closed. Compiled out
-        // entirely when the feature is off, where `opencode-free` keeps the
-        // Go-relay, required-credential behaviour below.
-        #[cfg(feature = "opencode-free-tier")]
-        if config.provider == "opencode-free" {
-            let key = config.effective_api_key(creds).unwrap_or_default();
-            let base =
-                OpenCodeZenProvider::resolve_api_base(&config.provider, config.api_base.as_deref());
-            let provider = OpenCodeZenProvider::with_api_base(
-                key,
+        // `opencode-local` authenticates to a local `opencode serve` instance
+        // with HTTP Basic (`opencode:<password>`); the password is a real
+        // credential, so it resolves through the shared keyring-then-env path
+        // plus the `OPENCODE_SERVER_PASSWORD` fallback the server itself reads.
+        // This returns before the shared key resolution so the extra env
+        // fallback is honoured without widening every other provider.
+        //
+        // The advertised tool capability is deliberately not threaded: the
+        // transport cannot carry Concerto's tool schemas (its `tools` map only
+        // toggles permissions over the server's own registry), so the
+        // connector reports `supports_tool_calling: false` and the ADR-66 §4
+        // text-fallback driver drives Concerto's tool loop. See
+        // `crate::opencode_local`.
+        if config.provider == "opencode-local" {
+            let password = crate::credential::resolve_opencode_local_password(config, creds)?;
+            let base = config
+                .api_base
+                .clone()
+                .unwrap_or_else(|| crate::opencode_local::OPENCODE_LOCAL_DEFAULT_BASE.to_string());
+            let provider = OpenCodeLocalProvider::with_api_base(
+                password,
                 config.model.clone(),
                 config.timeout_seconds,
                 base,
-            )
-            .with_free_tier(true)
-            .with_tool_schema_mode(resolve_tool_schema_mode(config))
-            .with_advertised_tool_support(advertised_tool_support);
+            );
             let provider: Arc<dyn LlmProvider> = Arc::new(provider);
             return Ok(Self::with_context_guard(provider, &config.model));
         }
@@ -290,6 +296,16 @@ impl ProviderFactory {
                 )
                 .with_tool_schema_mode(resolve_tool_schema_mode(config))
                 .with_advertised_tool_support(advertised_tool_support);
+                // The feature-on `opencode-free` type keeps the free-tier 403
+                // error mapping. The anonymous `Bearer public` credential was
+                // removed (the relay refuses it); a real key is required
+                // exactly like `opencode`.
+                #[cfg(feature = "opencode-free-tier")]
+                let provider = if config.provider == "opencode-free" {
+                    provider.with_free_tier(true)
+                } else {
+                    provider
+                };
                 Arc::new(provider)
             }
             "google" => {
@@ -1657,13 +1673,13 @@ mod tests {
     /// credential at all, short-circuiting before key resolution. The Go
     /// relay answers `401 AuthError "Missing API key."` when a request carries
     /// no `Authorization` header, so that build succeeded only to fail on the
-    /// first network call — the silent-unusable failure. It now resolves the
-    /// key through the shared path and fails closed with `CredentialMissing`,
+    /// first network call — the silent-unusable failure. It resolves the key
+    /// through the shared path and fails closed with `CredentialMissing`,
     /// exactly like every other key-based type.
     ///
-    /// Feature-off only: with `opencode-free-tier` ON, keyless is the whole
-    /// point (see `build_opencode_free_keyless_free_tier_builds`).
-    #[cfg(not(feature = "opencode-free-tier"))]
+    /// This holds in **both** feature states: the feature-on anonymous
+    /// `Bearer public` path was removed after live testing proved the relay
+    /// refuses it, so the Zen variant is key-required too.
     #[test]
     fn build_opencode_free_without_credential_fails_closed() {
         // `blocking_lock` is safe here: this is a plain `#[test]`, outside
@@ -1692,39 +1708,6 @@ mod tests {
         assert!(
             matches!(error, ProviderError::CredentialMissing { .. }),
             "capability build must fail closed with CredentialMissing, got {error:?}"
-        );
-    }
-
-    /// Feature-on: a keyless `opencode-free` config builds (that is the free
-    /// tier), and its requests carry the literal `Bearer public` credential
-    /// that the server maps to its anonymous path.
-    #[cfg(feature = "opencode-free-tier")]
-    #[tokio::test]
-    async fn build_opencode_free_keyless_free_tier_builds() {
-        let _env = OPENCODE_FREE_ENV_LOCK.lock().await;
-        let _restored = RestoreEnvVar::without(OPENCODE_FREE_ENV_KEY);
-        let (base, req_rx) = crate::testing::mock_server::spawn(String::new());
-        let mut config = uncredentialed_opencode_free_config();
-        config.api_base = Some(base.clone());
-        let creds = test_creds();
-
-        assert!(config.effective_api_key(&creds).is_err(), "no key may resolve for this config");
-
-        let provider = ProviderFactory::build(&config, &creds)
-            .expect("a keyless opencode-free config must build in free-tier mode");
-        assert_eq!(provider.provider_name(), "opencode");
-
-        provider
-            .test_connection(concerto_core::CancellationToken::new())
-            .await
-            .expect("the connection test must reach the overridden api_base");
-        let raw = req_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("the mock endpoint must capture exactly one request");
-        let headers = crate::testing::mock_server::request_headers(&raw);
-        assert!(
-            headers.contains("authorization: bearer public"),
-            "keyless free-tier requests must carry the literal `public` credential: {headers}"
         );
     }
 
@@ -1779,6 +1762,83 @@ mod tests {
             !headers.contains("x-session-id"),
             "X-Session-ID is not an upstream header and must never be sent: {headers}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // `opencode-local` credential resolution
+    // ------------------------------------------------------------------
+
+    /// Serializes the tests that mutate the `OPENCODE_SERVER_PASSWORD` env
+    /// var. Kept separate from [`OPENCODE_FREE_ENV_LOCK`] because it is a
+    /// different variable; both are process-global.
+    static OPENCODE_LOCAL_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// An `opencode-local` config with a unique keyring account so no
+    /// `CONCERTO_*` env var can satisfy it.
+    fn opencode_local_config() -> ProviderConfig {
+        ProviderConfig {
+            id: "opencode-local-main".into(),
+            name: "OpenCode (local)".into(),
+            provider: "opencode-local".into(),
+            model: "big-pickle".into(),
+            keyring_key: "test-uncredentialed-opencode-local/server_password".into(),
+            ..ProviderConfig::default()
+        }
+    }
+
+    /// Without a keyring entry, an `<PROVIDER>_API_KEY` env var, or
+    /// `OPENCODE_SERVER_PASSWORD`, construction fails closed: the local server
+    /// answers 401 without a password, so a build that deferred the failure
+    /// would be silently unusable.
+    #[test]
+    fn build_opencode_local_without_credential_fails_closed() {
+        let _env = OPENCODE_LOCAL_ENV_LOCK.blocking_lock();
+        let _restored = RestoreEnvVar::without(crate::credential::OPENCODE_SERVER_PASSWORD_ENV);
+        let config = opencode_local_config();
+        let creds = test_creds();
+
+        let Err(error) = ProviderFactory::build(&config, &creds) else {
+            panic!("a credential-less opencode-local config must not build");
+        };
+        assert!(
+            matches!(error, ProviderError::CredentialMissing { .. }),
+            "build must fail closed with CredentialMissing, got {error:?}"
+        );
+    }
+
+    /// `OPENCODE_SERVER_PASSWORD` — the variable the server itself reads — is
+    /// honoured as the credential fallback, and the provider builds.
+    #[test]
+    fn build_opencode_local_with_server_password_env_builds() {
+        let _env = OPENCODE_LOCAL_ENV_LOCK.blocking_lock();
+        let _password = RestoreEnvVar::set(
+            crate::credential::OPENCODE_SERVER_PASSWORD_ENV,
+            "test-server-password",
+        );
+        let config = opencode_local_config();
+        let creds = test_creds();
+
+        let provider = ProviderFactory::build(&config, &creds)
+            .expect("the server-password env var must satisfy the credential");
+        assert_eq!(provider.provider_name(), "opencode-local");
+    }
+
+    /// A keyring-backed credential also satisfies construction (resolved
+    /// through the shared `effective_api_key` path).
+    #[test]
+    fn build_opencode_local_with_keyring_credential_builds() {
+        let _env = OPENCODE_LOCAL_ENV_LOCK.blocking_lock();
+        let _password = RestoreEnvVar::without(crate::credential::OPENCODE_SERVER_PASSWORD_ENV);
+        let _key = RestoreEnvVar::set(
+            "CONCERTO_TEST_UNCREDENTIALED_OPENCODE_LOCAL_SERVER_PASSWORD",
+            "from-keyring",
+        );
+        let config = opencode_local_config();
+        let creds = test_creds();
+
+        let provider = ProviderFactory::build(&config, &creds)
+            .expect("the keyring credential must satisfy the shared resolution");
+        assert_eq!(provider.provider_name(), "opencode-local");
     }
 
     /// Credential enforcement does not narrow to OpenCode: a `zhipu` config

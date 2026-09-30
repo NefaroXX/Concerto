@@ -210,6 +210,42 @@ pub mod mock_server {
         (base, req_rx)
     }
 
+    /// Serve a scripted sequence of `(status, body)` JSON responses, one per
+    /// incoming request, recording every raw request in order.
+    ///
+    /// Multi-request connectors (e.g. `opencode-local`, which creates a session
+    /// and then posts a message) use this instead of [`spawn`]. Each response
+    /// is sent with `Connection: close`, so the client opens a fresh connection
+    /// for the next request and the server thread can accept them serially.
+    pub fn spawn_scripted(responses: Vec<(u16, String)>) -> (String, mpsc::Receiver<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local mock server");
+        let port = listener.local_addr().expect("local address").port();
+        let base = format!("http://127.0.0.1:{port}");
+        let (req_tx, req_rx) = mpsc::channel();
+        let _ = std::thread::spawn(move || {
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().expect("accept one request");
+                let request = read_request(&mut stream);
+                let _ = req_tx.send(request);
+                let reason = match status {
+                    200 => "OK",
+                    401 => "Unauthorized",
+                    403 => "Forbidden",
+                    404 => "Not Found",
+                    _ => "Error",
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (base, req_rx)
+    }
+
     /// Parse the captured request's JSON body out of its raw HTTP bytes.
     pub fn request_body(raw: Vec<u8>) -> serde_json::Value {
         let header_end = find_subsequence(&raw, b"\r\n\r\n").expect("captured request has headers");

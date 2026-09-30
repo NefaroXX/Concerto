@@ -460,10 +460,14 @@ pub fn provider_definition(provider_type: &str) -> ProviderDefinition {
         //
         // - OFF (shipped default): the **Go** relay sibling, with its own
         //   static catalog and a required key. Byte-identical to before.
-        // - ON: targets the **Zen** relay, ships the cost-aware Zen catalog
-        //   (free-ness is `cost.input == 0`), and is usable without a key —
-        //   a keyless request carries the literal `public` credential that
-        //   the server maps to its anonymous path (see `crate::credential`).
+        // - ON: targets the **Zen** relay and ships the cost-aware Zen catalog
+        //   (free-ness is `cost.input == 0`). The anonymous `Bearer public`
+        //   credential this mode used to send was REMOVED (2026-09-30): live
+        //   testing proved the relay refuses it server-side (`403
+        //   FreeTierError` / `429`). A real key is now required exactly like
+        //   `opencode`; the supported route to OpenCode's free models is the
+        //   `opencode-local` type. The keyless picker still lists only
+        //   zero-cost models.
         #[cfg(not(feature = "opencode-free-tier"))]
         "opencode-free" => ProviderDefinition {
             id: "opencode-free",
@@ -495,22 +499,41 @@ pub fn provider_definition(provider_type: &str) -> ProviderDefinition {
         "opencode-free" => ProviderDefinition {
             id: "opencode-free",
             display_name: String::from("OpenCode Zen (free)"),
-            // `space-bunny-free` is the one catalog model measured to answer
-            // HTTP 200 to the anonymous `public` credential, and it takes the
-            // OpenAI-compatible `/chat/completions` dialect on Zen. Chosen for
-            // measured anonymous availability + cost, never for its name.
+            // `space-bunny-free` takes the OpenAI-compatible
+            // `/chat/completions` dialect on Zen and is a zero-cost catalog
+            // entry. It is the default for its cost and dialect, never for its
+            // name (name-based free-ness is the regression this repo has fixed
+            // twice).
             default_model: Some("space-bunny-free"),
             // The ids come from the cost-aware catalog so the keyed picker can
             // still reach the paid roster; the keyless picker filters it.
             known_models: &[],
             known_model_costs: OPENCODE_FREE_KNOWN,
-            // Keyless free tier: a missing key is the normal case, so readiness
-            // must not block on it. A stored key upgrades the same config to
-            // the full catalog and the `Bearer <key>` path.
-            credential_requirement: CredentialRequirement::Optional,
+            // A real key is required: the anonymous `Bearer public` path was
+            // removed after live testing showed the relay refuses it. The
+            // keyless picker filter still shows only zero-cost models before a
+            // key is entered.
+            credential_requirement: CredentialRequirement::Required,
             // Discovery stays off: the Zen `/models` endpoint is ungated and
             // would leak paid ids into the keyless picker.
             model_discovery: ModelDiscoverySupport::Unsupported,
+            allows_custom_model: true,
+        },
+        // A local `opencode serve` instance. Unlike the two relay types this
+        // one is not an HTTP relay to a hosted service: it is a first-class
+        // provider over the server's own API. The model catalog is discovered
+        // from `GET /provider` and filtered to `cost.input == 0` (free-ness is
+        // COST, never a name suffix), so no static list ships here. The server
+        // password is a real credential (the API answers 401 without it), so
+        // the requirement is `Required`; discovery is `Supported`.
+        "opencode-local" => ProviderDefinition {
+            id: "opencode-local",
+            display_name: String::from("OpenCode (local server)"),
+            default_model: None,
+            known_models: &[],
+            known_model_costs: &[],
+            credential_requirement: CredentialRequirement::Required,
+            model_discovery: ModelDiscoverySupport::Supported,
             allows_custom_model: true,
         },
         "deepseek" => ProviderDefinition {
@@ -686,6 +709,7 @@ pub const PROVIDER_TYPE_IDS: &[&str] = &[
     "ollama",
     "opencode",
     "opencode-free",
+    "opencode-local",
     "deepseek",
     "groq",
     "together",
@@ -1067,10 +1091,11 @@ mod tests {
         assert_eq!(expected.len(), 43, "the Go relay advertises exactly 43 models");
     }
 
-    /// The feature-on `opencode-free` type is the unauthenticated Zen
-    /// free-tier port: the full cost-aware Zen catalog, an optional
-    /// credential, discovery disabled, and a default that is measured to
-    /// answer the anonymous credential.
+    /// The feature-on `opencode-free` type is the Zen relay sibling with the
+    /// cost-aware catalog and a **required** credential: the anonymous
+    /// `Bearer public` path was removed after live testing proved the relay
+    /// refuses it server-side. Discovery stays disabled and the default is a
+    /// zero-cost Chat Completions model.
     #[cfg(feature = "opencode-free-tier")]
     #[test]
     fn opencode_free_definition_is_complete() {
@@ -1078,8 +1103,8 @@ mod tests {
         assert_eq!(def.id, "opencode-free");
         assert_eq!(def.display_name, "OpenCode Zen (free)");
         assert_eq!(def.default_model, Some("space-bunny-free"));
-        // Keyless is the normal case in free-tier mode.
-        assert_eq!(def.credential_requirement, CredentialRequirement::Optional);
+        // A real key is required: the anonymous path was removed.
+        assert_eq!(def.credential_requirement, CredentialRequirement::Required);
         assert_eq!(def.model_discovery, ModelDiscoverySupport::Unsupported);
         assert!(def.allows_custom_model);
         // The full 114-model Zen catalog ships, with 34 zero-cost models.
@@ -1087,6 +1112,52 @@ mod tests {
         assert_eq!(def.known_models.len(), 0, "ids come from the cost catalog");
         let free_count = def.known_model_costs.iter().filter(|model| model.free).count();
         assert_eq!(free_count, 34, "the catalog has exactly 34 cost.input == 0 models");
+    }
+
+    /// The `opencode-local` type is a first-class, key-required,
+    /// discovery-supported provider over a local `opencode serve` instance.
+    /// No static catalog ships: the free list is discovered from `/provider`.
+    #[test]
+    fn opencode_local_definition_is_complete() {
+        let def = provider_definition("opencode-local");
+        assert_eq!(def.id, "opencode-local");
+        assert_eq!(def.display_name, "OpenCode (local server)");
+        assert_eq!(def.default_model, None, "the catalog is discovered, not hard-coded");
+        assert!(def.known_models.is_empty());
+        assert!(def.known_model_costs.is_empty());
+        // The server password is a real credential; the API answers 401
+        // without it.
+        assert_eq!(def.credential_requirement, CredentialRequirement::Required);
+        assert_eq!(def.model_discovery, ModelDiscoverySupport::Supported);
+        assert!(def.allows_custom_model);
+    }
+
+    /// `opencode-local` is registered in the picker type list next to the
+    /// other OpenCode types, and `opencode-free` stays immediately after
+    /// `opencode`.
+    #[test]
+    fn opencode_local_is_registered_next_to_opencode() {
+        let position = |id: &str| {
+            PROVIDER_TYPE_IDS
+                .iter()
+                .position(|candidate| *candidate == id)
+                .unwrap_or_else(|| panic!("{id} must be registered in PROVIDER_TYPE_IDS"))
+        };
+        assert_eq!(position("opencode-local"), position("opencode-free") + 1);
+        assert_eq!(position("opencode-free"), position("opencode") + 1);
+    }
+
+    /// The keyless picker lists discovered free models for `opencode-local`:
+    /// the connector's `list_models` returns only zero-cost entries and the
+    /// picker merges `cached_models` additively.
+    #[test]
+    fn picker_lists_discovered_free_models_for_opencode_local() {
+        let mut provider =
+            pc("opencode-local", "big-pickle", None, "opencode-local/server_password");
+        provider.cached_models = vec!["big-pickle".into(), "space-bunny-free".into()];
+        let options = picker_model_options(&provider);
+        assert!(options.contains(&"big-pickle".to_string()));
+        assert!(options.contains(&"space-bunny-free".to_string()));
     }
 
     /// Feature-on: the default is a free, tool-capable Chat Completions model

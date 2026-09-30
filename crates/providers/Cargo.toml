@@ -10,12 +10,21 @@ workspace = true
 
 [features]
 default = []
-# Opt-in port of OpenCode's unauthenticated ("free tier") provider behaviour.
+# Opt-in OpenCode free-tier port.
 #
-# OFF by default: with the flag off every code path is byte-identical to the
-# shipped behaviour. ON, `opencode-free` targets the Zen relay, resolves a
-# keyless credential to the literal `public`, classifies free-ness from the
-# catalog's `cost.input == 0`, and lists only free models while keyless.
+# STATUS (2026-09-30): the anonymous HTTP path this feature was built for does
+# NOT work. Live testing shows the Zen relay refuses `Authorization: Bearer
+# public` with `403 FreeTierError` for 7 of the 8 zero-cost models and `429`
+# for the rest — anonymous HTTP access to the Zen relay is refused
+# server-side. The supported route to OpenCode's free models is a local
+# `opencode serve` instance, exposed as the `opencode-local` provider type
+# (which does not need this feature).
+#
+# What remains useful with the flag ON: the cost-based Zen catalog
+# (`OPENCODE_FREE_KNOWN`) and `is_free_cost` classification, the free-only
+# keyless picker filter, and the `FreeTierRefused` 403 error surface. The
+# credential substitution to the literal `public` has been removed; a real key
+# is now required.
 opencode-free-tier = []
 
 [dependencies]

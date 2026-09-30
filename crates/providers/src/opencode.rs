@@ -17,15 +17,25 @@
 //!
 //! # `opencode-free-tier` feature
 //!
+//! STATUS (2026-09-30): the anonymous HTTP path this feature was built for
+//! **does not work**. Live testing shows the Zen relay refuses
+//! `Authorization: Bearer public` with `403 FreeTierError` for 7 of the 8
+//! zero-cost models and `429` for the rest — anonymous HTTP access to the Zen
+//! relay is refused server-side. The credential substitution to the literal
+//! `public` has been removed; the supported route to OpenCode's free models is
+//! a local `opencode serve` instance via the `opencode-local` provider type
+//! ([`crate::opencode_local`]).
+//!
 //! With the non-default `opencode-free-tier` feature enabled, the
-//! `opencode-free` type becomes Concerto's port of OpenCode's own
-//! unauthenticated `opencode` provider: it targets the **Zen** relay, ships
-//! the cost-aware Zen catalog (free-ness is `cost.input == 0`, never a name
-//! suffix), and a keyless request carries the literal `public` credential that
-//! the server maps back to the anonymous IP-rate-limited path. When a real key
-//! is present it is used instead and the full catalog is available. With the
-//! feature OFF every path here is byte-identical to the shipped Go-relay
-//! behaviour. See `crate::credential` and `crate::provider_defs`.
+//! `opencode-free` type still targets the **Zen** relay and ships the
+//! cost-aware Zen catalog (free-ness is `cost.input == 0`, never a name
+//! suffix), and the keyless picker still lists only zero-cost models. It now
+//! requires a real credential exactly like `opencode` — a keyless request
+//! carries no anonymous sentinel. The genuinely reusable parts (the cost
+//! catalog, [`crate::provider_defs::is_free_cost`], the free-only picker
+//! filter, and the `FreeTierRefused` 403 surface) are kept. With the feature
+//! OFF every path here is byte-identical to the shipped Go-relay behaviour.
+//! See `crate::credential` and `crate::provider_defs`.
 //!
 //! Each relay dispatches on the **lowercased full model-id prefix** — the
 //! authoritative contract is the upstream consumer's
@@ -121,10 +131,9 @@ impl OpenCodeRelay {
     /// The relay a provider type targets when no `api_base` overrides it.
     ///
     /// With the `opencode-free-tier` feature OFF, `opencode-free` targets the
-    /// Go relay exactly as shipped. With the feature ON, it is the
-    /// unauthenticated free-tier port of OpenCode's own `opencode` provider,
-    /// which speaks to the Zen relay whose catalog carries the `cost` metadata
-    /// free-ness is derived from. Every other type targets Zen.
+    /// Go relay exactly as shipped. With the feature ON, it targets the Zen
+    /// relay whose catalog carries the `cost` metadata free-ness is derived
+    /// from. Every other type targets Zen.
     fn default_for(provider_type: &str) -> Self {
         if provider_type == "opencode-free" {
             #[cfg(feature = "opencode-free-tier")]
@@ -332,8 +341,9 @@ pub struct OpenCodeZenProvider {
     /// dialect path and is forwarded to `openai_inner` for the
     /// OpenAI-compatible path.
     advertised_tool_support: Option<bool>,
-    /// Whether this provider is serving OpenCode's unauthenticated free tier
-    /// (see [`crate::credential`]). Mirrored into `openai_inner` so the
+    /// Whether this provider is serving the OpenCode free tier (see
+    /// [`crate::credential`]), which enables the dedicated `403
+    /// FreeTierError` mapping. Mirrored into `openai_inner` so the
     /// OpenAI-compatible leg agrees with the Responses/Anthropic legs.
     free_tier: bool,
     /// Pre-built inner OpenAI provider for OpenAI-compatible models.
@@ -404,8 +414,9 @@ impl OpenCodeZenProvider {
         }
     }
 
-    /// Enable OpenCode's unauthenticated free-tier wire behaviour on this
-    /// provider and its inner OpenAI-compatible connector.
+    /// Mark this provider as serving the OpenCode free tier (enabling the
+    /// dedicated `403 FreeTierError` mapping) on both this provider and its
+    /// inner OpenAI-compatible connector.
     ///
     /// Set by the factory only for `opencode-free` under the
     /// `opencode-free-tier` feature. Default `false` keeps both the feature-off
@@ -433,11 +444,6 @@ impl OpenCodeZenProvider {
     /// callers never materialize a second copy of the key.
     pub(crate) fn api_key(&self) -> &SecretString {
         self.openai_inner.api_key()
-    }
-
-    /// The three-state wire credential for a request (see `crate::credential`).
-    fn wire_credential(&self) -> crate::credential::WireCredential<'_> {
-        crate::credential::resolve_wire_credential(self.api_key().expose(), self.free_tier)
     }
 
     /// Set the tool-schema presentation mode (adaptive tool schemas).
@@ -637,17 +643,13 @@ impl OpenCodeZenProvider {
         let url = format!("{}/responses", self.api_base);
 
         let body = Self::build_responses_body(&request, &model);
-        // One credential decision per request; the error mapping reuses it so
-        // the anonymous free-tier path is recognised consistently.
-        let credential = self.wire_credential();
-        let anonymous = credential.is_anonymous();
 
         let response = tokio::select! {
             _ = cancel.cancelled() => Err(ProviderError::Cancelled),
             result = async {
                 let r = client
                     .post(&url)
-                    .bearer_auth(credential.expose())
+                    .bearer_auth(self.api_key().expose())
                     .header(CONTENT_TYPE, "application/json")
                     // Backend/prompt-cache affinity, not authentication —
                     // see `OPENCODE_SESSION_HEADER`.
@@ -666,7 +668,6 @@ impl OpenCodeZenProvider {
                         &text,
                         retry_after,
                         self.free_tier,
-                        anonymous,
                     ));
                 }
                 Ok(r)
@@ -760,19 +761,13 @@ impl OpenCodeZenProvider {
         }
 
         let body = self.build_anthropic_body(&request, &model);
-        // The Anthropic dialect carries the same three-state credential in
-        // `x-api-key` (see `crate::credential`): a real key verbatim, the
-        // literal `public` in keyless free-tier mode, or the historical empty
-        // value when free-tier mode is off.
-        let credential = self.wire_credential();
-        let anonymous = credential.is_anonymous();
 
         let response = tokio::select! {
             _ = cancel.cancelled() => Err(ProviderError::Cancelled),
             result = async {
                 let r = client
                     .post(&url)
-                    .header("x-api-key", credential.expose())
+                    .header("x-api-key", self.api_key().expose())
                     .header("anthropic-version", "2023-06-01")
                     .header(CONTENT_TYPE, "application/json")
                     // Backend/prompt-cache affinity, not authentication —
@@ -792,7 +787,6 @@ impl OpenCodeZenProvider {
                         &text,
                         retry_after,
                         self.free_tier,
-                        anonymous,
                     ));
                 }
                 Ok(r)
@@ -2325,113 +2319,51 @@ mod tests {
             .expect("the request reaches the mock")
     }
 
-    /// Feature-on, keyless: the Chat Completions leg carries exactly
-    /// `Authorization: Bearer public` — the literal sentinel the server maps
-    /// back to its anonymous path.
+    /// The `Bearer public` anonymous credential this feature used to send was
+    /// removed (2026-09-30): live testing proved the Zen relay refuses it
+    /// (`403 FreeTierError` / `429`), so a real key is the only credential the
+    /// connector ever sends. A keyed request is unchanged and reaches all
+    /// three wire legs verbatim.
     #[cfg(feature = "opencode-free-tier")]
     #[tokio::test]
-    async fn keyless_free_tier_chat_leg_sends_bearer_public() {
-        let headers =
-            captured_headers(&capture_wire_request_with_credential("minimax-m3", "", true).await);
-        assert!(
-            headers.contains("authorization: bearer public"),
-            "keyless free-tier request must carry `Bearer public`: {headers}"
-        );
-    }
-
-    /// Feature-on, keyed: the real key wins over the anonymous sentinel.
-    #[cfg(feature = "opencode-free-tier")]
-    #[tokio::test]
-    async fn keyed_free_tier_chat_leg_sends_the_real_key() {
-        let headers = captured_headers(
+    async fn keyed_free_tier_sends_the_real_key_on_every_leg() {
+        let chat = captured_headers(
             &capture_wire_request_with_credential("minimax-m3", "sk-live", true).await,
         );
         assert!(
-            headers.contains("authorization: bearer sk-live"),
-            "a real key must be sent verbatim: {headers}"
+            chat.contains("authorization: bearer sk-live"),
+            "the Chat Completions leg must carry the real key: {chat}"
         );
-        assert!(!headers.contains("bearer public"), "the sentinel must never accompany a key");
-    }
+        assert!(!chat.contains("bearer public"), "the anonymous sentinel must never appear");
 
-    /// Feature-on, keyless: the Responses leg carries the same sentinel.
-    #[cfg(feature = "opencode-free-tier")]
-    #[tokio::test]
-    async fn keyless_free_tier_responses_leg_sends_bearer_public() {
-        let headers =
-            captured_headers(&capture_wire_request_with_credential("muse-v2", "", true).await);
-        assert!(headers.starts_with("post /responses http/1.1"), "{headers}");
+        let responses = captured_headers(
+            &capture_wire_request_with_credential("muse-v2", "sk-live", true).await,
+        );
+        assert!(responses.starts_with("post /responses http/1.1"), "{responses}");
         assert!(
-            headers.contains("authorization: bearer public"),
-            "the Responses leg must carry `Bearer public`: {headers}"
+            responses.contains("authorization: bearer sk-live"),
+            "the Responses leg must carry the real key: {responses}"
         );
-    }
 
-    /// Feature-on, keyless: the Anthropic Messages leg carries the sentinel
-    /// in `x-api-key`.
-    #[cfg(feature = "opencode-free-tier")]
-    #[tokio::test]
-    async fn keyless_free_tier_anthropic_leg_sends_public_api_key() {
-        let headers = captured_headers(
-            &capture_wire_request_with_credential("claude-3-5-sonnet", "", true).await,
+        let anthropic = captured_headers(
+            &capture_wire_request_with_credential("claude-3-5-sonnet", "sk-live", true).await,
         );
-        assert!(headers.starts_with("post /messages http/1.1"), "{headers}");
+        assert!(anthropic.starts_with("post /messages http/1.1"), "{anthropic}");
         assert!(
-            headers.contains("x-api-key: public"),
-            "the Anthropic leg must carry `x-api-key: public`: {headers}"
+            anthropic.contains("x-api-key: sk-live"),
+            "the Anthropic leg must carry the real key: {anthropic}"
         );
     }
 
-    /// Runnable demonstration (feature `opencode-free-tier`): prints, for a
-    /// keyless `opencode-free` provider, the picker's model list and the exact
-    /// auth header each wire leg carries.
-    ///
-    /// Run with:
-    /// `cargo test -p concerto-providers --features opencode-free-tier \
-    ///  opencode_free_tier_demo -- --nocapture`
-    #[cfg(feature = "opencode-free-tier")]
+    /// A keyless request — feature on or off — carries the shipped empty
+    /// credential and must never be upgraded to the removed `public` sentinel.
     #[tokio::test]
-    async fn opencode_free_tier_demo() {
-        let config = concerto_config::ProviderConfig {
-            id: "demo".into(),
-            name: "OpenCode Zen (free)".into(),
-            provider: "opencode-free".into(),
-            model: "space-bunny-free".into(),
-            keyring_key: "demo/api_key".into(),
-            ..Default::default()
-        };
-        let keyless = crate::provider_defs::picker_model_options_for(&config, false);
-        println!("opencode-free keyless picker ({} models, all cost.input == 0):", keyless.len());
-        for model in &keyless {
-            println!("  {model}");
-        }
-
-        println!();
-        println!("exact auth header per wire leg (keyless, no key):");
-        for (leg, model) in [
-            ("POST /chat/completions", "space-bunny-free"),
-            ("POST /responses", "muse-v2"),
-            ("POST /messages", "claude-3-5-sonnet"),
-        ] {
-            let headers =
-                captured_headers(&capture_wire_request_with_credential(model, "", true).await);
-            let auth = headers
-                .lines()
-                .find(|line| line.starts_with("authorization:") || line.starts_with("x-api-key:"))
-                .unwrap_or("<none>");
-            println!("  {leg} ({model}) -> {auth}");
-        }
-    }
-
-    /// Feature-off: a keyless request keeps the shipped empty credential and
-    /// must never be upgraded to the `public` sentinel.
-    #[cfg(not(feature = "opencode-free-tier"))]
-    #[tokio::test]
-    async fn feature_off_keyless_never_sends_public() {
+    async fn keyless_never_sends_the_public_sentinel() {
         let headers =
             captured_headers(&capture_wire_request_with_credential("minimax-m3", "", false).await);
         assert!(
             !headers.contains("bearer public"),
-            "the `public` sentinel is feature-gated and must not appear: {headers}"
+            "the `public` sentinel was removed and must not appear: {headers}"
         );
         assert!(
             headers.contains("authorization: bearer \r\n"),

@@ -40,6 +40,7 @@ pub mod novita;
 pub mod ollama;
 pub mod openai;
 pub mod opencode;
+pub mod opencode_local;
 pub mod openrouter;
 pub mod perplexity;
 pub mod sambanova;
@@ -174,6 +175,19 @@ pub async fn list_models_for_provider_async(
                 String::new(),
                 DEFAULT_TIMEOUT_SECS,
                 opencode::OpenCodeZenProvider::resolve_api_base(provider_type, api_base),
+            );
+            p.list_models(cancel.clone()).await
+        }
+        // A local `opencode serve` instance: discovery reads `/provider` and
+        // returns the zero-cost models it advertises. The credential is the
+        // server password; the caller resolves it through the standard path
+        // before calling this helper.
+        "opencode-local" => {
+            let p = opencode_local::OpenCodeLocalProvider::with_api_base(
+                api_key.to_string(),
+                String::new(),
+                DEFAULT_TIMEOUT_SECS,
+                api_base.unwrap_or(opencode_local::OPENCODE_LOCAL_DEFAULT_BASE).to_string(),
             );
             p.list_models(cancel.clone()).await
         }
