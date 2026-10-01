@@ -1,7 +1,7 @@
 //! Adaptive tool-call guard — VALIDATE → COERCE → REPAIR between the provider
 //! and the tool executor.
 //!
-//! Weak models (audit: mimo-v2.5-free, 21× filesystem / 4× shell argument
+//! Weak models (audit: the MiMo family, 21× filesystem / 4× shell argument
 //! stalls) emit tool calls whose accumulated `arguments` are `null` or empty,
 //! JSON wrapped in fenced code blocks, stringified numbers, capitalized enum
 //! values, or objects carrying hallucinated extra keys. This module repairs

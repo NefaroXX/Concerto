@@ -2067,13 +2067,36 @@ pub struct ModelInfo {
     /// Entity that owns/publishes the model, if available.
     pub owned_by: Option<String>,
     /// Tool-calling capability **as advertised by the provider's listing
-    /// API** (ADR-66 §3 precedence level 2), when the provider publishes
-    /// such metadata (e.g. Ollama's `capabilities` array containing
+    /// API** (ADR-66 §3 precedence level 2 / ADR-75), when the provider
+    /// publishes such metadata (e.g. Ollama's `capabilities` array containing
     /// `"tools"`). `None` when the provider does not advertise capability
-    /// flags; resolution then falls through the built-in family table to
-    /// the provider default (see `concerto-providers::capability`).
+    /// flags; resolution then falls through the last-resort name heuristic to
+    /// the optimistic provider default (see `concerto-providers::capability`).
+    /// Advertised metadata is always believed over a model-name guess.
     #[serde(default)]
     pub supports_tool_calling: Option<bool>,
+}
+
+impl ModelInfo {
+    /// A bare model entry carrying only its id — no display metadata and no
+    /// advertised capability. Useful where a caller has an id but no listing
+    /// metadata; capability resolution then falls through to the last-resort
+    /// heuristic and the optimistic provider default.
+    pub fn from_id(id: impl Into<String>) -> Self {
+        Self { id: id.into(), name: None, owned_by: None, supports_tool_calling: None }
+    }
+}
+
+impl From<&str> for ModelInfo {
+    fn from(id: &str) -> Self {
+        Self::from_id(id)
+    }
+}
+
+impl From<String> for ModelInfo {
+    fn from(id: String) -> Self {
+        Self::from_id(id)
+    }
 }
 
 // ---- Phase 8: SandboxProfile --------------------------------------------------

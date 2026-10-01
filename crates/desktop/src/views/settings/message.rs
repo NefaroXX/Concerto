@@ -49,10 +49,15 @@ pub enum Message {
     /// (`pending_refresh`) and spawns the async discovery fetch.
     ProviderModelsRefreshRequested(String),
     /// Discovery result for a saved provider, produced by the app's async task.
+    ///
+    /// Carries the full [`concerto_core::types::ModelInfo`] entries so
+    /// provider-advertised capability metadata survives into the persisted
+    /// catalog and then into `ProviderFactory::build` (ADR-75). UI consumers
+    /// map `.id` where only names are needed.
     ProviderModelsRefreshed {
         provider_id: String,
         request_id: u64,
-        result: Result<Vec<String>, String>,
+        result: Result<Vec<concerto_core::types::ModelInfo>, String>,
     },
 
     // Global default model — single unified picker for single-agent mode + fallback

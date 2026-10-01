@@ -216,6 +216,15 @@ pub mod mock_server {
         serde_json::from_slice(&raw[header_end + 4..]).expect("captured request body is JSON")
     }
 
+    /// Return the captured request's header block, lowercased, so header
+    /// assertions can be plain `contains` checks (`"x-opencode-session:"`).
+    /// Includes the request line (`get /models http/1.1`), which doubles as
+    /// a check that the right endpoint was reached.
+    pub fn request_headers(raw: &[u8]) -> String {
+        let header_end = find_subsequence(raw, b"\r\n\r\n").expect("captured request has headers");
+        String::from_utf8_lossy(&raw[..header_end]).to_ascii_lowercase()
+    }
+
     /// Read a full HTTP request: headers plus a `Content-Length`-framed body.
     fn read_request(stream: &mut TcpStream) -> Vec<u8> {
         let mut raw = Vec::new();

@@ -8,6 +8,12 @@ publish.workspace = true
 [lints]
 workspace = true
 
+# Optional: the `opencode-local` provider (a connector to a running
+# `opencode serve`). Off by default; enabled only by the gitignored
+# `local-dev/` patch + build script. See local-dev/README.md.
+[features]
+opencode-local = []
+
 [dependencies]
 concerto-core = { path = "../core", version = "0.1.0" }
 concerto-config = { path = "../config", version = "0.1.0" }

@@ -65,6 +65,14 @@ impl SambaNovaProvider {
         self.inner = self.inner.with_tool_schema_mode(mode);
         self
     }
+
+    /// Forward the provider-advertised per-model tool-calling capability
+    /// (ADR-66 §3 precedence level 2) to the inner OpenAI-compatible
+    /// provider.
+    pub fn with_advertised_tool_support(mut self, advertised: Option<bool>) -> Self {
+        self.inner = self.inner.with_advertised_tool_support(advertised);
+        self
+    }
 }
 
 #[async_trait]

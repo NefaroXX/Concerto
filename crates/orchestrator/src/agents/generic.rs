@@ -115,6 +115,10 @@ pub struct GenericSpecialistAgent {
     /// event attributed to this agent (its `id`) — fail-soft, never affects
     /// tool results.
     tool_facts: Option<ToolFactContext>,
+    /// Provider-advertised tool-calling capability for the model this agent
+    /// runs on (ADR-66 §3 level 2 / ADR-75). `Some(false)` engages the §4
+    /// text-fallback driver; `None` falls through to the optimistic default.
+    advertised_tool_support: Option<bool>,
 }
 
 impl GenericSpecialistAgent {
@@ -155,6 +159,7 @@ impl GenericSpecialistAgent {
             skills_section: String::new(),
             environment_card: String::new(),
             tool_facts: None,
+            advertised_tool_support: None,
         }
     }
 
@@ -164,6 +169,14 @@ impl GenericSpecialistAgent {
     /// builder; until then every agent stays Freeform by construction.
     pub fn with_output_mode(mut self, output_mode: OutputMode) -> Self {
         self.output_mode = output_mode;
+        self
+    }
+
+    /// Supply the provider-advertised tool-calling capability for the model
+    /// this agent runs on (ADR-66 §3 level 2 / ADR-75), so advertised absence
+    /// engages the text-fallback driver instead of forcing native tools.
+    pub fn with_advertised_tool_support(mut self, advertised: Option<bool>) -> Self {
+        self.advertised_tool_support = advertised;
         self
     }
 
@@ -516,8 +529,17 @@ impl GenericSpecialistAgent {
         // for plugin providers — those are hard-gated to AnswerOnly tasks
         // with an explicit error). Fallback-driven requests carry no wire
         // tool declarations; the driver's prompt section replaces them.
+        // The generic/collaborator path honors the agent's advertised flag: a
+        // provider that advertises its absence (`Some(false)`) engages the
+        // driver; `None` resolves via the optimistic default, with advertised
+        // absence additionally honored earlier by the tool-calling profile
+        // filter.
         let mut tool_driver = (!tool_defs.is_empty()
-            && crate::tool_driver::fallback_engaged(self.provider.provider_name(), model))
+            && crate::tool_driver::fallback_engaged(
+                self.provider.provider_name(),
+                model,
+                self.advertised_tool_support,
+            ))
         .then(|| crate::tool_driver::TextToolDriver::new(tool_defs.clone()));
         if let Some(_driver) = tool_driver.as_ref() {
             // The prompt section is injected per request by
@@ -5404,6 +5426,10 @@ mod tests {
 
     /// Build a Freeform specialist wired for the fallback tests: a real
     /// executor with [`WriteFileTool`] behind a capturing audit log.
+    ///
+    /// The agent advertises `Some(false)` — the fallback tests exercise the
+    /// driver for a provider that *advertises* no native tool support. A model
+    /// NAME alone never engages the driver (ADR-75).
     fn fallback_agent(
         provider: Arc<dyn LlmProvider>,
         audit: CapturingAudit,
@@ -5426,6 +5452,7 @@ mod tests {
             PromptSections { system_instructions: "You write code.".into(), ..Default::default() },
             AgentCapabilities::default(),
         )
+        .with_advertised_tool_support(Some(false))
     }
 
     fn fallback_task() -> SubTask {
@@ -5443,10 +5470,10 @@ mod tests {
         }
     }
 
-    /// ADR-66 A5: a simulated text-only specialist provider completes a
-    /// tool task through the fallback driver — the tool-call block parses,
-    /// executes through the real executor, and no wire tool declarations
-    /// are ever sent.
+    /// ADR-66 A5 / ADR-75: a specialist provider that **advertises its
+    /// absence** of native tool support completes a tool task through the
+    /// fallback driver — the tool-call block parses, executes through the real
+    /// executor, and no wire tool declarations are ever sent.
     #[tokio::test]
     async fn freeform_fallback_completes_tool_task() {
         let block = "<tool_calls>\n\

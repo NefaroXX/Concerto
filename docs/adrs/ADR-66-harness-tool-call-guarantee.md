@@ -12,6 +12,14 @@ Amends ADR-61's implicit assumption that capability is uniform per provider.
 
 ## Context
 
+> **Historical record.** This section describes the state as of 2026-09-07 and
+> is kept for provenance. The hazards listed here were subsequently resolved:
+> `needs_responses_api()` and `needs_anthropic_dialect()` no longer exist —
+> dialect selection is now the single relay-aware `api_mode_for(relay, model)`
+> decision, which uses the upstream per-relay prefix contract instead of name
+> substring matching, and the Responses path carries native tools rather than
+> omitting them. See ADR-75 §4 and the `opencode-free` Go-relay work.
+
 The pre-smoke review (2026-09-07) established that tool calling is a
 per-provider accident, not a harness guarantee:
 
