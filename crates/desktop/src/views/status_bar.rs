@@ -1,34 +1,10 @@
 use iced::widget::{button, container, row, text};
 use iced::{Background, Element, Length};
 
-use concerto_config::CredentialStore;
 use concerto_core::intent::RunStage;
-use concerto_providers::provider_defs::{provider_definition, provider_readiness};
 
-use crate::app::{App, Message, Page, RunStatus};
+use crate::app::{App, Message, RunStatus};
 use crate::views::spend::{spend_chip_state, SpendChipTone};
-
-fn page_name(page: Page) -> &'static str {
-    match page {
-        Page::Chat => "Chat",
-        Page::ToolLog => "Tool Log",
-        Page::DiffViewer => "Diff Viewer",
-        Page::Settings => "Settings",
-        Page::OrchestrationStudio => "Orchestration Studio",
-        Page::Editor => "Editor",
-    }
-}
-
-fn shortcut_hints(page: Page) -> &'static str {
-    match page {
-        Page::Chat => "Ctrl+T New Task  |  Ctrl+Enter Send  |  Ctrl+S Screenshot",
-        Page::ToolLog => "Ctrl+L Tool Log",
-        Page::DiffViewer => "Ctrl+D Diff  |  Ctrl+` Terminal",
-        Page::Settings => "",
-        Page::OrchestrationStudio => "",
-        Page::Editor => "Ctrl+S Save  |  Ctrl+F Find  |  Ctrl+G Go to Line  |  Ctrl+Z Undo",
-    }
-}
 
 /// Chip label for an intent-router [`RunStage`] (ADR-55 §9).
 ///
@@ -82,40 +58,6 @@ pub fn status_bar_view(app: &App) -> Element<'_, Message> {
     let sp = &app.current_theme.spacing;
     let palette = &app.current_theme.palette;
 
-    let name = text(page_name(app.page)).size(ts.caption);
-    let hints = text(shortcut_hints(app.page)).size(ts.caption).color(palette.text_muted);
-
-    // Screenshot button — monochrome Unicode
-    let screenshot_btn = button(text("◻").size(ts.caption))
-        .padding([4, 10])
-        .on_press(Message::TakeScreenshot)
-        .style(crate::ui::button::secondary);
-
-    // Screenshot status (if any)
-    let status_section = if let Some(ref status) = app.screenshot_status {
-        row![screenshot_btn, text(status).size(ts.caption).color(palette.text_muted),]
-            .spacing(sp.sm)
-            .align_y(iced::Alignment::Center)
-    } else {
-        row![screenshot_btn].align_y(iced::Alignment::Center)
-    };
-
-    // Active project folder — click to change it.
-    let folder_label = {
-        let s = app.project_dir.to_string_lossy().to_string();
-        let char_count = s.chars().count();
-        if char_count > 42 {
-            let tail: String = s.chars().skip(char_count - 41).collect();
-            format!("…{tail}")
-        } else {
-            s
-        }
-    };
-    let folder_btn = button(text(format!("▸ {}", folder_label)).size(ts.caption))
-        .padding([4, 10])
-        .style(crate::ui::button::secondary)
-        .on_press(Message::OpenProjectDirPicker);
-
     let run_section: Element<'_, Message> = match app.run_status {
         RunStatus::Idle => text("Idle").size(ts.caption).into(),
         RunStatus::Running => row![
@@ -130,28 +72,6 @@ pub fn status_bar_view(app: &App) -> Element<'_, Message> {
         .into(),
         RunStatus::Cancelling => text("Cancelling…").size(ts.caption).into(),
     };
-
-    // Active provider / model + readiness summary.
-    let provider_summary: Element<'_, Message> =
-        match app.settings.providers.iter().find(|p| p.id == app.active_provider_id) {
-            Some(provider) => {
-                let def = provider_definition(&provider.provider);
-                let creds = CredentialStore::new();
-                let has_key = creds.exists(&provider.keyring_key);
-                let ready = provider_readiness(provider, &def, has_key).is_ready();
-                let model = if app.active_model.is_empty() { "—" } else { &app.active_model };
-                let marker = if ready { "✓" } else { "⚠ setup" };
-                let color = if ready { palette.success } else { palette.warning };
-                row![
-                    text(format!("{} · {}", provider.name, model)).size(ts.caption),
-                    text(marker).size(ts.caption).color(color),
-                ]
-                .spacing(sp.sm)
-                .align_y(iced::Alignment::Center)
-                .into()
-            }
-            None => text("No provider selected").size(ts.caption).color(palette.warning).into(),
-        };
 
     // Intent-router run-stage chip (ADR-55 §9), between the run
     // indicator and the transient feedback. Shows the current stage in
@@ -201,16 +121,15 @@ pub fn status_bar_view(app: &App) -> Element<'_, Message> {
         .on_press(Message::OpenSpendLog)
         .style(crate::ui::button::secondary);
 
+    // Status strip only: run state, run stage, transient feedback, config
+    // health, and spend. Provider/model info and project switching live in the
+    // right toolbar and sidebar respectively (the composer is now write-only).
     let content = row![
-        config_broken_badge,
-        folder_btn,
-        name,
-        provider_summary,
-        hints,
         run_section,
         run_stage_chip,
         feedback,
-        status_section,
+        config_broken_badge,
+        iced::widget::space::horizontal(),
         spend_btn
     ]
     .spacing(16)

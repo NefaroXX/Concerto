@@ -1,12 +1,10 @@
-use iced::widget::{
-    button, column, container, pick_list, row, rule, scrollable, text, text_input, toggler, tooltip,
-};
+use iced::widget::{button, column, container, row, rule, scrollable, text, text_editor};
 use iced::{border::Radius, Alignment, Background, Border, Color, Element, Length};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use crate::theme::AppTheme;
+use crate::theme::{AppTheme, Spacing};
 use crate::views::agent_graph;
 use crate::views::spend::{
     cap_status_text, compact_created_at, spend_totals, CapUiState, SpendTotals,
@@ -44,7 +42,12 @@ pub enum SubView {
 /// Messages that the chat view can handle.
 #[derive(Debug, Clone)]
 pub enum Message {
+    /// Programmatic replacement of the composer text (empty-state quick
+    /// actions, `/thinking` clear, tests). Rebuilds the editor content.
     InputChanged(String),
+    /// A `text_editor` action from the auto-growing multiline composer
+    /// (typing, cursor moves, focus changes). Performed on the owned content.
+    InputAction(text_editor::Action),
     SubmitInput,
     AddUser(String),
     AddAssistant(String),
@@ -91,6 +94,8 @@ pub enum Message {
     NewSession,
     /// Set the active sub-view overlay (Diff / AgentGraph / ToolLog / Main).
     SetSubView(SubView),
+    /// Expand/collapse one subagent run's progress card.
+    ToggleRun(String),
     /// Spend records for the active session loaded (Spend Log modal body).
     /// Driven from `App::load_spend_log`; best-effort (empty on failure).
     SpendLogsLoaded(Vec<SpendRecord>),
@@ -291,8 +296,27 @@ fn is_mutating_tool(tool_name: &str) -> bool {
 
 pub struct State {
     entries: Vec<ChatEntry>,
-    input: String,
+    /// Auto-growing multiline composer content. The widget owns cursor and
+    /// selection; the plain text is read via [`State::input`].
+    input: text_editor::Content,
     next_id: EntryId,
+    /// Per-subagent-run progress, keyed by backend task id (run id) alone —
+    /// the agent name is display/status metadata, never identity, so two
+    /// concurrent runs of the same agent stay two cards. Rendered as one
+    /// collapsible card per run. Transient view state — never serialized;
+    /// rebuilt from live `SubTask*` events on each run.
+    runs: Vec<SubagentRun>,
+    /// Explicit single-owner map: entry id → the run id that owns that
+    /// transcript entry, assigned once at push time (see
+    /// [`Self::owning_run_id`]) and never recomputed. Because an entry id maps
+    /// to at most one run id, interleaved concurrent runs can never share a
+    /// Thinking/ToolCall entry, and run-owned work stays out of the per-agent
+    /// thinking buckets. Transient view state — never serialized: a restored
+    /// transcript starts unowned and only live events get attributed.
+    entry_owner: HashMap<EntryId, String>,
+    /// Run id of the currently expanded progress card, or `None` when all are
+    /// collapsed. Independent of the thinking-bucket accordion.
+    expanded_run_id: Option<String>,
     /// Active sub-view overlay shown on top of the chat canvas.
     pub sub_view: SubView,
     /// The first id of the currently expanded thinking group, or `None` when
@@ -439,6 +463,32 @@ struct ThinkingGroup {
     headline: String,
 }
 
+/// One coordinator-dispatched subagent run. Progress is keyed by the backend
+/// task id (`run_id`) alone, so two runs by the same agent render as two cards
+/// instead of collapsing into one per-agent box. The run's work history is the
+/// set of transcript entries the run *owns* (the chat state's entry-owner
+/// map), never an index range — ranges overlap as soon as concurrent runs
+/// interleave, while ownership assigns every entry to exactly one run.
+#[derive(Debug, Clone)]
+pub struct SubagentRun {
+    /// Backend task id (stable per dispatch) — the run's identity.
+    pub run_id: String,
+    /// Normalized agent id that owns this run (display + status light only;
+    /// never used to decide which entries belong to the run).
+    pub agent: String,
+    /// True until a terminal `SubTask*` event arrives.
+    pub running: bool,
+    /// Latest digest: dispatch description while running, outcome/error after.
+    pub summary: Option<String>,
+    /// Transcript index the card is emitted at (the dispatch point). Card
+    /// *content* comes from the entry-owner map, not from a range starting
+    /// here.
+    pub start_idx: usize,
+    /// Whether the card is expanded. Running cards start expanded; settled
+    /// cards collapse by default.
+    pub expanded: bool,
+}
+
 impl Default for State {
     fn default() -> Self {
         Self::new()
@@ -449,8 +499,11 @@ impl State {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
-            input: String::new(),
+            input: text_editor::Content::new(),
             next_id: 1,
+            runs: Vec::new(),
+            entry_owner: HashMap::new(),
+            expanded_run_id: None,
             sub_view: SubView::Main,
             expanded_thinking_id: None,
             thinking_expand_all: false,
@@ -505,8 +558,11 @@ impl State {
         let next_id = entries.iter().map(Self::entry_id).max().unwrap_or(0) + 1;
         Self {
             entries,
-            input: String::new(),
+            input: text_editor::Content::new(),
             next_id,
+            runs: Vec::new(),
+            entry_owner: HashMap::new(),
+            expanded_run_id: None,
             sub_view: SubView::Main,
             expanded_thinking_id: None,
             thinking_expand_all: false,
@@ -601,7 +657,8 @@ impl State {
 
     fn trim_entries(&mut self) {
         if self.entries.len() > MAX_LIVE_ENTRIES {
-            self.entries.drain(0..self.entries.len() - MAX_LIVE_ENTRIES);
+            let removed = self.entries.len() - MAX_LIVE_ENTRIES;
+            self.entries.drain(0..removed);
             // Evicted entries are gone; drop their transient view state too so
             // per-entry caches (markdown docs, reveal/animation maps) can never
             // grow stale or leak ids that no longer exist.
@@ -611,6 +668,14 @@ impl State {
             self.line_wipe_ticks.clear();
             self.line_wipe_settled.clear();
             self.handoff_hold = None;
+            // Ownership and card positions are id/index keyed: prune evicted
+            // ids and shift every card's start so it keeps pointing at the
+            // same (shifted) entries after the front of the transcript drains.
+            let alive: HashSet<EntryId> = self.entries.iter().map(Self::entry_id).collect();
+            self.entry_owner.retain(|id, _| alive.contains(id));
+            for run in &mut self.runs {
+                run.start_idx = run.start_idx.saturating_sub(removed);
+            }
         }
     }
 
@@ -641,9 +706,121 @@ impl State {
         }
     }
 
-    /// Get a reference to the current input text.
-    pub fn input(&self) -> &str {
-        &self.input
+    /// Current composer text. Returns an owned `String` because the backing
+    /// `text_editor::Content` only exposes a snapshot accessor.
+    pub fn input(&self) -> String {
+        self.input.text()
+    }
+
+    /// Begin a fresh run: drop the previous run's progress cards and collapse
+    /// state. Called at the dispatch boundary so an old run can never attach
+    /// to a newer prompt. Entry ownership goes with the runs — the previous
+    /// run's cards can no longer claim any transcript entry.
+    pub fn begin_run(&mut self) {
+        self.runs.clear();
+        self.entry_owner.clear();
+        self.expanded_run_id = None;
+    }
+
+    /// The run that should own a freshly pushed transcript entry, decided once
+    /// at push time and never recomputed. Attribution is keyed on run identity
+    /// (task id), never on a position in the transcript, so concurrent runs
+    /// can never claim each other's entries:
+    ///
+    /// 1. Thinking with an agent id prefers the newest *running* run for that
+    ///    agent, then the newest settled run for it (so a terminal digest
+    ///    lands in its own card and not in a concurrently running neighbour).
+    ///    Interleaved cross-agent work therefore stays inside its own card.
+    /// 2. Everything else — tool calls and errors carry no agent id, and work
+    ///    arriving mid-dispatch belongs to the run in flight — falls back to
+    ///    the newest still-running run (the capture run).
+    /// 3. No running run → `None`: the entry stays in the main transcript
+    ///    (plain rows + per-agent thinking buckets).
+    fn owning_run_id(&self, agent_id: Option<&str>) -> Option<String> {
+        if let Some(agent) = agent_id.map(str::trim).filter(|agent| !agent.is_empty()) {
+            let mut same_agent = self.runs.iter().rev().filter(|run| run.agent == agent);
+            if let Some(run) = same_agent.clone().find(|run| run.running) {
+                return Some(run.run_id.clone());
+            }
+            if let Some(run) = same_agent.next() {
+                return Some(run.run_id.clone());
+            }
+        }
+        self.runs.iter().rev().find(|run| run.running).map(|run| run.run_id.clone())
+    }
+
+    /// Record ownership for a just-created entry `id` under
+    /// [`Self::owning_run_id`]. Called by every push helper that can produce
+    /// run work: `agent_id` is `Some` for thinking (agent-attributed) and
+    /// `None` for tool calls/errors. The map holds at most one run id per
+    /// entry id, which is what makes card contents strictly disjoint.
+    fn own_entry(&mut self, id: EntryId, agent_id: Option<&str>) {
+        if let Some(run_id) = self.owning_run_id(agent_id) {
+            self.entry_owner.insert(id, run_id);
+        }
+    }
+
+    /// Record a coordinator dispatch as a new per-run progress card. A repeated
+    /// run id replaces the previous card (replay safety). Entries pushed from
+    /// here on are attributed via [`Self::owning_run_id`], which keys on this
+    /// run id — never on the agent name — so a second concurrent run of the
+    /// same agent is a separate card with its own, non-overlapping entries.
+    pub fn record_subtask_created(&mut self, run_id: String, agent: &str, description: String) {
+        // Bracket the run cleanly: close any open thinking so earlier work
+        // can never merge into an entry this run is about to own.
+        self.finish_open_thinking();
+        let start_idx = self.entries.len();
+        self.runs.retain(|run| run.run_id != run_id);
+        self.runs.push(SubagentRun {
+            run_id,
+            agent: normalize_agent_id(agent),
+            running: true,
+            summary: (!description.trim().is_empty()).then_some(description),
+            start_idx,
+            expanded: true,
+        });
+    }
+
+    /// Settle a run with an optional terminal digest (completion outcome or
+    /// failure). Collapses the card so a finished run reads as a summary line
+    /// the user can reopen. Ownership was fixed per entry at push time, so
+    /// settling never re-slices the transcript: later entries simply stop
+    /// being attributed to this run (see [`Self::owning_run_id`]).
+    pub fn record_subtask_finished(&mut self, run_id: &str, summary: Option<String>) {
+        self.finish_open_thinking();
+        if let Some(run) = self.runs.iter_mut().find(|run| run.run_id == run_id) {
+            run.running = false;
+            if let Some(summary) = summary {
+                run.summary = Some(summary);
+            }
+            run.expanded = false;
+            if self.expanded_run_id.as_deref() == Some(run_id) {
+                self.expanded_run_id = None;
+            }
+        }
+    }
+
+    /// Expand/collapse one run card (accordion: only one open at a time).
+    pub fn toggle_run(&mut self, run_id: &str) {
+        self.expanded_run_id = if self.expanded_run_id.as_deref() == Some(run_id) {
+            None
+        } else {
+            Some(run_id.to_string())
+        };
+    }
+
+    /// Whether `agent_id` currently owns a running subagent run. Drives the
+    /// right-toolbar status light: it lights only for the agent actually
+    /// running, never for every agent while any run is active.
+    pub fn agent_running(&self, agent_id: &str) -> bool {
+        let key = normalize_agent_id(agent_id);
+        self.runs.iter().any(|run| run.running && run.agent == key)
+    }
+
+    /// Whether any subagent run is currently in flight. The coordinator's
+    /// status light uses this to stay dark while a specialist owns the work.
+    pub fn has_running_subagent(&self) -> bool {
+        self.runs.iter().any(|run| run.running)
     }
 
     /// Spend records for the active session (Spend Log modal body).
@@ -725,6 +902,11 @@ impl State {
         // multi-byte content (CJK, emoji), so the same text could sometimes
         // collide into an open bucket and sometimes spawn a ragged one.
         let collapsed = content.chars().count() > 500;
+        // Attribute before the push (the agent id is moved into the entry
+        // below): the run in flight — or the matching run for this agent —
+        // owns the entry from the moment it exists. A merged continuation
+        // keeps the owner its entry was first created with.
+        self.own_entry(id, Some(&agent_id));
         self.entries.push(ChatEntry::Thinking {
             id,
             agent: agent_id,
@@ -765,7 +947,8 @@ impl State {
     }
 
     /// Surface a blocking error to the user as a distinct chat entry (e.g. a
-    /// dispatch validation failure before a run starts).
+    /// dispatch validation failure before a run starts). Owned by the run in
+    /// flight when there is one, otherwise it stays a main-transcript row.
     pub fn add_error(&mut self, content: String) {
         self.finish_open_thinking();
         let id = self.next_id;
@@ -773,11 +956,14 @@ impl State {
         if !self.reduced_motion {
             self.entrance_ticks.insert(id, 0);
         }
+        self.own_entry(id, None);
         self.entries.push(ChatEntry::Error { id, content, created_at: Some(now_rfc3339()) });
         self.trim_entries();
     }
 
-    /// Add a tool call annotation.
+    /// Add a tool call annotation. Tool calls carry no agent id, so they are
+    /// owned by the newest still-running run (see [`Self::owning_run_id`]) —
+    /// the same rule that keeps a tool row out of every other card.
     pub fn add_tool_call(&mut self, tool_name: String, detail: String) {
         self.finish_open_thinking();
         if let Some(ChatEntry::ToolCall {
@@ -799,6 +985,7 @@ impl State {
         if !self.reduced_motion {
             self.entrance_ticks.insert(id, 0);
         }
+        self.own_entry(id, None);
         self.entries.push(ChatEntry::ToolCall {
             id,
             tool_name,
@@ -833,6 +1020,7 @@ impl State {
         if !self.reduced_motion {
             self.entrance_ticks.insert(id, 0);
         }
+        self.own_entry(id, None);
         self.entries.push(ChatEntry::ToolCall {
             id,
             tool_name: tool_name.to_string(),
@@ -915,6 +1103,14 @@ impl State {
             || !self.line_wipe_ticks.is_empty()
             || self.handoff_hold.is_some()
         {
+            return true;
+        }
+        // Any agent or the orchestrator still thinking keeps the shared tick
+        // alive so the "Composing…" row and the open-run shimmer animate. This
+        // animation is driven by a real in-flight run, not by a settled
+        // thinking entry, so it cannot reintroduce the "pulses forever"
+        // defect guarded below. Reduced-motion already returned early.
+        if self.runs.iter().any(|run| run.running) {
             return true;
         }
         // An open-but-settled thinking entry is static: its shimmer freezes
@@ -1284,10 +1480,13 @@ impl State {
     pub fn update(&mut self, message: Message) -> iced::Task<Message> {
         match message {
             Message::InputChanged(s) => {
-                self.input = s;
+                self.input = text_editor::Content::with_text(&s);
+            }
+            Message::InputAction(action) => {
+                self.input.perform(action);
             }
             Message::SubmitInput => {
-                let trimmed = self.input.trim().to_string();
+                let trimmed = self.input.text().trim().to_string();
                 if !trimmed.is_empty() {
                     self.finish_open_thinking();
                     let id = self.next_id;
@@ -1297,7 +1496,7 @@ impl State {
                         content: trimmed,
                         created_at: Some(now_rfc3339()),
                     });
-                    self.input.clear();
+                    self.input = text_editor::Content::new();
                 }
             }
             Message::AddUser(s) => {
@@ -1369,7 +1568,7 @@ impl State {
                 self.shimmer_phase = self.shimmer_phase.wrapping_add(1);
             }
             Message::UsePrompt(prompt) => {
-                self.input = prompt;
+                self.input = text_editor::Content::with_text(&prompt);
             }
             Message::SelectSession(_) => {
                 // Handled by App because session loading requires shared services.
@@ -1423,6 +1622,9 @@ impl State {
             Message::SetSubView(_) => {
                 // Handled by the App level — sets self.chat.sub_view
             }
+            Message::ToggleRun(run_id) => {
+                self.toggle_run(&run_id);
+            }
             Message::SpendLogsLoaded(records) => {
                 self.spend_log = records;
                 self.spend_log_loaded = true;
@@ -1439,6 +1641,7 @@ impl State {
         &'a self,
         entry: &'a ChatEntry,
         palette: &'a crate::theme::Palette,
+        spacing: &'a Spacing,
     ) -> Element<'a, Message> {
         match entry {
             ChatEntry::User { content, created_at, .. } => {
@@ -1548,6 +1751,12 @@ impl State {
                 block.into()
             }
             ChatEntry::Thinking { content, collapsed, id, created_at, finished_at, .. } => {
+                // Empty or system-only thinking is not information: collapse it
+                // to the shared "Composing…" animation row instead of an empty
+                // box (the "blank colored block" defect).
+                if thinking_content_is_noise(content) {
+                    return composing_row(palette, self.shimmer_phase, spacing);
+                }
                 let char_count = content.chars().count();
                 // Thinking previews render their full content as it arrives:
                 // a short entrance fade (see `add_thinking`) — no typewriter
@@ -1590,14 +1799,22 @@ impl State {
                 if let Some(label) = duration_label {
                     preview_row = preview_row.push(label);
                 }
+                // Subtle thinking bar: a low-alpha surface wash with a thin
+                // border instead of a solid box, so thinking reads as ambient
+                // context rather than a competing message. Padding comes from
+                // the spacing tokens.
                 container(preview_row)
-                    .padding(8)
+                    .padding([spacing.xs, spacing.sm])
                     .style(move |_theme| container::Style {
                         background: Some(Background::Color(with_alpha(
                             palette.surface_variant,
-                            fade,
+                            0.28 * fade,
                         ))),
-                        border: Border { radius: Radius::from(8.0), ..Default::default() },
+                        border: Border {
+                            radius: Radius::from(8.0),
+                            width: 1.0,
+                            color: with_alpha(palette.border, 0.45 * fade),
+                        },
                         ..container::Style::default()
                     })
                     .into()
@@ -1976,43 +2193,36 @@ impl State {
         .into()
     }
 
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
+    /// Render the chat canvas.
+    ///
+    /// `has_providers` drives the empty-state quick actions; `busy` is true
+    /// while a run is in flight, which — together with
+    /// [`Self::show_composing_row`] — appends the "Composing…" animation row.
     pub fn view<'a>(
         &'a self,
         theme: &'a AppTheme,
-        multi_agent: bool,
-        fast: bool,
-        active_model: &'a str,
-        model_names: &'a [String],
-        model_source: &'a str,
+        has_providers: bool,
+        busy: bool,
         agent_graph: &'a agent_graph::State,
-        has_agent_assignments: bool,
     ) -> Element<'a, Message> {
         let palette = &theme.palette;
+        let spacing = &theme.spacing;
 
         // Empty state
         if self.entries.is_empty() {
-            let has_providers = !model_names.is_empty();
             return iced::widget::column![
                 scrollable(self.empty_session_view(theme, has_providers)).height(Length::Fill),
-                input_bar(
-                    &self.input,
-                    palette,
-                    multi_agent,
-                    fast,
-                    active_model,
-                    model_names,
-                    model_source,
-                    has_agent_assignments,
-                    false,
-                ),
+                input_bar(&self.input, palette, spacing, false),
             ]
             .into();
         }
 
-        // Message list — render with the per-agent thinking accordion (V2).
+        // Message list — per-run progress cards over the per-agent thinking
+        // accordion. Entries *owned* by a subagent run render inside that
+        // run's card only: ownership assigns each entry to at most one run, so
+        // concurrent runs (different agents, or two runs of the same agent)
+        // never show each other's work and never double it into a bucket.
+        let covered = self.run_coverage();
         let mut col = column![].spacing(4).padding(8);
         let has_timeline =
             agent_graph.has_multi_agent_activity && !agent_graph.model.nodes.is_empty();
@@ -2038,6 +2248,30 @@ impl State {
         let mut last_turn_agent: Option<String> = None;
         let mut idx = 0;
         while idx < self.entries.len() {
+            // One progress card per run, emitted at its dispatch index. Every
+            // run with a position in the transcript is hit exactly once here,
+            // so even two runs dispatched back to back (same index) both get a
+            // card. The card body is the run's *owned* entries (single-owner
+            // map), never an index range, so it can only ever show this run's
+            // work — concurrent runs of any agent stay strictly separated.
+            for run in self.runs_starting_at(idx) {
+                col = col.push(render_run_card(
+                    run,
+                    &self.run_work(&run.run_id),
+                    palette,
+                    spacing,
+                    self.expanded_run_id.as_deref(),
+                    self.shimmer_phase,
+                    self.reduced_motion,
+                ));
+            }
+            // Run-owned entries render inside their card only: skip them here
+            // so the plain rows and the per-agent thinking buckets can never
+            // repeat an entry a card already shows.
+            if covered.contains(&idx) {
+                idx += 1;
+                continue;
+            }
             let bucket_key = match &self.entries[idx] {
                 ChatEntry::Thinking { agent, content, .. } => {
                     Some(thinking_agent_key(agent, content))
@@ -2050,8 +2284,18 @@ impl State {
                     idx += 1;
                     continue;
                 }
-                if emitted_buckets.insert(agent.clone()) {
-                    let indices = buckets.get(&agent).cloned().unwrap_or_default();
+                if !emitted_buckets.contains(&agent) {
+                    let indices: Vec<usize> = buckets
+                        .get(&agent)
+                        .map(|indices| {
+                            indices.iter().copied().filter(|i| !covered.contains(i)).collect()
+                        })
+                        .unwrap_or_default();
+                    if indices.is_empty() {
+                        idx += 1;
+                        continue;
+                    }
+                    emitted_buckets.insert(agent.clone());
                     let first_id = indices
                         .first()
                         .and_then(|&i| match &self.entries[i] {
@@ -2075,6 +2319,7 @@ impl State {
                         &self.entrance_ticks,
                         self.reduced_motion,
                         self.shimmer_phase,
+                        spacing,
                     ));
                 }
                 idx += 1;
@@ -2085,31 +2330,127 @@ impl State {
                         palette,
                     ));
                 }
-                col = col.push(self.render_entry(&self.entries[idx], palette));
+                col = col.push(self.render_entry(&self.entries[idx], palette, spacing));
                 if has_timeline && latest_user_index == Some(idx) {
                     col = col.push(self.orchestration_timeline(agent_graph, palette));
                 }
                 idx += 1;
             }
         }
+        // Runs dispatched without a transcript position (created at the end of
+        // the transcript, or pushed past it by trimming) still get a card so
+        // their digest is never silently dropped. The body is their owned
+        // entries again — never a slice — so nothing they own is dropped by
+        // the `covered` skip above.
+        for run in self.runs_without_position() {
+            col = col.push(render_run_card(
+                run,
+                &self.run_work(&run.run_id),
+                palette,
+                spacing,
+                self.expanded_run_id.as_deref(),
+                self.shimmer_phase,
+                self.reduced_motion,
+            ));
+        }
+        // While a run is in flight, show a single subtle "Composing…" row at
+        // the bottom of the transcript — but only when the transcript itself
+        // has nothing else that reads as live work (see
+        // `show_composing_row`): a tool-call-only run already shows its live
+        // tool rows and run card, so an unconditional row there duplicated
+        // the busy cue.
+        if busy && self.show_composing_row() {
+            col = col.push(composing_row(palette, self.shimmer_phase, spacing));
+        }
         let messages = scrollable(col).anchor_bottom().height(Length::Fill).width(Length::Fill);
 
         // Compose with input bar at the bottom
-        column![
-            messages,
-            input_bar(
-                &self.input,
-                palette,
-                multi_agent,
-                fast,
-                active_model,
-                model_names,
-                model_source,
-                has_agent_assignments,
-                true,
-            )
-        ]
-        .into()
+        column![messages, input_bar(&self.input, palette, spacing, true)].into()
+    }
+
+    /// Runs whose progress card is emitted at transcript index `idx`. Each run
+    /// reports itself exactly once (its recorded `start_idx`), so every
+    /// positioned run gets exactly one card even when two runs share an index
+    /// because they were dispatched with no entries in between.
+    fn runs_starting_at(&self, idx: usize) -> impl Iterator<Item = &SubagentRun> + '_ {
+        self.runs.iter().filter(move |run| run.start_idx == idx)
+    }
+
+    /// Runs whose card has no position inside the transcript (dispatched at
+    /// the end, or shifted past it by trimming) — rendered after the walk.
+    fn runs_without_position(&self) -> impl Iterator<Item = &SubagentRun> + '_ {
+        let len = self.entries.len();
+        self.runs.iter().filter(move |run| run.start_idx >= len)
+    }
+
+    /// The run that owns `entry`, or `None` when it belongs to the main
+    /// transcript only. Single-valued by construction (one run id per entry
+    /// id), so no entry can ever be rendered in two cards or in a card *and*
+    /// a thinking bucket.
+    fn owner_of(&self, entry: &ChatEntry) -> Option<&str> {
+        self.entry_owner.get(&Self::entry_id(entry)).map(String::as_str)
+    }
+
+    /// Transcript indices exclusively owned by `run_id`, in transcript order.
+    fn run_owned_indices(&self, run_id: &str) -> Vec<usize> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|&(_, entry)| self.owner_of(entry) == Some(run_id))
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    /// One run's work history for its card body: exactly the entries it owns,
+    /// in transcript order — never a contiguous slice.
+    fn run_work(&self, run_id: &str) -> Vec<&ChatEntry> {
+        self.run_owned_indices(run_id).into_iter().map(|idx| &self.entries[idx]).collect()
+    }
+
+    /// Set of entry indices owned by any *live* run. The walk skips these so
+    /// they render only inside their card, and the per-agent thinking buckets
+    /// filter them out for the same reason.
+    fn run_coverage(&self) -> HashSet<usize> {
+        let live: HashSet<&str> = self.runs.iter().map(|run| run.run_id.as_str()).collect();
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|&(_, entry)| self.owner_of(entry).is_some_and(|owner| live.contains(owner)))
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    /// Whether a busy transcript should append the shared "Composing…" row.
+    ///
+    /// `busy` alone is not enough: a run that is only executing tool calls
+    /// already reads as work through its live tool rows and run card, so a
+    /// second cue there is noise. The row shows while thinking is actually in
+    /// flight — an open thinking entry (`finished_at: None`), a streaming
+    /// reply, or a still-running run whose own owned entries carry thinking
+    /// work — plus the one case where nothing else in the transcript is live
+    /// (no running tool call, no running run card), which would otherwise
+    /// leave a busy run rendering with no cue at all.
+    fn show_composing_row(&self) -> bool {
+        let live_thinking = self.entries.iter().any(|entry| match entry {
+            ChatEntry::Thinking { finished_at, .. } => finished_at.is_none(),
+            ChatEntry::Assistant { streaming, .. } => *streaming,
+            _ => false,
+        });
+        if live_thinking {
+            return true;
+        }
+        let running_run_has_thinking = self.runs.iter().filter(|run| run.running).any(|run| {
+            self.run_work(&run.run_id)
+                .into_iter()
+                .any(|entry| matches!(entry, ChatEntry::Thinking { .. }))
+        });
+        if running_run_has_thinking {
+            return true;
+        }
+        let tool_in_flight = self.entries.iter().any(|entry| {
+            matches!(entry, ChatEntry::ToolCall { status: ToolCallStatus::Running, .. })
+        });
+        !tool_in_flight && !self.has_running_subagent()
     }
 }
 
@@ -2215,11 +2556,23 @@ fn render_thinking_group<'a>(
     entrance_ticks: &'a std::collections::HashMap<EntryId, u8>,
     reduced_motion: bool,
     shimmer_phase: u32,
+    spacing: &'a Spacing,
 ) -> Element<'a, Message> {
     let count = group.indices.len();
 
     let agent_color =
         crate::theme::agent_color_from_id(&group.agent_id, palette).unwrap_or(palette.text_muted);
+    // Subtle panel: a low-alpha surface wash with a hairline border, matching
+    // the single Thinking entry's ambient treatment.
+    let panel_style = |_theme: &iced::Theme| container::Style {
+        background: Some(Background::Color(with_alpha(palette.surface_variant, 0.28))),
+        border: Border {
+            radius: Radius::from(8.0),
+            width: 1.0,
+            color: with_alpha(palette.border, 0.45),
+        },
+        ..container::Style::default()
+    };
 
     if !group.expanded {
         // Collapsed: single header row with agent badge + headline + count.
@@ -2229,12 +2582,8 @@ fn render_thinking_group<'a>(
             .style(crate::ui::button::secondary)
             .on_press(Message::ToggleEntry(group.first_id));
         container(row![toggle_btn, text(label).size(12).color(agent_color)].spacing(4))
-            .padding([6, 8])
-            .style(|_theme| container::Style {
-                background: Some(Background::Color(palette.surface_variant)),
-                border: Border { radius: Radius::from(8.0), ..Default::default() },
-                ..container::Style::default()
-            })
+            .padding([spacing.xs, spacing.sm])
+            .style(panel_style)
             .into()
     } else {
         // Expanded: each entry renders its full content with a per-entry
@@ -2252,7 +2601,7 @@ fn render_thinking_group<'a>(
         col = col.push(header);
         for &idx in &group.indices {
             if let ChatEntry::Thinking { id, content, kind, finished_at, .. } = &entries[idx] {
-                if *kind == ThinkingKind::LowLevel {
+                if *kind == ThinkingKind::LowLevel || thinking_content_is_noise(content) {
                     continue;
                 }
                 let fade = entrance_alpha(entrance_ticks.get(id).copied());
@@ -2261,20 +2610,153 @@ fn render_thinking_group<'a>(
                 } else {
                     with_alpha(palette.text_muted, fade)
                 };
-                col = col
-                    .push(container(text(content.clone()).size(13).color(color)).padding([4, 8]));
+                col = col.push(
+                    container(text(content.clone()).size(13).color(color))
+                        .padding([spacing.xs, spacing.sm]),
+                );
             }
         }
         container(col)
-            .padding([6, 8])
+            .padding([spacing.xs, spacing.sm])
             .width(Length::Fill)
-            .style(|_theme| container::Style {
-                background: Some(Background::Color(palette.surface_variant)),
-                border: Border { radius: Radius::from(8.0), ..Default::default() },
-                ..container::Style::default()
-            })
+            .style(panel_style)
             .into()
     }
+}
+
+/// Whether a thinking entry carries no information: empty/whitespace-only, or
+/// a bare system message. These collapse to the shared animation row instead
+/// of rendering as an empty box.
+fn thinking_content_is_noise(content: &str) -> bool {
+    let trimmed = content.trim();
+    trimmed.is_empty() || trimmed.to_ascii_lowercase().starts_with("[system]")
+}
+
+/// The shared "Composing…" animation row shown while an agent or the
+/// orchestrator is busy. The dot count cycles with the free-running shimmer
+/// phase; every color comes from the palette.
+fn composing_row<'a>(
+    palette: &'a crate::theme::Palette,
+    shimmer_phase: u32,
+    spacing: &'a Spacing,
+) -> Element<'a, Message> {
+    let dots = ".".repeat((shimmer_phase as usize % 3) + 1);
+    let color = shimmer_color(palette, shimmer_phase);
+    row![text("◆").size(11).color(color), text(format!("Composing{dots}")).size(12).color(color)]
+        .spacing(spacing.xs)
+        .align_y(Alignment::Center)
+        .padding(iced::Padding::ZERO.left(spacing.sm).top(spacing.xs))
+        .into()
+}
+
+/// Render one subagent run's progress card. Collapsed shows the agent badge +
+/// digest + status + tool count; expanded lists the run's work history —
+/// thinking snippets and tool calls the run *owns*. `work` is that owned set
+/// in transcript order (a non-contiguous list: ownership, not a slice, decides
+/// what a card shows, so concurrent runs never repeat each other's entries).
+/// Expanded cards use the live shimmer while the run is still active.
+fn render_run_card<'a>(
+    run: &'a SubagentRun,
+    work: &[&'a ChatEntry],
+    palette: &'a crate::theme::Palette,
+    spacing: &'a Spacing,
+    expanded_run_id: Option<&str>,
+    shimmer_phase: u32,
+    reduced_motion: bool,
+) -> Element<'a, Message> {
+    let agent_color =
+        crate::theme::agent_color_from_id(&run.agent, palette).unwrap_or(palette.text_muted);
+
+    let tool_count =
+        work.iter().filter(|&&entry| matches!(entry, ChatEntry::ToolCall { .. })).count();
+    let status_color = if run.running { palette.success } else { palette.text_muted };
+    let status_label = if run.running { "running" } else { "done" };
+    let summary =
+        run.summary.as_deref().unwrap_or(if run.running { "Working…" } else { "Finished" });
+    let headline: String = summary.lines().next().unwrap_or("").chars().take(64).collect();
+    let label = if tool_count == 0 {
+        format!("[{}] ‖ {headline}", run.agent)
+    } else {
+        format!(
+            "[{}] ‖ {headline} · {tool_count} tool{}",
+            run.agent,
+            if tool_count == 1 { "" } else { "s" }
+        )
+    };
+
+    let expanded = expanded_run_id == Some(run.run_id.as_str());
+    let toggle_btn = button(text(if expanded { "▼" } else { "▶" }).size(11))
+        .style(crate::ui::button::secondary)
+        .on_press(Message::ToggleRun(run.run_id.clone()));
+
+    let header = row![
+        toggle_btn,
+        text("◆").size(11).color(agent_color),
+        text(label).size(12).color(agent_color),
+        iced::widget::space::horizontal(),
+        text(status_label).size(11).color(status_color),
+    ]
+    .spacing(spacing.xs)
+    .align_y(Alignment::Center);
+
+    let body: Element<'a, Message> = if expanded {
+        let mut work_col = column![].spacing(2);
+        for &entry in work {
+            match entry {
+                ChatEntry::Thinking { content, kind, finished_at, .. } => {
+                    if *kind == ThinkingKind::LowLevel || thinking_content_is_noise(content) {
+                        continue;
+                    }
+                    let color = if finished_at.is_none() && !reduced_motion {
+                        shimmer_color(palette, shimmer_phase)
+                    } else {
+                        palette.text_muted
+                    };
+                    work_col = work_col.push(
+                        container(text(content.clone()).size(12).color(color))
+                            .padding([spacing.xs, spacing.sm]),
+                    );
+                }
+                ChatEntry::ToolCall { tool_name, status, .. } => {
+                    work_col = work_col.push(
+                        text(format!("[Tool] {tool_name} — {status}"))
+                            .size(12)
+                            .color(palette.text_muted),
+                    );
+                }
+                ChatEntry::Error { content, .. } => {
+                    work_col = work_col.push(text(content.clone()).size(12).color(palette.danger));
+                }
+                ChatEntry::Completion { summary, .. } => {
+                    let kind = if summary.completed { "completed" } else { "stopped" };
+                    work_col = work_col
+                        .push(text(format!("Run {kind}")).size(12).color(palette.text_muted));
+                }
+                ChatEntry::User { .. } | ChatEntry::Assistant { .. } => {}
+            }
+        }
+        work_col.into()
+    } else {
+        column![].height(0).into()
+    };
+
+    let mut card = column![header].spacing(spacing.xs);
+    if expanded {
+        card = card.push(body);
+    }
+    container(card)
+        .padding([spacing.xs, spacing.sm])
+        .width(Length::Fill)
+        .style(move |_theme| container::Style {
+            background: Some(Background::Color(with_alpha(palette.surface_variant, 0.28))),
+            border: Border {
+                radius: Radius::from(8.0),
+                width: 1.0,
+                color: with_alpha(if run.running { palette.success } else { palette.border }, 0.5),
+            },
+            ..container::Style::default()
+        })
+        .into()
 }
 
 /// Height (logical px) of the Spend Log modal's record list so the centered
@@ -2535,27 +3017,28 @@ fn crosses_paragraph_boundary(content: &str, from: usize, to: usize) -> bool {
     false
 }
 
-/// Composer placeholder (V3 quick win): advertises the `/thinking`
-/// accordion toggle with zero behavior change.
-const COMPOSER_PLACEHOLDER: &str = "Type a message... (/thinking toggles thinking)";
+/// Composer placeholder.
+const COMPOSER_PLACEHOLDER: &str = "Type a message… (Ctrl+Enter to send)";
 
-#[allow(clippy::too_many_arguments)]
+/// Minimal composer: an auto-growing multiline editor + Send + New Session.
+/// Model/provider pickers, session toggles, and view switches live in the
+/// right toolbar, keeping the message box focused on writing.
 fn input_bar<'a>(
-    input: &'a str,
+    input: &'a text_editor::Content,
     palette: &'a crate::theme::Palette,
-    multi_agent: bool,
-    fast: bool,
-    active_model: &'a str,
-    model_names: &'a [String],
-    model_source: &'a str,
-    has_agent_assignments: bool,
+    spacing: &'a Spacing,
     has_entries: bool,
 ) -> Element<'a, Message> {
-    let txt = text_input(COMPOSER_PLACEHOLDER, input)
-        .on_input(Message::InputChanged)
-        .on_submit(Message::SubmitInput)
-        .width(Length::Fill)
-        .padding(10);
+    // `Length::Shrink` grows the editor with its content; `max_height` caps it
+    // at ~6 lines, after which the editor scrolls internally. `min_height`
+    // keeps a comfortable single-line floor.
+    let editor = text_editor(input)
+        .placeholder(COMPOSER_PLACEHOLDER)
+        .on_action(Message::InputAction)
+        .height(Length::Shrink)
+        .min_height(38.0)
+        .max_height(160.0)
+        .padding(spacing.sm);
 
     let send = button(text("Send").size(14))
         .style(crate::ui::button::primary)
@@ -2571,97 +3054,12 @@ fn input_bar<'a>(
         container(text("").height(0)).into()
     };
 
-    let selected_model = model_names.iter().find(|model| model.as_str() == active_model);
-    let model_picker: Element<'_, Message> = if model_names.is_empty() {
-        container(text("").height(0)).into()
-    } else {
-        let picker =
-            pick_list(model_names, selected_model, |model| Message::SetActiveModel(model.clone()))
-                .padding(2)
-                .width(Length::Shrink);
-        if !model_source.is_empty() {
-            column![picker, text(model_source).size(9).color(palette.text_muted),]
-                .spacing(1)
-                .align_x(Alignment::Center)
-                .into()
-        } else {
-            picker.into()
-        }
-    };
+    let bar = row![editor, send, new_session_btn]
+        .spacing(spacing.sm)
+        .padding(spacing.sm)
+        .align_y(Alignment::End);
 
-    // Multi-agent toggle with label and tooltip
-    let toggle_group: Element<'a, Message> = {
-        let label = text("Multi").size(12).color(palette.text_muted);
-        let tgl = toggler(multi_agent).on_toggle(|_| Message::ToggleMultiAgent).spacing(4).size(20);
-        let inner = row![label, tgl].spacing(4).align_y(iced::Alignment::Center);
-        tooltip::Tooltip::new(
-            inner,
-            container(
-                text("Route tasks to specialist agents. Configure agents in Studio.").size(12),
-            )
-            .padding(8),
-            tooltip::Position::Top,
-        )
-        .gap(4)
-        .into()
-    };
-
-    // Fast-mode toggle with label and tooltip (mirrors the multi-agent
-    // toggler; mirrors CLI `-f/--fast` — skip project memory retrieval).
-    let fast_group: Element<'a, Message> = {
-        let label = text("Fast").size(12).color(palette.text_muted);
-        let tgl = toggler(fast).on_toggle(|_| Message::ToggleFastMode).spacing(4).size(20);
-        let inner = row![label, tgl].spacing(4).align_y(iced::Alignment::Center);
-        tooltip::Tooltip::new(
-            inner,
-            container(text("Fast mode: skip project memory retrieval (like CLI --fast).").size(12))
-                .padding(8),
-            tooltip::Position::Top,
-        )
-        .gap(4)
-        .into()
-    };
-
-    // `/thinking` accordion toggle: the composer's real button (mirrors the
-    // filter-bar caption; the `/thinking` text command still works too).
-    let thinking_toggle: Element<'a, Message> = tooltip::Tooltip::new(
-        button(text("‖ thinking").size(12))
-            .style(crate::ui::button::secondary)
-            .on_press(Message::ToggleThinkingAll),
-        container(text("Expand/collapse every thinking trace (/thinking)").size(12)).padding(8),
-        tooltip::Position::Top,
-    )
-    .gap(4)
-    .into();
-
-    // Guidance hint when multi-agent is ON but no agents are configured
-    let setup_hint: Element<'a, Message> = if multi_agent && !has_agent_assignments {
-        container(
-            button(
-                row![
-                    text("⚠").size(11),
-                    text("Configure agents in Studio →").size(12).color(palette.primary),
-                ]
-                .spacing(4)
-                .align_y(Alignment::Center),
-            )
-            .style(button::text)
-            .on_press(Message::NavigateToStudio),
-        )
-        .padding([2, 8])
-        .width(Length::Fill)
-        .into()
-    } else {
-        container(text("").height(0)).into()
-    };
-
-    let bar =
-        row![new_session_btn, model_picker, txt, send, toggle_group, fast_group, thinking_toggle,]
-            .spacing(8)
-            .padding(8)
-            .align_y(iced::Alignment::Center);
-
-    container(column![setup_hint, bar].spacing(2))
+    container(bar)
         .width(Length::Fill)
         .style(move |_theme: &iced::Theme| container::Style {
             background: Some(Background::Color(palette.surface)),
@@ -3747,9 +4145,11 @@ mod tests {
         assert_eq!(thinking_headline_from_entries(&entries, &[0]), "Thinking…");
     }
 
+    /// The composer is write-only now: its placeholder documents the send
+    /// chord rather than the relocated `/thinking` toggle.
     #[test]
-    fn composer_placeholder_advertises_thinking_toggle() {
-        assert!(COMPOSER_PLACEHOLDER.contains("/thinking"));
+    fn composer_placeholder_advertises_send_chord() {
+        assert!(COMPOSER_PLACEHOLDER.contains("Ctrl+Enter"));
     }
 
     #[test]
@@ -4094,5 +4494,235 @@ mod tests {
             restored.entries().first(),
             Some(ChatEntry::Thinking { agent, .. }) if agent == "coder"
         ));
+    }
+
+    /// Each subagent run is tracked by task id alone (the agent name is
+    /// display/status metadata), so two runs by the same agent are distinct
+    /// cards and the status light follows the run still in flight.
+    #[test]
+    fn subagent_runs_are_keyed_by_run_id() {
+        let mut state = State::new();
+        state.record_subtask_created("task-1".into(), "Coder", "implement".into());
+        state.add_thinking("coder", "working".into(), ThinkingKind::Detail);
+        state.record_subtask_created("task-2".into(), "Coder", "review".into());
+
+        assert_eq!(state.runs.len(), 2, "same agent, two runs → two cards");
+        assert!(state.agent_running("coder"));
+        assert!(state.has_running_subagent());
+
+        state.record_subtask_finished("task-1", Some("Completed: done".into()));
+        let run = state.runs.iter().find(|run| run.run_id == "task-1").expect("run-1");
+        assert!(!run.running);
+        assert!(!run.expanded, "a finished run collapses by default");
+        assert_eq!(run.summary.as_deref(), Some("Completed: done"));
+        assert!(state.agent_running("coder"), "task-2 still owns the coder light");
+
+        state.record_subtask_finished("task-2", None);
+        assert!(!state.agent_running("coder"));
+        assert!(!state.has_running_subagent());
+    }
+
+    /// Debug assertion for the strict card-separation invariant: no transcript
+    /// index may be owned by two runs at once. Ownership is a single
+    /// `entry id → run id` map, so this holds by construction — the test keeps
+    /// any future range-based shortcut from quietly reintroducing overlap.
+    fn assert_runs_share_no_entries(state: &State) {
+        let mut claimed: HashMap<usize, &str> = HashMap::new();
+        for run in &state.runs {
+            for idx in state.run_owned_indices(&run.run_id) {
+                if let Some(other) = claimed.insert(idx, run.run_id.as_str()) {
+                    panic!("entry {idx} is owned by both {other} and {}", run.run_id);
+                }
+            }
+        }
+    }
+
+    /// Replay the view walk's card emission: every positioned run emits one
+    /// card at its dispatch index, and runs without a position emit after the
+    /// walk. Returns the emitted run ids in render order.
+    fn emitted_run_cards(state: &State) -> Vec<String> {
+        let mut cards = Vec::new();
+        for idx in 0..state.entries().len() {
+            cards.extend(state.runs_starting_at(idx).map(|run| run.run_id.clone()));
+        }
+        cards.extend(state.runs_without_position().map(|run| run.run_id.clone()));
+        cards
+    }
+
+    /// Two concurrent runs by the SAME agent (same agent name, different run
+    /// ids) are two cards with two disjoint entry sets — never one merged box
+    /// and never shared content.
+    #[test]
+    fn concurrent_same_agent_runs_partition_entries_and_render_two_cards() {
+        let mut state = State::new();
+        state.record_subtask_created("run-1".into(), "Coder", "first".into());
+        state.add_thinking("coder", "work-one".into(), ThinkingKind::Detail); // index 0
+        state.record_subtask_created("run-2".into(), "Coder", "second".into());
+        state.add_thinking("coder", "work-two".into(), ThinkingKind::Detail); // index 1
+        state.add_tool_call("bash".into(), "cargo test".into()); // index 2
+
+        assert_eq!(state.runs.len(), 2, "same agent, two run ids → two cards");
+        assert_eq!(state.run_owned_indices("run-1"), vec![0], "work before dispatch 2");
+        assert_eq!(state.run_owned_indices("run-2"), vec![1, 2], "work after it");
+        assert_runs_share_no_entries(&state);
+
+        // Exactly one card per run, in dispatch order — nothing swallowed.
+        assert_eq!(emitted_run_cards(&state), vec!["run-1".to_string(), "run-2".to_string()]);
+
+        // Settling one run never re-slices or re-homes the other's entries.
+        state.record_subtask_finished("run-1", Some("Completed: done".into()));
+        assert_eq!(state.run_owned_indices("run-1"), vec![0]);
+        assert_eq!(state.run_owned_indices("run-2"), vec![1, 2]);
+        assert_runs_share_no_entries(&state);
+    }
+
+    /// Concurrent runs by *different* agents interleave in one transcript.
+    /// Ownership (not index ranges) keeps their work strictly separated: the
+    /// two cards share zero entries, run-owned thinking never leaks into the
+    /// per-agent buckets, and both cards still render.
+    #[test]
+    fn interleaved_cross_agent_runs_share_zero_entries() {
+        let mut state = State::new();
+        state.record_subtask_created("a".into(), "Coder", "implement".into());
+        state.add_thinking("coder", "a-work".into(), ThinkingKind::Detail); // 0 → a
+        state.add_tool_call("bash".into(), "cargo test".into()); // 1 → a (run in flight)
+        state.record_subtask_created("b".into(), "Reviewer", "review".into());
+        state.add_thinking("reviewer", "b-work".into(), ThinkingKind::Detail); // 2 → b
+        state.add_thinking("coder", "a-work-2".into(), ThinkingKind::Detail); // 3 → a
+        state.add_tool_call("grep".into(), "todo".into()); // 4 → b (newest running)
+        assert_eq!(state.entries().len(), 5, "three thinking + two tool entries");
+
+        let a = state.run_owned_indices("a");
+        let b = state.run_owned_indices("b");
+        assert_eq!(a, vec![0, 1, 3], "the coder run keeps its interleaved work");
+        assert_eq!(b, vec![2, 4], "the reviewer run keeps its own");
+        assert_runs_share_no_entries(&state);
+        assert!(a.iter().all(|idx| !b.contains(idx)), "zero shared entries");
+        assert_eq!(a.len() + b.len(), state.entries().len(), "every entry has one owner");
+
+        let covered = state.run_coverage();
+        assert_eq!(covered, (0..state.entries().len()).collect::<HashSet<_>>());
+        // Run-owned thinking renders only inside its card: the per-agent
+        // buckets filter every covered index out.
+        let (_, buckets) = thinking_buckets(state.entries());
+        for indices in buckets.values() {
+            for &idx in indices {
+                assert!(covered.contains(&idx), "entry {idx} must render only in its card");
+            }
+        }
+        // Both cards are emitted, at their dispatch indices.
+        assert_eq!(emitted_run_cards(&state), vec!["a".to_string(), "b".to_string()]);
+
+        // Settling one run moves no entry to the other.
+        state.record_subtask_finished("a", None);
+        assert_eq!(state.run_owned_indices("a"), vec![0, 1, 3]);
+        assert_eq!(state.run_owned_indices("b"), vec![2, 4]);
+        assert_runs_share_no_entries(&state);
+    }
+
+    /// The strict-separation render path builds: interleaved run cards
+    /// (collapsed and expanded) plus the skip logic around them render without
+    /// panicking.
+    #[test]
+    fn interleaved_run_cards_render_without_panic() {
+        let mut state = State::new();
+        state.record_subtask_created("a".into(), "Coder", "implement".into());
+        state.add_thinking("coder", "a-work".into(), ThinkingKind::Detail);
+        state.record_subtask_created("b".into(), "Reviewer", "review".into());
+        state.add_thinking("reviewer", "b-work".into(), ThinkingKind::Detail);
+        state.add_tool_call("bash".into(), "cargo test".into());
+        let theme = crate::theme::AppTheme::by_name("Midnight");
+        let graph = agent_graph::State::new();
+
+        state.toggle_run("a");
+        let _ = state.view(&theme, true, true, &graph);
+        state.toggle_run("b");
+        let _ = state.view(&theme, true, true, &graph);
+        state.toggle_run("b");
+        let _ = state.view(&theme, true, true, &graph);
+    }
+
+    /// The "Composing…" row is gated on thinking activity instead of being
+    /// appended for every busy frame: a tool-call-only run already reads as
+    /// busy through its live tool rows and run card.
+    #[test]
+    fn composing_row_is_gated_on_thinking_activity() {
+        let mut state = State::new();
+        let _ = state.update(Message::AddUser("go".into()));
+        assert!(
+            state.show_composing_row(),
+            "a busy transcript with no live cue at all still needs the row"
+        );
+
+        // Tool work only — the running tool row is the cue, not Composing.
+        state.record_subtask_created("t1".into(), "Coder", "do it".into());
+        state.add_tool_call("bash".into(), "cargo test".into());
+        assert!(!state.show_composing_row(), "tool-only run suppresses the row");
+
+        // Open thinking → the row is shown while thinking is in flight.
+        state.add_thinking("coder", "planning the fix".into(), ThinkingKind::Detail);
+        assert!(state.show_composing_row());
+
+        // The tool call that closed the thinking is still running, but the
+        // run owns that thinking entry, so the row stays.
+        state.add_tool_call("clippy".into(), "cargo clippy".into());
+        assert!(state.show_composing_row());
+
+        // Settle the run with both tools completed: only a bare busy state is
+        // left, which the row covers again.
+        state.record_subtask_finished("t1", None);
+        assert!(!state.show_composing_row(), "completed tools still render as work");
+        state.update_tool_call("bash", String::new(), true);
+        state.update_tool_call("clippy", String::new(), true);
+        assert!(state.show_composing_row(), "nothing live is left to show the busy state");
+
+        // A streaming reply is live activity too.
+        let _ = state.update(Message::AddAssistant("done".into()));
+        assert!(state.show_composing_row());
+    }
+
+    /// `begin_run` drops the previous run's cards — and their entry ownership
+    /// — so a stale card cannot attach to the next prompt or claim entries
+    /// from a fresh transcript.
+    #[test]
+    fn begin_run_clears_previous_progress_cards() {
+        let mut state = State::new();
+        state.record_subtask_created("task-1".into(), "Coder", "x".into());
+        state.add_thinking("coder", "old work".into(), ThinkingKind::Detail);
+        state.toggle_run("task-1");
+        assert!(state.expanded_run_id.is_some());
+        assert_eq!(state.run_owned_indices("task-1"), vec![0]);
+        state.begin_run();
+        assert!(state.runs.is_empty());
+        assert!(state.entry_owner.is_empty(), "no stale run may claim an entry");
+        assert!(state.run_coverage().is_empty());
+        assert!(state.expanded_run_id.is_none());
+    }
+
+    /// Empty / system-only thinking collapses to the animation row instead of
+    /// rendering an empty box.
+    #[test]
+    fn empty_and_system_thinking_is_noise() {
+        assert!(thinking_content_is_noise(""));
+        assert!(thinking_content_is_noise("   \n "));
+        assert!(thinking_content_is_noise("[system] heartbeat"));
+        assert!(thinking_content_is_noise("[System]"));
+        assert!(!thinking_content_is_noise("planning the change"));
+    }
+
+    /// A `text_editor` action mutates the composer content; `input()` reads it
+    /// back and a submit clears it.
+    #[test]
+    fn input_action_updates_and_submit_clears_composer() {
+        let mut state = State::new();
+        let _ = state.update(Message::InputAction(text_editor::Action::Edit(
+            text_editor::Edit::Insert('h'),
+        )));
+        assert_eq!(state.input(), "h");
+        let _ = state.update(Message::SubmitInput);
+        assert!(state.input().is_empty());
+        assert!(
+            matches!(state.entries().last(), Some(ChatEntry::User { content, .. }) if content == "h")
+        );
     }
 }

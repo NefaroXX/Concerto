@@ -1434,6 +1434,27 @@ impl State {
         self.agents.iter().filter(|agent| !is_coordinator_agent(agent))
     }
 
+    /// Public roster view (the engine-owned coordinator filtered out). Used by
+    /// the right-toolbar agent cards, which mirror the Studio roster.
+    pub fn roster_agents(&self) -> impl Iterator<Item = &AgentConfig> {
+        self.visible_agents()
+    }
+
+    /// The engine-owned coordinator, when present. Rendered read-only in the
+    /// right toolbar (no model dropdown; the coordinator is not a roster row).
+    pub fn coordinator_agent(&self) -> Option<&AgentConfig> {
+        self.agents.iter().find(|agent| is_coordinator_agent(agent))
+    }
+
+    /// Update one roster agent's model override in memory (right-toolbar quick
+    /// swap). Persistence is owned by the App; this only keeps the rendered
+    /// card in sync until the next config reload.
+    pub fn set_agent_model_override(&mut self, agent_id: &str, model: Option<String>) {
+        if let Some(agent) = self.agents.iter_mut().find(|agent| agent.id == agent_id) {
+            agent.model_override = model;
+        }
+    }
+
     /// Parts of the studio that should be persisted back to config.
     pub fn persisted_parts(
         &self,

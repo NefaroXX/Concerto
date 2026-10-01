@@ -17,7 +17,7 @@ fn chat_view_renders_without_panic() {
     let state = views::chat::State::new();
     let graph = views::agent_graph::State::new();
     let theme = AppTheme::by_name("Midnight");
-    let _element = state.view(&theme, false, false, "", &[], "", &graph, false);
+    let _element = state.view(&theme, false, false, &graph);
 }
 
 #[test]
@@ -67,7 +67,7 @@ fn all_views_render_in_all_themes() {
         // Chat
         let chat = views::chat::State::new();
         let graph = views::agent_graph::State::new();
-        let _ = chat.view(theme, false, false, "", &[], "", &graph, false);
+        let _ = chat.view(theme, false, false, &graph);
 
         // Memory (modal dialog content)
         let mem = views::memory::State::new();
@@ -105,7 +105,7 @@ fn chat_empty_state_shows_prompt() {
     // Must not panic — this is the primary smoke assertion.
     // We can't easily inspect Iced Element internals, so we just verify
     // it renders cleanly (no panic) with the default empty state.
-    let _element = state.view(&theme, false, false, "", &[], "", &graph, false);
+    let _element = state.view(&theme, false, false, &graph);
 }
 
 /// When the tool log has no rows, should not panic.

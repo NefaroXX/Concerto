@@ -1,5 +1,37 @@
 use iced::keyboard::{key::Named, Key, Modifiers};
 
+/// One row of the shortcuts reference modal: the key chord and what it does.
+/// Kept next to the resolver so the modal can never drift from the bindings it
+/// documents (the modal lists every variant this module can produce).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShortcutInfo {
+    pub keys: &'static str,
+    pub label: &'static str,
+}
+
+/// Every shortcut the desktop app binds, grouped for the modal. Text focus
+/// gates most global bindings; `Ctrl+Enter` and `Esc` always apply. Keep this
+/// in sync with [`resolve`] — the modal renders it verbatim.
+pub const ALL: &[ShortcutInfo] = &[
+    ShortcutInfo { keys: "Ctrl+Enter", label: "Send message" },
+    ShortcutInfo { keys: "Ctrl+T / Ctrl+N", label: "New task" },
+    ShortcutInfo { keys: "Ctrl+D", label: "Toggle Diff viewer" },
+    ShortcutInfo { keys: "Ctrl+M", label: "Open Memory explorer" },
+    ShortcutInfo { keys: "Ctrl+L", label: "Open Tool Log" },
+    ShortcutInfo { keys: "Ctrl+R", label: "Open Runtime panels" },
+    ShortcutInfo { keys: "Ctrl+`", label: "Toggle terminal panel" },
+    ShortcutInfo { keys: "Ctrl+Z", label: "Undo last run (rollback)" },
+    ShortcutInfo { keys: "Ctrl+E", label: "Open code editor" },
+    ShortcutInfo { keys: "Ctrl+S", label: "Screenshot (Save in editor)" },
+    ShortcutInfo { keys: "Ctrl+F", label: "Editor: find" },
+    ShortcutInfo { keys: "Ctrl+H", label: "Editor: find & replace" },
+    ShortcutInfo { keys: "Ctrl+G", label: "Editor: go to line" },
+    ShortcutInfo { keys: "F3 / Shift+F3", label: "Editor: find next / previous" },
+    ShortcutInfo { keys: "Ctrl+Shift+Z / Ctrl+Y", label: "Editor: redo" },
+    ShortcutInfo { keys: "?", label: "Toggle this shortcuts panel" },
+    ShortcutInfo { keys: "Esc", label: "Dismiss dialog / overlay" },
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shortcut {
     NewTask,

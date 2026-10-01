@@ -160,6 +160,13 @@ pub enum Message {
     SetActiveProvider(String),
     /// Change the model used with the active provider.
     SetActiveModel(String),
+    /// Quick-swap one agent's model override from the right toolbar. Persists
+    /// to the global config and re-derives runtime state (same seam the Studio
+    /// uses), without opening Settings/Studio.
+    SetAgentModel {
+        agent_id: String,
+        model: String,
+    },
     /// External config files changed on disk — reload and re-derive every
     /// config-derived `App` field (ADR-57). Self-induced events (our own
     /// saves) are no-ops via the equality short-circuit in
@@ -741,6 +748,24 @@ fn provider_discovery_ready(
             || provider.api_key(credentials).map(|key| !key.is_empty()).unwrap_or(false))
 }
 
+/// Load the persisted desktop theme from the `UserPrefsStore`, falling back
+/// to Midnight when the store cannot be opened.
+///
+/// Prefs are the single source of truth for every desktop surface that
+/// renders the theme. `config.display.theme` only bridges the same palettes
+/// to the CLI and is never read back into the UI — it is written alongside
+/// prefs by [`App::apply_and_save_theme`] and asserted on every Settings save.
+fn load_prefs_theme() -> AppTheme {
+    let data_dir = dirs::data_dir()
+        .map(|d| d.join("concerto"))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let prefs_dir = data_dir.join("prefs");
+    match concerto_memory::prefs::UserPrefsStore::open(&prefs_dir) {
+        Ok(store) => crate::theme::prefs::load_theme(&store),
+        Err(_) => AppTheme::by_name("Midnight"),
+    }
+}
+
 impl App {
     /// Best-effort persist of the current agent-graph view state to the active
     /// session's file. A write failure must never break the UI, so errors are
@@ -752,15 +777,10 @@ impl App {
     }
 
     pub fn new() -> (Self, iced::Task<Message>) {
-        let data_dir = dirs::data_dir()
-            .map(|d| d.join("concerto"))
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-        let prefs_dir = data_dir.join("prefs");
-        let _ = std::fs::create_dir_all(&prefs_dir);
-        let theme = match concerto_memory::prefs::UserPrefsStore::open(&prefs_dir) {
-            Ok(store) => crate::theme::prefs::load_theme(&store),
-            Err(_) => AppTheme::by_name("Midnight").clone(),
-        };
+        // Prefs — not `global_config.display.theme` — decide the startup
+        // theme; both the live theme and the Settings picker are seeded from
+        // this one value below.
+        let theme = load_prefs_theme();
         // Initial project folder — restore the last explicitly chosen folder
         // if it was persisted, otherwise fall back to the current dir or home.
         // Persisting this matters: the default is `std::env::current_dir()`,
@@ -826,6 +846,11 @@ impl App {
         let plugin_manager = concerto_plugins::manager::new_shared_plugin_manager();
         let initial_scanline_overlay = initial_config.display.scanline_overlay_enabled;
         let initial_reduced_motion = initial_config.display.reduced_motion;
+        // Capture the persisted theme before it moves into the struct so the
+        // Settings editor seeds from the applied theme (not the hardcoded
+        // "Midnight" default) — the theme-persistence defect.
+        let initial_theme_name = theme.name;
+        let initial_font_size = theme.font_stack.base_size;
         let mut app = Self {
             page: Page::Chat,
             current_theme: theme,
@@ -919,6 +944,7 @@ impl App {
         // capability prompts are answered through the SAME shared queue the
         // runtime capability dialog consumes, so a freshly installed plugin's
         // persistent grants land in the store that runs later honour.
+        app.settings.seed_theme(initial_theme_name, initial_font_size);
         app.settings.with_plugin_approval(app.cap_pending.clone());
         // Spec §6 (startup-fallback toast): when config loading fell back to
         // defaults at startup, surface it as a high-severity toast.
@@ -978,6 +1004,65 @@ impl App {
 
     pub fn title(&self) -> String {
         "Concerto".into()
+    }
+
+    /// Apply the theme currently selected in Settings and persist it to both
+    /// stores that hold it — the `UserPrefsStore` (theme name + font size)
+    /// and `config.display.theme` (the CLI bridge) — in one step, without
+    /// waiting for a `SaveSettings` round-trip. Keeps `current_theme`, the
+    /// terminal palette, the Settings picker, and both stores in lockstep so
+    /// a restart restores the chosen theme (the theme-persistence defect:
+    /// `ThemeSelected` only mutated the editor's local selection and was lost
+    /// unless Settings was saved).
+    fn apply_and_save_theme(&mut self) {
+        let new_theme =
+            AppTheme::by_name(self.settings.selected_theme).with_base_size(self.settings.font_size);
+        let name_changed = new_theme.name != self.current_theme.name;
+        self.current_theme = new_theme.clone();
+        self.terminal.set_theme(&self.current_theme);
+        // The picker is part of the applied state: re-seed it from what was
+        // just applied so selection and live theme cannot drift apart.
+        self.settings.seed_theme(new_theme.name, new_theme.font_stack.base_size);
+        // Prefs are the single source the UI renders from; `display.theme` is
+        // a read-through bridge for the CLI only, so it is asserted (memory +
+        // disk, in one step) exactly when the applied theme's NAME changes —
+        // a font-size tweak has no config key and must not rewrite the file.
+        if name_changed {
+            // Both in-memory copies are asserted together with the write, so
+            // the merged config shown elsewhere in the app cannot keep the old
+            // value. A project-layer `display.theme` override still wins on
+            // the next reload (the file is truth, ADR-57 §6).
+            let value = Some(new_theme.name.to_string());
+            self.global_config.display.theme = value.clone();
+            if let Some(config) = self.config.as_mut() {
+                config.display.theme = value;
+            }
+            if let Some(path) = concerto_config::default_config_path() {
+                if let Err(error) = concerto_config::save_config(&self.global_config, &path) {
+                    tracing::error!(%error, "failed to persist the theme to the config");
+                }
+            }
+        }
+        let data_dir = dirs::data_dir()
+            .map(|d| d.join("concerto"))
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let prefs_dir = data_dir.join("prefs");
+        if let Ok(store) = concerto_memory::prefs::UserPrefsStore::open(&prefs_dir) {
+            crate::theme::prefs::save_theme(&store, &new_theme);
+        }
+    }
+
+    /// Apply a theme loaded from the `UserPrefsStore` to every surface that
+    /// renders it: the live theme, the terminal palette, and the Settings
+    /// picker. Used by the external-prefs reload path (`Message::ThemeChanged`),
+    /// where prefs — not config — are the source. Deliberately does not touch
+    /// `config.display.theme`: an out-of-band prefs change must not rewrite
+    /// the config file, and mutating only the in-memory copy would let the
+    /// next config write persist a value that was never on disk.
+    fn apply_prefs_theme(&mut self, theme: AppTheme) {
+        self.current_theme = theme.clone();
+        self.terminal.set_theme(&self.current_theme);
+        self.settings.seed_theme(theme.name, theme.font_stack.base_size);
     }
 
     pub fn update(&mut self, message: Message) -> iced::Task<Message> {
@@ -1488,7 +1573,12 @@ impl App {
             Message::Settings(msg) => match &msg {
                 views::settings::Message::SaveSettings => {
                     let task = self.settings.update(msg).map(Message::Settings);
-                    let base = self.global_config.clone();
+                    // Prefs decide the theme the UI renders, so assert it onto
+                    // the config written here: without this, a save could
+                    // persist whatever `display.theme` the file happened to
+                    // carry (the UI never reads that key back).
+                    let mut base = self.global_config.clone();
+                    base.display.theme = Some(self.settings.selected_theme.to_string());
                     let new_config = self.settings.to_config(&base);
                     if let Some(path) = concerto_config::default_config_path() {
                         if let Err(e) = concerto_config::save_config(&new_config, &path) {
@@ -1501,16 +1591,11 @@ impl App {
                             self.reconcile_config_from_reload();
                         }
                     }
-                    let data_dir = dirs::data_dir()
-                        .map(|d| d.join("concerto"))
-                        .unwrap_or_else(|| std::path::PathBuf::from("."));
-                    let prefs_dir = data_dir.join("prefs");
-                    if let Ok(store) = concerto_memory::prefs::UserPrefsStore::open(&prefs_dir) {
-                        let new_theme = AppTheme::by_name(self.settings.selected_theme)
-                            .with_base_size(self.settings.font_size);
-                        self.current_theme = new_theme.clone();
-                        crate::theme::prefs::save_theme(&store, &new_theme);
-                    }
+                    // Persist the picker's theme + font size through the one
+                    // shared path (prefs AND config together), so a save can
+                    // never write back a stale theme. Runs after the reload so
+                    // it re-applies on top of the freshly derived config.
+                    self.apply_and_save_theme();
                     // The studio's model cache must reflect any provider/model
                     // changes saved in Settings (add/delete/rename provider,
                     // or model-discovery results).
@@ -1582,6 +1667,15 @@ impl App {
                     self.sync_chat_model_options();
                     self.orchestration_studio
                         .sync_models(self.settings.cached_models_by_provider());
+                    task
+                }
+                // Theme / font changes apply and persist immediately: the
+                // selector must survive a restart without a SaveSettings
+                // round-trip (and the picker must show the applied theme).
+                views::settings::Message::ThemeSelected(_)
+                | views::settings::Message::FontSizeChanged(_) => {
+                    let task = self.settings.update(msg).map(Message::Settings);
+                    self.apply_and_save_theme();
                     task
                 }
                 views::settings::Message::ProviderModelsRefreshRequested(provider_id) => {
@@ -1670,14 +1764,12 @@ impl App {
                 )
                 .map(Message::Editor),
             Message::ThemeChanged => {
-                let data_dir = dirs::data_dir()
-                    .map(|d| d.join("concerto"))
-                    .unwrap_or_else(|| std::path::PathBuf::from("."));
-                let prefs_dir = data_dir.join("prefs");
-                if let Ok(store) = concerto_memory::prefs::UserPrefsStore::open(&prefs_dir) {
-                    self.current_theme = crate::theme::prefs::load_theme(&store);
-                }
-                self.terminal.set_theme(&self.current_theme);
+                // Re-read the single source (prefs) and re-apply it to every
+                // surface, including the Settings picker — a prefs reload that
+                // only replaced `current_theme` would leave the picker showing
+                // a theme the shell is not rendering.
+                let theme = load_prefs_theme();
+                self.apply_prefs_theme(theme);
                 iced::Task::none()
             }
             Message::HelpToggled => {
@@ -1921,6 +2013,10 @@ impl App {
                         "ignored model selection that does not belong to the active provider"
                     );
                 }
+                iced::Task::none()
+            }
+            Message::SetAgentModel { agent_id, model } => {
+                self.set_agent_model(agent_id, model);
                 iced::Task::none()
             }
 
@@ -2402,6 +2498,9 @@ impl App {
         // conversation. Reset it at the run boundary even when dispatch
         // validation fails, so an old phase cannot attach to a newer prompt.
         self.agent_graph = views::agent_graph::State::new();
+        // Drop the previous run's per-subagent progress cards for the same
+        // reason: a stale card must never attach to the new prompt.
+        self.chat.begin_run();
         // Dispatch-boundary validation: block the run with a clear message if
         // the active provider/model or any agent assignment is incomplete,
         // rather than failing deep inside the orchestrator.
@@ -2617,24 +2716,6 @@ impl App {
         self.chat_model_options.first().cloned().unwrap_or_default()
     }
 
-    /// Human-readable label for where the active model was resolved from.
-    /// Returns the agent role name if from a role assignment.
-    fn model_source_label(&self) -> &'static str {
-        // Check if the active model matches a role assignment's model override.
-        for assignment in self.runtime_assignments() {
-            if assignment.provider_config_id == self.active_provider_id {
-                if let Some(model) = &assignment.model_override {
-                    if !model.is_empty()
-                        && (model == &self.active_model || self.active_model.is_empty())
-                    {
-                        return "from role assignment";
-                    }
-                }
-            }
-        }
-        ""
-    }
-
     fn persist_active_model_selection(&mut self) {
         let mut config = self.global_config.clone();
         let settings = config.model_settings.get_or_insert_with(Default::default);
@@ -2658,6 +2739,62 @@ impl App {
             }
         }
         self.sync_chat_model_options();
+    }
+
+    /// Persist one agent's model override to the global config (right-toolbar
+    /// quick swap) and re-derive runtime state. Mirrors the Studio's
+    /// `AssignModel` seam: an empty/"default" model removes the assignment so
+    /// the agent falls back to the global default. Provider resolution prefers
+    /// the agent's existing assignment, then the active provider, then the
+    /// first configured provider.
+    fn set_agent_model(&mut self, agent_id: String, model: String) {
+        let provider_id = self
+            .runtime_assignments()
+            .iter()
+            .find(|assignment| assignment.agent_role == agent_id)
+            .map(|assignment| assignment.provider_config_id.clone())
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| {
+                if !self.active_provider_id.is_empty() {
+                    self.active_provider_id.clone()
+                } else {
+                    self.runtime_providers().first().map(|p| p.id.clone()).unwrap_or_default()
+                }
+            });
+        let use_default = model.is_empty() || model == "default" || provider_id.is_empty();
+        let mut config = self.global_config.clone();
+        let settings = config.model_settings.get_or_insert_with(Default::default);
+        if use_default {
+            settings.agent_assignments.retain(|assignment| assignment.agent_role != agent_id);
+        } else if let Some(assignment) =
+            settings.agent_assignments.iter_mut().find(|a| a.agent_role == agent_id)
+        {
+            assignment.provider_config_id = provider_id;
+            assignment.model_override = Some(model.clone());
+        } else {
+            settings.agent_assignments.push(concerto_config::AgentModelAssignment {
+                agent_role: agent_id.clone(),
+                provider_config_id: provider_id,
+                model_override: Some(model.clone()),
+            });
+        }
+        match concerto_config::default_config_path() {
+            Some(path) => match concerto_config::save_config(&config, &path) {
+                Ok(()) => self.reconcile_config_from_reload(),
+                Err(error) => {
+                    tracing::error!(%error, "failed to persist agent model override");
+                    self.toasts.push(ToastLevel::Error, format!("Could not save model: {error}"));
+                    return;
+                }
+            },
+            None => {
+                self.global_config = config.clone();
+                self.config = Some(config);
+            }
+        }
+        // Keep the rendered card in sync until the next config reload.
+        let override_model = (!use_default).then_some(model);
+        self.orchestration_studio.set_agent_model_override(&agent_id, override_model);
     }
 
     /// Rebuild the chat header model-option list from the active provider's
@@ -3950,17 +4087,6 @@ impl App {
     pub fn view(&self) -> Element<'_, Message> {
         let sidebar = views::nav::sidebar_view(self);
 
-        // Agents count as configured when per-agent model pins exist inside
-        // `multi_agent.custom_agents`, even before any
-        // `model_settings.agent_assignments` are persisted — so the "Configure
-        // agents in Studio" hint must not show in that case.
-        let agents_configured = self
-            .config
-            .as_ref()
-            .and_then(|config| config.multi_agent.as_ref())
-            .map(|multi| !multi.custom_agents.is_empty())
-            .unwrap_or(false);
-
         let content: Element<'_, Message> = match self.page {
             Page::Chat => {
                 // Constrain the chat reading column: `Fill` width capped at
@@ -3974,13 +4100,9 @@ impl App {
                     .chat
                     .view(
                         &self.current_theme,
-                        self.multi_agent,
-                        self.fast,
-                        &self.active_model,
-                        &self.chat_model_options,
-                        self.model_source_label(),
+                        !self.chat_model_options.is_empty(),
+                        self.run_status == RunStatus::Running,
                         &self.agent_graph,
-                        !self.runtime_assignments().is_empty() || agents_configured,
                     )
                     .map(Message::Chat);
                 container(
@@ -4084,7 +4206,13 @@ impl App {
             views::quick_panel::quick_panel_collapsed(self)
         };
 
-        let shell = row![sidebar, sep, main_area, sep2, right_panel,];
+        // Explicit `Fill` on the shell row: the sidebar and right panel keep
+        // their natural/`Fixed` widths, the center column takes the remaining
+        // space. Without this the row reports its natural width and the chat
+        // column can slide under the fixed right rail on narrow windows.
+        let shell = row![sidebar, sep, main_area, sep2, right_panel,]
+            .width(Length::Fill)
+            .height(Length::Fill);
 
         let base = container(shell).width(Length::Fill).height(Length::Fill);
 
@@ -4386,6 +4514,50 @@ impl App {
                     memory_content,
                 ]
                 .spacing(10)
+                .padding(20)
+                .width(Length::Fill),
+            )
+            .width(Length::FillPortion(2))
+            .height(Length::FillPortion(2))
+            .style(crate::ui::container::modal);
+            let backdrop = container(modal)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .style(|_theme: &iced::Theme| container::Style {
+                    background: Some(iced::Background::Color(iced::Color {
+                        a: 0.55,
+                        ..self.current_theme.palette.background
+                    })),
+                    ..container::Style::default()
+                });
+            stack![after_subview, backdrop].into()
+        } else if self.show_help {
+            // Shortcuts reference modal (`?` or the right-toolbar keyboard
+            // button). Lists every binding from `shortcuts::ALL` so the panel
+            // cannot drift from the resolver.
+            let rows = shortcuts::ALL.iter().fold(column![].spacing(6), |col, info| {
+                col.push(
+                    row![
+                        text(info.keys).size(13).width(Length::Fixed(200.0)),
+                        text(info.label).size(13).color(self.current_theme.palette.text_muted),
+                    ]
+                    .spacing(12),
+                )
+            });
+            let modal = container(
+                column![
+                    row![
+                        text("Keyboard Shortcuts").size(18).width(Length::Fill),
+                        button(text("✕").size(14))
+                            .style(crate::ui::button::secondary)
+                            .on_press(Message::HelpToggled),
+                    ]
+                    .align_y(iced::Alignment::Center),
+                    rows,
+                ]
+                .spacing(12)
                 .padding(20)
                 .width(Length::Fill),
             )
@@ -8753,5 +8925,226 @@ model_pins = { coder = "local-model" }
             "the keys stay declared (still ignored at load) until the user resolves it"
         );
         let _ = app;
+    }
+
+    /// The Settings theme picker seeds from the applied (persisted) theme at
+    /// startup, so it never reverts to the hardcoded Midnight default.
+    #[test]
+    fn settings_theme_seeds_from_applied_theme() {
+        let (app, _) = App::new();
+        assert_eq!(
+            app.settings.selected_theme, app.current_theme.name,
+            "settings picker must show the applied theme after restart"
+        );
+    }
+
+    /// Selecting a theme applies and persists it immediately (no SaveSettings
+    /// round-trip), keeping the picker, the live theme, the prefs store, and
+    /// the CLI-facing `display.theme` bridge in lockstep. Runs under the
+    /// config/env lock with isolated data + config dirs so it never touches
+    /// the developer's real preferences.
+    #[test]
+    fn theme_selected_applies_immediately() {
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let config_dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let previous_config = std::env::var_os("XDG_CONFIG_HOME");
+        let previous_data = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", config_dir.path());
+        std::env::set_var("XDG_DATA_HOME", data_dir.path());
+
+        let (mut app, _) = App::new();
+        let target = if app.current_theme.name == "Slate" { "Chalk" } else { "Slate" };
+        let _ = app.update(Message::Settings(SettingsMessage::ThemeSelected(target)));
+        assert_eq!(app.current_theme.name, target);
+        assert_eq!(app.settings.selected_theme, target);
+        // Applied (prefs) theme and the CLI bridge are written together, so
+        // neither store can report a theme the UI is not rendering.
+        assert_eq!(
+            app.global_config.display.theme.as_deref(),
+            Some(target),
+            "the in-memory config must carry the applied theme"
+        );
+        let merged = app.config.as_ref().and_then(|c| c.display.theme.as_deref());
+        assert_eq!(merged, Some(target), "the merged config copy must match the global one");
+        let on_disk = concerto_config::load_global_config(None).expect("reload config");
+        assert_eq!(
+            on_disk.display.theme.as_deref(),
+            Some(target),
+            "the config file must carry the applied theme"
+        );
+        let prefs_dir = data_dir.path().join("concerto").join("prefs");
+        let store = concerto_memory::prefs::UserPrefsStore::open(&prefs_dir).expect("prefs store");
+        let saved = crate::theme::prefs::load_theme(&store);
+        assert_eq!(saved.name, target, "the prefs store must carry the applied theme");
+
+        // A font-size tweak has no config key: it must apply and persist to
+        // prefs without rewriting (and therefore without clobbering) the theme.
+        let _ = app.update(Message::Settings(SettingsMessage::FontSizeChanged(18.0)));
+        assert_eq!(app.current_theme.font_stack.base_size, 18.0);
+        assert_eq!(app.settings.font_size, 18.0);
+        let store = concerto_memory::prefs::UserPrefsStore::open(&prefs_dir).expect("prefs store");
+        assert_eq!(crate::theme::prefs::load_theme(&store).font_stack.base_size, 18.0);
+        let on_disk = concerto_config::load_global_config(None).expect("reload config");
+        assert_eq!(on_disk.display.theme.as_deref(), Some(target), "a size tweak keeps the theme");
+
+        // A later save round-trip must never write back a stale theme.
+        let _ = app.update(Message::Settings(SettingsMessage::SaveSettings));
+        assert_eq!(app.current_theme.name, target, "save must not revert the applied theme");
+        assert_eq!(app.settings.selected_theme, target);
+        let on_disk = concerto_config::load_global_config(None).expect("reload config");
+        assert_eq!(
+            on_disk.display.theme.as_deref(),
+            Some(target),
+            "SaveSettings must not persist a theme the UI is not rendering"
+        );
+
+        restore_xdg_env(previous_config, previous_data);
+    }
+
+    /// Startup seeds every theme surface from the prefs store, even when the
+    /// config file's `display.theme` says something else: prefs are the
+    /// source of truth, config only bridges the same palettes to the CLI.
+    #[test]
+    fn startup_seeds_theme_surfaces_from_prefs_not_config() {
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let config_dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let previous_config = std::env::var_os("XDG_CONFIG_HOME");
+        let previous_data = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", config_dir.path());
+        std::env::set_var("XDG_DATA_HOME", data_dir.path());
+
+        // Config and prefs deliberately disagree; prefs must win for the UI.
+        if let Some(path) = concerto_config::default_config_path() {
+            let mut config = AppConfig::default();
+            config.display.theme = Some("Slate".to_string());
+            concerto_config::save_config(&config, &path).expect("seed config");
+        }
+        let prefs_dir = data_dir.path().join("concerto").join("prefs");
+        if let Ok(store) = concerto_memory::prefs::UserPrefsStore::open(&prefs_dir) {
+            let theme = crate::theme::AppTheme::by_name("Chalk").with_base_size(18.0);
+            crate::theme::prefs::save_theme(&store, &theme);
+        }
+
+        let (app, _) = App::new();
+        assert_eq!(app.current_theme.name, "Chalk", "startup must render the prefs theme");
+        assert_eq!(
+            app.settings.selected_theme, "Chalk",
+            "the picker must be seeded from the same prefs value as the live theme"
+        );
+        assert_eq!(app.current_theme.font_stack.base_size, 18.0);
+        assert_eq!(app.settings.font_size, 18.0);
+
+        restore_xdg_env(previous_config, previous_data);
+    }
+
+    /// An external prefs change (another window, or the CLI writing the store)
+    /// is re-applied to every surface that renders it, including the Settings
+    /// picker — not just the live theme.
+    #[test]
+    fn theme_changed_reseeds_the_picker_from_prefs() {
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let config_dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let previous_config = std::env::var_os("XDG_CONFIG_HOME");
+        let previous_data = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", config_dir.path());
+        std::env::set_var("XDG_DATA_HOME", data_dir.path());
+
+        let (mut app, _) = App::new();
+        let target = if app.current_theme.name == "Nebula" { "Slate" } else { "Nebula" };
+        let prefs_dir = data_dir.path().join("concerto").join("prefs");
+        if let Ok(store) = concerto_memory::prefs::UserPrefsStore::open(&prefs_dir) {
+            let theme = crate::theme::AppTheme::by_name(target).with_base_size(16.0);
+            crate::theme::prefs::save_theme(&store, &theme);
+        }
+
+        let _ = app.update(Message::ThemeChanged);
+        assert_eq!(app.current_theme.name, target, "the live theme must follow prefs");
+        assert_eq!(app.current_theme.font_stack.base_size, 16.0);
+        assert_eq!(
+            app.settings.selected_theme, target,
+            "the picker must be re-seeded from prefs on an external theme change"
+        );
+        assert_eq!(app.settings.font_size, 16.0);
+
+        restore_xdg_env(previous_config, previous_data);
+    }
+
+    /// A per-agent model override from the right toolbar persists an
+    /// assignment and keeps the Studio card in sync; clearing it removes the
+    /// assignment (fall back to the global default). Isolated like the theme
+    /// test so it never writes the developer's config.
+    #[test]
+    fn set_agent_model_persists_and_clears_override() {
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let config_dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let previous_config = std::env::var_os("XDG_CONFIG_HOME");
+        let previous_data = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", config_dir.path());
+        std::env::set_var("XDG_DATA_HOME", data_dir.path());
+
+        // Seed a provider so an agent model override has a valid assignment
+        // target; App::new loads it as the active route.
+        if let Some(path) = concerto_config::default_config_path() {
+            let config = AppConfig {
+                model_settings: Some(concerto_config::ModelSettings {
+                    providers: vec![ProviderConfig {
+                        id: "test-provider".into(),
+                        provider: "openai".into(),
+                        model: "gpt-4o-mini".into(),
+                        ..Default::default()
+                    }],
+                    global_default_model: Some("gpt-4o-mini".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            concerto_config::save_config(&config, &path).expect("seed config");
+        }
+
+        let (mut app, _) = App::new();
+        let agent_id =
+            app.orchestration_studio.roster_agents().next().map(|agent| agent.id.clone());
+        let Some(agent_id) = agent_id else {
+            restore_xdg_env(previous_config, previous_data);
+            return;
+        };
+        let _ = app.update(Message::SetAgentModel {
+            agent_id: agent_id.clone(),
+            model: "test-model-x".into(),
+        });
+        assert!(
+            app.runtime_assignments()
+                .iter()
+                .any(|a| a.agent_role == agent_id
+                    && a.model_override.as_deref() == Some("test-model-x")),
+            "the override must be persisted to the model assignment"
+        );
+        let _ = app
+            .update(Message::SetAgentModel { agent_id: agent_id.clone(), model: "default".into() });
+        assert!(
+            !app.runtime_assignments().iter().any(|a| a.agent_role == agent_id),
+            "clearing must drop the assignment"
+        );
+
+        restore_xdg_env(previous_config, previous_data);
+    }
+
+    /// Restore the two XDG dirs captured by an isolated env test.
+    fn restore_xdg_env(
+        previous_config: Option<std::ffi::OsString>,
+        previous_data: Option<std::ffi::OsString>,
+    ) {
+        match previous_config {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        match previous_data {
+            Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
     }
 }

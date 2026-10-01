@@ -623,6 +623,14 @@ pub fn route_event(
                 description: description.clone(),
                 role: role.clone(),
             });
+            // One progress card per dispatched run, keyed by task id alone.
+            // Recorded *before* the coordinator dispatch note below so the
+            // note is attributed to the run that was just opened.
+            chat_state.record_subtask_created(
+                task_id.to_string(),
+                role.as_str(),
+                description.clone(),
+            );
             chat_state.add_thinking(
                 "Coordinator",
                 format!("→ {role:?}: {description}"),
@@ -635,6 +643,13 @@ pub fn route_event(
                 outcome: outcome.clone(),
                 role: role.clone(),
             });
+            // Settle before the digest so the line below is attributed to a
+            // run of this role's card, not to whatever run is currently
+            // capturing new work (`State::owning_run_id`).
+            chat_state.record_subtask_finished(
+                &task_id.to_string(),
+                Some(format!("Completed: {outcome}")),
+            );
             // Terminal completion is a bucket digest (Headline);
             // decomposition internals stay Detail.
             chat_state.add_thinking(role, format!("Completed: {outcome}"), ThinkingKind::Headline);
@@ -645,6 +660,10 @@ pub fn route_event(
                 reason: reason.clone(),
                 role: role.clone(),
             });
+            chat_state.record_subtask_finished(
+                &task_id.to_string(),
+                Some(format!("Needs revision: {reason}")),
+            );
             chat_state.add_thinking(
                 role,
                 format!("Needs revision: {reason}"),
@@ -665,6 +684,10 @@ pub fn route_event(
                 role: role.clone(),
                 reason: reason.clone(),
             });
+            chat_state.record_subtask_finished(
+                &task_id.to_string(),
+                Some(format!("Cancelled: {reason}")),
+            );
             chat_state.add_thinking(role, format!("Cancelled: {reason}"), ThinkingKind::Detail);
         }
         DesktopEvent::SubTaskFailed { task_id, error, role } => {
@@ -673,6 +696,8 @@ pub fn route_event(
                 error: error.clone(),
                 role: role.clone(),
             });
+            chat_state
+                .record_subtask_finished(&task_id.to_string(), Some(format!("Failed: {error}")));
             // Terminal failure is a bucket digest (Headline);
             // cancellation and revision/blocked internals stay Detail.
             chat_state.add_thinking(role, format!("Failed: {error}"), ThinkingKind::Headline);
