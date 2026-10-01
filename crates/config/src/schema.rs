@@ -1,5 +1,5 @@
 use camino::Utf8PathBuf;
-use concerto_core::types::{AgentId, AgentStage, OutputMode};
+use concerto_core::types::{AgentId, AgentStage, ModelInfo, OutputMode};
 use concerto_core::SecretString;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -1425,7 +1425,7 @@ impl ConditionDef {
 
 /// How tool parameter schemas are presented to a model on the wire.
 ///
-/// Weak tool-calling models (audit: `mimo-v2.5-free`) stall on nested
+/// Weak tool-calling models (audit: the MiMo family) stall on nested
 /// JSON-Schema tool parameters: they emit `null` arguments, hallucinate keys,
 /// and miss required nested fields. "Loose" presentation flattens nested
 /// object properties to dot-notation leaves, appends argument examples to
@@ -1438,12 +1438,13 @@ impl ConditionDef {
 /// `tool_schema_mode` string (`"auto"` | `"strict"` | `"loose"`); this enum is
 /// the parsed, provider-side value. Default is [`ToolSchemaMode::Auto`]:
 /// unknown model names keep today's verbatim ("strict") schema — only names
-/// matching the weak-tier heuristic are adapted.
+/// matching the last-resort weak-family heuristic are adapted. A `*-free`/
+/// `:free` route token is a price tier, never a capability signal (ADR-75).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ToolSchemaMode {
-    /// Decide per resolved model name: weak tool-callers (heuristic, see
-    /// `concerto_providers::adapters::schema_loose`) get loose schemas,
-    /// every other model keeps the verbatim strict schema.
+    /// Decide per resolved model name: weak tool-callers (last-resort
+    /// heuristic, see `concerto_providers::adapters::schema_loose`) get loose
+    /// schemas, every other model keeps the verbatim strict schema.
     #[default]
     Auto,
     /// Always send the tool schema verbatim (strong tool-calling models).
@@ -1527,11 +1528,42 @@ pub struct ProviderConfig {
     /// Tool-schema presentation tier for this provider's models.
     ///
     /// One of `"auto"` (default — adapt schemas only for weak tool-calling
-    /// model names such as `mimo-v2.5-free`), `"strict"` (never adapt), or
+    /// model families such as MiMo), `"strict"` (never adapt), or
     /// `"loose"` (always adapt). `None`/unrecognized resolves to `"auto"`.
     /// See [`ToolSchemaMode`] for what adaptation changes on the wire.
     #[serde(default)]
     pub tool_schema_mode: Option<String>,
+    /// Provider-advertised per-model tool-calling capability captured from the
+    /// last model-discovery listing (ADR-66 §3 precedence level 2, ADR-75).
+    ///
+    /// Keyed by the discovered model id; only models whose listing explicitly
+    /// advertised a `supports_tool_calling` flag appear here. This is
+    /// **additive derived state** parallel to `cached_models`: it survives
+    /// reload because the config is persisted, and
+    /// [`ProviderConfig::advertised_tool_support_for`] feeds it into
+    /// `ProviderFactory::build` so a provider that advertises tool support is
+    /// believed and one that advertises its absence is not forced onto the
+    /// native path when a fallback exists. `#[serde(default)]` keeps configs
+    /// written before this field deserializable.
+    #[serde(default)]
+    pub cached_model_tool_support: HashMap<String, bool>,
+}
+
+/// Outcome of [`ProviderConfig::record_discovered_models`].
+///
+/// Separates "the cache was refreshed" from "the refresh produced nothing, so
+/// the previous catalog was kept". Callers need the distinction to tell the
+/// user which happened — from the cache contents alone an ignored empty
+/// refresh is indistinguishable from a genuine one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoveryOutcome {
+    /// The incoming list replaced `cached_models` and
+    /// `cached_models_fetched_at` was stamped with the current time.
+    Updated,
+    /// The incoming list normalized to nothing while a non-empty catalog was
+    /// already cached: neither `cached_models` nor `cached_models_fetched_at`
+    /// was touched.
+    EmptyIgnored,
 }
 
 impl ProviderConfig {
@@ -1583,12 +1615,75 @@ impl ProviderConfig {
         }
     }
 
-    /// Record a successful model discovery result. Normalizes (trims, dedupes,
-    /// sorts) the discovered list and stamps the fetch time. Additive state,
-    /// separate from the user's selected `model`.
-    pub fn record_discovered_models(&mut self, models: Vec<String>) {
-        self.cached_models = normalize_model_list(models);
+    /// Record a model-discovery result: normalize (trim, dedupe, sort) the
+    /// incoming list, capture any per-model capability metadata the listing
+    /// advertised, and stamp the fetch time. Additive state, separate from
+    /// the user's selected `model`.
+    ///
+    /// # No-clobber contract
+    ///
+    /// An **empty** result — an empty list, or one containing only blank
+    /// entries — never overwrites an existing non-empty `cached_models` and
+    /// never advances `cached_models_fetched_at`. A refresh that fails or
+    /// returns an empty catalog must not erase a previously discovered list,
+    /// and must not stamp a fresh time that would make the empty state look
+    /// like a valid, just-completed discovery. In that case a
+    /// `tracing::warn!` naming the provider id, the retained count, and the
+    /// fact that the previous cache was kept is emitted and
+    /// [`DiscoveryOutcome::EmptyIgnored`] is returned, so the failure is
+    /// visible rather than silent.
+    ///
+    /// An empty result against an **already-empty** cache is still recorded —
+    /// there is no good cache to protect — and still stamps the time
+    /// ([`DiscoveryOutcome::Updated`]).
+    ///
+    /// A non-empty result always replaces the cache and stamps the time
+    /// ([`DiscoveryOutcome::Updated`]). Advertised capability metadata
+    /// ([`concerto_core::types::ModelInfo::supports_tool_calling`]) is
+    /// preserved per model in `cached_model_tool_support`, keyed by the
+    /// trimmed model id; models that advertised no flag are absent (their
+    /// resolution falls through to the last-resort heuristic and the
+    /// optimistic default).
+    pub fn record_discovered_models(&mut self, models: Vec<ModelInfo>) -> DiscoveryOutcome {
+        // Capture advertised capability keyed by the trimmed id the catalog
+        // stores, so `advertised_tool_support_for` matches without re-trimming
+        // surprises.
+        let mut advertised: HashMap<String, bool> = HashMap::new();
+        for model in &models {
+            let id = model.id.trim();
+            if id.is_empty() {
+                continue;
+            }
+            if let Some(supports) = model.supports_tool_calling {
+                advertised.insert(id.to_string(), supports);
+            }
+        }
+        let normalized = normalize_model_list(models.into_iter().map(|model| model.id).collect());
+        if normalized.is_empty() && !self.cached_models.is_empty() {
+            let retained = self.cached_models.len();
+            tracing::warn!(
+                provider_id = %self.id,
+                provider = %self.provider,
+                retained,
+                "discovery returned no models; keeping the previously cached model list"
+            );
+            return DiscoveryOutcome::EmptyIgnored;
+        }
+        self.cached_model_tool_support = advertised;
+        self.cached_models = normalized;
         self.cached_models_fetched_at = now_unix_secs();
+        DiscoveryOutcome::Updated
+    }
+
+    /// The provider-advertised tool-calling capability for `model`, if the last
+    /// discovery listing published one (ADR-66 §3 precedence level 2).
+    ///
+    /// `None` means the provider advertised no flag for this model: resolution
+    /// falls through to the last-resort name heuristic and then the optimistic
+    /// provider default. This is the accessor `ProviderFactory::build` consults
+    /// so advertised metadata reaches the connector.
+    pub fn advertised_tool_support_for(&self, model: &str) -> Option<bool> {
+        self.cached_model_tool_support.get(model.trim()).copied()
     }
 
     /// Count of cached discovered models (for compact UI summary).
@@ -1665,6 +1760,7 @@ impl Default for ProviderConfig {
             reasoning_echo: None,
             cache_breakpoints: false,
             tool_schema_mode: None,
+            cached_model_tool_support: HashMap::new(),
         }
     }
 }
@@ -2905,9 +3001,18 @@ mod tests {
         assert_eq!(ms.providers[0].id, "keep-me");
     }
 
-    #[test]
-    fn record_discovered_models_normalizes_and_stamps() {
-        let mut pc = ProviderConfig {
+    // ------------------------------------------------------------------
+    // ProviderConfig::record_discovered_models — no-clobber contract
+    // ------------------------------------------------------------------
+
+    /// A fixed, long-past fetch stamp so "unchanged" assertions are exact
+    /// rather than racing the wall clock.
+    const SEED_FETCHED_AT: i64 = 1_700_000_000;
+
+    /// A provider seeded with a discovery cache (already normalized) and a
+    /// fixed fetch stamp. An empty seed starts at `0`, i.e. "never fetched".
+    fn provider_with_cached_models(models: &[&str]) -> ProviderConfig {
+        ProviderConfig {
             id: "prov_1".into(),
             name: "OpenAI".into(),
             provider: "openai".into(),
@@ -2915,22 +3020,230 @@ mod tests {
             api_base: None,
             timeout_seconds: 30,
             keyring_key: "openai/api_key".into(),
-            cached_models: Vec::new(),
-            cached_models_fetched_at: 0,
+            cached_models: models.iter().map(|m| (*m).to_string()).collect(),
+            cached_models_fetched_at: if models.is_empty() { 0 } else { SEED_FETCHED_AT },
             ..ProviderConfig::default()
-        };
-        // Duplicate + different casing + whitespace should be trimmed/deduped and sorted.
-        pc.record_discovered_models(vec![
+        }
+    }
+
+    /// One captured WARN event: its rendered message plus its fields.
+    #[derive(Clone, Debug, Default)]
+    struct CapturedWarn {
+        message: String,
+        fields: Vec<(String, String)>,
+    }
+
+    impl CapturedWarn {
+        fn field(&self, name: &str) -> Option<&str> {
+            self.fields.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str())
+        }
+    }
+
+    impl tracing::field::Visit for CapturedWarn {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            let rendered = format!("{value:?}");
+            if field.name() == "message" {
+                // `fmt::Arguments` (the usual message carrier) renders
+                // verbatim; a `&str`-backed debug value arrives quoted, so
+                // strip the quotes to keep assertions readable.
+                self.message = rendered.trim_matches('"').to_string();
+            } else {
+                self.fields.push((field.name().to_string(), rendered));
+            }
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.message = value.to_string();
+            } else {
+                self.fields.push((field.name().to_string(), value.to_string()));
+            }
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.fields.push((field.name().to_string(), value.to_string()));
+        }
+
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.fields.push((field.name().to_string(), value.to_string()));
+        }
+    }
+
+    /// Minimal `tracing::Subscriber` collecting WARN events while a closure
+    /// runs under `tracing::subscriber::with_default`, so the no-clobber
+    /// warning can be asserted without pulling `tracing-subscriber` into
+    /// dev-dependencies (workspace precedent: `concerto-providers`
+    /// `openai::tests::WarnSink`).
+    #[derive(Clone, Default)]
+    struct WarnSink {
+        warns: std::sync::Arc<std::sync::Mutex<Vec<CapturedWarn>>>,
+    }
+
+    impl WarnSink {
+        fn warns(&self) -> Vec<CapturedWarn> {
+            self.warns.lock().expect("warn capture mutex poisoned").clone()
+        }
+    }
+
+    impl tracing::Subscriber for WarnSink {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::Id {
+            static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            tracing::Id::from_u64(NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+        }
+
+        fn record(&self, _span: &tracing::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::Id, _follows: &tracing::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if event.metadata().level() != &tracing::Level::WARN {
+                return;
+            }
+            let mut captured = CapturedWarn::default();
+            event.record(&mut captured);
+            self.warns.lock().expect("warn capture mutex poisoned").push(captured);
+        }
+
+        fn enter(&self, _span: &tracing::Id) {}
+
+        fn exit(&self, _span: &tracing::Id) {}
+    }
+
+    #[test]
+    fn record_discovered_models_normalizes_and_stamps() {
+        let mut pc = provider_with_cached_models(&["legacy-model"]);
+        // Duplicate + different casing + whitespace should be trimmed/deduped
+        // and sorted, replacing whatever was cached, and the fetch time moves
+        // off the seeded stamp.
+        let outcome = pc.record_discovered_models(vec![
             " gpt-4o ".into(),
             "GPT-4O".into(),
             "gpt-4o-mini".into(),
             "".into(),
             "gpt-4o".into(),
         ]);
+        assert_eq!(outcome, DiscoveryOutcome::Updated, "a non-empty result updates the cache");
         assert_eq!(pc.cached_models, vec!["gpt-4o", "gpt-4o-mini"]);
-        assert!(pc.cached_models_fetched_at > 0);
+        assert!(
+            pc.cached_models_fetched_at > SEED_FETCHED_AT,
+            "a non-empty result must stamp a fresh fetch time"
+        );
         assert_eq!(pc.cached_model_count(), 2);
         assert!(pc.cached_models_age().is_some());
+    }
+
+    /// Advertised tool-calling capability survives discovery into the config
+    /// cache, keyed by the normalized model id, and a model that advertised
+    /// nothing resolves to `None` (the optimistic default applies downstream).
+    #[test]
+    fn record_discovered_models_preserves_advertised_capability() {
+        let mut pc = provider_with_cached_models(&[]);
+        let mut supports = ModelInfo::from_id("gpt-4o");
+        supports.supports_tool_calling = Some(true);
+        let mut no_tools = ModelInfo::from_id("muse-v2");
+        no_tools.supports_tool_calling = Some(false);
+        let silent = ModelInfo::from_id("plain-model");
+
+        let outcome = pc.record_discovered_models(vec![supports, no_tools, silent]);
+        assert_eq!(outcome, DiscoveryOutcome::Updated);
+        assert_eq!(pc.cached_models, vec!["gpt-4o", "muse-v2", "plain-model"]);
+        assert_eq!(pc.advertised_tool_support_for("gpt-4o"), Some(true));
+        assert_eq!(pc.advertised_tool_support_for("muse-v2"), Some(false));
+        assert_eq!(
+            pc.advertised_tool_support_for("plain-model"),
+            None,
+            "a model with no advertised flag stays unspecified"
+        );
+        // The lookup trims, matching the stored normalized id.
+        assert_eq!(pc.advertised_tool_support_for("  gpt-4o  "), Some(true));
+    }
+
+    /// The no-clobber contract covers capability metadata too: an ignored
+    /// empty refresh keeps the previous capability map alongside the catalog.
+    #[test]
+    fn record_discovered_models_empty_result_keeps_capability_metadata() {
+        let mut pc = provider_with_cached_models(&["gpt-4o"]);
+        pc.cached_model_tool_support.insert("gpt-4o".to_string(), true);
+
+        let outcome = pc.record_discovered_models(Vec::new());
+        assert_eq!(outcome, DiscoveryOutcome::EmptyIgnored);
+        assert_eq!(pc.cached_models, vec!["gpt-4o"]);
+        assert_eq!(pc.advertised_tool_support_for("gpt-4o"), Some(true));
+    }
+
+    /// The regression behind the bug: an empty refresh must not erase a good
+    /// catalog or stamp a time that makes the empty state look freshly fetched.
+    /// It must also say so, loudly, naming the provider and the retained count.
+    #[test]
+    fn record_discovered_models_empty_result_keeps_cache_and_warns() {
+        let mut pc = provider_with_cached_models(&["gpt-4o", "gpt-4o-mini"]);
+        let subscriber = WarnSink::default();
+        let sink = subscriber.clone();
+
+        let outcome = tracing::subscriber::with_default(subscriber, || {
+            pc.record_discovered_models(Vec::new())
+        });
+
+        assert_eq!(outcome, DiscoveryOutcome::EmptyIgnored);
+        assert_eq!(
+            pc.cached_models,
+            vec!["gpt-4o", "gpt-4o-mini"],
+            "an empty result must not clobber a non-empty cache"
+        );
+        assert_eq!(
+            pc.cached_models_fetched_at, SEED_FETCHED_AT,
+            "an ignored empty result must not advance the fetch time"
+        );
+
+        let warns = sink.warns();
+        assert_eq!(warns.len(), 1, "the ignored empty result must be visible, not silent");
+        let warn = &warns[0];
+        assert!(
+            warn.message.contains("keeping the previously cached model list"),
+            "the warning must say the previous cache was kept: {}",
+            warn.message
+        );
+        assert_eq!(warn.field("provider_id"), Some("prov_1"), "the warning must name the provider");
+        assert_eq!(warn.field("retained"), Some("2"), "the warning must name the retained count");
+    }
+
+    /// Nothing is being protected when the cache is already empty, so an empty
+    /// result is still a real update and still records the fetch time.
+    #[test]
+    fn record_discovered_models_empty_result_into_empty_cache_is_recorded() {
+        let mut pc = provider_with_cached_models(&[]);
+
+        let outcome = pc.record_discovered_models(Vec::new());
+
+        assert_eq!(outcome, DiscoveryOutcome::Updated);
+        assert!(pc.cached_models.is_empty());
+        assert!(
+            pc.cached_models_fetched_at > 0,
+            "an empty cache with an empty result must still stamp the time"
+        );
+    }
+
+    /// `["   ", "\t"]` is what a blank-only catalog normalizes to, so it must
+    /// take the same path as a truly empty list rather than overwriting a good
+    /// cache with `[]`.
+    #[test]
+    fn record_discovered_models_whitespace_only_result_is_treated_as_empty() {
+        let mut pc = provider_with_cached_models(&["gpt-4o"]);
+        let subscriber = WarnSink::default();
+        let sink = subscriber.clone();
+
+        let outcome = tracing::subscriber::with_default(subscriber, || {
+            pc.record_discovered_models(vec!["   ".into(), "\t".into(), "\n".into(), " ".into()])
+        });
+
+        assert_eq!(outcome, DiscoveryOutcome::EmptyIgnored);
+        assert_eq!(pc.cached_models, vec!["gpt-4o"], "a blank-only result is an empty result");
+        assert_eq!(pc.cached_models_fetched_at, SEED_FETCHED_AT);
+        assert_eq!(sink.warns().len(), 1, "a blank-only result must warn like an empty one");
     }
 
     #[test]

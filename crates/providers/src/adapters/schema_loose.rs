@@ -1,6 +1,6 @@
 //! Loose-tier tool-schema adaptation for weak tool-calling models.
 //!
-//! Weak models (audit: `mimo-v2.5-free`) stall the agent loop on nested
+//! Weak models (audit: the MiMo family) stall the agent loop on nested
 //! JSON-Schema tool parameters: they omit required nested fields, hallucinate
 //! keys, and produce malformed argument objects. This module adapts the wire
 //! presentation of tool schemas for such models *without* changing the tools'
@@ -67,12 +67,14 @@ const MAX_ENUM_LISTING: usize = 20;
 /// request to `model`.
 ///
 /// `Strict` never adapts, `Loose` always adapts, and `Auto` (the default)
-/// adapts exactly when [`is_weak_tool_calling_model`] matches.
+/// adapts exactly when [`last_resort_weak_tool_calling_model`] matches. The name
+/// heuristic is the last-resort default of the ADR-66 §3 capability chain,
+/// never a first-line capability fact (see that function's docs and ADR-75).
 pub fn adaptive_tool_schemas_active(configured: ToolSchemaMode, model: &str) -> bool {
     match configured {
         ToolSchemaMode::Strict => false,
         ToolSchemaMode::Loose => true,
-        ToolSchemaMode::Auto => is_weak_tool_calling_model(model),
+        ToolSchemaMode::Auto => last_resort_weak_tool_calling_model(model),
     }
 }
 
@@ -90,16 +92,47 @@ pub fn non_streaming_transport_active(configured: ToolSchemaMode, model: &str) -
     adaptive_tool_schemas_active(configured, model)
 }
 
-/// Name heuristic for models with weak tool-calling reliability.
+/// Last-resort name heuristic for models with historically weak tool-calling.
 ///
-/// Matches the audit's problem model (`mimo-v2.5-free`) and the conventional
-/// weak-tier markers: `mimo` (MiMo), `free` (OpenRouter `:free` pilots), and
-/// `mini` (small fast variants). Strong tool-callers (`gpt-4o`,
-/// `claude-sonnet-4`, …) never match, so `Auto` keeps their wire output
-/// byte-identical to the strict presentation.
-pub fn is_weak_tool_calling_model(model: &str) -> bool {
-    let lower = model.to_ascii_lowercase();
-    ["mimo", "free", "mini"].iter().any(|hint| lower.contains(hint))
+/// This is a **LAST-RESORT default**, not a capability fact: it is the
+/// bottom of the ADR-75 capability precedence chain
+/// (`explicit user declaration > advertised metadata > this heuristic >
+/// optimistic strict default`) and exists only because `Auto` is the default
+/// dial and some models have no advertised capability metadata at all. The
+/// authoritative sources are the explicit `tool_schema_mode` dial
+/// (precedence level 1) and the provider-advertised capability flag
+/// (`ModelInfo::supports_tool_calling`, level 2); unknown models with no
+/// metadata resolve to the optimistic strict end — verbatim schema, streamed
+/// transport — matching ADR-66 §3's "unknown models attempt native first".
+/// This heuristic only selects the *presentation tier* (loose schema +
+/// non-streamed transport); it can never mark a model as lacking tool
+/// support.
+///
+/// Name-based prediction was rejected as a primary mechanism (ADR-75): the
+/// same weights are served behind `:free` routes, so a price-tier token is
+/// not a capability signal — e.g. `space-bunny-free` is MiniMax M3.1, a
+/// strong tool-caller, and must never be degraded by its route name. The
+/// only remaining hints are two weak-tier markers with an observed failure
+/// history:
+///
+/// * `mimo` — the audit's MiMo-family stall pattern;
+/// * `mini` — small/fast variants that historically omit nested fields.
+///
+/// Matching is **token-bounded** (ADR-66 §5): the name is split by the
+/// shared [`crate::opencode::tokenize_model_name`] and a hint matches only
+/// when it is *equal* to a whole dash-delimited token — never when it is a
+/// substring of a larger one. So `gpt-5.4-mini` matches, while
+/// `gemini-2.5-flash-lite` (`gemini` contains `mini`) and `minimax-m1`
+/// (`minimax` contains `mini`) do not.
+///
+/// A future model whose name happens to carry one of the hint tokens can
+/// still be forced onto the reliable path with the explicit
+/// `tool_schema_mode = "strict"` dial (precedence level 1) or an advertised
+/// capability flag (level 2); the real safety net is the detect-and-repair
+/// path in [`crate::tool_args`], which is model-agnostic.
+pub fn last_resort_weak_tool_calling_model(model: &str) -> bool {
+    let tokens = crate::opencode::tokenize_model_name(model);
+    ["mimo", "mini"].iter().any(|hint| tokens.iter().any(|token| token == hint))
 }
 
 /// Adapt a batch of tool definitions in place for weak-model presentation.
@@ -403,24 +436,168 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn weak_model_heuristic_matches_audit_models() {
-        assert!(is_weak_tool_calling_model("mimo-v2.5-free"));
-        assert!(is_weak_tool_calling_model("MIMO-V2.5-FREE"));
-        assert!(is_weak_tool_calling_model("deepseek/deepseek-r1:free"));
-        assert!(is_weak_tool_calling_model("gpt-4o-mini"));
-        assert!(is_weak_tool_calling_model("gemini-2.0-flash-mini"));
+    fn weak_model_heuristic_matches_weak_family_tokens() {
+        // The two remaining last-resort markers: the audit's MiMo family and
+        // small/fast `mini` variants.
+        assert!(last_resort_weak_tool_calling_model("mimo-v2.5"));
+        assert!(last_resort_weak_tool_calling_model("MIMO-V2.5"));
+        assert!(last_resort_weak_tool_calling_model("gpt-4o-mini"));
+        assert!(last_resort_weak_tool_calling_model("gemini-2.0-flash-mini"));
 
         // Strong tool-callers never match, so Auto leaves them untouched.
-        assert!(!is_weak_tool_calling_model("claude-sonnet-4"));
-        assert!(!is_weak_tool_calling_model("gpt-4o"));
-        assert!(!is_weak_tool_calling_model(""));
+        assert!(!last_resort_weak_tool_calling_model("claude-sonnet-4"));
+        assert!(!last_resort_weak_tool_calling_model("gpt-4o"));
+        assert!(!last_resort_weak_tool_calling_model(""));
+    }
+
+    /// Regression (ADR-75): a `*-free`/`:free` route name is a price tier, not
+    /// a capability signal. `space-bunny-free` is MiniMax M3.1, a strong
+    /// tool-caller, and must NOT be auto-classified weak — the removed `"free"`
+    /// hint silently degraded exactly this class of model.
+    #[test]
+    fn free_route_names_are_not_classified_weak() {
+        assert!(!last_resort_weak_tool_calling_model("space-bunny-free"));
+        assert!(!last_resort_weak_tool_calling_model("space-bunny:free"));
+        assert!(!last_resort_weak_tool_calling_model("deepseek/deepseek-r1:free"));
+        assert!(!last_resort_weak_tool_calling_model("qwen3-coder:free"));
+        assert!(!last_resort_weak_tool_calling_model("llama-3.3-70b-free"));
+
+        // ...and the loose tier / non-streamed transport stay OFF for them.
+        assert!(!adaptive_tool_schemas_active(ToolSchemaMode::Auto, "space-bunny-free"));
+        assert!(!non_streaming_transport_active(ToolSchemaMode::Auto, "space-bunny-free"));
+    }
+
+    /// Genuine weak variants keep their tier: in each of these the hint IS a
+    /// whole dash-delimited token (`mimo`, `mini`), so the token-bounded
+    /// heuristic still classifies them weak and routes them onto loose
+    /// schemas + non-streamed transport.
+    #[test]
+    fn weak_variant_names_still_classify_weak() {
+        for model in ["mimo-v2.5-free", "gpt-5.4-mini", "qwen2.5-mini-instruct"] {
+            assert!(
+                last_resort_weak_tool_calling_model(model),
+                "{model} must stay on the weak tier"
+            );
+            assert!(
+                adaptive_tool_schemas_active(ToolSchemaMode::Auto, model),
+                "{model}: loose schemas stay ON"
+            );
+            assert!(
+                non_streaming_transport_active(ToolSchemaMode::Auto, model),
+                "{model}: non-streamed transport stays ON"
+            );
+        }
+    }
+
+    /// Regression (ADR-66 §5): a hint must never match *inside* a larger
+    /// token. `gemini` and `minimax` merely contain the `mini` substring —
+    /// classifying them weak flipped every Gemini/MiniMax model onto loose
+    /// schemas and `stream: false`.
+    #[test]
+    fn hint_inside_a_larger_token_does_not_classify_weak() {
+        for model in ["gemini-2.5-flash-lite", "gemini-3.1-pro", "minimax-m1", "minimax-m2"] {
+            assert!(
+                !last_resort_weak_tool_calling_model(model),
+                "{model} must stay on the strict tier"
+            );
+            assert!(
+                !adaptive_tool_schemas_active(ToolSchemaMode::Auto, model),
+                "{model}: loose schemas stay OFF"
+            );
+            assert!(
+                !non_streaming_transport_active(ToolSchemaMode::Auto, model),
+                "{model}: streamed transport stays ON"
+            );
+        }
+    }
+
+    /// The substring-vs-token distinction stated explicitly: `gemini` and
+    /// `minimax` DO contain the `mini` substring, but neither carries it as a
+    /// whole dash-delimited token, so the heuristic must not match them.
+    #[test]
+    fn substring_hint_never_matches_inside_a_larger_token() {
+        assert!("gemini".contains("mini"), "precondition: the substring collision is real");
+        assert!("minimax".contains("mini"), "precondition: the substring collision is real");
+
+        for model in ["gemini", "gemini-2.5-flash-lite", "minimax", "minimax-m1"] {
+            let tokens = crate::opencode::tokenize_model_name(model);
+            assert!(!tokens.iter().any(|token| token == "mini"), "{model} tokens: {tokens:?}");
+            assert!(
+                !last_resort_weak_tool_calling_model(model),
+                "{model} must not match the mini hint"
+            );
+        }
+
+        // The converse: a name that carries the hint token itself matches.
+        assert!(last_resort_weak_tool_calling_model("mini"));
+        assert!(last_resort_weak_tool_calling_model("mimo"));
+    }
+
+    /// Pre-fix raw-substring heuristic, inlined ONLY as the "before" column
+    /// of [`weak_heuristic_classifies_by_whole_tokens_not_substrings`] — it
+    /// reproduces the historical bug (`gemini`/`minimax` matched `mini`) so
+    /// the table below documents the actual before/after classifications.
+    fn legacy_substring_heuristic(model: &str) -> bool {
+        let lower = model.to_ascii_lowercase();
+        ["mimo", "mini"].iter().any(|hint| lower.contains(hint))
+    }
+
+    /// Runnable before/after classification table: every weak-variant name
+    /// that must stay weak, every substring false positive that must go
+    /// strict, plus the explicit substring-vs-token rows. Run with
+    /// `--nocapture` to see the table; each row pins BOTH the pre-fix
+    /// substring column (documenting the bug) and the current token-bounded
+    /// column (the contract).
+    ///
+    /// Columns: `before` = raw-substring heuristic (`free` already removed),
+    /// `after` = [`last_resort_weak_tool_calling_model`] as implemented now.
+    #[test]
+    fn weak_heuristic_classifies_by_whole_tokens_not_substrings() {
+        // (model, after — token-bounded, before — pre-fix substring)
+        let table: &[(&str, bool, bool)] = &[
+            // Genuinely weak: the hint IS a whole dash-delimited token.
+            ("mimo-v2.5-free", true, true),
+            ("gpt-5.4-mini", true, true),
+            ("qwen2.5-mini-instruct", true, true),
+            // False positives under substring matching: the hint appears
+            // only INSIDE a larger token (`gemini`, `minimax`).
+            ("gemini-2.5-flash-lite", false, true),
+            ("gemini-3.1-pro", false, true),
+            ("minimax-m1", false, true),
+            ("minimax-m2", false, true),
+            // Already correct before this fix (`free` hint removed earlier);
+            // kept as a regression row.
+            ("space-bunny-free", false, false),
+            // The explicit substring-vs-token distinction: the bare family
+            // token contains `mini` as a substring but is not `mini`…
+            ("gemini", false, true),
+            // …while a Gemini variant that really carries the `mini` token
+            // stays weak after the fix.
+            ("gemini-2.0-flash-mini", true, true),
+        ];
+
+        let render = |weak: bool| if weak { "WEAK" } else { "STRICT" };
+        println!("{:<24} {:<16} after(token)", "model", "before(substring)");
+        for &(model, after, before) in table {
+            assert_eq!(
+                legacy_substring_heuristic(model),
+                before,
+                "pre-fix substring column drifted for {model}"
+            );
+            assert_eq!(
+                last_resort_weak_tool_calling_model(model),
+                after,
+                "token-bounded classification wrong for {model}"
+            );
+            println!("{model:<24} {:<16} {}", render(before), render(after));
+        }
     }
 
     #[test]
     fn adaptive_active_resolves_all_modes() {
         assert!(adaptive_tool_schemas_active(ToolSchemaMode::Loose, "claude-sonnet-4"));
-        assert!(!adaptive_tool_schemas_active(ToolSchemaMode::Strict, "mimo-v2.5-free"));
-        assert!(adaptive_tool_schemas_active(ToolSchemaMode::Auto, "mimo-v2.5-free"));
+        assert!(!adaptive_tool_schemas_active(ToolSchemaMode::Strict, "mimo-v2.5"));
+        assert!(adaptive_tool_schemas_active(ToolSchemaMode::Auto, "mimo-v2.5"));
         assert!(!adaptive_tool_schemas_active(ToolSchemaMode::Auto, "claude-sonnet-4"));
     }
 
@@ -428,19 +605,20 @@ mod tests {
     /// AND the non-streamed transport. Weak model names resolve to
     /// non-streamed completions so tool-call arguments arrive whole; strong
     /// names keep the streamed transport. Explicit `Loose`/`Strict` dials
-    /// still win over the name heuristic.
+    /// still win over the name heuristic, and the `free` route token no longer
+    /// selects the tier.
     #[test]
     fn weak_models_resolve_to_non_streamed_transport() {
-        assert!(non_streaming_transport_active(ToolSchemaMode::Auto, "mimo-v2.5-free"));
-        assert!(non_streaming_transport_active(ToolSchemaMode::Auto, "deepseek/deepseek-r1:free"));
+        assert!(non_streaming_transport_active(ToolSchemaMode::Auto, "mimo-v2.5"));
         assert!(non_streaming_transport_active(ToolSchemaMode::Auto, "gpt-4o-mini"));
 
         assert!(!non_streaming_transport_active(ToolSchemaMode::Auto, "claude-sonnet-4"));
         assert!(!non_streaming_transport_active(ToolSchemaMode::Auto, "gpt-4o"));
+        assert!(!non_streaming_transport_active(ToolSchemaMode::Auto, "space-bunny-free"));
         assert!(!non_streaming_transport_active(ToolSchemaMode::Auto, ""));
 
         assert!(non_streaming_transport_active(ToolSchemaMode::Loose, "gpt-4o"));
-        assert!(!non_streaming_transport_active(ToolSchemaMode::Strict, "mimo-v2.5-free"));
+        assert!(!non_streaming_transport_active(ToolSchemaMode::Strict, "mimo-v2.5"));
     }
 
     /// Representative two-level nested schema: the promoted required leaf

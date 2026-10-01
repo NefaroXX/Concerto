@@ -26,6 +26,10 @@ pub struct AnthropicProvider {
     /// request against the actual model name; `Auto` (default) keeps every
     /// non-weak model on the verbatim strict schema.
     tool_schema_mode: concerto_config::ToolSchemaMode,
+    /// Provider-advertised per-model tool-calling capability (ADR-66 §3
+    /// precedence level 2). `None` when the provider publishes no such
+    /// metadata; when set it beats the last-resort name heuristic.
+    advertised_tool_support: Option<bool>,
 }
 
 impl AnthropicProvider {
@@ -37,6 +41,7 @@ impl AnthropicProvider {
             dialect: AnthropicChatDialect,
             cache_breakpoints: false,
             tool_schema_mode: concerto_config::ToolSchemaMode::default(),
+            advertised_tool_support: None,
         }
     }
 
@@ -68,6 +73,13 @@ impl AnthropicProvider {
     /// output. See `crate::adapters::schema_loose`.
     pub fn with_tool_schema_mode(mut self, mode: concerto_config::ToolSchemaMode) -> Self {
         self.tool_schema_mode = mode;
+        self
+    }
+
+    /// Set the provider-advertised per-model tool-calling capability
+    /// (ADR-66 §3 precedence level 2).
+    pub fn with_advertised_tool_support(mut self, advertised: Option<bool>) -> Self {
+        self.advertised_tool_support = advertised;
         self
     }
 
@@ -103,6 +115,11 @@ struct AnthropicStreamState {
     /// `message_delta` reports the cumulative `usage.output_tokens`. Attached
     /// to the `message_stop` terminal chunk only.
     usage: Option<CompletionUsage>,
+    /// Set when a completed tool_use block carried unrepairable arguments.
+    /// The typed error is deferred to `message_stop` so the stream still
+    /// terminates with a real error instead of silently emitting a tool call
+    /// with empty arguments (which the executor would run as `{}`).
+    tool_parse_error: Option<ProviderError>,
 }
 
 impl AnthropicStreamState {
@@ -113,6 +130,7 @@ impl AnthropicStreamState {
             pending: VecDeque::new(),
             tool_adapted: false,
             usage: None,
+            tool_parse_error: None,
         }
     }
 
@@ -205,39 +223,63 @@ impl AnthropicStreamState {
                         usage: None,
                     }));
                 } else if let Some((id, name, args_str)) = self.parse.tool_acc.remove(&index) {
-                    let mut args_json = if args_str.trim().is_empty() {
-                        serde_json::Value::Null
-                    } else {
-                        serde_json::from_str(&args_str).unwrap_or(serde_json::Value::Null)
-                    };
-                    // Adaptive tool schemas: re-nest dot-notation arguments
-                    // from loose-schema streams before the executor or the
-                    // tool-call guard validates against the nested schema.
-                    if self.tool_adapted {
-                        crate::adapters::schema_loose::unflatten_tool_arguments(&mut args_json);
+                    match crate::tool_args::parse_tool_arguments(&args_str) {
+                        Ok(outcome) => {
+                            let args_json = match outcome {
+                                crate::tool_args::ToolArgumentParse::Value(value) => value,
+                                crate::tool_args::ToolArgumentParse::Empty => {
+                                    serde_json::Value::Null
+                                }
+                            };
+                            let mut args_json = crate::protocol::ensure_arguments_object(args_json);
+                            // Adaptive tool schemas: re-nest dot-notation
+                            // arguments from loose-schema streams before the
+                            // executor or the tool-call guard validates
+                            // against the nested schema.
+                            if self.tool_adapted {
+                                crate::adapters::schema_loose::unflatten_tool_arguments(
+                                    &mut args_json,
+                                );
+                            }
+                            self.pending.push_back(Ok(CompletionChunk {
+                                reasoning: None,
+                                delta: String::new(),
+                                tool_call: Some(ToolCall {
+                                    id,
+                                    name,
+                                    arguments: args_json,
+                                    ..Default::default()
+                                }),
+                                is_final: false,
+                                usage: None,
+                            }));
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                tool_name = %name,
+                                raw_len = error.raw_len,
+                                parse_error = %error,
+                                "tool args unrepairable; failing the stream loudly"
+                            );
+                            self.tool_parse_error = Some(ProviderError::InvalidResponse(format!(
+                                "provider returned unparseable tool-call arguments for '{name}': {error}"
+                            )));
+                        }
                     }
-                    self.pending.push_back(Ok(CompletionChunk {
-                        reasoning: None,
-                        delta: String::new(),
-                        tool_call: Some(ToolCall {
-                            id,
-                            name,
-                            arguments: args_json,
-                            ..Default::default()
-                        }),
-                        is_final: false,
-                        usage: None,
-                    }));
                 }
             }
             "message_stop" => {
-                self.pending.push_back(Ok(CompletionChunk {
-                    reasoning: None,
-                    delta: String::new(),
-                    tool_call: None,
-                    is_final: true,
-                    usage: self.usage.take(),
-                }));
+                if let Some(error) = self.tool_parse_error.take() {
+                    self.pending.push_back(Err(error));
+                } else {
+                    self.pending.push_back(Ok(CompletionChunk {
+                        reasoning: None,
+                        delta: String::new(),
+                        tool_call: None,
+                        is_final: true,
+                        usage: self.usage.take(),
+                    }));
+                }
             }
             _ => {}
         }
@@ -342,10 +384,14 @@ impl LlmProvider for AnthropicProvider {
         // place before the dialect renders the body. Strict models are
         // untouched — their wire output stays byte-identical.
         let mut request = request;
-        let tool_adapted = crate::adapters::schema_loose::adaptive_tool_schemas_active(
-            self.tool_schema_mode,
+        let resolved_mode = crate::capability::resolve_tool_schema_mode(
+            "anthropic",
             &model,
+            self.tool_schema_mode,
+            self.advertised_tool_support,
         );
+        let tool_adapted =
+            crate::adapters::schema_loose::adaptive_tool_schemas_active(resolved_mode, &model);
         if tool_adapted {
             if let Some(tools) = request.tools.as_mut() {
                 crate::adapters::schema_loose::adapt_tool_definitions(tools);

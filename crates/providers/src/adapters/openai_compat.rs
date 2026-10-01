@@ -119,7 +119,7 @@ impl Dialect for OpenAiChatDialect {
         model: &str,
         echo: ReasoningEcho,
     ) -> serde_json::Value {
-        let messages: Vec<serde_json::Value> = request
+        let mut messages: Vec<serde_json::Value> = request
             .messages
             .iter()
             .flat_map(|m| match m.role {
@@ -130,6 +130,12 @@ impl Dialect for OpenAiChatDialect {
                 _ => vec![],
             })
             .collect();
+        // Strict OpenAI-compatible gateways reject a system-only conversation
+        // with `HTTP 400 invalid_request_error`. Guarantee a non-system turn
+        // before the body goes on the wire; a conversation that already has
+        // one is left byte-identical (see `protocol::
+        // ensure_non_system_conversation`).
+        crate::protocol::ensure_non_system_conversation(&mut messages);
 
         let mut body = serde_json::json!({
             "model": model,
@@ -459,6 +465,93 @@ mod tests {
         let msgs = body["messages"].as_array().expect("should have messages");
         assert_eq!(msgs[0]["role"], "system");
         assert_eq!(msgs[0]["content"], "You are a helpful assistant.");
+        // A system-only conversation is rejected by strict gateways, so the
+        // renderer appends the protocol floor user turn after the system one.
+        assert_eq!(msgs.len(), 2, "system-only conversation gains the floor user turn");
+        assert_eq!(msgs[1]["role"], "user");
+    }
+
+    /// The regression this fix exists for: a `CompletionRequest` whose
+    /// conversation is system-only must render a body carrying a non-system
+    /// message, never the `messages:[{role:"system"}]` shape that the
+    /// OpenCode Zen/Go relay rejects with `HTTP 400 invalid_request_error`.
+    #[test]
+    fn system_only_request_renders_a_non_system_message() {
+        let request = CompletionRequest {
+            messages: vec![Message {
+                role: Role::System,
+                content: "You are the coordinator.".into(),
+                tool_calls: None,
+                tool_results: None,
+                reasoning_content: None,
+                tokens_in: None,
+                tokens_out: None,
+            }],
+            stream: false,
+            ..Default::default()
+        };
+        let body = render(&request, ReasoningEcho::IfPresent);
+        let msgs = body["messages"].as_array().expect("should have messages");
+
+        assert_eq!(msgs.len(), 2, "system + appended floor");
+        assert_eq!(msgs[0]["role"], "system");
+        assert!(
+            msgs.iter().any(|message| message["role"] != "system"),
+            "a system-only request must render at least one non-system message"
+        );
+        assert_eq!(
+            msgs[1]["content"],
+            crate::protocol::CONVERSATION_FLOOR_USER_MESSAGE,
+            "the appended turn is the neutral protocol floor"
+        );
+    }
+
+    /// An empty conversation is equally unsatisfiable and gets the floor.
+    #[test]
+    fn empty_conversation_renders_a_floor_user_message() {
+        let request = CompletionRequest { messages: vec![], ..Default::default() };
+        let body = render(&request, ReasoningEcho::IfPresent);
+        let msgs = body["messages"].as_array().expect("should have messages");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"], crate::protocol::CONVERSATION_FLOOR_USER_MESSAGE);
+    }
+
+    /// The common path stays byte-identical: a system+user conversation is
+    /// untouched by the floor. The exact serialized body is asserted so a
+    /// future refactor cannot silently insert a turn.
+    #[test]
+    fn normal_conversation_is_unchanged_by_the_conversation_floor() {
+        let request = CompletionRequest {
+            messages: vec![
+                Message {
+                    role: Role::System,
+                    content: "You are a test assistant.".into(),
+                    tool_calls: None,
+                    tool_results: None,
+                    reasoning_content: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                },
+                Message {
+                    role: Role::User,
+                    content: "Hello".into(),
+                    tool_calls: None,
+                    tool_results: None,
+                    reasoning_content: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                },
+            ],
+            stream: true,
+            ..Default::default()
+        };
+        let body = render(&request, ReasoningEcho::IfPresent);
+        assert_eq!(
+            serde_json::to_string(&body).expect("body serializes"),
+            r#"{"messages":[{"content":"You are a test assistant.","role":"system"},{"content":"Hello","role":"user"}],"model":"gpt-4o","stream":true}"#,
+            "a normal conversation must be byte-identical after the floor"
+        );
     }
 
     #[test]

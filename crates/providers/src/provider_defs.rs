@@ -125,6 +125,68 @@ const ZHIPU_KNOWN: &[&str] = &["glm-4.7", "glm-4.6", "glm-4.5", "glm-4-plus", "g
 // tail).
 const NOVITA_KNOWN: &[&str] = &[];
 
+/// Model IDs served by the OpenCode **Go** relay (`https://opencode.ai/zen/go/v1`),
+/// the endpoint behind the `opencode-free` provider type.
+///
+/// Retrieved live from `GET https://opencode.ai/zen/go/v1/models` on
+/// 2026-09-29. The catalog is hand-maintained and refreshed periodically; it
+/// is deliberately a snapshot of the *Go* roster — a **distinct relay with a
+/// distinct catalog**, not Zen's (`opencode` type, `…/zen/v1/models`): of the
+/// old Zen free-tier ids only `longcat-2.5-preview-free` and
+/// `space-bunny-free` also appear on Go, while Go serves plenty of non-`free`
+/// ids (`minimax-m3`, `glm-5.3`, `mimo-v2.6-pro`, …). Never copy a catalog
+/// between the two relays.
+///
+/// Live discovery is intentionally NOT used for this provider type
+/// (`ModelDiscoverySupport::Unsupported`): the Go listing endpoint is ungated
+/// and returns the full paid roster too, which would leak paid IDs into a
+/// free-only picker.
+pub const OPENCODE_FREE_KNOWN: &[&str] = &[
+    "deepseek-flash",
+    "deepseek-v4-flash",
+    "deepseek-v4-flash-vision-exp",
+    "deepseek-v4-pro",
+    "deepseek-v4.1-flash",
+    "glm-5",
+    "glm-5.1",
+    "glm-5.2",
+    "glm-5.3",
+    "glm-5.3-flash",
+    "gpt-5.6-luna",
+    "gpt-6-luna",
+    "grok-4.5",
+    "grok-4.6",
+    "grok-4.7",
+    "hy3",
+    "hy3-preview",
+    "hy4-preview",
+    "kimi-k2.5",
+    "kimi-k2.6",
+    "kimi-k2.7-code",
+    "kimi-k3",
+    "longcat-2.0",
+    "longcat-2.5-preview-free",
+    "mimo-v2-omni",
+    "mimo-v2-pro",
+    "mimo-v2.5",
+    "mimo-v2.5-pro",
+    "mimo-v2.6-flash",
+    "mimo-v2.6-pro",
+    "minimax-m2.5",
+    "minimax-m2.7",
+    "minimax-m3",
+    "muse-spark-1.2-contributor",
+    "muse-spark-1.3-contributor",
+    "omen-alpha",
+    "qwen3.5-plus",
+    "qwen3.6-plus",
+    "qwen3.7-max",
+    "qwen3.7-plus",
+    "qwen3.8-flash",
+    "qwen3.8-max",
+    "space-bunny-free",
+];
+
 /// Return the [`ProviderDefinition`] for a provider type string.
 ///
 /// Unrecognized types fall back to a permissive "unknown" definition so the UI
@@ -193,6 +255,34 @@ pub fn provider_definition(provider_type: &str) -> ProviderDefinition {
             known_models: &[],
             credential_requirement: CredentialRequirement::Required,
             model_discovery: ModelDiscoverySupport::Supported,
+            allows_custom_model: true,
+        },
+        // Sibling of `opencode`: same connector, but the **Go** relay and its
+        // own static catalog, so the two entries stay independent (a paid
+        // `opencode` entry keeps its key and its Zen base).
+        "opencode-free" => ProviderDefinition {
+            id: "opencode-free",
+            display_name: String::from("OpenCode Zen (free)"),
+            // `minimax-m3` takes the Anthropic Messages `/messages` dialect on
+            // the Go relay (`minimax-` is an Anthropic prefix in the upstream
+            // Go table), escapes the weak-tool-calling heuristic — it
+            // tokenizes to `["minimax","m3"]`, and the heuristic only matches
+            // whole `mimo`/`mini` tokens (ADR-66 §5 token bounding) — and
+            // resolves tool-capable on that path, so it is usable as a
+            // tool-requiring default. Ranking it against the other 42 ids
+            // would need live probing; name resemblance is never used for
+            // capability decisions.
+            default_model: Some("minimax-m3"),
+            known_models: OPENCODE_FREE_KNOWN,
+            // The Go relay answers `401 AuthError "Missing API key."` when no
+            // `Authorization` header is sent, so this type requires a real
+            // credential exactly like `opencode`; it is not keyless.
+            credential_requirement: CredentialRequirement::Required,
+            // Live discovery is intentionally unsupported: `GET
+            // https://opencode.ai/zen/go/v1/models` is ungated and returns the
+            // entire paid roster too, so advertising discovery here would let
+            // paid IDs leak into a free-only picker.
+            model_discovery: ModelDiscoverySupport::Unsupported,
             allows_custom_model: true,
         },
         "deepseek" => ProviderDefinition {
@@ -351,6 +441,7 @@ pub const PROVIDER_TYPE_IDS: &[&str] = &[
     "nim",
     "ollama",
     "opencode",
+    "opencode-free",
     "deepseek",
     "groq",
     "together",
@@ -606,6 +697,212 @@ mod tests {
             assert_eq!(def.id, *id);
             assert!(!def.display_name.is_empty());
         }
+    }
+
+    /// The `opencode-free` type is fully defined against the **Go** relay:
+    /// its static Go catalog, a required credential (the Go relay answers
+    /// `401 AuthError` without one), discovery disabled, custom models
+    /// allowed, and an OpenAI-compat default model (see the arm's comments).
+    #[test]
+    fn opencode_free_definition_is_complete() {
+        let def = provider_definition("opencode-free");
+        assert_eq!(def.id, "opencode-free");
+        assert_eq!(def.display_name, "OpenCode Zen (free)");
+        assert_eq!(def.default_model, Some("minimax-m3"));
+        // Inverted from the old keyless assertion: the Go relay requires a
+        // real API key, so this type is no more keyless than `opencode`.
+        assert_eq!(def.credential_requirement, CredentialRequirement::Required);
+        assert_eq!(def.model_discovery, ModelDiscoverySupport::Unsupported);
+        assert!(def.allows_custom_model);
+
+        // The 43 ids served by `GET https://opencode.ai/zen/go/v1/models`
+        // (2026-09-29), quoted verbatim in alphabetical order: this list is
+        // the contract for the Go roster, not Zen's — a wrong id here is a
+        // silent 404 at request time, so it is pinned byte for byte.
+        let expected = [
+            "deepseek-flash",
+            "deepseek-v4-flash",
+            "deepseek-v4-flash-vision-exp",
+            "deepseek-v4-pro",
+            "deepseek-v4.1-flash",
+            "glm-5",
+            "glm-5.1",
+            "glm-5.2",
+            "glm-5.3",
+            "glm-5.3-flash",
+            "gpt-5.6-luna",
+            "gpt-6-luna",
+            "grok-4.5",
+            "grok-4.6",
+            "grok-4.7",
+            "hy3",
+            "hy3-preview",
+            "hy4-preview",
+            "kimi-k2.5",
+            "kimi-k2.6",
+            "kimi-k2.7-code",
+            "kimi-k3",
+            "longcat-2.0",
+            "longcat-2.5-preview-free",
+            "mimo-v2-omni",
+            "mimo-v2-pro",
+            "mimo-v2.5",
+            "mimo-v2.5-pro",
+            "mimo-v2.6-flash",
+            "mimo-v2.6-pro",
+            "minimax-m2.5",
+            "minimax-m2.7",
+            "minimax-m3",
+            "muse-spark-1.2-contributor",
+            "muse-spark-1.3-contributor",
+            "omen-alpha",
+            "qwen3.5-plus",
+            "qwen3.6-plus",
+            "qwen3.7-max",
+            "qwen3.7-plus",
+            "qwen3.8-flash",
+            "qwen3.8-max",
+            "space-bunny-free",
+        ];
+        assert_eq!(
+            def.known_models,
+            expected.as_slice(),
+            "the Go catalog must ship exactly the 43 live-retrieved IDs"
+        );
+        assert_eq!(expected.len(), 43, "the Go relay advertises exactly 43 models");
+    }
+
+    /// The default model is real, routable, and usable for tool-requiring
+    /// tasks: it must exist in the catalog, take exactly the dialect the
+    /// upstream Go table assigns it (`minimax-*` → Anthropic Messages), and
+    /// escape the weak-tier heuristic so its default schema tier is strict.
+    #[test]
+    fn opencode_free_default_model_is_usable() {
+        use crate::opencode::{api_mode_for, ApiMode, OpenCodeRelay};
+
+        let def = provider_definition("opencode-free");
+        let default_model = def.default_model.expect("opencode-free ships a default model");
+        assert!(
+            OPENCODE_FREE_KNOWN.contains(&default_model),
+            "the default `{default_model}` must be part of the Go catalog"
+        );
+        assert_eq!(
+            api_mode_for(OpenCodeRelay::Go, default_model),
+            ApiMode::AnthropicMessages,
+            "on the Go relay `minimax-*` is served via the Anthropic Messages dialect"
+        );
+        assert!(
+            !crate::adapters::schema_loose::last_resort_weak_tool_calling_model(default_model),
+            "the default must not fall to the weak tool-calling tier"
+        );
+        assert_eq!(
+            crate::capability::resolve_tool_schema_mode(
+                "opencode-free",
+                default_model,
+                concerto_config::ToolSchemaMode::default(),
+                None,
+            ),
+            concerto_config::ToolSchemaMode::Strict,
+            "an unknown-but-not-weak model defaults to the strict schema tier"
+        );
+        assert!(
+            crate::capability::require_tool_support("opencode-free", default_model, None, None)
+                .is_ok(),
+            "the default must pass the tool-support gate"
+        );
+    }
+
+    /// Prints the Go catalog verbatim (run with `--nocapture`) so a reviewer
+    /// can diff it against `GET https://opencode.ai/zen/go/v1/models` without
+    /// re-probing the network — the same 43 ids the previous test pins.
+    #[test]
+    fn opencode_free_catalog_prints_verbatim_for_review() {
+        println!("OPENCODE_FREE_KNOWN ({} ids):", OPENCODE_FREE_KNOWN.len());
+        for id in OPENCODE_FREE_KNOWN {
+            println!("{id}");
+        }
+    }
+
+    /// `opencode-free` is a first-class picker entry, registered immediately
+    /// after the paid `opencode` entry.
+    #[test]
+    fn opencode_free_is_registered_immediately_after_opencode() {
+        let position = |id: &str| {
+            PROVIDER_TYPE_IDS
+                .iter()
+                .position(|candidate| *candidate == id)
+                .unwrap_or_else(|| panic!("{id} must be registered in PROVIDER_TYPE_IDS"))
+        };
+        assert_eq!(position("opencode-free"), position("opencode") + 1);
+    }
+
+    /// Pin the Go catalog's wire routing against the upstream `opencode-go`
+    /// prefix table and confirm every id stays tool-capable on its dialect
+    /// (the Responses converter carries native tools since ADR-75).
+    ///
+    /// This test was updated from the old assertion that *no* Go id routes to
+    /// Anthropic: the upstream Go table sends `minimax-*`/`qwen*` to
+    /// `/messages` and `gpt-*`/`grok-*`/`muse-spark*` to `/responses`.
+    #[test]
+    fn opencode_free_catalog_routing_is_pinned() {
+        use crate::opencode::{api_mode_for, ApiMode, OpenCodeRelay};
+
+        let mut responses: Vec<&str> = Vec::new();
+        let mut anthropic: Vec<&str> = Vec::new();
+        let mut chat: Vec<&str> = Vec::new();
+        for model in OPENCODE_FREE_KNOWN {
+            match api_mode_for(OpenCodeRelay::Go, model) {
+                ApiMode::Responses => responses.push(*model),
+                ApiMode::AnthropicMessages => anthropic.push(*model),
+                ApiMode::ChatCompletions => chat.push(*model),
+            }
+            assert!(
+                crate::capability::resolve_tool_support("opencode-free", model, None, None),
+                "{model} must not be capability-blocked for tool calling"
+            );
+            assert!(
+                crate::capability::require_tool_support("opencode-free", model, None, None).is_ok(),
+                "{model} must pass the tool-support gate regardless of wire dialect"
+            );
+        }
+
+        assert_eq!(
+            responses,
+            [
+                "gpt-5.6-luna",
+                "gpt-6-luna",
+                "grok-4.5",
+                "grok-4.6",
+                "grok-4.7",
+                "muse-spark-1.2-contributor",
+                "muse-spark-1.3-contributor",
+            ],
+            "exactly the gpt-/grok-/muse-spark Go ids ride the Responses dialect"
+        );
+        assert_eq!(
+            anthropic,
+            [
+                "minimax-m2.5",
+                "minimax-m2.7",
+                "minimax-m3",
+                "qwen3.5-plus",
+                "qwen3.6-plus",
+                "qwen3.7-max",
+                "qwen3.7-plus",
+                "qwen3.8-flash",
+                "qwen3.8-max",
+            ],
+            "exactly the minimax-/qwen Go ids ride the Anthropic Messages dialect"
+        );
+        assert_eq!(chat.len(), 27, "every other Go id rides Chat Completions");
+        assert_eq!(
+            responses.len() + anthropic.len() + chat.len(),
+            OPENCODE_FREE_KNOWN.len(),
+            "each id lands in exactly one dialect bucket"
+        );
+        // `omen-alpha` is a live-roster near-miss of `union-alpha`; upstream
+        // lists only `union-alpha`, so `omen-alpha` stays on Chat Completions.
+        assert!(chat.contains(&"omen-alpha"), "omen-alpha must not be Anthropic");
     }
 
     #[test]

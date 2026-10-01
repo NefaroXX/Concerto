@@ -25,6 +25,10 @@ pub struct GoogleProvider {
     /// (the default) keeps every non-weak model on the verbatim strict
     /// schema. See `crate::adapters::schema_loose`.
     tool_schema_mode: concerto_config::ToolSchemaMode,
+    /// Provider-advertised per-model tool-calling capability (ADR-66 §3
+    /// precedence level 2). `None` when the provider publishes no such
+    /// metadata; when set it beats the last-resort name heuristic.
+    advertised_tool_support: Option<bool>,
 }
 
 impl GoogleProvider {
@@ -35,6 +39,7 @@ impl GoogleProvider {
             timeout_secs,
             dialect: GeminiChatDialect,
             tool_schema_mode: concerto_config::ToolSchemaMode::default(),
+            advertised_tool_support: None,
         }
     }
 
@@ -61,14 +66,25 @@ impl GoogleProvider {
         self
     }
 
+    /// Set the provider-advertised per-model tool-calling capability
+    /// (ADR-66 §3 precedence level 2).
+    pub fn with_advertised_tool_support(mut self, advertised: Option<bool>) -> Self {
+        self.advertised_tool_support = advertised;
+        self
+    }
+
     /// Rewrite the request's tool definitions in place when the loose tier
     /// is active for `model`. Returns whether adaptation happened so the
     /// stream parser can re-nest emitted arguments.
     fn adapt_tools_for(&self, request: &mut CompletionRequest, model: &str) -> bool {
-        let tool_adapted = crate::adapters::schema_loose::adaptive_tool_schemas_active(
-            self.tool_schema_mode,
+        let resolved_mode = crate::capability::resolve_tool_schema_mode(
+            "google",
             model,
+            self.tool_schema_mode,
+            self.advertised_tool_support,
         );
+        let tool_adapted =
+            crate::adapters::schema_loose::adaptive_tool_schemas_active(resolved_mode, model);
         if tool_adapted {
             if let Some(tools) = request.tools.as_mut() {
                 crate::adapters::schema_loose::adapt_tool_definitions(tools);
@@ -81,7 +97,10 @@ impl GoogleProvider {
 /// Extract the `args` value of a Gemini `functionCall` part into a canonical
 /// tool-call arguments value.
 ///
-/// Gemini accepts arbitrary JSON in `functionCall.args`, but canonical
+/// Gemini delivers `functionCall.args` as an already-parsed JSON value (never
+/// as an accumulated JSON string), so this connector has no string-parse
+/// failure path and cannot exhibit streamed-argument truncation; the shared
+/// [`crate::tool_args`] repair module is therefore not wired here. Canonical
 /// `ToolCall.arguments` feeds OpenAI-compatible serializers downstream that
 /// require a JSON object; absent or non-object `args` (e.g. a raw string) are
 /// coerced to `{}` so the wire never carries `"null"` / `"\"ls\""`
@@ -1217,8 +1236,71 @@ mod tests {
             }]),
             ..Default::default()
         };
-        assert!(!strict.adapt_tools_for(&mut request, "mimo-v2.5-free"));
+        assert!(!strict.adapt_tools_for(&mut request, "mimo-v2.5"));
         assert!(loose.adapt_tools_for(&mut request, "gemini-2.0-flash"));
+    }
+
+    /// Regression (ADR-75): a `*-free` route name no longer selects the loose
+    /// tier. Under `Auto`, a genuine whole `mini` token (e.g.
+    /// `gemini-2.0-flash-mini`) still does, while family names that merely
+    /// contain a hint as a substring (`gemini`, `minimax`) and a strong model
+    /// served behind a free route are left on the verbatim strict schema.
+    #[test]
+    fn google_free_route_name_is_not_weak() {
+        let provider = GoogleProvider::new("k".to_string(), "space-bunny-free".into(), 30)
+            .with_tool_schema_mode(concerto_config::ToolSchemaMode::Auto);
+        let mut request = CompletionRequest {
+            tools: Some(vec![ToolDefinition {
+                name: "t".into(),
+                description: String::new(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "opts": {"type": "object", "properties": {"x": {"type": "string"}}}
+                    }
+                }),
+            }]),
+            ..Default::default()
+        };
+        assert!(!provider.adapt_tools_for(&mut request, "space-bunny-free"));
+    }
+
+    /// ADR-75 / ADR-66 §3 precedence level 2: an advertised `supports_tool_calling`
+    /// flag beats the last-resort name heuristic. A model whose name carries
+    /// the weak `mini` token as a whole dash-delimited token is kept on the
+    /// reliable strict tier when the provider advertises native tool support.
+    #[test]
+    fn google_advertised_support_beats_name_heuristic() {
+        let advertised = GoogleProvider::new("k".to_string(), "gemini-2.0-flash-mini".into(), 30)
+            .with_tool_schema_mode(concerto_config::ToolSchemaMode::Auto)
+            .with_advertised_tool_support(Some(true));
+        let heuristic = GoogleProvider::new("k".to_string(), "gemini-2.0-flash-mini".into(), 30)
+            .with_tool_schema_mode(concerto_config::ToolSchemaMode::Auto);
+        let make_request = || CompletionRequest {
+            tools: Some(vec![ToolDefinition {
+                name: "t".into(),
+                description: String::new(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "opts": {"type": "object", "properties": {"x": {"type": "string"}}}
+                    }
+                }),
+            }]),
+            ..Default::default()
+        };
+        let mut advertised_request = make_request();
+        let mut heuristic_request = make_request();
+        // Advertised true → strict (no adaptation) despite the whole `mini`
+        // token in the name...
+        assert!(!advertised.adapt_tools_for(&mut advertised_request, "gemini-2.0-flash-mini"));
+        // ...while the bare heuristic adapts.
+        assert!(heuristic.adapt_tools_for(&mut heuristic_request, "gemini-2.0-flash-mini"));
+        // The family marker alone is not a hint: a Gemini name WITHOUT a
+        // whole `mini` token never matches the heuristic (ADR-66 §5 token
+        // boundary — `gemini` merely *contains* `mini` as a substring).
+        let mut plain_request = make_request();
+        assert!(!heuristic.adapt_tools_for(&mut plain_request, "gemini-2.0-flash"));
     }
 
     /// ADR-48 §4: Gemini's `usageMetadata` (`promptTokenCount` /

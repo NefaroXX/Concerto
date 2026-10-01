@@ -42,6 +42,18 @@ const CUSTOM_MODEL_SENTINEL: &str = "Custom model ID…";
 /// [`Message::JumpToSection`] to scroll a section header into view.
 pub(crate) const MAIN_SCROLL_ID: &str = "settings_main_scroll";
 
+/// Inline refresh message when discovery produced nothing while a previous
+/// catalog exists: the refresh is reported as a failure and the retained list
+/// is named, so "0 models · updated just now" can never be shown as a valid
+/// fresh discovery.
+pub(crate) const EMPTY_DISCOVERY_KEPT: &str =
+    "Discovery returned no models — keeping the previous list. Check credentials/network.";
+
+/// Inline refresh message when discovery produced nothing and there was no
+/// previous catalog to keep.
+pub(crate) const EMPTY_DISCOVERY_NO_CACHE: &str =
+    "Discovery returned no models — check credentials/network.";
+
 /// A selectable parent-directory option in the skill-create wizard (ADR-43).
 /// `raw` stays the configured search path (e.g. `~/.config/concerto/skills`);
 /// `label` is the resolved absolute path plus an existence badge, so the user

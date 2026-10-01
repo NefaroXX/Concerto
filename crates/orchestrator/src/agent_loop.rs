@@ -119,6 +119,12 @@ pub struct AgentLoop {
 
     /// Model id and cumulative usage for session/dashboard accounting.
     usage_model: String,
+    /// Provider-advertised per-model tool-calling capability (ADR-66 §3 level
+    /// 2 / ADR-75), when the caller resolved one from the provider's discovery
+    /// catalog. `Some(false)` engages the §4 text-fallback driver even for a
+    /// model the optimistic default would run natively, so advertised absence
+    /// is believed; `None` falls through to the optimistic default.
+    advertised_tool_support: Option<bool>,
     usage_tokens_in: u64,
     usage_tokens_out: u64,
     usage_cost_usd: f64,
@@ -442,6 +448,7 @@ impl AgentLoop {
             session_store: None,
             tool_facts: None,
             usage_model: String::new(),
+            advertised_tool_support: None,
             usage_tokens_in: 0,
             usage_tokens_out: 0,
             usage_cost_usd: 0.0,
@@ -454,6 +461,14 @@ impl AgentLoop {
     /// Supply the exact selected model id used for usage attribution.
     pub fn with_usage_model(mut self, model: impl Into<String>) -> Self {
         self.usage_model = model.into();
+        self
+    }
+
+    /// Supply the provider-advertised tool-calling capability for the selected
+    /// model (ADR-66 §3 level 2 / ADR-75), so advertised absence engages the
+    /// text-fallback driver instead of forcing native tools.
+    pub fn with_advertised_tool_support(mut self, advertised: Option<bool>) -> Self {
+        self.advertised_tool_support = advertised;
         self
     }
 
@@ -1339,7 +1354,11 @@ impl AgentLoop {
         if tools.is_empty() {
             return None;
         }
-        if !tool_driver::fallback_engaged(self.provider.provider_name(), &self.usage_model) {
+        if !tool_driver::fallback_engaged(
+            self.provider.provider_name(),
+            &self.usage_model,
+            self.advertised_tool_support,
+        ) {
             return None;
         }
         Some(TextToolDriver::new(tools))
@@ -5111,11 +5130,16 @@ mod tests {
     // ADR-66 §4: universal text-fallback driver (single-agent loop)
     // -----------------------------------------------------------------------
 
-    /// ADR-66 A5: a simulated text-only provider (no native tool support —
-    /// a Zen-served Muse model) completes a multi-turn tool task through
-    /// the fallback driver: the tool-call block is parsed, executed through
+    /// ADR-66 A5 / ADR-75: a provider that **advertises its absence** of
+    /// native tool support completes a multi-turn tool task through the
+    /// fallback driver: the tool-call block is parsed, executed through
     /// the real FilesystemTool, the materialized file lands on disk, and
     /// the no-declaration contract holds (no wire tools ever sent).
+    ///
+    /// Re-scoped from the old claim that a Zen-served Muse model is fallback
+    /// driven because of its *name*: the Responses converter now carries
+    /// native tools, so fallback engagement is driven by advertised absence
+    /// (`Some(false)`), not by the model id.
     #[tokio::test]
     async fn text_fallback_driver_completes_tool_task_end_to_end() {
         let dir = tempfile::tempdir().unwrap();
@@ -5129,7 +5153,8 @@ mod tests {
         ]));
         let approval = Arc::new(ApprovalTestHarness::always_approve());
         let mut loop_ = make_loop_with_fs_tool(dir.path(), provider.clone(), approval, 10)
-            .with_usage_model("muse-v2".to_string());
+            .with_usage_model("muse-v2".to_string())
+            .with_advertised_tool_support(Some(false));
         let task =
             AgentTask::new_action_required(Ulid::new(), "write a file through the text driver");
         let result = loop_.run(task, CancellationToken::new()).await;
@@ -5155,12 +5180,12 @@ mod tests {
         );
     }
 
-    /// ADR-66 §5 correction (2026-09-08): `muse-spark-*` rides the explicit
-    /// Responses dialect prefix entry, so it resolves to no NATIVE tool
-    /// support — but its tool-requiring run must PROCEED via the labeled §4
-    /// fallback driver (never refused at selection, never silently
-    /// text-only), exactly like the genuine Muse models. The driver is
-    /// prompt-text-based, so it works over the Responses SSE path.
+    /// ADR-66 §5 / ADR-75: a `muse-spark-*` model routed through the
+    /// Responses dialect now carries native tools, so this test is re-scoped:
+    /// it pins that a provider **advertising absence** (`Some(false)`) still
+    /// PROCEEDS via the labeled §4 fallback driver (never refused at
+    /// selection, never silently text-only), and the prompt-text driver works
+    /// over the Responses SSE path.
     #[tokio::test]
     async fn responses_dialect_model_completes_tool_task_via_fallback() {
         let dir = tempfile::tempdir().unwrap();
@@ -5174,7 +5199,8 @@ mod tests {
         ]));
         let approval = Arc::new(ApprovalTestHarness::always_approve());
         let mut loop_ = make_loop_with_fs_tool(dir.path(), provider.clone(), approval, 10)
-            .with_usage_model("muse-spark-1.3-contributor-free".to_string());
+            .with_usage_model("muse-spark-1.3-contributor-free".to_string())
+            .with_advertised_tool_support(Some(false));
         let task = AgentTask::new_action_required(Ulid::new(), "write a file on muse-spark");
         let result = loop_.run(task, CancellationToken::new()).await;
         assert!(
@@ -5220,7 +5246,8 @@ mod tests {
         ]));
         let approval = Arc::new(ApprovalTestHarness::always_approve());
         let mut loop_ = make_loop_with_fs_tool(dir.path(), provider.clone(), approval, 10)
-            .with_usage_model("muse-v2".to_string());
+            .with_usage_model("muse-v2".to_string())
+            .with_advertised_tool_support(Some(false));
         let task = AgentTask::new_action_required(Ulid::new(), "write the repaired file");
         let result = loop_.run(task, CancellationToken::new()).await;
         assert!(result.is_ok(), "repaired run should succeed: {:?}", result.err());
@@ -5253,7 +5280,8 @@ mod tests {
         let provider = Arc::new(TextScriptedProvider::new(vec![malformed.to_string()]));
         let approval = Arc::new(ApprovalTestHarness::always_approve());
         let mut loop_ = make_loop_with_fs_tool(dir.path(), provider.clone(), approval, 10)
-            .with_usage_model("muse-v2".to_string());
+            .with_usage_model("muse-v2".to_string())
+            .with_advertised_tool_support(Some(false));
         let task = AgentTask::new_action_required(Ulid::new(), "write the impossible file");
         let result = loop_.run(task, CancellationToken::new()).await;
         let error = result.expect_err("bound exhaustion must fail the run loudly");
@@ -5317,7 +5345,8 @@ mod tests {
             dir.path().to_path_buf(),
             None,
         )
-        .with_usage_model("muse-v2".to_string());
+        .with_usage_model("muse-v2".to_string())
+        .with_advertised_tool_support(Some(false));
         let task = AgentTask::new_action_required(Ulid::new(), "write the audited file");
         let result = loop_.run(task, CancellationToken::new()).await;
         assert!(result.is_ok(), "audited fallback run should succeed: {:?}", result.err());
@@ -5363,6 +5392,10 @@ mod tests {
         // provider_name "scripted" resolves to the provider default (native
         // tools), so no fallback engagement — even though the usage model
         // alone is a Muse name.
+        //
+        // Unlike the re-scoped fallback tests, this case deliberately passes
+        // NO advertised capability: the point is that a model *name* can
+        // never engage the fallback driver.
         let provider = Arc::new(ScriptedProvider::new(vec![vec![tc], vec![]]));
         let approval = Arc::new(ApprovalTestHarness::always_approve());
         let mut loop_ = make_loop_with_fs_tool(dir.path(), provider.clone(), approval, 10)
@@ -6578,7 +6611,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_guard_rejects_null_arguments_with_corrective_result() {
-        // Audit stall shape: mimo-v2.5-free emits `arguments: null`. The guard
+        // Audit stall shape: the MiMo family emits `arguments: null`. The guard
         // must normalize to `{}`, find the required fields missing, and inject
         // a corrective tool result instead of executing (or erroring) inside
         // the filesystem tool.

@@ -62,6 +62,17 @@ ignore = [
                           # embedder-only (needs 2 Engines, objects mixed across them), not
                           # guest-triggerable; PluginHost uses a single shared Engine
                           # (crates/plugins/src/host.rs), so usage is unaffected
+    "RUSTSEC-2026-0316",  # wasmtime dynamic record lifting can allocate beyond the hostcall
+                          # fuel limit (GHSA-jqpg-j7w6-42pr). NOT REACHABLE: record lifting
+                          # is a COMPONENT-MODEL API (wasmtime::component); the plugin host
+                          # uses core modules only — Config, Store, Module::new, Instance,
+                          # Linker::new, func_wrap_async over linear memory. No Component,
+                          # component linker, or Val is ever constructed, so no hostcall
+                          # record lifting occurs and the fuel limit cannot be bypassed.
+                          # Scope: concerto-plugins crate only (crates/plugins/).
+                          # Fixed upstream in >= 36.0.16 / >= 48.0.3 / >= 49.0.1, all of
+                          # which require the func_wrap API migration noted above; revisit
+                          # if/when wasmtime leaves the 24.0.x line.
     # === quick-xml exceptions ===
     # Reason: quick-xml v0.38.4/v0.39.4 constrained by plist (syntect via iced) and
     # wayland-scanner. These are XML parsing DoS vectors that require crafted XML input.

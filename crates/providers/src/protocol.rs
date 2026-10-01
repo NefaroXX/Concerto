@@ -59,6 +59,70 @@ pub fn ensure_arguments_object(args: serde_json::Value) -> serde_json::Value {
 /// only once per process.
 static ARGUMENTS_COERCION_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
+/// The neutral continuation cue appended when a rendered OpenAI-compatible
+/// `messages` array would otherwise be empty or system-only.
+///
+/// Deliberately short and content-free: this is a protocol floor, not prompt
+/// content. A real objective is the caller's job (the coordinator seeds one on
+/// the planning path), so this message only has to make the request
+/// satisfiable.
+pub const CONVERSATION_FLOOR_USER_MESSAGE: &str = "Continue.";
+
+/// Guarantee that an OpenAI-compatible `messages` array is satisfiable before
+/// the request goes on the wire.
+///
+/// A strict OpenAI-compatible gateway rejects a conversation whose `messages`
+/// array contains only `system` messages with `HTTP 400 invalid_request_error`.
+/// The verified shape matrix against the OpenCode Zen/Go relay
+/// (`POST https://opencode.ai/zen/go/v1/chat/completions`) is:
+///
+/// | `messages`                      | result |
+/// |---------------------------------|--------|
+/// | `system` only                   | **400** |
+/// | `system` + `user`               | 200 |
+/// | `user` only                     | 200 |
+/// | `system` + `assistant`          | 200 |
+/// | `system` + `user` + `assistant` | 200 |
+///
+/// The rejection is not a size, `temperature`, `max_tokens`, `tool_choice`, or
+/// tool-schema problem — a system-only conversation is the single rejected
+/// shape. This helper is the provider-level floor that keeps every
+/// OpenAI-compatible request satisfiable regardless of caller:
+///
+/// * A non-empty array that already carries at least one non-`system` message
+///   is left **unchanged** (byte-identical to the pre-floor output). This is
+///   the overwhelmingly common case.
+/// * An empty array, or one containing only `system` messages, gets ONE
+///   appended minimal `user` message (see [`CONVERSATION_FLOOR_USER_MESSAGE`])
+///   so the request is satisfiable.
+///
+/// The coordinator is separately fixed to always seed a real objective user
+/// turn, so this floor should never fire on the planning path; it exists as
+/// defence in depth for every other caller.
+///
+/// ```
+/// use concerto_providers::protocol::ensure_non_system_conversation;
+///
+/// // The exact shape strict gateways reject: a system-only conversation.
+/// let mut messages = vec![serde_json::json!({"role": "system", "content": "objective"})];
+/// ensure_non_system_conversation(&mut messages);
+///
+/// assert_eq!(messages.len(), 2);
+/// assert_eq!(messages[0]["role"], "system");
+/// assert_eq!(messages[1]["role"], "user");
+/// ```
+pub fn ensure_non_system_conversation(messages: &mut Vec<serde_json::Value>) {
+    let has_non_system = messages
+        .iter()
+        .any(|message| message.get("role").and_then(serde_json::Value::as_str) != Some("system"));
+    if messages.is_empty() || !has_non_system {
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": CONVERSATION_FLOOR_USER_MESSAGE,
+        }));
+    }
+}
+
 /// A normalized response from a provider.
 #[derive(Debug, Clone)]
 pub struct ProviderResponse {
@@ -80,7 +144,67 @@ pub enum StreamEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_arguments_object, ProviderRequest};
+    use super::{
+        ensure_arguments_object, ensure_non_system_conversation, ProviderRequest,
+        CONVERSATION_FLOOR_USER_MESSAGE,
+    };
+
+    /// Build a wire `message` object for the floor tests.
+    fn wire_message(role: &str, content: &str) -> serde_json::Value {
+        serde_json::json!({ "role": role, "content": content })
+    }
+
+    /// The common path: a conversation that already carries a non-system turn
+    /// is returned byte-identical — no floor, no reordering, no allocation.
+    #[test]
+    fn non_system_conversations_pass_through_byte_identical() {
+        let cases: Vec<Vec<serde_json::Value>> = vec![
+            vec![wire_message("user", "Hello")],
+            vec![wire_message("system", "sys"), wire_message("user", "Hello")],
+            vec![wire_message("system", "sys"), wire_message("assistant", "hi")],
+            vec![wire_message("user", "Hello"), wire_message("assistant", "hi")],
+        ];
+        for before in cases {
+            let mut after = before.clone();
+            ensure_non_system_conversation(&mut after);
+            assert_eq!(after, before, "non-system conversation must be untouched: {before:?}");
+        }
+    }
+
+    /// An empty conversation gets exactly one appended floor user turn.
+    #[test]
+    fn empty_conversation_gets_a_floor_user_turn() {
+        let mut messages = Vec::new();
+        ensure_non_system_conversation(&mut messages);
+        assert_eq!(
+            messages,
+            vec![wire_message("user", CONVERSATION_FLOOR_USER_MESSAGE)],
+            "empty conversation must gain one user turn"
+        );
+    }
+
+    /// A system-only conversation gets the floor appended AFTER the system
+    /// message (order is preserved; the system prompt stays first).
+    #[test]
+    fn system_only_conversation_gets_a_floor_user_turn_after_it() {
+        let mut messages = vec![wire_message("system", "the 14 KB coordinator prompt")];
+        ensure_non_system_conversation(&mut messages);
+        assert_eq!(messages.len(), 2, "system turn + floor");
+        assert_eq!(messages[0], wire_message("system", "the 14 KB coordinator prompt"));
+        assert_eq!(messages[1], wire_message("user", CONVERSATION_FLOOR_USER_MESSAGE));
+    }
+
+    /// Applying the floor twice is a no-op the second time: after the first
+    /// pass the array already carries a user turn, so the common-path rule
+    /// leaves it alone.
+    #[test]
+    fn conversation_floor_is_idempotent() {
+        let mut messages = vec![wire_message("system", "sys")];
+        ensure_non_system_conversation(&mut messages);
+        let once = messages.clone();
+        ensure_non_system_conversation(&mut messages);
+        assert_eq!(messages, once, "a second floor application must not append again");
+    }
 
     /// A JSON object — the only wire-legal shape — passes through untouched.
     /// Fixture is synthetic — never a real credential. `ProviderRequest`

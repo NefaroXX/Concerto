@@ -1852,6 +1852,27 @@ fn tool_support_override(config: &AppConfig, provider_config_id: Option<&str>) -
         .and_then(|override_config| override_config.supports_tool_calling)
 }
 
+/// The provider-advertised tool-calling capability for the resolved provider
+/// configuration/model, when model discovery published one (ADR-66 §3
+/// precedence level 2 / ADR-75).
+///
+/// `provider_config_id` is `None` for plugin-backed and env-fallback
+/// providers; a provider that advertised no per-model flag yields `None`,
+/// leaving the optimistic default.
+fn advertised_tool_support(
+    config: &AppConfig,
+    provider_config_id: Option<&str>,
+    model: &str,
+) -> Option<bool> {
+    let settings = config.model_settings.as_ref()?;
+    let id = provider_config_id?;
+    settings
+        .providers
+        .iter()
+        .find(|provider| ProviderFactory::config_id(provider) == id)
+        .and_then(|provider| provider.advertised_tool_support_for(model))
+}
+
 /// Build the run's audit sink and its backing session-DB pool.
 ///
 /// Fail-soft: a missing data directory or unopenable/pathological DB degrades
@@ -2079,6 +2100,9 @@ async fn execute_agent_loop(
     services: &SharedServices,
     provider: Arc<dyn LlmProvider>,
     model: String,
+    // Provider-advertised tool-calling capability for `model` (ADR-66 §3
+    // level 2 / ADR-75). `Some(false)` engages the §4 fallback driver.
+    advertised_tool_support: Option<bool>,
     executor: crate::exec_backend::SharedExecutionBackend,
     memory: Arc<dyn MemoryStore>,
     session_store: Option<Arc<dyn SessionStore>>,
@@ -2174,6 +2198,7 @@ async fn execute_agent_loop(
     )
     .with_retry_policy(retry_policy)
     .with_usage_model(model)
+    .with_advertised_tool_support(advertised_tool_support)
     .with_initial_messages(req.conversation_history)
     .with_session_store(session_store)
     .with_tool_facts(fact_pool.map(|pool| {
@@ -3506,11 +3531,16 @@ pub async fn run_shared_agent(
     // the provider default.
     if action_required {
         let override_flag = tool_support_override(&services.config, provider_config_id.as_deref());
+        // Provider-advertised capability (level 2) is threaded here so a model
+        // that advertises its absence is not forced into native tools when a
+        // fallback exists (ADR-75).
+        let advertised_flag =
+            advertised_tool_support(&services.config, provider_config_id.as_deref(), &model);
         if let Err(refusal) = concerto_providers::capability::require_tool_support_with_fallback(
             provider.provider_name(),
             &model,
             override_flag,
-            None,
+            advertised_flag,
         ) {
             let ProviderError::CapabilityRefused {
                 provider: refused_provider,
@@ -3702,11 +3732,14 @@ pub async fn run_shared_agent(
             executor.clone()
         }
     };
+    let single_agent_advertised =
+        advertised_tool_support(&services.config, provider_config_id.as_deref(), &model);
     let output = execute_agent_loop(
         req,
         &services,
         provider,
         model,
+        single_agent_advertised,
         single_agent_executor,
         memory,
         session_store.clone(),
@@ -5459,16 +5492,13 @@ mod runtime_runner_tests {
 
     /// ADR-66 §2(a) + §4: the selection gate refuses a tool-requiring run
     /// only when no tool path exists at all — plugin-backed providers
-    /// (decision (a)). Models whose ONLY gap is native tool declarations
-    /// (the Zen Responses dialect: genuine Muse models and `muse-spark-*`
-    /// via the explicit prefix entry) PROCEED via the labeled §4 fallback
-    /// driver instead of being refused. Precedence level 1 (the
+    /// (decision (a)). The Zen Responses-dialect models now carry native
+    /// tools (the converter was completed, ADR-75), so they pass on native
+    /// support rather than via the fallback driver. Precedence level 1 (the
     /// explicit-config override) is unchanged.
     #[test]
     fn selection_gate_refuses_only_uncoverable_tool_gaps() {
-        // Responses-dialect models on Zen: no native tool declarations, but
-        // the fallback driver covers them → the gate proceeds (Execute runs
-        // on muse-spark-* must not be refused).
+        // Responses-dialect models on Zen now have native tool support.
         assert!(concerto_providers::capability::require_tool_support_with_fallback(
             "opencode",
             "muse-spark-1.3-contributor-free",
@@ -5478,6 +5508,15 @@ mod runtime_runner_tests {
         .is_ok());
         assert!(concerto_providers::capability::require_tool_support_with_fallback(
             "opencode", "muse-v2", None, None
+        )
+        .is_ok());
+        // Advertised absence still proceeds via the coverable fallback driver
+        // (not refused, not forced native).
+        assert!(concerto_providers::capability::require_tool_support_with_fallback(
+            "openai",
+            "gpt-4o",
+            None,
+            Some(false),
         )
         .is_ok());
         // Plugin-backed gap: refused, naming everything (decision (a)).
@@ -5498,15 +5537,15 @@ mod runtime_runner_tests {
         }
         // The refusal is permanent: retrying cannot add the capability.
         assert!(!error.is_transient());
-        // The pure §2(a) primitive (no fallback carve-out) still refuses
-        // the Responses-dialect models — the carve-out is the gate's choice.
+        // Inverted from the old assertion: the pure §2(a) primitive no longer
+        // refuses the Responses-dialect models — no name decides capability.
         assert!(concerto_providers::capability::require_tool_support(
             "opencode",
             "muse-spark-1.3-contributor-free",
             None,
             None,
         )
-        .is_err());
+        .is_ok());
     }
 
     /// ADR-66 §3 precedence level 1: `tool_support_override` reads the
@@ -8657,6 +8696,7 @@ mod runtime_runner_tests {
             &services,
             provider,
             "test-model".into(),
+            None, // no advertised capability in this test
             executor,
             Arc::new(NullMemoryStore),
             None,
@@ -8718,6 +8758,7 @@ mod runtime_runner_tests {
             &services,
             provider,
             "test-model".into(),
+            None, // no advertised capability in this test
             executor,
             Arc::new(NullMemoryStore),
             None,
