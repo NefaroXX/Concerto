@@ -1087,6 +1087,15 @@ fn default_coordinator_agent() -> AgentConfig {
     }
 }
 
+/// True when a key (agent id or role) names the engine-owned coordinator.
+///
+/// Single source of truth for the reserved identity, shared by the roster-row
+/// predicate and the model-assignment seams so the sidebar card, the Studio
+/// filter, and the persisted assignment all agree on what "coordinator" means.
+fn is_coordinator_key(key: &str) -> bool {
+    key.eq_ignore_ascii_case("coordinator")
+}
+
 /// True when a roster row is the engine-constructed coordinator.
 ///
 /// The coordinator is hardcoded (maintainer decision 2026-09): it is not a
@@ -1095,7 +1104,7 @@ fn default_coordinator_agent() -> AgentConfig {
 /// either the `id` or the legacy `role` key, case-insensitively — mirroring
 /// how the runtime reserves the role.
 fn is_coordinator_agent(agent: &AgentConfig) -> bool {
-    agent.id.eq_ignore_ascii_case("coordinator") || agent.role.eq_ignore_ascii_case("coordinator")
+    is_coordinator_key(&agent.id) || is_coordinator_key(&agent.role)
 }
 
 fn default_builtin_agents() -> Vec<AgentConfig> {
@@ -1327,6 +1336,20 @@ impl State {
         let ms = config.model_settings.clone().unwrap_or_default();
         self.global_default_model = ms.global_default_model.clone();
         self.model_assignments = ms.agent_assignments.clone();
+        // A persisted coordinator assignment needs the engine-owned row to land
+        // on: a config-owned roster (`agents = config_agents` above) never
+        // carries the coordinator because the persist path filters it out, so
+        // the frozen row is materialized here. The gate is the assignment
+        // itself — a config without one keeps its roster byte-identical, so
+        // the "config roster IS the roster" guarantee still holds.
+        if !self.agents.iter().any(is_coordinator_agent)
+            && self
+                .model_assignments
+                .iter()
+                .any(|assignment| is_coordinator_key(&assignment.agent_role))
+        {
+            self.agents.push(default_coordinator_agent());
+        }
         for assignment in &self.model_assignments {
             if let Some(agent) = self.agents.iter_mut().find(|agent| {
                 agent.id == assignment.agent_role || agent.role == assignment.agent_role
@@ -1432,6 +1455,40 @@ impl State {
     /// pipeline topology and relationships stay complete.
     fn visible_agents(&self) -> impl Iterator<Item = &AgentConfig> {
         self.agents.iter().filter(|agent| !is_coordinator_agent(agent))
+    }
+
+    /// Public roster view (the engine-owned coordinator filtered out). Used by
+    /// the right-toolbar agent cards, which mirror the Studio roster.
+    pub fn roster_agents(&self) -> impl Iterator<Item = &AgentConfig> {
+        self.visible_agents()
+    }
+
+    /// The engine-owned coordinator, when present. Rendered read-only in the
+    /// right toolbar (no model dropdown; the coordinator is not a roster row).
+    pub fn coordinator_agent(&self) -> Option<&AgentConfig> {
+        self.agents.iter().find(|agent| is_coordinator_agent(agent))
+    }
+
+    /// Update one roster agent's model override in memory (right-toolbar quick
+    /// swap). Persistence is owned by the App; this only keeps the rendered
+    /// card in sync until the next config reload.
+    ///
+    /// The engine-owned coordinator row exists by construction on the seeded
+    /// path, but a config-owned roster replaces `agents` wholesale and never
+    /// persists the coordinator — so the sidebar card renders its default
+    /// (row-less) state there. Assigning a model to that id materializes the
+    /// frozen row first, which is what flips the card from the fallback to the
+    /// assigned state instead of the assignment landing on no row.
+    pub fn set_agent_model_override(&mut self, agent_id: &str, model: Option<String>) {
+        if model.is_some()
+            && is_coordinator_key(agent_id)
+            && !self.agents.iter().any(is_coordinator_agent)
+        {
+            self.agents.push(default_coordinator_agent());
+        }
+        if let Some(agent) = self.agents.iter_mut().find(|agent| agent.id == agent_id) {
+            agent.model_override = model;
+        }
     }
 
     /// Parts of the studio that should be persisted back to config.
@@ -4532,6 +4589,108 @@ mod tests {
         injected.load_from_config(&config);
         let (custom, _, _) = injected.persisted_parts();
         assert!(!custom.iter().any(is_custom_coordinator), "config entry must not persist");
+    }
+
+    /// A config-owned roster never carries the coordinator row: the persist
+    /// path filters it out, so after a config load `coordinator_agent()` is
+    /// `None` and the sidebar must render its default card (not bare text).
+    #[test]
+    fn config_owned_roster_has_no_coordinator_row() {
+        let config = AppConfig {
+            multi_agent: Some(concerto_config::MultiAgentConfig {
+                custom_agents: vec![concerto_config::CustomAgentConfig {
+                    id: "coder".into(),
+                    role: "coder".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut state = State::new();
+        state.load_from_config(&config);
+
+        assert!(
+            state.coordinator_agent().is_none(),
+            "a config-owned roster holds no coordinator row"
+        );
+        assert_eq!(state.roster_agents().count(), 1, "the roster is exactly the config list");
+        assert!(!state.visible_agents().any(is_coordinator_agent));
+    }
+
+    /// Picking a model on the row-less sidebar card assigns it to the frozen
+    /// `coordinator` id: the quick-swap materializes the engine-owned row, so
+    /// the card flips from its default render to the assigned card while the
+    /// roster and the Studio draft stay untouched.
+    #[test]
+    fn coordinator_model_assignment_creates_the_engine_owned_row() {
+        let config = AppConfig {
+            multi_agent: Some(concerto_config::MultiAgentConfig {
+                custom_agents: vec![concerto_config::CustomAgentConfig {
+                    id: "coder".into(),
+                    role: "coder".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut state = State::new();
+        state.load_from_config(&config);
+        assert!(state.coordinator_agent().is_none());
+
+        state.set_agent_model_override("coordinator", Some("gemini-2.5-flash-lite".into()));
+
+        let Some(coord) = state.coordinator_agent() else {
+            panic!("the assignment must materialize the engine-owned coordinator row");
+        };
+        assert_eq!(coord.name, "Coordinator", "the frozen definition renders verbatim");
+        assert_eq!(coord.model_override.as_deref(), Some("gemini-2.5-flash-lite"));
+        assert!(
+            !state.visible_agents().any(is_coordinator_agent),
+            "the created row must never render as a roster row"
+        );
+        assert!(!state.unsaved, "the quick swap is App-persisted, not a Studio draft");
+    }
+
+    /// A persisted coordinator assignment re-materializes the row on reload,
+    /// so the sidebar card keeps showing the assigned model after a config
+    /// round-trip instead of reverting to the row-less fallback.
+    #[test]
+    fn load_from_config_restores_the_coordinator_row_for_a_persisted_assignment() {
+        let config = AppConfig {
+            multi_agent: Some(concerto_config::MultiAgentConfig {
+                custom_agents: vec![concerto_config::CustomAgentConfig {
+                    id: "coder".into(),
+                    role: "coder".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            model_settings: Some(concerto_config::ModelSettings {
+                agent_assignments: vec![AgentModelAssignment {
+                    agent_role: "coordinator".into(),
+                    provider_config_id: "nim".into(),
+                    model_override: Some("coord-model".into()),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut state = State::new();
+        state.load_from_config(&config);
+
+        let Some(coord) = state.coordinator_agent() else {
+            panic!("a persisted coordinator assignment must restore the engine-owned row");
+        };
+        assert_eq!(coord.provider_id.as_deref(), Some("nim"));
+        assert_eq!(coord.model_override.as_deref(), Some("coord-model"));
+        assert_eq!(
+            state.roster_agents().count(),
+            1,
+            "the coordinator row stays filtered from the roster"
+        );
+        assert!(!state.unsaved, "assignment application mirrors config; the studio stays clean");
     }
 
     /// The obsolete "No coordinator agent present" warning is gone: the

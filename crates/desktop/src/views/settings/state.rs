@@ -1260,6 +1260,14 @@ impl State {
         ))
     }
 
+    /// Seed the theme editor from the persisted `UserPrefsStore` theme so the
+    /// picker shows the applied theme after a restart instead of the hardcoded
+    /// "Midnight" default. Called once at startup from `App::new`.
+    pub fn seed_theme(&mut self, name: &'static str, font_size: f32) {
+        self.selected_theme = name;
+        self.font_size = font_size.clamp(12.0, 20.0);
+    }
+
     pub fn update(&mut self, message: Message) -> iced::Task<Message> {
         match message {
             Message::ThemeSelected(name) => self.selected_theme = name,
