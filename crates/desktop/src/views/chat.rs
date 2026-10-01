@@ -319,12 +319,6 @@ pub struct State {
     expanded_run_id: Option<String>,
     /// Active sub-view overlay shown on top of the chat canvas.
     pub sub_view: SubView,
-    /// The first id of the currently expanded thinking group, or `None` when
-    /// all groups are collapsed. Drives the accordion toggle.
-    expanded_thinking_id: Option<EntryId>,
-    /// `/thinking` expand-all override: when true every bucket renders
-    /// expanded regardless of `expanded_thinking_id`.
-    thinking_expand_all: bool,
     /// Per-agent mute set for the thinking filter bar. Muted buckets are
     /// hidden from chat only — the WAL, transcript, and AgentGraph logs
     /// still record everything. Persisted to `[display] muted_agents`;
@@ -445,24 +439,6 @@ const LINE_WIPE_TICKS: u8 = 8;
 /// interpolates from muted to text over `SHIMMER_PERIOD` ticks and back.
 const SHIMMER_PERIOD: u32 = 8;
 
-/// One agent's thinking bucket: every `Thinking` entry from that agent in
-/// the current run, regardless of consecutiveness. The bucket's `expanded`
-/// state is keyed to the first entry id so `ToggleEntry` toggles the whole
-/// bucket (or `thinking_expand_all` opens all of them via `/thinking`).
-#[derive(Debug, Clone)]
-struct ThinkingGroup {
-    agent_id: String,
-    /// Indices into the parent `entries` slice.
-    indices: Vec<usize>,
-    /// The first entry id in the group — `ToggleEntry` target.
-    first_id: EntryId,
-    /// Whether this group is expanded (one at a time).
-    expanded: bool,
-    /// Latest headline: first line of the latest entry's content, heuristically
-    /// shortened to a movement verb phrase.
-    headline: String,
-}
-
 /// One coordinator-dispatched subagent run. Progress is keyed by the backend
 /// task id (`run_id`) alone, so two runs by the same agent render as two cards
 /// instead of collapsing into one per-agent box. The run's work history is the
@@ -505,8 +481,6 @@ impl State {
             entry_owner: HashMap::new(),
             expanded_run_id: None,
             sub_view: SubView::Main,
-            expanded_thinking_id: None,
-            thinking_expand_all: false,
             muted_agents: HashSet::new(),
             streaming_cursor_visible: false,
             revealed_chars: None,
@@ -564,8 +538,6 @@ impl State {
             entry_owner: HashMap::new(),
             expanded_run_id: None,
             sub_view: SubView::Main,
-            expanded_thinking_id: None,
-            thinking_expand_all: false,
             muted_agents: HashSet::new(),
             streaming_cursor_visible: false,
             revealed_chars: None,
@@ -1574,18 +1546,15 @@ impl State {
                 // Handled by App because session loading requires shared services.
             }
             Message::ToggleEntry(id) => {
-                // Toggle the thinking bucket accordion: the id is the first
-                // entry's id of the bucket. Clicking the same bucket collapses
-                // it; clicking a different bucket switches expansion. A manual
-                // toggle always leaves expand-all mode first.
-                if let Some(ChatEntry::Thinking { .. }) = self
+                // Toggle one thinking entry's collapsed preview. The global
+                // agent-grouped accordion is gone (per-run thinking replaced
+                // it), so this is a per-entry disclosure now.
+                if let Some(ChatEntry::Thinking { collapsed, .. }) = self
                     .entries
-                    .iter()
+                    .iter_mut()
                     .find(|e| matches!(e, ChatEntry::Thinking { id: eid, .. } if *eid == id))
                 {
-                    self.thinking_expand_all = false;
-                    self.expanded_thinking_id =
-                        if self.expanded_thinking_id == Some(id) { None } else { Some(id) };
+                    *collapsed = !*collapsed;
                 }
             }
             Message::ToggleMuteAgent(agent) => {
@@ -1595,11 +1564,10 @@ impl State {
                 }
             }
             Message::CollapseAllThinking => {
-                self.thinking_expand_all = false;
-                self.expanded_thinking_id = None;
+                self.set_all_thinking_collapsed(true);
             }
             Message::ExpandAllThinking => {
-                self.thinking_expand_all = true;
+                self.set_all_thinking_collapsed(false);
             }
             Message::ToggleThinkingAll => {
                 self.toggle_thinking_all();
@@ -1895,14 +1863,24 @@ impl State {
         }
     }
 
-    /// `/thinking` toggle for the current movement: collapse everything when
-    /// any bucket is open, otherwise expand all buckets.
+    /// `/thinking` toggle for the current movement: collapse every thinking
+    /// entry when any is expanded, otherwise expand all. The old per-agent
+    /// bucket accordion is gone; disclosure is now per entry / per run.
     pub fn toggle_thinking_all(&mut self) {
-        if self.thinking_expand_all || self.expanded_thinking_id.is_some() {
-            self.thinking_expand_all = false;
-            self.expanded_thinking_id = None;
-        } else {
-            self.thinking_expand_all = true;
+        let any_expanded = self
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, ChatEntry::Thinking { collapsed: false, .. }));
+        self.set_all_thinking_collapsed(any_expanded);
+    }
+
+    /// Set every thinking entry's collapsed flag (used by `/thinking` and the
+    /// collapse-all / expand-all messages).
+    fn set_all_thinking_collapsed(&mut self, collapsed: bool) {
+        for entry in &mut self.entries {
+            if let ChatEntry::Thinking { collapsed: entry_collapsed, .. } = entry {
+                *entry_collapsed = collapsed;
+            }
         }
     }
 
@@ -2217,13 +2195,22 @@ impl State {
             .into();
         }
 
-        // Message list — per-run progress cards over the per-agent thinking
-        // accordion. Entries *owned* by a subagent run render inside that
-        // run's card only: ownership assigns each entry to at most one run, so
-        // concurrent runs (different agents, or two runs of the same agent)
-        // never show each other's work and never double it into a bucket.
+        // Message list — one contiguous group per subagent run (progress card →
+        // that run's thinking entries → that run's tool calls), with unowned
+        // entries in the main flow between groups. Entries are attributed at
+        // push time to at most one run (the entry-owner map), so concurrent
+        // runs never show each other's work and the `covered` skip below can
+        // never drop or duplicate an entry.
         let covered = self.run_coverage();
-        let mut col = column![].spacing(4).padding(8);
+        // Right gutter (>= the 10px default scrollbar width, from the spacing
+        // scale) keeps the vertical scrollbar from overlapping the right edge
+        // of cards/containers. The other insets stay at the existing 8px.
+        let mut col = column![].spacing(4).padding(iced::Padding {
+            top: 8.0,
+            right: spacing.md,
+            bottom: 8.0,
+            left: 8.0,
+        });
         let has_timeline =
             agent_graph.has_multi_agent_activity && !agent_graph.model.nodes.is_empty();
         let latest_user_index =
@@ -2231,134 +2218,66 @@ impl State {
         if has_timeline && latest_user_index.is_none() {
             col = col.push(self.orchestration_timeline(agent_graph, palette));
         }
-        // Full per-agent buckets over ALL thinking entries (not just
-        // consecutive runs): one panel per agent in first-appearance order,
-        // emitted at the agent's first entry. Muted agents are skipped here
-        // (view-only; the WAL/transcript still hold everything). The filter
-        // bar always renders once the chat has entries, so the composer's
-        // position under it stays fixed — no layout jump when the first
-        // bucket appears (the no-entries case returned above).
+        // Per-agent mute filter bar over ALL thinking entries (run-owned or
+        // not): one chip per agent in first-appearance order. Muting hides the
+        // agent's thinking rows from chat only — the WAL/transcript keep
+        // everything. The bar always renders once the chat has entries so the
+        // composer's position under it stays fixed (the no-entries case
+        // returned above).
         let (bucket_order, buckets) = thinking_buckets(&self.entries);
         col = col.push(self.thinking_filter_bar(palette, &bucket_order, &buckets));
-        let mut emitted_buckets = HashSet::new();
         // Per-turn agent attribution for assistant entries: the assistant
         // entry carries no agent id (single-agent transcript), so the header
-        // derives the speaker from the most recent thinking bucket's agent,
+        // derives the speaker from the most recent thinking entry's agent,
         // falling back to the generic "agent" role. View-only — never stored.
         let mut last_turn_agent: Option<String> = None;
         let mut idx = 0;
         while idx < self.entries.len() {
-            // One progress card per run, emitted at its dispatch index. Every
-            // run with a position in the transcript is hit exactly once here,
-            // so even two runs dispatched back to back (same index) both get a
-            // card. The card body is the run's *owned* entries (single-owner
-            // map), never an index range, so it can only ever show this run's
-            // work — concurrent runs of any agent stay strictly separated.
+            // One contiguous group per run dispatched at this index, in
+            // dispatch order. A group renders the run's whole owned set (card
+            // + thinking + tools), never an index range, so concurrent runs
+            // stay strictly separated even when their entries interleave.
             for run in self.runs_starting_at(idx) {
-                col = col.push(render_run_card(
-                    run,
-                    &self.run_work(&run.run_id),
-                    palette,
-                    spacing,
-                    self.expanded_run_id.as_deref(),
-                    self.shimmer_phase,
-                    self.reduced_motion,
-                ));
+                col = col.push(self.run_group(run, palette, spacing));
             }
-            // Run-owned entries render inside their card only: skip them here
-            // so the plain rows and the per-agent thinking buckets can never
-            // repeat an entry a card already shows.
+            // Run-owned entries already rendered in their group: skip them in
+            // the main flow so nothing is shown twice.
             if covered.contains(&idx) {
                 idx += 1;
                 continue;
             }
-            let bucket_key = match &self.entries[idx] {
-                ChatEntry::Thinking { agent, content, .. } => {
-                    Some(thinking_agent_key(agent, content))
-                }
-                _ => None,
-            };
-            if let Some(agent) = bucket_key {
-                last_turn_agent = Some(agent.clone());
-                if self.muted_agents.contains(&agent) {
+            // Unowned thinking renders inline (per-run thinking replaced the
+            // global agent buckets); the mute filter still applies per agent.
+            if let ChatEntry::Thinking { agent, content, .. } = &self.entries[idx] {
+                let key = thinking_agent_key(agent, content);
+                last_turn_agent = Some(key.clone());
+                if self.muted_agents.contains(&key) {
                     idx += 1;
                     continue;
                 }
-                if !emitted_buckets.contains(&agent) {
-                    let indices: Vec<usize> = buckets
-                        .get(&agent)
-                        .map(|indices| {
-                            indices.iter().copied().filter(|i| !covered.contains(i)).collect()
-                        })
-                        .unwrap_or_default();
-                    if indices.is_empty() {
-                        idx += 1;
-                        continue;
-                    }
-                    emitted_buckets.insert(agent.clone());
-                    let first_id = indices
-                        .first()
-                        .and_then(|&i| match &self.entries[i] {
-                            ChatEntry::Thinking { id, .. } => Some(*id),
-                            _ => None,
-                        })
-                        .unwrap_or(0);
-                    let headline = thinking_headline_from_entries(&self.entries, &indices);
-                    let group = ThinkingGroup {
-                        agent_id: agent,
-                        indices,
-                        first_id,
-                        expanded: self.thinking_expand_all
-                            || self.expanded_thinking_id == Some(first_id),
-                        headline,
-                    };
-                    col = col.push(render_thinking_group(
-                        &group,
-                        &self.entries,
-                        palette,
-                        &self.entrance_ticks,
-                        self.reduced_motion,
-                        self.shimmer_phase,
-                        spacing,
-                    ));
-                }
-                idx += 1;
-            } else {
-                if let ChatEntry::Assistant { .. } = &self.entries[idx] {
-                    col = col.push(self.agent_turn_header(
-                        last_turn_agent.clone().unwrap_or_else(|| "agent".to_string()),
-                        palette,
-                    ));
-                }
-                col = col.push(self.render_entry(&self.entries[idx], palette, spacing));
-                if has_timeline && latest_user_index == Some(idx) {
-                    col = col.push(self.orchestration_timeline(agent_graph, palette));
-                }
-                idx += 1;
             }
+            if let ChatEntry::Assistant { .. } = &self.entries[idx] {
+                col = col.push(self.agent_turn_header(
+                    last_turn_agent.clone().unwrap_or_else(|| "agent".to_string()),
+                    palette,
+                ));
+            }
+            col = col.push(self.render_entry(&self.entries[idx], palette, spacing));
+            if has_timeline && latest_user_index == Some(idx) {
+                col = col.push(self.orchestration_timeline(agent_graph, palette));
+            }
+            idx += 1;
         }
         // Runs dispatched without a transcript position (created at the end of
-        // the transcript, or pushed past it by trimming) still get a card so
-        // their digest is never silently dropped. The body is their owned
-        // entries again — never a slice — so nothing they own is dropped by
-        // the `covered` skip above.
+        // the transcript, or pushed past it by trimming) still render their
+        // group so their digest and work are never silently dropped.
         for run in self.runs_without_position() {
-            col = col.push(render_run_card(
-                run,
-                &self.run_work(&run.run_id),
-                palette,
-                spacing,
-                self.expanded_run_id.as_deref(),
-                self.shimmer_phase,
-                self.reduced_motion,
-            ));
+            col = col.push(self.run_group(run, palette, spacing));
         }
-        // While a run is in flight, show a single subtle "Composing…" row at
-        // the bottom of the transcript — but only when the transcript itself
-        // has nothing else that reads as live work (see
-        // `show_composing_row`): a tool-call-only run already shows its live
-        // tool rows and run card, so an unconditional row there duplicated
-        // the busy cue.
+        // Global "Composing…" row for busy work that no run group already
+        // covers (a coordinator/single-agent turn, or a run group that does
+        // not exist yet). Running subagent runs render their own cue inside
+        // their group, so `show_composing_row` defers to them.
         if busy && self.show_composing_row() {
             col = col.push(composing_row(palette, self.shimmer_phase, spacing));
         }
@@ -2366,6 +2285,66 @@ impl State {
 
         // Compose with input bar at the bottom
         column![messages, input_bar(&self.input, palette, spacing, true)].into()
+    }
+
+    /// One run's contiguous transcript group, in dispatch order: the progress
+    /// card, then the run's thinking entries (transcript order), then its tool
+    /// calls and errors (transcript order), then — while the run is still in
+    /// flight — a live composing row. Work always renders here, beneath the
+    /// card, never inside a collapsed card body: the card's expand/collapse
+    /// only governs the progress-summary digest. Muted agents' thinking is
+    /// skipped (the filter stays chat-only).
+    fn run_group<'a>(
+        &'a self,
+        run: &'a SubagentRun,
+        palette: &'a crate::theme::Palette,
+        spacing: &'a Spacing,
+    ) -> Element<'a, Message> {
+        let ordered = self.run_group_indices(&run.run_id);
+        let tool_count = ordered
+            .iter()
+            .filter(|&&idx| matches!(self.entries[idx], ChatEntry::ToolCall { .. }))
+            .count();
+        let expanded = self.expanded_run_id.as_deref() == Some(run.run_id.as_str());
+        let mut group = column![].spacing(4);
+        group = group.push(render_run_card(run, tool_count, palette, spacing, expanded));
+        for &idx in &ordered {
+            if let ChatEntry::Thinking { agent, content, .. } = &self.entries[idx] {
+                let key = thinking_agent_key(agent, content);
+                // Noise thinking collapses to the group's single composing
+                // cue (below) instead of rendering an empty box here.
+                if self.muted_agents.contains(&key) || thinking_content_is_noise(content) {
+                    continue;
+                }
+            }
+            group = group.push(self.render_entry(&self.entries[idx], palette, spacing));
+        }
+        if run.running {
+            group = group.push(composing_row(palette, self.shimmer_phase, spacing));
+        }
+        group.into()
+    }
+
+    /// Owned indices for one run in group render order: thinking entries
+    /// (transcript order) first, then tool calls / errors (transcript order).
+    /// This is the order `run_group` emits and keeps the ordering testable
+    /// without constructing widgets.
+    fn run_group_indices(&self, run_id: &str) -> Vec<usize> {
+        let owned = self.run_owned_indices(run_id);
+        let mut ordered = Vec::with_capacity(owned.len());
+        ordered.extend(
+            owned
+                .iter()
+                .copied()
+                .filter(|&idx| matches!(self.entries[idx], ChatEntry::Thinking { .. })),
+        );
+        ordered.extend(
+            owned
+                .iter()
+                .copied()
+                .filter(|&idx| !matches!(self.entries[idx], ChatEntry::Thinking { .. })),
+        );
+        ordered
     }
 
     /// Runs whose progress card is emitted at transcript index `idx`. Each run
@@ -2401,15 +2380,9 @@ impl State {
             .collect()
     }
 
-    /// One run's work history for its card body: exactly the entries it owns,
-    /// in transcript order — never a contiguous slice.
-    fn run_work(&self, run_id: &str) -> Vec<&ChatEntry> {
-        self.run_owned_indices(run_id).into_iter().map(|idx| &self.entries[idx]).collect()
-    }
-
-    /// Set of entry indices owned by any *live* run. The walk skips these so
-    /// they render only inside their card, and the per-agent thinking buckets
-    /// filter them out for the same reason.
+    /// Set of entry indices owned by any run still tracked in `self.runs`. The
+    /// walk skips these so run-owned entries render only inside their
+    /// contiguous group (never again in the main flow).
     fn run_coverage(&self) -> HashSet<usize> {
         let live: HashSet<&str> = self.runs.iter().map(|run| run.run_id.as_str()).collect();
         self.entries
@@ -2420,17 +2393,22 @@ impl State {
             .collect()
     }
 
-    /// Whether a busy transcript should append the shared "Composing…" row.
+    /// Whether a busy transcript should append the shared bottom "Composing…"
+    /// row.
     ///
-    /// `busy` alone is not enough: a run that is only executing tool calls
-    /// already reads as work through its live tool rows and run card, so a
-    /// second cue there is noise. The row shows while thinking is actually in
-    /// flight — an open thinking entry (`finished_at: None`), a streaming
-    /// reply, or a still-running run whose own owned entries carry thinking
-    /// work — plus the one case where nothing else in the transcript is live
-    /// (no running tool call, no running run card), which would otherwise
-    /// leave a busy run rendering with no cue at all.
+    /// A running subagent run renders its own composing cue inside its
+    /// contiguous group, so this defers to it entirely (`false` while any run
+    /// is in flight) rather than double-cueing. Otherwise `busy` alone is not
+    /// enough: a run that is only executing tool calls already reads as work
+    /// through its live tool rows, so the row shows only while thinking is
+    /// actually in flight (an open thinking entry or a streaming reply) or
+    /// when nothing else in the transcript is live (no running tool call) —
+    /// which would otherwise leave a busy coordinator/single-agent turn with
+    /// no cue at all.
     fn show_composing_row(&self) -> bool {
+        if self.has_running_subagent() {
+            return false;
+        }
         let live_thinking = self.entries.iter().any(|entry| match entry {
             ChatEntry::Thinking { finished_at, .. } => finished_at.is_none(),
             ChatEntry::Assistant { streaming, .. } => *streaming,
@@ -2439,18 +2417,10 @@ impl State {
         if live_thinking {
             return true;
         }
-        let running_run_has_thinking = self.runs.iter().filter(|run| run.running).any(|run| {
-            self.run_work(&run.run_id)
-                .into_iter()
-                .any(|entry| matches!(entry, ChatEntry::Thinking { .. }))
-        });
-        if running_run_has_thinking {
-            return true;
-        }
         let tool_in_flight = self.entries.iter().any(|entry| {
             matches!(entry, ChatEntry::ToolCall { status: ToolCallStatus::Running, .. })
         });
-        !tool_in_flight && !self.has_running_subagent()
+        !tool_in_flight
     }
 }
 
@@ -2485,145 +2455,6 @@ fn thinking_buckets(entries: &[ChatEntry]) -> (Vec<String>, HashMap<String, Vec<
     (order, buckets)
 }
 
-/// Strip a legacy `[agent]` prefix from content for headline display.
-fn strip_agent_prefix(content: &str) -> &str {
-    content.split_once("] ").map(|(_, rest)| rest).unwrap_or(content)
-}
-
-/// Digest for a thinking bucket: the first line of the latest `Headline`
-/// entry when one exists, else the latest `Detail` line. `LowLevel` entries
-/// never feed the digest (they render only in the AgentGraph logs, and the
-/// expanded accordion skips them too); a bucket with neither falls back to
-/// the generic label.
-fn thinking_headline_from_entries(entries: &[ChatEntry], indices: &[usize]) -> String {
-    let headline_content = indices
-        .iter()
-        .rev()
-        .filter_map(|&idx| match &entries[idx] {
-            ChatEntry::Thinking { content, kind: ThinkingKind::Headline, .. } => {
-                Some(content.as_str())
-            }
-            _ => None,
-        })
-        .next();
-    let last_content = headline_content
-        .or_else(|| {
-            indices
-                .iter()
-                .rev()
-                .filter_map(|&idx| match &entries[idx] {
-                    ChatEntry::Thinking { content, kind: ThinkingKind::Detail, .. } => {
-                        Some(content.as_str())
-                    }
-                    _ => None,
-                })
-                .next()
-        })
-        .unwrap_or("");
-    let first_line = strip_agent_prefix(last_content).lines().next().unwrap_or("").trim();
-    if first_line.is_empty() {
-        return "Thinking…".to_string();
-    }
-    for verb in &["Tuning", "Scoring", "Rehearsing", "Coda", "Starting"] {
-        if let Some(rest) = first_line.strip_prefix(verb) {
-            let tail = rest.trim_start();
-            if tail.is_empty() {
-                return verb.to_string();
-            }
-            let token = tail.split_whitespace().next().unwrap_or("");
-            return format!("{verb} {token}");
-        }
-    }
-    let truncated: String = first_line.chars().take(48).collect();
-    if truncated.len() < first_line.len() {
-        format!("{truncated}…")
-    } else {
-        truncated
-    }
-}
-
-/// Render a thinking bucket as a collapsible accordion panel. Collapsed
-/// shows the agent badge + digest headline + count; expanded shows each
-/// `Headline`/`Detail` entry (`LowLevel` never reaches chat — it is routed
-/// to the AgentGraph logs in `runtime.rs`, and is skipped here defensively).
-/// Entries render at full content with their own entrance fade and live
-/// shimmer (fade-only — see `add_thinking`); reduced-motion renders them
-/// static and instantly opaque.
-fn render_thinking_group<'a>(
-    group: &ThinkingGroup,
-    entries: &'a [ChatEntry],
-    palette: &'a crate::theme::Palette,
-    entrance_ticks: &'a std::collections::HashMap<EntryId, u8>,
-    reduced_motion: bool,
-    shimmer_phase: u32,
-    spacing: &'a Spacing,
-) -> Element<'a, Message> {
-    let count = group.indices.len();
-
-    let agent_color =
-        crate::theme::agent_color_from_id(&group.agent_id, palette).unwrap_or(palette.text_muted);
-    // Subtle panel: a low-alpha surface wash with a hairline border, matching
-    // the single Thinking entry's ambient treatment.
-    let panel_style = |_theme: &iced::Theme| container::Style {
-        background: Some(Background::Color(with_alpha(palette.surface_variant, 0.28))),
-        border: Border {
-            radius: Radius::from(8.0),
-            width: 1.0,
-            color: with_alpha(palette.border, 0.45),
-        },
-        ..container::Style::default()
-    };
-
-    if !group.expanded {
-        // Collapsed: single header row with agent badge + headline + count.
-        let label =
-            format!("[{}] ‖ {headline} ×{count}", group.agent_id, headline = group.headline);
-        let toggle_btn = button(text("▶").size(11))
-            .style(crate::ui::button::secondary)
-            .on_press(Message::ToggleEntry(group.first_id));
-        container(row![toggle_btn, text(label).size(12).color(agent_color)].spacing(4))
-            .padding([spacing.xs, spacing.sm])
-            .style(panel_style)
-            .into()
-    } else {
-        // Expanded: each entry renders its full content with a per-entry
-        // entrance fade and (while the phase is still open) a live shimmer.
-        let mut col = column![].spacing(2);
-        let header = row![
-            button(text("▼").size(11))
-                .style(crate::ui::button::secondary)
-                .on_press(Message::ToggleEntry(group.first_id)),
-            text(format!("[{}] ‖ {headline} ×{count}", group.agent_id, headline = group.headline))
-                .size(12)
-                .color(agent_color),
-        ]
-        .spacing(4);
-        col = col.push(header);
-        for &idx in &group.indices {
-            if let ChatEntry::Thinking { id, content, kind, finished_at, .. } = &entries[idx] {
-                if *kind == ThinkingKind::LowLevel || thinking_content_is_noise(content) {
-                    continue;
-                }
-                let fade = entrance_alpha(entrance_ticks.get(id).copied());
-                let color = if finished_at.is_none() && !reduced_motion {
-                    with_alpha(shimmer_color(palette, shimmer_phase), fade)
-                } else {
-                    with_alpha(palette.text_muted, fade)
-                };
-                col = col.push(
-                    container(text(content.clone()).size(13).color(color))
-                        .padding([spacing.xs, spacing.sm]),
-                );
-            }
-        }
-        container(col)
-            .padding([spacing.xs, spacing.sm])
-            .width(Length::Fill)
-            .style(panel_style)
-            .into()
-    }
-}
-
 /// Whether a thinking entry carries no information: empty/whitespace-only, or
 /// a bare system message. These collapse to the shared animation row instead
 /// of rendering as an empty box.
@@ -2632,9 +2463,41 @@ fn thinking_content_is_noise(content: &str) -> bool {
     trimmed.is_empty() || trimmed.to_ascii_lowercase().starts_with("[system]")
 }
 
+/// Small inline animated mark for the "Composing…" row: three dots whose
+/// opacity travels with the shimmer phase so the row reads as visibly alive
+/// rather than static text. Palette colors only (accent, alpha-modulated).
+fn composing_mark<'a>(
+    palette: &'a crate::theme::Palette,
+    shimmer_phase: u32,
+) -> Element<'a, Message> {
+    // Triangle wave in `[0.0, 1.0]` over `SHIMMER_PERIOD` ticks each way,
+    // offset per dot so the highlight travels across the row.
+    let wave = |offset: u32| {
+        let phase = shimmer_phase.wrapping_add(offset) % (2 * SHIMMER_PERIOD);
+        if phase < SHIMMER_PERIOD {
+            phase as f32 / SHIMMER_PERIOD as f32
+        } else {
+            (2 * SHIMMER_PERIOD - phase) as f32 / SHIMMER_PERIOD as f32
+        }
+    };
+    let mut dots = row![].spacing(3).align_y(Alignment::Center);
+    for i in 0..3u32 {
+        let color = with_alpha(palette.accent, 0.25 + 0.75 * wave(i * 3));
+        dots =
+            dots.push(container(iced::widget::space::Space::new()).width(5.0).height(5.0).style(
+                move |_| container::Style {
+                    background: Some(Background::Color(color)),
+                    border: Border { radius: 999.0.into(), ..Default::default() },
+                    ..container::Style::default()
+                },
+            ));
+    }
+    dots.into()
+}
+
 /// The shared "Composing…" animation row shown while an agent or the
-/// orchestrator is busy. The dot count cycles with the free-running shimmer
-/// phase; every color comes from the palette.
+/// orchestrator is busy. The dot count and the inline mark both cycle with the
+/// free-running shimmer phase; every color comes from the palette.
 fn composing_row<'a>(
     palette: &'a crate::theme::Palette,
     shimmer_phase: u32,
@@ -2642,33 +2505,31 @@ fn composing_row<'a>(
 ) -> Element<'a, Message> {
     let dots = ".".repeat((shimmer_phase as usize % 3) + 1);
     let color = shimmer_color(palette, shimmer_phase);
-    row![text("◆").size(11).color(color), text(format!("Composing{dots}")).size(12).color(color)]
-        .spacing(spacing.xs)
-        .align_y(Alignment::Center)
-        .padding(iced::Padding::ZERO.left(spacing.sm).top(spacing.xs))
-        .into()
+    row![
+        composing_mark(palette, shimmer_phase),
+        text(format!("Composing{dots}")).size(12).color(color),
+    ]
+    .spacing(spacing.xs)
+    .align_y(Alignment::Center)
+    .padding(iced::Padding::ZERO.left(spacing.sm).top(spacing.xs))
+    .into()
 }
 
 /// Render one subagent run's progress card. Collapsed shows the agent badge +
-/// digest + status + tool count; expanded lists the run's work history —
-/// thinking snippets and tool calls the run *owns*. `work` is that owned set
-/// in transcript order (a non-contiguous list: ownership, not a slice, decides
-/// what a card shows, so concurrent runs never repeat each other's entries).
-/// Expanded cards use the live shimmer while the run is still active.
+/// digest + status + tool count; expanded reveals the full progress digest.
+/// The run's thinking/tool work is never nested here — it always renders
+/// inline beneath the card as the run's contiguous group (see `run_group`),
+/// so a collapsed card can no longer hide the work.
 fn render_run_card<'a>(
     run: &'a SubagentRun,
-    work: &[&'a ChatEntry],
+    tool_count: usize,
     palette: &'a crate::theme::Palette,
     spacing: &'a Spacing,
-    expanded_run_id: Option<&str>,
-    shimmer_phase: u32,
-    reduced_motion: bool,
+    expanded: bool,
 ) -> Element<'a, Message> {
     let agent_color =
         crate::theme::agent_color_from_id(&run.agent, palette).unwrap_or(palette.text_muted);
 
-    let tool_count =
-        work.iter().filter(|&&entry| matches!(entry, ChatEntry::ToolCall { .. })).count();
     let status_color = if run.running { palette.success } else { palette.text_muted };
     let status_label = if run.running { "running" } else { "done" };
     let summary =
@@ -2684,7 +2545,6 @@ fn render_run_card<'a>(
         )
     };
 
-    let expanded = expanded_run_id == Some(run.run_id.as_str());
     let toggle_btn = button(text(if expanded { "▼" } else { "▶" }).size(11))
         .style(crate::ui::button::secondary)
         .on_press(Message::ToggleRun(run.run_id.clone()));
@@ -2699,50 +2559,11 @@ fn render_run_card<'a>(
     .spacing(spacing.xs)
     .align_y(Alignment::Center);
 
-    let body: Element<'a, Message> = if expanded {
-        let mut work_col = column![].spacing(2);
-        for &entry in work {
-            match entry {
-                ChatEntry::Thinking { content, kind, finished_at, .. } => {
-                    if *kind == ThinkingKind::LowLevel || thinking_content_is_noise(content) {
-                        continue;
-                    }
-                    let color = if finished_at.is_none() && !reduced_motion {
-                        shimmer_color(palette, shimmer_phase)
-                    } else {
-                        palette.text_muted
-                    };
-                    work_col = work_col.push(
-                        container(text(content.clone()).size(12).color(color))
-                            .padding([spacing.xs, spacing.sm]),
-                    );
-                }
-                ChatEntry::ToolCall { tool_name, status, .. } => {
-                    work_col = work_col.push(
-                        text(format!("[Tool] {tool_name} — {status}"))
-                            .size(12)
-                            .color(palette.text_muted),
-                    );
-                }
-                ChatEntry::Error { content, .. } => {
-                    work_col = work_col.push(text(content.clone()).size(12).color(palette.danger));
-                }
-                ChatEntry::Completion { summary, .. } => {
-                    let kind = if summary.completed { "completed" } else { "stopped" };
-                    work_col = work_col
-                        .push(text(format!("Run {kind}")).size(12).color(palette.text_muted));
-                }
-                ChatEntry::User { .. } | ChatEntry::Assistant { .. } => {}
-            }
-        }
-        work_col.into()
-    } else {
-        column![].height(0).into()
-    };
-
     let mut card = column![header].spacing(spacing.xs);
     if expanded {
-        card = card.push(body);
+        // Full progress digest: the header truncates multi-line summaries to
+        // their first line; expanding reveals the rest.
+        card = card.push(text(summary.to_string()).size(12).color(palette.text_muted));
     }
     container(card)
         .padding([spacing.xs, spacing.sm])
@@ -4098,105 +3919,27 @@ mod tests {
     }
 
     #[test]
-    fn headline_digest_falls_back_to_detail_and_skips_low_level() {
-        let entries = vec![
-            ChatEntry::Thinking {
-                id: 1,
-                agent: "coder".into(),
-                content: "older detail".into(),
-                kind: ThinkingKind::Detail,
-                collapsed: false,
-                created_at: None,
-                finished_at: None,
-            },
-            ChatEntry::Thinking {
-                id: 2,
-                agent: "coder".into(),
-                content: "latest detail".into(),
-                kind: ThinkingKind::Detail,
-                collapsed: false,
-                created_at: None,
-                finished_at: None,
-            },
-            ChatEntry::Thinking {
-                id: 3,
-                agent: "coder".into(),
-                content: "[system_instructions]".into(),
-                kind: ThinkingKind::LowLevel,
-                collapsed: false,
-                created_at: None,
-                finished_at: None,
-            },
-        ];
-        assert_eq!(thinking_headline_from_entries(&entries, &[0, 1, 2]), "latest detail");
-    }
-
-    #[test]
-    fn headline_digest_low_level_only_stays_generic() {
-        let entries = vec![ChatEntry::Thinking {
-            id: 1,
-            agent: "coder".into(),
-            content: "[system_instructions]".into(),
-            kind: ThinkingKind::LowLevel,
-            collapsed: false,
-            created_at: None,
-            finished_at: None,
-        }];
-        assert_eq!(thinking_headline_from_entries(&entries, &[0]), "Thinking…");
-    }
-
-    /// The composer is write-only now: its placeholder documents the send
-    /// chord rather than the relocated `/thinking` toggle.
-    #[test]
-    fn composer_placeholder_advertises_send_chord() {
-        assert!(COMPOSER_PLACEHOLDER.contains("Ctrl+Enter"));
-    }
-
-    #[test]
-    fn headline_digest_prefers_latest_headline_entry() {
-        let entries = vec![
-            ChatEntry::Thinking {
-                id: 1,
-                agent: "coder".into(),
-                content: "old detail".into(),
-                kind: ThinkingKind::Detail,
-                collapsed: false,
-                created_at: None,
-                finished_at: None,
-            },
-            ChatEntry::Thinking {
-                id: 2,
-                agent: "coder".into(),
-                content: "Starting work".into(),
-                kind: ThinkingKind::Headline,
-                collapsed: false,
-                created_at: None,
-                finished_at: None,
-            },
-            ChatEntry::Thinking {
-                id: 3,
-                agent: "coder".into(),
-                content: "newer detail".into(),
-                kind: ThinkingKind::Detail,
-                collapsed: false,
-                created_at: None,
-                finished_at: None,
-            },
-        ];
-        assert_eq!(thinking_headline_from_entries(&entries, &[0, 1, 2]), "Starting work");
-    }
-
-    #[test]
     fn toggle_thinking_all_collapses_then_expands() {
         let mut state = State::new();
         state.add_thinking("coder", "x".to_string(), ThinkingKind::Detail);
-        // Nothing open: first toggle expands all.
+        // Short content starts expanded: the first toggle collapses all.
         state.toggle_thinking_all();
-        assert!(state.thinking_expand_all);
-        // Anything open: next toggle collapses all.
+        assert!(
+            state
+                .entries()
+                .iter()
+                .all(|entry| matches!(entry, ChatEntry::Thinking { collapsed: true, .. })),
+            "first toggle collapses every thinking entry"
+        );
+        // Anything collapsed: the next toggle expands all.
         state.toggle_thinking_all();
-        assert!(!state.thinking_expand_all);
-        assert_eq!(state.expanded_thinking_id, None);
+        assert!(
+            state
+                .entries()
+                .iter()
+                .all(|entry| matches!(entry, ChatEntry::Thinking { collapsed: false, .. })),
+            "second toggle expands every thinking entry"
+        );
     }
 
     #[test]
@@ -4204,12 +3947,47 @@ mod tests {
         // The input-bar toggle must reach `toggle_thinking_all` through the
         // message bus (it is forwarded from App::update unhandled).
         let mut state = State::new();
-        state.add_error("notes".to_string());
-        assert!(!state.thinking_expand_all, "sanity: nothing open yet");
+        state.add_thinking("coder", "notes".to_string(), ThinkingKind::Detail);
         let _ = state.update(Message::ToggleThinkingAll);
-        assert!(state.thinking_expand_all, "first toggle opens all thinking");
+        assert!(state
+            .entries()
+            .iter()
+            .all(|entry| matches!(entry, ChatEntry::Thinking { collapsed: true, .. })));
         let _ = state.update(Message::ToggleThinkingAll);
-        assert!(!state.thinking_expand_all, "second toggle collapses all");
+        assert!(state
+            .entries()
+            .iter()
+            .all(|entry| matches!(entry, ChatEntry::Thinking { collapsed: false, .. })));
+    }
+
+    /// `ToggleEntry` is a per-entry disclosure now (the global bucket
+    /// accordion is gone): it flips exactly one thinking entry's `collapsed`
+    /// flag and leaves its neighbours untouched.
+    #[test]
+    fn toggle_entry_flips_single_thinking_collapsed() {
+        let mut state = State::new();
+        state.add_thinking("coder", "first".to_string(), ThinkingKind::Detail);
+        state.add_error("closes the trailing thinking".to_string());
+        state.add_thinking("reviewer", "second".to_string(), ThinkingKind::Detail);
+        let first_id = match &state.entries()[0] {
+            ChatEntry::Thinking { id, .. } => *id,
+            _ => panic!("expected a thinking entry"),
+        };
+        let _ = state.update(Message::ToggleEntry(first_id));
+        assert!(matches!(state.entries()[0], ChatEntry::Thinking { collapsed: true, .. }));
+        assert!(
+            matches!(state.entries()[2], ChatEntry::Thinking { collapsed: false, .. }),
+            "the other agent's entry is untouched"
+        );
+        let _ = state.update(Message::ToggleEntry(first_id));
+        assert!(matches!(state.entries()[0], ChatEntry::Thinking { collapsed: false, .. }));
+    }
+
+    /// The composer is write-only now: its placeholder documents the send
+    /// chord rather than the relocated `/thinking` toggle.
+    #[test]
+    fn composer_placeholder_advertises_send_chord() {
+        assert!(COMPOSER_PLACEHOLDER.contains("Ctrl+Enter"));
     }
 
     #[test]
@@ -4578,8 +4356,8 @@ mod tests {
 
     /// Concurrent runs by *different* agents interleave in one transcript.
     /// Ownership (not index ranges) keeps their work strictly separated: the
-    /// two cards share zero entries, run-owned thinking never leaks into the
-    /// per-agent buckets, and both cards still render.
+    /// two groups share zero entries, run-owned thinking never leaks into the
+    /// main flow, and both groups still render.
     #[test]
     fn interleaved_cross_agent_runs_share_zero_entries() {
         let mut state = State::new();
@@ -4602,12 +4380,13 @@ mod tests {
 
         let covered = state.run_coverage();
         assert_eq!(covered, (0..state.entries().len()).collect::<HashSet<_>>());
-        // Run-owned thinking renders only inside its card: the per-agent
-        // buckets filter every covered index out.
+        // Every run-owned thinking index is covered, so it can only render
+        // inside its run's contiguous group (the main-flow skip above); the
+        // per-agent buckets are now used only for the mute filter bar counts.
         let (_, buckets) = thinking_buckets(state.entries());
         for indices in buckets.values() {
             for &idx in indices {
-                assert!(covered.contains(&idx), "entry {idx} must render only in its card");
+                assert!(covered.contains(&idx), "entry {idx} must render only in its group");
             }
         }
         // Both cards are emitted, at their dispatch indices.
@@ -4642,11 +4421,37 @@ mod tests {
         let _ = state.view(&theme, true, true, &graph);
     }
 
-    /// The "Composing…" row is gated on thinking activity instead of being
-    /// appended for every busy frame: a tool-call-only run already reads as
-    /// busy through its live tool rows and run card.
+    /// Each run's group renders thinking before tools regardless of transcript
+    /// interleaving, and a running run always carries its own composing cue
+    /// (the group view is exercised for both shapes without panicking).
     #[test]
-    fn composing_row_is_gated_on_thinking_activity() {
+    fn run_group_orders_thinking_then_tools_and_renders_cue() {
+        let mut state = State::new();
+        state.record_subtask_created("r1".into(), "Coder", "do".into());
+        state.add_tool_call("bash".into(), "cargo test".into()); // 0 → tool
+        state.add_thinking("coder", "plan".into(), ThinkingKind::Detail); // 1 → thinking
+        state.add_tool_call("grep".into(), "todo".into()); // 2 → tool
+                                                           // Owned indices in transcript order are [0, 1, 2]; the group order is
+                                                           // thinking first, then tools.
+        assert_eq!(state.run_owned_indices("r1"), vec![0, 1, 2]);
+        assert_eq!(state.run_group_indices("r1"), vec![1, 0, 2]);
+        assert!(state.has_running_subagent(), "a running run renders its own cue");
+
+        let theme = crate::theme::AppTheme::by_name("Midnight");
+        let graph = agent_graph::State::new();
+        let _ = state.view(&theme, true, true, &graph);
+
+        // A running run with no thinking renders the cue alone (no panic).
+        state.record_subtask_created("r2".into(), "Reviewer", "review".into());
+        let _ = state.view(&theme, true, true, &graph);
+        state.record_subtask_finished("r2", None);
+    }
+
+    /// The global bottom "Composing…" row defers to a running subagent run
+    /// (whose contiguous group renders its own cue) and is otherwise gated on
+    /// live thinking instead of being appended for every busy frame.
+    #[test]
+    fn composing_row_defers_to_running_runs_then_gates_on_thinking() {
         let mut state = State::new();
         let _ = state.update(Message::AddUser("go".into()));
         assert!(
@@ -4654,26 +4459,27 @@ mod tests {
             "a busy transcript with no live cue at all still needs the row"
         );
 
-        // Tool work only — the running tool row is the cue, not Composing.
+        // A running subagent run renders its own composing cue inside its
+        // group, so the global row must not duplicate it.
         state.record_subtask_created("t1".into(), "Coder", "do it".into());
+        assert!(!state.show_composing_row(), "a running run owns the composing cue");
+
+        // Tool work only — the running tool row is the cue, not Composing.
         state.add_tool_call("bash".into(), "cargo test".into());
-        assert!(!state.show_composing_row(), "tool-only run suppresses the row");
+        assert!(!state.show_composing_row());
 
-        // Open thinking → the row is shown while thinking is in flight.
+        // Open thinking still defers to the run group while it is running.
         state.add_thinking("coder", "planning the fix".into(), ThinkingKind::Detail);
-        assert!(state.show_composing_row());
+        assert!(!state.show_composing_row());
 
-        // The tool call that closed the thinking is still running, but the
-        // run owns that thinking entry, so the row stays.
-        state.add_tool_call("clippy".into(), "cargo clippy".into());
-        assert!(state.show_composing_row());
-
-        // Settle the run with both tools completed: only a bare busy state is
-        // left, which the row covers again.
+        // Settle the run with the tool still running: the live tool row is the
+        // cue, so the global row stays hidden.
         state.record_subtask_finished("t1", None);
-        assert!(!state.show_composing_row(), "completed tools still render as work");
+        assert!(!state.show_composing_row(), "a running tool still renders as work");
+
+        // Complete the tool: only a bare busy state is left, which the row
+        // covers again.
         state.update_tool_call("bash", String::new(), true);
-        state.update_tool_call("clippy", String::new(), true);
         assert!(state.show_composing_row(), "nothing live is left to show the busy state");
 
         // A streaming reply is live activity too.

@@ -66,6 +66,40 @@ fn status_dot<'a>(running: bool, app: &'a App) -> Element<'a, Message> {
         .into()
 }
 
+/// Build the per-agent model picker shared by roster and coordinator cards.
+///
+/// The agent's current override is unioned into the shared option list
+/// (prepended when absent) so `selected` resolves to the *actual* assigned
+/// model even when it belongs to another provider and is therefore missing
+/// from the active provider's list. Without the union the picker silently
+/// falls back to the "Default model" placeholder. Passing an owned `Vec`
+/// keeps the list alive inside the widget (no borrow of the per-frame view);
+/// the placeholder only shows when the override is `None`.
+fn agent_model_picker<'a>(
+    app: &App,
+    agent_id: &str,
+    model_override: Option<&String>,
+) -> Element<'a, Message> {
+    let ts = app.current_theme.type_scale;
+    let mut options = app.chat_model_options.clone();
+    if let Some(model) = model_override {
+        if !options.iter().any(|option| option == model) {
+            options.insert(0, model.clone());
+        }
+    }
+    let selected = model_override.cloned();
+    let agent_id = agent_id.to_string();
+    pick_list(options, selected, move |model| Message::SetAgentModel {
+        agent_id: agent_id.clone(),
+        model,
+    })
+    .placeholder("Default model")
+    .text_size(ts.caption)
+    .padding([2, 6])
+    .width(Length::Fill)
+    .into()
+}
+
 /// One agent card: avatar + name + model dropdown + per-agent status light.
 /// The model picker quick-swaps that agent's override via `SetAgentModel`
 /// using the same unified model list as the composer used to.
@@ -79,20 +113,10 @@ fn agent_card<'a>(
     let theme = &app.current_theme;
     let palette = &theme.palette;
     let sp = &theme.spacing;
-    let ts = &theme.type_scale;
     let role_color_val = role_color(app, role);
     let running = app.chat.agent_running(role);
 
-    let selected =
-        model_override.filter(|model| app.chat_model_options.iter().any(|option| option == *model));
-    let agent_id = id.to_string();
-    let picker = pick_list(app.chat_model_options.as_slice(), selected, move |model| {
-        Message::SetAgentModel { agent_id: agent_id.clone(), model }
-    })
-    .placeholder("Default model")
-    .text_size(ts.caption)
-    .padding([2, 6])
-    .width(Length::Fill);
+    let picker = agent_model_picker(app, id, model_override);
 
     container(
         column![
@@ -116,36 +140,62 @@ fn agent_card<'a>(
     .into()
 }
 
-/// Read-only coordinator info card: avatar + name + model, no dropdown (the
-/// coordinator is engine-owned, not a roster row).
+/// Coordinator card: identical container and model picker to [`agent_card`],
+/// so the engine-owned coordinator reads as a peer roster row. The
+/// "engine-owned" note is preserved as a tooltip on the picker rather than
+/// inline text.
+///
+/// Both roster states render this same card. `Some(coord)` is the engine-owned
+/// row already present in `State::agents`; `None` is a config-owned roster,
+/// whose persist path never writes the coordinator back, so the card falls
+/// back to the frozen defaults (name "Coordinator", default model, idle light)
+/// instead of degrading to bare text. The fallback picker still emits
+/// `SetAgentModel` for the `coordinator` id, which creates the assignment and
+/// the missing row — flipping the card into the `Some` state on first pick.
 fn coordinator_card<'a>(
     app: &'a App,
-    coord: &'a crate::views::orchestration_studio::AgentConfig,
+    coord: Option<&'a crate::views::orchestration_studio::AgentConfig>,
 ) -> Element<'a, Message> {
     let theme = &app.current_theme;
     let palette = &theme.palette;
     let sp = &theme.spacing;
-    let role_color_val = role_color(app, &coord.role);
+    let (id, name, role, model_override) = match coord {
+        Some(coord) => (
+            coord.id.as_str(),
+            coord.name.as_str(),
+            coord.role.as_str(),
+            coord.model_override.as_ref(),
+        ),
+        // Fallback: the frozen definition's identity, so the picker targets
+        // exactly the row `set_agent_model_override` creates.
+        None => ("coordinator", "Coordinator", "coordinator", None),
+    };
+    let role_color_val = role_color(app, role);
     // The coordinator is active while the run is in flight and no specialist
-    // currently owns the work.
-    let running = app.run_status == RunStatus::Running && !app.chat.has_running_subagent();
-    let model = coord.model_override.as_deref().unwrap_or("Default model");
+    // currently owns the work; an absent row never runs, so it stays idle.
+    let running =
+        coord.is_some() && app.run_status == RunStatus::Running && !app.chat.has_running_subagent();
+    let picker = tooltip(
+        agent_model_picker(app, id, model_override),
+        text("Engine-owned coordinator model").size(11),
+        Position::Left,
+    );
 
     container(
-        row![
-            agent_avatar(app, &coord.role),
-            column![
-                text(&coord.name)
+        column![
+            row![
+                agent_avatar(app, role),
+                column![text(name)
                     .size(14)
-                    .style(move |_| iced::widget::text::Style { color: Some(role_color_val) }),
-                text(model).size(12).color(palette.text_muted),
+                    .style(move |_| iced::widget::text::Style { color: Some(role_color_val) }),]
+                .width(Length::Fill),
+                status_dot(running, app),
             ]
-            .spacing(2)
-            .width(Length::Fill),
-            status_dot(running, app),
+            .align_y(Alignment::Center)
+            .spacing(sp.sm),
+            picker,
         ]
-        .align_y(Alignment::Center)
-        .spacing(sp.sm),
+        .spacing(sp.xs),
     )
     .padding(10)
     .style(move |_| crate::theme::card_style(palette))
@@ -167,18 +217,12 @@ pub fn quick_panel_view(app: &App) -> Element<'_, Message> {
         RunStatus::Running => ("Running", palette.success),
         RunStatus::Cancelling => ("Cancelling", palette.warning),
     };
-    let shortcuts_btn = tooltip(
-        button(text("⌨").size(ts.body))
-            .style(button::text)
-            .padding([2, 6])
-            .on_press(Message::HelpToggled),
-        text("Keyboard shortcuts (?)").size(11),
-        Position::Left,
-    );
+    // The run-status header keeps only the status + collapse control: the
+    // shortcuts button lives in the footer toolbar below, where it cannot be
+    // squeezed behind the divider by the `Fill` run label.
     let header = row![
         text("●").size(ts.caption).color(run_color),
         text(run_label).size(ts.body).width(Length::Fill),
-        shortcuts_btn,
         button(text("»").size(ts.caption)).style(button::text).on_press(Message::ToggleQuickPanel),
     ]
     .spacing(sp.sm)
@@ -209,11 +253,11 @@ pub fn quick_panel_view(app: &App) -> Element<'_, Message> {
     .spacing(sp.sm)
     .width(Length::Fill);
 
-    // --- Coordinator info box (read-only) ---
-    let coordinator: Element<'_, Message> = match app.orchestration_studio.coordinator_agent() {
-        Some(coord) => coordinator_card(app, coord),
-        None => text("Coordinator unavailable").size(ts.caption).color(palette.text_muted).into(),
-    };
+    // --- Coordinator card (same card + model picker as the roster) ---
+    // Both states render the full card: `None` (config-owned roster) falls
+    // back to the frozen defaults rather than degrading to bare text.
+    let coordinator: Element<'_, Message> =
+        coordinator_card(app, app.orchestration_studio.coordinator_agent());
 
     // --- Agent cards (one model dropdown + status light each) ---
     let mut agent_rows = column![].spacing(sp.sm);
@@ -270,6 +314,30 @@ pub fn quick_panel_view(app: &App) -> Element<'_, Message> {
         text("Open Memory (Ctrl+M)").size(11),
         Position::Left,
     );
+    // Shortcuts toolbar: relocated out of the crowded run-status header. The
+    // fixed width guarantees it can never be clipped behind the panel divider
+    // regardless of the run label's length.
+    let shortcuts_btn = tooltip(
+        button(text("⌨").size(ts.body))
+            .style(button::text)
+            .padding([2, 6])
+            .width(Length::Fixed(28.0))
+            .on_press(Message::HelpToggled),
+        text("Keyboard shortcuts (?)").size(11),
+        Position::Left,
+    );
+    let footer_tools = row![memory_btn, shortcuts_btn]
+        .spacing(sp.sm)
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
+
+    // The agent list scrolls; a right-side inner gutter (>= the 10px default
+    // scrollbar width) keeps its vertical scrollbar from overlapping the
+    // cards' right edges. Cards stay `Fill` inside the padded content.
+    let agent_scroll = scrollable(
+        container(agent_rows).width(Length::Fill).padding(iced::Padding::ZERO.right(sp.md)),
+    )
+    .height(Length::FillPortion(2));
 
     let panel = column![
         header,
@@ -286,9 +354,9 @@ pub fn quick_panel_view(app: &App) -> Element<'_, Message> {
             .size(11)
             .shaping(iced::widget::text::Shaping::Advanced)
             .style(move |_| crate::theme::sidebar_header_style(palette)),
-        scrollable(agent_rows).height(Length::FillPortion(2)),
+        agent_scroll,
         rule::horizontal(1),
-        memory_btn,
+        footer_tools,
         rule::horizontal(1),
         text("GIT")
             .size(11)

@@ -4743,10 +4743,12 @@ impl App {
             Subscription::none()
         };
         // One shared 16 ms tick drives every chat animation — the assistant
-        // typewriter reveal, entrance fades and the open-thinking shimmer —
-        // active only while at least one is in flight, so it costs nothing
-        // at idle.
-        let typing_sub = if self.chat.is_revealing() {
+        // typewriter reveal, entrance fades, the open-thinking shimmer and the
+        // "Composing…" row. Active while a reveal is in flight OR any run is in
+        // progress (`run_status == Running`), so the composing indicator keeps
+        // animating even when the busy work has no reveal/entrance state of its
+        // own (e.g. a coordinator thinking phase before any subagent dispatch).
+        let typing_sub = if self.chat.is_revealing() || self.run_status == RunStatus::Running {
             iced::time::every(std::time::Duration::from_millis(circuit_background::TICK_MS))
                 .map(|_| Message::Chat(views::chat::Message::TypingTick))
         } else {
