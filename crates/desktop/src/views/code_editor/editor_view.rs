@@ -52,6 +52,11 @@ impl State {
                 )
                 .padding(6)
                 .on_press(Message::ToggleTrimTrailing),
+                // Screenshot, restored for this page only: Ctrl+S is Save in
+                // the editor, and the chat input bar no longer carries one.
+                // Sits at the toolbar's end, directly above the find/replace
+                // bar, and dispatches the app-level capture.
+                button(text("📷 Screenshot").size(12)).padding(6).on_press(Message::TakeScreenshot),
             ]
         .spacing(6)
         .align_y(Alignment::Center);
