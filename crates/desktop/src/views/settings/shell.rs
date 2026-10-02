@@ -1,7 +1,9 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use iced::widget::{button, checkbox, column, container, pick_list, row, text, text_input, Column};
+use iced::widget::{
+    button, checkbox, column, container, pick_list, row, text, text_editor, text_input, Column,
+};
 use iced::{Element, Length};
 
 use concerto_config::managed::ManagedRuntimeManager;
@@ -31,7 +33,109 @@ impl fmt::Display for ShellProfileOption {
 
 impl State {
     pub(crate) fn handle_shell_message(&mut self, message: Message) -> iced::Task<Message> {
+        if self.shell_security_busy && !matches!(message, Message::ShellSecurityFinished { .. }) {
+            return iced::Task::none();
+        }
         match message {
+            Message::ShellSecurityReload => {
+                self.shell_security_busy = true;
+                self.shell_security_notice = "Reloading security settings…".into();
+                return iced::Task::perform(
+                    async {
+                        tokio::task::spawn_blocking(|| {
+                            concerto_config::load_global_config(None)
+                                .map(|config| config.shell_security)
+                                .map_err(|error| error.to_string())
+                        })
+                        .await
+                        .unwrap_or_else(|error| Err(error.to_string()))
+                    },
+                    |result| Message::ShellSecurityFinished {
+                        result: Box::new(result),
+                        saved: false,
+                    },
+                );
+            }
+            Message::ShellSecurityFinished { result, saved } => {
+                self.shell_security_busy = false;
+                match *result {
+                    Ok(security) => {
+                        self.shell_security = security;
+                        self.shell_security_editor = text_editor::Content::with_text(
+                            &serde_json::to_string_pretty(&self.shell_security).unwrap_or_default(),
+                        );
+                        self.shell_security_pending = None;
+                        self.shell_security_notice = if saved {
+                            "Security saved. Restart active agent runs to apply it."
+                        } else {
+                            "Security settings reloaded."
+                        }
+                        .into();
+                    }
+                    Err(error) => self.shell_security_notice = error,
+                }
+            }
+            Message::ShellSecurityEdit(action) => {
+                self.shell_security_editor.perform(action);
+                self.shell_security_pending = None;
+            }
+            Message::ShellSecurityPreset(preset) => {
+                let security = match preset {
+                    "read_only" => concerto_core::shell_security::ShellSecurity::read_only(),
+                    "isolated" => concerto_core::shell_security::ShellSecurity::isolated(),
+                    _ => concerto_core::shell_security::ShellSecurity::default(),
+                };
+                self.shell_security_editor = text_editor::Content::with_text(
+                    &serde_json::to_string_pretty(&security).unwrap_or_default(),
+                );
+                self.shell_security_pending = None;
+            }
+            Message::ShellSecurityReview => {
+                match serde_json::from_str::<concerto_core::shell_security::ShellSecurity>(
+                    &self.shell_security_editor.text(),
+                ) {
+                    Ok(mut security) => {
+                        security.revision = self.shell_security.revision;
+                        match security.validate() {
+                            Ok(()) => {
+                                self.shell_security_pending = Some(security);
+                                self.shell_security_notice.clear();
+                            }
+                            Err(error) => self.shell_security_notice = error,
+                        }
+                    }
+                    Err(error) => self.shell_security_notice = error.to_string(),
+                }
+            }
+            Message::ShellSecurityConfirm => {
+                if let Some(security) = self.shell_security_pending.take() {
+                    let Some(path) = concerto_config::default_config_path() else {
+                        self.shell_security_notice = "Global config path is unavailable.".into();
+                        return iced::Task::none();
+                    };
+                    let revision = self.shell_security.revision;
+                    self.shell_security_busy = true;
+                    self.shell_security_notice = "Saving security settings…".into();
+                    return iced::Task::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                concerto_config::shell_security::save_shell_security(
+                                    &path, revision, security,
+                                )
+                                .map_err(|error| error.to_string())
+                            })
+                            .await
+                            .unwrap_or_else(|error| Err(error.to_string()))
+                        },
+                        |result| Message::ShellSecurityFinished {
+                            result: Box::new(result),
+                            saved: true,
+                        },
+                    );
+                }
+            }
+            Message::ShellSecurityCancel => self.shell_security_pending = None,
+
             // ── ADR-28 shell profiles ───────────────────────────────────────
             Message::ShellActiveProfileChanged(id) => {
                 self.shell_active_profile = id;
@@ -252,6 +356,50 @@ impl State {
     pub(super) fn shell_section<'a>(&'a self, theme: &'a AppTheme) -> Element<'a, Message> {
         let palette = &theme.palette;
 
+        let mut security = column![
+            text("Native shell security").size(16),
+            text("Processes execute directly with explicit arguments. Host mode uses your OS permissions. Offline networking and resource limits require container isolation. Protected paths cover native file tools; approved host programs retain ambient access.").size(12).color(palette.text_muted),
+            row![
+                button("Read only").on_press(Message::ShellSecurityPreset("read_only")),
+                button("Ask before changes").on_press(Message::ShellSecurityPreset("default")),
+                button("Isolated offline").on_press(Message::ShellSecurityPreset("isolated")),
+            ].spacing(SPACING_SM),
+            text("All settings are editable below. Revision is managed by Concerto. Changes require review and confirmation.").size(12),
+            text_editor(&self.shell_security_editor).on_action(Message::ShellSecurityEdit).height(320),
+            row![
+                button("Review security changes").on_press(Message::ShellSecurityReview),
+                button("Reload saved security").on_press(Message::ShellSecurityReload),
+            ].spacing(SPACING_SM),
+            text(&self.shell_security_notice).size(12),
+        ].spacing(SPACING_SM);
+        if let Some(pending) = &self.shell_security_pending {
+            let before = serde_json::to_value(&self.shell_security).unwrap_or_default();
+            let after = serde_json::to_value(pending).unwrap_or_default();
+            let changes = after
+                .as_object()
+                .map(|fields| {
+                    fields
+                        .iter()
+                        .filter(|(key, value)| before.get(*key) != Some(*value))
+                        .map(|(key, value)| {
+                            format!(
+                                "{key}: {} → {value}",
+                                before.get(key).unwrap_or(&serde_json::Value::Null)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            security = security.push(text(changes).size(12)).push(
+                row![
+                    button("Confirm and save security").on_press(Message::ShellSecurityConfirm),
+                    button("Cancel").on_press(Message::ShellSecurityCancel),
+                ]
+                .spacing(SPACING_SM),
+            );
+        }
+
         let profile_options = self
             .shell_profiles
             .iter()
@@ -265,9 +413,9 @@ impl State {
 
         let bindings = column![form_field(
             theme,
-            "Agent execution shell",
+            "Optional interpreter profile",
             false,
-            Some("The shell agents use for commands. Validation and the integrated terminal use the same profile."),
+            Some("Compatibility profiles for explicit interpreter use. Enable interpreter compatibility in security to allow shell programs."),
             None::<&str>,
             pick_list(
                 profile_options,
@@ -550,7 +698,8 @@ impl State {
         .spacing(SPACING_SM);
 
         column![
-            text("Choose the shell used by agents. Installed shells are detected automatically; add a profile only for a custom executable or environment.")
+            security,
+            text("Interpreter profiles are optional compatibility settings. Native commands and agent execution do not require these shells.")
                 .size(12)
                 .color(palette.text_muted),
             managed_block,
@@ -560,5 +709,29 @@ impl State {
         ]
         .spacing(SPACING_SM)
         .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // verifies: a failed asynchronous save releases the editor without claiming the new policy.
+    #[test]
+    fn failed_security_save_keeps_last_saved_settings() {
+        let config = concerto_config::AppConfig::default();
+        let mut state = State::from_config(&config);
+        state.shell_security_pending =
+            Some(concerto_core::shell_security::ShellSecurity::read_only());
+        let _task = state.handle_shell_message(Message::ShellSecurityConfirm);
+        assert!(state.shell_security_busy);
+        assert_eq!(state.shell_security, config.shell_security);
+        let _task = state.handle_shell_message(Message::ShellSecurityFinished {
+            result: Box::new(Err("shell security changed; reload before saving".into())),
+            saved: true,
+        });
+        assert!(!state.shell_security_busy);
+        assert_eq!(state.shell_security, config.shell_security);
+        assert!(state.shell_security_notice.contains("reload before saving"));
     }
 }

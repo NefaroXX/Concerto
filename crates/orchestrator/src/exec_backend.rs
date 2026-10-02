@@ -21,6 +21,38 @@ use concerto_core::ids::Ulid;
 use concerto_core::types::{SessionContext, ToolDefinition, ToolOutput};
 use concerto_core::CancellationToken;
 
+/// Route automatic native validation through the same local/supervised gate.
+pub(crate) struct NativeEvalExecutor {
+    pub backend: SharedExecutionBackend,
+    pub session: SessionContext,
+    pub orchestrator_authority: bool,
+}
+
+#[async_trait]
+impl concerto_eval::EvalProcessExecutor for NativeEvalExecutor {
+    async fn execute(
+        &self,
+        program: &str,
+        args: &[&str],
+        cwd: &std::path::Path,
+        cancel: CancellationToken,
+    ) -> Result<ToolOutput, concerto_eval::EvalError> {
+        let input = serde_json::json!({"command":program,"args":args,"cwd":cwd});
+        let call_id = format!("eval-{}", Ulid::new());
+        let result = if self.orchestrator_authority {
+            self.backend
+                .execute_with_authority("shell", input, &call_id, &self.session, cancel)
+                .await
+        } else {
+            self.backend.execute("shell", input, &call_id, &self.session, cancel).await
+        };
+        result.map_err(|error| match error {
+            ToolError::Cancelled => concerto_eval::EvalError::Cancelled,
+            other => concerto_eval::EvalError::TestRunnerFailed(other.to_string()),
+        })
+    }
+}
+
 /// The execution backend seam behind the loop's single tool call site.
 #[async_trait]
 pub trait ToolExecutionBackend: Send + Sync {

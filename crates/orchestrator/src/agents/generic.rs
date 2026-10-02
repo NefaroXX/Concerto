@@ -1403,6 +1403,22 @@ impl GenericSpecialistAgent {
         let eval_dir = (!evidence_files.is_empty() && resolved != session_root.as_std_path())
             .then_some(resolved);
 
+        // Native runtime validators share the actual session's policy and approval gate.
+        let governed_eval = self
+            .tool_executor
+            .as_ref()
+            .filter(|_| self.environment_card.contains("concerto-native"))
+            .map(|executor| {
+                eval.as_ref().clone().with_process_executor(Arc::new(
+                    crate::exec_backend::NativeEvalExecutor {
+                        backend: executor.clone(),
+                        session: context.session.clone(),
+                        orchestrator_authority: false,
+                    },
+                ))
+            });
+        let eval = governed_eval.as_ref().unwrap_or(eval.as_ref());
+
         // Delegate to EvalEngine — no LLM call needed
         let eval_result = match match &eval_dir {
             Some(dir) => eval.run_in_dir(dir, cancel.clone()).await,

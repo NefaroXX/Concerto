@@ -48,37 +48,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "alacritty_terminal"
-version = "0.25.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46319972e74179d707445f64aaa2893bbf6a111de3a9af29b7eb382f8b39e282"
-dependencies = [
- "base64 0.22.1",
- "bitflags 2.13.0",
- "home",
- "libc",
- "log",
- "miow",
- "parking_lot",
- "piper",
- "polling",
- "regex-automata",
- "rustix 1.1.4",
- "rustix-openpty",
- "serde",
- "signal-hook 0.3.18",
- "unicode-width 0.2.0",
- "vte",
- "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "aliasable"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "250f629c0161ad8107cf89319e990051fae62832fd343083bea452d93e2205fd"
-
-[[package]]
 name = "aligned"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1228,6 +1197,7 @@ dependencies = [
  "concerto-plugins",
  "concerto-providers",
  "concerto-sessions",
+ "concerto-shell",
  "concerto-skills",
  "concerto-tools",
  "crossterm",
@@ -1259,6 +1229,7 @@ dependencies = [
  "chrono-tz",
  "concerto-core",
  "dirs 6.0.0",
+ "fd-lock",
  "figment",
  "keyring",
  "semver",
@@ -1319,6 +1290,7 @@ dependencies = [
  "concerto-plugins",
  "concerto-providers",
  "concerto-sessions",
+ "concerto-shell",
  "concerto-skills",
  "concerto-tools",
  "dirs 5.0.1",
@@ -1326,7 +1298,6 @@ dependencies = [
  "iced",
  "iced_core",
  "iced_futures",
- "iced_term",
  "image",
  "notify",
  "notify-debouncer-mini",
@@ -1617,6 +1588,8 @@ dependencies = [
  "camino",
  "concerto-config",
  "concerto-core",
+ "concerto-sessions",
+ "concerto-tools",
  "proptest",
  "serde",
  "serde_json",
@@ -4478,15 +4451,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec9d92d097f4749b64e8cc33d924d9f40a2d4eb91402b458014b781f5733d60f"
 
 [[package]]
-name = "home"
-version = "0.5.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc627f471c528ff0c4a49e1d5e60450c8f6461dd6d10ba9dcd3a61d3dff7728d"
-dependencies = [
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "http"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4777,21 +4741,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "iced_term"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1e287970417db55e0b395a966f061f10c7d3b03fd146d0b8806678d8c063103"
-dependencies = [
- "alacritty_terminal",
- "anyhow",
- "iced",
- "iced_core",
- "iced_graphics",
- "open",
- "tokio",
-]
-
-[[package]]
 name = "iced_tiny_skia"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4839,7 +4788,6 @@ dependencies = [
  "iced_renderer",
  "log",
  "num-traits",
- "ouroboros",
  "rustc-hash 2.1.2",
  "thiserror 2.0.18",
  "unicode-segmentation",
@@ -5138,15 +5086,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 
 [[package]]
-name = "is-docker"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "928bae27f42bc99b60d9ac7334e3a21d10ad8f1835a4e12ec3ec0464765ed1b3"
-dependencies = [
- "once_cell",
-]
-
-[[package]]
 name = "is-terminal"
 version = "0.4.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5155,16 +5094,6 @@ dependencies = [
  "hermit-abi",
  "libc",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "is-wsl"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "173609498df190136aa7dea1a91db051746d339e18476eed5ca40521f02d7aa5"
-dependencies = [
- "is-docker",
- "once_cell",
 ]
 
 [[package]]
@@ -5883,15 +5812,6 @@ dependencies = [
  "libc",
  "log",
  "wasi",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "miow"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "536bfad37a309d62069485248eeaba1e8d9853aaf951caaeaed0585a95346f08"
-dependencies = [
  "windows-sys 0.61.2",
 ]
 
@@ -6650,16 +6570,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
-name = "open"
-version = "5.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0b3d059e795d52b8a72fef45658620edd4d9c359b338564aa14391ffa511ed5"
-dependencies = [
- "is-wsl",
- "libc",
-]
-
-[[package]]
 name = "openssl"
 version = "0.10.81"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6888,30 +6798,6 @@ dependencies = [
  "hmac-sha256",
  "lzma-rust2",
  "ureq",
-]
-
-[[package]]
-name = "ouroboros"
-version = "0.18.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e0f050db9c44b97a94723127e6be766ac5c340c48f2c4bb3ffa11713744be59"
-dependencies = [
- "aliasable",
- "ouroboros_macro",
- "static_assertions",
-]
-
-[[package]]
-name = "ouroboros_macro"
-version = "0.18.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c7028bdd3d43083f6d8d4d5187680d0d3560d54df4cc9d752005268b41e64d0"
-dependencies = [
- "heck 0.4.1",
- "proc-macro2",
- "proc-macro2-diagnostics",
- "quote",
- "syn 2.0.118",
 ]
 
 [[package]]
@@ -7988,17 +7874,6 @@ dependencies = [
  "libc",
  "linux-raw-sys 0.12.1",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "rustix-openpty"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1de16c7c59892b870a6336f185dc10943517f1327447096bbb7bb32cd85e2393"
-dependencies = [
- "errno",
- "libc",
- "rustix 1.1.4",
 ]
 
 [[package]]
@@ -9326,7 +9201,6 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",
@@ -10078,20 +9952,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "vte"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5924018406ce0063cd67f8e008104968b74b563ee1b85dde3ed1f7cb87d3dbd"
-dependencies = [
- "arrayvec",
- "bitflags 2.13.0",
- "cursor-icon",
- "log",
- "memchr",
- "serde",
-]
 
 [[package]]
 name = "wait-timeout"

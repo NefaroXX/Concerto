@@ -37,6 +37,7 @@ pub struct ShellRuntime {
     context: ShellContext,
     registry: CommandRegistry,
     history: ShellHistory,
+    history_enabled: bool,
 }
 
 impl ShellRuntime {
@@ -51,6 +52,7 @@ impl ShellRuntime {
             context,
             registry: CommandRegistry::new(),
             history: ShellHistory::new(DEFAULT_HISTORY_CAPACITY),
+            history_enabled: true,
         };
         for command in standard_commands() {
             runtime.register_read_only(command)?;
@@ -82,6 +84,26 @@ impl ShellRuntime {
 
         let runtime = Self::standard(context)?;
         for command in external_commands(adapter, profiles) {
+            runtime.registry.register(command)?;
+        }
+        Ok(runtime)
+    }
+
+    /// Native commands require no host shell profile. All effects use the adapter.
+    pub fn native(
+        context: ShellContext,
+        adapter: PolicyExecutionAdapter,
+        history_enabled: bool,
+    ) -> Result<Self, RuntimeBuildError> {
+        if !same_project_root(&context.project_root, adapter.project_dir()) {
+            return Err(RuntimeBuildError::ProjectMismatch {
+                context_root: context.project_root,
+                executor_root: adapter.project_dir().to_path_buf(),
+            });
+        }
+        let mut runtime = Self::standard(context)?;
+        runtime.history_enabled = history_enabled;
+        for command in crate::execution::native_commands(adapter) {
             runtime.registry.register(command)?;
         }
         Ok(runtime)
@@ -203,7 +225,7 @@ impl ShellRuntime {
         result.set_duration_ms(duration_ms);
         apply_provenance(&mut result, command.spec().source, &self.context);
 
-        if command.spec().records_history {
+        if self.history_enabled && command.spec().records_history {
             if let Err(error) = self.history.record(result.clone()) {
                 return CommandResult::terminal(
                     &invocation.command,

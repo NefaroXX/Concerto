@@ -498,6 +498,17 @@ impl SqliteSessionStore {
         Ok(store)
     }
 
+    /// Open an additional client connection using the configured at-rest policy.
+    pub async fn connect_shared() -> Result<Self, SessionError> {
+        let pool = Self::open_pool(&app_data_dir()?.join("sessions.db")).await?;
+        Ok(Self { pool, _data_dir_lock: None, at_rest_key: None })
+    }
+
+    /// Audit writer on this store's already configured connection pool.
+    pub fn audit_sink(&self) -> Arc<dyn concerto_core::traits::policy::AuditLog> {
+        Arc::new(audit::SqliteAuditLog::new(self.pool.clone()))
+    }
+
     /// Connect to an explicit database path. SQLite WAL and `busy_timeout`
     /// provide safe multi-process coordination; no process-lifetime advisory
     /// lock is held.

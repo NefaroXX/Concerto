@@ -35,6 +35,16 @@ pub trait PolicyEngine: Send + Sync {
     }
 
     fn audit_log(&self) -> &dyn AuditLog;
+
+    /// User security ceilings remain binding on read-only fast paths whose
+    /// ordinary write-policy evaluation is intentionally advisory.
+    async fn evaluate_security_ceiling(
+        &self,
+        _action: &PolicyAction<'_>,
+        _cancel: CancellationToken,
+    ) -> Result<PolicyVerdict, PolicyError> {
+        Ok(PolicyVerdict::Allow)
+    }
 }
 
 /// Append-only. No deletes, no updates.
