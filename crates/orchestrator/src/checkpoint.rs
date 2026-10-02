@@ -2606,6 +2606,7 @@ mod tests {
                 needed: vec!["obs-1".to_owned()],
                 opened_journal_len: 1,
                 opened_ref: Some("obs-1".to_owned()),
+                subject_decision_id: Some("dec-9".to_owned()),
                 opened_at_ms: 900,
                 cycles_open: 2,
                 state: crate::world_model::QuestionState::Open,
