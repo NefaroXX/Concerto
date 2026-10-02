@@ -265,7 +265,23 @@ fn resume_drive_instruction() -> String {
 /// Coordinator's decision loop. The roster ([`Self::render_specialist_roster`])
 /// is injected after these instructions; the Orchestration Studio's
 /// supplemental prompt (ADR-35 §5) is appended after everything.
+///
+/// Issue #146 (ADR-76): the prompt opens with an explicit DECISION BOUNDARY
+/// that separates "the Coordinator owns the turn" from "the turn requires a
+/// specialist" — ordinary conversation is a valid terminal outcome and
+/// delegation must not be manufactured for it — while restating that
+/// `ActionRequired` work keeps the mandatory-dispatch invariant enforced by
+/// `run_dispatch_session`'s prose-only guard. Prompt text only: the modes,
+/// the guard, and the runtime classification are #145/#147 concerns and are
+/// not changed here.
 const COORDINATOR_DISPATCH_PROMPT: &str = r#"You are the Coordinator: the sole decision-maker of a multi-agent software project. You decide which specialist to call, when, and with what task — no code decides for you.
+
+Decision boundary (read this before the steps below):
+- You own every turn that reaches this session. Owning the turn does NOT mean the turn requires a specialist: judge the objective in front of you, not the fact that it arrived at the Coordinator.
+- If the objective is ordinary conversation, or an informational answer that needs no workspace work and no specialist expertise, answer directly with NO tool call. Natural conversation is a valid, complete outcome — a turn you can answer plainly is done when you have answered it.
+- Do not manufacture delegation (or investigation, planning, implementation, or review) merely because the turn entered the coordinator. Never invent work, a dispatch, or a task graph to look diligent; a conversational request stays conversational.
+- If the objective actually requires implementation, modification, review, validation, or specialist investigation, use the orchestration machinery described below: step 2's delegation doctrine governs that work, and step 5's roster-exhaustion rule governs who does the work — it never turns a turn that needs no work into a required dispatch.
+- Execution modes name the REQUIREMENT of the run, not your judgment: AnswerOnly carries no orchestration work (answer directly, no dispatch), CoordinatorDecides may be answered directly OR delegated at your discretion, and ActionRequired MUST be dispatched — the mandatory-dispatch invariant for action-required work still applies, and closing such a run in prose while the dispatch graph is empty is re-prompted, then escalated to planning recovery, never accepted as completion. You still decide from the objective itself: no keyword table, greeting corpus, or word router classifies a turn as conversational.
 
 How to work:
 1. Read the objective, the recorded evidence (workspace facts, the design document if one binds), and the specialist roster below.
@@ -1635,6 +1651,12 @@ struct DecomposeResult {
     /// produced when it stopped calling tools; the planning-only depth
     /// surfaces it as the run's final message. Empty on a checkpoint restore.
     dispatch_summary: String,
+    /// Issue #145 conversational close: `Some` prose when the dispatch
+    /// session answered directly in pure prose (zero tool calls) — the
+    /// zero-dispatch run's final message. `None` whenever the session was
+    /// tool-mediated or the summary is empty; `execute_graph` then keeps the
+    /// established completion message. `None` on a checkpoint restore.
+    dispatch_direct_answer: Option<String>,
     /// Loop notes to downgrade the run exit (per-call zero-work flags, an
     /// empty dispatch session on an action-required run, cap/iteration-bound
     /// stops). Consumed by `execute_graph`'s tail. Empty on a restore.
@@ -1670,6 +1692,23 @@ struct DispatchLedger {
     /// `Partial` (per-call zero-work flags, an empty dispatch session on an
     /// action-required run). Consumed by `execute_graph`'s tail.
     notes: Vec<String>,
+    /// Issue #148: how many of the coordinator's OWN dispatch-session tool
+    /// calls were classified mutating by
+    /// [`is_mutating_self_execution_tool`] at attempt time (counted when
+    /// the pre-delegation guard passes and execution is attempted, whether
+    /// or not it succeeds). Observability only: the zero-dispatch post-hoc
+    /// gate downgrades empty-graph runs regardless of this count, while
+    /// partial-dispatch (non-empty graph) runs keep their verdict so
+    /// delegation-failure recovery stays intact — see the vacuous-completion
+    /// gate's partial-dispatch limitation note.
+    coordinator_mutating_calls: u32,
+    /// How many tool calls the Coordinator's decision loop executed in its
+    /// dispatch session (every tool surface: dispatch, consult, investigate,
+    /// splits, waits, executor tools). Drives the conversational-close gate
+    /// (issue #145): a zero-dispatch run whose session used NO tools is a
+    /// pure direct answer, so its prose becomes the run's final message; a
+    /// tool-mediated session keeps the established completion message.
+    coordinator_tool_calls: u32,
 }
 
 /// Issue #63: the coordinator's live-world refiner for one parked wait.
@@ -3214,18 +3253,38 @@ fn tool_executor_offers(executor: Option<&ToolExecutor>, tool_name: &str) -> boo
 /// The precise set of the Coordinator's own tool calls that MUTATE the
 /// workspace, derived from the executor's registered tool names: the `write`
 /// alias, `shell`, and `git`, plus the `filesystem` tool's destructive
-/// operations (`write`/`delete`/`move`/`copy`). Read-only calls (`filesystem`
-/// `read`/`list`/`exists`, LSP, consult, etc.) are never classified here, so
-/// they stay unrestricted.
+/// operations (`write`/`delete`/`move`/`copy`). The LSP mutating tools
+/// (`RenameSymbol` renames a symbol across the workspace,
+/// `ExecuteCodeAction` executes a workspace command) mutate under
+/// non-filesystem names, so they are listed explicitly. Every `mcp:*`
+/// namespaced tool is classified as potentially mutating (conservative:
+/// MCP tools are network-capable and their write behavior is not visible
+/// to this name-based classifier). Read-only calls (`filesystem`
+/// `read`/`list`/`exists`, read-only LSP, consult, etc.) are never
+/// classified here, so they stay unrestricted.
 fn is_mutating_self_execution_tool(tool_name: &str, arguments: &serde_json::Value) -> bool {
+    if tool_name.starts_with("mcp:") {
+        return true;
+    }
     match tool_name {
-        "write" | "shell" | "git" => true,
+        "write" | "shell" | "git" | "RenameSymbol" | "ExecuteCodeAction" => true,
         "filesystem" => matches!(
             arguments.get("operation").and_then(serde_json::Value::as_str),
             Some("write" | "delete" | "move" | "copy")
         ),
         _ => false,
     }
+}
+
+/// Issue #147: the mandatory specialist-dispatch invariant arms ONLY on
+/// [`TaskExecutionMode::ActionRequired`] runs — action-required work with a
+/// capable specialist available cannot close in prose alone. AnswerOnly and
+/// CoordinatorDecides (issue #145) may close in prose; PlanningOnly offers no
+/// dispatch tools. Every prose-only / vacuous-completion guard funnels through
+/// here so the mode predicate cannot drift between sites.
+fn requires_mandatory_dispatch(task: &AgentTask) -> bool {
+    let mode: &TaskExecutionMode = &task.execution_mode;
+    mode.is_action_required()
 }
 /// Resolve each registered agent to the stage kind it staffs, for building the
 /// engine-default collaboration topology (ADR-58 D2/ADR-35).
@@ -6177,7 +6236,7 @@ impl CoordinatorAgent {
     /// preserved input/approval pause, a parked wait, or an empty graph keeps
     /// today's restore behaviour untouched.
     fn resume_needs_implement_drive(&self, task: &AgentTask, result: &DecomposeResult) -> bool {
-        matches!(task.execution_mode, TaskExecutionMode::ActionRequired { .. })
+        requires_mandatory_dispatch(task)
             && self.orchestration_depth == OrchestrationDepth::Full
             && self.run_has_promised_plan()
             && !self.implement_stage_dispatch_occurred(&result.graph, &result.action_ledger)
@@ -6249,6 +6308,8 @@ impl CoordinatorAgent {
             model_assignments: std::mem::take(&mut result.model_assignments),
             action_ledger: std::mem::take(&mut result.action_ledger),
             notes: Vec::new(),
+            coordinator_mutating_calls: 0,
+            coordinator_tool_calls: 0,
         };
         // Persist under the RESTORED run id + sequence so the drive's
         // intermediate checkpoints stay part of the same run history. The
@@ -6319,6 +6380,12 @@ impl CoordinatorAgent {
         result.model_assignments = std::mem::take(&mut ledger.model_assignments);
         result.action_ledger = std::mem::take(&mut ledger.action_ledger);
         result.dispatch_summary = summary;
+        // Issue #145 conversational close, resume-drive edition: same
+        // pure-prose rule as `finish_decompose_result` — the drive's ledger
+        // carries this session's tool calls.
+        result.dispatch_direct_answer = (ledger.coordinator_tool_calls == 0
+            && !result.dispatch_summary.trim().is_empty())
+        .then(|| result.dispatch_summary.clone());
         result.loop_notes.append(&mut ledger.notes);
         // A pause raised by THIS drive (model-requested input, a dispatch
         // pending approval) supersedes whatever the restored row carried;
@@ -6528,6 +6595,12 @@ impl CoordinatorAgent {
         run_context: (String, String, String),
     ) -> Result<DecomposeResult, OrchestratorError> {
         let (summary, objective, objective_hash) = run_context;
+        // Issue #145 conversational close: the session's prose is a direct
+        // answer only when the loop executed NO tool calls (pure prose) and
+        // the summary is non-empty. Read before the ledger is moved below.
+        let dispatch_direct_answer = (ledger.coordinator_tool_calls == 0
+            && !summary.trim().is_empty())
+        .then(|| summary.clone());
         // ADR-35 amendment: an EMPTY graph is a legal decompose result — the
         // Coordinator may decide no dispatch is needed (an answer-only run,
         // or a planning decision to stop). Validation applies to non-empty
@@ -6578,6 +6651,7 @@ impl CoordinatorAgent {
                 model_assignments: HashMap::new(),
                 action_ledger: Vec::new(),
                 dispatch_summary: String::new(),
+                dispatch_direct_answer: None,
                 loop_notes: Vec::new(),
                 requested_user_input: None,
                 pending_approval: None,
@@ -6607,6 +6681,7 @@ impl CoordinatorAgent {
             model_assignments: ledger.model_assignments,
             action_ledger: ledger.action_ledger,
             dispatch_summary: summary,
+            dispatch_direct_answer,
             loop_notes: ledger.notes,
             requested_user_input: self.requested_user_input.take(),
             pending_approval: self.pending_approval.take(),
@@ -6972,6 +7047,7 @@ impl CoordinatorAgent {
             model_assignments,
             action_ledger,
             dispatch_summary: String::new(),
+            dispatch_direct_answer: None,
             loop_notes,
             // TODO #22 (tracking half): an AwaitingUser pause carries its
             // pending question on the checkpoint; the resume hands it to
@@ -7618,6 +7694,7 @@ impl CoordinatorAgent {
         loop_notes: Vec<String>,
         requested_user_input: Option<String>,
         pending_approval: Option<concerto_core::types::PendingApprovalInfo>,
+        dispatch_direct_answer: Option<String>,
     ) -> Result<(AgentOutput, Vec<String>), OrchestratorError> {
         // ADR-52: the run-wide dispatch cap is counted across the whole `run`
         // invocation (the Coordinator decision loop + this graph loop share
@@ -9636,22 +9713,55 @@ impl CoordinatorAgent {
         // Partial and the stall gate below KEEPS the run's checkpoint
         // (persisted with `completed=false`) so a later bare "continue" can
         // resume the run.
-        // Exempt by construction: AnswerOnly root tasks (prose completion is
-        // correct — the mode gate below only arms ActionRequired runs),
+        // Exempt by construction (issue #145): AnswerOnly and
+        // CoordinatorDecides root tasks (prose completion is correct — the
+        // mode gate below only arms ActionRequired runs),
         // PlanningOnly depth (returned before `execute_graph`), runs waiting
-        // on user input (short-circuited to AwaitingUser above), fully
+        // on user input (short-circuited to AwaitingUser above), and fully
         // resolver-reused runs (their graphs hold planned, timeline-resolved
-        // tasks — never empty here), and any run that actually wrote files.
+        // tasks — never empty here).
+        //
+        // Issue #147 tool-surface audit: the coordinator's own file writes do
+        // NOT satisfy the invariant while capable specialists remain. The
+        // dispatch session offers the shared executor's full toolset
+        // (`executor.tool_definitions()`: `filesystem`, `write`, `shell`,
+        // `git`, LSP, MCP bridge), and the pre-delegation refusal
+        // (`guard_self_execution`) classifies the known mutating names
+        // (`write`/`shell`/`git`, destructive `filesystem` ops, the LSP
+        // mutating tools `RenameSymbol`/`ExecuteCodeAction`, and every
+        // `mcp:*` namespaced tool conservatively) — a write-capable tool
+        // under any OTHER unlisted name (future registrations) still
+        // executes unrestricted yet leaves the graph empty. So produced
+        // files excuse an empty dispatch session ONLY
+        // for the roster-empty exhaustion case (lawful §8 self-execution, no
+        // specialist to delegate to); with a non-empty roster the run still
+        // reports Partial. Read-only/orchestration calls (consult,
+        // investigate, wait, reconsider, transfer_ownership, roster logic) are
+        // unaffected — they neither write files nor dispatch, so this gate
+        // never fires because of them. Delegation-failure recovery is
+        // preserved: a run that dispatched (graph non-empty) and then
+        // self-executed past a failed specialist never has an empty graph.
+        // Partial-dispatch limitation (issue #148): when the graph is
+        // NON-empty, coordinator mutating work alongside dispatched subtasks
+        // is tracked (`DispatchLedger::coordinator_mutating_calls` plus a
+        // `CoordinatorSelfImplementing` event per allowed call, including
+        // `unclassified-file-write` for unlisted tools that produce files)
+        // but does NOT downgrade the exit — post-dispatch self-execution is
+        // the lawful delegation-failure recovery path, and attributing which
+        // bytes each party produced is beyond this name-based gate. Only the
+        // zero-dispatch (empty graph) case is gated here.
+        let roster_has_specialists = !self.registry.ids().is_empty();
         let vacuous_execute_dispatch = graph.is_empty()
-            && matches!(&task.execution_mode, TaskExecutionMode::ActionRequired { .. })
+            && requires_mandatory_dispatch(&task)
             && requested_user_input.is_none()
             && self.orchestration_depth == OrchestrationDepth::Full
-            && all_files.is_empty();
+            && (all_files.is_empty() || roster_has_specialists);
         if vacuous_execute_dispatch {
             recoverable_notes.push(
-                "Vacuous-completion guard: this action-required run dispatched zero tasks and \
-                 produced zero files — an empty dispatch session cannot claim completion; the \
-                 run is reported Partial and its checkpoint is preserved for resume."
+                "Vacuous-completion guard: this action-required run dispatched zero tasks — an \
+                 empty dispatch session cannot claim completion, even when the coordinator's own \
+                 tools produced files while capable specialists remained; the run is reported \
+                 Partial and its checkpoint is preserved for resume."
                     .to_owned(),
             );
         }
@@ -9673,10 +9783,7 @@ impl CoordinatorAgent {
         // The note downgrades the exit to Partial, and the stall gate below
         // keeps the checkpoint resumable for a later resume.
         let dispatched_subtasks = action_ledger.iter().any(|action| action.kind == "dispatched");
-        if matches!(&task.execution_mode, TaskExecutionMode::ActionRequired { .. })
-            && dispatched_subtasks
-            && total_tool_calls == 0
-        {
+        if requires_mandatory_dispatch(&task) && dispatched_subtasks && total_tool_calls == 0 {
             recoverable_notes.push(
                 "Zero-work guard: the task required tool work but zero tool calls executed \
                  across the run; the completion claim was not backed by any executed tool."
@@ -9824,7 +9931,7 @@ impl CoordinatorAgent {
         // those failure paths already handle themselves). Stage kinds come
         // from config via `AgentStage::is_implement`; no role name participates.
         let has_code_artifact = all_files.iter().any(|path| is_code_artifact_path(path));
-        if matches!(&task.execution_mode, TaskExecutionMode::ActionRequired { .. })
+        if requires_mandatory_dispatch(&task)
             && self.orchestration_depth == OrchestrationDepth::Full
             && self.run_has_promised_plan()
             && !self.implement_stage_dispatch_occurred(&graph, &action_ledger)
@@ -9950,7 +10057,22 @@ impl CoordinatorAgent {
                 task_id: task.id,
                 session_id: task.session_id,
                 final_message: if recoverable_notes.is_empty() {
-                    "Multi-agent orchestration completed".into()
+                    // Zero-dispatch conversational close (issue #145): the
+                    // Coordinator answered directly in a pure-prose dispatch
+                    // session (no tool calls), so that prose IS the reply —
+                    // not the synthetic orchestration fallback. Gated on the
+                    // empty graph, so dispatched runs keep the established
+                    // completion message; tool-mediated sessions (consult,
+                    // investigate, splits, executor work) keep it too, and
+                    // ActionRequired runs never reach this arm empty (the
+                    // vacuous-completion guard above downgrades them to Partial
+                    // with a note).
+                    if graph.is_empty() {
+                        dispatch_direct_answer
+                            .unwrap_or_else(|| "Multi-agent orchestration completed".into())
+                    } else {
+                        "Multi-agent orchestration completed".into()
+                    }
                 } else {
                     format!(
                     "Automation preserved its workspace changes and session context after recoverable issues remained. {}",
@@ -10078,6 +10200,7 @@ impl CoordinatorAgent {
             model_assignments,
             action_ledger,
             dispatch_summary,
+            dispatch_direct_answer,
             loop_notes,
             requested_user_input,
             pending_approval,
@@ -10214,6 +10337,7 @@ impl CoordinatorAgent {
                 loop_notes,
                 requested_user_input,
                 pending_approval,
+                dispatch_direct_answer,
             )
             .await;
         match outcome {
@@ -10537,7 +10661,7 @@ impl CoordinatorAgent {
         // `planning_recovery_in_progress`, so this never recurses deeper than
         // one level (the run budget is bounded by MAX_PLANNING_RECOVERY_ROUNDS).
         let prose_only_stop = self.orchestration_depth != OrchestrationDepth::PlanningOnly
-            && matches!(task.execution_mode, TaskExecutionMode::ActionRequired { .. })
+            && requires_mandatory_dispatch(task)
             && graph.is_empty();
         if prose_only_stop {
             match self.attempt_prose_only_planning_recovery(task, context, cancel).await {
@@ -11285,7 +11409,7 @@ impl CoordinatorAgent {
         // the nested retry's own prose-only stop is suppressed via
         // `planning_recovery_in_progress` — never deeper than one level.
         let prose_only_stop = self.orchestration_depth != OrchestrationDepth::PlanningOnly
-            && matches!(task.execution_mode, TaskExecutionMode::ActionRequired { .. })
+            && requires_mandatory_dispatch(task)
             && graph.is_empty();
         if prose_only_stop {
             match self.attempt_prose_only_planning_recovery(task, context, cancel).await {
@@ -11415,6 +11539,19 @@ impl CoordinatorAgent {
             if self.write_gate.is_some() {
                 tool_defs.push(transfer_ownership_tool_definition());
             }
+            // Issue #147 audit: the shared executor's tools ride the SAME
+            // dispatch surface (`filesystem`, `write`, `shell`, `git`, LSP,
+            // MCP bridge — whatever the run registered). The coordinator can
+            // therefore reason AND act here, but its direct implementation
+            // work never satisfies the mandatory-dispatch invariant: known
+            // mutating names are refused pre-delegation by
+            // `guard_self_execution`, and anything that slips past the
+            // name-based classifier still leaves the graph empty, so the
+            // prose-only guard (re-prompt ×5, then planning recovery) and the
+            // vacuous-completion backstop report Partial while specialists
+            // remain. Gating decision: post-hoc completion check, NOT tool
+            // removal — the roster-empty exhaustion case and post-dispatch
+            // failure recovery must keep their self-execution path.
             if let Some(executor) = &self.tool_executor {
                 tool_defs.extend(executor.tool_definitions());
             }
@@ -11580,7 +11717,18 @@ impl CoordinatorAgent {
                 max_tokens: Some(8192),
                 stream: false,
             };
-            let (text, reasoning, tool_calls, _usage) = crate::prompts::complete_provider_request(
+            // ADR-48 §4: the planning provider's reported usage is the source
+            // of truth when present; the byte/4 heuristic is the fallback for
+            // providers that report none (`0` is measured, only `None` falls
+            // back). Mirrors the single-agent loop's per-turn accounting.
+            let request_tokens_in = request
+                .messages
+                .iter()
+                .map(|message| message.content.len() as u64)
+                .sum::<u64>()
+                .div_ceil(4);
+            let request_started = std::time::Instant::now();
+            let (text, reasoning, tool_calls, usage) = crate::prompts::complete_provider_request(
                 &self.planning_provider,
                 &request,
                 &self.retry_policy,
@@ -11590,6 +11738,32 @@ impl CoordinatorAgent {
                 cancel,
             )
             .await?; // provider-class errors classify at the decompose level
+                     // The decision loop's own model turns are real spend: record each
+                     // turn on the ledger (and the settled mirror) so a zero-dispatch
+                     // conversational close still carries provider metrics instead of
+                     // reporting tokens 0/0 with an empty metric list.
+            {
+                let measured_in = usage.as_ref().and_then(|u| u.prompt_tokens);
+                let measured_out = usage.as_ref().and_then(|u| u.completion_tokens);
+                let tool_chars = serde_json::to_string(&tool_calls)
+                    .map(|value| value.len() as u64)
+                    .unwrap_or_default();
+                let estimated_out = (text.len() as u64).saturating_add(tool_chars).div_ceil(4);
+                let tokens_in = measured_in.unwrap_or(request_tokens_in);
+                let tokens_out = measured_out.unwrap_or(estimated_out);
+                let cost = self.planning_provider.approximate_cost(tokens_in, tokens_out);
+                let settled = ProviderMetrics {
+                    provider: self.planning_provider.provider_name().to_owned(),
+                    model: model.clone(),
+                    tokens_in,
+                    tokens_out,
+                    cost_usd: cost,
+                    latency_ms: request_started.elapsed().as_millis() as u64,
+                };
+                ledger.provider_metrics.push(settled.clone());
+                self.settled_metrics.push(settled);
+                ledger.total_cost += cost;
+            }
 
             messages.push(Message {
                 role: Role::Assistant,
@@ -11613,12 +11787,14 @@ impl CoordinatorAgent {
                 // `MAX_PROSE_STOP_REPROMPTS`; past that bound the stop stands
                 // and the caller (`decompose_task`) escalates to the
                 // planning-recovery fallback (ADR-45 tier-1b).
-                // Exempt by construction: AnswerOnly task modes (prose is the
-                // correct outcome — the twin tests keep those single-pass)
+                // Exempt by construction (issue #145): AnswerOnly and
+                // CoordinatorDecides task modes (prose is a correct outcome
+                // for both — the coordinator is allowed to answer directly)
                 // and PlanningOnly depth (no tools exist to dispatch with).
-                let prose_only_stop =
-                    matches!(task.execution_mode, TaskExecutionMode::ActionRequired { .. })
-                        && graph.is_empty();
+                // Only ActionRequired arms this guard (issue #147): a mode that
+                // requires work cannot close with prose alone while a capable
+                // specialist remains.
+                let prose_only_stop = requires_mandatory_dispatch(task) && graph.is_empty();
                 if dispatching && prose_only_stop && prose_stop_reprompts < MAX_PROSE_STOP_REPROMPTS
                 {
                     prose_stop_reprompts += 1;
@@ -11673,6 +11849,11 @@ impl CoordinatorAgent {
             let journal_len_before_cycle = self.decision_journal.len();
             let cost_before_cycle = ledger.total_cost;
             let mut observation = crate::progress::CycleObservation::default();
+            // Conversational-close gate (issue #145): every tool call the
+            // session executes marks it tool-mediated, so only a pure-prose
+            // session (zero calls) can close as a direct answer.
+            ledger.coordinator_tool_calls =
+                ledger.coordinator_tool_calls.saturating_add(tool_calls.len() as u32);
 
             for tool_call in tool_calls {
                 if cancel.is_cancelled() {
@@ -15654,6 +15835,15 @@ impl CoordinatorAgent {
             &format!("execute own tool {tool_name}"),
         );
         ledger.total_tool_calls = ledger.total_tool_calls.saturating_add(1);
+        // Issue #148 tracking: flag mutating self-execution attempts in the
+        // dispatch session, so partial-dispatch + coordinator mutating work
+        // is observable even where the post-hoc gate preserves the verdict
+        // (delegation-failure recovery). Counted at attempt time, alongside
+        // `total_tool_calls`.
+        let attempted_mutating = is_mutating_self_execution_tool(tool_name, arguments);
+        if attempted_mutating {
+            ledger.coordinator_mutating_calls = ledger.coordinator_mutating_calls.saturating_add(1);
+        }
         match executor
             .execute_with_authority(tool_name, arguments.clone(), &base_ctx.session, cancel.clone())
             .await
@@ -15663,14 +15853,30 @@ impl CoordinatorAgent {
                     .transition(&decision_id, crate::decisions::DecisionStatus::Settled);
                 // Collect the paths the coordinator's own work touched so
                 // the run's file ledger stays complete.
+                let mut produced_file: Option<camino::Utf8PathBuf> = None;
                 for key in ["destination", "path", "file_path"] {
                     if let Some(path) = output.data.get(key).and_then(serde_json::Value::as_str) {
                         let path = camino::Utf8PathBuf::from(path);
                         if !ledger.all_files.contains(&path) {
-                            ledger.all_files.push(path);
+                            ledger.all_files.push(path.clone());
                         }
+                        produced_file = Some(path);
                         break;
                     }
+                }
+                // Issue #148: an UNLISTED tool that produced a file slipped
+                // past the name-based mutating classifier — the zero-dispatch
+                // post-hoc gate still catches the empty-graph case, but the
+                // partial-dispatch case keeps its verdict by design, so record
+                // the bypass observably instead of silently. Allowed listed
+                // calls already emit `CoordinatorSelfImplementing` via
+                // `guard_self_execution`; this covers the remainder.
+                if !attempted_mutating && produced_file.is_some() {
+                    self.publish_self_implementing(
+                        base_ctx.session.session_id,
+                        tool_name,
+                        "unclassified-file-write",
+                    );
                 }
                 serde_json::to_value(&output).unwrap_or(serde_json::json!({
                     "summary": output.summary,
@@ -18841,6 +19047,7 @@ mod tests {
                 Vec::new(), // loop_notes
                 None,       // requested_user_input
                 None,       // pending_approval
+                None,       // dispatch_direct_answer
             )
             .await
             .expect("execute_graph returns");
@@ -19395,6 +19602,957 @@ mod tests {
         }
         assert!(!is_mutating_self_execution_tool("consult_specialist", &serde_json::json!({})));
         assert!(!is_mutating_self_execution_tool("call_specialist", &serde_json::json!({})));
+    }
+
+    /// Issue #147: the mandatory-dispatch predicate arms ONLY on
+    /// ActionRequired — CoordinatorDecides and AnswerOnly stay prose-exempt
+    /// (issue #145 compatibility).
+    #[test]
+    fn mandatory_dispatch_guard_arms_only_on_action_required() {
+        let session_id = Ulid::new();
+        assert!(requires_mandatory_dispatch(&AgentTask::new_action_required(
+            session_id,
+            "build the thing"
+        )));
+        assert!(!requires_mandatory_dispatch(&AgentTask::new_coordinator_decides(
+            session_id, "hi there"
+        )));
+        assert!(!requires_mandatory_dispatch(&AgentTask::new(session_id, "hi there")));
+    }
+
+    /// A write-capable tool under a name the mutating classifier cannot see
+    /// (mirrors LSP rename/execute-action and `mcp:*` tools, which perform
+    /// workspace work under unlisted names): it writes a real file and reports
+    /// the `path` output shape `handle_executor_tool` ledgers, yet
+    /// `guard_self_execution` waves it through pre-delegation — the exact
+    /// bypass the #147 post-hoc completion gate closes.
+    struct DirectEditTool;
+
+    #[async_trait::async_trait]
+    impl concerto_core::traits::tool::Tool for DirectEditTool {
+        fn name(&self) -> &str {
+            "direct_edit"
+        }
+        fn description(&self) -> &str {
+            "edits a file directly, bypassing specialist ownership"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" }, "content": { "type": "string" } },
+                "required": ["path"]
+            })
+        }
+        fn capability_requirements(&self) -> concerto_core::types::CapabilitySet {
+            concerto_core::types::CapabilitySet::default()
+        }
+        async fn execute(
+            &self,
+            input: serde_json::Value,
+            _policy: &dyn concerto_core::traits::policy::PolicyEngine,
+            session: &concerto_core::types::SessionContext,
+            _cancel: CancellationToken,
+        ) -> Result<concerto_core::types::ToolOutput, concerto_core::ToolError> {
+            let path = input.get("path").and_then(serde_json::Value::as_str).unwrap_or("out.txt");
+            let content =
+                input.get("content").and_then(serde_json::Value::as_str).unwrap_or("// test");
+            let target = session.project_dir.join(path);
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::write(&target, content).map_err(|error| {
+                concerto_core::ToolError::ExecutionFailed { message: error.to_string() }
+            })?;
+            Ok(concerto_core::types::ToolOutput {
+                summary: format!("edited {path}"),
+                data: serde_json::json!({ "path": path }),
+            })
+        }
+    }
+
+    /// An executor carrying only [`DirectEditTool`] under an allow-all policy.
+    fn direct_edit_executor() -> Arc<ToolExecutor> {
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(DirectEditTool));
+        let allow_all = vec![PolicyRule::AutoApprove(Condition::Always)];
+        let policy = Arc::new(SimplePolicyEngine::new(allow_all, Arc::new(TestAudit)));
+        Arc::new(ToolExecutor::new(Arc::new(registry), policy))
+    }
+
+    /// A direct-implementation tool call for the coordinator's own toolset.
+    fn direct_edit_tool_call(path: &str) -> ToolCall {
+        ToolCall {
+            id: format!("direct-{path}"),
+            name: "direct_edit".to_string(),
+            arguments: serde_json::json!({ "path": path, "content": "// generated" }),
+
+            ..Default::default()
+        }
+    }
+
+    /// Issue #147 acceptance (post-hoc gate): on an ActionRequired run with a
+    /// non-empty roster, the coordinator's DIRECT implementation work does not
+    /// satisfy the dispatch invariant. `direct_edit` slips past the
+    /// name-based pre-delegation refusal, writes a real file, and the run
+    /// still closes in prose with zero specialist dispatches — the run must
+    /// report Partial (bounded re-prompts, then the planning-recovery and
+    /// vacuous-completion escalation), never Completed. Read-only and
+    /// orchestration ops stay permitted; the retry budgets
+    /// (`MAX_PROSE_STOP_REPROMPTS`, failover caps) are untouched.
+    #[tokio::test]
+    async fn action_required_direct_write_without_dispatch_stays_partial() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let (mut coordinator, primary) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![
+                CoordinatorTurn::Calls(vec![direct_edit_tool_call("src/direct.rs")]),
+                CoordinatorTurn::Text("done without dispatching".into()),
+            ],
+        );
+        coordinator = coordinator.with_executor(direct_edit_executor());
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_action_required(session_id, "build the thing"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskStarted { .. })),
+            "zero specialist dispatches despite the direct write: {events:?}"
+        );
+        assert!(
+            project_dir.path().join("src/direct.rs").exists(),
+            "the direct implementation work really happened on disk"
+        );
+        assert_eq!(
+            primary.turn_count(),
+            7,
+            "the direct write plus the prose close consume the scripted turns plus exactly \
+             MAX_PROSE_STOP_REPROMPTS re-prompts, got {}",
+            primary.turn_count()
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "an action-required run with zero dispatches must not claim Completed, got: {:?} — {}",
+            output.completion_status,
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Prose-only dispatch guard"),
+            "the prose-only guard names the empty dispatch session: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Vacuous-completion guard"),
+            "direct implementation work does not satisfy the dispatch invariant while capable \
+             specialists remain: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #148 (security follow-ups 1–2): the mutating classifier covers
+    /// the LSP mutating tools and every `mcp:*` namespaced tool, while
+    /// read-only LSP and orchestration tools stay unrestricted.
+    #[test]
+    fn mutating_self_execution_classification_covers_lsp_and_mcp() {
+        for name in ["RenameSymbol", "ExecuteCodeAction"] {
+            assert!(
+                is_mutating_self_execution_tool(name, &serde_json::json!({})),
+                "{name} mutates the workspace"
+            );
+        }
+        for name in ["mcp:github:list_repos", "mcp:server:tool", "mcp:filesystem:write"] {
+            assert!(
+                is_mutating_self_execution_tool(name, &serde_json::json!({})),
+                "{name} is conservatively mutating"
+            );
+        }
+        for name in [
+            "GetHover",
+            "FindReferences",
+            "GetDiagnostics",
+            "GetSemanticTokens",
+            "GetCodeActions",
+            "GetInlayHints",
+        ] {
+            assert!(
+                !is_mutating_self_execution_tool(name, &serde_json::json!({})),
+                "{name} is read-only"
+            );
+        }
+        assert!(!is_mutating_self_execution_tool("mcp", &serde_json::json!({})));
+        assert!(!is_mutating_self_execution_tool("not-mcp:tool", &serde_json::json!({})));
+    }
+
+    /// Issue #148 (security follow-ups 1–2): the pre-delegation refusal fires
+    /// for the newly classified names — `RenameSymbol`,
+    /// `ExecuteCodeAction`, and `mcp:*` — while a non-empty roster has seen
+    /// no delegation attempt. Read-only LSP stays permitted.
+    #[test]
+    fn mutating_guard_refuses_lsp_and_mcp_before_any_delegation() {
+        let bus = EventBus::new(256);
+        let coordinator = coordinator_with_turns(
+            bus,
+            Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+                AgentId::new("coder"),
+                "implemented",
+            )])),
+            vec![],
+        );
+        let session_id = Ulid::new();
+        for name in ["RenameSymbol", "ExecuteCodeAction", "mcp:server:tool"] {
+            let refusal =
+                coordinator.guard_self_execution(session_id, name, &serde_json::json!({}));
+            let refusal = refusal.expect("mutating self-execution must be refused");
+            assert_eq!(
+                refusal.get("error").and_then(serde_json::Value::as_str),
+                Some("delegation_required"),
+                "{name} refuses with the named error"
+            );
+        }
+        assert!(
+            coordinator
+                .guard_self_execution(session_id, "GetHover", &serde_json::json!({}))
+                .is_none(),
+            "read-only LSP passes the guard"
+        );
+        assert!(
+            coordinator
+                .guard_self_execution(
+                    session_id,
+                    "filesystem",
+                    &serde_json::json!({ "operation": "read" })
+                )
+                .is_none(),
+            "read-only filesystem passes the guard"
+        );
+    }
+
+    /// A file-writing stub under an ARBITRARY tool name (issue #148): models
+    /// the LSP mutating tools (`RenameSymbol`, `ExecuteCodeAction`) and
+    /// `mcp:*` tools under their real names, which perform workspace work
+    /// the pre-#148 classifier could not see. Mirrors
+    /// [`DirectEditTool`]'s output shape so the coordinator ledgers the path.
+    struct NamedFileTool {
+        tool_name: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl concerto_core::traits::tool::Tool for NamedFileTool {
+        fn name(&self) -> &str {
+            self.tool_name
+        }
+        fn description(&self) -> &str {
+            "writes a file under a non-filesystem tool name"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" }, "content": { "type": "string" } },
+                "required": ["path"]
+            })
+        }
+        fn capability_requirements(&self) -> concerto_core::types::CapabilitySet {
+            concerto_core::types::CapabilitySet::default()
+        }
+        async fn execute(
+            &self,
+            input: serde_json::Value,
+            _policy: &dyn concerto_core::traits::policy::PolicyEngine,
+            session: &concerto_core::types::SessionContext,
+            _cancel: CancellationToken,
+        ) -> Result<concerto_core::types::ToolOutput, concerto_core::ToolError> {
+            let path = input.get("path").and_then(serde_json::Value::as_str).unwrap_or("out.txt");
+            let content =
+                input.get("content").and_then(serde_json::Value::as_str).unwrap_or("// test");
+            let target = session.project_dir.join(path);
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::write(&target, content).map_err(|error| {
+                concerto_core::ToolError::ExecutionFailed { message: error.to_string() }
+            })?;
+            Ok(concerto_core::types::ToolOutput {
+                summary: format!("{} wrote {path}", self.tool_name),
+                data: serde_json::json!({ "path": path }),
+            })
+        }
+    }
+
+    /// An executor carrying [`NamedFileTool`]s under the given names with an
+    /// allow-all policy.
+    fn named_file_executor(tool_names: &[&'static str]) -> Arc<ToolExecutor> {
+        let mut registry = ToolRegistry::default();
+        for name in tool_names {
+            registry.register(Box::new(NamedFileTool { tool_name: name }));
+        }
+        let allow_all = vec![PolicyRule::AutoApprove(Condition::Always)];
+        let policy = Arc::new(SimplePolicyEngine::new(allow_all, Arc::new(TestAudit)));
+        Arc::new(ToolExecutor::new(Arc::new(registry), policy))
+    }
+
+    /// A coordinator-owned file-write call under an arbitrary tool name.
+    fn named_file_tool_call(tool_name: &str, path: &str) -> ToolCall {
+        ToolCall {
+            id: format!("{tool_name}-{path}"),
+            name: tool_name.to_string(),
+            arguments: serde_json::json!({ "path": path, "content": "// generated" }),
+
+            ..Default::default()
+        }
+    }
+
+    /// Issue #148 (security follow-up, LSP half): with the hardened
+    /// classifier, the coordinator's direct `RenameSymbol` work is refused
+    /// pre-delegation while capable specialists remain — nothing is written
+    /// — and the prose-only close still reports Partial via both
+    /// completion guards. The HIGH-rated LSP bypass is closed end to end.
+    #[tokio::test]
+    async fn action_required_lsp_rename_without_dispatch_stays_partial() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let (mut coordinator, primary) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![
+                CoordinatorTurn::Calls(vec![named_file_tool_call(
+                    "RenameSymbol",
+                    "src/renamed.rs",
+                )]),
+                CoordinatorTurn::Text("renamed without dispatching".into()),
+            ],
+        );
+        coordinator = coordinator.with_executor(named_file_executor(&["RenameSymbol"]));
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_action_required(session_id, "build the thing"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskStarted { .. })),
+            "zero specialist dispatches despite the direct rename: {events:?}"
+        );
+        assert!(
+            !project_dir.path().join("src/renamed.rs").exists(),
+            "the refused rename must not land on disk"
+        );
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::PolicyVerdict { verdict, .. }
+                    if verdict.contains("delegation-required")
+            )),
+            "the rename refusal is a named, policy-visible verdict: {events:?}"
+        );
+        assert_eq!(
+            primary.turn_count(),
+            7,
+            "the refused rename plus the prose close consume the scripted turns plus exactly \
+             MAX_PROSE_STOP_REPROMPTS re-prompts, got {}",
+            primary.turn_count()
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "an action-required run with zero dispatches must not claim Completed, got: {:?} — {}",
+            output.completion_status,
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Prose-only dispatch guard"),
+            "the prose-only guard names the empty dispatch session: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Vacuous-completion guard"),
+            "direct LSP work does not satisfy the dispatch invariant while capable specialists \
+             remain: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #148 (security follow-up, code-action half): with the hardened
+    /// classifier, the coordinator's direct `ExecuteCodeAction` work is refused
+    /// pre-delegation while capable specialists remain — nothing is written
+    /// — and the prose-only close still reports Partial via both
+    /// completion guards. Mirrors
+    /// [`action_required_lsp_rename_without_dispatch_stays_partial`].
+    #[tokio::test]
+    async fn action_required_execute_code_action_without_dispatch_stays_partial() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let (mut coordinator, primary) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![
+                CoordinatorTurn::Calls(vec![named_file_tool_call(
+                    "ExecuteCodeAction",
+                    "src/action.rs",
+                )]),
+                CoordinatorTurn::Text("applied the fix without dispatching".into()),
+            ],
+        );
+        coordinator = coordinator.with_executor(named_file_executor(&["ExecuteCodeAction"]));
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_action_required(session_id, "build the thing"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskStarted { .. })),
+            "zero specialist dispatches despite the direct code action: {events:?}"
+        );
+        assert!(
+            !project_dir.path().join("src/action.rs").exists(),
+            "the refused code action must not land on disk"
+        );
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::PolicyVerdict { verdict, .. }
+                    if verdict.contains("delegation-required")
+            )),
+            "the code-action refusal is a named, policy-visible verdict: {events:?}"
+        );
+        assert_eq!(
+            primary.turn_count(),
+            7,
+            "the refused code action plus the prose close consume the scripted turns plus exactly \
+             MAX_PROSE_STOP_REPROMPTS re-prompts, got {}",
+            primary.turn_count()
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "an action-required run with zero dispatches must not claim Completed, got: {:?} — {}",
+            output.completion_status,
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Prose-only dispatch guard"),
+            "the prose-only guard names the empty dispatch session: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Vacuous-completion guard"),
+            "direct code-action work does not satisfy the dispatch invariant while capable \
+             specialists remain: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #148 (security follow-up, MCP half): with the hardened
+    /// classifier, the coordinator's direct `mcp:*` work is refused
+    /// pre-delegation while capable specialists remain — nothing is written
+    /// — and the prose-only close still reports Partial via both
+    /// completion guards. The MEDIUM-rated MCP bypass is closed end to end.
+    /// Mirrors [`action_required_lsp_rename_without_dispatch_stays_partial`].
+    #[tokio::test]
+    async fn action_required_mcp_tool_without_dispatch_stays_partial() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let (mut coordinator, primary) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![
+                CoordinatorTurn::Calls(vec![named_file_tool_call(
+                    "mcp:server:tool",
+                    "src/mcp_out.rs",
+                )]),
+                CoordinatorTurn::Text("used the MCP tool without dispatching".into()),
+            ],
+        );
+        coordinator = coordinator.with_executor(named_file_executor(&["mcp:server:tool"]));
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_action_required(session_id, "build the thing"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskStarted { .. })),
+            "zero specialist dispatches despite the direct MCP call: {events:?}"
+        );
+        assert!(
+            !project_dir.path().join("src/mcp_out.rs").exists(),
+            "the refused MCP call must not land on disk"
+        );
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::PolicyVerdict { verdict, .. }
+                    if verdict.contains("delegation-required")
+            )),
+            "the MCP refusal is a named, policy-visible verdict: {events:?}"
+        );
+        assert_eq!(
+            primary.turn_count(),
+            7,
+            "the refused MCP call plus the prose close consume the scripted turns plus exactly \
+             MAX_PROSE_STOP_REPROMPTS re-prompts, got {}",
+            primary.turn_count()
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "an action-required run with zero dispatches must not claim Completed, got: {:?} — {}",
+            output.completion_status,
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Prose-only dispatch guard"),
+            "the prose-only guard names the empty dispatch session: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Vacuous-completion guard"),
+            "direct MCP work does not satisfy the dispatch invariant while capable specialists \
+             remain: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #148 conversational matrix: a simple general question needing no
+    /// workspace access completes with a direct coordinator response and zero
+    /// specialist dispatches. The provider serves exactly one turn — the
+    /// ActionRequired-only prose re-prompt guard never fires.
+    #[tokio::test]
+    async fn coordinator_decides_general_question_completes_without_dispatch() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let (mut coordinator, primary) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text("Paris is the capital of France.".into())],
+        );
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_coordinator_decides(session_id, "What is the capital of France?"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskStarted { .. })),
+            "a general question dispatches nothing: {events:?}"
+        );
+        assert!(
+            primary.tool_result_contents().is_empty(),
+            "a general question performs zero tool calls"
+        );
+        assert_eq!(
+            primary.turn_count(),
+            1,
+            "a conversational turn is NOT re-prompted to dispatch (the prose-only guard is \
+             ActionRequired-only)"
+        );
+        assert!(
+            !events.iter().any(|kind| matches!(
+                kind,
+                EventKind::AgentThought { content, .. } if content.contains("coordinator re-prompt")
+            )),
+            "no bounded prose-only re-prompt loop for a conversational turn: {events:?}"
+        );
+        assert!(
+            output.files_modified.is_empty(),
+            "a conversational turn modifies nothing, got: {:?}",
+            output.files_modified
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "a general question completes, got: {:?} — {}",
+            output.completion_status,
+            output.final_message
+        );
+        assert!(
+            !output.final_message.is_empty(),
+            "the coordinator answers directly with a non-empty response"
+        );
+    }
+
+    /// Issue #148 conversational matrix: the coordinator does not manufacture
+    /// task, plan, investigation, or delegation work for conversational input
+    /// — zero tool calls of any kind, zero dispatches, zero files, one model
+    /// turn. (The "Hi there" prose path in
+    /// `coordinator_decides_prose_only_run_completes_without_dispatch` proves
+    /// completion; this test pins the no-manufactured-work half.)
+    #[tokio::test]
+    async fn conversational_turn_manufactures_no_work() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let (mut coordinator, primary) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text("Hello! How can I help you today?".into())],
+        );
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_coordinator_decides(session_id, "Hi there"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskStarted { .. })),
+            "no manufactured delegation: {events:?}"
+        );
+        assert!(
+            primary.tool_result_contents().is_empty(),
+            "no manufactured task/plan/investigation/delegation means zero tool calls"
+        );
+        assert!(
+            output.files_modified.is_empty(),
+            "no manufactured work means no files, got: {:?}",
+            output.files_modified
+        );
+        assert_eq!(
+            primary.turn_count(),
+            1,
+            "no manufactured work means a single model turn, never the 5x re-prompt loop"
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "a conversational turn completes, got: {:?} — {}",
+            output.completion_status,
+            output.final_message
+        );
+    }
+
+    /// Issue #148 orchestration matrix (fix/review/validation family): an
+    /// action-required review request still dispatches the expected
+    /// specialist. The prose-only re-prompt guard does NOT fire (the graph is
+    /// non-empty); the run reports Partial only via the mock-harness
+    /// zero-work guard (scripted specialists perform zero tool calls), which
+    /// is orthogonal to the dispatch invariant.
+    #[tokio::test]
+    async fn action_required_review_request_dispatches_specialist() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("reviewer"), "approved"),
+        ];
+        let (mut coordinator, primary) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist(
+                    "reviewer",
+                    "review the recent auth changes for correctness",
+                )]),
+                CoordinatorTurn::Text("review complete: two nits".into()),
+            ],
+        );
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_action_required(
+                    session_id,
+                    "Review the recent auth changes for correctness",
+                ),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert!(
+            events.iter().any(|kind| {
+                matches!(
+                    kind,
+                    EventKind::SubTaskStarted { role, .. }
+                        if role == &AgentId::new("reviewer")
+                )
+            }),
+            "an action-required review request dispatches the reviewer: {events:?}"
+        );
+        assert_eq!(
+            primary.turn_count(),
+            2,
+            "a dispatching run serves the dispatch turn plus the prose turn — never the \
+             prose-only re-prompt loop"
+        );
+        assert!(
+            !output.final_message.contains("Prose-only dispatch guard"),
+            "the prose-only guard stays silent once the graph is non-empty: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #148 security follow-up 3 (partial-dispatch limitation): when the
+    /// graph is NON-empty, the coordinator's own file-producing work under an
+    /// unlisted name is TRACKED — an observable
+    /// `CoordinatorSelfImplementing` event with reason
+    /// `unclassified-file-write` — but the verdict is preserved (Completed),
+    /// because post-dispatch self-execution is the lawful
+    /// delegation-failure recovery path and this name-based gate cannot
+    /// attribute which party produced each byte. Only the zero-dispatch
+    /// (empty graph) case is gated to Partial. This test pins both halves:
+    /// the tracking event fires AND the run still completes.
+    #[tokio::test]
+    async fn partial_dispatch_with_coordinator_file_write_is_tracked_not_gated() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let (mut coordinator, primary) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist("researcher", "gather context")]),
+                CoordinatorTurn::Calls(vec![direct_edit_tool_call("src/extra.rs")]),
+                CoordinatorTurn::Text("done".into()),
+            ],
+        );
+        coordinator = coordinator.with_executor(direct_edit_executor());
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_action_required(session_id, "build the thing"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert!(
+            events.iter().any(|kind| matches!(kind, EventKind::SubTaskStarted { .. })),
+            "the run really did partially dispatch: {events:?}"
+        );
+        assert!(
+            project_dir.path().join("src/extra.rs").exists(),
+            "the coordinator's own unlisted write really happened on disk"
+        );
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::CoordinatorSelfImplementing { reason, .. }
+                    if reason == "unclassified-file-write"
+            )),
+            "the unlisted file write is tracked observably: {events:?}"
+        );
+        assert_eq!(
+            primary.turn_count(),
+            3,
+            "a dispatching run serves its scripted turns with no prose-only re-prompts, got {}",
+            primary.turn_count()
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "partial-dispatch keeps its verdict by design (recovery preservation); only \
+             zero-dispatch is gated, got: {:?} — {}",
+            output.completion_status,
+            output.final_message
+        );
+        assert!(
+            !output.final_message.contains("Vacuous-completion guard"),
+            "the vacuous gate stays silent once the graph is non-empty: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #148 recovery matrix: cancelling a conversational turn terminates
+    /// promptly with zero specialist dispatches — never the 5x re-prompt
+    /// loop, never a hang. Cancellation machinery itself is covered by
+    /// `mid_batch_cancellation_aborts_without_partial_state` and
+    /// `planning_provider_cancellation_skips_recovery_and_pauses`; this test
+    /// pins the conversational shape (already-cancelled token).
+    #[tokio::test]
+    async fn conversational_cancellation_terminates_without_dispatch() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let (mut coordinator, primary) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text("Hello!".into())],
+        );
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            coordinator.run(
+                AgentTask::new_coordinator_decides(session_id, "Hi there"),
+                context,
+                cancel,
+                None,
+            ),
+        )
+        .await
+        .expect("a cancelled conversational turn terminates (no hang)");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskStarted { .. })),
+            "a cancelled conversational turn dispatches nothing: {events:?}"
+        );
+        match outcome {
+            Err(_) => (),
+            Ok(output) => {
+                assert!(
+                    primary.turn_count() <= 1,
+                    "cancellation never enters the re-prompt loop, got {} turns",
+                    primary.turn_count()
+                );
+                assert!(
+                    !events.iter().any(|kind| matches!(
+                        kind,
+                        EventKind::AgentThought { content, .. }
+                            if content.contains("coordinator re-prompt")
+                    )),
+                    "no re-prompt loop under cancellation: {events:?}"
+                );
+                let _ = output;
+            }
+        }
     }
 
     /// Delegation is NEVER gated on which stage is staffed: a roster with a
@@ -20139,6 +21297,7 @@ mod tests {
                 Vec::new(), // loop_notes
                 None,       // requested_user_input
                 None,       // pending_approval
+                None,       // dispatch_direct_answer
             )
             .await;
 
@@ -21504,6 +22663,7 @@ mod tests {
                 Vec::new(), // loop_notes
                 None,       // requested_user_input
                 None,       // pending_approval
+                None,       // dispatch_direct_answer
             )
             .await
             .expect("execute_graph should succeed");
@@ -23908,6 +25068,7 @@ mod tests {
                 Vec::new(), // loop_notes
                 None,       // requested_user_input
                 None,       // pending_approval
+                None,       // dispatch_direct_answer
             )
             .await;
 
@@ -24212,8 +25373,13 @@ mod tests {
         .await;
 
         assert!(
-            output.final_message.contains("Multi-agent orchestration completed"),
-            "unexpected final message: {}",
+            output.final_message.contains("Researcher"),
+            "a pure-prose zero-dispatch run returns the session prose, got: {}",
+            output.final_message
+        );
+        assert!(
+            !output.final_message.contains("Multi-agent orchestration completed"),
+            "the synthetic fallback must not replace a direct prose answer: {}",
             output.final_message
         );
     }
@@ -24931,9 +26097,12 @@ mod tests {
             output.completion_status,
             output.final_message
         );
+        // The session stops at the first prose turn (pure-prose close), so
+        // the final message is that turn's text — the plan JSON — and never
+        // the synthetic fallback.
         assert!(
-            output.final_message.contains("Multi-agent orchestration completed"),
-            "unexpected final message: {}",
+            output.final_message.contains("Researcher"),
+            "a pure-prose zero-dispatch run returns the session prose, got: {}",
             output.final_message
         );
         assert!(
@@ -28848,6 +30017,7 @@ mod tests {
                 Vec::new(), // loop_notes
                 None,       // requested_user_input
                 None,       // pending_approval
+                None,       // dispatch_direct_answer
             )
             .await
             .expect("execute_graph returns");
@@ -29931,6 +31101,144 @@ mod tests {
             output.completion_status,
             concerto_core::types::AgentCompletionStatus::Completed,
             "an answer-only prose turn stays Completed, got: {:?} — {}",
+            output.completion_status,
+            output.final_message
+        );
+    }
+
+    /// Issue #145 acceptance: an ordinary conversational turn on a
+    /// [`TaskExecutionMode::CoordinatorDecides`] root completes with a direct
+    /// coordinator response and ZERO specialist dispatches — no manufactured
+    /// delegation. This is the "Hi there" path: no word router classifies it;
+    /// the coordinator itself decides no workspace work is required. The
+    /// provider serves exactly one turn, proving the prose-only re-prompt
+    /// guard did NOT fire (it is ActionRequired-only).
+    #[tokio::test]
+    async fn coordinator_decides_prose_only_run_completes_without_dispatch() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let (mut coordinator, primary) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text("Hello! How can I help?".into())],
+        );
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_coordinator_decides(session_id, "Hi there"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskStarted { .. })),
+            "a conversational coordinator-decides turn dispatches nothing: {events:?}"
+        );
+        assert_eq!(
+            primary.turn_count(),
+            1,
+            "a coordinator-decides prose turn is NOT re-prompted to dispatch (the \
+             prose-only guard is ActionRequired-only)"
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "a coordinator-decides prose turn completes, got: {:?} — {}",
+            output.completion_status,
+            output.final_message
+        );
+        // The coordinator's own dispatch-session prose IS the reply: the
+        // synthetic orchestration fallback must never surface for a
+        // zero-dispatch conversational turn.
+        assert_eq!(
+            output.final_message, "Hello! How can I help?",
+            "a conversational coordinator-decides turn returns the provider prose, got: {}",
+            output.final_message
+        );
+        assert!(
+            !output.final_message.contains("Multi-agent orchestration completed"),
+            "the synthetic fallback leaked into a conversational reply: {}",
+            output.final_message
+        );
+        // The dispatch session's model turn is real spend: its metrics ride
+        // the output instead of reporting tokens 0/0 with an empty list.
+        assert!(
+            !output.provider_metrics.is_empty(),
+            "a conversational turn must record its dispatch-session provider metrics"
+        );
+    }
+
+    /// Issue #145: CoordinatorDecides permits OPTIONAL delegation — the
+    /// coordinator may still dispatch a specialist when the work needs it.
+    /// The mode change must not disable dispatch; it only removes the
+    /// mandatory-dispatch invariant from conversational turns. A non-implement
+    /// stage is used so the implement-role zero-work guard (an orthogonal
+    /// concern, out of #145 scope) does not downgrade the exit.
+    #[tokio::test]
+    async fn coordinator_decides_run_may_still_dispatch() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "found")];
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist("researcher", "gather context")]),
+                CoordinatorTurn::Text("here is what I found".into()),
+            ],
+        );
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_coordinator_decides(session_id, "look into the cache staleness"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        let dispatched = events.iter().any(|kind| {
+            matches!(
+                kind,
+                EventKind::SubTaskStarted { role, .. }
+                    if role == &AgentId::new("researcher")
+            )
+        });
+        assert!(
+            dispatched,
+            "a coordinator-decides run still dispatches when the coordinator decides \
+             the work requires it: {events:?}"
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "a dispatched coordinator-decides run completes, got: {:?} — {}",
             output.completion_status,
             output.final_message
         );
@@ -31604,9 +32912,9 @@ mod tests {
             .run(task, context, CancellationToken::new(), None)
             .await
             .expect("the run should complete");
-        assert!(
-            output.final_message.contains("Multi-agent orchestration completed"),
-            "run completes: {}",
+        assert_eq!(
+            output.final_message, "nothing to do",
+            "a pure-prose zero-dispatch run returns the session prose: {}",
             output.final_message
         );
 
@@ -31747,6 +33055,114 @@ mod tests {
                     "Self-execution is permitted ONLY when you have exhausted the roster"
                 ),
             "ADR-74 delegation doctrine is untouched"
+        );
+    }
+
+    /// Issue #146 acceptance (prompt half): the dispatch prompt opens with an
+    /// explicit decision boundary that separates "the Coordinator owns the
+    /// turn" from "the turn requires a specialist" — ordinary conversation is
+    /// a valid, complete outcome answered directly with NO tool call, and
+    /// delegation/investigation must not be manufactured merely because the
+    /// turn reached the coordinator. The boundary references the #145
+    /// execution modes without a hard-coded greeting/keyword router, keeps the
+    /// mandatory-dispatch invariant for `ActionRequired` work (consistent with
+    /// the prose-only guard in `run_dispatch_session`), and leaves the ADR-74
+    /// delegation doctrine and the six numbered steps intact.
+    #[tokio::test]
+    async fn dispatch_prompt_declares_conversation_valid_and_bans_manufactured_delegation() {
+        let bus = EventBus::new(256);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "implemented",
+        )]));
+        let (mut coordinator, provider) = coordinator_with_turns_captured(
+            bus,
+            registry,
+            vec![CoordinatorTurn::Text("nothing to do".into())],
+        );
+        let task = AgentTask::new(Ulid::new(), "build the thing");
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let _ = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("the run should complete");
+
+        let prompt = provider.prompts().into_iter().next().expect("one dispatch-decision prompt");
+
+        // The decision boundary exists and leads the built-in instructions.
+        let boundary = prompt
+            .find("Decision boundary")
+            .expect("the prompt opens with an explicit decision boundary");
+        let steps = prompt.find("How to work:").expect("the numbered steps follow the boundary");
+        assert!(boundary < steps, "the boundary sits before the steps: {prompt}");
+
+        // 1. Ownership is stated, and is explicitly NOT a dispatch requirement.
+        assert!(
+            prompt.contains("own every turn")
+                && prompt.contains("does NOT mean the turn requires a specialist"),
+            "coordinator owns the turn without the turn requiring a specialist"
+        );
+        // 2. Natural conversation is a valid outcome: answer directly, no tool.
+        assert!(
+            prompt.contains("ordinary conversation")
+                && prompt.contains("answer directly with NO tool call")
+                && prompt.contains("Natural conversation is a valid, complete outcome"),
+            "ordinary conversation must be explicitly valid and answered directly"
+        );
+        // 3. No manufactured delegation / invented investigation.
+        assert!(
+            prompt.contains(
+                "Do not manufacture delegation (or investigation, planning, implementation, or review)"
+            ),
+            "delegation must not be manufactured because the turn reached the coordinator"
+        );
+        // 4. Real work still goes through the existing orchestration machinery.
+        assert!(
+            prompt.contains(
+                "If the objective actually requires implementation, modification, review, validation, \
+                 or specialist investigation, use the orchestration machinery described below"
+            ),
+            "actionable objectives still route through the orchestration machinery"
+        );
+        // 5. ActionRequired keeps the mandatory-dispatch invariant, matching the
+        //    prose-only guard's re-prompt-then-escalate contract (never
+        //    contradicted by the conversational clause above).
+        assert!(
+            prompt.contains("ActionRequired MUST be dispatched")
+                && prompt.contains("mandatory-dispatch invariant")
+                && prompt.contains(
+                    "closing such a run in prose while the dispatch graph is empty is re-prompted"
+                ),
+            "action-required work retains mandatory dispatch and the guard's escalation"
+        );
+        // 6. The #145 modes are referenced as requirements, with no word router.
+        assert!(
+            prompt.contains("AnswerOnly carries no orchestration work")
+                && prompt.contains("CoordinatorDecides may be answered directly OR delegated"),
+            "the three execution modes are named by requirement"
+        );
+        assert!(
+            prompt.contains("no keyword table, greeting corpus, or word router"),
+            "the boundary forbids classifying turns by keywords/greetings"
+        );
+        assert!(
+            !prompt.to_lowercase().contains("hello"),
+            "no hard-coded greeting intent may appear in the prompt"
+        );
+        // The pre-existing structure and doctrines survive intact.
+        assert!(
+            prompt.contains("1. Read the objective")
+                && prompt.contains("6. When the objective is met")
+                && prompt.contains("Delegation is the DEFAULT action")
+                && prompt.contains(
+                    "Self-execution is permitted ONLY when you have exhausted the roster"
+                )
+                && prompt.contains("Transforming an EXISTING artifact (no synthesis)"),
+            "the six steps and the ADR-74/ no-synthesis doctrines are untouched"
         );
     }
 

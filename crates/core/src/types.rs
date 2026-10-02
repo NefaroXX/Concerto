@@ -917,6 +917,12 @@ pub enum TaskExecutionMode {
     /// Answer-only mode — the model can respond with text only, no tools required.
     #[default]
     AnswerOnly,
+    /// Coordinator-decides mode (issue #145) — the coordinator owns the turn
+    /// and may answer directly or delegate to a specialist when the work
+    /// requires it. Unlike [`Self::AnswerOnly`], delegation is permitted;
+    /// unlike [`Self::ActionRequired`], closing the turn in prose without a
+    /// dispatch is a valid outcome (no mandatory-dispatch invariant).
+    CoordinatorDecides,
     /// Action-required mode — the model MUST use tools to complete the task.
     ActionRequired {
         /// Minimum number of tool calls expected before considering the task complete.
@@ -924,6 +930,27 @@ pub enum TaskExecutionMode {
         /// Whether verification (e.g., running tests) is required after tool execution.
         require_verification: bool,
     },
+}
+
+impl TaskExecutionMode {
+    /// The canonical action-required mode: at least one tool call and
+    /// verification required. Shared by [`AgentTask::new_action_required`] and
+    /// the runtime entry's structural work classification (issue #145).
+    pub const ACTION_REQUIRED: Self =
+        Self::ActionRequired { min_tool_calls: 1, require_verification: true };
+
+    /// Whether this is the strict [`Self::ActionRequired`] mode whose
+    /// mandatory specialist-dispatch invariant must hold. Only this mode arms
+    /// the coordinator's prose-only and vacuous-completion guards (issue #145).
+    pub fn is_action_required(&self) -> bool {
+        matches!(self, Self::ActionRequired { .. })
+    }
+
+    /// Whether the run may delegate work to specialists. True for every mode
+    /// except [`Self::AnswerOnly`] (issue #145).
+    pub fn permits_delegation(&self) -> bool {
+        !matches!(self, Self::AnswerOnly)
+    }
 }
 
 // ---- System prompts (ADR-55 §8) --------------------------------------
@@ -1156,26 +1183,40 @@ pub struct AgentTask {
 impl AgentTask {
     /// Create a new answer-only task (default for conversational prompts).
     pub fn new(session_id: Ulid, description: impl Into<String>) -> Self {
-        Self {
-            id: TaskId::new(),
+        Self::new_with_execution_mode(session_id, description, TaskExecutionMode::AnswerOnly)
+    }
+
+    /// Create a new coordinator-decides task (issue #145): the coordinator
+    /// owns the turn and may answer directly or delegate to a specialist when
+    /// the work requires it. This is the runtime entry's default for ordinary
+    /// conversation and informational requests.
+    pub fn new_coordinator_decides(session_id: Ulid, description: impl Into<String>) -> Self {
+        Self::new_with_execution_mode(
             session_id,
-            description: description.into(),
-            created_at: OffsetDateTime::now_utc(),
-            execution_mode: TaskExecutionMode::AnswerOnly,
-        }
+            description,
+            TaskExecutionMode::CoordinatorDecides,
+        )
     }
 
     /// Create a new action-required task (for template/materialization tasks).
     pub fn new_action_required(session_id: Ulid, description: impl Into<String>) -> Self {
+        Self::new_with_execution_mode(session_id, description, TaskExecutionMode::ACTION_REQUIRED)
+    }
+
+    /// Create a task with an explicit execution mode. The single construction
+    /// path behind [`Self::new`], [`Self::new_coordinator_decides`], and
+    /// [`Self::new_action_required`].
+    pub fn new_with_execution_mode(
+        session_id: Ulid,
+        description: impl Into<String>,
+        execution_mode: TaskExecutionMode,
+    ) -> Self {
         Self {
             id: TaskId::new(),
             session_id,
             description: description.into(),
             created_at: OffsetDateTime::now_utc(),
-            execution_mode: TaskExecutionMode::ActionRequired {
-                min_tool_calls: 1,
-                require_verification: true,
-            },
+            execution_mode,
         }
     }
 
@@ -2347,6 +2388,26 @@ mod tests {
         let task = AgentTask::new_action_required(session_id, "write code");
         assert!(matches!(task.execution_mode, TaskExecutionMode::ActionRequired { .. }));
         assert!(task.is_scoped());
+    }
+
+    #[test]
+    fn agent_task_new_coordinator_decides() {
+        let session_id = Ulid::new();
+        let task = AgentTask::new_coordinator_decides(session_id, "hi there");
+        assert_eq!(task.execution_mode, TaskExecutionMode::CoordinatorDecides);
+    }
+
+    #[test]
+    fn execution_mode_guard_predicates() {
+        // Only ActionRequired is strict; both CoordinatorDecides and
+        // ActionRequired may delegate; AnswerOnly may not.
+        assert!(TaskExecutionMode::ACTION_REQUIRED.is_action_required());
+        assert!(!TaskExecutionMode::CoordinatorDecides.is_action_required());
+        assert!(!TaskExecutionMode::AnswerOnly.is_action_required());
+
+        assert!(TaskExecutionMode::ACTION_REQUIRED.permits_delegation());
+        assert!(TaskExecutionMode::CoordinatorDecides.permits_delegation());
+        assert!(!TaskExecutionMode::AnswerOnly.permits_delegation());
     }
 
     #[test]

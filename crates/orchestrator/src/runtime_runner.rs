@@ -40,7 +40,7 @@ use concerto_core::transcript::{
 use concerto_core::types::ToolRegistry;
 use concerto_core::types::{
     AgentCompletionStatus, AgentContext, AgentId, AgentOutput, AgentStage, AgentTask, DesignDoc,
-    Message, ProjectId, ProviderMetrics, Role, SessionContext, TaskId,
+    Message, ProjectId, ProviderMetrics, Role, SessionContext, TaskExecutionMode, TaskId,
 };
 use concerto_core::types::{Condition, PolicyRule};
 use concerto_core::{
@@ -2914,12 +2914,18 @@ async fn seed_run_continuity(
 /// subtasks were literally built from the approval phrase and the Coder
 /// produced nothing. ADR-60 D7: when the whiteboard state was verified
 /// (`approved`), the structured artifact + ledger description replaces the
-/// legacy rendered-prose description entirely. Under full local agency the
-/// `action_required` flag is set by the caller; routing no longer shapes it.
+/// legacy rendered-prose description entirely.
+///
+/// Issue #145: the caller passes the run's [`TaskExecutionMode`]. An Apply is
+/// real work by construction, so the `apply_plan` arm always builds an
+/// [`TaskExecutionMode::ActionRequired`] task regardless of the passed mode;
+/// every other shape carries the caller's mode verbatim (CoordinatorDecides
+/// for ordinary coordinator turns, AnswerOnly/ActionRequired for the
+/// single-agent path).
 #[allow(clippy::too_many_arguments)]
 fn build_run_task(
     session_id: Ulid,
-    action_required: bool,
+    execution_mode: TaskExecutionMode,
     apply_plan: bool,
     applied_plan: Option<&PlanBinding>,
     approved: Option<&ApprovedPlanContext>,
@@ -2938,10 +2944,8 @@ fn build_run_task(
             // impossible — the Apply arm captures before consuming).
             AgentTask::new_action_required(session_id, input.to_owned())
         }
-    } else if action_required {
-        AgentTask::new_action_required(session_id, input.to_owned())
     } else {
-        AgentTask::new(session_id, input.to_owned())
+        AgentTask::new_with_execution_mode(session_id, input.to_owned(), execution_mode)
     }
 }
 
@@ -3509,11 +3513,31 @@ pub async fn run_shared_agent(
         }
     }
 
-    // Task shape under full local agency: the unified loop is action-capable
-    // for every message. Mutation boundaries are enforced by deny-class policy
-    // rules and the approval sink, never by a keyword-selected answer-only
-    // path.
-    let action_required = true;
+    // Task shape (issue #145): separate the *capability* to act from the
+    // *requirement* to act. Every non-AnswerOnly run stays action-capable (the
+    // capability gate, full topology resolution, and the supervised path below
+    // all key off `action_capable`), but the task's execution mode decides
+    // whether a specialist dispatch is mandatory:
+    // - an approved-plan Apply is real work → ActionRequired;
+    // - a checkpoint-governed resume continues prior (possibly action-required)
+    //   work → ActionRequired, so a stalled action-required run cannot resume
+    //   into a prose-exempt mode;
+    // - a forced single-agent run keeps the action-capable ActionRequired loop
+    //   (unchanged);
+    // - every other coordinator-owned turn → CoordinatorDecides: the
+    //   coordinator may answer directly or delegate. This is the default for
+    //   ordinary conversation and informational requests; no word router
+    //   classifies them (ADR-71: the coordinator is the sole decision-maker).
+    let execution_mode =
+        if apply_plan || req.resume_checkpoint_json.is_some() || req.force_single_agent {
+            TaskExecutionMode::ACTION_REQUIRED
+        } else {
+            TaskExecutionMode::CoordinatorDecides
+        };
+    // Capability (not requirement): true for ActionRequired and
+    // CoordinatorDecides, false only for AnswerOnly. Mutation boundaries remain
+    // enforced by deny-class policy rules and the approval sink.
+    let action_capable = execution_mode.permits_delegation();
 
     // ADR-66 §2(a) selection gate with the §4 fallback carve-out (2026-09-08
     // correction): a tool-requiring run is refused BEFORE any agent
@@ -3529,7 +3553,7 @@ pub async fn run_shared_agent(
     // missing capability. The resolution follows the ADR-66 §3 precedence:
     // explicit config override first, then the built-in family table, then
     // the provider default.
-    if action_required {
+    if action_capable {
         let override_flag = tool_support_override(&services.config, provider_config_id.as_deref());
         // Provider-advertised capability (level 2) is threaded here so a model
         // that advertises its absence is not forced into native tools when a
@@ -3590,7 +3614,7 @@ pub async fn run_shared_agent(
     // ledger description instead of the rendered prose.
     let mut task = build_run_task(
         session_id,
-        action_required,
+        execution_mode,
         apply_plan,
         applied_plan.as_ref(),
         approved_context.as_ref(),
@@ -3686,7 +3710,7 @@ pub async fn run_shared_agent(
             &task,
             event_recorder,
             transcript_recorder,
-            action_required,
+            action_capable,
             plan_objective_hash,
             approved_context.as_ref(),
             &stage_tracker,
@@ -3748,7 +3772,7 @@ pub async fn run_shared_agent(
         event_recorder,
         transcript_recorder,
         envelope,
-        action_required,
+        action_capable,
         &stage_tracker,
         d7_event_pool.clone(),
         project_context,
@@ -3763,7 +3787,9 @@ pub async fn run_shared_agent(
 ///
 /// ADR-55 §1: this path receives every non-forced run. Under full
 /// local agency the coordinator's decision loop engages specialists on need,
-/// never by pre-scanning the user's words; `action_required` is always true.
+/// never by pre-scanning the user's words; the run is action-capable
+/// (`action_capable`), while whether a dispatch is *mandatory* is carried by
+/// the task's own `execution_mode` (issue #145).
 ///
 /// `plan_objective_hash` keys the approved-plan binding resolution.
 ///
@@ -3791,7 +3817,7 @@ async fn run_multi_agent(
     task: &AgentTask,
     event_recorder: EventRecorderGuard,
     transcript_recorder: TranscriptRecorderGuard,
-    action_required: bool,
+    action_capable: bool,
     plan_objective_hash: String,
     approved_plan: Option<&ApprovedPlanContext>,
     stage_tracker: &Arc<Mutex<StageTracker>>,
@@ -3936,7 +3962,7 @@ async fn run_multi_agent(
     // agents) instead of a hardcoded role list. The shape follows the intent
     // gate's effective outcome (ADR-55 §7): Execute runs use the full
     // topology, everything else resolves only the coordinator.
-    let roles_to_resolve: Vec<AgentId> = if action_required {
+    let roles_to_resolve: Vec<AgentId> = if action_capable {
         topology_roles(&services.config.multi_agent)
     } else {
         COORDINATOR_ONLY_ROLES.iter().map(|name| AgentId::new(*name)).collect()
@@ -4136,7 +4162,7 @@ async fn run_multi_agent(
     // runs on the coordinator at planning-only depth. Any preparation gap
     // (no session-DB pool, missing child binary, empty roster) degrades loudly
     // to the coordinator below rather than failing the run.
-    if action_required
+    if action_capable
         && services.config.multi_agent.as_ref().is_some_and(|multi| multi.supervisor_enabled)
     {
         // ADR-60 D7 ledger enrichment (Phase 4): a plan-driven run (its
@@ -7336,7 +7362,14 @@ mod runtime_runner_tests {
         let input = "i approve";
 
         // An Apply run with a captured binding executes the approved plan.
-        let task = build_run_task(session_id, false, true, Some(&binding), None, input);
+        let task = build_run_task(
+            session_id,
+            TaskExecutionMode::ACTION_REQUIRED,
+            true,
+            Some(&binding),
+            None,
+            input,
+        );
         assert!(
             task.description.contains(plan_text),
             "Apply task describes the approved plan, got: {}",
@@ -7357,12 +7390,20 @@ mod runtime_runner_tests {
 
         // Defensive fallback: apply without a captured binding (should be
         // impossible) reuses the input rather than panicking.
-        let fallback = build_run_task(session_id, true, true, None, None, input);
+        let fallback =
+            build_run_task(session_id, TaskExecutionMode::ACTION_REQUIRED, true, None, None, input);
         assert_eq!(fallback.description, input);
 
         // Non-apply routing is unchanged: action-required and answer-only
         // tasks both carry the user's input verbatim.
-        let action = build_run_task(session_id, true, false, None, None, input);
+        let action = build_run_task(
+            session_id,
+            TaskExecutionMode::ACTION_REQUIRED,
+            false,
+            None,
+            None,
+            input,
+        );
         assert_eq!(action.description, input);
         assert!(
             matches!(
@@ -7371,9 +7412,28 @@ mod runtime_runner_tests {
             ),
             "a confirmed Execute must stay action-required"
         );
-        let answer = build_run_task(session_id, false, false, None, None, "explain X");
+        let answer = build_run_task(
+            session_id,
+            TaskExecutionMode::AnswerOnly,
+            false,
+            None,
+            None,
+            "explain X",
+        );
         assert_eq!(answer.description, "explain X");
-        assert_eq!(answer.execution_mode, concerto_core::types::TaskExecutionMode::AnswerOnly);
+        assert_eq!(answer.execution_mode, TaskExecutionMode::AnswerOnly);
+
+        // Issue #145: the coordinator entry's default mode is carried verbatim
+        // through a non-apply build.
+        let conversational = build_run_task(
+            session_id,
+            TaskExecutionMode::CoordinatorDecides,
+            false,
+            None,
+            None,
+            "hi",
+        );
+        assert_eq!(conversational.execution_mode, TaskExecutionMode::CoordinatorDecides);
     }
 
     // ------------------------------------------------------------------
@@ -7465,7 +7525,7 @@ mod runtime_runner_tests {
 
         let task = build_run_task(
             Ulid::new(),
-            true,
+            TaskExecutionMode::ACTION_REQUIRED,
             true,
             Some(&binding),
             Some(&ctx),
@@ -7545,7 +7605,14 @@ mod runtime_runner_tests {
 
         let ctx =
             load_approved_plan(&pool, &binding).await.expect("verified load").expect("approval");
-        let task = build_run_task(Ulid::new(), true, true, Some(&binding), Some(&ctx), "continue");
+        let task = build_run_task(
+            Ulid::new(),
+            TaskExecutionMode::ACTION_REQUIRED,
+            true,
+            Some(&binding),
+            Some(&ctx),
+            "continue",
+        );
         assert!(
             task.description.contains("- 01HQ"),
             "completed subtasks are carried forward: {}",
@@ -7817,7 +7884,14 @@ mod runtime_runner_tests {
         );
 
         // The seed mirrors the hook: a resume-shaped task grows the section.
-        let mut task = build_run_task(session_id, true, false, None, None, "continue");
+        let mut task = build_run_task(
+            session_id,
+            TaskExecutionMode::ACTION_REQUIRED,
+            false,
+            None,
+            None,
+            "continue",
+        );
         assert_eq!(task.description, "continue");
         seed_run_continuity(&mut task, &pool, session_id, None, false).await;
         assert!(
@@ -7858,7 +7932,14 @@ mod runtime_runner_tests {
         .await;
 
         // Headless: the seed rides the verified payload.
-        let mut task = build_run_task(session_id, true, false, None, None, "continue");
+        let mut task = build_run_task(
+            session_id,
+            TaskExecutionMode::ACTION_REQUIRED,
+            false,
+            None,
+            None,
+            "continue",
+        );
         let seed = seed_run_continuity(&mut task, &pool, session_id, None, true)
             .await
             .expect("the headless resume seeds from the verified approval");
@@ -7880,7 +7961,14 @@ mod runtime_runner_tests {
         );
 
         // Checkpoint-governed: no dispatch seed (the §7 evaluator governs).
-        let mut task = build_run_task(session_id, true, false, None, None, "continue");
+        let mut task = build_run_task(
+            session_id,
+            TaskExecutionMode::ACTION_REQUIRED,
+            false,
+            None,
+            None,
+            "continue",
+        );
         assert!(
             seed_run_continuity(&mut task, &pool, session_id, None, false).await.is_none(),
             "a checkpoint-governed resume never takes the headless dispatch cursor"
@@ -8060,7 +8148,14 @@ mod runtime_runner_tests {
         let continuity = load_run_continuity(&pool, session_id, None, false).await.expect("load");
         assert!(continuity.is_empty(), "an empty log is the truthful empty state");
 
-        let mut task = build_run_task(session_id, true, false, None, None, "continue");
+        let mut task = build_run_task(
+            session_id,
+            TaskExecutionMode::ACTION_REQUIRED,
+            false,
+            None,
+            None,
+            "continue",
+        );
         seed_run_continuity(&mut task, &pool, session_id, None, false).await;
         assert_eq!(
             task.description, "continue",
