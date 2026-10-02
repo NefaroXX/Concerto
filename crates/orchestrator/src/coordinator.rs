@@ -4917,6 +4917,53 @@ impl CoordinatorAgent {
             })
     }
 
+    /// Obligation-armed dispatch predicate (concurrent-execution correction):
+    /// whether the run carries runtime-observable execution obligations
+    /// independent of its [`TaskExecutionMode`]. Derives an
+    /// [`ObligationLedger`] from the live graph — implement-stage work maps to
+    /// `Implement`, validate-stage work to `Verify` (stage *kinds*, never role
+    /// names) — and reports open execution work. No text classification: the
+    /// coordinator interprets intent and creates graph work; this only reads
+    /// the resulting state, so conversational turns (empty graph, no plan)
+    /// stay prose-exempt while fresh implementation work in
+    /// `CoordinatorDecides` arms the same guards as `ActionRequired`.
+    ///
+    /// [`ObligationLedger`]: crate::obligations::ObligationLedger
+    fn obligation_dispatch_pending(&self, graph: &TaskGraph) -> bool {
+        let mut ledger = crate::obligations::ObligationLedger::new();
+        ledger.sync_from_graph(graph, |role| {
+            if self.role_in_kind_stage(role, StageKind::Execution, AgentStage::is_implement) {
+                Some(crate::obligations::ObligationKind::Implement)
+            } else if self.role_in_kind_stage(role, StageKind::Acceptance, AgentStage::is_validate)
+            {
+                Some(crate::obligations::ObligationKind::Verify)
+            } else {
+                None
+            }
+        });
+        ledger.has_open_execution_work()
+    }
+
+    /// Combined guard predicate: the legacy mode requirement, open graph
+    /// obligations, or a promised-but-unattempted plan. Every prose-only /
+    /// vacuous-completion / zero-work / unattempted-implementation guard
+    /// funnels through here so the predicate cannot drift between sites.
+    /// Either source arms a requirement; neither disarms the other's.
+    /// `all_files` is the run's produced-file list (tail) or the session
+    /// ledger's (dispatch session): a promised plan with no code artifact is
+    /// unattempted work even when the graph is still empty.
+    fn dispatch_guard_arms(
+        &self,
+        task: &AgentTask,
+        graph: &TaskGraph,
+        all_files: &[camino::Utf8PathBuf],
+    ) -> bool {
+        requires_mandatory_dispatch(task)
+            || self.obligation_dispatch_pending(graph)
+            || (self.run_has_promised_plan()
+                && !all_files.iter().any(|path| is_code_artifact_path(path)))
+    }
+
     /// Record a completion-tail guard decision: the run was downgraded to
     /// `Partial` because unfinished/unattempted work contradicted a
     /// `Completed` claim. Fail-soft like every other coordinator decision
@@ -6219,13 +6266,16 @@ impl CoordinatorAgent {
     }
 
     /// Whether a restored checkpoint is in the shape the resume-drive exists
-    /// for: an ACTION-REQUIRED, full-depth run that PROMISED implementation
-    /// (the same predicate the completion guard arms on) yet holds no
-    /// implement-stage dispatch, no code artifact, and no unresolved pause —
-    /// with every restored node already `Completed`, so there is no open work
-    /// for the decision loop to wait on.
+    /// for: a full-depth run that PROMISED implementation (the same predicate
+    /// the completion guard arms on) yet holds no implement-stage dispatch,
+    /// no code artifact, and no unresolved pause — with every restored node
+    /// already `Completed`, so there is no open work for the decision loop to
+    /// wait on.
     ///
-    /// Returning `true` hands the restored result to
+    /// Obligation correction: the mode gate is gone — a `CoordinatorDecides`
+    /// resume carrying a promised-but-unattempted plan drives back into the
+    /// decision loop instead of re-reporting the completion guard's canned
+    /// Partial on every resume. Returning `true` hands the restored result to
     /// [`Self::drive_resumed_implement`] instead of returning it verbatim:
     /// verbatim would fall straight through to `execute_graph`'s
     /// unattempted-implementation guard, which re-reports the SAME canned
@@ -6235,9 +6285,8 @@ impl CoordinatorAgent {
     /// Deliberately narrower than the guard: any `Failed`/`Blocked` node, a
     /// preserved input/approval pause, a parked wait, or an empty graph keeps
     /// today's restore behaviour untouched.
-    fn resume_needs_implement_drive(&self, task: &AgentTask, result: &DecomposeResult) -> bool {
-        requires_mandatory_dispatch(task)
-            && self.orchestration_depth == OrchestrationDepth::Full
+    fn resume_needs_implement_drive(&self, _task: &AgentTask, result: &DecomposeResult) -> bool {
+        self.orchestration_depth == OrchestrationDepth::Full
             && self.run_has_promised_plan()
             && !self.implement_stage_dispatch_occurred(&result.graph, &result.action_ledger)
             && !result.all_files.iter().any(|path| is_code_artifact_path(path))
@@ -9751,8 +9800,14 @@ impl CoordinatorAgent {
         // bytes each party produced is beyond this name-based gate. Only the
         // zero-dispatch (empty graph) case is gated here.
         let roster_has_specialists = !self.registry.ids().is_empty();
+        // Obligation correction: the mode predicate below is the combined
+        // [`Self::dispatch_guard_arms`] — a `CoordinatorDecides` run holding a
+        // promised-but-unattempted plan (or open execution work, which cannot
+        // occur with an empty graph) is vacuous in exactly the same way as an
+        // `ActionRequired` one. Conversational turns stay exempt: no plan, no
+        // open work, no guard.
         let vacuous_execute_dispatch = graph.is_empty()
-            && requires_mandatory_dispatch(&task)
+            && self.dispatch_guard_arms(&task, &graph, &all_files)
             && requested_user_input.is_none()
             && self.orchestration_depth == OrchestrationDepth::Full
             && (all_files.is_empty() || roster_has_specialists);
@@ -9922,17 +9977,19 @@ impl CoordinatorAgent {
             .await;
         }
 
-        // 2. Unattempted implementation: an action-required, full-depth run
-        // that carried a plan (an approved plan or a non-empty DesignDoc
-        // contract) but dispatched NO implement-stage specialist and produced
-        // NO code artifact never attempted the implementation it promised.
-        // Ad-hoc runs with no plan are exempt (nothing was promised), as are
-        // runs where any implement dispatch occurred (success or failure —
-        // those failure paths already handle themselves). Stage kinds come
-        // from config via `AgentStage::is_implement`; no role name participates.
+        // 2. Unattempted implementation: a full-depth run that carried a plan
+        // (an approved plan or a non-empty DesignDoc contract) but dispatched
+        // NO implement-stage specialist and produced NO code artifact never
+        // attempted the implementation it promised. Ad-hoc runs with no plan
+        // are exempt (nothing was promised), as are runs where any implement
+        // dispatch occurred (success or failure — those failure paths already
+        // handle themselves). Obligation correction: the mode gate is gone —
+        // a promised plan is a runtime-observable obligation in
+        // `CoordinatorDecides` too, so prose can never mark it complete.
+        // Stage kinds come from config via `AgentStage::is_implement`; no role
+        // name participates.
         let has_code_artifact = all_files.iter().any(|path| is_code_artifact_path(path));
-        if requires_mandatory_dispatch(&task)
-            && self.orchestration_depth == OrchestrationDepth::Full
+        if self.orchestration_depth == OrchestrationDepth::Full
             && self.run_has_promised_plan()
             && !self.implement_stage_dispatch_occurred(&graph, &action_ledger)
             && !has_code_artifact
@@ -10660,8 +10717,13 @@ impl CoordinatorAgent {
         // resume. The nested retry's own prose-only stop is suppressed by
         // `planning_recovery_in_progress`, so this never recurses deeper than
         // one level (the run budget is bounded by MAX_PLANNING_RECOVERY_ROUNDS).
+        // Obligation correction: the mode predicate below is the combined
+        // [`Self::dispatch_guard_arms`] — an open execution obligation or a
+        // promised-but-unattempted plan arms the escalation in any mode, so a
+        // fresh implementation obligation in `CoordinatorDecides` escalates
+        // exactly like `ActionRequired` instead of closing in prose.
         let prose_only_stop = self.orchestration_depth != OrchestrationDepth::PlanningOnly
-            && requires_mandatory_dispatch(task)
+            && self.dispatch_guard_arms(task, &graph, &ledger.all_files)
             && graph.is_empty();
         if prose_only_stop {
             match self.attempt_prose_only_planning_recovery(task, context, cancel).await {
@@ -11408,8 +11470,11 @@ impl CoordinatorAgent {
         // `Decision` event. The recovery is re-entrancy guarded and bounded, so
         // the nested retry's own prose-only stop is suppressed via
         // `planning_recovery_in_progress` — never deeper than one level.
+        // Obligation correction: combined [`Self::dispatch_guard_arms`] — an
+        // evidence-resume carrying open execution obligations or an unattempted
+        // promised plan escalates in any mode, not just `ActionRequired`.
         let prose_only_stop = self.orchestration_depth != OrchestrationDepth::PlanningOnly
-            && requires_mandatory_dispatch(task)
+            && self.dispatch_guard_arms(task, &graph, &ledger.all_files)
             && graph.is_empty();
         if prose_only_stop {
             match self.attempt_prose_only_planning_recovery(task, context, cancel).await {
@@ -11787,14 +11852,19 @@ impl CoordinatorAgent {
                 // `MAX_PROSE_STOP_REPROMPTS`; past that bound the stop stands
                 // and the caller (`decompose_task`) escalates to the
                 // planning-recovery fallback (ADR-45 tier-1b).
-                // Exempt by construction (issue #145): AnswerOnly and
-                // CoordinatorDecides task modes (prose is a correct outcome
-                // for both — the coordinator is allowed to answer directly)
-                // and PlanningOnly depth (no tools exist to dispatch with).
-                // Only ActionRequired arms this guard (issue #147): a mode that
-                // requires work cannot close with prose alone while a capable
-                // specialist remains.
-                let prose_only_stop = requires_mandatory_dispatch(task) && graph.is_empty();
+                // Exempt by construction (issue #145): AnswerOnly task modes
+                // (prose is a correct outcome — the coordinator is allowed to
+                // answer directly) and PlanningOnly depth (no tools exist to
+                // dispatch with). ActionRequired arms this guard (issue #147):
+                // a mode that requires work cannot close with prose alone while
+                // a capable specialist remains. The obligation correction
+                // extends the same arming to any run that owes execution work —
+                // open implement/verify-stage graph work or a promised plan
+                // with no code artifact yet — whatever its mode. Conversational
+                // turns (empty graph, no plan) stay exempt: no dispatch is
+                // manufactured for them.
+                let prose_only_stop =
+                    self.dispatch_guard_arms(task, graph, &ledger.all_files) && graph.is_empty();
                 if dispatching && prose_only_stop && prose_stop_reprompts < MAX_PROSE_STOP_REPROMPTS
                 {
                     prose_stop_reprompts += 1;
@@ -19618,6 +19688,109 @@ mod tests {
             session_id, "hi there"
         )));
         assert!(!requires_mandatory_dispatch(&AgentTask::new(session_id, "hi there")));
+    }
+
+    /// Obligation correction (review): the combined dispatch-guard predicate
+    /// arms on open execution obligations, not on the mode alone. A
+    /// `CoordinatorDecides` run whose graph holds an open implement-stage
+    /// subtask requires dispatch exactly like `ActionRequired`; an empty,
+    /// plan-free graph stays prose-exempt so conversational turns never
+    /// manufacture a dispatch. Settled work disarms the dispatch guards again
+    /// (verification/closure is the C-06 gate's job, not theirs).
+    #[test]
+    fn dispatch_guard_arms_on_obligations_not_mode_alone() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")];
+        let coordinator =
+            coordinator_with_turns(bus, Arc::new(AgentRegistry::from_mocks(mocks)), Vec::new());
+        let session_id = Ulid::new();
+        let empty = TaskGraph::new();
+        assert!(
+            !coordinator.dispatch_guard_arms(
+                &AgentTask::new_coordinator_decides(session_id, "hi there"),
+                &empty,
+                &[]
+            ),
+            "a conversational turn (empty graph, no plan) stays prose-exempt"
+        );
+        let mut graph = TaskGraph::new();
+        graph.add_root(SubTask::new(session_id, AgentId::new("coder"), "fix the bug"));
+        assert!(
+            coordinator.dispatch_guard_arms(
+                &AgentTask::new_coordinator_decides(session_id, "fix the bug and explain"),
+                &graph,
+                &[]
+            ),
+            "open implement-stage work arms the guard without ActionRequired mode"
+        );
+        let mut settled = TaskGraph::new();
+        let mut done = SubTask::new(session_id, AgentId::new("coder"), "fix the bug");
+        done.status = SubTaskStatus::Completed;
+        settled.add_root(done);
+        assert!(
+            !coordinator.dispatch_guard_arms(
+                &AgentTask::new_coordinator_decides(session_id, "fix the bug and explain"),
+                &settled,
+                &[]
+            ),
+            "settled implement work disarms the dispatch guards"
+        );
+        assert!(
+            coordinator.dispatch_guard_arms(
+                &AgentTask::new_action_required(session_id, "build the thing"),
+                &empty,
+                &[]
+            ),
+            "the legacy mode predicate still arms on an empty graph"
+        );
+    }
+
+    /// Obligation correction (review), runtime half: a `CoordinatorDecides`
+    /// run that dispatches implement-stage work but executes zero tool calls
+    /// reports Partial — prose never backfills unexecuted implementation, in
+    /// any mode. The checkpoint is preserved for resume.
+    #[tokio::test]
+    async fn coordinator_decides_implement_dispatch_without_tool_work_reports_partial() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")];
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist("coder", "fix the bug")]),
+                CoordinatorTurn::Text("fixed it".into()),
+            ],
+        );
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_coordinator_decides(session_id, "fix the bug and explain"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "implement dispatched but zero tool calls executed: prose cannot complete it, got: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Zero-work guard"),
+            "the downgrade names its cause, got: {}",
+            output.final_message
+        );
+        assert!(
+            output.checkpoint_json.is_some(),
+            "a Partial run preserves its checkpoint for resume"
+        );
     }
 
     /// A write-capable tool under a name the mutating classifier cannot see
