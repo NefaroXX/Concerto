@@ -55,6 +55,8 @@ fn kind_label(kind: DecisionKind) -> &'static str {
         DecisionKind::Investigate => "investigate",
         DecisionKind::Wait => "wait",
         DecisionKind::Reconsider => "reconsider",
+        DecisionKind::DeclareObligations => "declare-obligations",
+        DecisionKind::UpdateObligations => "update-obligations",
     }
 }
 
