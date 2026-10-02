@@ -36,7 +36,9 @@ use concerto_providers::model_selector::ModelSelector;
 use concerto_providers::retry::RetryPolicy;
 use concerto_sessions::spend::SpendTracker;
 use concerto_sessions::whiteboard::append_whiteboard_event;
-use concerto_sessions::whiteboard::{latest_gate_seq, load_whiteboard_events, WhiteboardLoadOpts};
+use concerto_sessions::whiteboard::{
+    consult_finding_payload, latest_gate_seq, load_whiteboard_events, WhiteboardLoadOpts,
+};
 use concerto_sessions::{
     NewWhiteboardEvent, OrchestrationCheckpointRecord, ResourceFactRow, ResourceFacts,
     SessionStore, WhiteboardEvent, WhiteboardKind,
@@ -14974,13 +14976,14 @@ impl CoordinatorAgent {
             session_id: Some(session_id.to_string()),
             plan_id: None,
             causation: Some(consult_decision_id.to_owned()),
-            payload: serde_json::json!({
-                "consultative": true,
-                "question": bounded_text(question, 512),
-                "findings": findings,
-                "supporting_evidence_ids": cited_evidence_ids,
-                "hypothesis_id": hypothesis_id,
-            }),
+            // Shared payload builder (issue #136): the world model reads
+            // `findings` back through the accessor paired with this builder.
+            payload: consult_finding_payload(
+                &bounded_text(question, 512),
+                findings,
+                cited_evidence_ids,
+                hypothesis_id,
+            ),
             pre_image_hash: None,
             created_at: crate::tool_facts::unix_ms(),
         };
@@ -18832,6 +18835,111 @@ mod tests {
         assert!(
             cited.contains(&finding.event_id.as_str()),
             "the dispatch must cite the consult findings as evidence: {cited:?}"
+        );
+    }
+
+    /// Issue #136 contract (real writer path): a consultative `Finding`
+    /// appended by [`CoordinatorAgent::append_consult_finding`] projects into
+    /// the world model as an ASSUMPTION carrying its `findings` text, and two
+    /// different findings stay two DISTINCT assumptions instead of collapsing
+    /// into the shared `"finding recorded"` fallback label. The events are
+    /// built by the production writer and round-tripped through the log —
+    /// never hand-assembled — so any payload-shape change in that writer
+    /// fails this test.
+    #[tokio::test]
+    async fn consult_finding_projects_into_distinct_world_model_assumptions() {
+        const FIRST: &str = "the lexer treats a trailing comma as a terminator";
+        const SECOND: &str = "the parser table has no shift/reduce conflict";
+        let (_dir, pool) = resume_log_pool().await;
+        let coordinator = coordinator_with_turns(
+            EventBus::new(64),
+            Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+                AgentId::new("researcher"),
+                "advisory",
+            )])),
+            vec![],
+        )
+        .with_review_store(Some(pool.clone()));
+        let session_id = Ulid::new();
+        let agent = AgentId::new("researcher");
+        let first = coordinator
+            .append_consult_finding(
+                session_id,
+                &agent,
+                "why does the parser drop trailing commas?",
+                FIRST,
+                "decision-1",
+                &[],
+                Some("hypothesis-1"),
+            )
+            .await
+            .expect("the first consultative finding lands");
+        let second = coordinator
+            .append_consult_finding(
+                session_id,
+                &agent,
+                "is the parser table ambiguous?",
+                SECOND,
+                "decision-2",
+                &[],
+                None,
+            )
+            .await
+            .expect("the second consultative finding lands");
+
+        // Read the events back from the LOG: the writer's real output,
+        // round-tripped through storage, is what the builder projects.
+        let logged = load_whiteboard_events(
+            &pool,
+            &WhiteboardLoadOpts { after_gate_seq: 0, session_id: None, scope: None, limit: 64 },
+        )
+        .await
+        .expect("the log loads");
+        assert_eq!(
+            logged.iter().filter(|event| event.kind == WhiteboardKind::Finding).count(),
+            2,
+            "both consultative Findings are on the whiteboard"
+        );
+        let model = crate::world_model::WorldModel::build(&crate::world_model::WorldModelInput {
+            objective: "issue #136 contract",
+            criteria: Vec::new(),
+            current_generation: None,
+            workspace_changed: false,
+            events: &logged,
+            artifacts: Vec::new(),
+            decisions: &[],
+            diagnoses: &[],
+            roster: Vec::new(),
+            models: Vec::new(),
+            pending: None,
+            pending_stale: false,
+            previous_questions: Vec::new(),
+            external_changes: &[],
+            now_ms: 1_000,
+        });
+        for (event_id, text) in [(first.as_str(), FIRST), (second.as_str(), SECOND)] {
+            let fact = model
+                .facts
+                .iter()
+                .find(|fact| fact.ref_id == event_id)
+                .unwrap_or_else(|| panic!("finding {event_id} projects a fact"));
+            assert_eq!(
+                fact.status,
+                crate::world_model::FactStatus::Assumed,
+                "a Finding is only ever assumed (F-ASSUME)"
+            );
+            assert_eq!(
+                fact.label, text,
+                "the label is the writer's `findings` text, not a placeholder"
+            );
+        }
+        let labels: Vec<&str> =
+            model.assumptions.iter().map(|entry| entry.label.as_str()).collect();
+        assert_eq!(labels.len(), 2, "two findings stay two distinct assumptions: {labels:?}");
+        assert!(labels.contains(&FIRST) && labels.contains(&SECOND), "{labels:?}");
+        assert!(
+            !labels.contains(&"finding recorded"),
+            "#136 regression: a consultative finding fell back to the placeholder label"
         );
     }
 

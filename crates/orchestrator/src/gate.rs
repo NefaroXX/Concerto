@@ -145,8 +145,8 @@ use concerto_core::types::{
 };
 use concerto_core::CancellationToken;
 use concerto_sessions::whiteboard::{
-    append_whiteboard_event, latest_gate_seq, load_whiteboard_events_up_to, NewWhiteboardEvent,
-    WhiteboardKind,
+    append_whiteboard_event, latest_gate_seq, load_whiteboard_events_up_to, write_applied_payload,
+    NewWhiteboardEvent, WhiteboardKind,
 };
 use concerto_sessions::SessionError;
 use serde::{Deserialize, Serialize};
@@ -1395,12 +1395,11 @@ impl WriteGate {
 
         // WAL-before-execute: the applied event is durable before the tool
         // runs; a crash after this point replays as `replayed: true`.
-        let mut payload = serde_json::json!({
-            "tool": &req.tool,
-            "input": &req.input,
-            "policy_verdict": "allow",
-            "pre_images": &pre_images,
-        });
+        // The base shape is the shared builder next to the whiteboard events
+        // (issue #136): the world model reads `input.path` back through the
+        // accessor paired with this builder, so writer and reader cannot
+        // drift apart silently. Gate-specific additions below.
+        let mut payload = write_applied_payload(&req.tool, &req.input, &pre_images);
         if !acquired_now.is_empty() {
             payload["ownership_acquired"] = serde_json::Value::Array(
                 acquired_now.clone().into_iter().map(serde_json::Value::String).collect(),
@@ -2548,6 +2547,66 @@ mod tests {
         let c4 = gate.submit(request("pic-4"), CancellationToken::new()).await;
         assert!(c4.is_ok(), "non-filesystem tool allowed: {c4:?}");
         assert_eq!(applied_row(&pool, "pic-4").await.pre_image_hash, None);
+    }
+
+    /// Issue #136 contract (real writer path): the write gate's applied-write
+    /// record — produced by the gate itself, never hand-assembled — projects
+    /// into the world model as a VERIFIED fact naming the written path, with
+    /// the artifact Written and owned by the writer. Any payload-shape change
+    /// in the gate's applied-write record fails this test.
+    #[tokio::test]
+    async fn applied_write_record_projects_into_world_model_write_fact() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        let root = dir.path().to_path_buf();
+        let (_pool_dir, pool) = test_pool(8).await;
+        let gate = gate(allow_engine(), Arc::new(AtomicUsize::new(0)), pool.clone(), root);
+        gate.submit(
+            filesystem_request("wm-write-1", "write", "notes.md"),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("filesystem write allowed");
+
+        let applied = applied_row(&pool, "wm-write-1").await;
+        assert_eq!(
+            applied.kind,
+            WhiteboardKind::WriteApplied,
+            "the gate recorded the applied write"
+        );
+        let events = [applied];
+        let model = crate::world_model::WorldModel::build(&crate::world_model::WorldModelInput {
+            objective: "issue #136 contract",
+            criteria: Vec::new(),
+            current_generation: None,
+            workspace_changed: false,
+            events: &events,
+            artifacts: Vec::new(),
+            decisions: &[],
+            diagnoses: &[],
+            roster: Vec::new(),
+            models: Vec::new(),
+            pending: None,
+            pending_stale: false,
+            previous_questions: Vec::new(),
+            external_changes: &[],
+            now_ms: 1_000,
+        });
+        let fact = model
+            .facts
+            .iter()
+            .find(|fact| fact.ref_id == "wm-write-1")
+            .unwrap_or_else(|| panic!("the applied write projects a fact: {:?}", model.facts));
+        assert_eq!(
+            fact.label, "wrote notes.md by agent-a",
+            "the written path reads from the gate's applied-write payload"
+        );
+        assert_eq!(fact.status, crate::world_model::FactStatus::Verified, "F-VERIFY");
+        assert_eq!(fact.artifact.as_deref(), Some("notes.md"));
+        assert_eq!(
+            model.artifact_status("notes.md"),
+            Some(crate::world_model::ArtifactStatus::Written),
+            "A-WRITTEN attributes the path to the writing agent"
+        );
     }
 
     /// A `filesystem` request with a content payload — used with the real

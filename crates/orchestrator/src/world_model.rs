@@ -73,7 +73,9 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use concerto_sessions::whiteboard::WhiteboardEvent;
+use concerto_sessions::whiteboard::{
+    finding_text, tool_executed_view, write_applied_path, WhiteboardEvent,
+};
 use concerto_sessions::WhiteboardKind;
 
 use crate::checkpoint::CheckpointPendingDecision;
@@ -389,14 +391,10 @@ fn extract_writes_and_facts(
         match event.kind {
             WhiteboardKind::WriteApplied => {
                 // The write gate's applied-write record: the written path
-                // lives at payload["input"]["path"] (see the own-write
-                // reconciliation in coordinator.rs for the canonical shape).
-                let Some(path) = event
-                    .payload
-                    .get("input")
-                    .and_then(|input| input.get("path"))
-                    .and_then(serde_json::Value::as_str)
-                else {
+                // lives at payload["input"]["path"], read through the shared
+                // accessor the gate's own payload builder writes against
+                // (#136).
+                let Some(path) = write_applied_path(&event.payload) else {
                     continue;
                 };
                 facts.push(FactCandidate {
@@ -414,38 +412,28 @@ fn extract_writes_and_facts(
                 });
             }
             WhiteboardKind::ToolExecuted => {
-                let tool = event.payload.get("tool").and_then(serde_json::Value::as_str);
-                let args = event.payload.get("args").cloned().unwrap_or(serde_json::Value::Null);
-                let success =
-                    event.payload.get("success").and_then(serde_json::Value::as_bool) == Some(true);
-                if !success {
+                // One typed read of the payload (#136): tool, args, success
+                // and observed paths, all from the shape the tool-fact writer
+                // appends.
+                let view = tool_executed_view(&event.payload);
+                if !view.success {
                     continue;
                 }
-                let paths: Vec<String> = event
-                    .payload
-                    .get("paths")
-                    .and_then(serde_json::Value::as_array)
-                    .map(|rows| {
-                        rows.iter()
-                            .filter_map(|row| row.get("path").and_then(serde_json::Value::as_str))
-                            .map(str::to_owned)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let file_affecting =
-                    tool.is_some_and(|tool| crate::tool_facts::is_file_affecting_tool(tool, &args));
-                let tool_label = tool.unwrap_or("tool");
+                let file_affecting = view
+                    .tool
+                    .is_some_and(|tool| crate::tool_facts::is_file_affecting_tool(tool, view.args));
+                let tool_label = view.tool.unwrap_or("tool");
                 if file_affecting {
-                    for path in paths.iter().take(MAX_PATHS_PER_EVENT) {
+                    for path in view.paths.iter().take(MAX_PATHS_PER_EVENT) {
                         facts.push(FactCandidate {
                             ref_id: event.event_id.clone(),
                             label: bounded(format!("{tool_label} applied {path}")),
                             status: FactStatus::Verified,
-                            artifact: Some(path.clone()),
+                            artifact: Some((*path).to_owned()),
                             seq: event.gate_seq,
                         });
                         writes.push(RecordedWrite {
-                            path: path.clone(),
+                            path: (*path).to_owned(),
                             seq: event.gate_seq,
                             event_id: event.event_id.clone(),
                             agent: event.agent_id.clone(),
@@ -455,7 +443,11 @@ fn extract_writes_and_facts(
                 }
                 // A non-write execution: a verified observation WITHOUT a
                 // written artifact (reads, builds, checks).
-                let subject = paths.first().cloned().unwrap_or_else(|| tool_label.to_owned());
+                let subject = view
+                    .paths
+                    .first()
+                    .map(|path| (*path).to_owned())
+                    .unwrap_or_else(|| tool_label.to_owned());
                 facts.push(FactCandidate {
                     ref_id: event.event_id.clone(),
                     label: bounded(format!("ran {tool_label} ({subject})")),
@@ -466,16 +458,15 @@ fn extract_writes_and_facts(
             }
             WhiteboardKind::Finding => {
                 // An assertion without an executed observation: Assumed
-                // (F-ASSUME), never Verified.
-                let summary = event
-                    .payload
-                    .get("summary")
-                    .or_else(|| event.payload.get("content"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("finding recorded");
+                // (F-ASSUME), never Verified. Issue #136: the label reads the
+                // consultative writer's `findings` text through the shared
+                // accessor (`summary`/`content` stay aliases); a textless
+                // payload keeps this explicit, observable fallback instead of
+                // dropping the fact.
+                let text = finding_text(&event.payload).unwrap_or("finding recorded");
                 facts.push(FactCandidate {
                     ref_id: event.event_id.clone(),
-                    label: bounded(summary.to_owned()),
+                    label: bounded(text.to_owned()),
                     status: FactStatus::Assumed,
                     artifact: None,
                     seq: event.gate_seq,
@@ -1601,6 +1592,61 @@ mod tests {
         let rendered = model.render();
         assert!(rendered.contains(&finding.label), "short labels render");
         assert!(!rendered.contains(&huge), "prose is never copied into the model");
+    }
+
+    /// Issue #136: the consultative writer's payload key (`findings`) is the
+    /// label source; `summary`/`content` stay accepted aliases for Findings
+    /// written by older/other producers, and a payload with no text keeps the
+    /// explicit observable fallback instead of dropping the fact.
+    #[test]
+    fn finding_label_reads_the_writer_shape_with_legacy_aliases() {
+        let events = vec![
+            event(
+                WhiteboardKind::Finding,
+                "ev-findings",
+                10,
+                serde_json::json!({ "findings": "the lexer drops trailing commas" }),
+            ),
+            event(
+                WhiteboardKind::Finding,
+                "ev-summary",
+                20,
+                serde_json::json!({ "summary": "legacy summary text" }),
+            ),
+            event(
+                WhiteboardKind::Finding,
+                "ev-content",
+                30,
+                serde_json::json!({ "content": "legacy content text" }),
+            ),
+            event(WhiteboardKind::Finding, "ev-none", 40, serde_json::json!({ "note": "no text" })),
+        ];
+        let model = WorldModel::build(&input(&events, Vec::new(), &[], &[], Vec::new()));
+        let label = |id: &str| {
+            model
+                .facts
+                .iter()
+                .find(|fact| fact.ref_id == id)
+                .unwrap_or_else(|| panic!("fact {id} derived"))
+                .label
+                .clone()
+        };
+        assert_eq!(
+            label("ev-findings"),
+            "the lexer drops trailing commas",
+            "the consultative writer's `findings` text is the label"
+        );
+        assert_eq!(label("ev-summary"), "legacy summary text", "`summary` stays an alias");
+        assert_eq!(label("ev-content"), "legacy content text", "`content` stays an alias");
+        assert_eq!(
+            label("ev-none"),
+            "finding recorded",
+            "a textless payload keeps the explicit observable fallback"
+        );
+        // Distinct findings stay distinct assumptions — before #136 every
+        // consultative Finding rendered the same fallback label and deduped
+        // into ONE assumption.
+        assert_eq!(model.assumptions.len(), 4, "{:?}", model.assumptions);
     }
 
     /// The rendered block is bounded even for a huge single entry, and the
