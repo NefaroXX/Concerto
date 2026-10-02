@@ -510,6 +510,7 @@ mod tests {
                 needed: Vec::new(),
                 opened_journal_len: 0,
                 opened_ref: None,
+                subject_decision_id: None,
                 opened_at_ms: 1,
                 cycles_open,
                 state,

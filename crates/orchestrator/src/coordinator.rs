@@ -19012,8 +19012,10 @@ mod tests {
     /// unresolved question (issue #56); once it has stood
     /// [`CONSULT_TRIGGER_MIN_CYCLES`] rebuilds, the decision loop injects
     /// the consultation request BEFORE the next decision turn (exactly
-    /// once), and a settled consultation resolves the question (the #56
-    /// lifecycle reads the Settled consult decision as recovery evidence).
+    /// once), the consultation runs and records advisory findings — and the
+    /// question STILL stands afterwards (issue #135, Q-RESOLVE-UNLINKABLE):
+    /// a settled consult is advisory evidence, not recovery, so it never
+    /// resolves the failure question by coincidence.
     #[tokio::test]
     async fn low_confidence_question_triggers_consultation_deterministically() {
         let (_dir, pool) = resume_log_pool().await;
@@ -19098,21 +19100,24 @@ mod tests {
             .expect("the finding event exists on the whiteboard");
         assert_eq!(finding.kind, WhiteboardKind::Finding);
         assert_eq!(finding.payload["consultative"], serde_json::Value::Bool(true));
-        // The settled consultation RESOLVED the standing question (the #56
-        // lifecycle consumes the Settled consult decision as recovery
-        // evidence). The finding event's causation IS the consult decision
-        // id the resolution recorded.
-        let resolved = coordinator
+        // The settled consultation does NOT resolve the standing question
+        // (issue #135, Q-RESOLVE-UNLINKABLE): advisory findings are citable
+        // evidence, not recovery — the failure still needs its
+        // retry/replacement/reconsider descendant (or settled work touching
+        // its artifact) before the question closes. The question stands and
+        // keeps aging instead of resolving by coincidence.
+        let standing = coordinator
             .world_model
             .questions
             .iter()
-            .find(|question| question.state == crate::world_model::QuestionState::Resolved)
-            .expect("the standing question was resolved by the consultation");
+            .find(|question| question.state == crate::world_model::QuestionState::Open)
+            .expect("the failure question still stands after advisory consultation");
         assert_eq!(
-            resolved.resolved_by.as_deref(),
-            finding.causation.as_deref(),
-            "the question was resolved by the consult decision"
+            standing.kind,
+            crate::world_model::QuestionKind::OpenProblem,
+            "the standing question is the failure one"
         );
+        assert_eq!(standing.resolved_by, None, "no coincidence resolution recorded");
     }
 
     // ------------------------------------------------------------------
