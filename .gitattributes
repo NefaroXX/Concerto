@@ -1,0 +1,5 @@
+# Normalize line endings so embedded sqlx migration checksums are stable
+# across Windows (CRLF) and Linux (LF) checkouts. Without this, a db created
+# by one platform fails to open on the other with
+# "migration N was previously applied but has been modified".
+*.sql text eol=lf

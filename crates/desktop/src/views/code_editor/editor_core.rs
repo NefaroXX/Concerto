@@ -111,6 +111,11 @@ impl State {
                     iced::Task::none()
                 }
             }
+            // The toolbar's screenshot button: the capture itself is an
+            // app-level action, and `App::update` intercepts this variant
+            // before it ever reaches the editor state (the window pixels
+            // live above this view). Arm kept only for exhaustiveness.
+            Message::TakeScreenshot => iced::Task::none(),
             Message::Save => {
                 // Expand folds first so placeholders never reach disk.
                 self.expand_intersecting(0, usize::MAX);

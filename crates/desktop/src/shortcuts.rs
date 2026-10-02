@@ -10,8 +10,9 @@ pub struct ShortcutInfo {
 }
 
 /// Every shortcut the desktop app binds, grouped for the modal. Text focus
-/// gates most global bindings; `Ctrl+Enter` and `Esc` always apply. Keep this
-/// in sync with [`resolve`] — the modal renders it verbatim.
+/// gates most global bindings; `Ctrl+Enter`, `Esc`, the editor commands and
+/// the two screenshot chords always apply. Keep this in sync with [`resolve`]
+/// — the modal renders it verbatim.
 pub const ALL: &[ShortcutInfo] = &[
     ShortcutInfo { keys: "Ctrl+Enter", label: "Send message" },
     ShortcutInfo { keys: "Ctrl+T / Ctrl+N", label: "New task" },
@@ -23,6 +24,7 @@ pub const ALL: &[ShortcutInfo] = &[
     ShortcutInfo { keys: "Ctrl+Z", label: "Undo last run (rollback)" },
     ShortcutInfo { keys: "Ctrl+E", label: "Open code editor" },
     ShortcutInfo { keys: "Ctrl+S", label: "Screenshot (Save in editor)" },
+    ShortcutInfo { keys: "Ctrl+Shift+S", label: "Screenshot (all pages)" },
     ShortcutInfo { keys: "Ctrl+F", label: "Editor: find" },
     ShortcutInfo { keys: "Ctrl+H", label: "Editor: find & replace" },
     ShortcutInfo { keys: "Ctrl+G", label: "Editor: go to line" },
@@ -46,7 +48,12 @@ pub enum Shortcut {
     SubmitInput,
     CancelDialog,
     HelpOverlay,
+    /// `Ctrl+S` — screenshot everywhere *except* the Editor page with an open
+    /// file, where it means Save (the editor's own binding).
     Screenshot,
+    /// `Ctrl+Shift+S` — screenshot on every page, the Editor included. This
+    /// is the chord that keeps a screenshot reachable where `Ctrl+S` is Save.
+    ScreenshotAlways,
     Editor,
     EditorRedo,
     EditorFind,
@@ -57,12 +64,21 @@ pub enum Shortcut {
 }
 
 /// Resolve a key event into a shortcut.
-/// `text_focused` controls whether we steal typing keys — only Escape and
-/// Ctrl+Enter bypass this check.
+/// `text_focused` controls whether we steal typing keys — only Escape,
+/// Ctrl+Enter and the editor/screenshot chords bypass this check.
 pub fn resolve(key: &Key, mods: Modifiers, text_focused: bool) -> Option<Shortcut> {
     match key {
         Key::Named(Named::Escape) => return Some(Shortcut::CancelDialog),
         Key::Named(Named::Enter) if mods.control() => return Some(Shortcut::SubmitInput),
+        // Ctrl+Shift+S for screenshot on every page — the Editor's Ctrl+S is
+        // Save, so this is the chord that survives there. Case-insensitive:
+        // some backends report the shifted character ("S"), others the base
+        // one ("s"). Global: bypasses text_focused like Ctrl+S.
+        Key::Character(ch)
+            if ch.as_str().eq_ignore_ascii_case("s") && mods.control() && mods.shift() =>
+        {
+            return Some(Shortcut::ScreenshotAlways);
+        }
         // Ctrl+S for screenshot — bypass text_focused since it's a global shortcut
         Key::Character(ch) if ch.as_str() == "s" && mods.control() && !mods.shift() => {
             return Some(Shortcut::Screenshot);
@@ -196,6 +212,41 @@ mod tests {
     fn ctrl_r_runtime_panels() {
         let result = resolve(&Key::Character("r".into()), Modifiers::CTRL, false);
         assert_eq!(result, Some(Shortcut::RuntimePanels));
+    }
+
+    /// Ctrl+Shift+S resolves to the always-screenshot binding regardless of
+    /// text focus — it is the chord that stays available on the Editor page,
+    /// where Ctrl+S is Save.
+    #[test]
+    fn ctrl_shift_s_is_the_global_screenshot() {
+        let mods = Modifiers::CTRL | Modifiers::SHIFT;
+        // Backends disagree on the shifted character; both must resolve.
+        for key in ["s", "S"] {
+            assert_eq!(
+                resolve(&Key::Character(key.into()), mods, false),
+                Some(Shortcut::ScreenshotAlways),
+                "key {key:?} without text focus"
+            );
+            assert_eq!(
+                resolve(&Key::Character(key.into()), mods, true),
+                Some(Shortcut::ScreenshotAlways),
+                "key {key:?} with text focus"
+            );
+        }
+    }
+
+    /// Ctrl+S keeps its own binding (Save in the editor, screenshot elsewhere)
+    /// so the new chord never steals it.
+    #[test]
+    fn ctrl_s_keeps_its_own_binding() {
+        assert_eq!(
+            resolve(&Key::Character("s".into()), Modifiers::CTRL, false),
+            Some(Shortcut::Screenshot)
+        );
+        assert_eq!(
+            resolve(&Key::Character("s".into()), Modifiers::CTRL, true),
+            Some(Shortcut::Screenshot)
+        );
     }
 
     /// Ctrl+R must not fire while a text field owns the keyboard (same

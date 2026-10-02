@@ -438,6 +438,13 @@ const LINE_WIPE_TICKS: u8 = 8;
 /// Period (in ticks) of the subtle thinking shimmer pulse: the color
 /// interpolates from muted to text over `SHIMMER_PERIOD` ticks and back.
 const SHIMMER_PERIOD: u32 = 8;
+/// Phase divisor for the shared "Composing…" row *only*: its traveling-dot
+/// alpha, dot count and text pulse read `shimmer_phase / COMPOSING_PHASE_DIV`,
+/// so the busy cue advances one phase step every 2 `TypingTick`s (~32 ms
+/// instead of 16 ms — 50% slower) while the global tick cadence and every
+/// other tick-driven cue (typewriter reveal, entrance fades, open-thinking
+/// shimmer) keep their original rate. `1` restores the old speed.
+const COMPOSING_PHASE_DIV: u32 = 2;
 
 /// One coordinator-dispatched subagent run. Progress is keyed by the backend
 /// task id (`run_id`) alone, so two runs by the same agent render as two cards
@@ -2464,8 +2471,10 @@ fn thinking_content_is_noise(content: &str) -> bool {
 }
 
 /// Small inline animated mark for the "Composing…" row: three dots whose
-/// opacity travels with the shimmer phase so the row reads as visibly alive
-/// rather than static text. Palette colors only (accent, alpha-modulated).
+/// opacity travels with the phase so the row reads as visibly alive rather
+/// than static text. The caller passes the already-scaled phase
+/// (`COMPOSING_PHASE_DIV`), so this mark pulses slower than the global tick.
+/// Palette colors only (accent, alpha-modulated).
 fn composing_mark<'a>(
     palette: &'a crate::theme::Palette,
     shimmer_phase: u32,
@@ -2497,22 +2506,24 @@ fn composing_mark<'a>(
 
 /// The shared "Composing…" animation row shown while an agent or the
 /// orchestrator is busy. The dot count and the inline mark both cycle with the
-/// free-running shimmer phase; every color comes from the palette.
+/// free-running shimmer phase, scaled by `COMPOSING_PHASE_DIV` so this busy
+/// cue alone runs at half the tick rate; every color comes from the palette.
 fn composing_row<'a>(
     palette: &'a crate::theme::Palette,
     shimmer_phase: u32,
     spacing: &'a Spacing,
 ) -> Element<'a, Message> {
-    let dots = ".".repeat((shimmer_phase as usize % 3) + 1);
-    let color = shimmer_color(palette, shimmer_phase);
-    row![
-        composing_mark(palette, shimmer_phase),
-        text(format!("Composing{dots}")).size(12).color(color),
-    ]
-    .spacing(spacing.xs)
-    .align_y(Alignment::Center)
-    .padding(iced::Padding::ZERO.left(spacing.sm).top(spacing.xs))
-    .into()
+    // Slow only this indicator: all three consumers below read the scaled
+    // phase, while the shared counter and the 16 ms `TypingTick` cadence in
+    // `Message::TypingTick` stay untouched for every other animation.
+    let phase = shimmer_phase / COMPOSING_PHASE_DIV;
+    let dots = ".".repeat((phase as usize % 3) + 1);
+    let color = shimmer_color(palette, phase);
+    row![composing_mark(palette, phase), text(format!("Composing{dots}")).size(12).color(color),]
+        .spacing(spacing.xs)
+        .align_y(Alignment::Center)
+        .padding(iced::Padding::ZERO.left(spacing.sm).top(spacing.xs))
+        .into()
 }
 
 /// Render one subagent run's progress card. Collapsed shows the agent badge +

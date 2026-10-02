@@ -1753,16 +1753,23 @@ impl App {
                 }
                 iced::Task::none()
             }
-            Message::Editor(msg) => self
-                .editor
-                .update(
-                    msg,
-                    &self.vfs,
-                    &Utf8PathBuf::from_path_buf(self.project_dir.clone())
-                        .unwrap_or_else(|p| Utf8PathBuf::from(p.to_string_lossy().as_ref())),
-                    &self.cancel_token,
-                )
-                .map(Message::Editor),
+            Message::Editor(msg) => match msg {
+                // The Editor toolbar's screenshot button is an app-level
+                // action (whole-window capture), so it never enters the
+                // editor state — the Editor page is the one page whose
+                // Ctrl+S means Save, and this is its screenshot access.
+                views::code_editor::Message::TakeScreenshot => self.update(Message::TakeScreenshot),
+                msg => self
+                    .editor
+                    .update(
+                        msg,
+                        &self.vfs,
+                        &Utf8PathBuf::from_path_buf(self.project_dir.clone())
+                            .unwrap_or_else(|p| Utf8PathBuf::from(p.to_string_lossy().as_ref())),
+                        &self.cancel_token,
+                    )
+                    .map(Message::Editor),
+            },
             Message::ThemeChanged => {
                 // Re-read the single source (prefs) and re-apply it to every
                 // surface, including the Settings picker — a prefs reload that
@@ -2347,6 +2354,9 @@ impl App {
                 }
                 self.update(Message::TakeScreenshot)
             }
+            // Ctrl+Shift+S: the screenshot chord that works on every page,
+            // the Editor included (where Ctrl+S is Save). Never saves.
+            Shortcut::ScreenshotAlways => self.update(Message::TakeScreenshot),
             Shortcut::Editor => {
                 self.page = Page::Editor;
                 iced::Task::none()
@@ -7104,6 +7114,22 @@ custom_agents = []
         assert_eq!(app.page, Page::OrchestrationStudio);
     }
 
+    /// Ctrl+Shift+S (the always-screenshot chord) reaches the capture path on
+    /// the Editor page — the one page where Ctrl+S means Save, so it is the
+    /// chord that keeps screenshots reachable there.
+    #[test]
+    fn screenshot_always_reaches_capture_on_the_editor_page() {
+        let (mut app, _) = App::new();
+        app.page = Page::Editor;
+        assert!(app.screenshot_status.is_none());
+        let _ = app.update(Message::Shortcut(crate::shortcuts::Shortcut::ScreenshotAlways));
+        assert_eq!(
+            app.screenshot_status.as_deref(),
+            Some("Capturing..."),
+            "Ctrl+Shift+S must capture even on the Editor page"
+        );
+    }
+
     /// Screenshot status can be stored and cleared.
     #[test]
     fn screenshot_status_stored_and_cleared() {
@@ -9125,11 +9151,24 @@ model_pins = { coder = "local-model" }
                     && a.model_override.as_deref() == Some("test-model-x")),
             "the override must be persisted to the model assignment"
         );
+        // Write path stays override-only: the quick panel picker displays the
+        // *effective* model (override, else Settings global default) but must
+        // never repoint single-agent chat when an override is picked.
+        assert_eq!(
+            app.settings.global_default_model.as_deref(),
+            Some("gpt-4o-mini"),
+            "picking an agent model must leave the Settings global default alone"
+        );
         let _ = app
             .update(Message::SetAgentModel { agent_id: agent_id.clone(), model: "default".into() });
         assert!(
             !app.runtime_assignments().iter().any(|a| a.agent_role == agent_id),
             "clearing must drop the assignment"
+        );
+        assert_eq!(
+            app.settings.global_default_model.as_deref(),
+            Some("gpt-4o-mini"),
+            "clearing an override must also leave the Settings global default alone"
         );
 
         restore_xdg_env(previous_config, previous_data);
