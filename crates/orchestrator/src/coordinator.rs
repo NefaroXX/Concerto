@@ -134,6 +134,30 @@ pub(crate) const MERGE_TASKS_TOOL: &str = "merge_tasks";
 /// applies no policy gate (there is nothing to gate).
 pub(crate) const RECONSIDER_TOOL: &str = "reconsider";
 
+/// The obligation-declaration surface: the Coordinator's structured decision
+/// creates obligation-bearing work BEFORE any dispatch. Each declared item
+/// becomes a `Declared` (Outstanding, not-yet-dispatched) graph node — the
+/// graph is the source of truth, the `ObligationLedger` a derived view — and
+/// declared-undispatched Implement/Verify work blocks the completion guards
+/// exactly like dispatched-but-unsettled work, while coordinator prose keeps
+/// answering Explain freely. Dispatches no agents and touches no tools, so
+/// like split/merge/reconsider it applies no policy gate.
+pub(crate) const DECLARE_OBLIGATIONS_TOOL: &str = "declare_obligations";
+
+/// The obligation-update surface: revise the description, expected
+/// artifacts, or owning specialist of still-undispatched (`Declared` or
+/// `Pending`) work, or release a `Declared` node to `Pending` so the graph
+/// loop may dispatch it. Settled or dispatched work is rejected — completed
+/// work is never re-cut, failed/blocked work retries through its own paths.
+/// Same no-dispatch, no-gate discipline as declaration.
+pub(crate) const UPDATE_OBLIGATIONS_TOOL: &str = "update_obligations";
+
+/// Bound on one `declare_obligations` call's item count. Mirrors the
+/// `split_task` 1–8 child bound: an investigate → implement → verify →
+/// explain chain fits several times over; larger work statements split
+/// across turns.
+const MAX_DECLARE_OBLIGATIONS: usize = 8;
+
 /// ADR-35 amendment (2026-09-16 §2): the explicit human-input request
 /// surface — the Coordinator side of the operator consent/interaction gate.
 /// The model calls it with a reason; the decision loop then unwinds and the
@@ -310,6 +334,11 @@ Restructuring an open task (use sparingly, deterministically):
 - When several open pending tasks overlap in role and substance, merge_tasks folds them into one survivor with the lowest id. Merge only tasks of the SAME role.
 - Both tools are validated against the real graph BEFORE anything changes; a rejected split or merge is a structured error you can read and fix, never a crash.
 
+Declaring work before dispatching it:
+- When the turn needs work, FIRST declare it with declare_obligations (one structured call naming each obligation's owning specialist and work text, chained in order), THEN dispatch each item with call_specialist passing its task_id. Declaration creates Outstanding, not-yet-dispatched work without running anything.
+- Declared Implement/Verify work blocks completion until it is dispatched with evidence: closing the run in prose while such obligations stand open is re-prompted, then reported Partial — never accepted as completion. Prose answers the explanation half freely and discharges nothing else.
+- Revise still-undispatched work with update_obligations (description, artifacts, owner, or release a declared node to Pending); settled or dispatched work is never re-cut there — reconsider, split, or merge it instead.
+
 Consultation (read-only, use it to resolve open questions):
 - consult_specialist asks a registered specialist for ADVICE. The consultant runs READ-ONLY — it cannot write files or mutate the workspace — and consultation never dispatches task work or changes task state.
 - The consultation returns findings plus a real evidence id; cite that id in supporting_evidence_ids when a later decision rests on the advice.
@@ -338,7 +367,10 @@ fn call_specialist_tool_definition() -> ToolDefinition {
         name: CALL_SPECIALIST_TOOL.to_string(),
         description: "Dispatch a registered specialist agent. The specialist runs to \
                       completion and its outcome is returned so you can decide the next \
-                      step."
+                      step. To dispatch work you previously declared with \
+                      `declare_obligations`, pass its `task_id`: the declared node is \
+                      adopted (no duplicate node) and runs. Without `task_id` a fresh \
+                      node is recorded."
             .to_string(),
         parameters: serde_json::json!({
             "type": "object",
@@ -350,6 +382,10 @@ fn call_specialist_tool_definition() -> ToolDefinition {
                 "task": {
                     "type": "string",
                     "description": "The complete, self-contained task for the specialist."
+                },
+                "task_id": {
+                    "type": "string",
+                    "description": "Optional id of a declared (not-yet-dispatched) obligation to dispatch. The node must still be undispatched and name this same specialist; use `update_obligations` first when it names someone else."
                 },
                 "notes": {
                     "type": "string",
@@ -577,6 +613,125 @@ fn reconsider_tool_definition() -> ToolDefinition {
                 }
             },
             "required": ["decision_id", "reason", "affected_task_ids"]
+        }),
+    }
+}
+
+/// Argument schema for the Coordinator's `declare_obligations` tool: the
+/// structured decision that creates obligation-bearing work BEFORE any
+/// dispatch. Each item becomes a `Declared` (Outstanding, not-yet-dispatched)
+/// graph node — the graph stays the source of truth and the obligation
+/// ledger a derived view — persisted through the existing checkpoint rows.
+/// Declared-undispatched Implement/Verify work blocks completion until it is
+/// dispatched (via `call_specialist` with its `task_id`, or released to
+/// `Pending` and taken by the graph loop) and evidenced; coordinator prose
+/// answers Explain freely and discharges nothing else.
+fn declare_obligations_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: DECLARE_OBLIGATIONS_TOOL.to_string(),
+        description: "Declare obligation-bearing work before dispatching it. Each item \
+                      becomes a not-yet-dispatched graph node (Outstanding obligation) \
+                      chained in order; dispatch each later with `call_specialist` \
+                      passing its `task_id`. Declared Implement/Verify work blocks \
+                      completion until dispatched with evidence — prose alone never \
+                      discharges it."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "obligations": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "agent_id": {
+                                "type": "string",
+                                "description": "The id of the registered specialist that will eventually take this work, exactly as listed in the roster."
+                            },
+                            "task": {
+                                "type": "string",
+                                "description": "The complete, self-contained work text for this obligation."
+                            },
+                            "expected_artifacts": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Optional workspace-root-relative paths this obligation should produce (canonicalized; fabricated-traversal paths are rejected)."
+                            },
+                            "after": {
+                                "type": "array",
+                                "items": { "type": "integer" },
+                                "description": "Optional indices of strictly EARLIER obligations (positions in this obligations list) that must finish before this one runs. Defaults to chaining after the previous item."
+                            }
+                        },
+                        "required": ["agent_id", "task"]
+                    }
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Optional short reason for declaring this work now, recorded as the decision reason."
+                },
+                "supporting_evidence_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional real whiteboard event ids that justify the declaration."
+                }
+            },
+            "required": ["obligations"]
+        }),
+    }
+}
+
+/// Argument schema for the Coordinator's `update_obligations` tool: revise
+/// still-undispatched (`Declared` or `Pending`) work — its description,
+/// expected artifacts, or owning specialist — or release a `Declared` node
+/// to `Pending` so the graph loop may dispatch it. Settled or dispatched
+/// work is rejected with a structured error; use reconsider/split/merge for
+/// decided-then-wrong work, never this tool.
+fn update_obligations_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: UPDATE_OBLIGATIONS_TOOL.to_string(),
+        description: "Revise still-undispatched work (description, expected artifacts, \
+                      owning specialist) or release a declared node to Pending for \
+                      graph-loop dispatch. Only Declared/Pending nodes are editable; \
+                      settled or dispatched work is rejected."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "The id of the declared (not-yet-dispatched) obligation to revise."
+                },
+                "task": {
+                    "type": "string",
+                    "description": "Optional replacement work text (non-empty)."
+                },
+                "agent_id": {
+                    "type": "string",
+                    "description": "Optional replacement owning specialist, exactly as listed in the roster."
+                },
+                "expected_artifacts": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional replacement workspace-root-relative paths (canonicalized; replaces the node's set)."
+                },
+                "release": {
+                    "type": "boolean",
+                    "description": "When true, release a Declared node to Pending so the graph loop may dispatch it. No-op on Pending nodes."
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Optional short reason for the revision, recorded as the decision reason."
+                },
+                "supporting_evidence_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional real whiteboard event ids that justify the revision."
+                }
+            },
+            "required": ["task_id"]
         }),
     }
 }
@@ -2479,6 +2634,11 @@ struct CallSpecialistArgs {
     /// they validate (lexically canonicalize inside the project root) at
     /// decision-validation time before any materialization.
     expected_artifacts: Vec<String>,
+    /// Optional adoption of a declared (not-yet-dispatched) obligation: the
+    /// `task_id` of a `Declared`/`Pending` node this dispatch takes up. The
+    /// node must name the same specialist; `update_obligations` retargets it
+    /// first when it does not. Absent, the dispatch records a fresh node.
+    task_id: Option<String>,
 }
 
 impl CallSpecialistArgs {
@@ -2491,12 +2651,135 @@ impl CallSpecialistArgs {
         let notes = arguments.get("notes").and_then(serde_json::Value::as_str);
         let supporting_evidence_ids = parse_string_array(arguments, "supporting_evidence_ids");
         let expected_artifacts = parse_string_array(arguments, "expected_artifacts");
+        let task_id =
+            arguments.get("task_id").and_then(serde_json::Value::as_str).map(str::to_owned);
         Some(Self {
             agent_id: agent_id.to_owned(),
             task: task.to_owned(),
             notes: notes.map(str::to_owned),
             supporting_evidence_ids,
             expected_artifacts,
+            task_id,
+        })
+    }
+}
+
+/// One `declare_obligations` item: a single unit of obligation-bearing work
+/// that becomes a `Declared` graph node without any dispatch.
+struct DeclareObligationItem {
+    agent_id: String,
+    task: String,
+    expected_artifacts: Vec<String>,
+    after: Vec<usize>,
+}
+
+/// `declare_obligations` tool arguments: 1–[`MAX_DECLARE_OBLIGATIONS`]
+/// items chained in order (each item defaults to running after the previous
+/// one; explicit `after` indices name strictly earlier items instead).
+struct DeclareObligationsArgs {
+    obligations: Vec<DeclareObligationItem>,
+    notes: Option<String>,
+    supporting_evidence_ids: Vec<String>,
+}
+
+impl DeclareObligationsArgs {
+    /// Parse the tool arguments. Malformed arguments (missing/non-array
+    /// `obligations`, or an item missing string `agent_id`/`task`) yield
+    /// `None` — the caller answers with a structured tool error, never a
+    /// crash. Bounds (count, `after` shape) validate in the handler against
+    /// the live decision, where structured rejections carry the fix.
+    fn parse(arguments: &serde_json::Value) -> Option<Self> {
+        let items = arguments.get("obligations").and_then(serde_json::Value::as_array)?;
+        let obligations = items
+            .iter()
+            .filter_map(|item| {
+                let agent_id = item.get("agent_id").and_then(serde_json::Value::as_str)?;
+                let task = item.get("task").and_then(serde_json::Value::as_str)?;
+                let expected_artifacts = parse_string_array(item, "expected_artifacts")
+                    .into_iter()
+                    .map(|raw| {
+                        crate::declared_artifacts::path_without_description(&raw).into_owned()
+                    })
+                    .collect::<Vec<_>>();
+                let after = item
+                    .get("after")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|values| {
+                        values.iter().filter_map(serde_json::Value::as_u64).collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|index| usize::try_from(index).ok())
+                    .collect::<Vec<_>>();
+                Some(DeclareObligationItem {
+                    agent_id: agent_id.to_owned(),
+                    task: task.to_owned(),
+                    expected_artifacts,
+                    after,
+                })
+            })
+            .collect::<Vec<_>>();
+        if obligations.len() != items.len() {
+            return None;
+        }
+        let notes = arguments.get("notes").and_then(serde_json::Value::as_str);
+        let supporting_evidence_ids = parse_string_array(arguments, "supporting_evidence_ids");
+        Some(Self { obligations, notes: notes.map(str::to_owned), supporting_evidence_ids })
+    }
+}
+
+/// `update_obligations` tool arguments: revise one still-undispatched
+/// (`Declared`/`Pending`) node. At least the `task_id` is required; every
+/// other field is an independent optional edit, and `release` promotes a
+/// `Declared` node to `Pending`.
+struct UpdateObligationsArgs {
+    task_id: String,
+    task: Option<String>,
+    agent_id: Option<String>,
+    expected_artifacts: Option<Vec<String>>,
+    release: bool,
+    notes: Option<String>,
+    supporting_evidence_ids: Vec<String>,
+}
+
+impl UpdateObligationsArgs {
+    /// Parse the tool arguments. A missing/non-string `task_id` yields
+    /// `None` (structured tool error, never a crash); an explicitly present
+    /// but non-array `expected_artifacts` is treated as absent here and
+    /// rejected in the handler as `invalid_arguments` so the model gets a
+    /// readable fix instead of a silent drop.
+    fn parse(arguments: &serde_json::Value) -> Option<Self> {
+        let task_id = arguments.get("task_id").and_then(serde_json::Value::as_str)?;
+        let task = arguments.get("task").and_then(serde_json::Value::as_str).map(str::to_owned);
+        let agent_id =
+            arguments.get("agent_id").and_then(serde_json::Value::as_str).map(str::to_owned);
+        let expected_artifacts = match arguments.get("expected_artifacts") {
+            None => None,
+            Some(value) => {
+                let array = value.as_array()?;
+                Some(
+                    array
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(|raw| {
+                            crate::declared_artifacts::path_without_description(raw).into_owned()
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            }
+        };
+        let release =
+            arguments.get("release").and_then(serde_json::Value::as_bool).unwrap_or(false);
+        let notes = arguments.get("notes").and_then(serde_json::Value::as_str);
+        let supporting_evidence_ids = parse_string_array(arguments, "supporting_evidence_ids");
+        Some(Self {
+            task_id: task_id.to_owned(),
+            task,
+            agent_id,
+            expected_artifacts,
+            release,
+            notes: notes.map(str::to_owned),
+            supporting_evidence_ids,
         })
     }
 }
@@ -11599,6 +11882,13 @@ impl CoordinatorAgent {
             // Issue #64: the reconsideration surface — supersede a decision
             // and freeze only its affected pending tasks.
             tool_defs.push(reconsider_tool_definition());
+            // The obligation-declaration surfaces — structured work before
+            // dispatch: `declare_obligations` creates Outstanding
+            // (not-yet-dispatched) graph nodes, `update_obligations` revises
+            // or releases them. Both are deterministic graph writes (no
+            // dispatch, no tools), so they apply no policy gate.
+            tool_defs.push(declare_obligations_tool_definition());
+            tool_defs.push(update_obligations_tool_definition());
             // Issue #61: the mediated ownership-transfer surface — only
             // lawful when a write gate is attached to the run.
             if self.write_gate.is_some() {
@@ -12077,6 +12367,39 @@ impl CoordinatorAgent {
                         )
                         .await
                     }
+                    // The obligation-declaration surfaces — structured work
+                    // before dispatch. `declare_obligations` materializes
+                    // Outstanding (not-yet-dispatched) graph nodes;
+                    // `update_obligations` revises or releases them.
+                    // Deterministic graph writes: no agents, no tools, no
+                    // policy gate — but journaled, whiteboard-recorded, and
+                    // checkpointed, and every tool call here marks the
+                    // session tool-mediated for the conversational-close
+                    // gate.
+                    DECLARE_OBLIGATIONS_TOOL if dispatching => {
+                        self.handle_declare_obligations(
+                            graph,
+                            task,
+                            base_ctx,
+                            cancel,
+                            scope,
+                            ledger,
+                            &tool_call.arguments,
+                        )
+                        .await
+                    }
+                    UPDATE_OBLIGATIONS_TOOL if dispatching => {
+                        self.handle_update_obligations(
+                            graph,
+                            task,
+                            base_ctx,
+                            cancel,
+                            scope,
+                            ledger,
+                            &tool_call.arguments,
+                        )
+                        .await
+                    }
                     // Issue #61: the mediated transfer operation — a typed,
                     // validated decision applied by the attached gate. It
                     // moves records only from their actual current owner;
@@ -12396,6 +12719,61 @@ impl CoordinatorAgent {
         Some(serde_json::json!({ "same_role_guard": "cap_reached", "message": note }))
     }
 
+    /// Resolve an optional `call_specialist` `task_id` onto a declared
+    /// (not-yet-dispatched) obligation. The node must exist, still be
+    /// undispatched (`Declared`/`Pending`), and name the same specialist —
+    /// otherwise a structured tool error tells the model the fix
+    /// (`update_obligations` retargets a mis-owned node,
+    /// `declare_obligations` declares fresh work). `Ok(None)` is the legacy
+    /// path: no `task_id` was passed, so the dispatch records a fresh node.
+    /// Pure: reads the live graph, mutates nothing.
+    fn adopted_obligation(
+        &self,
+        graph: &TaskGraph,
+        agent_id: &AgentId,
+        task_id: Option<&str>,
+    ) -> Result<Option<TaskId>, serde_json::Value> {
+        let Some(raw) = task_id else {
+            return Ok(None);
+        };
+        let id = Ulid::from_string(raw).map(TaskId).map_err(|_| {
+            serde_json::json!({
+                "error": "invalid_arguments",
+                "message": format!("call_specialist: task_id {raw} is not a task id"),
+            })
+        })?;
+        let Some(node) = graph.get(&id) else {
+            return Err(serde_json::json!({
+                "error": "unknown_obligation",
+                "message": format!(
+                    "call_specialist: no declared obligation with id {raw}; declare it first \
+                     with declare_obligations"
+                ),
+            }));
+        };
+        if !matches!(node.status, SubTaskStatus::Declared | SubTaskStatus::Pending) {
+            return Err(serde_json::json!({
+                "error": "already_dispatched",
+                "message": format!(
+                    "call_specialist: obligation {raw} is {} (already dispatched or settled); \
+                     declare fresh work for a new dispatch",
+                    node.status.as_str()
+                ),
+            }));
+        }
+        if node.role != *agent_id {
+            return Err(serde_json::json!({
+                "error": "obligation_role_mismatch",
+                "message": format!(
+                    "call_specialist: obligation {raw} names {} but this dispatch targets \
+                     {agent_id}; retarget it first with update_obligations",
+                    node.role
+                ),
+            }));
+        }
+        Ok(Some(id))
+    }
+
     /// Handle ONE `call_specialist` tool call (ADR-35 amendment 2026-09-05):
     /// validate → policy-gate → record the evidence-backed Decision event →
     /// materialize the chained SubTask → dispatch through the existing
@@ -12598,10 +12976,19 @@ impl CoordinatorAgent {
             }
         };
         let decision_id = decision.id.clone();
-        // Mint the subtask id BEFORE the policy gate: every dispatch outcome
-        // below — including a denial that never materializes a graph node —
-        // correlates to this decision under one id in the run history.
-        let subtask_id = TaskId::new();
+        // Adopt-or-mint the subtask id BEFORE the policy gate: every dispatch
+        // outcome below — including a denial that never materializes a graph
+        // node — correlates to this decision under one id in the run history.
+        // A `task_id` adopts a declared (not-yet-dispatched) obligation: the
+        // node keeps its chain position and runs here, so declared work
+        // dispatches without a duplicate node. Absent, the dispatch records a
+        // fresh node exactly as before.
+        let subtask_id =
+            match self.adopted_obligation(graph, &effective_agent, args.task_id.as_deref()) {
+                Ok(Some(id)) => id,
+                Ok(None) => TaskId::new(),
+                Err(error) => return error,
+            };
         // Issue #60: the deterministic task class for the suitability
         // record — derived from the task text + expected artifacts (never
         // model-judged), attributed to the REQUESTED specialist.
@@ -12614,6 +13001,9 @@ impl CoordinatorAgent {
         // projection), captured here and attached to the tool result the
         // model reads back.
         let world_model_advisory = self.world_model_decision_advisory(&args.expected_artifacts);
+        // Canonical artifact set for this dispatch: an adopted declaration
+        // keeps its declared set unless the dispatch supplies its own.
+        let dispatch_artifacts = decision.expected_artifacts.clone();
         self.decision_journal.record(decision);
 
         // ── The DAG frontier must be settled: the chain parent (when any)
@@ -12769,40 +13159,63 @@ impl CoordinatorAgent {
         .await;
 
         // ── Materialize the SubTask node — the graph RECORDS the decision ──
-        let subtask = SubTask {
-            id: subtask_id,
-            parent_id: state.last_node,
-            session_id: task.session_id,
-            role: agent_id.clone(),
-            description: description.clone(),
-            status: SubTaskStatus::Pending,
-            dependencies: state.last_node.iter().copied().collect(),
-            deliverable: None,
-            created_at: time::OffsetDateTime::now_utc(),
-            completed_at: None,
-        };
-        match state.last_node {
-            Some(parent) => {
-                let relationship =
-                    self.fallback_relationship(graph, parent, &agent_id, design_role);
-                graph.add_child_with_relationship(
-                    subtask,
-                    parent,
-                    Dependency::MustFinishBefore,
-                    relationship,
+        // An adopted declaration keeps its declared chain position (parent,
+        // dependencies); only its description is refined to this dispatch's
+        // text and an explicitly supplied artifact set replaces the declared
+        // one. A fresh dispatch mints a node chained off the loop frontier
+        // exactly as before.
+        let adopted = graph.get(&subtask_id).is_some();
+        if adopted {
+            if let Some(node) = graph.get_mut(&subtask_id) {
+                node.description = description.clone();
+            }
+            if !dispatch_artifacts.is_empty() {
+                self.expected_artifacts.lock().unwrap_or_else(|error| error.into_inner()).insert(
+                    subtask_id,
+                    dispatch_artifacts.iter().map(camino::Utf8PathBuf::from).collect(),
                 );
             }
-            None => graph.add_root(subtask),
-        }
-        let _ = self.bus.publish_for_session(
-            task.session_id,
-            subtask_id.0,
-            EventKind::SubTaskCreated {
-                task_id: subtask_id,
+            let _ = self.bus.publish_for_session(
+                task.session_id,
+                subtask_id.0,
+                EventKind::SubTaskStarted { task_id: subtask_id, role: agent_id.clone() },
+            );
+        } else {
+            let subtask = SubTask {
+                id: subtask_id,
+                parent_id: state.last_node,
+                session_id: task.session_id,
                 role: agent_id.clone(),
                 description: description.clone(),
-            },
-        );
+                status: SubTaskStatus::Pending,
+                dependencies: state.last_node.iter().copied().collect(),
+                deliverable: None,
+                created_at: time::OffsetDateTime::now_utc(),
+                completed_at: None,
+            };
+            match state.last_node {
+                Some(parent) => {
+                    let relationship =
+                        self.fallback_relationship(graph, parent, &agent_id, design_role);
+                    graph.add_child_with_relationship(
+                        subtask,
+                        parent,
+                        Dependency::MustFinishBefore,
+                        relationship,
+                    );
+                }
+                None => graph.add_root(subtask),
+            }
+            let _ = self.bus.publish_for_session(
+                task.session_id,
+                subtask_id.0,
+                EventKind::SubTaskCreated {
+                    task_id: subtask_id,
+                    role: agent_id.clone(),
+                    description: description.clone(),
+                },
+            );
+        }
         graph.mark_running(&subtask_id);
         *ledger.subtask_attempts.entry(subtask_id).or_insert(0) += 1;
         ledger.action_ledger.push(checkpoint::CheckpointAction {
@@ -13287,6 +13700,22 @@ impl CoordinatorAgent {
         }
         if let Some(advisory) = world_model_advisory {
             tool_result["world_model"] = advisory;
+        }
+        // Declared-but-undispatched work survives the dispatch: name it so
+        // the next decision adopts it by `task_id` instead of minting a
+        // duplicate — and so the model sees that prose alone cannot close
+        // the run while Implement/Verify obligations stay Outstanding.
+        let declared_pending = graph
+            .all_tasks()
+            .iter()
+            .filter(|subtask| subtask.status == SubTaskStatus::Declared)
+            .count();
+        if declared_pending > 0 {
+            tool_result["declared_pending"] = serde_json::json!({
+                "count": declared_pending,
+                "hint": "declared (not-yet-dispatched) obligations remain; dispatch each with \
+                         call_specialist passing its task_id — prose alone never discharges them",
+            });
         }
         tool_result
     }
@@ -15407,6 +15836,435 @@ impl CoordinatorAgent {
             "outcome": "merged",
             "survivor": survivor.to_string(),
             "removed": removed.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+        })
+    }
+
+    /// Handle ONE `declare_obligations` tool call — the structured decision
+    /// that creates obligation-bearing work BEFORE any dispatch. Each item
+    /// becomes a `Declared` (Outstanding, not-yet-dispatched) graph node,
+    /// chained in order (each item defaults to running after the previous
+    /// one; explicit `after` names strictly earlier items instead).
+    ///
+    /// Same failure discipline as the other deterministic surfaces: validate
+    /// against the roster and the real project root BEFORE any mutation; a
+    /// rejection is a structured tool error the model reads, never a crash.
+    /// Declaration dispatches nothing and touches no tools, so it applies no
+    /// policy gate — but it is journaled, whiteboard-recorded, and
+    /// checkpointed like any decision, and the declared nodes persist through
+    /// the existing checkpoint rows. The declaration deliberately leaves
+    /// `state.last_node` alone: declaring is not dispatching, so the
+    /// chain-parent gate keeps governing dispatches from the last SETTLED
+    /// dispatch, and each declared node dispatches later via
+    /// `call_specialist` (passing its `task_id`) or an `update_obligations`
+    /// release to `Pending`.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_declare_obligations(
+        &mut self,
+        graph: &mut TaskGraph,
+        task: &AgentTask,
+        base_ctx: &AgentContext,
+        cancel: &CancellationToken,
+        scope: &mut checkpoint::CheckpointScope,
+        ledger: &mut DispatchLedger,
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        let Some(args) = DeclareObligationsArgs::parse(arguments) else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "declare_obligations requires an obligations array of {agent_id, task, expected_artifacts?, after?} specs",
+            });
+        };
+        if args.obligations.is_empty() || args.obligations.len() > MAX_DECLARE_OBLIGATIONS {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": format!(
+                    "declare_obligations takes 1–{MAX_DECLARE_OBLIGATIONS} obligations (got {})",
+                    args.obligations.len()
+                ),
+            });
+        }
+        // Per-item checks: roster membership, non-empty work text, and
+        // strictly-earlier, deduplicated order edges.
+        let roster = self.decision_roster();
+        for (index, item) in args.obligations.iter().enumerate() {
+            if !roster.contains(&item.agent_id) {
+                return serde_json::json!({
+                    "error": "unknown_agent",
+                    "message": format!(
+                        "declare_obligations: no specialist registered for id {}; the roster in \
+                         your context lists every callable agent",
+                        item.agent_id
+                    ),
+                });
+            }
+            if item.task.trim().is_empty() {
+                return serde_json::json!({
+                    "error": "incomplete_decision",
+                    "message": format!(
+                        "declare_obligations item {index} requires a non-empty task description"
+                    ),
+                });
+            }
+            let mut seen = HashSet::new();
+            for dep in &item.after {
+                if *dep >= index || !seen.insert(*dep) {
+                    return serde_json::json!({
+                        "error": "invalid_arguments",
+                        "message": format!(
+                            "declare_obligations item {index}: after indices must name strictly \
+                             EARLIER obligations once each"
+                        ),
+                    });
+                }
+            }
+        }
+        // Artifact canonicalization per item: every model-supplied path
+        // resolves INSIDE the project root before it reaches the decision
+        // (model paths are never trusted).
+        let path_validator = crate::decisions::DecisionValidator {
+            roster_ids: &HashSet::new(),
+            known_event_ids: &HashSet::new(),
+            project_root: Some(base_ctx.session.project_dir.as_path()),
+        };
+        let mut canonical_per_item: Vec<Vec<String>> = Vec::with_capacity(args.obligations.len());
+        let mut union_artifacts: Vec<String> = Vec::new();
+        for item in &args.obligations {
+            let mut canonical: Vec<String> = Vec::new();
+            for raw in &item.expected_artifacts {
+                let Some(path) = path_validator.canonical_artifact_path(raw) else {
+                    return serde_json::json!({
+                        "error": "invalid_artifact_path",
+                        "message": format!(
+                            "declare_obligations: expected-artifact path {raw:?} escapes the \
+                             workspace; give a workspace-root-relative path"
+                        ),
+                    });
+                };
+                if !canonical.contains(&path) {
+                    canonical.push(path.clone());
+                }
+                if !union_artifacts.contains(&path) {
+                    union_artifacts.push(path);
+                }
+            }
+            canonical_per_item.push(canonical);
+        }
+        let mut agents: Vec<&str> = Vec::new();
+        for item in &args.obligations {
+            if !agents.contains(&item.agent_id.as_str()) {
+                agents.push(item.agent_id.as_str());
+            }
+        }
+        let summary =
+            format!("declare {} obligation(s) ({})", args.obligations.len(), agents.join(", "));
+        let decision = match self
+            .validate_transform_decision(
+                crate::decisions::DecisionKind::DeclareObligations,
+                None,
+                &summary,
+                args.notes.as_deref(),
+                &args.supporting_evidence_ids,
+                &union_artifacts,
+                cancel,
+                base_ctx,
+            )
+            .await
+        {
+            Ok(decision) => decision,
+            Err(error) => return error,
+        };
+        let decision_id = decision.id.clone();
+        self.decision_journal.record(decision);
+
+        // ── Materialize one `Declared` node per item — the graph RECORDS ──
+        // ── the structured decision; nothing runs yet. ───────────────────
+        let mut declared: Vec<(TaskId, String, String)> =
+            Vec::with_capacity(args.obligations.len());
+        let mut minted: Vec<TaskId> = Vec::with_capacity(args.obligations.len());
+        for (index, (item, canonical)) in
+            args.obligations.iter().zip(canonical_per_item.iter()).enumerate()
+        {
+            let id = TaskId::new();
+            let dep_indices: Vec<usize> = if item.after.is_empty() {
+                // Default chain: every item after the first runs after its
+                // predecessor, giving the investigate → implement → verify →
+                // explain order without naming indices.
+                index.checked_sub(1).into_iter().collect::<Vec<_>>()
+            } else {
+                item.after.clone()
+            };
+            let dep_ids: Vec<TaskId> = dep_indices.into_iter().map(|dep| minted[dep]).collect();
+            let subtask = SubTask {
+                id,
+                parent_id: dep_ids.first().copied(),
+                session_id: task.session_id,
+                role: AgentId::new(&item.agent_id),
+                description: item.task.clone(),
+                status: SubTaskStatus::Declared,
+                dependencies: dep_ids.clone(),
+                deliverable: None,
+                created_at: time::OffsetDateTime::now_utc(),
+                completed_at: None,
+            };
+            graph.add_subtask(subtask);
+            let mut edge_failed = None;
+            for dep in &dep_ids {
+                if let Err(error) = graph.add_dependency(id, *dep, Dependency::MustFinishBefore) {
+                    edge_failed = Some(error.to_string());
+                    break;
+                }
+            }
+            if let Some(reason) = edge_failed {
+                // Unreachable by construction (every dep id was minted above
+                // from a validated strictly-earlier index) — fail closed so
+                // the run never keeps a half-declared chain.
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                return serde_json::json!({
+                    "error": "declaration_failed",
+                    "message": format!("declare_obligations: dependency wiring failed: {reason}"),
+                });
+            }
+            self.expected_artifacts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(id, canonical.iter().map(camino::Utf8PathBuf::from).collect());
+            let _ = self.bus.publish_for_session(
+                task.session_id,
+                id.0,
+                EventKind::SubTaskCreated {
+                    task_id: id,
+                    role: AgentId::new(&item.agent_id),
+                    description: item.task.clone(),
+                },
+            );
+            ledger.action_ledger.push(checkpoint::CheckpointAction {
+                kind: "declared".into(),
+                task_id: Some(id),
+                timestamp: time::OffsetDateTime::now_utc(),
+                evidence: None,
+            });
+            declared.push((id, item.agent_id.clone(), item.task.clone()));
+            minted.push(id);
+        }
+
+        // ── The trail: journal transitions, whiteboard decision, checkpoint.
+        self.decision_journal
+            .transition(&decision_id, crate::decisions::DecisionStatus::Dispatched);
+        self.decision_journal.transition(&decision_id, crate::decisions::DecisionStatus::Settled);
+        self.append_transform_decision(
+            task.session_id,
+            None,
+            args.notes.as_deref().unwrap_or("coordinator_choice"),
+            &summary,
+            &args.supporting_evidence_ids,
+        )
+        .await;
+        self.persist_dispatch_checkpoint(graph, task, base_ctx, scope, ledger).await;
+
+        serde_json::json!({
+            "status": "declared",
+            "obligations": declared
+                .iter()
+                .map(|(id, agent_id, item_task)| serde_json::json!({
+                    "task_id": id.to_string(),
+                    "agent_id": agent_id,
+                    "task": item_task,
+                }))
+                .collect::<Vec<_>>(),
+            "hint": "dispatch each obligation with call_specialist passing its task_id; \
+                      declared Implement/Verify work blocks completion until dispatched with \
+                      evidence — prose alone never discharges it",
+        })
+    }
+
+    /// Handle ONE `update_obligations` tool call — revise one
+    /// still-undispatched (`Declared`/`Pending`) node: its description,
+    /// expected artifacts, owning specialist, or its release from `Declared`
+    /// to `Pending` so the graph loop may dispatch it. Settled or dispatched
+    /// work is rejected (completed work is never re-cut; failed/blocked work
+    /// retries through its own paths; wrongly-decided work goes through
+    /// reconsider/split/merge). A call that changes nothing answers
+    /// `unchanged` without journaling noise.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_update_obligations(
+        &mut self,
+        graph: &mut TaskGraph,
+        task: &AgentTask,
+        base_ctx: &AgentContext,
+        cancel: &CancellationToken,
+        scope: &mut checkpoint::CheckpointScope,
+        ledger: &mut DispatchLedger,
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        let Some(args) = UpdateObligationsArgs::parse(arguments) else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "update_obligations requires a string task_id plus at least one edit (task, agent_id, expected_artifacts, or release)",
+            });
+        };
+        let Ok(target) = Ulid::from_string(&args.task_id).map(TaskId) else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": format!("update_obligations: task_id {} is not a task id", args.task_id),
+            });
+        };
+        let Some(node) = graph.get(&target) else {
+            return serde_json::json!({
+                "error": "unknown_obligation",
+                "message": format!(
+                    "update_obligations: no obligation with id {}; declare it first with \
+                     declare_obligations",
+                    args.task_id
+                ),
+            });
+        };
+        if !matches!(node.status, SubTaskStatus::Declared | SubTaskStatus::Pending) {
+            return serde_json::json!({
+                "error": "invalid_transition",
+                "message": format!(
+                    "update_obligations: obligation {} is {} — only Declared/Pending \
+                     (not-yet-dispatched) work is editable; settled or dispatched work is never \
+                     re-cut",
+                    args.task_id,
+                    node.status.as_str()
+                ),
+            });
+        }
+        if let Some(agent_id) = args.agent_id.as_deref() {
+            if !self.decision_roster().contains(agent_id) {
+                return serde_json::json!({
+                    "error": "unknown_agent",
+                    "message": format!(
+                        "update_obligations: no specialist registered for id {agent_id}; the roster \
+                         in your context lists every callable agent"
+                    ),
+                });
+            }
+        }
+        if let Some(text) = args.task.as_deref() {
+            if text.trim().is_empty() {
+                return serde_json::json!({
+                    "error": "invalid_arguments",
+                    "message": "update_obligations: task must be a non-empty string when provided",
+                });
+            }
+        }
+        // Artifact canonicalization for the replacement set (model paths are
+        // never trusted).
+        let mut canonical_artifacts: Option<Vec<String>> = None;
+        if let Some(raw_list) = args.expected_artifacts.as_deref() {
+            let path_validator = crate::decisions::DecisionValidator {
+                roster_ids: &HashSet::new(),
+                known_event_ids: &HashSet::new(),
+                project_root: Some(base_ctx.session.project_dir.as_path()),
+            };
+            let mut canonical: Vec<String> = Vec::new();
+            for raw in raw_list {
+                let Some(path) = path_validator.canonical_artifact_path(raw) else {
+                    return serde_json::json!({
+                        "error": "invalid_artifact_path",
+                        "message": format!(
+                            "update_obligations: expected-artifact path {raw:?} escapes the \
+                             workspace; give a workspace-root-relative path"
+                        ),
+                    });
+                };
+                if !canonical.contains(&path) {
+                    canonical.push(path);
+                }
+            }
+            canonical_artifacts = Some(canonical);
+        }
+        let was_declared = node.status == SubTaskStatus::Declared;
+        let will_release = args.release && was_declared;
+        if args.task.is_none()
+            && args.agent_id.is_none()
+            && canonical_artifacts.is_none()
+            && !will_release
+        {
+            return serde_json::json!({
+                "status": "unchanged",
+                "task_id": args.task_id,
+                "node_status": node.status.as_str(),
+                "message": "no edit applied: give a task, agent_id, expected_artifacts, or \
+                            release=true on a Declared node",
+            });
+        }
+        let mut edits: Vec<String> = Vec::new();
+        if args.task.is_some() {
+            edits.push("description".to_owned());
+        }
+        if let Some(agent_id) = args.agent_id.as_deref() {
+            edits.push(format!("owner→{agent_id}"));
+        }
+        if canonical_artifacts.is_some() {
+            edits.push("expected_artifacts".to_owned());
+        }
+        if will_release {
+            edits.push("release Declared→Pending".to_owned());
+        }
+        let summary = format!("update {}: {}", args.task_id, edits.join(", "));
+        let decision = match self
+            .validate_transform_decision(
+                crate::decisions::DecisionKind::UpdateObligations,
+                None,
+                &summary,
+                args.notes.as_deref(),
+                &args.supporting_evidence_ids,
+                canonical_artifacts.as_deref().unwrap_or(&[]),
+                cancel,
+                base_ctx,
+            )
+            .await
+        {
+            Ok(decision) => decision,
+            Err(error) => return error,
+        };
+        let decision_id = decision.id.clone();
+        self.decision_journal.record(decision);
+
+        if let Some(node) = graph.get_mut(&target) {
+            if let Some(text) = args.task.as_deref() {
+                node.description = text.to_owned();
+            }
+            if let Some(agent_id) = args.agent_id.as_deref() {
+                node.role = AgentId::new(agent_id);
+            }
+            if will_release {
+                node.status = SubTaskStatus::Pending;
+            }
+        }
+        if let Some(canonical) = canonical_artifacts {
+            self.expected_artifacts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(target, canonical.iter().map(camino::Utf8PathBuf::from).collect());
+        }
+        self.decision_journal
+            .transition(&decision_id, crate::decisions::DecisionStatus::Dispatched);
+        self.decision_journal.transition(&decision_id, crate::decisions::DecisionStatus::Settled);
+        self.append_transform_decision(
+            task.session_id,
+            Some(target),
+            args.notes.as_deref().unwrap_or("coordinator_choice"),
+            &summary,
+            &args.supporting_evidence_ids,
+        )
+        .await;
+        ledger.action_ledger.push(checkpoint::CheckpointAction {
+            kind: "obligation-updated".into(),
+            task_id: Some(target),
+            timestamp: time::OffsetDateTime::now_utc(),
+            evidence: None,
+        });
+        self.persist_dispatch_checkpoint(graph, task, base_ctx, scope, ledger).await;
+
+        serde_json::json!({
+            "status": "updated",
+            "task_id": args.task_id,
+            "node_status": graph.get(&target).map(|node| node.status.as_str()).unwrap_or("unknown"),
+            "applied": edits,
         })
     }
 
@@ -19791,6 +20649,1195 @@ mod tests {
             output.checkpoint_json.is_some(),
             "a Partial run preserves its checkpoint for resume"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Declared obligations: structured work before dispatch (tests A–I)
+    // ------------------------------------------------------------------
+    //
+    // The missing transition the guards needed: `declare_obligations` lets
+    // the Coordinator's structured decision create obligation-bearing work
+    // BEFORE any dispatch. Each declared item becomes a `Declared`
+    // (Outstanding, not-yet-dispatched) graph node — the graph stays the
+    // source of truth, the `ObligationLedger` a derived view — persisted
+    // through the existing checkpoint rows. Communication stays
+    // unrestricted; obligations constrain completion only: declared
+    // Implement/Verify work blocks the guards until dispatched with
+    // evidence, while prose answers Explain freely.
+    //
+    // Lifecycle under test: none → declared → pending → dispatched →
+    // completed/failed → verify pending → verified → completed.
+
+    /// A `declare_obligations` tool call for a test turn.
+    fn declare_obligations_call(id: &str, obligations: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: id.to_owned(),
+            name: DECLARE_OBLIGATIONS_TOOL.to_string(),
+            arguments: serde_json::json!({ "obligations": obligations }),
+            ..Default::default()
+        }
+    }
+
+    /// A `call_specialist` tool call adopting a declared obligation.
+    fn call_specialist_for(agent_id: &str, task: &str, task_id: &str) -> ToolCall {
+        let mut call = call_specialist(agent_id, task);
+        call.id = format!("adopt-{agent_id}");
+        call.arguments["task_id"] = serde_json::json!(task_id);
+        call
+    }
+
+    /// Minimal harness for calling the declare/update/adopt handlers
+    /// directly: an allow-all coordinator over `mocks` plus a fresh graph,
+    /// ledger, scope, task, and context. The workspace dir is returned so
+    /// the caller keeps it alive for file-writing dispatches.
+    fn obligation_harness(
+        mocks: Vec<MockExpertAgent>,
+    ) -> (
+        CoordinatorAgent,
+        AgentTask,
+        AgentContext,
+        TaskGraph,
+        DispatchLedger,
+        checkpoint::CheckpointScope,
+        tempfile::TempDir,
+    ) {
+        let bus = EventBus::new(256);
+        let coordinator = coordinator_with_turns(
+            bus,
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text(String::new())],
+        );
+        let session_id = Ulid::new();
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let task = AgentTask::new_coordinator_decides(session_id, "fix the bug and explain");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let graph = TaskGraph::new();
+        let ledger = DispatchLedger::default();
+        let scope = coordinator.fresh_checkpoint_scope(&task, &context);
+        (coordinator, task, context, graph, ledger, scope, workspace)
+    }
+
+    /// Test-only shorthand for `handle_declare_obligations` with a fresh
+    /// cancellation token: the declaration-validation tests exercise the
+    /// structured rejections without a dispatch session.
+    #[allow(clippy::too_many_arguments)]
+    async fn declare_for_test(
+        coordinator: &mut CoordinatorAgent,
+        task: &AgentTask,
+        context: &AgentContext,
+        graph: &mut TaskGraph,
+        ledger: &mut DispatchLedger,
+        scope: &mut checkpoint::CheckpointScope,
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        coordinator
+            .handle_declare_obligations(
+                graph,
+                task,
+                context,
+                &CancellationToken::new(),
+                scope,
+                ledger,
+                arguments,
+            )
+            .await
+    }
+
+    /// Scripted provider for the declare→adopt lifecycle tests (C, E): the
+    /// first turn declares the configured obligations; once the declare
+    /// result (carrying the server-minted task ids) lands in the
+    /// conversation, each subsequent turn adopts the next obligation by its
+    /// `task_id`; afterwards it closes in prose. Mirrors the
+    /// `EvidenceChainProvider` shape: decisions read the REAL tool results,
+    /// never fabricated ids.
+    struct DeclareAdoptProvider {
+        requests: std::sync::Mutex<Vec<concerto_core::types::CompletionRequest>>,
+        items: Vec<serde_json::Value>,
+        closing_text: String,
+        declare_served: std::sync::atomic::AtomicBool,
+        adopts_queued: std::sync::atomic::AtomicBool,
+        adopt_queue: std::sync::Mutex<std::collections::VecDeque<(String, String, String)>>,
+    }
+
+    impl DeclareAdoptProvider {
+        fn new(items: Vec<serde_json::Value>, closing_text: &str) -> Self {
+            Self {
+                requests: std::sync::Mutex::new(Vec::new()),
+                items,
+                closing_text: closing_text.to_owned(),
+                declare_served: std::sync::atomic::AtomicBool::new(false),
+                adopts_queued: std::sync::atomic::AtomicBool::new(false),
+                adopt_queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            }
+        }
+
+        /// The declared (agent, work text, task id) triples observed in the
+        /// declare tool result so far.
+        fn observed_declared(&self) -> Vec<(String, String, String)> {
+            let requests = self.requests.lock().unwrap();
+            let mut out = Vec::new();
+            for request in requests.iter() {
+                for message in request.messages.iter() {
+                    let Some(results) = message.tool_results.as_ref() else {
+                        continue;
+                    };
+                    for result in results {
+                        if result.name != DECLARE_OBLIGATIONS_TOOL {
+                            continue;
+                        }
+                        let items = result
+                            .content
+                            .get("obligations")
+                            .and_then(serde_json::Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        for item in items {
+                            if let (Some(agent), Some(work), Some(id)) = (
+                                item.get("agent_id").and_then(serde_json::Value::as_str),
+                                item.get("task").and_then(serde_json::Value::as_str),
+                                item.get("task_id").and_then(serde_json::Value::as_str),
+                            ) {
+                                out.push((agent.to_owned(), work.to_owned(), id.to_owned()));
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        }
+
+        /// Every tool-result JSON payload observed (what the loop read back).
+        fn tool_result_contents(&self) -> Vec<serde_json::Value> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|request| {
+                    request
+                        .messages
+                        .iter()
+                        .filter_map(|message| message.tool_results.as_ref())
+                        .flat_map(|results| results.iter().map(|result| result.content.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl concerto_core::traits::provider::LlmProvider for DeclareAdoptProvider {
+        async fn stream_completion(
+            &self,
+            request: concerto_core::types::CompletionRequest,
+            _cancel: CancellationToken,
+        ) -> Result<concerto_core::traits::provider::CompletionStream, ProviderError> {
+            use std::sync::atomic::Ordering;
+            self.requests.lock().unwrap().push(request);
+            if !self.adopts_queued.load(Ordering::SeqCst) {
+                let found = self.observed_declared();
+                if !found.is_empty() {
+                    *self.adopt_queue.lock().unwrap() = found.into();
+                    self.adopts_queued.store(true, Ordering::SeqCst);
+                }
+            }
+            let chunk = if !self.declare_served.load(Ordering::SeqCst) {
+                self.declare_served.store(true, Ordering::SeqCst);
+                concerto_core::types::CompletionChunk {
+                    reasoning: None,
+                    delta: String::new(),
+                    tool_call: Some(declare_obligations_call(
+                        "declare-1",
+                        serde_json::Value::Array(self.items.clone()),
+                    )),
+                    is_final: true,
+                    usage: None,
+                }
+            } else if let Some((agent, work, id)) = self.adopt_queue.lock().unwrap().pop_front() {
+                concerto_core::types::CompletionChunk {
+                    reasoning: None,
+                    delta: String::new(),
+                    tool_call: Some(call_specialist_for(&agent, &work, &id)),
+                    is_final: true,
+                    usage: None,
+                }
+            } else {
+                concerto_core::types::CompletionChunk {
+                    reasoning: None,
+                    delta: self.closing_text.clone(),
+                    tool_call: None,
+                    is_final: true,
+                    usage: None,
+                }
+            };
+            Ok(Box::pin(futures::stream::iter(vec![Ok(chunk)])))
+        }
+        fn context_capacity(&self, _model: &str) -> concerto_core::types::TokenBudget {
+            concerto_core::types::TokenBudget::new(128_000, 4_096)
+        }
+        fn approximate_cost(&self, _tokens_in: u64, _tokens_out: u64) -> f64 {
+            0.0
+        }
+        fn provider_name(&self) -> &'static str {
+            "declare-adopt"
+        }
+    }
+
+    /// Classify a graph the way the coordinator's dispatch guards do:
+    /// implement-stage roles → `Implement`, validate-stage roles → `Verify`
+    /// (stage *kinds* via the coordinator, never role names).
+    fn test_ledger_for(
+        coordinator: &CoordinatorAgent,
+        graph: &TaskGraph,
+    ) -> crate::obligations::ObligationLedger {
+        let mut ledger = crate::obligations::ObligationLedger::new();
+        ledger.sync_from_graph(graph, |role| {
+            if coordinator.role_in_kind_stage(role, StageKind::Execution, AgentStage::is_implement)
+            {
+                Some(crate::obligations::ObligationKind::Implement)
+            } else if coordinator.role_in_kind_stage(
+                role,
+                StageKind::Acceptance,
+                AgentStage::is_validate,
+            ) {
+                Some(crate::obligations::ObligationKind::Verify)
+            } else {
+                None
+            }
+        });
+        ledger
+    }
+
+    /// A. Creation: "fix the bug and explain" declares Implement work that
+    /// EXISTS (Outstanding) before anything executes — no dispatch, no
+    /// running node, no evidence — while the explanation half stays
+    /// prose-satisfiable (and prose alone discharges nothing else).
+    #[tokio::test]
+    async fn test_a_declare_creates_implement_before_execution() {
+        let (mut coordinator, task, context, mut graph, mut ledger, mut scope, _workspace) =
+            obligation_harness(vec![MockExpertAgent::always_succeed(
+                AgentId::new("coder"),
+                "implemented",
+            )]);
+        let declared = coordinator
+            .handle_declare_obligations(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({
+                    "obligations": [{ "agent_id": "coder", "task": "fix the bug" }],
+                    "notes": "the turn needs implementation work",
+                }),
+            )
+            .await;
+        assert_eq!(declared["status"], "declared", "structured, yes: {declared:?}");
+        let raw_id = declared["obligations"][0]["task_id"]
+            .as_str()
+            .expect("the declare result names the obligation id")
+            .to_owned();
+        let id = Ulid::from_string(&raw_id).map(TaskId).expect("a task id");
+        // Pre-execution: one Outstanding node, zero dispatches, nothing
+        // running, no evidence claimed.
+        let node = graph.get(&id).expect("the declared node exists");
+        assert_eq!(node.status, SubTaskStatus::Declared);
+        assert_eq!(node.role, AgentId::new("coder"));
+        assert!(ledger.action_ledger.iter().all(|action| action.kind != "dispatched"));
+        assert!(ledger.completed_results.is_empty());
+        assert!(
+            ledger
+                .action_ledger
+                .iter()
+                .any(|action| action.kind == "declared" && action.task_id == Some(id)),
+            "the declaration is a durable action row: {:?}",
+            ledger.action_ledger
+        );
+        // The derived ledger view sees open Implement work ...
+        let derived = test_ledger_for(&coordinator, &graph);
+        assert!(derived.has_open_implementation());
+        assert!(derived.has_open_execution_work());
+        // ... while Explain stays prose-satisfiable: prose answers the
+        // explanation, and only the explanation.
+        assert!(crate::obligations::ObligationKind::Explain.is_prose_satisfiable());
+        assert!(!crate::obligations::ObligationKind::Implement.is_prose_satisfiable());
+        assert!(!crate::obligations::ObligationKind::Verify.is_prose_satisfiable());
+    }
+
+    /// B. Declared-but-undispatched Implement work plus pure prose is NOT
+    /// completion: the unfinished-work guard, the combined dispatch guard,
+    /// and the completion-evidence predicate all treat the Outstanding
+    /// obligation as blocking — in any mode, with or without files, and
+    /// without any verification declaration.
+    #[tokio::test]
+    async fn test_b_declared_undispatched_prose_does_not_complete() {
+        let (mut coordinator, task, context, mut graph, mut ledger, mut scope, _workspace) =
+            obligation_harness(vec![MockExpertAgent::always_succeed(
+                AgentId::new("coder"),
+                "implemented",
+            )]);
+        coordinator
+            .handle_declare_obligations(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({
+                    "obligations": [{ "agent_id": "coder", "task": "fix the bug" }],
+                }),
+            )
+            .await;
+        // The graph holds unfinished work ...
+        assert!(graph_has_unfinished_work(&graph));
+        // ... the combined guard arms with NO ActionRequired mode (the task
+        // is CoordinatorDecides) and would arm there too ...
+        assert!(coordinator.dispatch_guard_arms(&task, &graph, &[]));
+        assert!(coordinator.obligation_dispatch_pending(&graph));
+        let session_id = task.session_id;
+        assert!(coordinator.dispatch_guard_arms(
+            &AgentTask::new_action_required(session_id, "fix the bug and explain"),
+            &graph,
+            &[]
+        ));
+        // ... prose may not close over open execution work — bare, with
+        // files, or otherwise: files without settled obligations still
+        // cannot complete ...
+        for evidence in [
+            crate::obligations::CompletionEvidence::default(),
+            crate::obligations::CompletionEvidence { has_files: true, ..Default::default() },
+        ] {
+            assert!(!evidence.prose_may_close(true));
+            assert!(!evidence.implement_may_complete(true));
+        }
+        // ... and an evidenceless Complete transition on Implement is
+        // rejected: prose never marks execution complete.
+        assert!(crate::obligations::try_transition(
+            crate::obligations::ObligationState::Outstanding,
+            &crate::obligations::ObligationEvent::Complete { evidence: Vec::new() },
+            crate::obligations::ObligationKind::Implement,
+            "impl-1",
+        )
+        .is_err());
+    }
+
+    /// C. Mixed communication + execution + communication: the coordinator
+    /// declares, dispatches with evidence (a real file lands), and explains
+    /// — execution proceeds while the prose half discharges nothing: with
+    /// verification still open the run reports Partial, never Completed.
+    #[tokio::test]
+    async fn test_c_mixed_turn_executes_but_prose_discharges_nothing() {
+        let bus = EventBus::new(256);
+        let provider = Arc::new(DeclareAdoptProvider::new(
+            vec![serde_json::json!({
+                "agent_id": "coder",
+                "task": "fix the bug",
+                "expected_artifacts": ["src/fix.rs"],
+            })],
+            "fixed the bug; verification still open",
+        ));
+        let mut coordinator = coordinator_with_provider_and_policy(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+                AgentId::new("coder"),
+                "implemented",
+            )
+            .with_artifact_writer()])),
+            provider.clone(),
+            coordinator_allow_all_policy(),
+        );
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_coordinator_decides(session_id, "fix the bug and explain"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        // Execution happened: the adopt dispatch settled success with a real
+        // file, alongside the prose turns (Mixed, never DirectAnswer work).
+        let adopt_result = provider
+            .tool_result_contents()
+            .into_iter()
+            .find(|result| result.get("outcome").is_some() && result.get("agent_id").is_some())
+            .expect("the adopt dispatch result was observed");
+        assert_eq!(adopt_result["outcome"], "success");
+        assert!(
+            project_dir.path().join("src/fix.rs").exists(),
+            "the dispatched work produced its declared evidence on disk"
+        );
+        assert_eq!(
+            crate::obligations::derive_turn_disposition(false, 2, true),
+            crate::obligations::TurnDisposition::Mixed,
+            "prose alongside execution is lawful concurrency, not a direct answer"
+        );
+        // ... yet the prose half discharged nothing: verification never ran,
+        // so the completion claim is Partial.
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "execution without verification must not complete, got: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("C-06"),
+            "the downgrade names the missing verification, got: {}",
+            output.final_message
+        );
+        assert!(output.checkpoint_json.is_some(), "the Partial run stays resumable");
+    }
+
+    /// D. Follow-up direct answer keeps the obligation intact and dispatches
+    /// nothing extra: resuming the Partial checkpoint with a purely
+    /// conversational turn still reports Partial, runs zero dispatches, and
+    /// the preserved checkpoint still holds the Declared obligation.
+    #[tokio::test]
+    async fn test_d_follow_up_answer_keeps_obligation_without_dispatch() {
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context_for = |session: Ulid| {
+            AgentContext::new(concerto_core::types::SessionContext::new(
+                session,
+                project_dir.path().to_path_buf(),
+            ))
+        };
+        let bus = EventBus::new(256);
+        let mut coordinator = coordinator_with_turns(
+            bus,
+            Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+                AgentId::new("coder"),
+                "implemented",
+            )])),
+            vec![
+                CoordinatorTurn::Calls(vec![declare_obligations_call(
+                    "declare-1",
+                    serde_json::json!([{ "agent_id": "coder", "task": "fix the bug" }]),
+                )]),
+                CoordinatorTurn::Text("I'll investigate and fix".into()),
+            ],
+        );
+        let output = coordinator
+            .run(
+                AgentTask::new_coordinator_decides(session_id, "fix the bug and explain"),
+                context_for(session_id),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        assert_eq!(output.completion_status, concerto_core::types::AgentCompletionStatus::Partial);
+        let checkpoint_json = output.checkpoint_json.expect("the Partial run stays resumable");
+        // The follow-up is a direct answer: no new declaration, no dispatch.
+        let bus2 = EventBus::new(256);
+        let mut coordinator2 = coordinator_with_turns(
+            bus2,
+            Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+                AgentId::new("coder"),
+                "implemented",
+            )])),
+            vec![CoordinatorTurn::Text("noted, thanks".into())],
+        );
+        let second = coordinator2
+            .run(
+                AgentTask::new_coordinator_decides(session_id, "continue"),
+                context_for(session_id),
+                CancellationToken::new(),
+                Some(checkpoint_json),
+            )
+            .await
+            .expect("resume should succeed");
+        assert_eq!(
+            second.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "the obligation is intact, so the follow-up cannot complete either: {}",
+            second.final_message
+        );
+        assert_eq!(
+            second.tool_call_count, 0,
+            "the follow-up dispatched nothing extra: {}",
+            second.final_message
+        );
+        let preserved = second.checkpoint_json.expect("the follow-up stays resumable");
+        // The obligation itself is intact across the resume.
+        let restored_checkpoint =
+            crate::checkpoint::GraphCheckpoint::from_json(&preserved).expect("checkpoint loads");
+        let restored =
+            crate::checkpoint::restore_graph(&restored_checkpoint).expect("graph restores");
+        assert!(
+            restored.all_tasks().iter().any(|subtask| subtask.status == SubTaskStatus::Declared
+                && subtask.role == AgentId::new("coder")),
+            "the Declared obligation survives the follow-up untouched"
+        );
+    }
+
+    /// E. Implement → Verify → Explain with evidence completes: the declared
+    /// chain dispatches in order (each adoption carrying its declared
+    /// artifacts), verification settles with a real file behind it, and the
+    /// closing prose explains settled work — Completed with no checkpoint
+    /// left behind.
+    #[tokio::test]
+    async fn test_e_implement_verify_explain_with_evidence_completes() {
+        let bus = EventBus::new(256);
+        let provider = Arc::new(DeclareAdoptProvider::new(
+            vec![
+                serde_json::json!({
+                    "agent_id": "coder",
+                    "task": "fix the bug",
+                    "expected_artifacts": ["src/fix.rs"],
+                }),
+                serde_json::json!({ "agent_id": "validator", "task": "verify the fix" }),
+            ],
+            "fixed the bug and verified it",
+        ));
+        let mut coordinator = coordinator_with_provider_and_policy(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![
+                MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                    .with_artifact_writer(),
+                MockExpertAgent::always_succeed(AgentId::new("validator"), "validation ok"),
+            ])),
+            provider.clone(),
+            coordinator_allow_all_policy(),
+        );
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_coordinator_decides(session_id, "fix the bug and explain"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "evidenced implement + verification completes, got: {}",
+            output.final_message
+        );
+        assert!(output.checkpoint_json.is_none(), "a clean success clears its checkpoint");
+        assert!(
+            project_dir.path().join("src/fix.rs").exists(),
+            "the declared deliverable is on disk"
+        );
+        let outcomes: Vec<String> = provider
+            .tool_result_contents()
+            .into_iter()
+            .filter_map(|result| {
+                result.get("outcome").and_then(serde_json::Value::as_str).map(str::to_owned)
+            })
+            .collect();
+        assert!(
+            outcomes.iter().filter(|outcome| *outcome == "success").count() >= 2,
+            "both chain links dispatched with success, got: {outcomes:?}"
+        );
+    }
+
+    /// F. A bare "fixed" in prose with no evidence is not completion: the
+    /// declared deliverable is unproduced on disk, so the run reports
+    /// Partial naming the missing deliverable — the claim is actionable,
+    /// never silent.
+    #[tokio::test]
+    async fn test_f_fixed_prose_without_evidence_does_not_complete() {
+        let bus = EventBus::new(256);
+        let mut coordinator = coordinator_with_turns(
+            bus,
+            Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+                AgentId::new("coder"),
+                "implemented",
+            )])),
+            vec![
+                CoordinatorTurn::Calls(vec![declare_obligations_call(
+                    "declare-1",
+                    serde_json::json!([{
+                        "agent_id": "coder",
+                        "task": "fix the bug",
+                        "expected_artifacts": ["src/fix.rs"],
+                    }]),
+                )]),
+                CoordinatorTurn::Text("fixed".into()),
+            ],
+        );
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_coordinator_decides(session_id, "fix the bug and explain"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "prose with no evidence must not complete, got: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Unproduced declared deliverable"),
+            "the downgrade names the missing deliverable, got: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("src/fix.rs"),
+            "the downgrade names the path, got: {}",
+            output.final_message
+        );
+        assert!(output.checkpoint_json.is_some(), "the Partial run stays resumable");
+    }
+
+    /// G. Pure conversation stays clean: "hi there" with no declared work,
+    /// no plan, and no dispatch completes as a direct answer — communication
+    /// is unrestricted, and no dispatch is manufactured for it.
+    #[tokio::test]
+    async fn test_g_pure_conversation_completes_clean() {
+        let bus = EventBus::new(256);
+        let mut coordinator = coordinator_with_turns(
+            bus,
+            Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+                AgentId::new("coder"),
+                "implemented",
+            )])),
+            vec![CoordinatorTurn::Text("Hi there".into())],
+        );
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_coordinator_decides(session_id, "hi there"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "a conversational turn with no obligations completes, got: {}",
+            output.final_message
+        );
+        assert_eq!(output.final_message, "Hi there", "the prose IS the reply");
+    }
+
+    /// Decision boundary without ANY tool call: pure prose with zero
+    /// declared obligations completes — the guards constrain obligations,
+    /// never communication. Contrast test B, where the SAME prose shape with
+    /// a prior structured declaration reports Partial. Together they pin the
+    /// boundary: no keywords, no manufactured dispatch, no silent escape.
+    #[tokio::test]
+    async fn test_decision_boundary_pure_prose_without_calls_completes() {
+        let bus = EventBus::new(256);
+        let mut coordinator = coordinator_with_turns(
+            bus,
+            Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+                AgentId::new("coder"),
+                "implemented",
+            )])),
+            vec![CoordinatorTurn::Text("I'll investigate and fix".into())],
+        );
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_coordinator_decides(session_id, "fix the bug and explain"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "prose with zero declared obligations is communication, not an escape: {}",
+            output.final_message
+        );
+        assert!(
+            output.checkpoint_json.is_none(),
+            "a clean conversational close leaves no checkpoint"
+        );
+    }
+
+    /// B (run half): declared-but-undispatched work plus the escape-path
+    /// prose ("I'll investigate and fix") reports Partial with a preserved
+    /// checkpoint — the structured declaration is what arms the guards.
+    #[tokio::test]
+    async fn test_b_declared_prose_run_reports_partial() {
+        let bus = EventBus::new(256);
+        let mut coordinator = coordinator_with_turns(
+            bus,
+            Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+                AgentId::new("coder"),
+                "implemented",
+            )])),
+            vec![
+                CoordinatorTurn::Calls(vec![declare_obligations_call(
+                    "declare-1",
+                    serde_json::json!([{ "agent_id": "coder", "task": "fix the bug" }]),
+                )]),
+                CoordinatorTurn::Text("I'll investigate and fix".into()),
+            ],
+        );
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_coordinator_decides(session_id, "fix the bug and explain"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "declared-undispatched work cannot close in prose, got: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Unfinished-work guard"),
+            "the downgrade names the open obligation, got: {}",
+            output.final_message
+        );
+        assert!(output.checkpoint_json.is_some(), "the Partial run stays resumable");
+    }
+
+    /// I. Declared obligations survive cancel/interrupt/resume/failure/retry:
+    /// an interrupt re-pends in-flight work without touching Declared nodes,
+    /// the checkpoint round-trip preserves them, and failed/blocked
+    /// obligations retry explicitly back to Outstanding — never silently
+    /// dropped, never silently re-armed.
+    #[tokio::test]
+    async fn test_i_declared_work_survives_lifecycle() {
+        let (mut coordinator, task, context, mut graph, mut ledger, mut scope, _workspace) =
+            obligation_harness(vec![MockExpertAgent::always_succeed(
+                AgentId::new("coder"),
+                "implemented",
+            )]);
+        let declared = coordinator
+            .handle_declare_obligations(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({
+                    "obligations": [{ "agent_id": "coder", "task": "fix the bug" }],
+                }),
+            )
+            .await;
+        let raw_id = declared["obligations"][0]["task_id"]
+            .as_str()
+            .expect("the declare result names the obligation id")
+            .to_owned();
+        let id = Ulid::from_string(&raw_id).map(TaskId).expect("a task id");
+        // Interrupt: in-flight Running work re-pends; Declared work is
+        // untouched by the zombie-kill.
+        let running_id = TaskId::new();
+        graph.add_root(SubTask {
+            id: running_id,
+            parent_id: None,
+            session_id: task.session_id,
+            role: AgentId::new("coder"),
+            description: "in-flight work".into(),
+            status: SubTaskStatus::Running,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+        graph.mark_all_with_status(SubTaskStatus::Running, SubTaskStatus::Pending);
+        assert_eq!(graph.get(&running_id).map(|node| node.status), Some(SubTaskStatus::Pending));
+        assert_eq!(
+            graph.get(&id).map(|node| node.status),
+            Some(SubTaskStatus::Declared),
+            "interrupt re-pends in-flight work; declared obligations stand"
+        );
+        graph.remove_task(&running_id);
+        // Failure/retry through the derived ledger: Failed and Blocked stay
+        // open (blocking completion) until an explicit Retry re-arms them.
+        let mut derived = test_ledger_for(&coordinator, &graph);
+        assert_eq!(
+            derived.apply(
+                &raw_id,
+                crate::obligations::ObligationEvent::Fail { reason: "cancelled".into() }
+            ),
+            Ok(crate::obligations::ObligationState::Failed)
+        );
+        assert!(derived.has_open_implementation(), "failed work is unresolved, never droppable");
+        assert_eq!(
+            derived.apply(&raw_id, crate::obligations::ObligationEvent::Retry),
+            Ok(crate::obligations::ObligationState::Outstanding)
+        );
+        // Resume: the checkpoint round-trip preserves the Declared node and
+        // its open Implement obligation via the existing graph rows.
+        let scope = checkpoint::CheckpointScope {
+            run_id: Ulid::new(),
+            session_id: task.session_id,
+            root_task_id: TaskId::new(),
+            project_id: "test".into(),
+            objective: "fix the bug and explain".into(),
+            objective_hash: "hash".into(),
+            source_revision: None,
+            sequence_num: 0,
+        };
+        let working_memory = concerto_core::memory::WorkingMemorySnapshot {
+            id: Ulid::new(),
+            session_id: task.session_id,
+            decisions: Vec::new(),
+            task_tree: Vec::new(),
+            created_at: time::OffsetDateTime::now_utc(),
+        };
+        let checkpoint = checkpoint::build_checkpoint(
+            &scope,
+            checkpoint::CheckpointStage::Executing,
+            None,
+            &working_memory,
+            &graph,
+            &std::collections::HashMap::new(),
+            0.0,
+            0,
+            &[],
+            &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &checkpoint::CheckpointContext::default(),
+        );
+        let json = serde_json::to_string(&checkpoint).expect("checkpoint serializes");
+        let restored_checkpoint =
+            crate::checkpoint::GraphCheckpoint::from_json(&json).expect("checkpoint loads");
+        let restored =
+            crate::checkpoint::restore_graph(&restored_checkpoint).expect("graph restores");
+        assert_eq!(
+            restored.get(&id).map(|node| node.status),
+            Some(SubTaskStatus::Declared),
+            "resume preserves the declared obligation through the existing rows"
+        );
+        assert!(test_ledger_for(&coordinator, &restored).has_open_implementation());
+    }
+
+    /// Declaration validation: unknown agents, empty sets, oversized sets,
+    /// non-earlier order edges, and escaping artifact paths are structured
+    /// rejections that mutate nothing — never a crash, never a half-declared
+    /// chain.
+    #[tokio::test]
+    async fn declare_obligations_rejects_invalid_declarations() {
+        let (mut coordinator, task, context, mut graph, mut ledger, mut scope, _workspace) =
+            obligation_harness(vec![MockExpertAgent::always_succeed(
+                AgentId::new("coder"),
+                "implemented",
+            )]);
+        // Unknown agent.
+        let rejected = declare_for_test(
+            &mut coordinator,
+            &task,
+            &context,
+            &mut graph,
+            &mut ledger,
+            &mut scope,
+            &serde_json::json!({ "obligations": [{ "agent_id": "ghost", "task": "haunt" }] }),
+        )
+        .await;
+        assert_eq!(rejected["error"], "unknown_agent", "{rejected:?}");
+        // Empty set and oversized set.
+        for obligations in [
+            serde_json::json!([]),
+            serde_json::Value::Array(
+                (0..9)
+                    .map(|index| serde_json::json!({ "agent_id": "coder", "task": format!("work {index}") }))
+                    .collect(),
+            ),
+        ] {
+            let args = serde_json::json!({ "obligations": obligations });
+            let rejected = declare_for_test(
+                &mut coordinator,
+                &task,
+                &context,
+                &mut graph,
+                &mut ledger,
+                &mut scope,
+                &args,
+            )
+            .await;
+            assert_eq!(rejected["error"], "invalid_arguments", "{rejected:?}");
+        }
+        // Non-earlier order edge (self-dependency).
+        let rejected = declare_for_test(
+            &mut coordinator,
+            &task,
+            &context,
+            &mut graph,
+            &mut ledger,
+            &mut scope,
+            &serde_json::json!({ "obligations": [
+                { "agent_id": "coder", "task": "first", "after": [0] },
+            ] }),
+        )
+        .await;
+        assert_eq!(rejected["error"], "invalid_arguments", "{rejected:?}");
+        // Escaping artifact path.
+        let rejected = declare_for_test(
+            &mut coordinator,
+            &task,
+            &context,
+            &mut graph,
+            &mut ledger,
+            &mut scope,
+            &serde_json::json!({ "obligations": [
+                { "agent_id": "coder", "task": "fix", "expected_artifacts": ["../evil.rs"] },
+            ] }),
+        )
+        .await;
+        assert_eq!(rejected["error"], "invalid_artifact_path", "{rejected:?}");
+        assert!(graph.is_empty(), "rejections mutate nothing: {rejected:?}");
+        assert!(ledger.action_ledger.is_empty(), "rejections record nothing");
+    }
+
+    /// Update validation and release: edits land on undispatched nodes only,
+    /// a `release` promotes Declared → Pending for graph-loop dispatch, and
+    /// settled/dispatched/unknown nodes are structured rejections.
+    #[tokio::test]
+    async fn update_obligations_revises_and_releases_undispatched_work() {
+        let (mut coordinator, task, context, mut graph, mut ledger, mut scope, _workspace) =
+            obligation_harness(vec![
+                MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+                MockExpertAgent::always_succeed(AgentId::new("validator"), "validation ok"),
+            ]);
+        let declared = coordinator
+            .handle_declare_obligations(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({ "obligations": [{ "agent_id": "coder", "task": "fix the bug" }] }),
+            )
+            .await;
+        let raw_id = declared["obligations"][0]["task_id"].as_str().expect("id").to_owned();
+        // Retarget + re-describe + release in one revision.
+        let updated = coordinator
+            .handle_update_obligations(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({
+                    "task_id": raw_id,
+                    "task": "fix the bug thoroughly",
+                    "agent_id": "validator",
+                    "expected_artifacts": ["src/fix.rs"],
+                    "release": true,
+                }),
+            )
+            .await;
+        assert_eq!(updated["status"], "updated", "structured, yes: {updated:?}");
+        let id = Ulid::from_string(&raw_id).map(TaskId).expect("a task id");
+        let node = graph.get(&id).expect("the node exists");
+        assert_eq!(node.description, "fix the bug thoroughly");
+        assert_eq!(node.role, AgentId::new("validator"));
+        assert_eq!(node.status, SubTaskStatus::Pending, "release promotes to Pending");
+        // A no-op revision answers unchanged without journaling noise.
+        let unchanged = coordinator
+            .handle_update_obligations(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({ "task_id": raw_id }),
+            )
+            .await;
+        assert_eq!(unchanged["status"], "unchanged", "{unchanged:?}");
+        // Unknown, malformed, and mis-owned targets reject; settled work is
+        // never re-cut.
+        let unknown = coordinator
+            .handle_update_obligations(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({ "task_id": TaskId::new().to_string(), "task": "late edit" }),
+            )
+            .await;
+        assert_eq!(unknown["error"], "unknown_obligation", "{unknown:?}");
+        let misowned = coordinator
+            .handle_update_obligations(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({ "task_id": raw_id, "agent_id": "ghost" }),
+            )
+            .await;
+        assert_eq!(misowned["error"], "unknown_agent", "{misowned:?}");
+        graph.mark_done(&id);
+        let settled = coordinator
+            .handle_update_obligations(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({ "task_id": raw_id, "task": "rewrite history" }),
+            )
+            .await;
+        assert_eq!(settled["error"], "invalid_transition", "{settled:?}");
+    }
+
+    /// Adoption: `call_specialist` with a `task_id` dispatches the declared
+    /// node itself — no duplicate node, same settle/record/chain mechanics —
+    /// and names remaining declared work in its result. Unknown, settled, or
+    /// mis-owned ids are structured rejections.
+    #[tokio::test]
+    async fn call_specialist_adopts_declared_obligations() {
+        let (mut coordinator, task, context, mut graph, mut ledger, mut scope, _workspace) =
+            obligation_harness(vec![
+                MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+                MockExpertAgent::always_succeed(AgentId::new("validator"), "validation ok"),
+            ]);
+        let declared = coordinator
+            .handle_declare_obligations(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({ "obligations": [
+                    { "agent_id": "coder", "task": "fix the bug" },
+                    { "agent_id": "coder", "task": "double-check the fix" },
+                ] }),
+            )
+            .await;
+        let first = declared["obligations"][0]["task_id"].as_str().expect("id").to_owned();
+        let second = declared["obligations"][1]["task_id"].as_str().expect("id").to_owned();
+        let first_id = Ulid::from_string(&first).map(TaskId).expect("a task id");
+        let mut state = DispatchSessionState::default();
+        let adopted = coordinator
+            .handle_call_specialist(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                None,
+                &serde_json::json!({ "agent_id": "coder", "task": "fix the bug", "task_id": first }),
+            )
+            .await;
+        assert_eq!(adopted["outcome"], "success", "structured, yes: {adopted:?}");
+        assert_eq!(graph.len(), 2, "adoption dispatches the declared node itself — no duplicate");
+        assert_eq!(graph.get(&first_id).map(|node| node.status), Some(SubTaskStatus::Completed));
+        assert_eq!(
+            state.last_node,
+            Some(first_id),
+            "the chain frontier advances over the adopted node"
+        );
+        assert!(
+            ledger.completed_results.contains_key(&first_id),
+            "the adopted dispatch settles like any dispatch"
+        );
+        assert_eq!(
+            adopted["declared_pending"]["count"], 1,
+            "remaining declared work is named in the result: {adopted:?}"
+        );
+        // Re-adopting the settled node, adopting under the wrong owner, and
+        // adopting an unknown id all reject without mutation.
+        let settled = coordinator
+            .handle_call_specialist(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                None,
+                &serde_json::json!({ "agent_id": "coder", "task": "fix again", "task_id": first }),
+            )
+            .await;
+        assert_eq!(settled["error"], "already_dispatched", "{settled:?}");
+        let misowned = coordinator
+            .handle_call_specialist(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                None,
+                &serde_json::json!({ "agent_id": "validator", "task": "verify", "task_id": second }),
+            )
+            .await;
+        assert_eq!(misowned["error"], "obligation_role_mismatch", "{misowned:?}");
+        let unknown = coordinator
+            .handle_call_specialist(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                None,
+                &serde_json::json!({
+                    "agent_id": "coder",
+                    "task": "fix",
+                    "task_id": TaskId::new().to_string(),
+                }),
+            )
+            .await;
+        assert_eq!(unknown["error"], "unknown_obligation", "{unknown:?}");
+        assert_eq!(graph.len(), 2, "rejections mutate nothing");
     }
 
     /// A write-capable tool under a name the mutating classifier cannot see

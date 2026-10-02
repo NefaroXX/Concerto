@@ -91,6 +91,18 @@ pub enum DecisionKind {
     /// no target (it names hypotheses, not a single specialist) and carries
     /// no task description (the hypotheses themselves are the work text).
     Investigate,
+    /// Declare obligation-bearing work (`declare_obligations`): create
+    /// `Declared` graph nodes — Outstanding obligations enforceable before
+    /// any dispatch. Names obligations (not a single specialist target);
+    /// the summary rides the task description. Dispatches nothing, touches
+    /// no tools, applies no policy gate (there is nothing to gate, like
+    /// split/merge).
+    DeclareObligations,
+    /// Edit undispatched work (`update_obligations`): revise the
+    /// description, artifacts, or owner of a `Declared`/`Pending` node, or
+    /// release a `Declared` node to `Pending`. Names the obligation task id,
+    /// not a specialist; settled or dispatched work is rejected.
+    UpdateObligations,
     /// Issue #63: explicit WAIT. The Coordinator parks the decision loop on
     /// an external condition instead of burning turns or being misread as
     /// stalled. The model supplies a reason (recorded as the task
@@ -138,6 +150,8 @@ impl DecisionKind {
                 | DecisionKind::Replan
                 | DecisionKind::Split
                 | DecisionKind::Merge
+                | DecisionKind::DeclareObligations
+                | DecisionKind::UpdateObligations
                 | DecisionKind::Wait
                 | DecisionKind::Reconsider // names decisions/tasks, not a specialist
         )
@@ -152,6 +166,8 @@ impl DecisionKind {
                 | DecisionKind::Consult
                 | DecisionKind::Wait // the WAIT reason rides the task text
                 | DecisionKind::Reconsider // the RECONSIDER reason rides the task text
+                | DecisionKind::DeclareObligations // the declaration summary rides the task text
+                | DecisionKind::UpdateObligations // the update summary rides the task text
         )
     }
 }

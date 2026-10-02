@@ -375,6 +375,10 @@ pub(crate) fn decision_kind_label(kind: DecisionKind) -> &'static str {
         DecisionKind::Wait => "wait",
         // Issue #64 explicit reconsideration (supersede a decision + freeze).
         DecisionKind::Reconsider => "reconsider",
+        // Declared obligations (structured work before dispatch) and their
+        // undispatched edits.
+        DecisionKind::DeclareObligations => "declare-obligations",
+        DecisionKind::UpdateObligations => "update-obligations",
     }
 }
 

@@ -124,16 +124,19 @@ impl ObligationState {
 }
 
 /// Map a graph subtask status onto the obligation lifecycle. `Completed` is
-/// settled; `Failed` is terminal-but-retryable; every other status is work the
-/// run has not settled yet. There is no graph-native "superseded" — that
-/// transition lives on the ledger (reconsider/split/merge), never in a
-/// status column.
+/// settled; `Failed` is terminal-but-retryable; `Declared` (obligation
+/// declared via `declare_obligations`, not yet dispatched) is Outstanding —
+/// enforceable before any dispatch, never auto-executed; every other status
+/// is work the run has not settled yet. There is no graph-native "superseded"
+/// — that transition lives on the ledger (reconsider/split/merge), never in
+/// a status column.
 pub fn obligation_state_for_status(status: SubTaskStatus) -> ObligationState {
     match status {
         SubTaskStatus::Completed => ObligationState::Completed,
         SubTaskStatus::Blocked => ObligationState::Blocked,
         SubTaskStatus::Failed => ObligationState::Failed,
-        SubTaskStatus::Pending
+        SubTaskStatus::Declared
+        | SubTaskStatus::Pending
         | SubTaskStatus::Running
         | SubTaskStatus::AwaitingReview
         | SubTaskStatus::NeedsRevision => ObligationState::Outstanding,
@@ -975,5 +978,82 @@ mod tests {
             "superseded work is terminal"
         );
         assert!(!ledger.has_open_execution_work());
+    }
+
+    // ── Declared obligations (missing transition) ──────────────────────
+
+    #[test]
+    fn declared_status_derives_outstanding_and_arms_execution() {
+        use concerto_core::ids::Ulid;
+        use concerto_core::types::{AgentId, SubTask, TaskId};
+
+        assert_eq!(
+            obligation_state_for_status(SubTaskStatus::Declared),
+            ObligationState::Outstanding,
+            "declared (not-yet-dispatched) work is Outstanding — enforceable before any dispatch"
+        );
+        // A graph holding a Declared implement node derives an open
+        // Implement obligation even with an empty evidence set and pure
+        // prose around it.
+        let mut graph = TaskGraph::new();
+        let id = TaskId::new();
+        let mut declared = SubTask::new(Ulid::new(), AgentId::new("coder"), "fix the bug");
+        declared.id = id;
+        declared.status = SubTaskStatus::Declared;
+        graph.add_root(declared);
+        let mut ledger = ObligationLedger::new();
+        ledger.sync_from_graph(&graph, |role| {
+            if role.as_str() == "coder" {
+                Some(ObligationKind::Implement)
+            } else {
+                None
+            }
+        });
+        assert!(ledger.has_open_implementation());
+        assert!(ledger.has_open_execution_work());
+        assert!(dispatch_guard_arms(false, &ledger));
+        let bare = CompletionEvidence::default();
+        assert!(!bare.prose_may_close(true));
+        assert!(!bare.implement_may_complete(true));
+    }
+
+    /// H. A conversational follow-up adds no obligation and resets none: a
+    /// direct answer with a Declared obligation standing keeps every state,
+    /// keeps the dispatch armed, and records no dispatch of its own.
+    #[test]
+    fn h_follow_up_direct_answer_preserves_declared_obligations() {
+        use concerto_core::ids::Ulid;
+        use concerto_core::types::{AgentId, SubTask, TaskId};
+
+        let mut graph = TaskGraph::new();
+        let id = TaskId::new();
+        let mut declared = SubTask::new(Ulid::new(), AgentId::new("coder"), "fix the bug");
+        declared.id = id;
+        declared.status = SubTaskStatus::Declared;
+        graph.add_root(declared);
+        let mut ledger = ObligationLedger::new();
+        ledger.sync_from_graph(&graph, |role| {
+            if role.as_str() == "coder" {
+                Some(ObligationKind::Implement)
+            } else {
+                None
+            }
+        });
+        // The follow-up is a direct answer: no new execution, no dispatch.
+        let open_before = ledger.note_conversational_turn();
+        ledger.add_follow_up(Vec::new());
+        assert_eq!(
+            ledger.note_conversational_turn(),
+            open_before,
+            "prose must not reset, satisfy, or replace declared work"
+        );
+        assert_eq!(
+            ledger.get(&id.to_string()).map(|ob| ob.state),
+            Some(ObligationState::Outstanding),
+            "the declared obligation is intact after the follow-up"
+        );
+        assert!(ledger.has_open_implementation());
+        assert!(dispatch_guard_arms(false, &ledger));
+        assert_eq!(derive_turn_disposition(true, 0, true), TurnDisposition::DirectAnswer);
     }
 }

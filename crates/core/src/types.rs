@@ -1759,6 +1759,13 @@ pub enum Severity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum SubTaskStatus {
+    /// Declared but not yet dispatched: a coordinator `declare_obligations`
+    /// decision created obligation-bearing work that no specialist has taken
+    /// up. Open (blocks completion like any unfinished work) but never
+    /// auto-dispatched by the graph loop — only an explicit `call_specialist`
+    /// adoption (by `task_id`) or an `update_obligations` release to
+    /// `Pending` moves it toward execution.
+    Declared,
     Pending,
     Blocked,
     Running,
@@ -1771,6 +1778,7 @@ pub enum SubTaskStatus {
 impl SubTaskStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::Declared => "declared",
             Self::Pending => "pending",
             Self::Blocked => "blocked",
             Self::Running => "running",
@@ -1783,6 +1791,7 @@ impl SubTaskStatus {
 
     pub fn from_name(s: &str) -> Self {
         match s {
+            "declared" => Self::Declared,
             "blocked" => Self::Blocked,
             "running" => Self::Running,
             "awaiting_review" => Self::AwaitingReview,
@@ -2428,6 +2437,7 @@ mod tests {
     #[test]
     fn subtask_status_roundtrip() {
         for (name, status) in [
+            ("declared", SubTaskStatus::Declared),
             ("pending", SubTaskStatus::Pending),
             ("blocked", SubTaskStatus::Blocked),
             ("running", SubTaskStatus::Running),
