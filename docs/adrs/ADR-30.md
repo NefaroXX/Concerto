@@ -1,6 +1,6 @@
 # ADR-30: Unified Agent Shell Selection
 
-**Status:** Accepted
+**Status:** Partially superseded by [ADR-76](ADR-76-native-shell-security.md): native execution is the default; unified profiles remain optional interpreter compatibility settings.
 **Date:** 2026-07-19
 **Deciders:** Concerto architecture
 **Supersedes:** ADR-28 sections 2, 4, and 5 where they define independent shell bindings

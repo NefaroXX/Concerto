@@ -43,6 +43,8 @@ pub struct SimplePolicyEngine {
     /// `SandboxProfile::Containerized` profile. Defaults to the process-wide
     /// system probe; injectable so tests never need a container runtime.
     sandbox_runtime: Arc<dyn ContainerRuntimeProbe>,
+    shell_security: Option<(crate::shell_security::ShellSecurity, std::path::PathBuf)>,
+    protected_config: Option<std::path::PathBuf>,
 }
 
 impl SimplePolicyEngine {
@@ -57,6 +59,8 @@ impl SimplePolicyEngine {
             intent_auth: None,
             approval_timeout: std::time::Duration::from_secs(30),
             sandbox_runtime: Arc::new(SystemContainerRuntime::new()),
+            shell_security: None,
+            protected_config: None,
         }
     }
 
@@ -66,6 +70,101 @@ impl SimplePolicyEngine {
     pub fn with_sandbox_runtime(mut self, probe: Arc<dyn ContainerRuntimeProbe>) -> Self {
         self.sandbox_runtime = probe;
         self
+    }
+
+    /// Apply user-owned permission ceilings in addition to configured rules.
+    pub fn with_shell_security(
+        mut self,
+        security: crate::shell_security::ShellSecurity,
+        project_root: std::path::PathBuf,
+    ) -> Self {
+        self.shell_security = Some((security, project_root));
+        self
+    }
+
+    /// Global policy files cannot be modified through file tools.
+    pub fn with_protected_config(mut self, path: Option<std::path::PathBuf>) -> Self {
+        self.protected_config = path;
+        self
+    }
+
+    fn apply_shell_security(
+        &self,
+        action: &PolicyAction<'_>,
+        verdict: PolicyVerdict,
+        rule: String,
+    ) -> (PolicyVerdict, String) {
+        use crate::shell_security::ShellPermission;
+        let Some((security, root)) = &self.shell_security else {
+            return (verdict, rule);
+        };
+        if security.validate().is_err() {
+            return (PolicyVerdict::Deny, "shell_security_invalid".into());
+        }
+        if matches!(verdict, PolicyVerdict::Deny) {
+            return (verdict, rule);
+        }
+        let operation = action
+            .path_facts
+            .as_ref()
+            .map(|facts| facts.operation.as_str())
+            .or_else(|| action.input.get("operation").and_then(serde_json::Value::as_str));
+        let filesystem = action.tool_name == "filesystem";
+        let write = (filesystem && !matches!(operation, Some("read" | "exists" | "list")))
+            || (action.tool_name == "git"
+                && !matches!(operation, Some("status" | "diff" | "log" | "show" | "blame")));
+        if filesystem {
+            let facts = action.path_facts.as_ref();
+            let paths = [
+                facts
+                    .and_then(|f| f.attempted_path.as_deref())
+                    .or_else(|| action.input.get("path").and_then(serde_json::Value::as_str)),
+                facts.and_then(|f| f.attempted_destination.as_deref()).or_else(|| {
+                    action.input.get("destination").and_then(serde_json::Value::as_str)
+                }),
+            ];
+            for path in paths.into_iter().flatten() {
+                let Some(target) = resolve_security_path(&root.join(path)) else {
+                    return (PolicyVerdict::Deny, "shell_security_unresolved_path".into());
+                };
+                let protected = security
+                    .protected_paths
+                    .iter()
+                    .map(|p| root.join(p))
+                    .chain(self.protected_config.iter().cloned());
+                for protected in protected {
+                    let Some(protected) = resolve_security_path(&protected) else {
+                        return (PolicyVerdict::Deny, "shell_security_unresolved_path".into());
+                    };
+                    if target.starts_with(&protected) || (write && protected.starts_with(&target)) {
+                        return (PolicyVerdict::Deny, "shell_security_protected_path".into());
+                    }
+                }
+            }
+        }
+        let permission = if matches!(action.tool_name, "shell" | "process") {
+            if security.processes == ShellPermission::Deny {
+                ShellPermission::Deny
+            } else if security.processes == ShellPermission::Ask
+                || security.writes == ShellPermission::Ask
+            {
+                ShellPermission::Ask
+            } else {
+                ShellPermission::Policy
+            }
+        } else if write {
+            security.writes
+        } else {
+            ShellPermission::Policy
+        };
+        match permission {
+            ShellPermission::Deny => (PolicyVerdict::Deny, "shell_security_denied".into()),
+            ShellPermission::Ask if matches!(verdict, PolicyVerdict::Allow) => (
+                PolicyVerdict::RequireApproval { timeout: self.approval_timeout },
+                "shell_security_approval".into(),
+            ),
+            _ => (verdict, rule),
+        }
     }
 
     /// Override the default approval deadline (30s) carried by
@@ -546,6 +645,9 @@ impl SimplePolicyEngine {
     /// startup) rather than discovering invalid patterns only when evaluation
     /// silently skips them.
     pub fn validate(&self) -> Result<(), PolicyError> {
+        if let Some((security, _)) = &self.shell_security {
+            security.validate().map_err(PolicyError::RuleViolation)?;
+        }
         let mut problems = Vec::new();
         for rule in &self.rules {
             let cond = match rule {
@@ -913,6 +1015,18 @@ fn container_routing_is_asserted(action: &PolicyAction<'_>) -> bool {
 
 #[async_trait]
 impl PolicyEngine for SimplePolicyEngine {
+    async fn evaluate_security_ceiling(
+        &self,
+        action: &PolicyAction<'_>,
+        cancel: CancellationToken,
+    ) -> Result<PolicyVerdict, PolicyError> {
+        let (verdict, rule) =
+            self.apply_shell_security(action, PolicyVerdict::Allow, String::new());
+        if !matches!(verdict, PolicyVerdict::Allow) {
+            self.record_decision(action, &verdict, &rule, cancel).await;
+        }
+        Ok(verdict)
+    }
     async fn evaluate(
         &self,
         action: &PolicyAction<'_>,
@@ -937,6 +1051,7 @@ impl PolicyEngine for SimplePolicyEngine {
         // 3. Check configured policy rules.
         match self.evaluate_rules(action) {
             Some((verdict, rule)) => {
+                let (verdict, rule) = self.apply_shell_security(action, verdict, rule);
                 self.record_decision(action, &verdict, &rule, cancel.clone()).await;
                 Ok(verdict)
             }
@@ -980,9 +1095,38 @@ impl PolicyEngine for SimplePolicyEngine {
 
         // 3. Check configured policy rules.
         match self.evaluate_rules(action) {
-            Some((verdict, _)) => Ok(verdict),
+            Some((verdict, rule)) => Ok(self.apply_shell_security(action, verdict, rule).0),
             None => Ok(PolicyVerdict::Deny),
         }
+    }
+}
+
+/// Resolve existing ancestors before normalizing a missing leaf. Symlink errors
+/// and traversal above the filesystem root are denied rather than guessed.
+fn resolve_security_path(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    if let Ok(resolved) = path.canonicalize() {
+        return Some(resolved);
+    }
+    let mut missing = Vec::new();
+    let mut ancestor = path;
+    loop {
+        if let Ok(mut resolved) = ancestor.canonicalize() {
+            for part in missing.iter().rev() {
+                match part {
+                    std::path::Component::Normal(name) => resolved.push(name),
+                    std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir => {
+                        if !resolved.pop() {
+                            return None;
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            return Some(resolved);
+        }
+        missing.push(ancestor.components().next_back()?);
+        ancestor = ancestor.parent()?;
     }
 }
 
@@ -1383,6 +1527,59 @@ mod tests {
             command_facts: None,
             orchestrator_authority: false,
             path_facts: None,
+        }
+    }
+
+    // verifies: user deny/ask ceilings cannot be widened by auto-approve or advisory/cache evaluation.
+    #[tokio::test]
+    async fn shell_security_ceiling_applies_to_policy_and_advisory() {
+        use crate::shell_security::{ShellPermission, ShellSecurity};
+        let root = std::env::current_dir().expect("cwd");
+        for permission in [ShellPermission::Deny, ShellPermission::Ask] {
+            let security = ShellSecurity { processes: permission, ..ShellSecurity::default() };
+            let audit = Arc::new(TestAuditLog { entries: std::sync::Mutex::new(Vec::new()) });
+            let engine =
+                SimplePolicyEngine::new(vec![PolicyRule::AutoApprove(Condition::Always)], audit)
+                    .with_shell_security(security, root.clone());
+            let input = serde_json::json!({"command":"example"});
+            let action = make_action("shell", &input);
+            let verdict =
+                engine.evaluate(&action, CancellationToken::new()).await.expect("evaluate");
+            let advisory = engine
+                .evaluate_advisory(&action, CancellationToken::new())
+                .await
+                .expect("advisory");
+            if permission == ShellPermission::Deny {
+                assert!(matches!(verdict, PolicyVerdict::Deny));
+                assert!(matches!(advisory, PolicyVerdict::Deny));
+            } else {
+                assert!(matches!(verdict, PolicyVerdict::RequireApproval { .. }));
+                assert!(matches!(advisory, PolicyVerdict::RequireApproval { .. }));
+            }
+        }
+    }
+
+    // verifies: non-existing protected files and their parent directories cannot be changed through traversal.
+    #[tokio::test]
+    async fn protected_paths_deny_missing_files_and_ancestor_writes() {
+        let root = std::env::current_dir().expect("cwd");
+        let security = crate::shell_security::ShellSecurity {
+            protected_paths: vec!["new-protected.env".into()],
+            ..Default::default()
+        };
+        let audit = Arc::new(TestAuditLog { entries: std::sync::Mutex::new(Vec::new()) });
+        let engine =
+            SimplePolicyEngine::new(vec![PolicyRule::AutoApprove(Condition::Always)], audit)
+                .with_shell_security(security, root);
+        for path in ["new-protected.env", "missing/../new-protected.env", "."] {
+            let input = serde_json::json!({"operation":"write","path":path});
+            assert!(matches!(
+                engine
+                    .evaluate(&make_action("filesystem", &input), CancellationToken::new())
+                    .await
+                    .expect("evaluate"),
+                PolicyVerdict::Deny
+            ));
         }
     }
 

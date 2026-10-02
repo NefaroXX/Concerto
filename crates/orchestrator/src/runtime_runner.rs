@@ -67,7 +67,7 @@ use concerto_providers::model_selector::ModelSelector;
 use concerto_providers::retry::RetryPolicy;
 use concerto_providers::routing::RoutingEngine;
 use concerto_tools::filesystem::{FilesystemTool, WriteTool};
-use concerto_tools::shell::ShellTool;
+
 use concerto_tools::undo::UndoManager;
 use concerto_tools::virtual_fs::VirtualFs;
 
@@ -1786,14 +1786,9 @@ fn build_tool_registry(
         registry.register(Box::new(FilesystemTool::new(cwd_path.clone())));
         registry.register(Box::new(WriteTool::new(cwd_path.clone())));
     }
-    let shell_tool = {
-        let settings = config.resolved_shell_settings();
-        match settings.selected_profile() {
-            Some(profile) => ShellTool::with_profile(profile.clone(), true),
-            None => ShellTool::allow_all(),
-        }
-    };
-    registry.register(Box::new(shell_tool));
+    registry.register(Box::new(concerto_tools::native_process::NativeProcessTool::new(
+        config.shell_security.clone(),
+    )));
     registry.register(Box::new(GitTool));
 
     // LSP tools — unconditional registration; each tool lazily starts the LSP
@@ -1910,6 +1905,7 @@ async fn build_audit_sink() -> (Arc<dyn AuditLog>, Option<sqlx::SqlitePool>) {
 #[allow(clippy::too_many_arguments)]
 async fn setup_policy_and_audit(
     config: &AppConfig,
+    project_dir: &Path,
     approval_sink: Arc<dyn ApprovalSink>,
     registry: Arc<ToolRegistry>,
     force_single_agent: bool,
@@ -1973,7 +1969,9 @@ async fn setup_policy_and_audit(
     );
     let mut policy_engine = SimplePolicyEngine::new(policy_rules, audit)
         .with_spend_tracker(spend_tracker.clone())
-        .with_approval_timeout(approval_timeout);
+        .with_approval_timeout(approval_timeout)
+        .with_shell_security(config.shell_security.clone(), project_dir.to_path_buf())
+        .with_protected_config(concerto_config::default_config_path());
     if let Some(auth) = intent_auth {
         policy_engine = policy_engine.with_intent_auth(auth);
     }
@@ -2137,14 +2135,13 @@ async fn execute_agent_loop(
     // production requires a superseding ADR.
 
     let undo_manager = Arc::new(Mutex::new(UndoManager::new(&req.project_dir)));
-    let eval = {
-        let engine = EvalEngine::new(&req.project_dir);
-        let settings = services.config.resolved_shell_settings();
-        match settings.selected_profile() {
-            Some(profile) => engine.with_shell_profile(profile.clone()),
-            None => engine,
-        }
-    };
+    let eval = EvalEngine::new(&req.project_dir).with_process_executor(Arc::new(
+        crate::exec_backend::NativeEvalExecutor {
+            backend: executor.clone(),
+            session: SessionContext::new(session_id, req.project_dir.clone()),
+            orchestrator_authority: true,
+        },
+    ));
     // Full local agency: the unified loop always gets the tool-capable Build
     // prompt (writes stay policy-gated and approval-sinked). No keyword can
     // select a tool-less path; the model decides tool use from its own output.
@@ -2155,10 +2152,8 @@ async fn execute_agent_loop(
     };
     let prompt_text = base_prompt.to_string();
     let prompt_builder = PromptBuilder::with_skills(prompt_text, Some(services.skills.clone()))
-        // OS/shell identity card (custom-ai-shell plan, Phase C): the resolved
-        // selected profile grounds every built prompt in the host OS and the
-        // selected agent shell's dialect; `None` falls back to OS facts only.
-        .with_shell_profile(services.config.resolved_shell_settings().selected_profile().cloned())
+        // Native execution uses explicit argv, independently of compatibility profiles.
+        .with_native_shell()
         // Run-scoped project AGENTS.md context (ADR-70): injected between the
         // skills section and the environment card.
         .with_project_context(Some(project_context))
@@ -3091,6 +3086,7 @@ pub async fn run_shared_agent(
 
     let (executor, spend_tracker, intent_policy, gate_log_pool) = setup_policy_and_audit(
         &services.config,
+        &req.project_dir,
         services.approval_sink.clone(),
         registry.clone(),
         req.force_single_agent,
@@ -4211,13 +4207,8 @@ async fn run_multi_agent(
     // the roster and the seed set is NOT merged back in — deleted seeds stay
     // deleted at runtime (maintainer revision of ADR-58/59).
     let merge_seeds = !services.config.owns_agent_roster();
-    // OS/shell identity card (custom-ai-shell plan, Phase C): pre-rendered
-    // once from the resolved selected profile and threaded to the registry
-    // (every specialist) and the coordinator (dispatch prompts + the
-    // self-implement persona). `None` renders the OS-facts-only card.
-    let environment_card = crate::prompts::environment_card(
-        services.config.resolved_shell_settings().selected_profile(),
-    );
+    // All specialists receive the native argv contract and actual host OS.
+    let environment_card = crate::prompts::native_environment_card();
     let registry = Arc::new(AgentRegistry::build_with_roles_for_project_with_facade(
         role_providers,
         default_provider,
@@ -4235,10 +4226,8 @@ async fn run_multi_agent(
         // writer's per-call `generation` comes from `AgentContext` instead of
         // being baked here.
         gate_log_pool.clone(),
-        // Custom-ai-shell plan (Phase C): the resolved shell profile drives
-        // the validator's eval engine (build/validation commands), matching
-        // the single-agent and coordinator eval-engine paths.
-        services.config.resolved_shell_settings().selected_profile().cloned(),
+        // Native validators attach the governed executor using their actual session.
+        None,
     ));
     // The feed task below resolves implement-stage roles from the registry,
     // so keep a clone before `registry` moves into the coordinator.
@@ -4304,14 +4293,10 @@ async fn run_multi_agent(
     // dispatch system prompt between the skills section and the environment
     // card; its refresh cadence also gates the coordinator maintenance nudge.
     .with_project_context(Some(project_context))
-    // OS/shell identity card (custom-ai-shell plan, Phase C), pre-rendered
-    // above from the resolved shell settings; see the registry wiring.
+    // Native execution facts for specialist and coordinator prompts.
     .with_environment_card(environment_card)
-    // The DISPATCH prompt receives its OS/shell identity card through the
-    // shared `PromptBuilder` seam, so hand it the same resolved profile the
-    // registry was built with (the self-implement persona keeps the
-    // pre-rendered card above).
-    .with_shell_profile(services.config.resolved_shell_settings().selected_profile().cloned())
+    // Dispatch uses the same native command contract as the single-agent loop.
+    .with_native_shell()
     // ADR-048: `[context].cache_stable_prefix` pins a byte-stable dispatch
     // prompt head and appends the volatile working memory after it, matching
     // the single-agent loop. Resolved through the engine's budget policy so
@@ -4340,17 +4325,16 @@ async fn run_multi_agent(
     .with_executor(executor.clone())
     // ADR-35 §5 Phase 5 C-06 amendment: the coordinator's eval engine backs
     // coordinator self-verification when no validation-stage agent is
-    // registered. Built exactly like the single-agent path (detected runner
-    // + optional shell profile); attached unconditionally — the coordinator
+    // registered. Uses the same governed native executor as the single-agent
+    // path; attached unconditionally — the coordinator
     // only uses it when a validate-stage agent is absent.
-    .with_eval_engine(Arc::new({
-        let engine = EvalEngine::new(&req.project_dir);
-        let settings = services.config.resolved_shell_settings();
-        match settings.selected_profile() {
-            Some(profile) => engine.with_shell_profile(profile.clone()),
-            None => engine,
-        }
-    }))
+    .with_eval_engine(Arc::new(EvalEngine::new(&req.project_dir).with_process_executor(Arc::new(
+        crate::exec_backend::NativeEvalExecutor {
+            backend: executor.clone(),
+            session: SessionContext::new(session_id, req.project_dir.clone()),
+            orchestrator_authority: true,
+        },
+    ))))
     // Model-first serving pipe: an unassigned role's effective serving pipe
     // is the run's default provider. Without this the fallback ladder could
     // never resolve a serving pipe for unassigned roles, so tier 1 would be

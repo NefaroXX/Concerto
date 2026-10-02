@@ -1876,6 +1876,7 @@ pub struct CoordinatorAgent {
     /// `PromptBuilder` to append the same OS/shell identity card the
     /// single-agent loop gets. `None` renders the OS-facts-only card.
     shell_profile: Option<concerto_config::ShellProfileConfig>,
+    native_shell: bool,
     /// ADR-048 prefix discipline for the dispatch prompt: `[context]
     /// .cache_stable_prefix`, resolved by the runtime via
     /// [`crate::context_engine::ContextBudgetPolicy::from_config`] so the
@@ -3312,6 +3313,7 @@ impl CoordinatorAgent {
             skills_section: String::new(),
             environment_card: String::new(),
             shell_profile: None,
+            native_shell: false,
             cache_stable_prefix: false,
             project_context: None,
             project_context_nudge_count: 0,
@@ -4712,6 +4714,12 @@ impl CoordinatorAgent {
         shell_profile: Option<concerto_config::ShellProfileConfig>,
     ) -> Self {
         self.shell_profile = shell_profile;
+        self
+    }
+
+    pub fn with_native_shell(mut self) -> Self {
+        self.native_shell = true;
+        self.shell_profile = None;
         self
     }
 
@@ -16120,6 +16128,7 @@ impl CoordinatorAgent {
         let builder = crate::prompts::PromptBuilder::new(template)
             .with_shell_profile(self.shell_profile.clone())
             .with_cache_stable_prefix(self.cache_stable_prefix);
+        let builder = if self.native_shell { builder.with_native_shell() } else { builder };
         let request = builder.build(working_memory_block, &[], None, None);
         // `PromptBuilder::build` always prepends exactly one system message;
         // degrade to an empty system message rather than panicking if that

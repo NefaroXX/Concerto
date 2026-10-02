@@ -37,7 +37,8 @@ pub fn parse_command_line(line: &str) -> Result<CommandInvocation, ParseError> {
     let mut escaped = false;
     let mut token_started = false;
 
-    for character in line.chars() {
+    let mut characters = line.chars().peekable();
+    while let Some(character) = characters.next() {
         if escaped {
             current.push(character);
             escaped = false;
@@ -47,7 +48,16 @@ pub fn parse_command_line(line: &str) -> Result<CommandInvocation, ParseError> {
 
         match (quote, character) {
             (Quote::None | Quote::Double, '\\') => {
-                escaped = true;
+                // Preserve Windows path separators. Escaping applies only to
+                // syntax characters, not arbitrary following letters.
+                escaped = characters.peek().is_none_or(|next| {
+                    *next == '\\'
+                        || *next == '"'
+                        || (quote == Quote::None && (*next == '\'' || next.is_whitespace()))
+                });
+                if !escaped {
+                    current.push(character);
+                }
                 token_started = true;
             }
             (Quote::None, '\'') => {
@@ -105,6 +115,14 @@ mod tests {
             .expect("valid command line");
         assert_eq!(parsed.command, "ls-tree");
         assert_eq!(parsed.arguments, ["a b", "$HOME", "plain value"]);
+    }
+
+    // verifies: Windows paths survive native parsing without shell-specific escaping.
+    #[test]
+    fn preserves_windows_paths() {
+        let parsed = parse_command_line(r#"run "C:\Program Files\tool.exe" C:\work\file.txt"#)
+            .expect("parse");
+        assert_eq!(parsed.arguments, [r"C:\Program Files\tool.exe", r"C:\work\file.txt"]);
     }
 
     #[test]
@@ -200,7 +218,7 @@ mod tests {
         }
     }
 
-    // Property: backslash escapes the next character in unquoted context.
+    // Property: only syntax characters are escaped; ordinary backslashes survive.
     proptest! {
         #[test]
         fn backslash_escapes_next_char(
@@ -210,7 +228,12 @@ mod tests {
             let line = format!("{cmd} \\{ch}");
             let parsed = parse_command_line(&line).expect("escaped char arg must parse");
             prop_assert!(parsed.arguments.len() == 1, "expected exactly one argument");
-            prop_assert_eq!(parsed.arguments[0].as_str(), ch);
+            let expected = if matches!(ch.as_str(), "\\" | "\"" | "'" | " ") {
+                ch.clone()
+            } else {
+                format!("\\{ch}")
+            };
+            prop_assert_eq!(parsed.arguments[0].as_str(), expected);
         }
     }
 

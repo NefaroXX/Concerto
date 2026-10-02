@@ -18,6 +18,12 @@ limitation visible in the client. Policy evaluation and approval remain in
 ToolExecutor. Native process tools use the canonical `shell` policy vocabulary
 so switching executors does not discard existing approval rules.
 
+The executor resolves native host executable paths and working directories
+before policy evaluation and approval, and executes that prepared request.
+This prevents a repeated PATH/symlink lookup from changing the selected binary
+while approval is pending. Replacing the binary at its canonical path remains
+an ambient OS risk in host mode.
+
 Execution has two explicit boundaries: native host execution (ambient OS
 permissions) and isolated execution through Docker/Podman. Offline execution
 requires the isolated backend; it is never simulated by command-name filtering.
@@ -41,5 +47,11 @@ limits, environment leakage, unsupported isolation and cancellation. Expand
 platform confinement only with a working backend and native integration tests.
 
 This decision does not claim equivalent kernel guarantees on every platform.
+
+Automatic test validation in native runs uses an eval process-execution seam
+backed by the same tool executor and session, including supervised execution.
+It must not bypass shell security through a selected interpreter profile.
+Coverage helpers without a governed implementation refuse execution in this
+mode. Agent environment cards describe the argv-direct contract explicitly.
 Capabilities and unsupported controls must remain inspectable. OpenShell is
 not required by the native shell and can be added behind a future backend.

@@ -21,6 +21,7 @@ mod saving;
 mod schema;
 pub mod setup;
 pub mod shell;
+pub mod shell_security;
 
 pub use agents::{
     agent_file_path, agents_dir_for_config, delete_agent_file, ensure_agent_files,
@@ -141,6 +142,14 @@ fn load_config_layers(
         }
     }
 
+    // ADR-76: capture the user-global security/profile configuration before
+    // merging agent-writable project files or inherited environment variables.
+    let shell_security: concerto_core::shell_security::ShellSecurity =
+        figment.extract_inner("shell_security").map_err(|e| ConfigError::Load(e.to_string()))?;
+    let trusted_global: AppConfig =
+        figment.extract().map_err(|e| ConfigError::Load(e.to_string()))?;
+    let trusted_shell_settings = trusted_global.shell_settings;
+
     // 2) Project-scoped config (inserted between global config and env).
     // Maintainer decision (2026-09): orchestration is GLOBAL ONLY — the
     // global-only orchestration keys ([`saving::GLOBAL_ONLY_ORCHESTRATION_KEYS`])
@@ -191,6 +200,9 @@ fn load_config_layers(
 
     // Apply schema migration if needed.
     let mut config = migration::migrate_config(config)?;
+    config.shell_security = shell_security;
+    config.shell_settings = trusted_shell_settings;
+    config.shell_security.validate().map_err(ConfigError::Load)?;
 
     // Per-agent config files (single source of truth): when the global
     // config dir has an `agents/` directory, the files ARE the roster. Merge
@@ -439,6 +451,16 @@ fn apply_project_roots_env(config: &mut AppConfig) -> Result<(), ConfigError> {
 /// deduped) so the file and the chat buckets always agree; the write
 /// itself is a byte-identical no-op when the list is already canonical.
 pub fn save_config(config: &AppConfig, path: &Path) -> Result<(), ConfigError> {
+    let mut lock = shell_security::config_lock(path)?;
+    let _guard = lock.write().map_err(|e| ConfigError::Load(e.to_string()))?;
+    let current = shell_security::read_shell_security(path)?;
+    if current != config.shell_security {
+        return Err(ConfigError::Load(
+            "security changes require the shell security client; reload settings before saving"
+                .into(),
+        ));
+    }
+    config.shell_security.validate().map_err(ConfigError::Load)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| ConfigError::Load(format!("failed to create config dir: {e}")))?;
@@ -448,9 +470,7 @@ pub fn save_config(config: &AppConfig, path: &Path) -> Result<(), ConfigError> {
         crate::schema::normalize_muted_agents(normalized.display.muted_agents);
     let toml_str = toml::to_string_pretty(&normalized)
         .map_err(|e| ConfigError::Load(format!("failed to serialize config: {e}")))?;
-    std::fs::write(path, toml_str)
-        .map_err(|e| ConfigError::Load(format!("failed to write config file: {e}")))?;
-    Ok(())
+    saving::atomic_write(path, toml_str.as_bytes())
 }
 
 /// ADR-59 Decision 2 init step 2: surgically write the `[orchestration]`

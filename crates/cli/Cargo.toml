@@ -9,6 +9,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+concerto-shell = { path = "../shell", version = "0.1.0" }
 concerto-core = { path = "../core", version = "0.1.0" }
 
 sqlx = { workspace = true }

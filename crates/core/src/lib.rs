@@ -22,6 +22,7 @@ pub mod policy_presets;
 pub mod sandbox;
 pub mod sanitizer;
 pub mod secret;
+pub mod shell_security;
 #[cfg(test)]
 pub mod testing;
 pub mod text;

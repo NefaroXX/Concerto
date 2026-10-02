@@ -136,6 +136,11 @@ pub struct State {
     pub retry_max_elapsed_error: Option<String>,
 
     // ADR-28 — Shell profiles and integrated toolchain
+    pub shell_security: concerto_core::shell_security::ShellSecurity,
+    pub shell_security_editor: iced::widget::text_editor::Content,
+    pub shell_security_pending: Option<concerto_core::shell_security::ShellSecurity>,
+    pub shell_security_notice: String,
+    pub shell_security_busy: bool,
     pub shell_profiles: Vec<ShellProfileConfig>,
     /// Canonical shell selection. Agent execution is the primary consumer.
     pub shell_active_profile: String,
@@ -515,6 +520,13 @@ impl State {
             retry_max_elapsed_error: None,
             settings_saved_notice: false,
             settings_dirty: false,
+            shell_security: config.shell_security.clone(),
+            shell_security_editor: iced::widget::text_editor::Content::with_text(
+                &serde_json::to_string_pretty(&config.shell_security).unwrap_or_default(),
+            ),
+            shell_security_pending: None,
+            shell_security_notice: String::new(),
+            shell_security_busy: false,
             shell_profiles: Vec::new(),
             shell_active_profile: String::new(),
             selected_shell_profile: None,

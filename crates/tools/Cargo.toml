@@ -33,7 +33,7 @@ regex = { workspace = true }
 # `feature` (a pure cfg gate, no extra crate) exposes `unistd::sysconf` /
 # `SysconfVar::CLK_TCK`, which converts `/proc/<pid>/stat` jiffies into a CPU
 # time budget for the shell threat-gap-#6 watchdog (see `cpu_accounting`).
-nix = { version = "0.31", default-features = false, features = ["signal", "feature"] }
+nix = { version = "0.31", default-features = false, features = ["signal", "feature", "user"] }
 
 [dev-dependencies]
 tempfile = "3"

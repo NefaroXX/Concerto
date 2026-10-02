@@ -867,12 +867,10 @@ impl App {
                 state
             },
             agent_graph: views::agent_graph::State::new(),
-            terminal: {
-                let settings = initial_config.resolved_shell_settings();
-                let profiles = settings.profiles.clone();
-                let active_id = Some(settings.selected_profile_id().to_owned());
-                views::terminal::State::new(initial_project_dir.clone(), profiles, active_id)
-            },
+            terminal: views::terminal::State::new(
+                initial_project_dir.clone(),
+                initial_config.clone(),
+            ),
             orchestration_studio: views::orchestration_studio::State::new(),
             editor: views::code_editor::State::new(
                 Utf8PathBuf::from_path_buf(initial_project_dir.clone())
@@ -1571,6 +1569,22 @@ impl App {
                 iced::Task::none()
             }
             Message::Settings(msg) => match &msg {
+                views::settings::Message::ShellSecurityFinished { result, .. } => {
+                    let security = result.as_ref().as_ref().ok().cloned();
+                    let task = self.settings.update(msg).map(Message::Settings);
+                    if let Some(security) = security.filter(|security| {
+                        security.revision >= self.global_config.shell_security.revision
+                    }) {
+                        let mut global = self.global_config.clone();
+                        global.shell_security = security.clone();
+                        if let Some(mut config) = self.config.clone() {
+                            config.shell_security = security;
+                            self.apply_reloaded_config(global, config);
+                        }
+                    }
+                    task
+                }
+
                 views::settings::Message::SaveSettings => {
                     let task = self.settings.update(msg).map(Message::Settings);
                     // Prefs decide the theme the UI renders, so assert it onto
@@ -3429,10 +3443,7 @@ impl App {
                 prev.cancel.cancel();
             }
         }
-        let shell = reloaded.resolved_shell_settings();
-        let profiles = shell.profiles.clone();
-        let active_id = Some(shell.selected_profile_id().to_owned());
-        let _ = self.terminal.set_profiles(profiles, active_id, &self.current_theme);
+        let _ = self.terminal.set_config(reloaded.clone(), &self.current_theme);
         // Provider rows first, then the derived caches: the row sync rebuilds
         // the caches from the refreshed rows (and is a no-op while the user
         // has in-flight edits, ADR-57 §3d); the cache-only refresh below then
@@ -6331,10 +6342,9 @@ custom_agents = []
 
     /// Opening the terminal panel flips `terminal_panel_open` and closing it
     /// flips it back. The returned `ensure_started` task is dropped without
-    /// being run (iced only executes tasks handed to the runtime), and
-    /// `iced_term::Terminal::new` does not spawn a shell synchronously — the
-    /// process is launched through the async backend subscription — so the
-    /// test stays hermetic.
+    /// being run (iced only executes tasks handed to the runtime). Native
+    /// console initialization and execution are asynchronous, so this test
+    /// starts no process and stays hermetic.
     #[test]
     fn toggle_terminal_panel_opens_and_closes() {
         let (mut app, _) = App::new();

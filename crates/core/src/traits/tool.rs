@@ -17,6 +17,22 @@ pub trait Tool: Send + Sync {
 
     fn capability_requirements(&self) -> CapabilitySet;
 
+    /// Resolve a concrete request before policy and approval. Implementations
+    /// must not perform effects here. The prepared input is both evaluated and
+    /// executed, so PATH lookup need not change while approval is pending.
+    fn prepare_input(
+        &self,
+        _input: &mut serde_json::Value,
+        _session: &SessionContext,
+    ) -> Result<(), ToolError> {
+        Ok(())
+    }
+
+    /// Backend-selected isolation requirement; never taken from agent input.
+    fn sandbox_profile(&self) -> Option<crate::types::SandboxProfile> {
+        None
+    }
+
     /// ADR-28 §6: optional structured command-execution facts for this tool.
     ///
     /// Command-executing tools (e.g. the shell tool) override this to return

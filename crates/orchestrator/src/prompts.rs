@@ -52,6 +52,7 @@ pub struct PromptBuilder {
     /// `None` renders the card from OS facts plus the detected OS default
     /// shell instead — the card is never omitted and never errors.
     shell_profile: Option<ShellProfileConfig>,
+    native_shell: bool,
     /// ADR-048 prefix discipline (the `[context].cache_stable_prefix` knob).
     ///
     /// `false` (default) keeps today's byte-identical assembly. `true` pins a
@@ -72,6 +73,7 @@ impl PromptBuilder {
             skills: None,
             project_context: None,
             shell_profile: None,
+            native_shell: false,
             cache_stable_prefix: false,
         }
     }
@@ -87,6 +89,7 @@ impl PromptBuilder {
             skills,
             project_context: None,
             shell_profile: None,
+            native_shell: false,
             cache_stable_prefix: false,
         }
     }
@@ -104,6 +107,12 @@ impl PromptBuilder {
     /// detected OS default shell).
     pub fn with_shell_profile(mut self, profile: Option<ShellProfileConfig>) -> Self {
         self.shell_profile = profile;
+        self
+    }
+
+    pub fn with_native_shell(mut self) -> Self {
+        self.native_shell = true;
+        self.shell_profile = None;
         self
     }
 
@@ -177,7 +186,11 @@ impl PromptBuilder {
         // dialect gotchas. Always appended — with no configured profile it
         // falls back to OS facts plus the detected OS default shell, so the
         // card is never empty and never errors.
-        let card = environment_card(self.shell_profile.as_ref());
+        let card = if self.native_shell {
+            native_environment_card()
+        } else {
+            environment_card(self.shell_profile.as_ref())
+        };
         system.push_str("\n\n");
         system.push_str(&card);
 
@@ -410,6 +423,13 @@ pub fn environment_card(profile: Option<&ShellProfileConfig>) -> String {
         card.push_str(&note);
     }
     card
+}
+
+pub fn native_environment_card() -> String {
+    format!(
+        "## Environment\n- OS: {} ({})\n- Agent shell: concerto-native (argv-direct)\n- The shell tool's command is one executable path/name; args is an array.\n- Example: {{\"command\":\"cargo\",\"args\":[\"test\"]}}.\n- No shell expansion, variable substitution, pipes, redirection or implicit interpreter.\n- Use the filesystem tool for file operations; policy and user security settings govern every operation.",
+        std::env::consts::OS, std::env::consts::ARCH,
+    )
 }
 
 /// Per-OS gotchas appended after the shell-dialect notes. POSIX systems get

@@ -11,6 +11,8 @@ workspace = true
 [dependencies]
 concerto-config = { path = "../config", version = "0.1.0" }
 concerto-core = { path = "../core", version = "0.1.0" }
+concerto-tools = { path = "../tools", version = "0.1.0" }
+concerto-sessions = { path = "../sessions", version = "0.1.0" }
 
 async-trait = { workspace = true }
 camino = { workspace = true }

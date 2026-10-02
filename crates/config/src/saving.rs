@@ -79,6 +79,8 @@ pub(crate) fn merge_edit_toml(
     key: &str,
     value: &str,
 ) -> Result<(), ConfigError> {
+    let mut lock = crate::shell_security::config_lock(path)?;
+    let _guard = lock.write().map_err(|e| ConfigError::Load(e.to_string()))?;
     let raw = fs::read_to_string(path)
         .map_err(|e| ConfigError::Load(format!("failed to read {}: {e}", path.display())))?;
     let mut doc = raw
@@ -133,34 +135,21 @@ pub(crate) fn merge_edit_toml(
 /// Shared with the per-agent file store ([`crate::agents`]) so both write
 /// seams reuse the same atomic temp+rename discipline.
 pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), ConfigError> {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)
             .map_err(|e| ConfigError::Load(format!("failed to create config dir: {e}")))?;
     }
-    let file_name = path.file_name().ok_or_else(|| {
-        ConfigError::Load(format!("cannot write to '{}': no file name", path.display()))
-    })?;
-    let tmp_path =
-        path.with_file_name(format!(".{}.tmp-{}", file_name.to_string_lossy(), std::process::id()));
-
-    let write_result = (|| -> std::io::Result<()> {
-        let mut tmp = fs::File::create(&tmp_path)?;
-        tmp.write_all(contents)?;
-        tmp.flush()?;
-        Ok(())
-    })();
-    if let Err(error) = write_result {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(ConfigError::Load(format!(
-            "failed to write temporary file for '{}': {error}",
-            path.display()
-        )));
-    }
-
-    fs::rename(&tmp_path, path).map_err(|error| {
-        let _ = fs::remove_file(&tmp_path);
-        ConfigError::Load(format!("failed to atomically replace '{}': {error}", path.display()))
-    })
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| ConfigError::Load(format!("failed to create config temporary file: {e}")))?;
+    temporary
+        .write_all(contents)
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|e| ConfigError::Load(format!("failed to write config temporary file: {e}")))?;
+    temporary
+        .persist(path)
+        .map_err(|e| ConfigError::Load(format!("failed to replace config: {e}")))?;
+    Ok(())
 }
 
 /// Navigate to the `key` sub-table of `table`, creating it when absent.
@@ -217,6 +206,8 @@ fn ensure_table_mut<'a>(
 /// still goes through the same `toml_edit` document model, so unrelated
 /// content is untouched and the write is atomic ([`atomic_write`]).
 pub fn seed_orchestration_roster(config_path: &Path) -> Result<(), ConfigError> {
+    let mut lock = crate::shell_security::config_lock(config_path)?;
+    let _guard = lock.write().map_err(|e| ConfigError::Load(e.to_string()))?;
     let raw = match fs::read_to_string(config_path) {
         Ok(raw) => raw,
         Err(_) if !config_path.exists() => {
@@ -442,6 +433,8 @@ pub fn import_project_orchestration_to_global(
     project_path: &Path,
     global_path: &Path,
 ) -> Result<ImportOrchestrationOutcome, ConfigError> {
+    let mut lock = crate::shell_security::config_lock(global_path)?;
+    let _guard = lock.write().map_err(|e| ConfigError::Load(e.to_string()))?;
     let project_raw = fs::read_to_string(project_path).map_err(|e| {
         ConfigError::Load(format!("failed to read {}: {e}", project_path.display()))
     })?;
@@ -550,6 +543,8 @@ pub fn import_project_orchestration_to_global(
 /// comment, and key order. Used by the explicit import action only — the
 /// load path never writes files.
 pub fn remove_project_orchestration_keys(path: &Path) -> Result<(), ConfigError> {
+    let mut lock = crate::shell_security::config_lock(path)?;
+    let _guard = lock.write().map_err(|e| ConfigError::Load(e.to_string()))?;
     let raw = fs::read_to_string(path)
         .map_err(|e| ConfigError::Load(format!("failed to read {}: {e}", path.display())))?;
     let mut doc = raw
@@ -587,6 +582,8 @@ pub enum ImportOrchestrationOutcome {
 /// **idempotent** (re-seeding yields byte-identical output). A missing file is
 /// bootstrapped with only `schema_version` first, like the other merge seams.
 pub fn seed_agent_roster_only(config_path: &Path) -> Result<(), ConfigError> {
+    let mut lock = crate::shell_security::config_lock(config_path)?;
+    let _guard = lock.write().map_err(|e| ConfigError::Load(e.to_string()))?;
     let raw = match fs::read_to_string(config_path) {
         Ok(raw) => raw,
         Err(_) if !config_path.exists() => {
@@ -665,6 +662,8 @@ fn blueprint_selector_declared(item: &toml_edit::Item) -> bool {
 /// Returns `true` when the file was written, `false` when no selection was
 /// missing.
 pub fn ensure_default_blueprint(config_path: &Path) -> Result<bool, ConfigError> {
+    let mut lock = crate::shell_security::config_lock(config_path)?;
+    let _guard = lock.write().map_err(|e| ConfigError::Load(e.to_string()))?;
     let raw = fs::read_to_string(config_path)
         .map_err(|e| ConfigError::Load(format!("failed to read {}: {e}", config_path.display())))?;
     let mut doc = raw.parse::<toml_edit::DocumentMut>().map_err(|e| {
@@ -753,6 +752,8 @@ pub fn save_agent_roster(
     config_path: &Path,
     agents: &[CustomAgentConfig],
 ) -> Result<(), ConfigError> {
+    let mut lock = crate::shell_security::config_lock(config_path)?;
+    let _guard = lock.write().map_err(|e| ConfigError::Load(e.to_string()))?;
     let raw = match fs::read_to_string(config_path) {
         Ok(raw) => raw,
         Err(_) if !config_path.exists() => {
@@ -808,6 +809,8 @@ pub fn save_agent_roster(
 /// one case this seam creates the file instead of editing it — mirroring
 /// [`seed_orchestration_roster`].
 pub fn save_inline_blueprint(config_path: &Path, blueprint: &Blueprint) -> Result<(), ConfigError> {
+    let mut lock = crate::shell_security::config_lock(config_path)?;
+    let _guard = lock.write().map_err(|e| ConfigError::Load(e.to_string()))?;
     // A brand-new project has no config file yet; seed a minimal schema-versioned
     // document so the owned key can be merged into a real one.
     let raw = match fs::read_to_string(config_path) {

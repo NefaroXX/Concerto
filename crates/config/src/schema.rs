@@ -510,6 +510,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub shell_settings: Option<ShellSettings>,
 
+    /// User-global native shell security. Project/environment layers cannot override it.
+    #[serde(default)]
+    pub shell_security: concerto_core::shell_security::ShellSecurity,
+
     /// Shared project-root allowlist (ADR-44).
     ///
     /// When non-empty, the desktop gates out-of-root project opens and the
@@ -611,6 +615,7 @@ impl PartialEq for AppConfig {
             && self.memory == other.memory
             && self.display == other.display
             && self.shell_settings == other.shell_settings
+            && self.shell_security == other.shell_security
             && self.project_roots == other.project_roots
             && self.context == other.context
             && self.tool_settings == other.tool_settings
@@ -642,6 +647,7 @@ impl Default for AppConfig {
             memory: MemoryConfig::default(),
             display: DisplayConfig::default(),
             shell_settings: None,
+            shell_security: Default::default(),
             project_roots: Vec::new(),
             context: None,
             tool_settings: None,

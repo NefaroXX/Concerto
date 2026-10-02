@@ -61,8 +61,22 @@ impl PolicyExecutionAdapter {
             "timeout_secs": request.timeout_secs,
         });
 
-        match self.executor.execute("shell", input, &self.session, cancel).await {
-            Ok(output) => tool_output_result(result_command, output),
+        self.execute_tool(result_command, "shell", input, cancel).await
+    }
+
+    pub(crate) async fn execute_tool(
+        &self,
+        result_command: &str,
+        tool: &str,
+        input: serde_json::Value,
+        cancel: CancellationToken,
+    ) -> CommandResult {
+        match self.executor.execute(tool, input, &self.session, cancel).await {
+            Ok(output) if tool == "shell" => tool_output_result(result_command, output),
+            Ok(output) => {
+                CommandResult::new(result_command, CommandStatus::Succeeded, output.summary)
+                    .with_data(output.data)
+            }
             Err(error) => tool_error_result(result_command, error),
         }
     }
@@ -79,6 +93,12 @@ pub(crate) fn external_commands(
         Arc::new(ShellRunCommand::new(adapter, profiles.clone())),
         Arc::new(ShellProfilesCommand::new(profiles)),
     ]
+}
+
+pub(crate) fn native_commands(adapter: PolicyExecutionAdapter) -> Vec<Arc<dyn ShellCommand>> {
+    let mut commands = crate::native::commands(adapter.clone());
+    commands.push(Arc::new(RunCommand::new(Arc::new(adapter))));
+    commands
 }
 
 struct RunCommand {

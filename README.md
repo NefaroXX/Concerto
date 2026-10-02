@@ -206,6 +206,7 @@ Useful guides:
 - [Multi-agent relationships](docs/agent-collaboration.md)
 - [Policy rules](docs/policy-rules.md)
 - [Shell profiles](docs/shell-profiles.md)
+- [Native shell and security settings](docs/native-shell-security.md)
 - [Skills](docs/skills.md) and [MCP servers](docs/mcp.md)
 - [Configuration example](docs/config.toml.example)
 
