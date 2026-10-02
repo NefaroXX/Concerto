@@ -1619,9 +1619,24 @@ impl AgentLoop {
             user_message.tokens_in = Some(prompt_tokens);
         }
 
+        // Single-agent loop contract (issue #145): when the provider returns
+        // no tool calls, prose completes the turn in every mode except
+        // `ActionRequired`. `AnswerOnly` and `CoordinatorDecides` both set the
+        // final message, mark the run `completed`, and break — `CoordinatorDecides`
+        // must not fall through to `Proceed`, or `decide_exit` would report
+        // `IterationCapHit` for a run that actually finished in prose.
+        // `ActionRequired` alone treats a text-only response as a retry (or a
+        // close, once file-changing work already exists).
         if tool_calls.is_empty() {
             match task_execution_mode {
                 TaskExecutionMode::AnswerOnly => {
+                    *final_message = text.to_string();
+                    *completed = true;
+                    return ProviderResponseAction::Break;
+                }
+                // Coordinator-decides prose completion: identical outcome to
+                // `AnswerOnly` — no mandatory-dispatch invariant in this loop.
+                TaskExecutionMode::CoordinatorDecides => {
                     *final_message = text.to_string();
                     *completed = true;
                     return ProviderResponseAction::Break;
@@ -1658,6 +1673,12 @@ impl AgentLoop {
 
                     return ProviderResponseAction::ContinueIteration;
                 }
+                // `TaskExecutionMode` is `#[non_exhaustive]` in `concerto-core`,
+                // so this crate cannot match it without a catch-all arm. Every
+                // variant that exists today is handled above; the arm only
+                // absorbs variants added later, which conservatively fall
+                // through to `Proceed` (tool execution) rather than being
+                // silently treated as prose completion.
                 _ => {}
             }
         } else if !text.trim().is_empty() && !action_required {
@@ -7838,6 +7859,36 @@ mod tests {
         // AnswerOnly with no tool calls → Break + message set
         assert!(matches!(action, ProviderResponseAction::Break));
         assert!(completed);
+    }
+
+    #[test]
+    fn process_provider_response_coordinator_decides_completes_in_prose() {
+        let loop_ = make_minimal_loop();
+        let mut messages = vec![];
+        let mut final_message = String::new();
+        let mut completed = false;
+
+        let action = loop_.process_provider_response(
+            "direct coordinator answer",
+            None,
+            &[], // no tool calls → prose completion
+            None,
+            &TaskExecutionMode::CoordinatorDecides,
+            0,
+            1,
+            Ulid::new(),
+            Ulid::new(),
+            &mut messages,
+            &mut final_message,
+            &mut completed,
+        );
+
+        // CoordinatorDecides with no tool calls completes like AnswerOnly:
+        // without this the run would fall through to `Proceed` and surface
+        // `IterationCapHit` instead of `Completed` (issue #145).
+        assert!(matches!(action, ProviderResponseAction::Break));
+        assert!(completed, "CoordinatorDecides prose must mark the run completed");
+        assert_eq!(final_message, "direct coordinator answer");
     }
 
     #[test]

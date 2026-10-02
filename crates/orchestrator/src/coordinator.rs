@@ -134,6 +134,30 @@ pub(crate) const MERGE_TASKS_TOOL: &str = "merge_tasks";
 /// applies no policy gate (there is nothing to gate).
 pub(crate) const RECONSIDER_TOOL: &str = "reconsider";
 
+/// The obligation-declaration surface: the Coordinator's structured decision
+/// creates obligation-bearing work BEFORE any dispatch. Each declared item
+/// becomes a `Declared` (Outstanding, not-yet-dispatched) graph node — the
+/// graph is the source of truth, the `ObligationLedger` a derived view — and
+/// declared-undispatched Implement/Verify work blocks the completion guards
+/// exactly like dispatched-but-unsettled work, while coordinator prose keeps
+/// answering Explain freely. Dispatches no agents and touches no tools, so
+/// like split/merge/reconsider it applies no policy gate.
+pub(crate) const DECLARE_OBLIGATIONS_TOOL: &str = "declare_obligations";
+
+/// The obligation-update surface: revise the description, expected
+/// artifacts, or owning specialist of still-undispatched (`Declared` or
+/// `Pending`) work, or release a `Declared` node to `Pending` so the graph
+/// loop may dispatch it. Settled or dispatched work is rejected — completed
+/// work is never re-cut, failed/blocked work retries through its own paths.
+/// Same no-dispatch, no-gate discipline as declaration.
+pub(crate) const UPDATE_OBLIGATIONS_TOOL: &str = "update_obligations";
+
+/// Bound on one `declare_obligations` call's item count. Mirrors the
+/// `split_task` 1–8 child bound: an investigate → implement → verify →
+/// explain chain fits several times over; larger work statements split
+/// across turns.
+const MAX_DECLARE_OBLIGATIONS: usize = 8;
+
 /// ADR-35 amendment (2026-09-16 §2): the explicit human-input request
 /// surface — the Coordinator side of the operator consent/interaction gate.
 /// The model calls it with a reason; the decision loop then unwinds and the
@@ -265,7 +289,23 @@ fn resume_drive_instruction() -> String {
 /// Coordinator's decision loop. The roster ([`Self::render_specialist_roster`])
 /// is injected after these instructions; the Orchestration Studio's
 /// supplemental prompt (ADR-35 §5) is appended after everything.
+///
+/// Issue #146 (ADR-76): the prompt opens with an explicit DECISION BOUNDARY
+/// that separates "the Coordinator owns the turn" from "the turn requires a
+/// specialist" — ordinary conversation is a valid terminal outcome and
+/// delegation must not be manufactured for it — while restating that
+/// `ActionRequired` work keeps the mandatory-dispatch invariant enforced by
+/// `run_dispatch_session`'s prose-only guard. Prompt text only: the modes,
+/// the guard, and the runtime classification are #145/#147 concerns and are
+/// not changed here.
 const COORDINATOR_DISPATCH_PROMPT: &str = r#"You are the Coordinator: the sole decision-maker of a multi-agent software project. You decide which specialist to call, when, and with what task — no code decides for you.
+
+Decision boundary (read this before the steps below):
+- You own every turn that reaches this session. Owning the turn does NOT mean the turn requires a specialist: judge the objective in front of you, not the fact that it arrived at the Coordinator.
+- If the objective is ordinary conversation, or an informational answer that needs no workspace work and no specialist expertise, answer directly with NO tool call. Natural conversation is a valid, complete outcome — a turn you can answer plainly is done when you have answered it.
+- Do not manufacture delegation (or investigation, planning, implementation, or review) merely because the turn entered the coordinator. Never invent work, a dispatch, or a task graph to look diligent; a conversational request stays conversational.
+- If the objective actually requires implementation, modification, review, validation, or specialist investigation, use the orchestration machinery described below: step 2's delegation doctrine governs that work, and step 5's roster-exhaustion rule governs who does the work — it never turns a turn that needs no work into a required dispatch.
+- Execution modes name the REQUIREMENT of the run, not your judgment: AnswerOnly carries no orchestration work (answer directly, no dispatch), CoordinatorDecides may be answered directly OR delegated at your discretion, and ActionRequired MUST be dispatched — the mandatory-dispatch invariant for action-required work still applies, and closing such a run in prose while the dispatch graph is empty is re-prompted, then escalated to planning recovery, never accepted as completion. You still decide from the objective itself: no keyword table, greeting corpus, or word router classifies a turn as conversational.
 
 How to work:
 1. Read the objective, the recorded evidence (workspace facts, the design document if one binds), and the specialist roster below.
@@ -293,6 +333,11 @@ Restructuring an open task (use sparingly, deterministically):
 - When one open task is doing too much, split_task re-cuts it into ordered children that inherit the task's specialist role, evidence, and attempt counter. Splits of pending/running tasks only — completed work is never re-cut.
 - When several open pending tasks overlap in role and substance, merge_tasks folds them into one survivor with the lowest id. Merge only tasks of the SAME role.
 - Both tools are validated against the real graph BEFORE anything changes; a rejected split or merge is a structured error you can read and fix, never a crash.
+
+Declaring work before dispatching it:
+- When the turn needs work, FIRST declare it with declare_obligations (one structured call naming each obligation's owning specialist and work text, chained in order), THEN dispatch each item with call_specialist passing its task_id. Declaration creates Outstanding, not-yet-dispatched work without running anything.
+- Declared Implement/Verify work blocks completion until it is dispatched with evidence: closing the run in prose while such obligations stand open is re-prompted, then reported Partial — never accepted as completion. Prose answers the explanation half freely and discharges nothing else.
+- Revise still-undispatched work with update_obligations (description, artifacts, owner, or release a declared node to Pending); settled or dispatched work is never re-cut there — reconsider, split, or merge it instead.
 
 Consultation (read-only, use it to resolve open questions):
 - consult_specialist asks a registered specialist for ADVICE. The consultant runs READ-ONLY — it cannot write files or mutate the workspace — and consultation never dispatches task work or changes task state.
@@ -322,7 +367,10 @@ fn call_specialist_tool_definition() -> ToolDefinition {
         name: CALL_SPECIALIST_TOOL.to_string(),
         description: "Dispatch a registered specialist agent. The specialist runs to \
                       completion and its outcome is returned so you can decide the next \
-                      step."
+                      step. To dispatch work you previously declared with \
+                      `declare_obligations`, pass its `task_id`: the declared node is \
+                      adopted (no duplicate node) and runs. Without `task_id` a fresh \
+                      node is recorded."
             .to_string(),
         parameters: serde_json::json!({
             "type": "object",
@@ -334,6 +382,10 @@ fn call_specialist_tool_definition() -> ToolDefinition {
                 "task": {
                     "type": "string",
                     "description": "The complete, self-contained task for the specialist."
+                },
+                "task_id": {
+                    "type": "string",
+                    "description": "Optional id of a declared (not-yet-dispatched) obligation to dispatch. The node must still be undispatched and name this same specialist; use `update_obligations` first when it names someone else."
                 },
                 "notes": {
                     "type": "string",
@@ -561,6 +613,125 @@ fn reconsider_tool_definition() -> ToolDefinition {
                 }
             },
             "required": ["decision_id", "reason", "affected_task_ids"]
+        }),
+    }
+}
+
+/// Argument schema for the Coordinator's `declare_obligations` tool: the
+/// structured decision that creates obligation-bearing work BEFORE any
+/// dispatch. Each item becomes a `Declared` (Outstanding, not-yet-dispatched)
+/// graph node — the graph stays the source of truth and the obligation
+/// ledger a derived view — persisted through the existing checkpoint rows.
+/// Declared-undispatched Implement/Verify work blocks completion until it is
+/// dispatched (via `call_specialist` with its `task_id`, or released to
+/// `Pending` and taken by the graph loop) and evidenced; coordinator prose
+/// answers Explain freely and discharges nothing else.
+fn declare_obligations_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: DECLARE_OBLIGATIONS_TOOL.to_string(),
+        description: "Declare obligation-bearing work before dispatching it. Each item \
+                      becomes a not-yet-dispatched graph node (Outstanding obligation) \
+                      chained in order; dispatch each later with `call_specialist` \
+                      passing its `task_id`. Declared Implement/Verify work blocks \
+                      completion until dispatched with evidence — prose alone never \
+                      discharges it."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "obligations": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "agent_id": {
+                                "type": "string",
+                                "description": "The id of the registered specialist that will eventually take this work, exactly as listed in the roster."
+                            },
+                            "task": {
+                                "type": "string",
+                                "description": "The complete, self-contained work text for this obligation."
+                            },
+                            "expected_artifacts": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Optional workspace-root-relative paths this obligation should produce (canonicalized; fabricated-traversal paths are rejected)."
+                            },
+                            "after": {
+                                "type": "array",
+                                "items": { "type": "integer" },
+                                "description": "Optional indices of strictly EARLIER obligations (positions in this obligations list) that must finish before this one runs. Defaults to chaining after the previous item."
+                            }
+                        },
+                        "required": ["agent_id", "task"]
+                    }
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Optional short reason for declaring this work now, recorded as the decision reason."
+                },
+                "supporting_evidence_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional real whiteboard event ids that justify the declaration."
+                }
+            },
+            "required": ["obligations"]
+        }),
+    }
+}
+
+/// Argument schema for the Coordinator's `update_obligations` tool: revise
+/// still-undispatched (`Declared` or `Pending`) work — its description,
+/// expected artifacts, or owning specialist — or release a `Declared` node
+/// to `Pending` so the graph loop may dispatch it. Settled or dispatched
+/// work is rejected with a structured error; use reconsider/split/merge for
+/// decided-then-wrong work, never this tool.
+fn update_obligations_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: UPDATE_OBLIGATIONS_TOOL.to_string(),
+        description: "Revise still-undispatched work (description, expected artifacts, \
+                      owning specialist) or release a declared node to Pending for \
+                      graph-loop dispatch. Only Declared/Pending nodes are editable; \
+                      settled or dispatched work is rejected."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "The id of the declared (not-yet-dispatched) obligation to revise."
+                },
+                "task": {
+                    "type": "string",
+                    "description": "Optional replacement work text (non-empty)."
+                },
+                "agent_id": {
+                    "type": "string",
+                    "description": "Optional replacement owning specialist, exactly as listed in the roster."
+                },
+                "expected_artifacts": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional replacement workspace-root-relative paths (canonicalized; replaces the node's set)."
+                },
+                "release": {
+                    "type": "boolean",
+                    "description": "When true, release a Declared node to Pending so the graph loop may dispatch it. No-op on Pending nodes."
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Optional short reason for the revision, recorded as the decision reason."
+                },
+                "supporting_evidence_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional real whiteboard event ids that justify the revision."
+                }
+            },
+            "required": ["task_id"]
         }),
     }
 }
@@ -1635,6 +1806,12 @@ struct DecomposeResult {
     /// produced when it stopped calling tools; the planning-only depth
     /// surfaces it as the run's final message. Empty on a checkpoint restore.
     dispatch_summary: String,
+    /// Issue #145 conversational close: `Some` prose when the dispatch
+    /// session answered directly in pure prose (zero tool calls) — the
+    /// zero-dispatch run's final message. `None` whenever the session was
+    /// tool-mediated or the summary is empty; `execute_graph` then keeps the
+    /// established completion message. `None` on a checkpoint restore.
+    dispatch_direct_answer: Option<String>,
     /// Loop notes to downgrade the run exit (per-call zero-work flags, an
     /// empty dispatch session on an action-required run, cap/iteration-bound
     /// stops). Consumed by `execute_graph`'s tail. Empty on a restore.
@@ -1670,6 +1847,23 @@ struct DispatchLedger {
     /// `Partial` (per-call zero-work flags, an empty dispatch session on an
     /// action-required run). Consumed by `execute_graph`'s tail.
     notes: Vec<String>,
+    /// Issue #148: how many of the coordinator's OWN dispatch-session tool
+    /// calls were classified mutating by
+    /// [`is_mutating_self_execution_tool`] at attempt time (counted when
+    /// the pre-delegation guard passes and execution is attempted, whether
+    /// or not it succeeds). Observability only: the zero-dispatch post-hoc
+    /// gate downgrades empty-graph runs regardless of this count, while
+    /// partial-dispatch (non-empty graph) runs keep their verdict so
+    /// delegation-failure recovery stays intact — see the vacuous-completion
+    /// gate's partial-dispatch limitation note.
+    coordinator_mutating_calls: u32,
+    /// How many tool calls the Coordinator's decision loop executed in its
+    /// dispatch session (every tool surface: dispatch, consult, investigate,
+    /// splits, waits, executor tools). Drives the conversational-close gate
+    /// (issue #145): a zero-dispatch run whose session used NO tools is a
+    /// pure direct answer, so its prose becomes the run's final message; a
+    /// tool-mediated session keeps the established completion message.
+    coordinator_tool_calls: u32,
 }
 
 /// Issue #63: the coordinator's live-world refiner for one parked wait.
@@ -2440,6 +2634,11 @@ struct CallSpecialistArgs {
     /// they validate (lexically canonicalize inside the project root) at
     /// decision-validation time before any materialization.
     expected_artifacts: Vec<String>,
+    /// Optional adoption of a declared (not-yet-dispatched) obligation: the
+    /// `task_id` of a `Declared`/`Pending` node this dispatch takes up. The
+    /// node must name the same specialist; `update_obligations` retargets it
+    /// first when it does not. Absent, the dispatch records a fresh node.
+    task_id: Option<String>,
 }
 
 impl CallSpecialistArgs {
@@ -2452,12 +2651,135 @@ impl CallSpecialistArgs {
         let notes = arguments.get("notes").and_then(serde_json::Value::as_str);
         let supporting_evidence_ids = parse_string_array(arguments, "supporting_evidence_ids");
         let expected_artifacts = parse_string_array(arguments, "expected_artifacts");
+        let task_id =
+            arguments.get("task_id").and_then(serde_json::Value::as_str).map(str::to_owned);
         Some(Self {
             agent_id: agent_id.to_owned(),
             task: task.to_owned(),
             notes: notes.map(str::to_owned),
             supporting_evidence_ids,
             expected_artifacts,
+            task_id,
+        })
+    }
+}
+
+/// One `declare_obligations` item: a single unit of obligation-bearing work
+/// that becomes a `Declared` graph node without any dispatch.
+struct DeclareObligationItem {
+    agent_id: String,
+    task: String,
+    expected_artifacts: Vec<String>,
+    after: Vec<usize>,
+}
+
+/// `declare_obligations` tool arguments: 1–[`MAX_DECLARE_OBLIGATIONS`]
+/// items chained in order (each item defaults to running after the previous
+/// one; explicit `after` indices name strictly earlier items instead).
+struct DeclareObligationsArgs {
+    obligations: Vec<DeclareObligationItem>,
+    notes: Option<String>,
+    supporting_evidence_ids: Vec<String>,
+}
+
+impl DeclareObligationsArgs {
+    /// Parse the tool arguments. Malformed arguments (missing/non-array
+    /// `obligations`, or an item missing string `agent_id`/`task`) yield
+    /// `None` — the caller answers with a structured tool error, never a
+    /// crash. Bounds (count, `after` shape) validate in the handler against
+    /// the live decision, where structured rejections carry the fix.
+    fn parse(arguments: &serde_json::Value) -> Option<Self> {
+        let items = arguments.get("obligations").and_then(serde_json::Value::as_array)?;
+        let obligations = items
+            .iter()
+            .filter_map(|item| {
+                let agent_id = item.get("agent_id").and_then(serde_json::Value::as_str)?;
+                let task = item.get("task").and_then(serde_json::Value::as_str)?;
+                let expected_artifacts = parse_string_array(item, "expected_artifacts")
+                    .into_iter()
+                    .map(|raw| {
+                        crate::declared_artifacts::path_without_description(&raw).into_owned()
+                    })
+                    .collect::<Vec<_>>();
+                let after = item
+                    .get("after")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|values| {
+                        values.iter().filter_map(serde_json::Value::as_u64).collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|index| usize::try_from(index).ok())
+                    .collect::<Vec<_>>();
+                Some(DeclareObligationItem {
+                    agent_id: agent_id.to_owned(),
+                    task: task.to_owned(),
+                    expected_artifacts,
+                    after,
+                })
+            })
+            .collect::<Vec<_>>();
+        if obligations.len() != items.len() {
+            return None;
+        }
+        let notes = arguments.get("notes").and_then(serde_json::Value::as_str);
+        let supporting_evidence_ids = parse_string_array(arguments, "supporting_evidence_ids");
+        Some(Self { obligations, notes: notes.map(str::to_owned), supporting_evidence_ids })
+    }
+}
+
+/// `update_obligations` tool arguments: revise one still-undispatched
+/// (`Declared`/`Pending`) node. At least the `task_id` is required; every
+/// other field is an independent optional edit, and `release` promotes a
+/// `Declared` node to `Pending`.
+struct UpdateObligationsArgs {
+    task_id: String,
+    task: Option<String>,
+    agent_id: Option<String>,
+    expected_artifacts: Option<Vec<String>>,
+    release: bool,
+    notes: Option<String>,
+    supporting_evidence_ids: Vec<String>,
+}
+
+impl UpdateObligationsArgs {
+    /// Parse the tool arguments. A missing/non-string `task_id` yields
+    /// `None` (structured tool error, never a crash); an explicitly present
+    /// but non-array `expected_artifacts` is treated as absent here and
+    /// rejected in the handler as `invalid_arguments` so the model gets a
+    /// readable fix instead of a silent drop.
+    fn parse(arguments: &serde_json::Value) -> Option<Self> {
+        let task_id = arguments.get("task_id").and_then(serde_json::Value::as_str)?;
+        let task = arguments.get("task").and_then(serde_json::Value::as_str).map(str::to_owned);
+        let agent_id =
+            arguments.get("agent_id").and_then(serde_json::Value::as_str).map(str::to_owned);
+        let expected_artifacts = match arguments.get("expected_artifacts") {
+            None => None,
+            Some(value) => {
+                let array = value.as_array()?;
+                Some(
+                    array
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(|raw| {
+                            crate::declared_artifacts::path_without_description(raw).into_owned()
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            }
+        };
+        let release =
+            arguments.get("release").and_then(serde_json::Value::as_bool).unwrap_or(false);
+        let notes = arguments.get("notes").and_then(serde_json::Value::as_str);
+        let supporting_evidence_ids = parse_string_array(arguments, "supporting_evidence_ids");
+        Some(Self {
+            task_id: task_id.to_owned(),
+            task,
+            agent_id,
+            expected_artifacts,
+            release,
+            notes: notes.map(str::to_owned),
+            supporting_evidence_ids,
         })
     }
 }
@@ -3214,18 +3536,38 @@ fn tool_executor_offers(executor: Option<&ToolExecutor>, tool_name: &str) -> boo
 /// The precise set of the Coordinator's own tool calls that MUTATE the
 /// workspace, derived from the executor's registered tool names: the `write`
 /// alias, `shell`, and `git`, plus the `filesystem` tool's destructive
-/// operations (`write`/`delete`/`move`/`copy`). Read-only calls (`filesystem`
-/// `read`/`list`/`exists`, LSP, consult, etc.) are never classified here, so
-/// they stay unrestricted.
+/// operations (`write`/`delete`/`move`/`copy`). The LSP mutating tools
+/// (`RenameSymbol` renames a symbol across the workspace,
+/// `ExecuteCodeAction` executes a workspace command) mutate under
+/// non-filesystem names, so they are listed explicitly. Every `mcp:*`
+/// namespaced tool is classified as potentially mutating (conservative:
+/// MCP tools are network-capable and their write behavior is not visible
+/// to this name-based classifier). Read-only calls (`filesystem`
+/// `read`/`list`/`exists`, read-only LSP, consult, etc.) are never
+/// classified here, so they stay unrestricted.
 fn is_mutating_self_execution_tool(tool_name: &str, arguments: &serde_json::Value) -> bool {
+    if tool_name.starts_with("mcp:") {
+        return true;
+    }
     match tool_name {
-        "write" | "shell" | "git" => true,
+        "write" | "shell" | "git" | "RenameSymbol" | "ExecuteCodeAction" => true,
         "filesystem" => matches!(
             arguments.get("operation").and_then(serde_json::Value::as_str),
             Some("write" | "delete" | "move" | "copy")
         ),
         _ => false,
     }
+}
+
+/// Issue #147: the mandatory specialist-dispatch invariant arms ONLY on
+/// [`TaskExecutionMode::ActionRequired`] runs — action-required work with a
+/// capable specialist available cannot close in prose alone. AnswerOnly and
+/// CoordinatorDecides (issue #145) may close in prose; PlanningOnly offers no
+/// dispatch tools. Every prose-only / vacuous-completion guard funnels through
+/// here so the mode predicate cannot drift between sites.
+fn requires_mandatory_dispatch(task: &AgentTask) -> bool {
+    let mode: &TaskExecutionMode = &task.execution_mode;
+    mode.is_action_required()
 }
 /// Resolve each registered agent to the stage kind it staffs, for building the
 /// engine-default collaboration topology (ADR-58 D2/ADR-35).
@@ -4858,6 +5200,53 @@ impl CoordinatorAgent {
             })
     }
 
+    /// Obligation-armed dispatch predicate (concurrent-execution correction):
+    /// whether the run carries runtime-observable execution obligations
+    /// independent of its [`TaskExecutionMode`]. Derives an
+    /// [`ObligationLedger`] from the live graph — implement-stage work maps to
+    /// `Implement`, validate-stage work to `Verify` (stage *kinds*, never role
+    /// names) — and reports open execution work. No text classification: the
+    /// coordinator interprets intent and creates graph work; this only reads
+    /// the resulting state, so conversational turns (empty graph, no plan)
+    /// stay prose-exempt while fresh implementation work in
+    /// `CoordinatorDecides` arms the same guards as `ActionRequired`.
+    ///
+    /// [`ObligationLedger`]: crate::obligations::ObligationLedger
+    fn obligation_dispatch_pending(&self, graph: &TaskGraph) -> bool {
+        let mut ledger = crate::obligations::ObligationLedger::new();
+        ledger.sync_from_graph(graph, |role| {
+            if self.role_in_kind_stage(role, StageKind::Execution, AgentStage::is_implement) {
+                Some(crate::obligations::ObligationKind::Implement)
+            } else if self.role_in_kind_stage(role, StageKind::Acceptance, AgentStage::is_validate)
+            {
+                Some(crate::obligations::ObligationKind::Verify)
+            } else {
+                None
+            }
+        });
+        ledger.has_open_execution_work()
+    }
+
+    /// Combined guard predicate: the legacy mode requirement, open graph
+    /// obligations, or a promised-but-unattempted plan. Every prose-only /
+    /// vacuous-completion / zero-work / unattempted-implementation guard
+    /// funnels through here so the predicate cannot drift between sites.
+    /// Either source arms a requirement; neither disarms the other's.
+    /// `all_files` is the run's produced-file list (tail) or the session
+    /// ledger's (dispatch session): a promised plan with no code artifact is
+    /// unattempted work even when the graph is still empty.
+    fn dispatch_guard_arms(
+        &self,
+        task: &AgentTask,
+        graph: &TaskGraph,
+        all_files: &[camino::Utf8PathBuf],
+    ) -> bool {
+        requires_mandatory_dispatch(task)
+            || self.obligation_dispatch_pending(graph)
+            || (self.run_has_promised_plan()
+                && !all_files.iter().any(|path| is_code_artifact_path(path)))
+    }
+
     /// Record a completion-tail guard decision: the run was downgraded to
     /// `Partial` because unfinished/unattempted work contradicted a
     /// `Completed` claim. Fail-soft like every other coordinator decision
@@ -6160,13 +6549,16 @@ impl CoordinatorAgent {
     }
 
     /// Whether a restored checkpoint is in the shape the resume-drive exists
-    /// for: an ACTION-REQUIRED, full-depth run that PROMISED implementation
-    /// (the same predicate the completion guard arms on) yet holds no
-    /// implement-stage dispatch, no code artifact, and no unresolved pause —
-    /// with every restored node already `Completed`, so there is no open work
-    /// for the decision loop to wait on.
+    /// for: a full-depth run that PROMISED implementation (the same predicate
+    /// the completion guard arms on) yet holds no implement-stage dispatch,
+    /// no code artifact, and no unresolved pause — with every restored node
+    /// already `Completed`, so there is no open work for the decision loop to
+    /// wait on.
     ///
-    /// Returning `true` hands the restored result to
+    /// Obligation correction: the mode gate is gone — a `CoordinatorDecides`
+    /// resume carrying a promised-but-unattempted plan drives back into the
+    /// decision loop instead of re-reporting the completion guard's canned
+    /// Partial on every resume. Returning `true` hands the restored result to
     /// [`Self::drive_resumed_implement`] instead of returning it verbatim:
     /// verbatim would fall straight through to `execute_graph`'s
     /// unattempted-implementation guard, which re-reports the SAME canned
@@ -6176,9 +6568,8 @@ impl CoordinatorAgent {
     /// Deliberately narrower than the guard: any `Failed`/`Blocked` node, a
     /// preserved input/approval pause, a parked wait, or an empty graph keeps
     /// today's restore behaviour untouched.
-    fn resume_needs_implement_drive(&self, task: &AgentTask, result: &DecomposeResult) -> bool {
-        matches!(task.execution_mode, TaskExecutionMode::ActionRequired { .. })
-            && self.orchestration_depth == OrchestrationDepth::Full
+    fn resume_needs_implement_drive(&self, _task: &AgentTask, result: &DecomposeResult) -> bool {
+        self.orchestration_depth == OrchestrationDepth::Full
             && self.run_has_promised_plan()
             && !self.implement_stage_dispatch_occurred(&result.graph, &result.action_ledger)
             && !result.all_files.iter().any(|path| is_code_artifact_path(path))
@@ -6249,6 +6640,8 @@ impl CoordinatorAgent {
             model_assignments: std::mem::take(&mut result.model_assignments),
             action_ledger: std::mem::take(&mut result.action_ledger),
             notes: Vec::new(),
+            coordinator_mutating_calls: 0,
+            coordinator_tool_calls: 0,
         };
         // Persist under the RESTORED run id + sequence so the drive's
         // intermediate checkpoints stay part of the same run history. The
@@ -6319,6 +6712,12 @@ impl CoordinatorAgent {
         result.model_assignments = std::mem::take(&mut ledger.model_assignments);
         result.action_ledger = std::mem::take(&mut ledger.action_ledger);
         result.dispatch_summary = summary;
+        // Issue #145 conversational close, resume-drive edition: same
+        // pure-prose rule as `finish_decompose_result` — the drive's ledger
+        // carries this session's tool calls.
+        result.dispatch_direct_answer = (ledger.coordinator_tool_calls == 0
+            && !result.dispatch_summary.trim().is_empty())
+        .then(|| result.dispatch_summary.clone());
         result.loop_notes.append(&mut ledger.notes);
         // A pause raised by THIS drive (model-requested input, a dispatch
         // pending approval) supersedes whatever the restored row carried;
@@ -6528,6 +6927,12 @@ impl CoordinatorAgent {
         run_context: (String, String, String),
     ) -> Result<DecomposeResult, OrchestratorError> {
         let (summary, objective, objective_hash) = run_context;
+        // Issue #145 conversational close: the session's prose is a direct
+        // answer only when the loop executed NO tool calls (pure prose) and
+        // the summary is non-empty. Read before the ledger is moved below.
+        let dispatch_direct_answer = (ledger.coordinator_tool_calls == 0
+            && !summary.trim().is_empty())
+        .then(|| summary.clone());
         // ADR-35 amendment: an EMPTY graph is a legal decompose result — the
         // Coordinator may decide no dispatch is needed (an answer-only run,
         // or a planning decision to stop). Validation applies to non-empty
@@ -6578,6 +6983,7 @@ impl CoordinatorAgent {
                 model_assignments: HashMap::new(),
                 action_ledger: Vec::new(),
                 dispatch_summary: String::new(),
+                dispatch_direct_answer: None,
                 loop_notes: Vec::new(),
                 requested_user_input: None,
                 pending_approval: None,
@@ -6607,6 +7013,7 @@ impl CoordinatorAgent {
             model_assignments: ledger.model_assignments,
             action_ledger: ledger.action_ledger,
             dispatch_summary: summary,
+            dispatch_direct_answer,
             loop_notes: ledger.notes,
             requested_user_input: self.requested_user_input.take(),
             pending_approval: self.pending_approval.take(),
@@ -6972,6 +7379,7 @@ impl CoordinatorAgent {
             model_assignments,
             action_ledger,
             dispatch_summary: String::new(),
+            dispatch_direct_answer: None,
             loop_notes,
             // TODO #22 (tracking half): an AwaitingUser pause carries its
             // pending question on the checkpoint; the resume hands it to
@@ -7618,6 +8026,7 @@ impl CoordinatorAgent {
         loop_notes: Vec<String>,
         requested_user_input: Option<String>,
         pending_approval: Option<concerto_core::types::PendingApprovalInfo>,
+        dispatch_direct_answer: Option<String>,
     ) -> Result<(AgentOutput, Vec<String>), OrchestratorError> {
         // ADR-52: the run-wide dispatch cap is counted across the whole `run`
         // invocation (the Coordinator decision loop + this graph loop share
@@ -9636,22 +10045,61 @@ impl CoordinatorAgent {
         // Partial and the stall gate below KEEPS the run's checkpoint
         // (persisted with `completed=false`) so a later bare "continue" can
         // resume the run.
-        // Exempt by construction: AnswerOnly root tasks (prose completion is
-        // correct — the mode gate below only arms ActionRequired runs),
+        // Exempt by construction (issue #145): AnswerOnly and
+        // CoordinatorDecides root tasks (prose completion is correct — the
+        // mode gate below only arms ActionRequired runs),
         // PlanningOnly depth (returned before `execute_graph`), runs waiting
-        // on user input (short-circuited to AwaitingUser above), fully
+        // on user input (short-circuited to AwaitingUser above), and fully
         // resolver-reused runs (their graphs hold planned, timeline-resolved
-        // tasks — never empty here), and any run that actually wrote files.
+        // tasks — never empty here).
+        //
+        // Issue #147 tool-surface audit: the coordinator's own file writes do
+        // NOT satisfy the invariant while capable specialists remain. The
+        // dispatch session offers the shared executor's full toolset
+        // (`executor.tool_definitions()`: `filesystem`, `write`, `shell`,
+        // `git`, LSP, MCP bridge), and the pre-delegation refusal
+        // (`guard_self_execution`) classifies the known mutating names
+        // (`write`/`shell`/`git`, destructive `filesystem` ops, the LSP
+        // mutating tools `RenameSymbol`/`ExecuteCodeAction`, and every
+        // `mcp:*` namespaced tool conservatively) — a write-capable tool
+        // under any OTHER unlisted name (future registrations) still
+        // executes unrestricted yet leaves the graph empty. So produced
+        // files excuse an empty dispatch session ONLY
+        // for the roster-empty exhaustion case (lawful §8 self-execution, no
+        // specialist to delegate to); with a non-empty roster the run still
+        // reports Partial. Read-only/orchestration calls (consult,
+        // investigate, wait, reconsider, transfer_ownership, roster logic) are
+        // unaffected — they neither write files nor dispatch, so this gate
+        // never fires because of them. Delegation-failure recovery is
+        // preserved: a run that dispatched (graph non-empty) and then
+        // self-executed past a failed specialist never has an empty graph.
+        // Partial-dispatch limitation (issue #148): when the graph is
+        // NON-empty, coordinator mutating work alongside dispatched subtasks
+        // is tracked (`DispatchLedger::coordinator_mutating_calls` plus a
+        // `CoordinatorSelfImplementing` event per allowed call, including
+        // `unclassified-file-write` for unlisted tools that produce files)
+        // but does NOT downgrade the exit — post-dispatch self-execution is
+        // the lawful delegation-failure recovery path, and attributing which
+        // bytes each party produced is beyond this name-based gate. Only the
+        // zero-dispatch (empty graph) case is gated here.
+        let roster_has_specialists = !self.registry.ids().is_empty();
+        // Obligation correction: the mode predicate below is the combined
+        // [`Self::dispatch_guard_arms`] — a `CoordinatorDecides` run holding a
+        // promised-but-unattempted plan (or open execution work, which cannot
+        // occur with an empty graph) is vacuous in exactly the same way as an
+        // `ActionRequired` one. Conversational turns stay exempt: no plan, no
+        // open work, no guard.
         let vacuous_execute_dispatch = graph.is_empty()
-            && matches!(&task.execution_mode, TaskExecutionMode::ActionRequired { .. })
+            && self.dispatch_guard_arms(&task, &graph, &all_files)
             && requested_user_input.is_none()
             && self.orchestration_depth == OrchestrationDepth::Full
-            && all_files.is_empty();
+            && (all_files.is_empty() || roster_has_specialists);
         if vacuous_execute_dispatch {
             recoverable_notes.push(
-                "Vacuous-completion guard: this action-required run dispatched zero tasks and \
-                 produced zero files — an empty dispatch session cannot claim completion; the \
-                 run is reported Partial and its checkpoint is preserved for resume."
+                "Vacuous-completion guard: this action-required run dispatched zero tasks — an \
+                 empty dispatch session cannot claim completion, even when the coordinator's own \
+                 tools produced files while capable specialists remained; the run is reported \
+                 Partial and its checkpoint is preserved for resume."
                     .to_owned(),
             );
         }
@@ -9673,10 +10121,7 @@ impl CoordinatorAgent {
         // The note downgrades the exit to Partial, and the stall gate below
         // keeps the checkpoint resumable for a later resume.
         let dispatched_subtasks = action_ledger.iter().any(|action| action.kind == "dispatched");
-        if matches!(&task.execution_mode, TaskExecutionMode::ActionRequired { .. })
-            && dispatched_subtasks
-            && total_tool_calls == 0
-        {
+        if requires_mandatory_dispatch(&task) && dispatched_subtasks && total_tool_calls == 0 {
             recoverable_notes.push(
                 "Zero-work guard: the task required tool work but zero tool calls executed \
                  across the run; the completion claim was not backed by any executed tool."
@@ -9815,17 +10260,19 @@ impl CoordinatorAgent {
             .await;
         }
 
-        // 2. Unattempted implementation: an action-required, full-depth run
-        // that carried a plan (an approved plan or a non-empty DesignDoc
-        // contract) but dispatched NO implement-stage specialist and produced
-        // NO code artifact never attempted the implementation it promised.
-        // Ad-hoc runs with no plan are exempt (nothing was promised), as are
-        // runs where any implement dispatch occurred (success or failure —
-        // those failure paths already handle themselves). Stage kinds come
-        // from config via `AgentStage::is_implement`; no role name participates.
+        // 2. Unattempted implementation: a full-depth run that carried a plan
+        // (an approved plan or a non-empty DesignDoc contract) but dispatched
+        // NO implement-stage specialist and produced NO code artifact never
+        // attempted the implementation it promised. Ad-hoc runs with no plan
+        // are exempt (nothing was promised), as are runs where any implement
+        // dispatch occurred (success or failure — those failure paths already
+        // handle themselves). Obligation correction: the mode gate is gone —
+        // a promised plan is a runtime-observable obligation in
+        // `CoordinatorDecides` too, so prose can never mark it complete.
+        // Stage kinds come from config via `AgentStage::is_implement`; no role
+        // name participates.
         let has_code_artifact = all_files.iter().any(|path| is_code_artifact_path(path));
-        if matches!(&task.execution_mode, TaskExecutionMode::ActionRequired { .. })
-            && self.orchestration_depth == OrchestrationDepth::Full
+        if self.orchestration_depth == OrchestrationDepth::Full
             && self.run_has_promised_plan()
             && !self.implement_stage_dispatch_occurred(&graph, &action_ledger)
             && !has_code_artifact
@@ -9950,7 +10397,22 @@ impl CoordinatorAgent {
                 task_id: task.id,
                 session_id: task.session_id,
                 final_message: if recoverable_notes.is_empty() {
-                    "Multi-agent orchestration completed".into()
+                    // Zero-dispatch conversational close (issue #145): the
+                    // Coordinator answered directly in a pure-prose dispatch
+                    // session (no tool calls), so that prose IS the reply —
+                    // not the synthetic orchestration fallback. Gated on the
+                    // empty graph, so dispatched runs keep the established
+                    // completion message; tool-mediated sessions (consult,
+                    // investigate, splits, executor work) keep it too, and
+                    // ActionRequired runs never reach this arm empty (the
+                    // vacuous-completion guard above downgrades them to Partial
+                    // with a note).
+                    if graph.is_empty() {
+                        dispatch_direct_answer
+                            .unwrap_or_else(|| "Multi-agent orchestration completed".into())
+                    } else {
+                        "Multi-agent orchestration completed".into()
+                    }
                 } else {
                     format!(
                     "Automation preserved its workspace changes and session context after recoverable issues remained. {}",
@@ -10078,6 +10540,7 @@ impl CoordinatorAgent {
             model_assignments,
             action_ledger,
             dispatch_summary,
+            dispatch_direct_answer,
             loop_notes,
             requested_user_input,
             pending_approval,
@@ -10214,6 +10677,7 @@ impl CoordinatorAgent {
                 loop_notes,
                 requested_user_input,
                 pending_approval,
+                dispatch_direct_answer,
             )
             .await;
         match outcome {
@@ -10536,8 +11000,13 @@ impl CoordinatorAgent {
         // resume. The nested retry's own prose-only stop is suppressed by
         // `planning_recovery_in_progress`, so this never recurses deeper than
         // one level (the run budget is bounded by MAX_PLANNING_RECOVERY_ROUNDS).
+        // Obligation correction: the mode predicate below is the combined
+        // [`Self::dispatch_guard_arms`] — an open execution obligation or a
+        // promised-but-unattempted plan arms the escalation in any mode, so a
+        // fresh implementation obligation in `CoordinatorDecides` escalates
+        // exactly like `ActionRequired` instead of closing in prose.
         let prose_only_stop = self.orchestration_depth != OrchestrationDepth::PlanningOnly
-            && matches!(task.execution_mode, TaskExecutionMode::ActionRequired { .. })
+            && self.dispatch_guard_arms(task, &graph, &ledger.all_files)
             && graph.is_empty();
         if prose_only_stop {
             match self.attempt_prose_only_planning_recovery(task, context, cancel).await {
@@ -11284,8 +11753,11 @@ impl CoordinatorAgent {
         // `Decision` event. The recovery is re-entrancy guarded and bounded, so
         // the nested retry's own prose-only stop is suppressed via
         // `planning_recovery_in_progress` — never deeper than one level.
+        // Obligation correction: combined [`Self::dispatch_guard_arms`] — an
+        // evidence-resume carrying open execution obligations or an unattempted
+        // promised plan escalates in any mode, not just `ActionRequired`.
         let prose_only_stop = self.orchestration_depth != OrchestrationDepth::PlanningOnly
-            && matches!(task.execution_mode, TaskExecutionMode::ActionRequired { .. })
+            && self.dispatch_guard_arms(task, &graph, &ledger.all_files)
             && graph.is_empty();
         if prose_only_stop {
             match self.attempt_prose_only_planning_recovery(task, context, cancel).await {
@@ -11410,11 +11882,31 @@ impl CoordinatorAgent {
             // Issue #64: the reconsideration surface — supersede a decision
             // and freeze only its affected pending tasks.
             tool_defs.push(reconsider_tool_definition());
+            // The obligation-declaration surfaces — structured work before
+            // dispatch: `declare_obligations` creates Outstanding
+            // (not-yet-dispatched) graph nodes, `update_obligations` revises
+            // or releases them. Both are deterministic graph writes (no
+            // dispatch, no tools), so they apply no policy gate.
+            tool_defs.push(declare_obligations_tool_definition());
+            tool_defs.push(update_obligations_tool_definition());
             // Issue #61: the mediated ownership-transfer surface — only
             // lawful when a write gate is attached to the run.
             if self.write_gate.is_some() {
                 tool_defs.push(transfer_ownership_tool_definition());
             }
+            // Issue #147 audit: the shared executor's tools ride the SAME
+            // dispatch surface (`filesystem`, `write`, `shell`, `git`, LSP,
+            // MCP bridge — whatever the run registered). The coordinator can
+            // therefore reason AND act here, but its direct implementation
+            // work never satisfies the mandatory-dispatch invariant: known
+            // mutating names are refused pre-delegation by
+            // `guard_self_execution`, and anything that slips past the
+            // name-based classifier still leaves the graph empty, so the
+            // prose-only guard (re-prompt ×5, then planning recovery) and the
+            // vacuous-completion backstop report Partial while specialists
+            // remain. Gating decision: post-hoc completion check, NOT tool
+            // removal — the roster-empty exhaustion case and post-dispatch
+            // failure recovery must keep their self-execution path.
             if let Some(executor) = &self.tool_executor {
                 tool_defs.extend(executor.tool_definitions());
             }
@@ -11580,7 +12072,18 @@ impl CoordinatorAgent {
                 max_tokens: Some(8192),
                 stream: false,
             };
-            let (text, reasoning, tool_calls, _usage) = crate::prompts::complete_provider_request(
+            // ADR-48 §4: the planning provider's reported usage is the source
+            // of truth when present; the byte/4 heuristic is the fallback for
+            // providers that report none (`0` is measured, only `None` falls
+            // back). Mirrors the single-agent loop's per-turn accounting.
+            let request_tokens_in = request
+                .messages
+                .iter()
+                .map(|message| message.content.len() as u64)
+                .sum::<u64>()
+                .div_ceil(4);
+            let request_started = std::time::Instant::now();
+            let (text, reasoning, tool_calls, usage) = crate::prompts::complete_provider_request(
                 &self.planning_provider,
                 &request,
                 &self.retry_policy,
@@ -11590,6 +12093,32 @@ impl CoordinatorAgent {
                 cancel,
             )
             .await?; // provider-class errors classify at the decompose level
+                     // The decision loop's own model turns are real spend: record each
+                     // turn on the ledger (and the settled mirror) so a zero-dispatch
+                     // conversational close still carries provider metrics instead of
+                     // reporting tokens 0/0 with an empty metric list.
+            {
+                let measured_in = usage.as_ref().and_then(|u| u.prompt_tokens);
+                let measured_out = usage.as_ref().and_then(|u| u.completion_tokens);
+                let tool_chars = serde_json::to_string(&tool_calls)
+                    .map(|value| value.len() as u64)
+                    .unwrap_or_default();
+                let estimated_out = (text.len() as u64).saturating_add(tool_chars).div_ceil(4);
+                let tokens_in = measured_in.unwrap_or(request_tokens_in);
+                let tokens_out = measured_out.unwrap_or(estimated_out);
+                let cost = self.planning_provider.approximate_cost(tokens_in, tokens_out);
+                let settled = ProviderMetrics {
+                    provider: self.planning_provider.provider_name().to_owned(),
+                    model: model.clone(),
+                    tokens_in,
+                    tokens_out,
+                    cost_usd: cost,
+                    latency_ms: request_started.elapsed().as_millis() as u64,
+                };
+                ledger.provider_metrics.push(settled.clone());
+                self.settled_metrics.push(settled);
+                ledger.total_cost += cost;
+            }
 
             messages.push(Message {
                 role: Role::Assistant,
@@ -11613,12 +12142,19 @@ impl CoordinatorAgent {
                 // `MAX_PROSE_STOP_REPROMPTS`; past that bound the stop stands
                 // and the caller (`decompose_task`) escalates to the
                 // planning-recovery fallback (ADR-45 tier-1b).
-                // Exempt by construction: AnswerOnly task modes (prose is the
-                // correct outcome — the twin tests keep those single-pass)
-                // and PlanningOnly depth (no tools exist to dispatch with).
+                // Exempt by construction (issue #145): AnswerOnly task modes
+                // (prose is a correct outcome — the coordinator is allowed to
+                // answer directly) and PlanningOnly depth (no tools exist to
+                // dispatch with). ActionRequired arms this guard (issue #147):
+                // a mode that requires work cannot close with prose alone while
+                // a capable specialist remains. The obligation correction
+                // extends the same arming to any run that owes execution work —
+                // open implement/verify-stage graph work or a promised plan
+                // with no code artifact yet — whatever its mode. Conversational
+                // turns (empty graph, no plan) stay exempt: no dispatch is
+                // manufactured for them.
                 let prose_only_stop =
-                    matches!(task.execution_mode, TaskExecutionMode::ActionRequired { .. })
-                        && graph.is_empty();
+                    self.dispatch_guard_arms(task, graph, &ledger.all_files) && graph.is_empty();
                 if dispatching && prose_only_stop && prose_stop_reprompts < MAX_PROSE_STOP_REPROMPTS
                 {
                     prose_stop_reprompts += 1;
@@ -11673,6 +12209,11 @@ impl CoordinatorAgent {
             let journal_len_before_cycle = self.decision_journal.len();
             let cost_before_cycle = ledger.total_cost;
             let mut observation = crate::progress::CycleObservation::default();
+            // Conversational-close gate (issue #145): every tool call the
+            // session executes marks it tool-mediated, so only a pure-prose
+            // session (zero calls) can close as a direct answer.
+            ledger.coordinator_tool_calls =
+                ledger.coordinator_tool_calls.saturating_add(tool_calls.len() as u32);
 
             for tool_call in tool_calls {
                 if cancel.is_cancelled() {
@@ -11822,6 +12363,39 @@ impl CoordinatorAgent {
                             scope,
                             ledger,
                             state,
+                            &tool_call.arguments,
+                        )
+                        .await
+                    }
+                    // The obligation-declaration surfaces — structured work
+                    // before dispatch. `declare_obligations` materializes
+                    // Outstanding (not-yet-dispatched) graph nodes;
+                    // `update_obligations` revises or releases them.
+                    // Deterministic graph writes: no agents, no tools, no
+                    // policy gate — but journaled, whiteboard-recorded, and
+                    // checkpointed, and every tool call here marks the
+                    // session tool-mediated for the conversational-close
+                    // gate.
+                    DECLARE_OBLIGATIONS_TOOL if dispatching => {
+                        self.handle_declare_obligations(
+                            graph,
+                            task,
+                            base_ctx,
+                            cancel,
+                            scope,
+                            ledger,
+                            &tool_call.arguments,
+                        )
+                        .await
+                    }
+                    UPDATE_OBLIGATIONS_TOOL if dispatching => {
+                        self.handle_update_obligations(
+                            graph,
+                            task,
+                            base_ctx,
+                            cancel,
+                            scope,
+                            ledger,
                             &tool_call.arguments,
                         )
                         .await
@@ -12145,6 +12719,61 @@ impl CoordinatorAgent {
         Some(serde_json::json!({ "same_role_guard": "cap_reached", "message": note }))
     }
 
+    /// Resolve an optional `call_specialist` `task_id` onto a declared
+    /// (not-yet-dispatched) obligation. The node must exist, still be
+    /// undispatched (`Declared`/`Pending`), and name the same specialist —
+    /// otherwise a structured tool error tells the model the fix
+    /// (`update_obligations` retargets a mis-owned node,
+    /// `declare_obligations` declares fresh work). `Ok(None)` is the legacy
+    /// path: no `task_id` was passed, so the dispatch records a fresh node.
+    /// Pure: reads the live graph, mutates nothing.
+    fn adopted_obligation(
+        &self,
+        graph: &TaskGraph,
+        agent_id: &AgentId,
+        task_id: Option<&str>,
+    ) -> Result<Option<TaskId>, serde_json::Value> {
+        let Some(raw) = task_id else {
+            return Ok(None);
+        };
+        let id = Ulid::from_string(raw).map(TaskId).map_err(|_| {
+            serde_json::json!({
+                "error": "invalid_arguments",
+                "message": format!("call_specialist: task_id {raw} is not a task id"),
+            })
+        })?;
+        let Some(node) = graph.get(&id) else {
+            return Err(serde_json::json!({
+                "error": "unknown_obligation",
+                "message": format!(
+                    "call_specialist: no declared obligation with id {raw}; declare it first \
+                     with declare_obligations"
+                ),
+            }));
+        };
+        if !matches!(node.status, SubTaskStatus::Declared | SubTaskStatus::Pending) {
+            return Err(serde_json::json!({
+                "error": "already_dispatched",
+                "message": format!(
+                    "call_specialist: obligation {raw} is {} (already dispatched or settled); \
+                     declare fresh work for a new dispatch",
+                    node.status.as_str()
+                ),
+            }));
+        }
+        if node.role != *agent_id {
+            return Err(serde_json::json!({
+                "error": "obligation_role_mismatch",
+                "message": format!(
+                    "call_specialist: obligation {raw} names {} but this dispatch targets \
+                     {agent_id}; retarget it first with update_obligations",
+                    node.role
+                ),
+            }));
+        }
+        Ok(Some(id))
+    }
+
     /// Handle ONE `call_specialist` tool call (ADR-35 amendment 2026-09-05):
     /// validate → policy-gate → record the evidence-backed Decision event →
     /// materialize the chained SubTask → dispatch through the existing
@@ -12347,10 +12976,19 @@ impl CoordinatorAgent {
             }
         };
         let decision_id = decision.id.clone();
-        // Mint the subtask id BEFORE the policy gate: every dispatch outcome
-        // below — including a denial that never materializes a graph node —
-        // correlates to this decision under one id in the run history.
-        let subtask_id = TaskId::new();
+        // Adopt-or-mint the subtask id BEFORE the policy gate: every dispatch
+        // outcome below — including a denial that never materializes a graph
+        // node — correlates to this decision under one id in the run history.
+        // A `task_id` adopts a declared (not-yet-dispatched) obligation: the
+        // node keeps its chain position and runs here, so declared work
+        // dispatches without a duplicate node. Absent, the dispatch records a
+        // fresh node exactly as before.
+        let subtask_id =
+            match self.adopted_obligation(graph, &effective_agent, args.task_id.as_deref()) {
+                Ok(Some(id)) => id,
+                Ok(None) => TaskId::new(),
+                Err(error) => return error,
+            };
         // Issue #60: the deterministic task class for the suitability
         // record — derived from the task text + expected artifacts (never
         // model-judged), attributed to the REQUESTED specialist.
@@ -12363,6 +13001,9 @@ impl CoordinatorAgent {
         // projection), captured here and attached to the tool result the
         // model reads back.
         let world_model_advisory = self.world_model_decision_advisory(&args.expected_artifacts);
+        // Canonical artifact set for this dispatch: an adopted declaration
+        // keeps its declared set unless the dispatch supplies its own.
+        let dispatch_artifacts = decision.expected_artifacts.clone();
         self.decision_journal.record(decision);
 
         // ── The DAG frontier must be settled: the chain parent (when any)
@@ -12518,40 +13159,63 @@ impl CoordinatorAgent {
         .await;
 
         // ── Materialize the SubTask node — the graph RECORDS the decision ──
-        let subtask = SubTask {
-            id: subtask_id,
-            parent_id: state.last_node,
-            session_id: task.session_id,
-            role: agent_id.clone(),
-            description: description.clone(),
-            status: SubTaskStatus::Pending,
-            dependencies: state.last_node.iter().copied().collect(),
-            deliverable: None,
-            created_at: time::OffsetDateTime::now_utc(),
-            completed_at: None,
-        };
-        match state.last_node {
-            Some(parent) => {
-                let relationship =
-                    self.fallback_relationship(graph, parent, &agent_id, design_role);
-                graph.add_child_with_relationship(
-                    subtask,
-                    parent,
-                    Dependency::MustFinishBefore,
-                    relationship,
+        // An adopted declaration keeps its declared chain position (parent,
+        // dependencies); only its description is refined to this dispatch's
+        // text and an explicitly supplied artifact set replaces the declared
+        // one. A fresh dispatch mints a node chained off the loop frontier
+        // exactly as before.
+        let adopted = graph.get(&subtask_id).is_some();
+        if adopted {
+            if let Some(node) = graph.get_mut(&subtask_id) {
+                node.description = description.clone();
+            }
+            if !dispatch_artifacts.is_empty() {
+                self.expected_artifacts.lock().unwrap_or_else(|error| error.into_inner()).insert(
+                    subtask_id,
+                    dispatch_artifacts.iter().map(camino::Utf8PathBuf::from).collect(),
                 );
             }
-            None => graph.add_root(subtask),
-        }
-        let _ = self.bus.publish_for_session(
-            task.session_id,
-            subtask_id.0,
-            EventKind::SubTaskCreated {
-                task_id: subtask_id,
+            let _ = self.bus.publish_for_session(
+                task.session_id,
+                subtask_id.0,
+                EventKind::SubTaskStarted { task_id: subtask_id, role: agent_id.clone() },
+            );
+        } else {
+            let subtask = SubTask {
+                id: subtask_id,
+                parent_id: state.last_node,
+                session_id: task.session_id,
                 role: agent_id.clone(),
                 description: description.clone(),
-            },
-        );
+                status: SubTaskStatus::Pending,
+                dependencies: state.last_node.iter().copied().collect(),
+                deliverable: None,
+                created_at: time::OffsetDateTime::now_utc(),
+                completed_at: None,
+            };
+            match state.last_node {
+                Some(parent) => {
+                    let relationship =
+                        self.fallback_relationship(graph, parent, &agent_id, design_role);
+                    graph.add_child_with_relationship(
+                        subtask,
+                        parent,
+                        Dependency::MustFinishBefore,
+                        relationship,
+                    );
+                }
+                None => graph.add_root(subtask),
+            }
+            let _ = self.bus.publish_for_session(
+                task.session_id,
+                subtask_id.0,
+                EventKind::SubTaskCreated {
+                    task_id: subtask_id,
+                    role: agent_id.clone(),
+                    description: description.clone(),
+                },
+            );
+        }
         graph.mark_running(&subtask_id);
         *ledger.subtask_attempts.entry(subtask_id).or_insert(0) += 1;
         ledger.action_ledger.push(checkpoint::CheckpointAction {
@@ -13036,6 +13700,22 @@ impl CoordinatorAgent {
         }
         if let Some(advisory) = world_model_advisory {
             tool_result["world_model"] = advisory;
+        }
+        // Declared-but-undispatched work survives the dispatch: name it so
+        // the next decision adopts it by `task_id` instead of minting a
+        // duplicate — and so the model sees that prose alone cannot close
+        // the run while Implement/Verify obligations stay Outstanding.
+        let declared_pending = graph
+            .all_tasks()
+            .iter()
+            .filter(|subtask| subtask.status == SubTaskStatus::Declared)
+            .count();
+        if declared_pending > 0 {
+            tool_result["declared_pending"] = serde_json::json!({
+                "count": declared_pending,
+                "hint": "declared (not-yet-dispatched) obligations remain; dispatch each with \
+                         call_specialist passing its task_id — prose alone never discharges them",
+            });
         }
         tool_result
     }
@@ -15159,6 +15839,435 @@ impl CoordinatorAgent {
         })
     }
 
+    /// Handle ONE `declare_obligations` tool call — the structured decision
+    /// that creates obligation-bearing work BEFORE any dispatch. Each item
+    /// becomes a `Declared` (Outstanding, not-yet-dispatched) graph node,
+    /// chained in order (each item defaults to running after the previous
+    /// one; explicit `after` names strictly earlier items instead).
+    ///
+    /// Same failure discipline as the other deterministic surfaces: validate
+    /// against the roster and the real project root BEFORE any mutation; a
+    /// rejection is a structured tool error the model reads, never a crash.
+    /// Declaration dispatches nothing and touches no tools, so it applies no
+    /// policy gate — but it is journaled, whiteboard-recorded, and
+    /// checkpointed like any decision, and the declared nodes persist through
+    /// the existing checkpoint rows. The declaration deliberately leaves
+    /// `state.last_node` alone: declaring is not dispatching, so the
+    /// chain-parent gate keeps governing dispatches from the last SETTLED
+    /// dispatch, and each declared node dispatches later via
+    /// `call_specialist` (passing its `task_id`) or an `update_obligations`
+    /// release to `Pending`.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_declare_obligations(
+        &mut self,
+        graph: &mut TaskGraph,
+        task: &AgentTask,
+        base_ctx: &AgentContext,
+        cancel: &CancellationToken,
+        scope: &mut checkpoint::CheckpointScope,
+        ledger: &mut DispatchLedger,
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        let Some(args) = DeclareObligationsArgs::parse(arguments) else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "declare_obligations requires an obligations array of {agent_id, task, expected_artifacts?, after?} specs",
+            });
+        };
+        if args.obligations.is_empty() || args.obligations.len() > MAX_DECLARE_OBLIGATIONS {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": format!(
+                    "declare_obligations takes 1–{MAX_DECLARE_OBLIGATIONS} obligations (got {})",
+                    args.obligations.len()
+                ),
+            });
+        }
+        // Per-item checks: roster membership, non-empty work text, and
+        // strictly-earlier, deduplicated order edges.
+        let roster = self.decision_roster();
+        for (index, item) in args.obligations.iter().enumerate() {
+            if !roster.contains(&item.agent_id) {
+                return serde_json::json!({
+                    "error": "unknown_agent",
+                    "message": format!(
+                        "declare_obligations: no specialist registered for id {}; the roster in \
+                         your context lists every callable agent",
+                        item.agent_id
+                    ),
+                });
+            }
+            if item.task.trim().is_empty() {
+                return serde_json::json!({
+                    "error": "incomplete_decision",
+                    "message": format!(
+                        "declare_obligations item {index} requires a non-empty task description"
+                    ),
+                });
+            }
+            let mut seen = HashSet::new();
+            for dep in &item.after {
+                if *dep >= index || !seen.insert(*dep) {
+                    return serde_json::json!({
+                        "error": "invalid_arguments",
+                        "message": format!(
+                            "declare_obligations item {index}: after indices must name strictly \
+                             EARLIER obligations once each"
+                        ),
+                    });
+                }
+            }
+        }
+        // Artifact canonicalization per item: every model-supplied path
+        // resolves INSIDE the project root before it reaches the decision
+        // (model paths are never trusted).
+        let path_validator = crate::decisions::DecisionValidator {
+            roster_ids: &HashSet::new(),
+            known_event_ids: &HashSet::new(),
+            project_root: Some(base_ctx.session.project_dir.as_path()),
+        };
+        let mut canonical_per_item: Vec<Vec<String>> = Vec::with_capacity(args.obligations.len());
+        let mut union_artifacts: Vec<String> = Vec::new();
+        for item in &args.obligations {
+            let mut canonical: Vec<String> = Vec::new();
+            for raw in &item.expected_artifacts {
+                let Some(path) = path_validator.canonical_artifact_path(raw) else {
+                    return serde_json::json!({
+                        "error": "invalid_artifact_path",
+                        "message": format!(
+                            "declare_obligations: expected-artifact path {raw:?} escapes the \
+                             workspace; give a workspace-root-relative path"
+                        ),
+                    });
+                };
+                if !canonical.contains(&path) {
+                    canonical.push(path.clone());
+                }
+                if !union_artifacts.contains(&path) {
+                    union_artifacts.push(path);
+                }
+            }
+            canonical_per_item.push(canonical);
+        }
+        let mut agents: Vec<&str> = Vec::new();
+        for item in &args.obligations {
+            if !agents.contains(&item.agent_id.as_str()) {
+                agents.push(item.agent_id.as_str());
+            }
+        }
+        let summary =
+            format!("declare {} obligation(s) ({})", args.obligations.len(), agents.join(", "));
+        let decision = match self
+            .validate_transform_decision(
+                crate::decisions::DecisionKind::DeclareObligations,
+                None,
+                &summary,
+                args.notes.as_deref(),
+                &args.supporting_evidence_ids,
+                &union_artifacts,
+                cancel,
+                base_ctx,
+            )
+            .await
+        {
+            Ok(decision) => decision,
+            Err(error) => return error,
+        };
+        let decision_id = decision.id.clone();
+        self.decision_journal.record(decision);
+
+        // ── Materialize one `Declared` node per item — the graph RECORDS ──
+        // ── the structured decision; nothing runs yet. ───────────────────
+        let mut declared: Vec<(TaskId, String, String)> =
+            Vec::with_capacity(args.obligations.len());
+        let mut minted: Vec<TaskId> = Vec::with_capacity(args.obligations.len());
+        for (index, (item, canonical)) in
+            args.obligations.iter().zip(canonical_per_item.iter()).enumerate()
+        {
+            let id = TaskId::new();
+            let dep_indices: Vec<usize> = if item.after.is_empty() {
+                // Default chain: every item after the first runs after its
+                // predecessor, giving the investigate → implement → verify →
+                // explain order without naming indices.
+                index.checked_sub(1).into_iter().collect::<Vec<_>>()
+            } else {
+                item.after.clone()
+            };
+            let dep_ids: Vec<TaskId> = dep_indices.into_iter().map(|dep| minted[dep]).collect();
+            let subtask = SubTask {
+                id,
+                parent_id: dep_ids.first().copied(),
+                session_id: task.session_id,
+                role: AgentId::new(&item.agent_id),
+                description: item.task.clone(),
+                status: SubTaskStatus::Declared,
+                dependencies: dep_ids.clone(),
+                deliverable: None,
+                created_at: time::OffsetDateTime::now_utc(),
+                completed_at: None,
+            };
+            graph.add_subtask(subtask);
+            let mut edge_failed = None;
+            for dep in &dep_ids {
+                if let Err(error) = graph.add_dependency(id, *dep, Dependency::MustFinishBefore) {
+                    edge_failed = Some(error.to_string());
+                    break;
+                }
+            }
+            if let Some(reason) = edge_failed {
+                // Unreachable by construction (every dep id was minted above
+                // from a validated strictly-earlier index) — fail closed so
+                // the run never keeps a half-declared chain.
+                self.decision_journal
+                    .transition(&decision_id, crate::decisions::DecisionStatus::Rejected);
+                return serde_json::json!({
+                    "error": "declaration_failed",
+                    "message": format!("declare_obligations: dependency wiring failed: {reason}"),
+                });
+            }
+            self.expected_artifacts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(id, canonical.iter().map(camino::Utf8PathBuf::from).collect());
+            let _ = self.bus.publish_for_session(
+                task.session_id,
+                id.0,
+                EventKind::SubTaskCreated {
+                    task_id: id,
+                    role: AgentId::new(&item.agent_id),
+                    description: item.task.clone(),
+                },
+            );
+            ledger.action_ledger.push(checkpoint::CheckpointAction {
+                kind: "declared".into(),
+                task_id: Some(id),
+                timestamp: time::OffsetDateTime::now_utc(),
+                evidence: None,
+            });
+            declared.push((id, item.agent_id.clone(), item.task.clone()));
+            minted.push(id);
+        }
+
+        // ── The trail: journal transitions, whiteboard decision, checkpoint.
+        self.decision_journal
+            .transition(&decision_id, crate::decisions::DecisionStatus::Dispatched);
+        self.decision_journal.transition(&decision_id, crate::decisions::DecisionStatus::Settled);
+        self.append_transform_decision(
+            task.session_id,
+            None,
+            args.notes.as_deref().unwrap_or("coordinator_choice"),
+            &summary,
+            &args.supporting_evidence_ids,
+        )
+        .await;
+        self.persist_dispatch_checkpoint(graph, task, base_ctx, scope, ledger).await;
+
+        serde_json::json!({
+            "status": "declared",
+            "obligations": declared
+                .iter()
+                .map(|(id, agent_id, item_task)| serde_json::json!({
+                    "task_id": id.to_string(),
+                    "agent_id": agent_id,
+                    "task": item_task,
+                }))
+                .collect::<Vec<_>>(),
+            "hint": "dispatch each obligation with call_specialist passing its task_id; \
+                      declared Implement/Verify work blocks completion until dispatched with \
+                      evidence — prose alone never discharges it",
+        })
+    }
+
+    /// Handle ONE `update_obligations` tool call — revise one
+    /// still-undispatched (`Declared`/`Pending`) node: its description,
+    /// expected artifacts, owning specialist, or its release from `Declared`
+    /// to `Pending` so the graph loop may dispatch it. Settled or dispatched
+    /// work is rejected (completed work is never re-cut; failed/blocked work
+    /// retries through its own paths; wrongly-decided work goes through
+    /// reconsider/split/merge). A call that changes nothing answers
+    /// `unchanged` without journaling noise.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_update_obligations(
+        &mut self,
+        graph: &mut TaskGraph,
+        task: &AgentTask,
+        base_ctx: &AgentContext,
+        cancel: &CancellationToken,
+        scope: &mut checkpoint::CheckpointScope,
+        ledger: &mut DispatchLedger,
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        let Some(args) = UpdateObligationsArgs::parse(arguments) else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "update_obligations requires a string task_id plus at least one edit (task, agent_id, expected_artifacts, or release)",
+            });
+        };
+        let Ok(target) = Ulid::from_string(&args.task_id).map(TaskId) else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": format!("update_obligations: task_id {} is not a task id", args.task_id),
+            });
+        };
+        let Some(node) = graph.get(&target) else {
+            return serde_json::json!({
+                "error": "unknown_obligation",
+                "message": format!(
+                    "update_obligations: no obligation with id {}; declare it first with \
+                     declare_obligations",
+                    args.task_id
+                ),
+            });
+        };
+        if !matches!(node.status, SubTaskStatus::Declared | SubTaskStatus::Pending) {
+            return serde_json::json!({
+                "error": "invalid_transition",
+                "message": format!(
+                    "update_obligations: obligation {} is {} — only Declared/Pending \
+                     (not-yet-dispatched) work is editable; settled or dispatched work is never \
+                     re-cut",
+                    args.task_id,
+                    node.status.as_str()
+                ),
+            });
+        }
+        if let Some(agent_id) = args.agent_id.as_deref() {
+            if !self.decision_roster().contains(agent_id) {
+                return serde_json::json!({
+                    "error": "unknown_agent",
+                    "message": format!(
+                        "update_obligations: no specialist registered for id {agent_id}; the roster \
+                         in your context lists every callable agent"
+                    ),
+                });
+            }
+        }
+        if let Some(text) = args.task.as_deref() {
+            if text.trim().is_empty() {
+                return serde_json::json!({
+                    "error": "invalid_arguments",
+                    "message": "update_obligations: task must be a non-empty string when provided",
+                });
+            }
+        }
+        // Artifact canonicalization for the replacement set (model paths are
+        // never trusted).
+        let mut canonical_artifacts: Option<Vec<String>> = None;
+        if let Some(raw_list) = args.expected_artifacts.as_deref() {
+            let path_validator = crate::decisions::DecisionValidator {
+                roster_ids: &HashSet::new(),
+                known_event_ids: &HashSet::new(),
+                project_root: Some(base_ctx.session.project_dir.as_path()),
+            };
+            let mut canonical: Vec<String> = Vec::new();
+            for raw in raw_list {
+                let Some(path) = path_validator.canonical_artifact_path(raw) else {
+                    return serde_json::json!({
+                        "error": "invalid_artifact_path",
+                        "message": format!(
+                            "update_obligations: expected-artifact path {raw:?} escapes the \
+                             workspace; give a workspace-root-relative path"
+                        ),
+                    });
+                };
+                if !canonical.contains(&path) {
+                    canonical.push(path);
+                }
+            }
+            canonical_artifacts = Some(canonical);
+        }
+        let was_declared = node.status == SubTaskStatus::Declared;
+        let will_release = args.release && was_declared;
+        if args.task.is_none()
+            && args.agent_id.is_none()
+            && canonical_artifacts.is_none()
+            && !will_release
+        {
+            return serde_json::json!({
+                "status": "unchanged",
+                "task_id": args.task_id,
+                "node_status": node.status.as_str(),
+                "message": "no edit applied: give a task, agent_id, expected_artifacts, or \
+                            release=true on a Declared node",
+            });
+        }
+        let mut edits: Vec<String> = Vec::new();
+        if args.task.is_some() {
+            edits.push("description".to_owned());
+        }
+        if let Some(agent_id) = args.agent_id.as_deref() {
+            edits.push(format!("owner→{agent_id}"));
+        }
+        if canonical_artifacts.is_some() {
+            edits.push("expected_artifacts".to_owned());
+        }
+        if will_release {
+            edits.push("release Declared→Pending".to_owned());
+        }
+        let summary = format!("update {}: {}", args.task_id, edits.join(", "));
+        let decision = match self
+            .validate_transform_decision(
+                crate::decisions::DecisionKind::UpdateObligations,
+                None,
+                &summary,
+                args.notes.as_deref(),
+                &args.supporting_evidence_ids,
+                canonical_artifacts.as_deref().unwrap_or(&[]),
+                cancel,
+                base_ctx,
+            )
+            .await
+        {
+            Ok(decision) => decision,
+            Err(error) => return error,
+        };
+        let decision_id = decision.id.clone();
+        self.decision_journal.record(decision);
+
+        if let Some(node) = graph.get_mut(&target) {
+            if let Some(text) = args.task.as_deref() {
+                node.description = text.to_owned();
+            }
+            if let Some(agent_id) = args.agent_id.as_deref() {
+                node.role = AgentId::new(agent_id);
+            }
+            if will_release {
+                node.status = SubTaskStatus::Pending;
+            }
+        }
+        if let Some(canonical) = canonical_artifacts {
+            self.expected_artifacts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(target, canonical.iter().map(camino::Utf8PathBuf::from).collect());
+        }
+        self.decision_journal
+            .transition(&decision_id, crate::decisions::DecisionStatus::Dispatched);
+        self.decision_journal.transition(&decision_id, crate::decisions::DecisionStatus::Settled);
+        self.append_transform_decision(
+            task.session_id,
+            Some(target),
+            args.notes.as_deref().unwrap_or("coordinator_choice"),
+            &summary,
+            &args.supporting_evidence_ids,
+        )
+        .await;
+        ledger.action_ledger.push(checkpoint::CheckpointAction {
+            kind: "obligation-updated".into(),
+            task_id: Some(target),
+            timestamp: time::OffsetDateTime::now_utc(),
+            evidence: None,
+        });
+        self.persist_dispatch_checkpoint(graph, task, base_ctx, scope, ledger).await;
+
+        serde_json::json!({
+            "status": "updated",
+            "task_id": args.task_id,
+            "node_status": graph.get(&target).map(|node| node.status.as_str()).unwrap_or("unknown"),
+            "applied": edits,
+        })
+    }
+
     /// ADR-35 amendment (2026-09-16 §2): handle ONE `request_user_input`
     /// tool call. The Coordinator asks the operator a question — the reason
     /// is recorded and the decision loop unwinds on it (the inner/outer
@@ -15654,6 +16763,15 @@ impl CoordinatorAgent {
             &format!("execute own tool {tool_name}"),
         );
         ledger.total_tool_calls = ledger.total_tool_calls.saturating_add(1);
+        // Issue #148 tracking: flag mutating self-execution attempts in the
+        // dispatch session, so partial-dispatch + coordinator mutating work
+        // is observable even where the post-hoc gate preserves the verdict
+        // (delegation-failure recovery). Counted at attempt time, alongside
+        // `total_tool_calls`.
+        let attempted_mutating = is_mutating_self_execution_tool(tool_name, arguments);
+        if attempted_mutating {
+            ledger.coordinator_mutating_calls = ledger.coordinator_mutating_calls.saturating_add(1);
+        }
         match executor
             .execute_with_authority(tool_name, arguments.clone(), &base_ctx.session, cancel.clone())
             .await
@@ -15663,14 +16781,30 @@ impl CoordinatorAgent {
                     .transition(&decision_id, crate::decisions::DecisionStatus::Settled);
                 // Collect the paths the coordinator's own work touched so
                 // the run's file ledger stays complete.
+                let mut produced_file: Option<camino::Utf8PathBuf> = None;
                 for key in ["destination", "path", "file_path"] {
                     if let Some(path) = output.data.get(key).and_then(serde_json::Value::as_str) {
                         let path = camino::Utf8PathBuf::from(path);
                         if !ledger.all_files.contains(&path) {
-                            ledger.all_files.push(path);
+                            ledger.all_files.push(path.clone());
                         }
+                        produced_file = Some(path);
                         break;
                     }
+                }
+                // Issue #148: an UNLISTED tool that produced a file slipped
+                // past the name-based mutating classifier — the zero-dispatch
+                // post-hoc gate still catches the empty-graph case, but the
+                // partial-dispatch case keeps its verdict by design, so record
+                // the bypass observably instead of silently. Allowed listed
+                // calls already emit `CoordinatorSelfImplementing` via
+                // `guard_self_execution`; this covers the remainder.
+                if !attempted_mutating && produced_file.is_some() {
+                    self.publish_self_implementing(
+                        base_ctx.session.session_id,
+                        tool_name,
+                        "unclassified-file-write",
+                    );
                 }
                 serde_json::to_value(&output).unwrap_or(serde_json::json!({
                     "summary": output.summary,
@@ -18841,6 +19975,7 @@ mod tests {
                 Vec::new(), // loop_notes
                 None,       // requested_user_input
                 None,       // pending_approval
+                None,       // dispatch_direct_answer
             )
             .await
             .expect("execute_graph returns");
@@ -19395,6 +20530,2249 @@ mod tests {
         }
         assert!(!is_mutating_self_execution_tool("consult_specialist", &serde_json::json!({})));
         assert!(!is_mutating_self_execution_tool("call_specialist", &serde_json::json!({})));
+    }
+
+    /// Issue #147: the mandatory-dispatch predicate arms ONLY on
+    /// ActionRequired — CoordinatorDecides and AnswerOnly stay prose-exempt
+    /// (issue #145 compatibility).
+    #[test]
+    fn mandatory_dispatch_guard_arms_only_on_action_required() {
+        let session_id = Ulid::new();
+        assert!(requires_mandatory_dispatch(&AgentTask::new_action_required(
+            session_id,
+            "build the thing"
+        )));
+        assert!(!requires_mandatory_dispatch(&AgentTask::new_coordinator_decides(
+            session_id, "hi there"
+        )));
+        assert!(!requires_mandatory_dispatch(&AgentTask::new(session_id, "hi there")));
+    }
+
+    /// Obligation correction (review): the combined dispatch-guard predicate
+    /// arms on open execution obligations, not on the mode alone. A
+    /// `CoordinatorDecides` run whose graph holds an open implement-stage
+    /// subtask requires dispatch exactly like `ActionRequired`; an empty,
+    /// plan-free graph stays prose-exempt so conversational turns never
+    /// manufacture a dispatch. Settled work disarms the dispatch guards again
+    /// (verification/closure is the C-06 gate's job, not theirs).
+    #[test]
+    fn dispatch_guard_arms_on_obligations_not_mode_alone() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")];
+        let coordinator =
+            coordinator_with_turns(bus, Arc::new(AgentRegistry::from_mocks(mocks)), Vec::new());
+        let session_id = Ulid::new();
+        let empty = TaskGraph::new();
+        assert!(
+            !coordinator.dispatch_guard_arms(
+                &AgentTask::new_coordinator_decides(session_id, "hi there"),
+                &empty,
+                &[]
+            ),
+            "a conversational turn (empty graph, no plan) stays prose-exempt"
+        );
+        let mut graph = TaskGraph::new();
+        graph.add_root(SubTask::new(session_id, AgentId::new("coder"), "fix the bug"));
+        assert!(
+            coordinator.dispatch_guard_arms(
+                &AgentTask::new_coordinator_decides(session_id, "fix the bug and explain"),
+                &graph,
+                &[]
+            ),
+            "open implement-stage work arms the guard without ActionRequired mode"
+        );
+        let mut settled = TaskGraph::new();
+        let mut done = SubTask::new(session_id, AgentId::new("coder"), "fix the bug");
+        done.status = SubTaskStatus::Completed;
+        settled.add_root(done);
+        assert!(
+            !coordinator.dispatch_guard_arms(
+                &AgentTask::new_coordinator_decides(session_id, "fix the bug and explain"),
+                &settled,
+                &[]
+            ),
+            "settled implement work disarms the dispatch guards"
+        );
+        assert!(
+            coordinator.dispatch_guard_arms(
+                &AgentTask::new_action_required(session_id, "build the thing"),
+                &empty,
+                &[]
+            ),
+            "the legacy mode predicate still arms on an empty graph"
+        );
+    }
+
+    /// Obligation correction (review), runtime half: a `CoordinatorDecides`
+    /// run that dispatches implement-stage work but executes zero tool calls
+    /// reports Partial — prose never backfills unexecuted implementation, in
+    /// any mode. The checkpoint is preserved for resume.
+    #[tokio::test]
+    async fn coordinator_decides_implement_dispatch_without_tool_work_reports_partial() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")];
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist("coder", "fix the bug")]),
+                CoordinatorTurn::Text("fixed it".into()),
+            ],
+        );
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_coordinator_decides(session_id, "fix the bug and explain"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "implement dispatched but zero tool calls executed: prose cannot complete it, got: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Zero-work guard"),
+            "the downgrade names its cause, got: {}",
+            output.final_message
+        );
+        assert!(
+            output.checkpoint_json.is_some(),
+            "a Partial run preserves its checkpoint for resume"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Declared obligations: structured work before dispatch (tests A–I)
+    // ------------------------------------------------------------------
+    //
+    // The missing transition the guards needed: `declare_obligations` lets
+    // the Coordinator's structured decision create obligation-bearing work
+    // BEFORE any dispatch. Each declared item becomes a `Declared`
+    // (Outstanding, not-yet-dispatched) graph node — the graph stays the
+    // source of truth, the `ObligationLedger` a derived view — persisted
+    // through the existing checkpoint rows. Communication stays
+    // unrestricted; obligations constrain completion only: declared
+    // Implement/Verify work blocks the guards until dispatched with
+    // evidence, while prose answers Explain freely.
+    //
+    // Lifecycle under test: none → declared → pending → dispatched →
+    // completed/failed → verify pending → verified → completed.
+
+    /// A `declare_obligations` tool call for a test turn.
+    fn declare_obligations_call(id: &str, obligations: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: id.to_owned(),
+            name: DECLARE_OBLIGATIONS_TOOL.to_string(),
+            arguments: serde_json::json!({ "obligations": obligations }),
+            ..Default::default()
+        }
+    }
+
+    /// A `call_specialist` tool call adopting a declared obligation.
+    fn call_specialist_for(agent_id: &str, task: &str, task_id: &str) -> ToolCall {
+        let mut call = call_specialist(agent_id, task);
+        call.id = format!("adopt-{agent_id}");
+        call.arguments["task_id"] = serde_json::json!(task_id);
+        call
+    }
+
+    /// Minimal harness for calling the declare/update/adopt handlers
+    /// directly: an allow-all coordinator over `mocks` plus a fresh graph,
+    /// ledger, scope, task, and context. The workspace dir is returned so
+    /// the caller keeps it alive for file-writing dispatches.
+    fn obligation_harness(
+        mocks: Vec<MockExpertAgent>,
+    ) -> (
+        CoordinatorAgent,
+        AgentTask,
+        AgentContext,
+        TaskGraph,
+        DispatchLedger,
+        checkpoint::CheckpointScope,
+        tempfile::TempDir,
+    ) {
+        let bus = EventBus::new(256);
+        let coordinator = coordinator_with_turns(
+            bus,
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text(String::new())],
+        );
+        let session_id = Ulid::new();
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let task = AgentTask::new_coordinator_decides(session_id, "fix the bug and explain");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let graph = TaskGraph::new();
+        let ledger = DispatchLedger::default();
+        let scope = coordinator.fresh_checkpoint_scope(&task, &context);
+        (coordinator, task, context, graph, ledger, scope, workspace)
+    }
+
+    /// Test-only shorthand for `handle_declare_obligations` with a fresh
+    /// cancellation token: the declaration-validation tests exercise the
+    /// structured rejections without a dispatch session.
+    #[allow(clippy::too_many_arguments)]
+    async fn declare_for_test(
+        coordinator: &mut CoordinatorAgent,
+        task: &AgentTask,
+        context: &AgentContext,
+        graph: &mut TaskGraph,
+        ledger: &mut DispatchLedger,
+        scope: &mut checkpoint::CheckpointScope,
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        coordinator
+            .handle_declare_obligations(
+                graph,
+                task,
+                context,
+                &CancellationToken::new(),
+                scope,
+                ledger,
+                arguments,
+            )
+            .await
+    }
+
+    /// Scripted provider for the declare→adopt lifecycle tests (C, E): the
+    /// first turn declares the configured obligations; once the declare
+    /// result (carrying the server-minted task ids) lands in the
+    /// conversation, each subsequent turn adopts the next obligation by its
+    /// `task_id`; afterwards it closes in prose. Mirrors the
+    /// `EvidenceChainProvider` shape: decisions read the REAL tool results,
+    /// never fabricated ids.
+    struct DeclareAdoptProvider {
+        requests: std::sync::Mutex<Vec<concerto_core::types::CompletionRequest>>,
+        items: Vec<serde_json::Value>,
+        closing_text: String,
+        declare_served: std::sync::atomic::AtomicBool,
+        adopts_queued: std::sync::atomic::AtomicBool,
+        adopt_queue: std::sync::Mutex<std::collections::VecDeque<(String, String, String)>>,
+    }
+
+    impl DeclareAdoptProvider {
+        fn new(items: Vec<serde_json::Value>, closing_text: &str) -> Self {
+            Self {
+                requests: std::sync::Mutex::new(Vec::new()),
+                items,
+                closing_text: closing_text.to_owned(),
+                declare_served: std::sync::atomic::AtomicBool::new(false),
+                adopts_queued: std::sync::atomic::AtomicBool::new(false),
+                adopt_queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            }
+        }
+
+        /// The declared (agent, work text, task id) triples observed in the
+        /// declare tool result so far.
+        fn observed_declared(&self) -> Vec<(String, String, String)> {
+            let requests = self.requests.lock().unwrap();
+            let mut out = Vec::new();
+            for request in requests.iter() {
+                for message in request.messages.iter() {
+                    let Some(results) = message.tool_results.as_ref() else {
+                        continue;
+                    };
+                    for result in results {
+                        if result.name != DECLARE_OBLIGATIONS_TOOL {
+                            continue;
+                        }
+                        let items = result
+                            .content
+                            .get("obligations")
+                            .and_then(serde_json::Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        for item in items {
+                            if let (Some(agent), Some(work), Some(id)) = (
+                                item.get("agent_id").and_then(serde_json::Value::as_str),
+                                item.get("task").and_then(serde_json::Value::as_str),
+                                item.get("task_id").and_then(serde_json::Value::as_str),
+                            ) {
+                                out.push((agent.to_owned(), work.to_owned(), id.to_owned()));
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        }
+
+        /// Every tool-result JSON payload observed (what the loop read back).
+        fn tool_result_contents(&self) -> Vec<serde_json::Value> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|request| {
+                    request
+                        .messages
+                        .iter()
+                        .filter_map(|message| message.tool_results.as_ref())
+                        .flat_map(|results| results.iter().map(|result| result.content.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl concerto_core::traits::provider::LlmProvider for DeclareAdoptProvider {
+        async fn stream_completion(
+            &self,
+            request: concerto_core::types::CompletionRequest,
+            _cancel: CancellationToken,
+        ) -> Result<concerto_core::traits::provider::CompletionStream, ProviderError> {
+            use std::sync::atomic::Ordering;
+            self.requests.lock().unwrap().push(request);
+            if !self.adopts_queued.load(Ordering::SeqCst) {
+                let found = self.observed_declared();
+                if !found.is_empty() {
+                    *self.adopt_queue.lock().unwrap() = found.into();
+                    self.adopts_queued.store(true, Ordering::SeqCst);
+                }
+            }
+            let chunk = if !self.declare_served.load(Ordering::SeqCst) {
+                self.declare_served.store(true, Ordering::SeqCst);
+                concerto_core::types::CompletionChunk {
+                    reasoning: None,
+                    delta: String::new(),
+                    tool_call: Some(declare_obligations_call(
+                        "declare-1",
+                        serde_json::Value::Array(self.items.clone()),
+                    )),
+                    is_final: true,
+                    usage: None,
+                }
+            } else if let Some((agent, work, id)) = self.adopt_queue.lock().unwrap().pop_front() {
+                concerto_core::types::CompletionChunk {
+                    reasoning: None,
+                    delta: String::new(),
+                    tool_call: Some(call_specialist_for(&agent, &work, &id)),
+                    is_final: true,
+                    usage: None,
+                }
+            } else {
+                concerto_core::types::CompletionChunk {
+                    reasoning: None,
+                    delta: self.closing_text.clone(),
+                    tool_call: None,
+                    is_final: true,
+                    usage: None,
+                }
+            };
+            Ok(Box::pin(futures::stream::iter(vec![Ok(chunk)])))
+        }
+        fn context_capacity(&self, _model: &str) -> concerto_core::types::TokenBudget {
+            concerto_core::types::TokenBudget::new(128_000, 4_096)
+        }
+        fn approximate_cost(&self, _tokens_in: u64, _tokens_out: u64) -> f64 {
+            0.0
+        }
+        fn provider_name(&self) -> &'static str {
+            "declare-adopt"
+        }
+    }
+
+    /// Classify a graph the way the coordinator's dispatch guards do:
+    /// implement-stage roles → `Implement`, validate-stage roles → `Verify`
+    /// (stage *kinds* via the coordinator, never role names).
+    fn test_ledger_for(
+        coordinator: &CoordinatorAgent,
+        graph: &TaskGraph,
+    ) -> crate::obligations::ObligationLedger {
+        let mut ledger = crate::obligations::ObligationLedger::new();
+        ledger.sync_from_graph(graph, |role| {
+            if coordinator.role_in_kind_stage(role, StageKind::Execution, AgentStage::is_implement)
+            {
+                Some(crate::obligations::ObligationKind::Implement)
+            } else if coordinator.role_in_kind_stage(
+                role,
+                StageKind::Acceptance,
+                AgentStage::is_validate,
+            ) {
+                Some(crate::obligations::ObligationKind::Verify)
+            } else {
+                None
+            }
+        });
+        ledger
+    }
+
+    /// A. Creation: "fix the bug and explain" declares Implement work that
+    /// EXISTS (Outstanding) before anything executes — no dispatch, no
+    /// running node, no evidence — while the explanation half stays
+    /// prose-satisfiable (and prose alone discharges nothing else).
+    #[tokio::test]
+    async fn test_a_declare_creates_implement_before_execution() {
+        let (mut coordinator, task, context, mut graph, mut ledger, mut scope, _workspace) =
+            obligation_harness(vec![MockExpertAgent::always_succeed(
+                AgentId::new("coder"),
+                "implemented",
+            )]);
+        let declared = coordinator
+            .handle_declare_obligations(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({
+                    "obligations": [{ "agent_id": "coder", "task": "fix the bug" }],
+                    "notes": "the turn needs implementation work",
+                }),
+            )
+            .await;
+        assert_eq!(declared["status"], "declared", "structured, yes: {declared:?}");
+        let raw_id = declared["obligations"][0]["task_id"]
+            .as_str()
+            .expect("the declare result names the obligation id")
+            .to_owned();
+        let id = Ulid::from_string(&raw_id).map(TaskId).expect("a task id");
+        // Pre-execution: one Outstanding node, zero dispatches, nothing
+        // running, no evidence claimed.
+        let node = graph.get(&id).expect("the declared node exists");
+        assert_eq!(node.status, SubTaskStatus::Declared);
+        assert_eq!(node.role, AgentId::new("coder"));
+        assert!(ledger.action_ledger.iter().all(|action| action.kind != "dispatched"));
+        assert!(ledger.completed_results.is_empty());
+        assert!(
+            ledger
+                .action_ledger
+                .iter()
+                .any(|action| action.kind == "declared" && action.task_id == Some(id)),
+            "the declaration is a durable action row: {:?}",
+            ledger.action_ledger
+        );
+        // The derived ledger view sees open Implement work ...
+        let derived = test_ledger_for(&coordinator, &graph);
+        assert!(derived.has_open_implementation());
+        assert!(derived.has_open_execution_work());
+        // ... while Explain stays prose-satisfiable: prose answers the
+        // explanation, and only the explanation.
+        assert!(crate::obligations::ObligationKind::Explain.is_prose_satisfiable());
+        assert!(!crate::obligations::ObligationKind::Implement.is_prose_satisfiable());
+        assert!(!crate::obligations::ObligationKind::Verify.is_prose_satisfiable());
+    }
+
+    /// B. Declared-but-undispatched Implement work plus pure prose is NOT
+    /// completion: the unfinished-work guard, the combined dispatch guard,
+    /// and the completion-evidence predicate all treat the Outstanding
+    /// obligation as blocking — in any mode, with or without files, and
+    /// without any verification declaration.
+    #[tokio::test]
+    async fn test_b_declared_undispatched_prose_does_not_complete() {
+        let (mut coordinator, task, context, mut graph, mut ledger, mut scope, _workspace) =
+            obligation_harness(vec![MockExpertAgent::always_succeed(
+                AgentId::new("coder"),
+                "implemented",
+            )]);
+        coordinator
+            .handle_declare_obligations(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({
+                    "obligations": [{ "agent_id": "coder", "task": "fix the bug" }],
+                }),
+            )
+            .await;
+        // The graph holds unfinished work ...
+        assert!(graph_has_unfinished_work(&graph));
+        // ... the combined guard arms with NO ActionRequired mode (the task
+        // is CoordinatorDecides) and would arm there too ...
+        assert!(coordinator.dispatch_guard_arms(&task, &graph, &[]));
+        assert!(coordinator.obligation_dispatch_pending(&graph));
+        let session_id = task.session_id;
+        assert!(coordinator.dispatch_guard_arms(
+            &AgentTask::new_action_required(session_id, "fix the bug and explain"),
+            &graph,
+            &[]
+        ));
+        // ... prose may not close over open execution work — bare, with
+        // files, or otherwise: files without settled obligations still
+        // cannot complete ...
+        for evidence in [
+            crate::obligations::CompletionEvidence::default(),
+            crate::obligations::CompletionEvidence { has_files: true, ..Default::default() },
+        ] {
+            assert!(!evidence.prose_may_close(true));
+            assert!(!evidence.implement_may_complete(true));
+        }
+        // ... and an evidenceless Complete transition on Implement is
+        // rejected: prose never marks execution complete.
+        assert!(crate::obligations::try_transition(
+            crate::obligations::ObligationState::Outstanding,
+            &crate::obligations::ObligationEvent::Complete { evidence: Vec::new() },
+            crate::obligations::ObligationKind::Implement,
+            "impl-1",
+        )
+        .is_err());
+    }
+
+    /// C. Mixed communication + execution + communication: the coordinator
+    /// declares, dispatches with evidence (a real file lands), and explains
+    /// — execution proceeds while the prose half discharges nothing: with
+    /// verification still open the run reports Partial, never Completed.
+    #[tokio::test]
+    async fn test_c_mixed_turn_executes_but_prose_discharges_nothing() {
+        let bus = EventBus::new(256);
+        let provider = Arc::new(DeclareAdoptProvider::new(
+            vec![serde_json::json!({
+                "agent_id": "coder",
+                "task": "fix the bug",
+                "expected_artifacts": ["src/fix.rs"],
+            })],
+            "fixed the bug; verification still open",
+        ));
+        let mut coordinator = coordinator_with_provider_and_policy(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+                AgentId::new("coder"),
+                "implemented",
+            )
+            .with_artifact_writer()])),
+            provider.clone(),
+            coordinator_allow_all_policy(),
+        );
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_coordinator_decides(session_id, "fix the bug and explain"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        // Execution happened: the adopt dispatch settled success with a real
+        // file, alongside the prose turns (Mixed, never DirectAnswer work).
+        let adopt_result = provider
+            .tool_result_contents()
+            .into_iter()
+            .find(|result| result.get("outcome").is_some() && result.get("agent_id").is_some())
+            .expect("the adopt dispatch result was observed");
+        assert_eq!(adopt_result["outcome"], "success");
+        assert!(
+            project_dir.path().join("src/fix.rs").exists(),
+            "the dispatched work produced its declared evidence on disk"
+        );
+        assert_eq!(
+            crate::obligations::derive_turn_disposition(false, 2, true),
+            crate::obligations::TurnDisposition::Mixed,
+            "prose alongside execution is lawful concurrency, not a direct answer"
+        );
+        // ... yet the prose half discharged nothing: verification never ran,
+        // so the completion claim is Partial.
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "execution without verification must not complete, got: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("C-06"),
+            "the downgrade names the missing verification, got: {}",
+            output.final_message
+        );
+        assert!(output.checkpoint_json.is_some(), "the Partial run stays resumable");
+    }
+
+    /// D. Follow-up direct answer keeps the obligation intact and dispatches
+    /// nothing extra: resuming the Partial checkpoint with a purely
+    /// conversational turn still reports Partial, runs zero dispatches, and
+    /// the preserved checkpoint still holds the Declared obligation.
+    #[tokio::test]
+    async fn test_d_follow_up_answer_keeps_obligation_without_dispatch() {
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context_for = |session: Ulid| {
+            AgentContext::new(concerto_core::types::SessionContext::new(
+                session,
+                project_dir.path().to_path_buf(),
+            ))
+        };
+        let bus = EventBus::new(256);
+        let mut coordinator = coordinator_with_turns(
+            bus,
+            Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+                AgentId::new("coder"),
+                "implemented",
+            )])),
+            vec![
+                CoordinatorTurn::Calls(vec![declare_obligations_call(
+                    "declare-1",
+                    serde_json::json!([{ "agent_id": "coder", "task": "fix the bug" }]),
+                )]),
+                CoordinatorTurn::Text("I'll investigate and fix".into()),
+            ],
+        );
+        let output = coordinator
+            .run(
+                AgentTask::new_coordinator_decides(session_id, "fix the bug and explain"),
+                context_for(session_id),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        assert_eq!(output.completion_status, concerto_core::types::AgentCompletionStatus::Partial);
+        let checkpoint_json = output.checkpoint_json.expect("the Partial run stays resumable");
+        // The follow-up is a direct answer: no new declaration, no dispatch.
+        let bus2 = EventBus::new(256);
+        let mut coordinator2 = coordinator_with_turns(
+            bus2,
+            Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+                AgentId::new("coder"),
+                "implemented",
+            )])),
+            vec![CoordinatorTurn::Text("noted, thanks".into())],
+        );
+        let second = coordinator2
+            .run(
+                AgentTask::new_coordinator_decides(session_id, "continue"),
+                context_for(session_id),
+                CancellationToken::new(),
+                Some(checkpoint_json),
+            )
+            .await
+            .expect("resume should succeed");
+        assert_eq!(
+            second.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "the obligation is intact, so the follow-up cannot complete either: {}",
+            second.final_message
+        );
+        assert_eq!(
+            second.tool_call_count, 0,
+            "the follow-up dispatched nothing extra: {}",
+            second.final_message
+        );
+        let preserved = second.checkpoint_json.expect("the follow-up stays resumable");
+        // The obligation itself is intact across the resume.
+        let restored_checkpoint =
+            crate::checkpoint::GraphCheckpoint::from_json(&preserved).expect("checkpoint loads");
+        let restored =
+            crate::checkpoint::restore_graph(&restored_checkpoint).expect("graph restores");
+        assert!(
+            restored.all_tasks().iter().any(|subtask| subtask.status == SubTaskStatus::Declared
+                && subtask.role == AgentId::new("coder")),
+            "the Declared obligation survives the follow-up untouched"
+        );
+    }
+
+    /// E. Implement → Verify → Explain with evidence completes: the declared
+    /// chain dispatches in order (each adoption carrying its declared
+    /// artifacts), verification settles with a real file behind it, and the
+    /// closing prose explains settled work — Completed with no checkpoint
+    /// left behind.
+    #[tokio::test]
+    async fn test_e_implement_verify_explain_with_evidence_completes() {
+        let bus = EventBus::new(256);
+        let provider = Arc::new(DeclareAdoptProvider::new(
+            vec![
+                serde_json::json!({
+                    "agent_id": "coder",
+                    "task": "fix the bug",
+                    "expected_artifacts": ["src/fix.rs"],
+                }),
+                serde_json::json!({ "agent_id": "validator", "task": "verify the fix" }),
+            ],
+            "fixed the bug and verified it",
+        ));
+        let mut coordinator = coordinator_with_provider_and_policy(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![
+                MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+                    .with_artifact_writer(),
+                MockExpertAgent::always_succeed(AgentId::new("validator"), "validation ok"),
+            ])),
+            provider.clone(),
+            coordinator_allow_all_policy(),
+        );
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_coordinator_decides(session_id, "fix the bug and explain"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "evidenced implement + verification completes, got: {}",
+            output.final_message
+        );
+        assert!(output.checkpoint_json.is_none(), "a clean success clears its checkpoint");
+        assert!(
+            project_dir.path().join("src/fix.rs").exists(),
+            "the declared deliverable is on disk"
+        );
+        let outcomes: Vec<String> = provider
+            .tool_result_contents()
+            .into_iter()
+            .filter_map(|result| {
+                result.get("outcome").and_then(serde_json::Value::as_str).map(str::to_owned)
+            })
+            .collect();
+        assert!(
+            outcomes.iter().filter(|outcome| *outcome == "success").count() >= 2,
+            "both chain links dispatched with success, got: {outcomes:?}"
+        );
+    }
+
+    /// F. A bare "fixed" in prose with no evidence is not completion: the
+    /// declared deliverable is unproduced on disk, so the run reports
+    /// Partial naming the missing deliverable — the claim is actionable,
+    /// never silent.
+    #[tokio::test]
+    async fn test_f_fixed_prose_without_evidence_does_not_complete() {
+        let bus = EventBus::new(256);
+        let mut coordinator = coordinator_with_turns(
+            bus,
+            Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+                AgentId::new("coder"),
+                "implemented",
+            )])),
+            vec![
+                CoordinatorTurn::Calls(vec![declare_obligations_call(
+                    "declare-1",
+                    serde_json::json!([{
+                        "agent_id": "coder",
+                        "task": "fix the bug",
+                        "expected_artifacts": ["src/fix.rs"],
+                    }]),
+                )]),
+                CoordinatorTurn::Text("fixed".into()),
+            ],
+        );
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_coordinator_decides(session_id, "fix the bug and explain"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "prose with no evidence must not complete, got: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Unproduced declared deliverable"),
+            "the downgrade names the missing deliverable, got: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("src/fix.rs"),
+            "the downgrade names the path, got: {}",
+            output.final_message
+        );
+        assert!(output.checkpoint_json.is_some(), "the Partial run stays resumable");
+    }
+
+    /// G. Pure conversation stays clean: "hi there" with no declared work,
+    /// no plan, and no dispatch completes as a direct answer — communication
+    /// is unrestricted, and no dispatch is manufactured for it.
+    #[tokio::test]
+    async fn test_g_pure_conversation_completes_clean() {
+        let bus = EventBus::new(256);
+        let mut coordinator = coordinator_with_turns(
+            bus,
+            Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+                AgentId::new("coder"),
+                "implemented",
+            )])),
+            vec![CoordinatorTurn::Text("Hi there".into())],
+        );
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_coordinator_decides(session_id, "hi there"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "a conversational turn with no obligations completes, got: {}",
+            output.final_message
+        );
+        assert_eq!(output.final_message, "Hi there", "the prose IS the reply");
+    }
+
+    /// Decision boundary without ANY tool call: pure prose with zero
+    /// declared obligations completes — the guards constrain obligations,
+    /// never communication. Contrast test B, where the SAME prose shape with
+    /// a prior structured declaration reports Partial. Together they pin the
+    /// boundary: no keywords, no manufactured dispatch, no silent escape.
+    #[tokio::test]
+    async fn test_decision_boundary_pure_prose_without_calls_completes() {
+        let bus = EventBus::new(256);
+        let mut coordinator = coordinator_with_turns(
+            bus,
+            Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+                AgentId::new("coder"),
+                "implemented",
+            )])),
+            vec![CoordinatorTurn::Text("I'll investigate and fix".into())],
+        );
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_coordinator_decides(session_id, "fix the bug and explain"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "prose with zero declared obligations is communication, not an escape: {}",
+            output.final_message
+        );
+        assert!(
+            output.checkpoint_json.is_none(),
+            "a clean conversational close leaves no checkpoint"
+        );
+    }
+
+    /// B (run half): declared-but-undispatched work plus the escape-path
+    /// prose ("I'll investigate and fix") reports Partial with a preserved
+    /// checkpoint — the structured declaration is what arms the guards.
+    #[tokio::test]
+    async fn test_b_declared_prose_run_reports_partial() {
+        let bus = EventBus::new(256);
+        let mut coordinator = coordinator_with_turns(
+            bus,
+            Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+                AgentId::new("coder"),
+                "implemented",
+            )])),
+            vec![
+                CoordinatorTurn::Calls(vec![declare_obligations_call(
+                    "declare-1",
+                    serde_json::json!([{ "agent_id": "coder", "task": "fix the bug" }]),
+                )]),
+                CoordinatorTurn::Text("I'll investigate and fix".into()),
+            ],
+        );
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_coordinator_decides(session_id, "fix the bug and explain"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "declared-undispatched work cannot close in prose, got: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Unfinished-work guard"),
+            "the downgrade names the open obligation, got: {}",
+            output.final_message
+        );
+        assert!(output.checkpoint_json.is_some(), "the Partial run stays resumable");
+    }
+
+    /// I. Declared obligations survive cancel/interrupt/resume/failure/retry:
+    /// an interrupt re-pends in-flight work without touching Declared nodes,
+    /// the checkpoint round-trip preserves them, and failed/blocked
+    /// obligations retry explicitly back to Outstanding — never silently
+    /// dropped, never silently re-armed.
+    #[tokio::test]
+    async fn test_i_declared_work_survives_lifecycle() {
+        let (mut coordinator, task, context, mut graph, mut ledger, mut scope, _workspace) =
+            obligation_harness(vec![MockExpertAgent::always_succeed(
+                AgentId::new("coder"),
+                "implemented",
+            )]);
+        let declared = coordinator
+            .handle_declare_obligations(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({
+                    "obligations": [{ "agent_id": "coder", "task": "fix the bug" }],
+                }),
+            )
+            .await;
+        let raw_id = declared["obligations"][0]["task_id"]
+            .as_str()
+            .expect("the declare result names the obligation id")
+            .to_owned();
+        let id = Ulid::from_string(&raw_id).map(TaskId).expect("a task id");
+        // Interrupt: in-flight Running work re-pends; Declared work is
+        // untouched by the zombie-kill.
+        let running_id = TaskId::new();
+        graph.add_root(SubTask {
+            id: running_id,
+            parent_id: None,
+            session_id: task.session_id,
+            role: AgentId::new("coder"),
+            description: "in-flight work".into(),
+            status: SubTaskStatus::Running,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+        graph.mark_all_with_status(SubTaskStatus::Running, SubTaskStatus::Pending);
+        assert_eq!(graph.get(&running_id).map(|node| node.status), Some(SubTaskStatus::Pending));
+        assert_eq!(
+            graph.get(&id).map(|node| node.status),
+            Some(SubTaskStatus::Declared),
+            "interrupt re-pends in-flight work; declared obligations stand"
+        );
+        graph.remove_task(&running_id);
+        // Failure/retry through the derived ledger: Failed and Blocked stay
+        // open (blocking completion) until an explicit Retry re-arms them.
+        let mut derived = test_ledger_for(&coordinator, &graph);
+        assert_eq!(
+            derived.apply(
+                &raw_id,
+                crate::obligations::ObligationEvent::Fail { reason: "cancelled".into() }
+            ),
+            Ok(crate::obligations::ObligationState::Failed)
+        );
+        assert!(derived.has_open_implementation(), "failed work is unresolved, never droppable");
+        assert_eq!(
+            derived.apply(&raw_id, crate::obligations::ObligationEvent::Retry),
+            Ok(crate::obligations::ObligationState::Outstanding)
+        );
+        // Resume: the checkpoint round-trip preserves the Declared node and
+        // its open Implement obligation via the existing graph rows.
+        let scope = checkpoint::CheckpointScope {
+            run_id: Ulid::new(),
+            session_id: task.session_id,
+            root_task_id: TaskId::new(),
+            project_id: "test".into(),
+            objective: "fix the bug and explain".into(),
+            objective_hash: "hash".into(),
+            source_revision: None,
+            sequence_num: 0,
+        };
+        let working_memory = concerto_core::memory::WorkingMemorySnapshot {
+            id: Ulid::new(),
+            session_id: task.session_id,
+            decisions: Vec::new(),
+            task_tree: Vec::new(),
+            created_at: time::OffsetDateTime::now_utc(),
+        };
+        let checkpoint = checkpoint::build_checkpoint(
+            &scope,
+            checkpoint::CheckpointStage::Executing,
+            None,
+            &working_memory,
+            &graph,
+            &std::collections::HashMap::new(),
+            0.0,
+            0,
+            &[],
+            &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &checkpoint::CheckpointContext::default(),
+        );
+        let json = serde_json::to_string(&checkpoint).expect("checkpoint serializes");
+        let restored_checkpoint =
+            crate::checkpoint::GraphCheckpoint::from_json(&json).expect("checkpoint loads");
+        let restored =
+            crate::checkpoint::restore_graph(&restored_checkpoint).expect("graph restores");
+        assert_eq!(
+            restored.get(&id).map(|node| node.status),
+            Some(SubTaskStatus::Declared),
+            "resume preserves the declared obligation through the existing rows"
+        );
+        assert!(test_ledger_for(&coordinator, &restored).has_open_implementation());
+    }
+
+    /// Declaration validation: unknown agents, empty sets, oversized sets,
+    /// non-earlier order edges, and escaping artifact paths are structured
+    /// rejections that mutate nothing — never a crash, never a half-declared
+    /// chain.
+    #[tokio::test]
+    async fn declare_obligations_rejects_invalid_declarations() {
+        let (mut coordinator, task, context, mut graph, mut ledger, mut scope, _workspace) =
+            obligation_harness(vec![MockExpertAgent::always_succeed(
+                AgentId::new("coder"),
+                "implemented",
+            )]);
+        // Unknown agent.
+        let rejected = declare_for_test(
+            &mut coordinator,
+            &task,
+            &context,
+            &mut graph,
+            &mut ledger,
+            &mut scope,
+            &serde_json::json!({ "obligations": [{ "agent_id": "ghost", "task": "haunt" }] }),
+        )
+        .await;
+        assert_eq!(rejected["error"], "unknown_agent", "{rejected:?}");
+        // Empty set and oversized set.
+        for obligations in [
+            serde_json::json!([]),
+            serde_json::Value::Array(
+                (0..9)
+                    .map(|index| serde_json::json!({ "agent_id": "coder", "task": format!("work {index}") }))
+                    .collect(),
+            ),
+        ] {
+            let args = serde_json::json!({ "obligations": obligations });
+            let rejected = declare_for_test(
+                &mut coordinator,
+                &task,
+                &context,
+                &mut graph,
+                &mut ledger,
+                &mut scope,
+                &args,
+            )
+            .await;
+            assert_eq!(rejected["error"], "invalid_arguments", "{rejected:?}");
+        }
+        // Non-earlier order edge (self-dependency).
+        let rejected = declare_for_test(
+            &mut coordinator,
+            &task,
+            &context,
+            &mut graph,
+            &mut ledger,
+            &mut scope,
+            &serde_json::json!({ "obligations": [
+                { "agent_id": "coder", "task": "first", "after": [0] },
+            ] }),
+        )
+        .await;
+        assert_eq!(rejected["error"], "invalid_arguments", "{rejected:?}");
+        // Escaping artifact path.
+        let rejected = declare_for_test(
+            &mut coordinator,
+            &task,
+            &context,
+            &mut graph,
+            &mut ledger,
+            &mut scope,
+            &serde_json::json!({ "obligations": [
+                { "agent_id": "coder", "task": "fix", "expected_artifacts": ["../evil.rs"] },
+            ] }),
+        )
+        .await;
+        assert_eq!(rejected["error"], "invalid_artifact_path", "{rejected:?}");
+        assert!(graph.is_empty(), "rejections mutate nothing: {rejected:?}");
+        assert!(ledger.action_ledger.is_empty(), "rejections record nothing");
+    }
+
+    /// Update validation and release: edits land on undispatched nodes only,
+    /// a `release` promotes Declared → Pending for graph-loop dispatch, and
+    /// settled/dispatched/unknown nodes are structured rejections.
+    #[tokio::test]
+    async fn update_obligations_revises_and_releases_undispatched_work() {
+        let (mut coordinator, task, context, mut graph, mut ledger, mut scope, _workspace) =
+            obligation_harness(vec![
+                MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+                MockExpertAgent::always_succeed(AgentId::new("validator"), "validation ok"),
+            ]);
+        let declared = coordinator
+            .handle_declare_obligations(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({ "obligations": [{ "agent_id": "coder", "task": "fix the bug" }] }),
+            )
+            .await;
+        let raw_id = declared["obligations"][0]["task_id"].as_str().expect("id").to_owned();
+        // Retarget + re-describe + release in one revision.
+        let updated = coordinator
+            .handle_update_obligations(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({
+                    "task_id": raw_id,
+                    "task": "fix the bug thoroughly",
+                    "agent_id": "validator",
+                    "expected_artifacts": ["src/fix.rs"],
+                    "release": true,
+                }),
+            )
+            .await;
+        assert_eq!(updated["status"], "updated", "structured, yes: {updated:?}");
+        let id = Ulid::from_string(&raw_id).map(TaskId).expect("a task id");
+        let node = graph.get(&id).expect("the node exists");
+        assert_eq!(node.description, "fix the bug thoroughly");
+        assert_eq!(node.role, AgentId::new("validator"));
+        assert_eq!(node.status, SubTaskStatus::Pending, "release promotes to Pending");
+        // A no-op revision answers unchanged without journaling noise.
+        let unchanged = coordinator
+            .handle_update_obligations(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({ "task_id": raw_id }),
+            )
+            .await;
+        assert_eq!(unchanged["status"], "unchanged", "{unchanged:?}");
+        // Unknown, malformed, and mis-owned targets reject; settled work is
+        // never re-cut.
+        let unknown = coordinator
+            .handle_update_obligations(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({ "task_id": TaskId::new().to_string(), "task": "late edit" }),
+            )
+            .await;
+        assert_eq!(unknown["error"], "unknown_obligation", "{unknown:?}");
+        let misowned = coordinator
+            .handle_update_obligations(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({ "task_id": raw_id, "agent_id": "ghost" }),
+            )
+            .await;
+        assert_eq!(misowned["error"], "unknown_agent", "{misowned:?}");
+        graph.mark_done(&id);
+        let settled = coordinator
+            .handle_update_obligations(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({ "task_id": raw_id, "task": "rewrite history" }),
+            )
+            .await;
+        assert_eq!(settled["error"], "invalid_transition", "{settled:?}");
+    }
+
+    /// Adoption: `call_specialist` with a `task_id` dispatches the declared
+    /// node itself — no duplicate node, same settle/record/chain mechanics —
+    /// and names remaining declared work in its result. Unknown, settled, or
+    /// mis-owned ids are structured rejections.
+    #[tokio::test]
+    async fn call_specialist_adopts_declared_obligations() {
+        let (mut coordinator, task, context, mut graph, mut ledger, mut scope, _workspace) =
+            obligation_harness(vec![
+                MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+                MockExpertAgent::always_succeed(AgentId::new("validator"), "validation ok"),
+            ]);
+        let declared = coordinator
+            .handle_declare_obligations(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({ "obligations": [
+                    { "agent_id": "coder", "task": "fix the bug" },
+                    { "agent_id": "coder", "task": "double-check the fix" },
+                ] }),
+            )
+            .await;
+        let first = declared["obligations"][0]["task_id"].as_str().expect("id").to_owned();
+        let second = declared["obligations"][1]["task_id"].as_str().expect("id").to_owned();
+        let first_id = Ulid::from_string(&first).map(TaskId).expect("a task id");
+        let mut state = DispatchSessionState::default();
+        let adopted = coordinator
+            .handle_call_specialist(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                None,
+                &serde_json::json!({ "agent_id": "coder", "task": "fix the bug", "task_id": first }),
+            )
+            .await;
+        assert_eq!(adopted["outcome"], "success", "structured, yes: {adopted:?}");
+        assert_eq!(graph.len(), 2, "adoption dispatches the declared node itself — no duplicate");
+        assert_eq!(graph.get(&first_id).map(|node| node.status), Some(SubTaskStatus::Completed));
+        assert_eq!(
+            state.last_node,
+            Some(first_id),
+            "the chain frontier advances over the adopted node"
+        );
+        assert!(
+            ledger.completed_results.contains_key(&first_id),
+            "the adopted dispatch settles like any dispatch"
+        );
+        assert_eq!(
+            adopted["declared_pending"]["count"], 1,
+            "remaining declared work is named in the result: {adopted:?}"
+        );
+        // Re-adopting the settled node, adopting under the wrong owner, and
+        // adopting an unknown id all reject without mutation.
+        let settled = coordinator
+            .handle_call_specialist(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                None,
+                &serde_json::json!({ "agent_id": "coder", "task": "fix again", "task_id": first }),
+            )
+            .await;
+        assert_eq!(settled["error"], "already_dispatched", "{settled:?}");
+        let misowned = coordinator
+            .handle_call_specialist(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                None,
+                &serde_json::json!({ "agent_id": "validator", "task": "verify", "task_id": second }),
+            )
+            .await;
+        assert_eq!(misowned["error"], "obligation_role_mismatch", "{misowned:?}");
+        let unknown = coordinator
+            .handle_call_specialist(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                None,
+                &serde_json::json!({
+                    "agent_id": "coder",
+                    "task": "fix",
+                    "task_id": TaskId::new().to_string(),
+                }),
+            )
+            .await;
+        assert_eq!(unknown["error"], "unknown_obligation", "{unknown:?}");
+        assert_eq!(graph.len(), 2, "rejections mutate nothing");
+    }
+
+    /// A write-capable tool under a name the mutating classifier cannot see
+    /// (mirrors LSP rename/execute-action and `mcp:*` tools, which perform
+    /// workspace work under unlisted names): it writes a real file and reports
+    /// the `path` output shape `handle_executor_tool` ledgers, yet
+    /// `guard_self_execution` waves it through pre-delegation — the exact
+    /// bypass the #147 post-hoc completion gate closes.
+    struct DirectEditTool;
+
+    #[async_trait::async_trait]
+    impl concerto_core::traits::tool::Tool for DirectEditTool {
+        fn name(&self) -> &str {
+            "direct_edit"
+        }
+        fn description(&self) -> &str {
+            "edits a file directly, bypassing specialist ownership"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" }, "content": { "type": "string" } },
+                "required": ["path"]
+            })
+        }
+        fn capability_requirements(&self) -> concerto_core::types::CapabilitySet {
+            concerto_core::types::CapabilitySet::default()
+        }
+        async fn execute(
+            &self,
+            input: serde_json::Value,
+            _policy: &dyn concerto_core::traits::policy::PolicyEngine,
+            session: &concerto_core::types::SessionContext,
+            _cancel: CancellationToken,
+        ) -> Result<concerto_core::types::ToolOutput, concerto_core::ToolError> {
+            let path = input.get("path").and_then(serde_json::Value::as_str).unwrap_or("out.txt");
+            let content =
+                input.get("content").and_then(serde_json::Value::as_str).unwrap_or("// test");
+            let target = session.project_dir.join(path);
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::write(&target, content).map_err(|error| {
+                concerto_core::ToolError::ExecutionFailed { message: error.to_string() }
+            })?;
+            Ok(concerto_core::types::ToolOutput {
+                summary: format!("edited {path}"),
+                data: serde_json::json!({ "path": path }),
+            })
+        }
+    }
+
+    /// An executor carrying only [`DirectEditTool`] under an allow-all policy.
+    fn direct_edit_executor() -> Arc<ToolExecutor> {
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(DirectEditTool));
+        let allow_all = vec![PolicyRule::AutoApprove(Condition::Always)];
+        let policy = Arc::new(SimplePolicyEngine::new(allow_all, Arc::new(TestAudit)));
+        Arc::new(ToolExecutor::new(Arc::new(registry), policy))
+    }
+
+    /// A direct-implementation tool call for the coordinator's own toolset.
+    fn direct_edit_tool_call(path: &str) -> ToolCall {
+        ToolCall {
+            id: format!("direct-{path}"),
+            name: "direct_edit".to_string(),
+            arguments: serde_json::json!({ "path": path, "content": "// generated" }),
+
+            ..Default::default()
+        }
+    }
+
+    /// Issue #147 acceptance (post-hoc gate): on an ActionRequired run with a
+    /// non-empty roster, the coordinator's DIRECT implementation work does not
+    /// satisfy the dispatch invariant. `direct_edit` slips past the
+    /// name-based pre-delegation refusal, writes a real file, and the run
+    /// still closes in prose with zero specialist dispatches — the run must
+    /// report Partial (bounded re-prompts, then the planning-recovery and
+    /// vacuous-completion escalation), never Completed. Read-only and
+    /// orchestration ops stay permitted; the retry budgets
+    /// (`MAX_PROSE_STOP_REPROMPTS`, failover caps) are untouched.
+    #[tokio::test]
+    async fn action_required_direct_write_without_dispatch_stays_partial() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let (mut coordinator, primary) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![
+                CoordinatorTurn::Calls(vec![direct_edit_tool_call("src/direct.rs")]),
+                CoordinatorTurn::Text("done without dispatching".into()),
+            ],
+        );
+        coordinator = coordinator.with_executor(direct_edit_executor());
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_action_required(session_id, "build the thing"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskStarted { .. })),
+            "zero specialist dispatches despite the direct write: {events:?}"
+        );
+        assert!(
+            project_dir.path().join("src/direct.rs").exists(),
+            "the direct implementation work really happened on disk"
+        );
+        assert_eq!(
+            primary.turn_count(),
+            7,
+            "the direct write plus the prose close consume the scripted turns plus exactly \
+             MAX_PROSE_STOP_REPROMPTS re-prompts, got {}",
+            primary.turn_count()
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "an action-required run with zero dispatches must not claim Completed, got: {:?} — {}",
+            output.completion_status,
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Prose-only dispatch guard"),
+            "the prose-only guard names the empty dispatch session: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Vacuous-completion guard"),
+            "direct implementation work does not satisfy the dispatch invariant while capable \
+             specialists remain: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #148 (security follow-ups 1–2): the mutating classifier covers
+    /// the LSP mutating tools and every `mcp:*` namespaced tool, while
+    /// read-only LSP and orchestration tools stay unrestricted.
+    #[test]
+    fn mutating_self_execution_classification_covers_lsp_and_mcp() {
+        for name in ["RenameSymbol", "ExecuteCodeAction"] {
+            assert!(
+                is_mutating_self_execution_tool(name, &serde_json::json!({})),
+                "{name} mutates the workspace"
+            );
+        }
+        for name in ["mcp:github:list_repos", "mcp:server:tool", "mcp:filesystem:write"] {
+            assert!(
+                is_mutating_self_execution_tool(name, &serde_json::json!({})),
+                "{name} is conservatively mutating"
+            );
+        }
+        for name in [
+            "GetHover",
+            "FindReferences",
+            "GetDiagnostics",
+            "GetSemanticTokens",
+            "GetCodeActions",
+            "GetInlayHints",
+        ] {
+            assert!(
+                !is_mutating_self_execution_tool(name, &serde_json::json!({})),
+                "{name} is read-only"
+            );
+        }
+        assert!(!is_mutating_self_execution_tool("mcp", &serde_json::json!({})));
+        assert!(!is_mutating_self_execution_tool("not-mcp:tool", &serde_json::json!({})));
+    }
+
+    /// Issue #148 (security follow-ups 1–2): the pre-delegation refusal fires
+    /// for the newly classified names — `RenameSymbol`,
+    /// `ExecuteCodeAction`, and `mcp:*` — while a non-empty roster has seen
+    /// no delegation attempt. Read-only LSP stays permitted.
+    #[test]
+    fn mutating_guard_refuses_lsp_and_mcp_before_any_delegation() {
+        let bus = EventBus::new(256);
+        let coordinator = coordinator_with_turns(
+            bus,
+            Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+                AgentId::new("coder"),
+                "implemented",
+            )])),
+            vec![],
+        );
+        let session_id = Ulid::new();
+        for name in ["RenameSymbol", "ExecuteCodeAction", "mcp:server:tool"] {
+            let refusal =
+                coordinator.guard_self_execution(session_id, name, &serde_json::json!({}));
+            let refusal = refusal.expect("mutating self-execution must be refused");
+            assert_eq!(
+                refusal.get("error").and_then(serde_json::Value::as_str),
+                Some("delegation_required"),
+                "{name} refuses with the named error"
+            );
+        }
+        assert!(
+            coordinator
+                .guard_self_execution(session_id, "GetHover", &serde_json::json!({}))
+                .is_none(),
+            "read-only LSP passes the guard"
+        );
+        assert!(
+            coordinator
+                .guard_self_execution(
+                    session_id,
+                    "filesystem",
+                    &serde_json::json!({ "operation": "read" })
+                )
+                .is_none(),
+            "read-only filesystem passes the guard"
+        );
+    }
+
+    /// A file-writing stub under an ARBITRARY tool name (issue #148): models
+    /// the LSP mutating tools (`RenameSymbol`, `ExecuteCodeAction`) and
+    /// `mcp:*` tools under their real names, which perform workspace work
+    /// the pre-#148 classifier could not see. Mirrors
+    /// [`DirectEditTool`]'s output shape so the coordinator ledgers the path.
+    struct NamedFileTool {
+        tool_name: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl concerto_core::traits::tool::Tool for NamedFileTool {
+        fn name(&self) -> &str {
+            self.tool_name
+        }
+        fn description(&self) -> &str {
+            "writes a file under a non-filesystem tool name"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" }, "content": { "type": "string" } },
+                "required": ["path"]
+            })
+        }
+        fn capability_requirements(&self) -> concerto_core::types::CapabilitySet {
+            concerto_core::types::CapabilitySet::default()
+        }
+        async fn execute(
+            &self,
+            input: serde_json::Value,
+            _policy: &dyn concerto_core::traits::policy::PolicyEngine,
+            session: &concerto_core::types::SessionContext,
+            _cancel: CancellationToken,
+        ) -> Result<concerto_core::types::ToolOutput, concerto_core::ToolError> {
+            let path = input.get("path").and_then(serde_json::Value::as_str).unwrap_or("out.txt");
+            let content =
+                input.get("content").and_then(serde_json::Value::as_str).unwrap_or("// test");
+            let target = session.project_dir.join(path);
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::write(&target, content).map_err(|error| {
+                concerto_core::ToolError::ExecutionFailed { message: error.to_string() }
+            })?;
+            Ok(concerto_core::types::ToolOutput {
+                summary: format!("{} wrote {path}", self.tool_name),
+                data: serde_json::json!({ "path": path }),
+            })
+        }
+    }
+
+    /// An executor carrying [`NamedFileTool`]s under the given names with an
+    /// allow-all policy.
+    fn named_file_executor(tool_names: &[&'static str]) -> Arc<ToolExecutor> {
+        let mut registry = ToolRegistry::default();
+        for name in tool_names {
+            registry.register(Box::new(NamedFileTool { tool_name: name }));
+        }
+        let allow_all = vec![PolicyRule::AutoApprove(Condition::Always)];
+        let policy = Arc::new(SimplePolicyEngine::new(allow_all, Arc::new(TestAudit)));
+        Arc::new(ToolExecutor::new(Arc::new(registry), policy))
+    }
+
+    /// A coordinator-owned file-write call under an arbitrary tool name.
+    fn named_file_tool_call(tool_name: &str, path: &str) -> ToolCall {
+        ToolCall {
+            id: format!("{tool_name}-{path}"),
+            name: tool_name.to_string(),
+            arguments: serde_json::json!({ "path": path, "content": "// generated" }),
+
+            ..Default::default()
+        }
+    }
+
+    /// Issue #148 (security follow-up, LSP half): with the hardened
+    /// classifier, the coordinator's direct `RenameSymbol` work is refused
+    /// pre-delegation while capable specialists remain — nothing is written
+    /// — and the prose-only close still reports Partial via both
+    /// completion guards. The HIGH-rated LSP bypass is closed end to end.
+    #[tokio::test]
+    async fn action_required_lsp_rename_without_dispatch_stays_partial() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let (mut coordinator, primary) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![
+                CoordinatorTurn::Calls(vec![named_file_tool_call(
+                    "RenameSymbol",
+                    "src/renamed.rs",
+                )]),
+                CoordinatorTurn::Text("renamed without dispatching".into()),
+            ],
+        );
+        coordinator = coordinator.with_executor(named_file_executor(&["RenameSymbol"]));
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_action_required(session_id, "build the thing"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskStarted { .. })),
+            "zero specialist dispatches despite the direct rename: {events:?}"
+        );
+        assert!(
+            !project_dir.path().join("src/renamed.rs").exists(),
+            "the refused rename must not land on disk"
+        );
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::PolicyVerdict { verdict, .. }
+                    if verdict.contains("delegation-required")
+            )),
+            "the rename refusal is a named, policy-visible verdict: {events:?}"
+        );
+        assert_eq!(
+            primary.turn_count(),
+            7,
+            "the refused rename plus the prose close consume the scripted turns plus exactly \
+             MAX_PROSE_STOP_REPROMPTS re-prompts, got {}",
+            primary.turn_count()
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "an action-required run with zero dispatches must not claim Completed, got: {:?} — {}",
+            output.completion_status,
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Prose-only dispatch guard"),
+            "the prose-only guard names the empty dispatch session: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Vacuous-completion guard"),
+            "direct LSP work does not satisfy the dispatch invariant while capable specialists \
+             remain: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #148 (security follow-up, code-action half): with the hardened
+    /// classifier, the coordinator's direct `ExecuteCodeAction` work is refused
+    /// pre-delegation while capable specialists remain — nothing is written
+    /// — and the prose-only close still reports Partial via both
+    /// completion guards. Mirrors
+    /// [`action_required_lsp_rename_without_dispatch_stays_partial`].
+    #[tokio::test]
+    async fn action_required_execute_code_action_without_dispatch_stays_partial() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let (mut coordinator, primary) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![
+                CoordinatorTurn::Calls(vec![named_file_tool_call(
+                    "ExecuteCodeAction",
+                    "src/action.rs",
+                )]),
+                CoordinatorTurn::Text("applied the fix without dispatching".into()),
+            ],
+        );
+        coordinator = coordinator.with_executor(named_file_executor(&["ExecuteCodeAction"]));
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_action_required(session_id, "build the thing"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskStarted { .. })),
+            "zero specialist dispatches despite the direct code action: {events:?}"
+        );
+        assert!(
+            !project_dir.path().join("src/action.rs").exists(),
+            "the refused code action must not land on disk"
+        );
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::PolicyVerdict { verdict, .. }
+                    if verdict.contains("delegation-required")
+            )),
+            "the code-action refusal is a named, policy-visible verdict: {events:?}"
+        );
+        assert_eq!(
+            primary.turn_count(),
+            7,
+            "the refused code action plus the prose close consume the scripted turns plus exactly \
+             MAX_PROSE_STOP_REPROMPTS re-prompts, got {}",
+            primary.turn_count()
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "an action-required run with zero dispatches must not claim Completed, got: {:?} — {}",
+            output.completion_status,
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Prose-only dispatch guard"),
+            "the prose-only guard names the empty dispatch session: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Vacuous-completion guard"),
+            "direct code-action work does not satisfy the dispatch invariant while capable \
+             specialists remain: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #148 (security follow-up, MCP half): with the hardened
+    /// classifier, the coordinator's direct `mcp:*` work is refused
+    /// pre-delegation while capable specialists remain — nothing is written
+    /// — and the prose-only close still reports Partial via both
+    /// completion guards. The MEDIUM-rated MCP bypass is closed end to end.
+    /// Mirrors [`action_required_lsp_rename_without_dispatch_stays_partial`].
+    #[tokio::test]
+    async fn action_required_mcp_tool_without_dispatch_stays_partial() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let (mut coordinator, primary) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![
+                CoordinatorTurn::Calls(vec![named_file_tool_call(
+                    "mcp:server:tool",
+                    "src/mcp_out.rs",
+                )]),
+                CoordinatorTurn::Text("used the MCP tool without dispatching".into()),
+            ],
+        );
+        coordinator = coordinator.with_executor(named_file_executor(&["mcp:server:tool"]));
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_action_required(session_id, "build the thing"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskStarted { .. })),
+            "zero specialist dispatches despite the direct MCP call: {events:?}"
+        );
+        assert!(
+            !project_dir.path().join("src/mcp_out.rs").exists(),
+            "the refused MCP call must not land on disk"
+        );
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::PolicyVerdict { verdict, .. }
+                    if verdict.contains("delegation-required")
+            )),
+            "the MCP refusal is a named, policy-visible verdict: {events:?}"
+        );
+        assert_eq!(
+            primary.turn_count(),
+            7,
+            "the refused MCP call plus the prose close consume the scripted turns plus exactly \
+             MAX_PROSE_STOP_REPROMPTS re-prompts, got {}",
+            primary.turn_count()
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "an action-required run with zero dispatches must not claim Completed, got: {:?} — {}",
+            output.completion_status,
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Prose-only dispatch guard"),
+            "the prose-only guard names the empty dispatch session: {}",
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Vacuous-completion guard"),
+            "direct MCP work does not satisfy the dispatch invariant while capable specialists \
+             remain: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #148 conversational matrix: a simple general question needing no
+    /// workspace access completes with a direct coordinator response and zero
+    /// specialist dispatches. The provider serves exactly one turn — the
+    /// ActionRequired-only prose re-prompt guard never fires.
+    #[tokio::test]
+    async fn coordinator_decides_general_question_completes_without_dispatch() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let (mut coordinator, primary) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text("Paris is the capital of France.".into())],
+        );
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_coordinator_decides(session_id, "What is the capital of France?"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskStarted { .. })),
+            "a general question dispatches nothing: {events:?}"
+        );
+        assert!(
+            primary.tool_result_contents().is_empty(),
+            "a general question performs zero tool calls"
+        );
+        assert_eq!(
+            primary.turn_count(),
+            1,
+            "a conversational turn is NOT re-prompted to dispatch (the prose-only guard is \
+             ActionRequired-only)"
+        );
+        assert!(
+            !events.iter().any(|kind| matches!(
+                kind,
+                EventKind::AgentThought { content, .. } if content.contains("coordinator re-prompt")
+            )),
+            "no bounded prose-only re-prompt loop for a conversational turn: {events:?}"
+        );
+        assert!(
+            output.files_modified.is_empty(),
+            "a conversational turn modifies nothing, got: {:?}",
+            output.files_modified
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "a general question completes, got: {:?} — {}",
+            output.completion_status,
+            output.final_message
+        );
+        assert!(
+            !output.final_message.is_empty(),
+            "the coordinator answers directly with a non-empty response"
+        );
+    }
+
+    /// Issue #148 conversational matrix: the coordinator does not manufacture
+    /// task, plan, investigation, or delegation work for conversational input
+    /// — zero tool calls of any kind, zero dispatches, zero files, one model
+    /// turn. (The "Hi there" prose path in
+    /// `coordinator_decides_prose_only_run_completes_without_dispatch` proves
+    /// completion; this test pins the no-manufactured-work half.)
+    #[tokio::test]
+    async fn conversational_turn_manufactures_no_work() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let (mut coordinator, primary) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text("Hello! How can I help you today?".into())],
+        );
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_coordinator_decides(session_id, "Hi there"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskStarted { .. })),
+            "no manufactured delegation: {events:?}"
+        );
+        assert!(
+            primary.tool_result_contents().is_empty(),
+            "no manufactured task/plan/investigation/delegation means zero tool calls"
+        );
+        assert!(
+            output.files_modified.is_empty(),
+            "no manufactured work means no files, got: {:?}",
+            output.files_modified
+        );
+        assert_eq!(
+            primary.turn_count(),
+            1,
+            "no manufactured work means a single model turn, never the 5x re-prompt loop"
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "a conversational turn completes, got: {:?} — {}",
+            output.completion_status,
+            output.final_message
+        );
+    }
+
+    /// Issue #148 orchestration matrix (fix/review/validation family): an
+    /// action-required review request still dispatches the expected
+    /// specialist. The prose-only re-prompt guard does NOT fire (the graph is
+    /// non-empty); the run reports Partial only via the mock-harness
+    /// zero-work guard (scripted specialists perform zero tool calls), which
+    /// is orthogonal to the dispatch invariant.
+    #[tokio::test]
+    async fn action_required_review_request_dispatches_specialist() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("reviewer"), "approved"),
+        ];
+        let (mut coordinator, primary) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist(
+                    "reviewer",
+                    "review the recent auth changes for correctness",
+                )]),
+                CoordinatorTurn::Text("review complete: two nits".into()),
+            ],
+        );
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_action_required(
+                    session_id,
+                    "Review the recent auth changes for correctness",
+                ),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert!(
+            events.iter().any(|kind| {
+                matches!(
+                    kind,
+                    EventKind::SubTaskStarted { role, .. }
+                        if role == &AgentId::new("reviewer")
+                )
+            }),
+            "an action-required review request dispatches the reviewer: {events:?}"
+        );
+        assert_eq!(
+            primary.turn_count(),
+            2,
+            "a dispatching run serves the dispatch turn plus the prose turn — never the \
+             prose-only re-prompt loop"
+        );
+        assert!(
+            !output.final_message.contains("Prose-only dispatch guard"),
+            "the prose-only guard stays silent once the graph is non-empty: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #148 security follow-up 3 (partial-dispatch limitation): when the
+    /// graph is NON-empty, the coordinator's own file-producing work under an
+    /// unlisted name is TRACKED — an observable
+    /// `CoordinatorSelfImplementing` event with reason
+    /// `unclassified-file-write` — but the verdict is preserved (Completed),
+    /// because post-dispatch self-execution is the lawful
+    /// delegation-failure recovery path and this name-based gate cannot
+    /// attribute which party produced each byte. Only the zero-dispatch
+    /// (empty graph) case is gated to Partial. This test pins both halves:
+    /// the tracking event fires AND the run still completes.
+    #[tokio::test]
+    async fn partial_dispatch_with_coordinator_file_write_is_tracked_not_gated() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let (mut coordinator, primary) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist("researcher", "gather context")]),
+                CoordinatorTurn::Calls(vec![direct_edit_tool_call("src/extra.rs")]),
+                CoordinatorTurn::Text("done".into()),
+            ],
+        );
+        coordinator = coordinator.with_executor(direct_edit_executor());
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_action_required(session_id, "build the thing"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert!(
+            events.iter().any(|kind| matches!(kind, EventKind::SubTaskStarted { .. })),
+            "the run really did partially dispatch: {events:?}"
+        );
+        assert!(
+            project_dir.path().join("src/extra.rs").exists(),
+            "the coordinator's own unlisted write really happened on disk"
+        );
+        assert!(
+            events.iter().any(|kind| matches!(
+                kind,
+                EventKind::CoordinatorSelfImplementing { reason, .. }
+                    if reason == "unclassified-file-write"
+            )),
+            "the unlisted file write is tracked observably: {events:?}"
+        );
+        assert_eq!(
+            primary.turn_count(),
+            3,
+            "a dispatching run serves its scripted turns with no prose-only re-prompts, got {}",
+            primary.turn_count()
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "partial-dispatch keeps its verdict by design (recovery preservation); only \
+             zero-dispatch is gated, got: {:?} — {}",
+            output.completion_status,
+            output.final_message
+        );
+        assert!(
+            !output.final_message.contains("Vacuous-completion guard"),
+            "the vacuous gate stays silent once the graph is non-empty: {}",
+            output.final_message
+        );
+    }
+
+    /// Issue #148 recovery matrix: cancelling a conversational turn terminates
+    /// promptly with zero specialist dispatches — never the 5x re-prompt
+    /// loop, never a hang. Cancellation machinery itself is covered by
+    /// `mid_batch_cancellation_aborts_without_partial_state` and
+    /// `planning_provider_cancellation_skips_recovery_and_pauses`; this test
+    /// pins the conversational shape (already-cancelled token).
+    #[tokio::test]
+    async fn conversational_cancellation_terminates_without_dispatch() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let (mut coordinator, primary) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text("Hello!".into())],
+        );
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            coordinator.run(
+                AgentTask::new_coordinator_decides(session_id, "Hi there"),
+                context,
+                cancel,
+                None,
+            ),
+        )
+        .await
+        .expect("a cancelled conversational turn terminates (no hang)");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskStarted { .. })),
+            "a cancelled conversational turn dispatches nothing: {events:?}"
+        );
+        match outcome {
+            Err(_) => (),
+            Ok(output) => {
+                assert!(
+                    primary.turn_count() <= 1,
+                    "cancellation never enters the re-prompt loop, got {} turns",
+                    primary.turn_count()
+                );
+                assert!(
+                    !events.iter().any(|kind| matches!(
+                        kind,
+                        EventKind::AgentThought { content, .. }
+                            if content.contains("coordinator re-prompt")
+                    )),
+                    "no re-prompt loop under cancellation: {events:?}"
+                );
+                let _ = output;
+            }
+        }
     }
 
     /// Delegation is NEVER gated on which stage is staffed: a roster with a
@@ -20139,6 +23517,7 @@ mod tests {
                 Vec::new(), // loop_notes
                 None,       // requested_user_input
                 None,       // pending_approval
+                None,       // dispatch_direct_answer
             )
             .await;
 
@@ -21504,6 +24883,7 @@ mod tests {
                 Vec::new(), // loop_notes
                 None,       // requested_user_input
                 None,       // pending_approval
+                None,       // dispatch_direct_answer
             )
             .await
             .expect("execute_graph should succeed");
@@ -23908,6 +27288,7 @@ mod tests {
                 Vec::new(), // loop_notes
                 None,       // requested_user_input
                 None,       // pending_approval
+                None,       // dispatch_direct_answer
             )
             .await;
 
@@ -24212,8 +27593,13 @@ mod tests {
         .await;
 
         assert!(
-            output.final_message.contains("Multi-agent orchestration completed"),
-            "unexpected final message: {}",
+            output.final_message.contains("Researcher"),
+            "a pure-prose zero-dispatch run returns the session prose, got: {}",
+            output.final_message
+        );
+        assert!(
+            !output.final_message.contains("Multi-agent orchestration completed"),
+            "the synthetic fallback must not replace a direct prose answer: {}",
             output.final_message
         );
     }
@@ -24931,9 +28317,12 @@ mod tests {
             output.completion_status,
             output.final_message
         );
+        // The session stops at the first prose turn (pure-prose close), so
+        // the final message is that turn's text — the plan JSON — and never
+        // the synthetic fallback.
         assert!(
-            output.final_message.contains("Multi-agent orchestration completed"),
-            "unexpected final message: {}",
+            output.final_message.contains("Researcher"),
+            "a pure-prose zero-dispatch run returns the session prose, got: {}",
             output.final_message
         );
         assert!(
@@ -28848,6 +32237,7 @@ mod tests {
                 Vec::new(), // loop_notes
                 None,       // requested_user_input
                 None,       // pending_approval
+                None,       // dispatch_direct_answer
             )
             .await
             .expect("execute_graph returns");
@@ -29931,6 +33321,144 @@ mod tests {
             output.completion_status,
             concerto_core::types::AgentCompletionStatus::Completed,
             "an answer-only prose turn stays Completed, got: {:?} — {}",
+            output.completion_status,
+            output.final_message
+        );
+    }
+
+    /// Issue #145 acceptance: an ordinary conversational turn on a
+    /// [`TaskExecutionMode::CoordinatorDecides`] root completes with a direct
+    /// coordinator response and ZERO specialist dispatches — no manufactured
+    /// delegation. This is the "Hi there" path: no word router classifies it;
+    /// the coordinator itself decides no workspace work is required. The
+    /// provider serves exactly one turn, proving the prose-only re-prompt
+    /// guard did NOT fire (it is ActionRequired-only).
+    #[tokio::test]
+    async fn coordinator_decides_prose_only_run_completes_without_dispatch() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+        ];
+        let (mut coordinator, primary) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text("Hello! How can I help?".into())],
+        );
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_coordinator_decides(session_id, "Hi there"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskStarted { .. })),
+            "a conversational coordinator-decides turn dispatches nothing: {events:?}"
+        );
+        assert_eq!(
+            primary.turn_count(),
+            1,
+            "a coordinator-decides prose turn is NOT re-prompted to dispatch (the \
+             prose-only guard is ActionRequired-only)"
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "a coordinator-decides prose turn completes, got: {:?} — {}",
+            output.completion_status,
+            output.final_message
+        );
+        // The coordinator's own dispatch-session prose IS the reply: the
+        // synthetic orchestration fallback must never surface for a
+        // zero-dispatch conversational turn.
+        assert_eq!(
+            output.final_message, "Hello! How can I help?",
+            "a conversational coordinator-decides turn returns the provider prose, got: {}",
+            output.final_message
+        );
+        assert!(
+            !output.final_message.contains("Multi-agent orchestration completed"),
+            "the synthetic fallback leaked into a conversational reply: {}",
+            output.final_message
+        );
+        // The dispatch session's model turn is real spend: its metrics ride
+        // the output instead of reporting tokens 0/0 with an empty list.
+        assert!(
+            !output.provider_metrics.is_empty(),
+            "a conversational turn must record its dispatch-session provider metrics"
+        );
+    }
+
+    /// Issue #145: CoordinatorDecides permits OPTIONAL delegation — the
+    /// coordinator may still dispatch a specialist when the work needs it.
+    /// The mode change must not disable dispatch; it only removes the
+    /// mandatory-dispatch invariant from conversational turns. A non-implement
+    /// stage is used so the implement-role zero-work guard (an orthogonal
+    /// concern, out of #145 scope) does not downgrade the exit.
+    #[tokio::test]
+    async fn coordinator_decides_run_may_still_dispatch() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("researcher"), "found")];
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![
+                CoordinatorTurn::Calls(vec![call_specialist("researcher", "gather context")]),
+                CoordinatorTurn::Text("here is what I found".into()),
+            ],
+        );
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_coordinator_decides(session_id, "look into the cache staleness"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        let dispatched = events.iter().any(|kind| {
+            matches!(
+                kind,
+                EventKind::SubTaskStarted { role, .. }
+                    if role == &AgentId::new("researcher")
+            )
+        });
+        assert!(
+            dispatched,
+            "a coordinator-decides run still dispatches when the coordinator decides \
+             the work requires it: {events:?}"
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "a dispatched coordinator-decides run completes, got: {:?} — {}",
             output.completion_status,
             output.final_message
         );
@@ -31604,9 +35132,9 @@ mod tests {
             .run(task, context, CancellationToken::new(), None)
             .await
             .expect("the run should complete");
-        assert!(
-            output.final_message.contains("Multi-agent orchestration completed"),
-            "run completes: {}",
+        assert_eq!(
+            output.final_message, "nothing to do",
+            "a pure-prose zero-dispatch run returns the session prose: {}",
             output.final_message
         );
 
@@ -31747,6 +35275,114 @@ mod tests {
                     "Self-execution is permitted ONLY when you have exhausted the roster"
                 ),
             "ADR-74 delegation doctrine is untouched"
+        );
+    }
+
+    /// Issue #146 acceptance (prompt half): the dispatch prompt opens with an
+    /// explicit decision boundary that separates "the Coordinator owns the
+    /// turn" from "the turn requires a specialist" — ordinary conversation is
+    /// a valid, complete outcome answered directly with NO tool call, and
+    /// delegation/investigation must not be manufactured merely because the
+    /// turn reached the coordinator. The boundary references the #145
+    /// execution modes without a hard-coded greeting/keyword router, keeps the
+    /// mandatory-dispatch invariant for `ActionRequired` work (consistent with
+    /// the prose-only guard in `run_dispatch_session`), and leaves the ADR-74
+    /// delegation doctrine and the six numbered steps intact.
+    #[tokio::test]
+    async fn dispatch_prompt_declares_conversation_valid_and_bans_manufactured_delegation() {
+        let bus = EventBus::new(256);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "implemented",
+        )]));
+        let (mut coordinator, provider) = coordinator_with_turns_captured(
+            bus,
+            registry,
+            vec![CoordinatorTurn::Text("nothing to do".into())],
+        );
+        let task = AgentTask::new(Ulid::new(), "build the thing");
+        let workspace = tempfile::tempdir().expect("workspace dir");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            task.session_id,
+            workspace.path().to_path_buf(),
+        ));
+        let _ = coordinator
+            .run(task, context, CancellationToken::new(), None)
+            .await
+            .expect("the run should complete");
+
+        let prompt = provider.prompts().into_iter().next().expect("one dispatch-decision prompt");
+
+        // The decision boundary exists and leads the built-in instructions.
+        let boundary = prompt
+            .find("Decision boundary")
+            .expect("the prompt opens with an explicit decision boundary");
+        let steps = prompt.find("How to work:").expect("the numbered steps follow the boundary");
+        assert!(boundary < steps, "the boundary sits before the steps: {prompt}");
+
+        // 1. Ownership is stated, and is explicitly NOT a dispatch requirement.
+        assert!(
+            prompt.contains("own every turn")
+                && prompt.contains("does NOT mean the turn requires a specialist"),
+            "coordinator owns the turn without the turn requiring a specialist"
+        );
+        // 2. Natural conversation is a valid outcome: answer directly, no tool.
+        assert!(
+            prompt.contains("ordinary conversation")
+                && prompt.contains("answer directly with NO tool call")
+                && prompt.contains("Natural conversation is a valid, complete outcome"),
+            "ordinary conversation must be explicitly valid and answered directly"
+        );
+        // 3. No manufactured delegation / invented investigation.
+        assert!(
+            prompt.contains(
+                "Do not manufacture delegation (or investigation, planning, implementation, or review)"
+            ),
+            "delegation must not be manufactured because the turn reached the coordinator"
+        );
+        // 4. Real work still goes through the existing orchestration machinery.
+        assert!(
+            prompt.contains(
+                "If the objective actually requires implementation, modification, review, validation, \
+                 or specialist investigation, use the orchestration machinery described below"
+            ),
+            "actionable objectives still route through the orchestration machinery"
+        );
+        // 5. ActionRequired keeps the mandatory-dispatch invariant, matching the
+        //    prose-only guard's re-prompt-then-escalate contract (never
+        //    contradicted by the conversational clause above).
+        assert!(
+            prompt.contains("ActionRequired MUST be dispatched")
+                && prompt.contains("mandatory-dispatch invariant")
+                && prompt.contains(
+                    "closing such a run in prose while the dispatch graph is empty is re-prompted"
+                ),
+            "action-required work retains mandatory dispatch and the guard's escalation"
+        );
+        // 6. The #145 modes are referenced as requirements, with no word router.
+        assert!(
+            prompt.contains("AnswerOnly carries no orchestration work")
+                && prompt.contains("CoordinatorDecides may be answered directly OR delegated"),
+            "the three execution modes are named by requirement"
+        );
+        assert!(
+            prompt.contains("no keyword table, greeting corpus, or word router"),
+            "the boundary forbids classifying turns by keywords/greetings"
+        );
+        assert!(
+            !prompt.to_lowercase().contains("hello"),
+            "no hard-coded greeting intent may appear in the prompt"
+        );
+        // The pre-existing structure and doctrines survive intact.
+        assert!(
+            prompt.contains("1. Read the objective")
+                && prompt.contains("6. When the objective is met")
+                && prompt.contains("Delegation is the DEFAULT action")
+                && prompt.contains(
+                    "Self-execution is permitted ONLY when you have exhausted the roster"
+                )
+                && prompt.contains("Transforming an EXISTING artifact (no synthesis)"),
+            "the six steps and the ADR-74/ no-synthesis doctrines are untouched"
         );
     }
 
