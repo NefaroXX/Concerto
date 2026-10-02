@@ -16,6 +16,11 @@ pub enum Message {
     Edit(text_editor::Action),
     /// Save the current file.
     Save,
+    /// Toolbar "screenshot" button. The capture is app-level (window
+    /// pixels), so `App::update` intercepts this before it reaches the
+    /// editor state — the Editor page is the one page whose `Ctrl+S` is
+    /// Save, and this button is its screenshot access.
+    TakeScreenshot,
     /// Create a new file (prompts for name).
     NewFile,
     /// New file name entered.
