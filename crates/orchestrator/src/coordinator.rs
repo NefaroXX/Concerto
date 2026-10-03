@@ -12532,33 +12532,41 @@ impl CoordinatorAgent {
                 // Placement: immediately after the projection the next
                 // decision consumes, riding the same reconsideration-nudge
                 // pattern as issue #53 (a bounded user message into the
-                // existing conversation — never a forced tool call). A
-                // settled consultation resolves the question (issue #56
-                // Q-RESOLVE rules read the Settled consult decision), so
-                // the request stops once the advice lands.
-                if let Some((question_id, nudge)) =
-                    crate::consultation::consultation_nudge(&self.world_model)
-                {
-                    if consult_nudged_questions.insert(question_id) {
-                        let _ = self.bus.publish_for_session(
-                            task.session_id,
-                            task.id.0,
-                            EventKind::AgentThought {
-                                agent_id: "coordinator".into(),
-                                content: nudge.clone(),
-                                kind: ThinkingKind::Detail,
-                            },
-                        );
-                        messages.push(Message {
-                            role: Role::User,
-                            content: nudge,
-                            tool_calls: None,
-                            tool_results: None,
-                            reasoning_content: None,
-                            tokens_in: None,
-                            tokens_out: None,
-                        });
-                    }
+                // existing conversation — never a forced tool call). The
+                // pick skips the questions this loop already raised (issue
+                // #135 starvation fix): each standing question is requested
+                // exactly once and the next aged question gets the next
+                // turn. The request does not promise resolution — a
+                // consult's findings are advisory evidence; under
+                // Q-RESOLVE-LINKED the question closes only when RELATED
+                // settled work lands (the subject's reconsider descendant
+                // or settled work touching its blocked path).
+                if let Some((question_id, nudge)) = crate::consultation::consultation_nudge(
+                    &self.world_model,
+                    &consult_nudged_questions,
+                ) {
+                    // The pick already skips raised ids, so this insert is
+                    // the bookkeeping that keeps the NEXT pick skipping it
+                    // too (each question fires at most once per loop).
+                    consult_nudged_questions.insert(question_id);
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        task.id.0,
+                        EventKind::AgentThought {
+                            agent_id: "coordinator".into(),
+                            content: nudge.clone(),
+                            kind: ThinkingKind::Detail,
+                        },
+                    );
+                    messages.push(Message {
+                        role: Role::User,
+                        content: nudge,
+                        tool_calls: None,
+                        tool_results: None,
+                        reasoning_content: None,
+                        tokens_in: None,
+                        tokens_out: None,
+                    });
                 }
             }
             match self.progress_tracker.observe(&observation) {
