@@ -2646,6 +2646,19 @@ mod tests {
         }
     }
 
+    /// Verifies editing a server preserves spaces, empty arguments, and literal shell characters.
+    #[test]
+    fn mcp_edit_preserves_exact_arguments() {
+        let mut state = State::from_config(&AppConfig::default());
+        let mut configured = server("quoted");
+        configured.args = vec!["path with spaces".into(), "".into(), "$(literal)".into()];
+        let expected = configured.args.clone();
+        state.mcp_servers.push(configured);
+        let _ = state.update(Message::McpEditPressed("quoted".into()));
+        let _ = state.update(Message::McpEditSaved);
+        assert_eq!(state.mcp_servers[0].args, expected);
+    }
+
     // ── ADR-43 — Skills toggle semantics ──────────────────────────────────
     //
     // `skills.enabled_ids` is `None` (allow-all: every discovered skill is a
