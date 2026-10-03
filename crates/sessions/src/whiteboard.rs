@@ -213,22 +213,25 @@ pub struct NewWhiteboardEvent {
 }
 
 // ---------------------------------------------------------------------------
-// Shared payload shapes the projections read (issue #136)
+// Shared payload shapes the projections read (issue #136, #141)
 // ---------------------------------------------------------------------------
 //
 // Three whiteboard payloads carry the data the pure world-model builder
 // (`concerto-orchestrator::world_model`) projects into bounded labels: a
 // `Finding`'s text, the `WriteApplied` written path, and a `ToolExecuted`'s
-// tool/args/success/paths. BOTH sides of that contract live here — the
-// writers that append these events build their payloads with
+// tool/args/success/paths — plus the evidence ids every cited payload
+// shares through `supporting_evidence_ids` (ADR-65 §6 `Decision` shape and
+// the consultative `Finding`'s grounding refs). BOTH sides of that contract
+// live here — the writers that append these events build their payloads with
 // [`consult_finding_payload`] / [`write_applied_payload`], and the builder
 // reads them back through [`finding_text`] / [`write_applied_path`] /
-// [`tool_executed_view`] — so a key rename is one edit with failing contract
-// tests instead of a silent read-time fallback. That is exactly the #136
-// defect: the only consultative `Finding` writer keyed its text `findings`,
-// the builder read `summary`/`content`, and every consultative finding
-// rendered as `"finding recorded"` — which then deduped distinct findings
-// into one shared-label assumption.
+// [`tool_executed_view`] / [`supporting_evidence_ids`] — so a key rename is
+// one edit with failing contract tests instead of a silent read-time
+// fallback. That is exactly the #136 defect: the only consultative
+// `Finding` writer keyed its text `findings`, the builder read
+// `summary`/`content`, and every consultative finding rendered as
+// `"finding recorded"` — which then deduped distinct findings into one
+// shared-label assumption.
 //
 // The accessors are total and additive: an unknown or pre-#136 payload
 // yields `None` / an empty view and the CALLER keeps its own explicit,
@@ -250,6 +253,12 @@ const WRITE_INPUT_KEY: &str = "input";
 /// record (`ToolExecuted` payload rows).
 const PATH_KEY: &str = "path";
 
+/// The payload key carrying cited evidence ids: ADR-65 §6 fixes it on
+/// `Decision` payloads, and the consultative `Finding` writer emits it as
+/// the grounding refs (issue #141) the world model projects. One key, one
+/// reader ([`supporting_evidence_ids`]) — writer and reader cannot drift.
+const SUPPORTING_EVIDENCE_KEY: &str = "supporting_evidence_ids";
+
 /// The text a `Finding` label should carry: the consultative writer's
 /// `findings` first (#136), then the legacy `summary`/`content` aliases.
 /// `None` when the payload holds no string text — the caller keeps its own
@@ -259,6 +268,23 @@ pub fn finding_text(payload: &serde_json::Value) -> Option<&str> {
     [FINDING_TEXT_KEY, FINDING_SUMMARY_KEY, FINDING_CONTENT_KEY]
         .iter()
         .find_map(|key| payload.get(*key).and_then(serde_json::Value::as_str))
+}
+
+/// The evidence ids a payload cites through [`SUPPORTING_EVIDENCE_KEY`]:
+/// the optional array ADR-65 §6 fixes on `Decision` payloads and the
+/// consultative `Finding` writer ([`consult_finding_payload`]) emits as an
+/// assertion's grounding refs (issue #141). Total and additive like the
+/// other accessors: absent key, non-array or non-string entries ⇒ those ids
+/// are simply not cited (an empty vec). The accessor validates NOTHING —
+/// the append path checks the ids it reads for a `Decision` (ADR-65 §6),
+/// and the world model stores what it reads as provenance only.
+#[must_use]
+pub fn supporting_evidence_ids(payload: &serde_json::Value) -> Vec<String> {
+    payload
+        .get(SUPPORTING_EVIDENCE_KEY)
+        .and_then(serde_json::Value::as_array)
+        .map(|ids| ids.iter().filter_map(serde_json::Value::as_str).map(str::to_owned).collect())
+        .unwrap_or_default()
 }
 
 /// Build the payload of the consultative `Finding` the coordinator appends
@@ -277,7 +303,7 @@ pub fn consult_finding_payload(
         "consultative": true,
         "question": question,
         FINDING_TEXT_KEY: findings,
-        "supporting_evidence_ids": supporting_evidence_ids,
+        SUPPORTING_EVIDENCE_KEY: supporting_evidence_ids,
         "hypothesis_id": hypothesis_id,
     })
 }
@@ -422,21 +448,6 @@ fn push_field(buf: &mut Vec<u8>, value: &[u8]) {
     buf.extend_from_slice(value);
 }
 
-/// The evidence ids a Decision event's payload references, if any.
-///
-/// ADR-65 §6 fixes the Decision payload shape as `selected_agent, reason,
-/// required_output, supporting_evidence_ids`; the ids are read from the
-/// optional `supporting_evidence_ids` key (absent or non-array ⇒ empty).
-/// Any other payload — including every pre-existing Decision payload —
-/// validates as referencing nothing.
-fn decision_evidence_ids(payload: &serde_json::Value) -> Vec<String> {
-    payload
-        .get("supporting_evidence_ids")
-        .and_then(serde_json::Value::as_array)
-        .map(|ids| ids.iter().filter_map(serde_json::Value::as_str).map(str::to_owned).collect())
-        .unwrap_or_default()
-}
-
 /// Append a whiteboard event and return the stored row.
 ///
 /// `gate_seq` (global) and `agent_seq` (per-agent) are assigned inside a
@@ -465,8 +476,12 @@ pub async fn append_whiteboard_event(
 ) -> Result<WhiteboardEvent, SessionError> {
     let payload_json = serde_json::to_string(&event.payload)?;
     let content_hash = compute_content_hash(event)?;
+    // ADR-65 §6 fixes the Decision payload shape as `selected_agent,
+    // reason, required_output, supporting_evidence_ids`; any other payload
+    // — including every pre-existing Decision payload — cites nothing
+    // through the shared accessor, so it validates as referencing nothing.
     let evidence_ids = if event.kind == WhiteboardKind::Decision {
-        decision_evidence_ids(&event.payload)
+        supporting_evidence_ids(&event.payload)
     } else {
         Vec::new()
     };

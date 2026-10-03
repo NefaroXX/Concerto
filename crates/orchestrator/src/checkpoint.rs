@@ -2586,6 +2586,7 @@ mod tests {
                 status: crate::world_model::FactStatus::Verified,
                 artifact: Some("src/main.rs".to_owned()),
                 seq: 12,
+                grounded_by: vec!["ev-9".to_owned(), "ev-11".to_owned()],
             }],
             tasks: vec![crate::world_model::WorldTask {
                 ref_id: "dec-1".to_owned(),
