@@ -37,7 +37,8 @@ use concerto_providers::retry::RetryPolicy;
 use concerto_sessions::spend::SpendTracker;
 use concerto_sessions::whiteboard::append_whiteboard_event;
 use concerto_sessions::whiteboard::{
-    consult_finding_payload, latest_gate_seq, load_whiteboard_events, WhiteboardLoadOpts,
+    consult_finding_payload, latest_gate_seq, load_newest_session_events, load_whiteboard_events,
+    WhiteboardLoadOpts,
 };
 use concerto_sessions::{
     NewWhiteboardEvent, OrchestrationCheckpointRecord, ResourceFactRow, ResourceFacts,
@@ -3991,8 +3992,20 @@ impl CoordinatorAgent {
         );
     }
 
-    /// The bounded newest event window for the world-model builder.
-    /// Fail-soft: no pool or a read failure yields an empty window.
+    /// The bounded newest event window for the world-model builder: THIS
+    /// session's newest `WORLD_MODEL_EVENT_WINDOW` events, ascending
+    /// (issue #138).
+    ///
+    /// The window counts the session's own events; it is deliberately not
+    /// `gate_seq > global_head - N AND session_id = ?`, which measures the
+    /// window in GLOBAL seq units — other sessions' writes then both walk the
+    /// anchor forward and stretch the gaps between this session's rows, so
+    /// the window came back silently shrunk (possibly empty) whenever the
+    /// neighbours got busy and facts/supersession/staleness degraded with no
+    /// signal.
+    ///
+    /// Fail-soft: no pool, a cancelled token, or a read failure yields an
+    /// empty window — a projection must never fail the dispatch loop.
     async fn load_world_model_events(
         &self,
         session_id: Ulid,
@@ -4004,32 +4017,18 @@ impl CoordinatorAgent {
         let Some(pool) = self.review_store.as_ref() else {
             return Vec::new();
         };
-        let head = match concerto_sessions::whiteboard::latest_gate_seq(pool).await {
-            Ok(head) => head,
-            Err(error) => {
-                if !cancel.is_cancelled() {
-                    warn!(%error, "issue #56: world-model event read failed (head); \
-                         the projection builds without events this refresh");
-                }
-                return Vec::new();
-            }
-        };
-        let after = head.saturating_sub(Self::WORLD_MODEL_EVENT_WINDOW as u64);
-        match load_whiteboard_events(
+        match load_newest_session_events(
             pool,
-            &WhiteboardLoadOpts {
-                after_gate_seq: after,
-                session_id: Some(session_id.to_string()),
-                scope: None,
-                limit: Self::WORLD_MODEL_EVENT_WINDOW,
-            },
+            &session_id.to_string(),
+            Self::WORLD_MODEL_EVENT_WINDOW,
         )
         .await
         {
             Ok(events) => events,
             Err(error) => {
                 if !cancel.is_cancelled() {
-                    warn!(%error, "issue #56: world-model event read failed (fail-soft)");
+                    warn!(%error, "issue #138: world-model event read failed (fail-soft); \
+                         the projection builds without events this refresh");
                 }
                 Vec::new()
             }
@@ -35269,6 +35268,255 @@ mod tests {
         assert!(
             prompt.contains("status: Verified"),
             "freshness statuses are explicit in the block (issue #56)"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Issue #138: the world-model event window counts THIS session's own
+    // events — other sessions' writes must never shrink (or empty) it.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Append one `WriteApplied` event for `session_id` carrying the
+    /// canonical `payload.input.path` shape the world-model fact extractor
+    /// reads (so the projection side of the invariant is observable too).
+    async fn append_world_model_write(
+        pool: &sqlx::SqlitePool,
+        event_id: &str,
+        session_id: Ulid,
+        path: &str,
+    ) {
+        append_whiteboard_event(
+            pool,
+            &NewWhiteboardEvent {
+                event_id: event_id.to_owned(),
+                agent_id: "coder".to_owned(),
+                kind: WhiteboardKind::WriteApplied,
+                scope: String::new(),
+                session_id: Some(session_id.to_string()),
+                plan_id: None,
+                causation: None,
+                payload: serde_json::json!({ "input": { "path": path } }),
+                pre_image_hash: None,
+                created_at: 1,
+            },
+        )
+        .await
+        .expect("world-model write appended");
+    }
+
+    /// A coordinator wired to the evidence pool for the world-model reads
+    /// only — no run, no model turn needed.
+    fn world_model_coordinator(pool: &sqlx::SqlitePool) -> CoordinatorAgent {
+        let bus = EventBus::new(256);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "implemented",
+        )]));
+        let (coordinator, _turns) = coordinator_with_turns_captured(
+            bus,
+            registry,
+            vec![CoordinatorTurn::Text("done".into())],
+        );
+        coordinator.with_review_store(Some(pool.clone()))
+    }
+
+    /// WARN messages captured while the current thread runs under the
+    /// returned guard — the issue #138 acceptance requires the fail-soft read
+    /// failure to still log. A minimal `tracing::Subscriber` (same shape as
+    /// the providers' `WarnSink`) so no dev-dependency is added.
+    #[derive(Clone, Default)]
+    struct WarnSink {
+        messages: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl WarnSink {
+        fn messages(&self) -> Vec<String> {
+            self.messages.lock().unwrap_or_else(|error| error.into_inner()).clone()
+        }
+    }
+
+    impl tracing::Subscriber for WarnSink {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _attributes: &tracing::span::Attributes<'_>) -> tracing::Id {
+            static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            tracing::Id::from_u64(NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+        }
+
+        fn record(&self, _span: &tracing::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::Id, _follows: &tracing::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if event.metadata().level() != &tracing::Level::WARN {
+                return;
+            }
+            let mut capture = WarnMessage::default();
+            event.record(&mut capture);
+            if let Some(message) = capture.0 {
+                self.messages.lock().unwrap_or_else(|error| error.into_inner()).push(message);
+            }
+        }
+
+        fn enter(&self, _span: &tracing::Id) {}
+
+        fn exit(&self, _span: &tracing::Id) {}
+    }
+
+    /// The `message` field of a captured event, as its formatted text.
+    #[derive(Default)]
+    struct WarnMessage(Option<String>);
+
+    impl tracing::field::Visit for WarnMessage {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    /// Acceptance (issue #138): session A records 20 events interleaved with
+    /// 1,000 from session B, and A's window still holds all 20 — the window
+    /// counts A's own events, so B's traffic can neither walk the anchor
+    /// forward nor stretch the gaps between A's rows. The model built from
+    /// that window carries a fact per A event.
+    #[tokio::test]
+    async fn world_model_window_sees_all_session_events_despite_other_sessions() {
+        let (_dir, pool) = resume_log_pool().await;
+        let session_a = Ulid::new();
+        let session_b = Ulid::new();
+        let a_id = session_a.to_string();
+
+        // B writes first in every pair, so A's rows are spread through the
+        // log while B's tail runs far past A's last event (global head 1020,
+        // A's head 971): the old global-anchored window spanned only the last
+        // 256 GLOBAL seqs and returned 6 of A's 20.
+        let mut a_writes = 0usize;
+        for i in 0..1000usize {
+            append_world_model_write(
+                &pool,
+                &format!("ev-b-{i}"),
+                session_b,
+                &format!("src/b/{i}.rs"),
+            )
+            .await;
+            if i % 50 == 0 {
+                append_world_model_write(
+                    &pool,
+                    &format!("ev-a-{a_writes}"),
+                    session_a,
+                    &format!("src/a/{a_writes:03}.rs"),
+                )
+                .await;
+                a_writes += 1;
+            }
+        }
+        assert_eq!(a_writes, 20, "session A recorded 20 events");
+
+        let mut coordinator = world_model_coordinator(&pool);
+        let cancel = CancellationToken::new();
+
+        let events = coordinator.load_world_model_events(session_a, &cancel).await;
+        assert_eq!(events.len(), 20, "A's window holds every one of A's events");
+        assert!(
+            events.iter().all(|event| event.session_id.as_deref() == Some(a_id.as_str())),
+            "and nothing from any other session leaks in"
+        );
+        let seqs: Vec<u64> = events.iter().map(|event| event.gate_seq).collect();
+        assert!(
+            seqs.windows(2).all(|pair| pair[0] < pair[1]),
+            "the window stays in ascending gate_seq order: {seqs:?}"
+        );
+
+        // The projection itself sees all 20 (one fact per recorded write).
+        let task = AgentTask::new(session_a, "build the thing");
+        coordinator.refresh_world_model(&task, &[], Vec::new(), &cancel).await;
+        let artifacts: Vec<&str> = coordinator
+            .world_model
+            .facts
+            .iter()
+            .filter_map(|fact| fact.artifact.as_deref())
+            .collect();
+        assert_eq!(artifacts.len(), 20, "the model derives a fact per A event");
+        for i in 0..20usize {
+            let expected = format!("src/a/{i:03}.rs");
+            assert!(
+                artifacts.contains(&expected.as_str()),
+                "the model sees {expected}: {artifacts:?}"
+            );
+        }
+    }
+
+    /// Acceptance (issue #138): with a single session owning the log the
+    /// window is unchanged — every event, in append order (the pre-fix
+    /// behaviour when nothing else contends for the head).
+    #[tokio::test]
+    async fn world_model_window_single_session_is_unchanged() {
+        let (_dir, pool) = resume_log_pool().await;
+        let session = Ulid::new();
+        for i in 0..20usize {
+            append_world_model_write(&pool, &format!("ev-{i}"), session, &format!("src/{i}.rs"))
+                .await;
+        }
+
+        let coordinator = world_model_coordinator(&pool);
+        let cancel = CancellationToken::new();
+        let events = coordinator.load_world_model_events(session, &cancel).await;
+        let seqs: Vec<u64> = events.iter().map(|event| event.gate_seq).collect();
+        assert_eq!(seqs, (1..=20).collect::<Vec<u64>>(), "all 20, in append order");
+    }
+
+    /// The window stays bounded per session: a session past the window size
+    /// still gets exactly its newest `WORLD_MODEL_EVENT_WINDOW` events (the
+    /// documented drop — the oldest fall out of the projection's evidence
+    /// budget), never an unbounded read.
+    #[tokio::test]
+    async fn world_model_window_stays_bounded_per_session() {
+        const SESSION_EVENTS: u64 = 300;
+        let (_dir, pool) = resume_log_pool().await;
+        let session = Ulid::new();
+        for i in 0..SESSION_EVENTS {
+            append_world_model_write(&pool, &format!("ev-{i}"), session, &format!("src/{i}.rs"))
+                .await;
+        }
+
+        let coordinator = world_model_coordinator(&pool);
+        let cancel = CancellationToken::new();
+        let events = coordinator.load_world_model_events(session, &cancel).await;
+        let window = CoordinatorAgent::WORLD_MODEL_EVENT_WINDOW as u64;
+        assert_eq!(events.len() as u64, window, "the read stays bounded");
+        assert_eq!(
+            events.first().map(|event| event.gate_seq),
+            Some(SESSION_EVENTS - window + 1),
+            "the window opens at the session's newest-but-window+1 event"
+        );
+        assert_eq!(events.last().map(|event| event.gate_seq), Some(SESSION_EVENTS));
+    }
+
+    /// Acceptance (issue #138): a read failure stays fail-soft — an empty
+    /// window, never an error surfaced into the dispatch loop — and it still
+    /// logs the failure.
+    #[tokio::test]
+    async fn world_model_event_read_failure_is_fail_soft_and_logged() {
+        let (_dir, pool) = resume_log_pool().await;
+        let session = Ulid::new();
+        append_world_model_write(&pool, "ev-0", session, "src/0.rs").await;
+        pool.close().await;
+
+        let coordinator = world_model_coordinator(&pool);
+        let cancel = CancellationToken::new();
+        let sink = WarnSink::default();
+        let _guard = tracing::subscriber::set_default(sink.clone());
+        let events = coordinator.load_world_model_events(session, &cancel).await;
+        drop(_guard);
+
+        assert!(events.is_empty(), "a read failure degrades to an empty window");
+        let warns = sink.messages();
+        assert!(
+            warns.iter().any(|message| message.contains("world-model event read failed")),
+            "the failure is logged, not swallowed: {warns:?}"
         );
     }
 
