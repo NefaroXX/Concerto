@@ -634,6 +634,45 @@ pub async fn load_whiteboard_events_up_to(
     rows.into_iter().map(WhiteboardEvent::try_from).collect()
 }
 
+/// Newest-N-per-session reader: the last `limit` events of ONE session
+/// (counted in that session's OWN events), ordered by `gate_seq` ascending —
+/// the order every consumer of the log assumes.
+///
+/// This is what a "window over my session" needs, and it is deliberately not
+/// expressed as `gate_seq > global_head - limit AND session_id = ?`: that
+/// shape measures the window in GLOBAL seq units, so other sessions' writes
+/// both walk the anchor forward and stretch the gap between this session's
+/// rows — silently shrinking (down to empty) a session's window as its
+/// neighbours get busy (issue #138). Counting the session's own rows keeps
+/// the window exactly `limit` events wide no matter how loud the rest of the
+/// log is; a session with fewer than `limit` events gets all of them, and a
+/// session with none gets an empty window.
+///
+/// Served by `idx_whiteboard_session_gate (session_id, gate_seq)` (reverse
+/// scan + `LIMIT`, so the read stays bounded). `limit` of 0 returns nothing.
+pub async fn load_newest_session_events(
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+    limit: usize,
+) -> Result<Vec<WhiteboardEvent>, SessionError> {
+    let sql = format!(
+        "SELECT {EVENT_COLUMNS} FROM whiteboard_events \
+         WHERE session_id = ? ORDER BY gate_seq DESC LIMIT ?"
+    );
+    // AUDITED (sqlx 0.9 `AssertSqlSafe`): the SQL is assembled solely from static
+    // fragments and the const `EVENT_COLUMNS`; every filter value is bound via `?`.
+    let rows = query_as::<_, WhiteboardEventRow>(AssertSqlSafe(sql))
+        .bind(session_id)
+        .bind(limit as i64)
+        .fetch_all(pool)
+        .await?;
+    let mut events: Vec<WhiteboardEvent> =
+        rows.into_iter().map(WhiteboardEvent::try_from).collect::<Result<Vec<_>, _>>()?;
+    // Newest-first from the database; the log's canonical order is ascending.
+    events.reverse();
+    Ok(events)
+}
+
 /// Current head of the log: the largest assigned `gate_seq`, or `0` when the
 /// log is empty. This is the natural boundary for "checkpoint at the current
 /// gate" ([`load_whiteboard_events_up_to`] takes it as its inclusive bound).
@@ -1141,6 +1180,63 @@ mod tests {
             .await
             .expect("session cut");
         assert_eq!(sess1.iter().map(|ev| ev.event_id.as_str()).collect::<Vec<_>>(), vec!["cut-0"]);
+    }
+
+    /// Issue #138: the newest-N-per-session reader counts THIS session's own
+    /// rows — a busy interleaved log around it neither shrinks nor empties the
+    /// window — and it hands them back in the log's ascending `gate_seq` order.
+    #[tokio::test]
+    async fn newest_session_events_count_the_sessions_own_rows() {
+        let (_dir, pool) = test_pool(1).await;
+        let (session_a, session_b) = ("sess-a", "sess-b");
+
+        // A's 5 events are spread through B's 20, and B's tail runs far past
+        // A's last event — the shape that starved the old global-anchored
+        // window (issue #138).
+        let mut a_seqs = Vec::new();
+        for i in 0..20usize {
+            let mut other = new_event(&format!("b-{i:02}"), "agent-b", WhiteboardKind::Finding);
+            other.session_id = Some(session_b.to_owned());
+            append_whiteboard_event(&pool, &other).await.expect("append B");
+            if i % 4 == 0 {
+                let mut mine = new_event(&format!("a-{i:02}"), "agent-a", WhiteboardKind::Finding);
+                mine.session_id = Some(session_a.to_owned());
+                let stored = append_whiteboard_event(&pool, &mine).await.expect("append A");
+                a_seqs.push(stored.gate_seq);
+            }
+        }
+        assert_eq!(a_seqs, vec![2, 7, 12, 17, 22], "A owns 5 rows across the log");
+
+        // The newest 3 of A's OWN 5, ascending, and nothing of B's.
+        let window = load_newest_session_events(&pool, session_a, 3).await.expect("A window");
+        assert_eq!(
+            window.iter().map(|event| event.gate_seq).collect::<Vec<_>>(),
+            a_seqs[2..],
+            "the newest 3 of A's own events, in ascending order"
+        );
+        assert!(
+            window.iter().all(|event| event.event_id.starts_with("a-")),
+            "no other session's rows leak in"
+        );
+
+        // Fewer rows than the limit ⇒ all of them (never an error, never
+        // padded with a neighbour's rows).
+        let wide = load_newest_session_events(&pool, session_a, 8).await.expect("wide A window");
+        assert_eq!(wide.iter().map(|event| event.gate_seq).collect::<Vec<_>>(), a_seqs);
+
+        // B's window counts B's rows only: its 6 newest end at the log head.
+        let b_window = load_newest_session_events(&pool, session_b, 6).await.expect("B window");
+        assert_eq!(b_window.len(), 6, "bounded by the limit, not by A's rows");
+        assert_eq!(
+            b_window.last().map(|event| event.gate_seq),
+            Some(25),
+            "B's newest row is the log head"
+        );
+        assert!(b_window.iter().all(|event| event.event_id.starts_with("b-")));
+
+        // A session with no events gets an empty window, not an error.
+        let none = load_newest_session_events(&pool, "sess-none", 8).await.expect("no session");
+        assert!(none.is_empty());
     }
 
     #[tokio::test]
