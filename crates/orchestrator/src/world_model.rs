@@ -428,14 +428,29 @@ struct FactCandidate {
     seq: u64,
 }
 
+/// The event window's extraction result (issue #140): the effective writes
+/// and fact candidates, PLUS the write events that could not be attributed
+/// to a path. Counting the drop is what makes it observable — a silent skip
+/// leaves F-SUPERSEDE under-firing and older facts `Verified`.
+struct Extraction {
+    writes: Vec<RecordedWrite>,
+    facts: Vec<FactCandidate>,
+    /// How many `WriteApplied` events carried no usable `input.path`.
+    unattributed_writes: usize,
+    /// The first dropped event's id — the risk entry's `ref_id`, so it
+    /// points at evidence instead of prose.
+    first_unattributed: Option<String>,
+}
+
 /// Extract effective writes and fact candidates from the event window.
 /// Unknown event kinds are opaque and skipped (already the project's
-/// log-compat convention).
-fn extract_writes_and_facts(
-    events: &[WhiteboardEvent],
-) -> (Vec<RecordedWrite>, Vec<FactCandidate>) {
+/// log-compat convention) and are NOT counted; only a `WriteApplied` that
+/// yields no attributable path counts as unattributed (issue #140).
+fn extract_writes_and_facts(events: &[WhiteboardEvent]) -> Extraction {
     let mut writes = Vec::new();
     let mut facts = Vec::new();
+    let mut unattributed_writes = 0usize;
+    let mut first_unattributed: Option<String> = None;
     for event in events {
         match event.kind {
             WhiteboardKind::WriteApplied => {
@@ -444,6 +459,14 @@ fn extract_writes_and_facts(
                 // accessor the gate's own payload builder writes against
                 // (#136).
                 let Some(path) = write_applied_path(&event.payload) else {
+                    // Issue #140: the gate applied this write but the payload
+                    // names no path, so nothing can be attributed to an
+                    // artifact. Count it instead of dropping it silently —
+                    // `build` turns the count into a warn + a risk entry.
+                    unattributed_writes += 1;
+                    if first_unattributed.is_none() {
+                        first_unattributed = Some(event.event_id.clone());
+                    }
                     continue;
                 };
                 facts.push(FactCandidate {
@@ -466,6 +489,8 @@ fn extract_writes_and_facts(
                 // appends.
                 let view = tool_executed_view(&event.payload);
                 if !view.success {
+                    // A failed execution applied nothing, so there is no
+                    // write to attribute — not counted by issue #140.
                     continue;
                 }
                 let file_affecting = view
@@ -473,6 +498,11 @@ fn extract_writes_and_facts(
                     .is_some_and(|tool| crate::tool_facts::is_file_affecting_tool(tool, view.args));
                 let tool_label = view.tool.unwrap_or("tool");
                 if file_affecting {
+                    // Not counted as unattributable (issue #140): this arm's
+                    // `paths` are POST-HOC observations (a `delete_file`
+                    // legitimately reports none — the file is gone), and the
+                    // write itself is attributed by the gate's own
+                    // `WriteApplied` row.
                     for path in view.paths.iter().take(MAX_PATHS_PER_EVENT) {
                         facts.push(FactCandidate {
                             ref_id: event.event_id.clone(),
@@ -541,7 +571,7 @@ fn extract_writes_and_facts(
             _ => {}
         }
     }
-    (writes, facts)
+    Extraction { writes, facts, unattributed_writes, first_unattributed }
 }
 
 /// Whether the window holds an effective write to `path` newer than `seq`.
@@ -939,7 +969,19 @@ impl WorldModel {
     /// same render). No model calls, no I/O, no randomness.
     #[must_use]
     pub fn build(input: &WorldModelInput<'_>) -> Self {
-        let (writes, candidates) = extract_writes_and_facts(input.events);
+        let Extraction { writes, facts: candidates, unattributed_writes, first_unattributed } =
+            extract_writes_and_facts(input.events);
+        // Issue #140: a write that could not be attributed is a drop, and
+        // every drop is observable — warn once per build (bounded count),
+        // then carry the same count into the risk list below.
+        if unattributed_writes > 0 {
+            tracing::warn!(
+                count = unattributed_writes,
+                first_event = first_unattributed.as_deref().unwrap_or_default(),
+                "world model: write event(s) could not be attributed to a path; \
+                 freshness may be overstated"
+            );
+        }
 
         // ── Facts (capped from the NEWEST side; staleness per F-*) ──────
         let mut facts: Vec<WorldFact> = candidates
@@ -1083,6 +1125,18 @@ impl WorldModel {
             }
             risks.push(WorldRisk { ref_id, label });
         };
+        // Issue #140: unattributable write events lead the list — they make
+        // every freshness claim in the model suspect, so the entry must
+        // survive the cap applied at the end of this block.
+        if unattributed_writes > 0 {
+            push_risk(
+                first_unattributed.unwrap_or_else(|| "unattributed-writes".to_owned()),
+                bounded(format!(
+                    "{unattributed_writes} write event(s) could not be attributed — freshness may be overstated"
+                )),
+                &mut risks,
+            );
+        }
         if input.pending_stale {
             if let Some(pending) = input.pending {
                 push_risk(
@@ -2596,5 +2650,110 @@ mod tests {
         );
         let rendered = model.render();
         assert!(rendered.contains("risks:"), "risks render into the decision block");
+    }
+
+    /// Issue #140 (P1): a `WriteApplied` whose payload carries no usable
+    /// `input.path` used to be skipped with `continue` and no trace — the
+    /// write vanished, F-SUPERSEDE under-fired and older facts stayed
+    /// `Verified`. The drop MUST be observable: a non-zero extraction count,
+    /// one bounded risk entry naming that count. Well-formed input produces
+    /// neither.
+    #[test]
+    fn unattributed_write_events_surface_a_bounded_risk_entry() {
+        let malformed = vec![
+            event(WhiteboardKind::WriteApplied, "ev-no-input", 10, serde_json::json!({})),
+            event(
+                WhiteboardKind::WriteApplied,
+                "ev-no-path",
+                20,
+                serde_json::json!({ "input": {} }),
+            ),
+            event(
+                WhiteboardKind::WriteApplied,
+                "ev-path-not-a-string",
+                30,
+                serde_json::json!({ "input": { "path": 7 } }),
+            ),
+        ];
+        let extracted = extract_writes_and_facts(&malformed);
+        assert_eq!(
+            extracted.unattributed_writes, 3,
+            "every write that names no path is counted, never skipped silently"
+        );
+        assert_eq!(
+            extracted.first_unattributed.as_deref(),
+            Some("ev-no-input"),
+            "the count carries the first dropped event id"
+        );
+        assert!(extracted.writes.is_empty(), "no write can be recorded without a path");
+
+        let model = WorldModel::build(&input(&malformed, Vec::new(), &[], &[], Vec::new()));
+        let risk = model
+            .risks
+            .iter()
+            .find(|risk| risk.label.contains("could not be attributed"))
+            .expect("issue #140: an unattributable write surfaces as a risk entry");
+        assert_eq!(
+            risk.label, "3 write event(s) could not be attributed — freshness may be overstated",
+            "the entry is bounded and names the non-zero count"
+        );
+        assert_eq!(
+            risk.ref_id, "ev-no-input",
+            "the entry references the first dropped event, never prose"
+        );
+        assert!(model.facts.is_empty(), "an unattributable write derives no fact");
+
+        let well_formed =
+            vec![event(WhiteboardKind::WriteApplied, "ev-ok", 10, write_applied("src/a.rs"))];
+        let extracted = extract_writes_and_facts(&well_formed);
+        assert_eq!(extracted.unattributed_writes, 0, "a well-formed write is attributed");
+        assert!(extracted.first_unattributed.is_none(), "nothing was dropped");
+
+        let model = WorldModel::build(&input(&well_formed, Vec::new(), &[], &[], Vec::new()));
+        assert!(
+            !model.risks.iter().any(|risk| risk.label.contains("could not be attributed")),
+            "well-formed input produces no attribution risk"
+        );
+        assert_eq!(model.facts.len(), 1, "the attributed write still derives its fact");
+    }
+
+    /// Issue #140 acceptance: only dropped WRITE events raise the entry —
+    /// every other kind (including a failed execution and a rejected write)
+    /// stays ignored WITHOUT a warning, the project's log-compat convention.
+    #[test]
+    fn non_write_event_kinds_never_raise_an_attribution_risk() {
+        let events = vec![
+            event(WhiteboardKind::Finding, "ev-find", 10, serde_json::json!({"summary": "s"})),
+            event(
+                WhiteboardKind::DesignDoc,
+                "ev-doc",
+                20,
+                serde_json::json!({"proposed_files": ["a.rs"]}),
+            ),
+            event(WhiteboardKind::Failure, "ev-fail", 30, serde_json::json!({"error": "boom"})),
+            event(
+                WhiteboardKind::WriteRejected,
+                "ev-rejected",
+                40,
+                write_applied("src/rejected.rs"),
+            ),
+            event(
+                WhiteboardKind::ToolExecuted,
+                "ev-tool-failed",
+                50,
+                serde_json::json!({"tool": "edit_file", "args": {"path": "src/a.rs"}, "success": false}),
+            ),
+            event(WhiteboardKind::MemoryFact, "ev-memory", 60, serde_json::json!({"note": "n"})),
+        ];
+        let extracted = extract_writes_and_facts(&events);
+        assert_eq!(
+            extracted.unattributed_writes, 0,
+            "non-write kinds and non-applied writes are never counted as unattributed"
+        );
+        let model = WorldModel::build(&input(&events, Vec::new(), &[], &[], Vec::new()));
+        assert!(
+            !model.risks.iter().any(|risk| risk.label.contains("could not be attributed")),
+            "unknown/ignored kinds stay silent — no attribution risk"
+        );
     }
 }
