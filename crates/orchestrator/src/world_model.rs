@@ -3200,6 +3200,7 @@ mod tests {
                 needed: vec![hostile.clone()],
                 opened_journal_len: 0,
                 opened_ref: None,
+                subject_decision_id: None,
                 opened_at_ms: 0,
                 cycles_open: 1,
                 state: QuestionState::Open,
