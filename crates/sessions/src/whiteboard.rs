@@ -27,6 +27,7 @@
 use serde::{Deserialize, Serialize};
 use sqlx::query_as;
 use sqlx::AssertSqlSafe;
+use std::collections::BTreeMap;
 
 use crate::SessionError;
 
@@ -209,6 +210,148 @@ pub struct NewWhiteboardEvent {
     pub pre_image_hash: Option<String>,
     /// Unix epoch milliseconds (UTC).
     pub created_at: i64,
+}
+
+// ---------------------------------------------------------------------------
+// Shared payload shapes the projections read (issue #136)
+// ---------------------------------------------------------------------------
+//
+// Three whiteboard payloads carry the data the pure world-model builder
+// (`concerto-orchestrator::world_model`) projects into bounded labels: a
+// `Finding`'s text, the `WriteApplied` written path, and a `ToolExecuted`'s
+// tool/args/success/paths. BOTH sides of that contract live here — the
+// writers that append these events build their payloads with
+// [`consult_finding_payload`] / [`write_applied_payload`], and the builder
+// reads them back through [`finding_text`] / [`write_applied_path`] /
+// [`tool_executed_view`] — so a key rename is one edit with failing contract
+// tests instead of a silent read-time fallback. That is exactly the #136
+// defect: the only consultative `Finding` writer keyed its text `findings`,
+// the builder read `summary`/`content`, and every consultative finding
+// rendered as `"finding recorded"` — which then deduped distinct findings
+// into one shared-label assumption.
+//
+// The accessors are total and additive: an unknown or pre-#136 payload
+// yields `None` / an empty view and the CALLER keeps its own explicit,
+// observable fallback (nothing is dropped silently, nothing is validated
+// against a schema — historical rows must keep reading).
+
+/// `Finding` payload key carrying the finding text written by the
+/// consultative writer ([`consult_finding_payload`]). `summary` and
+/// `content` stay accepted aliases for Findings written before #136 or by
+/// other producers.
+const FINDING_TEXT_KEY: &str = "findings";
+const FINDING_SUMMARY_KEY: &str = "summary";
+const FINDING_CONTENT_KEY: &str = "content";
+
+/// `WriteApplied` payload key carrying the write tool's input object; the
+/// written path is that object's `path` field (the write tools' argument).
+const WRITE_INPUT_KEY: &str = "input";
+/// The path field name shared by a tool input object and an observed-path
+/// record (`ToolExecuted` payload rows).
+const PATH_KEY: &str = "path";
+
+/// The text a `Finding` label should carry: the consultative writer's
+/// `findings` first (#136), then the legacy `summary`/`content` aliases.
+/// `None` when the payload holds no string text — the caller keeps its own
+/// fallback rather than the fact being dropped.
+#[must_use]
+pub fn finding_text(payload: &serde_json::Value) -> Option<&str> {
+    [FINDING_TEXT_KEY, FINDING_SUMMARY_KEY, FINDING_CONTENT_KEY]
+        .iter()
+        .find_map(|key| payload.get(*key).and_then(serde_json::Value::as_str))
+}
+
+/// Build the payload of the consultative `Finding` the coordinator appends
+/// for a consultation (issue #59, #136): `{ consultative, question, findings,
+/// supporting_evidence_ids, hypothesis_id }`. `question` arrives already
+/// bounded by the caller; the world model reads `findings` back through
+/// [`finding_text`], which is why both sides share the `findings` key.
+#[must_use]
+pub fn consult_finding_payload(
+    question: &str,
+    findings: &str,
+    supporting_evidence_ids: &[String],
+    hypothesis_id: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "consultative": true,
+        "question": question,
+        FINDING_TEXT_KEY: findings,
+        "supporting_evidence_ids": supporting_evidence_ids,
+        "hypothesis_id": hypothesis_id,
+    })
+}
+
+/// Build the payload of the write gate's `WriteApplied` record (issue #136):
+/// `{ tool, input, policy_verdict: "allow", pre_images }`. An applied write
+/// is by definition an allowed one; [`write_applied_path`] reads the written
+/// path back from `input.path`, sharing the `input` key with this
+/// builder so writer and reader cannot drift apart silently.
+#[must_use]
+pub fn write_applied_payload(
+    tool: &str,
+    input: &serde_json::Value,
+    pre_images: &BTreeMap<String, String>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "tool": tool,
+        WRITE_INPUT_KEY: input,
+        "policy_verdict": "allow",
+        "pre_images": pre_images,
+    })
+}
+
+/// The path a `WriteApplied` event wrote (`input.path`, the write gate's
+/// shape) — what the world model's verified write facts and artifact
+/// attribution read. `None` when the payload carries no path: the caller
+/// decides (the builder skips that row visibly; it never fabricates a path).
+#[must_use]
+pub fn write_applied_path(payload: &serde_json::Value) -> Option<&str> {
+    payload
+        .get(WRITE_INPUT_KEY)
+        .and_then(|input| input.get(PATH_KEY))
+        .and_then(serde_json::Value::as_str)
+}
+
+/// What the world model reads from a `ToolExecuted` payload (issue #136):
+/// the tool name, its canonical arguments, the success flag and the observed
+/// paths — the fields its verified tool facts derive from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolExecutedView<'a> {
+    /// The tool name; `None` when the payload carries no usable name.
+    pub tool: Option<&'a str>,
+    /// The canonical arguments (`Value::Null` when the payload has none).
+    pub args: &'a serde_json::Value,
+    /// Whether the execution succeeded — only successes project to facts.
+    pub success: bool,
+    /// The observed paths, in payload order.
+    pub paths: Vec<&'a str>,
+}
+
+/// The `args` stand-in for a payload that carries none — a view sentinel
+/// only, never written back to the log.
+static NO_TOOL_ARGS: serde_json::Value = serde_json::Value::Null;
+
+/// Read the world-model fields of a `ToolExecuted` payload. Total: any
+/// payload shape yields a view (`success` is `false` unless the payload says
+/// so, paths default empty), so an unreadable field degrades to "no fact" at
+/// the caller instead of a panic or a fabricated observation.
+#[must_use]
+pub fn tool_executed_view(payload: &serde_json::Value) -> ToolExecutedView<'_> {
+    ToolExecutedView {
+        tool: payload.get("tool").and_then(serde_json::Value::as_str),
+        args: payload.get("args").unwrap_or(&NO_TOOL_ARGS),
+        success: payload.get("success").and_then(serde_json::Value::as_bool) == Some(true),
+        paths: payload
+            .get("paths")
+            .and_then(serde_json::Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| row.get(PATH_KEY).and_then(serde_json::Value::as_str))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
 }
 
 /// Cursor options for [`load_whiteboard_events`] — the per-subscriber
@@ -1562,5 +1705,86 @@ mod tests {
         let full = replay_whiteboard_tail_excluding(&pool, e1.gate_seq, &[]).await.expect("full");
         assert_eq!(full.len(), 2);
         let _ = e1;
+    }
+
+    // -----------------------------------------------------------------------
+    // Shared payload shapes (issue #136) — writer/reader contract tests.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn finding_text_prefers_consultative_findings_and_keeps_legacy_aliases() {
+        let cited = vec!["ev-1".to_owned(), "ev-2".to_owned()];
+        let payload =
+            consult_finding_payload("why?", "the lexer drops trailing commas", &cited, Some("h1"));
+
+        // The consultative writer's `findings` key is read back verbatim.
+        assert_eq!(finding_text(&payload), Some("the lexer drops trailing commas"));
+        assert_eq!(payload["consultative"], json!(true));
+        assert_eq!(payload["question"], json!("why?"));
+        assert_eq!(payload["supporting_evidence_ids"], json!(["ev-1", "ev-2"]));
+        assert_eq!(payload["hypothesis_id"], json!("h1"));
+
+        // Pre-#136 shapes keep reading: `summary`, then `content`.
+        assert_eq!(finding_text(&json!({"summary": "legacy"})), Some("legacy"));
+        assert_eq!(finding_text(&json!({"content": "older"})), Some("older"));
+        assert_eq!(
+            finding_text(&json!({"summary": "a", "content": "b"})),
+            Some("a"),
+            "first matching key wins, summary before content"
+        );
+
+        // No usable string: None — the caller supplies its own fallback and
+        // never silently drops the fact.
+        assert_eq!(finding_text(&json!({"summary": 7})), None);
+        assert_eq!(finding_text(&json!({})), None);
+    }
+
+    #[test]
+    fn write_applied_payload_reads_back_through_write_applied_path() {
+        let input = json!({"op": "write", "path": "notes.md", "content": "x"});
+        let pre_images = BTreeMap::from([("notes.md".to_owned(), "hash-1".to_owned())]);
+        let payload = write_applied_payload("filesystem", &input, &pre_images);
+
+        // Round-trip: builder shape → accessor.
+        assert_eq!(write_applied_path(&payload), Some("notes.md"));
+        assert_eq!(payload["tool"], json!("filesystem"));
+        assert_eq!(payload["input"], input);
+        assert_eq!(payload["policy_verdict"], json!("allow"));
+        assert_eq!(payload["pre_images"], json!({"notes.md": "hash-1"}));
+
+        // Missing path (or missing input entirely): None, never a fabricated
+        // path — the builder decides how to project such a row.
+        assert_eq!(write_applied_path(&json!({"input": {"op": "read"}})), None);
+        assert_eq!(write_applied_path(&json!({"tool": "filesystem"})), None);
+        assert_eq!(write_applied_path(&json!({})), None);
+    }
+
+    #[test]
+    fn tool_executed_view_reads_tool_success_args_and_paths() {
+        let payload = json!({
+            "tool": "shell",
+            "args": {"command": "cargo test"},
+            "success": true,
+            "paths": [{"path": "src/lib.rs"}, {"other": "ignored"}, {"path": "src/main.rs"}],
+        });
+        let view = tool_executed_view(&payload);
+        assert_eq!(view.tool, Some("shell"));
+        assert_eq!(view.args, &json!({"command": "cargo test"}));
+        assert!(view.success, "success: true is honoured");
+        assert_eq!(view.paths, vec!["src/lib.rs", "src/main.rs"], "path rows in order");
+
+        // Failure and degenerate payloads are total views, not panics.
+        let failed_payload = json!({"tool": "shell", "success": false});
+        let failed = tool_executed_view(&failed_payload);
+        assert_eq!(failed.tool, Some("shell"));
+        assert!(!failed.success);
+        assert!(failed.paths.is_empty());
+
+        let empty_payload = json!({});
+        let empty = tool_executed_view(&empty_payload);
+        assert_eq!(empty.tool, None);
+        assert_eq!(empty.args, &json!(null), "missing args reads as Null");
+        assert!(!empty.success);
+        assert!(empty.paths.is_empty());
     }
 }
