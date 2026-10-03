@@ -77,6 +77,17 @@
 //! Unresolved-question rules (fed ONLY from existing signals):
 //! - **Q-OPEN-PROBLEM**: a failure diagnosis requiring replanning or a
 //!   non-retryable, unviable-retry one opens an `OpenProblem` question.
+//!   Its identity subject is `code:evidence` PLUS the diagnosis's
+//!   `decision_id` when it carried one: the same code+evidence recurring
+//!   under a DIFFERENT dispatch decision is a NEW question (a resolved
+//!   one never masks a later failure), the SAME decision still dedupes
+//!   (Q-DEDUPE/Q-RESOLVE-STAY), and an unlinked diagnosis keeps the plain
+//!   `code:evidence` subject — checkpointed unlinked questions keep their
+//!   ids and nothing migrates. The `code` and `evidence` parts have their
+//!   delimiters escaped IN THE KEY INPUT ONLY (see `escape_subject_part`),
+//!   so evidence ending in `:{decision_id}` can never hash to the linked
+//!   question's key; labels, stored evidence and the recorded
+//!   `subject_decision_id` keep their exact bytes.
 //! - **Q-OPEN-MISSING**: a journal decision stood `Rejected` opens a
 //!   `MissingEvidence` question (the work needs a corrected decision).
 //! - **Q-OPEN-AMBIGUOUS**: a stale pending dispatch decision opens an
@@ -883,11 +894,29 @@ fn extract_grounded_by(payload: &serde_json::Value) -> Vec<String> {
 
 /// Stable question identity from kind + subject: the same underlying
 /// question keeps the same id forever (Q-DEDUPE) and a resolved standing
-/// entry blocks re-opening (Q-RESOLVE-STAY).
+/// entry blocks re-opening (Q-RESOLVE-STAY). The subject is composed by
+/// each feed site — an `OpenProblem` subject carries the diagnosis's
+/// `decision_id` when the surface knew one (see the feeding pass), so a
+/// resolution scoped to one dispatch decision never masks another's
+/// recurrence.
 fn question_key(kind: QuestionKind, subject: &str) -> String {
     let raw = format!("{kind:?}:{subject}");
     let digest = blake3::hash(raw.as_bytes()).to_hex();
     format!("q-{}", &digest[..12])
+}
+
+/// Escape one `OpenProblem` subject part for the KEY INPUT of
+/// [`question_key`] only: the `:` that composes `code:evidence[:decision_id]`
+/// must never be readable out of a part itself, or UNLINKED evidence ending
+/// in `:{decision_id}` would compose the byte-identical subject — and so hash
+/// to the SAME key — as the LINKED diagnosis carrying that decision id (one
+/// entry then masked the other). Percent-style, `'%'` first and then `':'`,
+/// keeps the mapping injective, so distinct parts still get distinct keys,
+/// and a part with neither character is returned unchanged — the ordinary
+/// colon-free id hashes byte for byte and nothing migrates. Labels, stored
+/// evidence and `subject_decision_id` never pass through here.
+fn escape_subject_part(part: &str) -> String {
+    part.replace('%', "%25").replace(':', "%3A")
 }
 
 /// The open-question overflow order under the cap: ambiguous recovery
@@ -2200,7 +2229,45 @@ fn resolve_and_feed_questions(input: &WorldModelInput<'_>) -> Vec<UnresolvedQues
         if !(diagnosis.replan_required || (!diagnosis.retryable && !diagnosis.same_agent_viable)) {
             continue;
         }
-        let subject = format!("{}:{}", diagnosis.code, bounded(diagnosis.evidence.clone()));
+        // The identity subject is `code:evidence`, PLUS the dispatch decision
+        // the diagnosis attributed the failure to when it knew one. Without
+        // the decision the key masked recurrence: a failure resolved through
+        // an artifact touch later BLOCKED the same code+evidence from
+        // reopening under a DIFFERENT dispatch decision — Q-RESOLVE-STAY
+        // matched the resolved entry by key and the new failure stayed
+        // invisible. With it, the same decision across cycles still dedupes
+        // (Q-DEDUPE) and a resolved entry still blocks re-opening for THAT
+        // decision (Q-RESOLVE-STAY), while another decision's recurrence is
+        // a NEW question. A diagnosis with no linkage keeps the exact old
+        // `code:evidence` subject, so checkpointed unlinked questions keep
+        // their ids byte for byte and nothing migrates.
+        // Transitional (one bounded overlap): an OPEN question keyed before
+        // this change — no decision in the subject, but the diagnosis already
+        // carried one — stands ALONGSIDE the newly keyed linked question for
+        // the same code+evidence until it resolves by its own rule; the old
+        // id is never re-keyed or migrated.
+        //
+        // Delimiter safety: `question_key` hashes the composed subject as-is,
+        // so a raw `:` inside the code or evidence could be read back as the
+        // part boundary — unlinked evidence ending in `:{decision_id}`
+        // composed the byte-identical subject as the LINKED diagnosis with
+        // that decision id and hashed to its key (a resolution scoped to one
+        // dispatch masked the other failure). The parts are escaped for the
+        // KEY INPUT ONLY (the question text below and the recorded evidence
+        // keep their exact bytes): the unlinked subject then has exactly two
+        // colon-separated segments and the linked one at least three, so they
+        // can no longer collide — whatever the decision id itself contains —
+        // and colon-free parts hash byte for byte as before. Transitional,
+        // same shape as above: a checkpointed question whose code or evidence
+        // DID carry a `:` or `%` is re-keyed once on the next rebuild, and its
+        // old entry stands alongside the new one until it resolves or ages out
+        // of the cap.
+        let code = escape_subject_part(&diagnosis.code);
+        let evidence = escape_subject_part(&bounded(diagnosis.evidence.clone()));
+        let subject = match diagnosis.decision_id.as_deref() {
+            Some(decision_id) => format!("{code}:{evidence}:{decision_id}"),
+            None => format!("{code}:{evidence}"),
+        };
         feed_or_advance(
             QuestionKind::OpenProblem,
             subject,
@@ -2517,6 +2584,17 @@ mod tests {
             decision_id: None,
             artifact_path: None,
         }
+    }
+
+    /// The LINKED diagnosis shape: the same code+evidence as [`diagnosis`],
+    /// attributed to a dispatch decision by a surface that knew the linkage
+    /// (`call_specialist` failure/settle paths) — the shape whose question
+    /// key must carry the decision id.
+    fn linked_diagnosis(decision_id: &str) -> FailureDiagnosis {
+        let mut linked = diagnosis("repl-required", true, false);
+        linked.decision_id = Some(decision_id.to_owned());
+        linked.artifact_path = Some("src/x.rs".to_owned());
+        linked
     }
 
     fn observation(
@@ -3162,6 +3240,233 @@ mod tests {
             "a settled replacement touching the artifact resolves it"
         );
         assert_eq!(resolved_touch.resolved_by.as_deref(), Some("d-replacement"));
+    }
+
+    /// Review (question key masks recurrence): the identity subject was
+    /// `code:evidence` with NO decision id, so a failure resolved through an
+    /// artifact touch later BLOCKED the same code+evidence from reopening
+    /// under a DIFFERENT dispatch decision — Q-RESOLVE-STAY matched the
+    /// resolved entry by key and the new failure stayed invisible. The
+    /// decision id now rides the subject: a resolved d1 question never masks
+    /// the d3 recurrence.
+    #[test]
+    fn resolved_question_does_not_mask_recurrence_under_a_new_decision() {
+        // Cycle 1: the failure is attributed to dispatch d1 and opens one
+        // LINKED question (keyed on code+evidence+d1).
+        let first_diagnoses = vec![linked_diagnosis("d1")];
+        let first = WorldModel::build(&input(&[], Vec::new(), &[], &first_diagnoses, Vec::new()));
+        let opened = first
+            .questions
+            .iter()
+            .find(|q| q.kind == QuestionKind::OpenProblem && q.is_open())
+            .expect("the failure opened one question");
+        assert_eq!(opened.subject_decision_id.as_deref(), Some("d1"));
+
+        // Cycle 2: settled replacement work touching the blocked artifact
+        // resolves it (Q-RESOLVE-LINKED), and re-feeding the SAME d1
+        // diagnosis keeps it resolved (Q-RESOLVE-STAY).
+        let resolving = vec![settled_with(
+            "d-retry-1",
+            crate::decisions::DecisionKind::Retry,
+            &["src/x.rs"],
+            None,
+        )];
+        let second = WorldModel::build(&input(
+            &[],
+            Vec::new(),
+            &resolving,
+            &first_diagnoses,
+            first.questions.clone(),
+        ));
+        let resolved = second.questions.iter().find(|q| q.id == opened.id).expect("kept");
+        assert_eq!(resolved.state, QuestionState::Resolved, "the artifact touch resolves it");
+        assert_eq!(
+            second.open_question_count(),
+            0,
+            "Q-RESOLVE-STAY: the same decision never re-opens it"
+        );
+
+        // Cycle 3: the SAME code+evidence recurs under dispatch d3 — a NEW
+        // failure the resolved d1 entry must NOT mask.
+        let later_diagnoses = vec![linked_diagnosis("d3")];
+        let third = WorldModel::build(&input(
+            &[],
+            Vec::new(),
+            &resolving,
+            &later_diagnoses,
+            second.questions.clone(),
+        ));
+        let reopened = third
+            .questions
+            .iter()
+            .find(|q| q.kind == QuestionKind::OpenProblem && q.is_open())
+            .expect("the recurrence under a NEW decision opens a NEW question");
+        assert_ne!(
+            reopened.id, opened.id,
+            "the dispatch decision is part of the question key, so d1's resolution \
+             cannot mask d3's failure"
+        );
+        assert_eq!(reopened.subject_decision_id.as_deref(), Some("d3"));
+        assert_eq!(third.open_question_count(), 1, "the new failure is visible");
+    }
+
+    /// Q-DEDUPE holds for the LINKED shape: the same code+evidence under the
+    /// SAME decision across rebuild cycles is ONE standing question (one id,
+    /// growing age), and once resolved that same decision never re-opens it
+    /// (Q-RESOLVE-STAY) — scoping the key to the decision changed neither.
+    #[test]
+    fn linked_question_same_decision_still_dedupes_across_cycles() {
+        let diagnoses = vec![linked_diagnosis("d1")];
+        let first = WorldModel::build(&input(&[], Vec::new(), &[], &diagnoses, Vec::new()));
+        let opened = first
+            .questions
+            .iter()
+            .find(|q| q.kind == QuestionKind::OpenProblem && q.is_open())
+            .expect("the failure opened one question");
+        assert_eq!(opened.cycles_open, 1, "a fresh question starts at age 1");
+
+        // The same signal again: one standing entry, older — not two.
+        let second =
+            WorldModel::build(&input(&[], Vec::new(), &[], &diagnoses, first.questions.clone()));
+        let standing = second
+            .questions
+            .iter()
+            .find(|q| q.kind == QuestionKind::OpenProblem && q.is_open())
+            .expect("the question persists while unresolved");
+        assert_eq!(opened.id, standing.id, "Q-DEDUPE keeps one id per question");
+        assert_eq!(standing.cycles_open, 2, "the standing question ages, not duplicates");
+        assert_eq!(second.open_question_count(), 1, "no duplicated question");
+
+        // Related settled work resolves it, and the SAME decision keeps it
+        // resolved from there on.
+        let resolving = vec![settled_with(
+            "d-retry-1",
+            crate::decisions::DecisionKind::Retry,
+            &["src/x.rs"],
+            None,
+        )];
+        let third = WorldModel::build(&input(
+            &[],
+            Vec::new(),
+            &resolving,
+            &diagnoses,
+            second.questions.clone(),
+        ));
+        let resolved = third.questions.iter().find(|q| q.id == opened.id).expect("kept");
+        assert_eq!(resolved.state, QuestionState::Resolved, "the artifact touch resolves it");
+        let fourth = WorldModel::build(&input(
+            &[],
+            Vec::new(),
+            &resolving,
+            &diagnoses,
+            third.questions.clone(),
+        ));
+        assert!(
+            fourth.questions.iter().all(|q| q.state == QuestionState::Resolved),
+            "Q-RESOLVE-STAY: the same decision never re-opens a resolved question"
+        );
+        assert_eq!(fourth.open_question_count(), 0);
+    }
+
+    /// Golden id: an UNLINKED diagnosis keys exactly as it did before the
+    /// decision id joined the subject — `OpenProblem` + `code:evidence` — so
+    /// checkpointed unlinked questions keep their ids byte for byte and
+    /// nothing migrates (no transitional duplicate for them either).
+    #[test]
+    fn unlinked_diagnosis_question_key_is_unchanged() {
+        let diagnoses = vec![diagnosis("repl-required", true, false)];
+        let model = WorldModel::build(&input(&[], Vec::new(), &[], &diagnoses, Vec::new()));
+        let opened = model
+            .questions
+            .iter()
+            .find(|q| q.kind == QuestionKind::OpenProblem && q.is_open())
+            .expect("the failure opened one question");
+        assert_eq!(opened.subject_decision_id, None, "no linkage: the key carries no decision");
+        let golden =
+            question_key(QuestionKind::OpenProblem, "repl-required:evidence for repl-required");
+        assert_eq!(
+            golden, "q-03d6767a3a26",
+            "the unlinked subject hashes to the pre-change id byte for byte"
+        );
+        assert_eq!(opened.id, golden, "the question is keyed by the golden subject");
+    }
+
+    /// Delimiter ambiguity: the subject is composed as
+    /// `code:evidence[:decision_id]` and the key hashed it as-is, so an
+    /// UNLINKED diagnosis whose evidence ends in `:{decision_id}` composed
+    /// the byte-identical subject — and hashed to the SAME key — as the
+    /// LINKED diagnosis carrying that decision id, masking one failure with
+    /// the other. The parts are escaped in the KEY INPUT only: the two get
+    /// distinct keys and both stay visible, while the stored label keeps its
+    /// exact `:` text.
+    #[test]
+    fn unlinked_evidence_ending_in_decision_id_does_not_collide() {
+        // Same code; the unlinked evidence deliberately ends in the linked
+        // diagnosis's `:{decision_id}`.
+        let mut unlinked = diagnosis("repl-required", true, false);
+        unlinked.evidence = "evidence for repl-required:d-1".to_owned();
+        let linked = linked_diagnosis("d-1");
+
+        // The collision itself: before the escape BOTH diagnoses composed
+        // this exact subject out of different parts.
+        let colliding =
+            question_key(QuestionKind::OpenProblem, "repl-required:evidence for repl-required:d-1");
+        assert_eq!(
+            question_key(
+                QuestionKind::OpenProblem,
+                &format!("repl-required:{}:d-1", linked.evidence)
+            ),
+            colliding,
+            "the raw compositions really were one string before the escape"
+        );
+
+        let diagnoses = vec![unlinked, linked];
+        let model = WorldModel::build(&input(&[], Vec::new(), &[], &diagnoses, Vec::new()));
+        let open: Vec<&UnresolvedQuestion> =
+            model.questions.iter().filter(|q| q.kind == QuestionKind::OpenProblem).collect();
+        assert_eq!(open.len(), 2, "neither failure masks the other");
+        assert_eq!(model.open_question_count(), 2, "both are visible");
+        let unlinked_question = open
+            .iter()
+            .copied()
+            .find(|q| q.subject_decision_id.is_none())
+            .expect("the unlinkable failure stands");
+        let linked_question = open
+            .iter()
+            .copied()
+            .find(|q| q.subject_decision_id.as_deref() == Some("d-1"))
+            .expect("the linked failure stands");
+        assert_ne!(
+            unlinked_question.id, linked_question.id,
+            "an evidence suffix reading as the decision segment never shares its key"
+        );
+        assert_ne!(
+            unlinked_question.id, colliding,
+            "the unlinked key is no longer the linked diagnosis's key"
+        );
+        assert_eq!(
+            linked_question.id, colliding,
+            "the linked subject's own key is unchanged — its parts carry no delimiter"
+        );
+        assert_eq!(
+            unlinked_question.id,
+            question_key(
+                QuestionKind::OpenProblem,
+                "repl-required:evidence for repl-required%3Ad-1"
+            ),
+            "the unlinked part is escaped in the key input"
+        );
+        // The escape is key-input only: the human-facing text is untouched.
+        assert!(
+            unlinked_question.question.contains("evidence for repl-required:d-1"),
+            "the label keeps the raw evidence: {}",
+            unlinked_question.question
+        );
+        assert!(
+            !unlinked_question.question.contains("%3A"),
+            "the escape never reaches the label: {}",
+            unlinked_question.question
+        );
     }
 
     /// Issue #135 (transitional): a `MissingEvidence` question restored from
