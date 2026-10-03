@@ -387,7 +387,9 @@ impl concerto_core::traits::tool::Tool for FilesystemTool {
                     });
                 }
                 // First try the in-memory VFS; if not found, load from disk.
-                let content = if vfs.exists(&path) {
+                let content = if let Some(max_bytes) = input.get("max_bytes").and_then(serde_json::Value::as_u64) {
+                    vfs.read_bounded(&path, usize::try_from(max_bytes).unwrap_or(usize::MAX))?
+                } else if vfs.exists(&path) {
                     vfs.read(&path)?
                 } else {
                     vfs.read_disk(&path).map_err(|error| {

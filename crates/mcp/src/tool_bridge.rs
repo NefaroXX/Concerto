@@ -129,9 +129,15 @@ impl Tool for McpTool {
             map.remove("timeout_secs");
         }
 
-        let call = {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        let exchange = async {
             let mut client = self.client.lock().await;
             client.call_tool(&self.tool.name, arguments, timeout_secs, cancel.clone()).await
+        };
+        let call = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(McpError::Cancelled),
+            result = tokio::time::timeout_at(deadline, exchange) => result.unwrap_or_else(|_| Err(McpError::Timeout { method: "tools/call".into() })),
         };
         match call {
             Err(McpError::Cancelled) => Err(ToolError::Cancelled),

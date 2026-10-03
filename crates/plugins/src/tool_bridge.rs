@@ -17,13 +17,7 @@ pub struct PluginTool {
     plugin_id: String,
     plugin: Arc<Mutex<ActivePlugin>>,
     tool_name: String,
-    /// Registry-facing name. Defaults to the friendly [`Self::tool_name`];
-    /// namespaced (`plugin:<plugin_id>:<name>`) whenever the friendly name is
-    /// already taken at registration time, is a reserved
-    /// grant-sensitive/orchestration name, or claims the `plugin:`/`mcp:`
-    /// namespace, so a locally installed plugin can neither inherit the
-    /// name-keyed grant treatment of a builtin tool, squat the coordinator's
-    /// dispatch tool, nor impersonate another registration's namespace.
+    /// Stable plugin namespace, independent of builtin registration order.
     registered_name: String,
     tool_description: String,
     /// JSON Schema for this tool's input parameters (from plugin manifest).
@@ -42,10 +36,10 @@ impl PluginTool {
         manifest_capabilities: CapabilitySet,
     ) -> Self {
         Self {
+            registered_name: format!("plugin:{plugin_id}:{tool_name}"),
             plugin_id,
             plugin,
-            tool_name: tool_name.clone(),
-            registered_name: tool_name,
+            tool_name,
             tool_description,
             input_schema,
             manifest_capabilities,
@@ -93,7 +87,10 @@ impl Tool for PluginTool {
         if cancel.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
-        let mut plugin = self.plugin.lock().await;
+        let mut plugin = tokio::select! {
+            _ = cancel.cancelled() => return Err(ToolError::Cancelled),
+            plugin = self.plugin.lock() => plugin,
+        };
         if cancel.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
@@ -141,85 +138,18 @@ impl std::fmt::Debug for PluginTool {
 // Helper to register plugin tools into a ToolRegistry
 // ---------------------------------------------------------------------------
 
-/// Tool-name namespace prefixes a plugin must never register under verbatim:
-/// a declaration literally named `plugin:<id>:<name>` or `mcp:<id>:<name>`
-/// would impersonate the namespacing contract of another plugin or of an MCP
-/// server (ADR-43) — inheriting any prefix-keyed policy treatment of that
-/// namespace or colliding with an existing namespaced registration. Such
-/// declared names are forced under the declaring plugin's own namespace
-/// instead (`plugin:<declaring-id>:<declared-name>`), which cannot collide
-/// and carries no impersonated head prefix (F2, 2026-09-14).
-const RESERVED_NAME_PREFIXES: &[&str] = &["plugin:", "mcp:"];
-
-/// Tool names that are grant-sensitive or orchestration-owned and can never be
-/// exposed under a plugin's own (unnamespaced) declaration:
-///
-/// - `call_specialist`: the coordinator's specialist-dispatch tool
-///   (orchestrator `CALL_SPECIALIST_TOOL`) — a WASM plugin registering this
-///   exact name would inherit the name-keyed treatment the registry/policy
-///   grant that orchestration name;
-/// - `filesystem` / `git` / `shell`: the tools crate's builtin tools — a
-///   squatting declaration would inherit their grant treatment (and silently
-///   overwrite the builtin in the registry, since `ToolRegistry::register`
-///   replaces colliding entries);
-/// - `read` / `search` / `inspect` / `diagnose` / `diagnostics`: the
-///   observe-class inspector names of the core tier classifier
-///   (`authorization::is_observe`) — a plugin declaring one of these under
-///   its friendly name would get free Observe-Allow with no grant, so the
-///   namespaced form (`plugin:<id>:<name>`, which classifies like any
-///   unknown tool) is the only registration it gets (2026-09-11 hardening).
-const RESERVED_TOOL_NAMES: &[&str] = &[
-    "call_specialist",
-    "filesystem",
-    "git",
-    "shell",
-    "read",
-    "search",
-    "inspect",
-    "diagnose",
-    "diagnostics",
-];
-
-/// Decide the registry-facing name for one plugin tool: the friendly name when
-/// it is free, non-reserved, and claims no namespace (`plugin:`/`mcp:` prefix),
-/// otherwise `plugin:<plugin_id>:<name>`.
-///
-/// Option chosen for the 2026-09-11 name-squat guard: **conditional
-/// namespacing**, not a registry-level reserved-name guard. (a) The
-/// `plugin:<id>:`-on-conflict behavior is the documented contract of
-/// `PluginManager::register_tools` and mirrors the `mcp:<server_id>:<tool>`
-/// namespacing precedent (ADR-43). (b) A hard reject in
-/// `ToolRegistry::register` would cut through the same registration path the
-/// tools crate legitimately uses for the `filesystem`/`git`/`shell` builtins,
-/// turning a hardening knob into a core-registry invariant change. Here the
-/// builtins stay untouched and plugin tool discovering its name taken simply
-/// lands under its own namespace — the grant treatment keyed by the friendly
-/// name can never be inherited.
-///
-/// F2 (2026-09-14): a declaration whose name literally starts with
-/// `plugin:` or `mcp:` impersonates another registration's namespace, so it
-/// is force-namespaced under the declaring plugin's id — the resulting name
-/// (`plugin:<declaring-id>:<declared-name>`) can never collide with the
-/// impersonated form and carries no impersonated head prefix.
+/// Stable names keep policy and audit identity independent of discovery order.
 fn registered_name_for(
     tool_name: &str,
     plugin_id: &str,
-    registry: &concerto_core::types::ToolRegistry,
+    _registry: &concerto_core::types::ToolRegistry,
 ) -> String {
-    let conflict = RESERVED_NAME_PREFIXES.iter().any(|prefix| tool_name.starts_with(prefix))
-        || RESERVED_TOOL_NAMES.contains(&tool_name)
-        || registry.get(tool_name).is_some();
-    if conflict {
-        format!("plugin:{plugin_id}:{tool_name}")
-    } else {
-        tool_name.to_string()
-    }
+    format!("plugin:{plugin_id}:{tool_name}")
 }
 
 /// Register all tools from an ActivePlugin into the given ToolRegistry.
 ///
-/// Tool names are prefixed with `plugin:<plugin_id>:` if a conflict exists
-/// with existing tools, otherwise the friendly name is used.
+/// Every tool uses the stable `plugin:<plugin_id>:<tool>` identity.
 ///
 /// Returns the registry-facing names actually registered, so the caller's
 /// bookkeeping (info display, unregistration) matches the registry keys.
@@ -391,7 +321,7 @@ mod tests {
             vec![
                 "plugin:squat:call_specialist".to_string(),
                 "plugin:squat:filesystem".to_string(),
-                "weather".to_string(),
+                "plugin:squat:weather".to_string(),
             ],
             "reserved names must be namespaced; free names keep the friendly name"
         );
@@ -403,7 +333,7 @@ mod tests {
                 "filesystem".to_string(),
                 "plugin:squat:call_specialist".to_string(),
                 "plugin:squat:filesystem".to_string(),
-                "weather".to_string(),
+                "plugin:squat:weather".to_string(),
             ],
             "builtin filesystem must not be replaced by the plugin declaration"
         );
@@ -427,8 +357,8 @@ mod tests {
             &[descriptor("weather")],
             &mut registry,
         );
-        assert_eq!(registered, vec!["weather".to_string()]);
-        assert!(registry.get("git").is_some() && registry.get("weather").is_some());
+        assert_eq!(registered, vec!["plugin:calm:weather".to_string()]);
+        assert!(registry.get("git").is_some() && registry.get("plugin:calm:weather").is_some());
     }
 
     /// Observe-class inspector names (core authorization `is_observe`: `read`,
@@ -448,7 +378,7 @@ mod tests {
         );
         assert_eq!(
             registered,
-            vec!["plugin:squat:read".to_string(), "weather".to_string()],
+            vec!["plugin:squat:read".to_string(), "plugin:squat:weather".to_string()],
             "observe-class squat name must be namespaced; free names keep the friendly name"
         );
         assert!(
@@ -498,7 +428,7 @@ mod tests {
             vec![
                 "plugin:squat:mcp:srv:echo".to_string(),
                 "plugin:squat:plugin:other:read".to_string(),
-                "weather".to_string(),
+                "plugin:squat:weather".to_string(),
             ],
             "namespace-claiming names must be force-namespaced; free names keep the friendly name"
         );

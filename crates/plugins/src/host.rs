@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use wasmtime::{Engine, Store};
+use wasmtime::{Engine, Store, StoreLimits, StoreLimitsBuilder};
 
 use concerto_core::traits::policy::AuditLog;
 use concerto_core::traits::provider::LlmProvider;
@@ -71,6 +71,7 @@ impl PluginHost {
     /// Create a per-plugin store with default data.
     pub fn create_store(&self) -> Store<PluginStoreData> {
         let mut store = Store::new(&self.engine, PluginStoreData::default());
+        store.limiter(|data| &mut data.limits);
         if let Err(e) = store.set_fuel(Self::MAX_FUEL) {
             tracing::warn!("failed to set initial fuel: {e}");
         }
@@ -88,7 +89,7 @@ impl PluginHost {
     /// Every `interval_ms` the epoch is bumped by one; stores set their
     /// deadline to `EPOCH_DEADLINE`, so with the default 100 ms interval the
     /// budget is `EPOCH_DEADLINE * 100 ms` = `EPOCH_BUDGET_SECS` seconds.
-    /// The returned `JoinHandle` can be dropped to stop the ticker.
+    /// Abort the returned `JoinHandle` to stop the ticker; dropping it detaches the task.
     pub fn start_epoch_ticker(&self, interval_ms: u64) -> tokio::task::JoinHandle<()> {
         let engine = self.engine.clone();
         tokio::spawn(async move {
@@ -105,6 +106,8 @@ impl PluginHost {
 #[derive(Clone)]
 pub struct PluginStoreData {
     pub plugin_id: String,
+    pub limits: StoreLimits,
+    pub execution: PluginHostContext,
     pub granted_caps: GrantedCapabilities,
     pub event_bus: Option<tokio::sync::broadcast::Sender<Arc<serde_json::Value>>>,
     pub provider: Option<Arc<dyn LlmProvider>>,
@@ -134,6 +137,14 @@ impl Default for PluginStoreData {
     fn default() -> Self {
         Self {
             plugin_id: String::new(),
+            limits: StoreLimitsBuilder::new()
+                .memory_size(PluginHost::DEFAULT_MAX_MEMORY)
+                .table_elements(10_000)
+                .instances(1)
+                .memories(1)
+                .tables(1)
+                .build(),
+            execution: Arc::new(std::sync::RwLock::new(None)),
             granted_caps: GrantedCapabilities::default(),
             event_bus: None,
             provider: None,
@@ -183,3 +194,11 @@ mod tests {
         drop(store);
     }
 }
+
+/// Bound to a single run, with weak ownership to avoid the registry/plugin cycle.
+#[derive(Clone)]
+pub struct PluginExecutionContext {
+    pub executor: std::sync::Weak<concerto_core::ToolExecutor>,
+    pub session: concerto_core::types::SessionContext,
+}
+pub type PluginHostContext = Arc<std::sync::RwLock<Option<PluginExecutionContext>>>;

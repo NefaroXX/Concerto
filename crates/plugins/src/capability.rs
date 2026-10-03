@@ -264,6 +264,19 @@ pub trait CapabilityApprovalUI: Send + Sync {
     ) -> Result<Vec<GrantDecision>, PluginError>;
 }
 
+/// Runtime discovery never authorizes a new capability request.
+pub struct DenyUnapproved;
+#[async_trait::async_trait]
+impl CapabilityApprovalUI for DenyUnapproved {
+    async fn request(
+        &self,
+        _: &PluginManifest,
+        capabilities: &[CapabilityRequest],
+    ) -> Result<Vec<GrantDecision>, PluginError> {
+        Ok(vec![GrantDecision::Denied; capabilities.len()])
+    }
+}
+
 /// Default TTL for persistent capability grants (30 days, in seconds).
 const GRANT_TTL_SECS: u64 = 30 * 24 * 3600;
 
@@ -366,7 +379,8 @@ impl PersistedGrant {
     fn hash_mismatch(&self, wasm_hash: Option<&str>) -> bool {
         match (&self.manifest_hash, wasm_hash) {
             (Some(stored), Some(current)) => stored != current,
-            _ => false, // one or both None → no mismatch
+            (None, Some(_)) => true, // runtime activation requires a binary pin
+            _ => false,              // inspection without a current binary hash
         }
     }
 }
@@ -599,6 +613,17 @@ impl CapabilityManager {
         Ok(Self { grant_store })
     }
 
+    /// Reload persisted approvals before activation so another UI/process's revocation wins.
+    pub fn reload(&mut self) -> Result<(), PluginError> {
+        let directory = self
+            .grant_store
+            .path
+            .parent()
+            .ok_or_else(|| PluginError::InvalidManifest("invalid grant-store path".into()))?;
+        self.grant_store = CapGrantStore::open(directory)?;
+        Ok(())
+    }
+
     /// The standard capability-store data directory (`<data_dir>/concerto/
     /// plugins`), shared by callers that need the store path without opening
     /// a manager first (e.g. the Settings revoke helper).
@@ -626,6 +651,9 @@ impl CapabilityManager {
         manifest_hash: Option<String>,
     ) -> Result<Vec<GrantDecision>, PluginError> {
         let decisions = approval_ui.request(plugin, capabilities).await?;
+        if decisions.len() != capabilities.len() {
+            return Err(PluginError::CapabilityDenied("incomplete approval response".into()));
+        }
 
         for (i, decision) in decisions.iter().enumerate() {
             if let GrantDecision::GrantedPersistent = decision {

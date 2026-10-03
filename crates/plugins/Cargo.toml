@@ -20,7 +20,6 @@ wasmtime.workspace = true
 # General
 serde.workspace = true
 sha2 = "0.10"
-nix = { version = "0.31", default-features = false, features = ["signal"] }
 serde_json.workspace = true
 toml.workspace = true
 tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread"] }
@@ -29,11 +28,12 @@ thiserror.workspace = true
 async-trait.workspace = true
 camino.workspace = true
 dirs.workspace = true
-reqwest = { workspace = true, features = ["blocking"] }
+reqwest.workspace = true
 anyhow = "1"
 url = "2"
 futures = { workspace = true }
-tempfile = "3"
 
 [dev-dependencies]
+concerto-tools = { path = "../tools", version = "0.1.0" }
+tempfile = "3"
 wat = "1"

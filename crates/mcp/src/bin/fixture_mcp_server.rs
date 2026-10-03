@@ -21,6 +21,20 @@ use std::time::Duration;
 const PROTOCOL_VERSION: &str = "2025-11-25";
 
 fn main() {
+    if std::env::args().any(|arg| arg == "--worker") {
+        if let Ok(path) = std::env::var("FIXTURE_CHILD_PID_FILE") {
+            let _ = std::fs::write(path, std::process::id().to_string());
+        }
+        loop {
+            std::thread::park();
+        }
+    }
+    if std::env::var_os("FIXTURE_CHILD_PID_FILE").is_some() {
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = std::process::Command::new(exe).arg("--worker").spawn();
+        }
+    }
+
     if std::env::var("FIXTURE_CRASH_ON_START").as_deref() == Ok("1") {
         eprintln!("fixture-mcp-server: FIXTURE_CRASH_ON_START=1, exiting 1");
         std::process::exit(1);
@@ -57,6 +71,13 @@ fn main() {
                 continue;
             }
         };
+        if std::env::var("FIXTURE_STALL_STDIN").as_deref() == Ok("1")
+            && message.get("method").and_then(Value::as_str) == Some("notifications/initialized")
+        {
+            loop {
+                std::thread::park();
+            }
+        }
         let stdout = stdout.clone();
         let fixture_version = fixture_version.clone();
         std::thread::spawn(move || {
@@ -81,6 +102,19 @@ fn handle(message: Value, fixture_version: Option<&str>, reject_initialize: bool
     let method = message.get("method").and_then(Value::as_str)?;
     let id = message.get("id").cloned().unwrap_or(Value::Null);
     match method {
+        "fixture/diagnostics" => {
+            let secret = std::env::var("FIXTURE_TOKEN").unwrap_or_default();
+            Some(error_response(
+                &id,
+                -32603,
+                &format!("failure: {secret}"),
+                Some(json!({"nested":[secret]})),
+            ))
+        }
+        "fixture/env" => Some(ok_response(
+            &id,
+            json!({"value": message.get("params").and_then(|p| p.get("key")).and_then(Value::as_str).and_then(|key| std::env::var(key).ok())}),
+        )),
         "initialize" => {
             if reject_initialize {
                 return Some(error_response(

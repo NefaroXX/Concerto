@@ -1119,6 +1119,12 @@ impl McpConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         let mut seen = std::collections::HashSet::new();
         for server in &self.servers {
+            if let Some(env) = &server.env {
+                McpServerConfig::validate_env(env)?;
+            }
+            if server.command.trim().is_empty() {
+                return Err(ConfigError::InvalidValue("MCP command must not be empty".into()));
+            }
             if server.id.is_empty() {
                 return Err(ConfigError::InvalidValue("mcp.servers[].id must be non-empty".into()));
             }
@@ -1153,8 +1159,8 @@ pub struct McpServerConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
 
-    /// Extra environment variables for the child process. Secrets are never
-    /// stored in TOML (keyring integration is deferred).
+    /// Explicit environment overrides. Secret-like keys require `keyring:<account>`.
+    /// References resolve through CredentialStore only when launching the server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<BTreeMap<String, String>>,
 
@@ -1166,6 +1172,52 @@ pub struct McpServerConfig {
     /// enforced in the bridge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+}
+
+impl McpServerConfig {
+    pub fn validate_env(env: &BTreeMap<String, String>) -> Result<(), ConfigError> {
+        for (key, value) in env {
+            if key.trim().is_empty() || key.contains(['=', '\0']) || value.contains('\0') {
+                return Err(ConfigError::InvalidValue("Invalid MCP environment variable".into()));
+            }
+            let upper = key.to_ascii_uppercase();
+            let secret =
+                ["TOKEN", "SECRET", "PASSWORD", "API_KEY", "APIKEY", "CREDENTIAL", "AUTHORIZATION"]
+                    .iter()
+                    .any(|s| upper.contains(s));
+            if secret && !value.starts_with("keyring:") {
+                return Err(ConfigError::InvalidValue(format!(
+                    "MCP credential {key} requires a keyring: reference"
+                )));
+            }
+            if value.strip_prefix("keyring:").is_some_and(|key| key.trim().is_empty()) {
+                return Err(ConfigError::InvalidValue(
+                    "MCP keyring reference must not be empty".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+    pub fn resolved_env(
+        &self,
+        store: &crate::CredentialStore,
+    ) -> Result<BTreeMap<String, SecretString>, ConfigError> {
+        let env = self.env.clone().unwrap_or_default();
+        Self::validate_env(&env)?;
+        env.into_iter()
+            .map(|(key, value)| {
+                let value = match value.strip_prefix("keyring:") {
+                    Some(account) => store.get_secret(account).map_err(|_| {
+                        ConfigError::InvalidValue(format!(
+                            "MCP credential for {key} is unavailable"
+                        ))
+                    })?,
+                    None => SecretString::from(value),
+                };
+                Ok((key, value))
+            })
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2431,6 +2483,28 @@ fn default_spend_cap_multiplier() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Verifies credential-like MCP values require references and malformed references fail closed.
+    #[test]
+    fn mcp_credentials_are_references_in_serialized_config() {
+        let mut env = BTreeMap::from([("API_TOKEN".into(), "synthetic-secret".into())]);
+        assert!(McpServerConfig::validate_env(&env).is_err());
+        env.insert("API_TOKEN".into(), "keyring:".into());
+        assert!(McpServerConfig::validate_env(&env).is_err());
+        env.insert("API_TOKEN".into(), "keyring:mcp/demo/API_TOKEN".into());
+        assert!(McpServerConfig::validate_env(&env).is_ok());
+        let config = McpServerConfig {
+            id: "demo".into(),
+            command: "fixture".into(),
+            args: vec![],
+            env: Some(env),
+            enabled: true,
+            timeout_secs: None,
+        };
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(!serialized.contains("synthetic-secret"));
+        assert_eq!(toml::from_str::<McpServerConfig>(&serialized).unwrap().env, config.env);
+    }
 
     #[test]
     fn retry_config_defaults_are_sane() {
