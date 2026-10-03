@@ -25,18 +25,36 @@ pub struct PluginLoader {
     host: Arc<PluginHost>,
     event_bus: Option<tokio::sync::broadcast::Sender<Arc<serde_json::Value>>>,
     provider: Option<Arc<dyn LlmProvider>>,
+    execution: crate::host::PluginHostContext,
 }
 
 impl PluginLoader {
     pub fn new(host: Arc<PluginHost>) -> Self {
-        Self { host, event_bus: None, provider: None }
+        Self {
+            host,
+            event_bus: None,
+            provider: None,
+            execution: Arc::new(std::sync::RwLock::new(None)),
+        }
     }
 
     pub fn with_event_bus(
         host: Arc<PluginHost>,
         event_bus: tokio::sync::broadcast::Sender<Arc<serde_json::Value>>,
     ) -> Self {
-        Self { host, event_bus: Some(event_bus), provider: None }
+        Self {
+            host,
+            event_bus: Some(event_bus),
+            provider: None,
+            execution: Arc::new(std::sync::RwLock::new(None)),
+        }
+    }
+
+    pub fn set_execution_context(&mut self, execution: crate::host::PluginHostContext) {
+        if let Ok(mut old) = self.execution.write() {
+            *old = None;
+        }
+        self.execution = execution;
     }
 
     pub fn set_provider(&mut self, provider: Option<Arc<dyn LlmProvider>>) {
@@ -45,12 +63,20 @@ impl PluginLoader {
 
     /// Load a plugin from a `.wasm` file path and extract its manifest.
     pub async fn load(&self, wasm_path: &Path) -> Result<LoadedPlugin, PluginError> {
-        let metadata = std::fs::metadata(wasm_path)?;
-        if metadata.len() as usize > PluginHost::MAX_WASM_MODULE_SIZE {
+        let wasm_bytes = Self::read_wasm_bytes(wasm_path)?;
+        self.load_from_bytes(&wasm_bytes, wasm_path).await
+    }
+
+    /// Bound collection itself, including a file growing between metadata and read.
+    pub fn read_wasm_bytes(wasm_path: &Path) -> Result<Vec<u8>, PluginError> {
+        use std::io::Read;
+        let file = std::fs::File::open(wasm_path)?;
+        let mut bytes = Vec::new();
+        file.take(PluginHost::MAX_WASM_MODULE_SIZE as u64 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > PluginHost::MAX_WASM_MODULE_SIZE {
             return Err(PluginError::InvalidManifest("module too large".into()));
         }
-        let wasm_bytes = std::fs::read(wasm_path)?;
-        self.load_from_bytes(&wasm_bytes, wasm_path).await
+        Ok(bytes)
     }
 
     /// Load a plugin from raw WASM bytes (useful for tests).
@@ -71,7 +97,10 @@ impl PluginLoader {
         let mut temp_store = self.host.create_store();
         let mut temp_linker = Linker::new(self.host.engine());
         register_minimal_host_functions(&mut temp_linker)?;
-        let temp_instance = temp_linker.instantiate_async(&mut temp_store, &module).await?;
+        let temp_instance =
+            temp_linker.instantiate_async(&mut temp_store, &module).await.map_err(|error| {
+                PluginError::InvalidManifest(format!("manifest instance rejected: {error}"))
+            })?;
 
         let manifest = extract_manifest(&mut temp_store, &temp_instance).await?;
 
@@ -93,6 +122,11 @@ impl PluginLoader {
             }
         }
 
+        if manifest.id.trim().is_empty() || manifest.id.contains(':') {
+            return Err(PluginError::InvalidManifest(
+                "plugin id must be non-empty and contain no ':'".into(),
+            ));
+        }
         // Step 3: Check ABI version.
         if manifest.abi_version > HOST_ABI_VERSION {
             return Err(PluginError::AbiTooNew {
@@ -150,6 +184,8 @@ impl PluginLoader {
             return Err(PluginError::InitFailed(result));
         }
 
+        // Bind authority only after start functions and init have completed.
+        store.data_mut().execution = self.execution.clone();
         Ok(ActivePlugin { manifest: plugin.manifest.clone(), instance, store })
     }
 

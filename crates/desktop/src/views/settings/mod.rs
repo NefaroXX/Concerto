@@ -1884,7 +1884,7 @@ impl State {
                 .style(crate::ui::button::secondary)
                 .padding([6, 14])
                 .into()
-        } else if !self.mcp_enabled {
+        } else if !self.mcp_enabled || !server.enabled {
             button(text("Test connection").size(13))
                 .style(crate::ui::button::secondary)
                 .padding([6, 14])
@@ -1988,11 +1988,16 @@ impl State {
                         .width(160),
                     text_input("value", &value)
                         .on_input(move |s| Message::McpEditEnvValueChanged(i, s))
+                        .secure(!value.starts_with("keyring:"))
                         .width(Length::Fill),
-                    button(text("Remove").size(13))
+                    button(text("Remove").size(12))
                         .style(crate::ui::button::danger_outline)
                         .padding([6, 10])
                         .on_press(Message::McpEditEnvRemove(i)),
+                    button(text("Store secret").size(12))
+                        .style(crate::ui::button::secondary)
+                        .padding([6, 10])
+                        .on_press(Message::McpCredentialStore(true, key.clone())),
                 ]
                 .spacing(SPACING_XS)
                 .align_y(Alignment::Center)
@@ -2002,7 +2007,7 @@ impl State {
 
         let mut env_field: Vec<Element<'a, Message>> = vec![
             text("Environment").size(13).color(palette.text).into(),
-            text("Optional variable overrides for the server process; leave empty for none.")
+            text("Only launch variables are inherited. Store tokens in the keychain; config keeps keyring: references.")
                 .size(11)
                 .color(palette.text_muted)
                 .into(),
@@ -2025,6 +2030,7 @@ impl State {
 
         column![
             text(format!("{} — edit", server.id)).size(16).color(palette.text),
+            text("Enabling or testing this server runs its executable with your user privileges. Trust the command and arguments.").size(12).color(palette.warning),
             form_field(
                 theme,
                 "Command",
@@ -2039,8 +2045,8 @@ impl State {
                 theme,
                 "Arguments",
                 false,
-                Some("Space-separated arguments, e.g. \"-y @example/server\""),
-                None::<&str>,
+                Some("JSON array, e.g. [\"-y\", \"path with spaces\"]"),
+                draft.args_error.as_deref(),
                 text_input("arguments", &draft.args)
                     .on_input(Message::McpEditArgsChanged)
                     .width(Length::Fill),
@@ -2060,7 +2066,7 @@ impl State {
                 button(text("Save").size(13))
                     .style(crate::ui::button::primary)
                     .padding([6, 14])
-                    .on_press(Message::McpEditSaved),
+                    .on_press_maybe((self.mcp_credentials_pending == 0).then_some(Message::McpEditSaved)),
                 button(text("Cancel").size(13))
                     .style(crate::ui::button::secondary)
                     .padding([6, 14])
@@ -2095,11 +2101,16 @@ impl State {
                         .width(160),
                     text_input("value", &value)
                         .on_input(move |s| Message::McpAddEnvValueChanged(i, s))
+                        .secure(!value.starts_with("keyring:"))
                         .width(Length::Fill),
-                    button(text("Remove").size(13))
+                    button(text("Remove").size(12))
                         .style(crate::ui::button::danger_outline)
                         .padding([6, 10])
                         .on_press(Message::McpAddEnvRemove(i)),
+                    button(text("Store secret").size(12))
+                        .style(crate::ui::button::secondary)
+                        .padding([6, 10])
+                        .on_press(Message::McpCredentialStore(false, key.clone())),
                 ]
                 .spacing(SPACING_XS)
                 .align_y(Alignment::Center)
@@ -2109,7 +2120,7 @@ impl State {
 
         let mut env_field: Vec<Element<'a, Message>> = vec![
             text("Environment").size(13).color(palette.text).into(),
-            text("Optional variable overrides for the server process; leave empty for none.")
+            text("Only launch variables are inherited. Store tokens in the keychain; config keeps keyring: references.")
                 .size(11)
                 .color(palette.text_muted)
                 .into(),
@@ -2132,6 +2143,7 @@ impl State {
 
         column![
             text("New MCP server").size(16).color(palette.text),
+            text("Enabling or testing this server runs its executable with your user privileges. Trust the command and arguments.").size(12).color(palette.warning),
             text(
                 "The server is added to the pending config and starts with the next run; \
                  edit and delete stay available from the detail pane."
@@ -2162,8 +2174,8 @@ impl State {
                 theme,
                 "Arguments",
                 false,
-                Some("Space-separated arguments, e.g. \"-y @example/server\""),
-                None::<&str>,
+                Some("JSON array, e.g. [\"-y\", \"path with spaces\"]"),
+                draft.args_error.as_deref(),
                 text_input("arguments", &draft.args)
                     .on_input(Message::McpAddArgsChanged)
                     .width(Length::Fill),
@@ -2183,7 +2195,7 @@ impl State {
                 button(text("Add server").size(13))
                     .style(crate::ui::button::primary)
                     .padding([6, 14])
-                    .on_press(Message::McpAddSaved),
+                    .on_press_maybe((self.mcp_credentials_pending == 0).then_some(Message::McpAddSaved)),
                 button(text("Cancel").size(13))
                     .style(crate::ui::button::secondary)
                     .padding([6, 14])
@@ -2335,6 +2347,8 @@ impl State {
             text(plugin.name.clone()).size(16).color(palette.text).into(),
             ext_meta_row(theme, "ID", plugin.id.clone()),
             ext_meta_row(theme, "Version", plugin.version.clone()),
+            ext_meta_row(theme, "Binary SHA-256", plugin.binary_hash.clone()),
+            ext_meta_row(theme, "Source", plugin.wasm_path.to_string_lossy().into_owned()),
             ext_meta_row(theme, "Description", plugin.description.clone()),
             ext_meta_row(theme, "Provides", plugin.provides.clone()),
             ext_meta_row(theme, "Grants", grants),

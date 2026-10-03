@@ -1607,18 +1607,18 @@ fn build_plugin_manager() -> Option<(Arc<PluginHost>, PluginManager)> {
     Some((host.clone(), PluginManager::new(host, cap_mgr, None, None)))
 }
 
-/// Load every discovered `.wasm` into `manager` with auto-approved session
+/// Load every discovered `.wasm` into `manager` with approved, hash-pinned
 /// grants rooted at `project_dir`, register their tools into `registry`, and
 /// collect the plugin-backed providers for this run. Never fails a run:
 /// discovery/load/init failures degrade to "no plugin providers".
 async fn load_discovered_plugins(
     manager: &mut PluginManager,
-    host: Arc<PluginHost>,
+    _host: Arc<PluginHost>,
     disc_cfg: PluginDiscoveryCfg,
     project_dir: &std::path::Path,
     registry: &mut ToolRegistry,
 ) -> HashMap<String, Arc<dyn LlmProvider>> {
-    use concerto_plugins::capability::{CapabilityDiscriminant, GrantedCapabilities};
+    use concerto_plugins::capability::{DenyUnapproved, GrantedCapabilities};
 
     let mut plugin_providers = HashMap::new();
     let Ok(candidates) = manager.discover(disc_cfg) else {
@@ -1627,7 +1627,8 @@ async fn load_discovered_plugins(
     };
 
     for candidate in &candidates {
-        let wasm_bytes = match std::fs::read(&candidate.wasm_path) {
+        let read = concerto_plugins::loader::PluginLoader::read_wasm_bytes(&candidate.wasm_path);
+        let wasm_bytes = match read {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(
@@ -1638,27 +1639,21 @@ async fn load_discovered_plugins(
                 continue;
             }
         };
-        let loader = concerto_plugins::loader::PluginLoader::new(host.clone());
-        let loaded = match loader.load_from_bytes(&wasm_bytes, &candidate.wasm_path).await {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::warn!(
-                    path = %candidate.wasm_path.display(),
-                    error = %e,
-                    "failed to load plugin module"
-                );
-                continue;
-            }
-        };
+        let loaded =
+            match manager.load_plugin(&wasm_bytes, &candidate.wasm_path, &DenyUnapproved).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %candidate.wasm_path.display(),
+                        error = %e,
+                        "failed to load plugin module"
+                    );
+                    continue;
+                }
+            };
 
-        // Auto-approve all capabilities (trusted plugins).
         let mut granted = GrantedCapabilities::new();
         granted.set_root(project_dir.to_path_buf());
-        for cap in &loaded.manifest.capabilities_required {
-            let disc: CapabilityDiscriminant = cap.into();
-            let scope: concerto_plugins::capability::CapabilityScope = cap.into();
-            granted.grant_session(disc, scope);
-        }
 
         let plugin_id = loaded.manifest.id.clone();
         match manager.initialise_plugin(&loaded, granted).await {
@@ -1672,7 +1667,7 @@ async fn load_discovered_plugins(
                 } else {
                     tracing::info!(
                         plugin_id = %plugin_id,
-                        "plugin loaded (auto-approved)"
+                        "plugin loaded with approved grants"
                     );
                 }
             }
@@ -1711,10 +1706,10 @@ async fn load_and_configure_plugins(
     plugins: Option<&concerto_plugins::manager::SharedPluginManager>,
     bus: &EventBus,
     audit: Option<Arc<dyn AuditLog>>,
-) -> HashMap<String, Arc<dyn LlmProvider>> {
+) -> (HashMap<String, Arc<dyn LlmProvider>>, Option<concerto_plugins::host::PluginHostContext>) {
     let plugin_providers = HashMap::new();
     let Some(ref plugin_cfg) = config.plugins else {
-        return plugin_providers;
+        return (plugin_providers, None);
     };
     if !plugin_cfg.enabled || !plugin_cfg.auto_load {
         if plugin_cfg.enabled {
@@ -1722,12 +1717,21 @@ async fn load_and_configure_plugins(
                 "WASM plugins enabled but auto_load=false — no frontend loads them automatically"
             );
         }
-        return plugin_providers;
+        return (plugin_providers, None);
     }
 
-    let search_paths: Vec<std::path::PathBuf> =
-        plugin_cfg.search_paths.iter().map(std::path::PathBuf::from).collect();
-    let disc_cfg = PluginDiscoveryCfg { search_paths, bundled_path: None };
+    let context: concerto_plugins::host::PluginHostContext = Arc::new(std::sync::RwLock::new(None));
+    let search_paths: Vec<std::path::PathBuf> = if plugin_cfg.search_paths.is_empty() {
+        PluginDiscoveryCfg::default().search_paths
+    } else {
+        plugin_cfg.search_paths.iter().map(std::path::PathBuf::from).collect()
+    };
+    let bundled_path = if plugin_cfg.bundled_plugins_enabled {
+        std::env::current_exe().ok().and_then(|path| path.parent().map(|dir| dir.join("plugins")))
+    } else {
+        None
+    };
+    let disc_cfg = PluginDiscoveryCfg { search_paths, bundled_path };
 
     // Desktop retained path: materialise the process-lifetime manager on the
     // first run (inside a tokio runtime context — the epoch ticker needs one)
@@ -1739,25 +1743,30 @@ async fn load_and_configure_plugins(
             *guard = build_plugin_manager();
         }
         let Some((host, manager)) = guard.as_mut() else {
-            return plugin_providers;
+            return (plugin_providers, None);
         };
+        manager.prepare_run(context.clone()).await;
         manager.set_event_bus(bus.clone());
         if let Some(audit) = audit.clone() {
             manager.set_audit_log(audit);
         }
-        return load_discovered_plugins(manager, host.clone(), disc_cfg, project_dir, registry)
-            .await;
+        let providers =
+            load_discovered_plugins(manager, host.clone(), disc_cfg, project_dir, registry).await;
+        return (providers, Some(context));
     }
 
     // No shared handle (CLI, tests): per-run manager, dropped on return.
     let Some((host, mut manager)) = build_plugin_manager() else {
-        return plugin_providers;
+        return (plugin_providers, None);
     };
+    manager.prepare_run(context.clone()).await;
     manager.set_event_bus(bus.clone());
     if let Some(audit) = audit {
         manager.set_audit_log(audit);
     }
-    load_discovered_plugins(&mut manager, host, disc_cfg, project_dir, registry).await
+    let providers =
+        load_discovered_plugins(&mut manager, host, disc_cfg, project_dir, registry).await;
+    (providers, Some(context))
 }
 
 /// Build the tool registry with filesystem, shell, git, and LSP tools.
@@ -3046,7 +3055,7 @@ pub async fn run_shared_agent(
     // 2. Load WASM plugins and collect plugin-backed providers. The desktop
     // passes a retained manager handle (plugin liveness); CLI/tests pass none
     // and get the per-run behaviour.
-    let plugin_providers = load_and_configure_plugins(
+    let (plugin_providers, plugin_context) = load_and_configure_plugins(
         &services.config,
         &req.project_dir,
         &mut registry,
@@ -3129,6 +3138,15 @@ pub async fn run_shared_agent(
             req.cancel_token.clone(),
         )
         .await?;
+
+    if let Some(context) = plugin_context {
+        if let Ok(mut context) = context.write() {
+            *context = Some(concerto_plugins::host::PluginExecutionContext {
+                executor: Arc::downgrade(&executor),
+                session: SessionContext::new(session_id, req.project_dir.clone()),
+            });
+        }
+    }
 
     // Record the user's prompt in the durable transcript up front (ADR-36 §4).
     // Text-only mode previously persisted no user message at all; the

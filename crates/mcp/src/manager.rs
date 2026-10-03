@@ -420,12 +420,17 @@ impl McpManager {
             self.audit.read().unwrap_or_else(|e| e.into_inner()).clone(),
         );
 
-        let timeout_secs = server.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
-        let env: Vec<(&str, &str)> = server
-            .env
-            .as_ref()
-            .map(|map| map.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect())
-            .unwrap_or_default();
+        let timeout_secs = server.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS).clamp(1, 300);
+        let resolved = match server.resolved_env(&concerto_config::CredentialStore::new()) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let detail = error.to_string();
+                client.lock().await.record_failure(detail.clone());
+                return Err(McpError::Protocol { detail });
+            }
+        };
+        let env: Vec<(&str, &str)> =
+            resolved.iter().map(|(key, value)| (key.as_str(), value.expose())).collect();
 
         let descriptors = match self.handshake(server, &client, timeout_secs, &env).await {
             Ok(tools) => tools,
@@ -500,19 +505,29 @@ impl McpManager {
         timeout_secs: u64,
         env: &[(&str, &str)],
     ) -> Result<Vec<McpToolDescriptor>, (McpError, String)> {
-        let mut guard = client.lock().await;
-        if let Err(e) = guard.spawn(&server.command, &server.args, env).await {
-            let detail = format!("spawn failed: {e}");
-            return Err((e, detail));
-        }
-        if let Err(e) = guard.initialize(timeout_secs).await {
-            let detail = format!("initialize failed: {e}");
-            return Err((e, detail));
-        }
-        guard.list_tools(timeout_secs, CancellationToken::new()).await.map_err(|e| {
-            let detail = format!("tools/list failed: {e}");
-            (e, detail)
-        })
+        let exchange = async {
+            let mut guard = client.lock().await;
+            if let Err(e) = guard.spawn(&server.command, &server.args, env).await {
+                let detail = format!("spawn failed: {e}");
+                return Err((e, detail));
+            }
+            if let Err(e) = guard.initialize(timeout_secs).await {
+                let detail = format!("initialize failed: {e}");
+                return Err((e, detail));
+            }
+            guard.list_tools(timeout_secs, CancellationToken::new()).await.map_err(|e| {
+                let detail = format!("tools/list failed: {e}");
+                (e, detail)
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(timeout_secs.clamp(1, 300)), exchange)
+            .await
+            .unwrap_or_else(|_| {
+                Err((
+                    McpError::Timeout { method: "discovery".into() },
+                    "MCP discovery timed out".into(),
+                ))
+            })
     }
 }
 

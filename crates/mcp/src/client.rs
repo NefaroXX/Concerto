@@ -30,7 +30,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, BufReader};
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+#[cfg(not(windows))]
+use tokio::process::Child;
+use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
+#[cfg(windows)]
+type Child = Box<dyn process_wrap::tokio::ChildWrapper>;
 use tokio::sync::{oneshot, watch, Mutex};
 use tokio::time::timeout;
 
@@ -113,6 +117,7 @@ impl McpCallResult {
 /// A client for one MCP stdio server process.
 pub struct McpClient {
     server_id: String,
+    process_id: Option<u32>,
     /// The server child, shared with the reader task so it can `try_wait()`
     /// the real exit status when the output pipe closes. `None` inside the
     /// mutex once `stop` has taken the process; the `Option` in the field
@@ -122,10 +127,11 @@ pub struct McpClient {
     /// `Arc` to reply to server requests (e.g. `ping`). `stop`/`Drop` drop
     /// the client's strong handle, closing the pipe and signaling EOF.
     stdin: Option<Arc<Mutex<ChildStdin>>>,
-    pending: Arc<Mutex<PendingMap>>,
+    pending: Arc<std::sync::Mutex<PendingMap>>,
     next_id: Arc<AtomicU64>,
     server_died: Arc<AtomicBool>,
     server_info: Option<McpServerInfo>,
+    redactions: Vec<concerto_core::SecretString>,
     /// Set while a graceful [`Self::stop`] is in flight so the reader task
     /// does not report the EOF it observes as a crash (`Failed`) — the stop
     /// path sends `Stopped` itself.
@@ -150,12 +156,14 @@ impl McpClient {
         let (state_tx, _) = watch::channel(McpServerState::Disabled);
         Self {
             server_id: server_id.to_string(),
+            process_id: None,
             child: None,
             stdin: None,
-            pending: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
             server_died: Arc::new(AtomicBool::new(false)),
             server_info: None,
+            redactions: Vec::new(),
             stopping: Arc::new(AtomicBool::new(false)),
             state_tx,
             last_failure: Arc::new(std::sync::Mutex::new(None)),
@@ -208,13 +216,47 @@ impl McpClient {
             // Safety net for the spawn-error path; the client's own `Drop`
             // reaps normally via `start_kill()` + `try_wait()`.
             .kill_on_drop(true);
+        cmd.env_clear();
+        for key in [
+            "PATH",
+            "SystemRoot",
+            "WINDIR",
+            "COMSPEC",
+            "PATHEXT",
+            "HOME",
+            "USERPROFILE",
+            "TEMP",
+            "TMP",
+            "TMPDIR",
+            "LANG",
+        ] {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+        #[cfg(unix)]
+        cmd.process_group(0);
         for (key, value) in env {
             cmd.env(key, value);
         }
+        #[cfg(not(windows))]
         let mut child = cmd.spawn().map_err(McpError::from)?;
-        let stdin = child.stdin.take().ok_or_else(|| pipe_error("stdin"))?;
-        let stdout = child.stdout.take().ok_or_else(|| pipe_error("stdout"))?;
-        let stderr = child.stderr.take().ok_or_else(|| pipe_error("stderr"))?;
+        #[cfg(windows)]
+        let mut child = {
+            let mut wrapped = process_wrap::tokio::CommandWrap::from(cmd);
+            wrapped.wrap(process_wrap::tokio::KillOnDrop).wrap(process_wrap::tokio::JobObject);
+            wrapped.spawn().map_err(McpError::from)?
+        };
+        self.process_id = child.id();
+        #[cfg(windows)]
+        let (stdin, stdout, stderr) =
+            (child.stdin().take(), child.stdout().take(), child.stderr().take());
+        #[cfg(not(windows))]
+        let (stdin, stdout, stderr) =
+            (child.stdin.take(), child.stdout.take(), child.stderr.take());
+        let stdin = stdin.ok_or_else(|| pipe_error("stdin"))?;
+        let stdout = stdout.ok_or_else(|| pipe_error("stdout"))?;
+        let stderr = stderr.ok_or_else(|| pipe_error("stderr"))?;
         // The three pipes above are guaranteed by `Stdio::piped`; on the
         // impossible failure path `kill_on_drop(true)` kills the child.
 
@@ -230,8 +272,15 @@ impl McpClient {
             self.server_id.clone(),
             self.state_tx.clone(),
             self.last_failure.clone(),
+            self.process_id,
         ));
-        tokio::spawn(stderr_pump(stderr, self.server_id.clone()));
+        let redactions: Vec<_> = env
+            .iter()
+            .filter(|(_, value)| !value.is_empty())
+            .map(|(_, value)| concerto_core::SecretString::from(*value))
+            .collect();
+        self.redactions = redactions.clone();
+        tokio::spawn(stderr_pump(stderr, self.server_id.clone(), redactions));
 
         self.child = Some(child_shared);
         self.stdin = Some(stdin_shared);
@@ -264,6 +313,22 @@ impl McpClient {
     /// be stopped. Never cancellable per spec. Idempotent: a second call
     /// returns the cached result.
     pub async fn initialize(&mut self, timeout_secs: u64) -> Result<McpServerInfo, McpError> {
+        let result = timeout(
+            Duration::from_secs(timeout_secs.clamp(1, 300)),
+            self.initialize_inner(timeout_secs),
+        )
+        .await;
+        match result {
+            Ok(result) => result,
+            Err(_) => {
+                self.server_died.store(true, Ordering::SeqCst);
+                terminate_process_id(self.process_id);
+                terminate_shared_tree(&self.child);
+                Err(McpError::Timeout { method: "initialize".into() })
+            }
+        }
+    }
+    async fn initialize_inner(&mut self, timeout_secs: u64) -> Result<McpServerInfo, McpError> {
         if let Some(info) = &self.server_info {
             return Ok(info.clone());
         }
@@ -326,6 +391,17 @@ impl McpClient {
         timeout_secs: u64,
         cancel: CancellationToken,
     ) -> Result<Vec<McpToolDescriptor>, McpError> {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(McpError::Cancelled),
+            result = timeout(Duration::from_secs(timeout_secs.clamp(1, 300)), self.list_tools_inner(timeout_secs, cancel.clone())) => result.unwrap_or_else(|_| Err(McpError::Timeout { method: "tools/list".into() })),
+        }
+    }
+    async fn list_tools_inner(
+        &mut self,
+        timeout_secs: u64,
+        cancel: CancellationToken,
+    ) -> Result<Vec<McpToolDescriptor>, McpError> {
         let mut tools = Vec::new();
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_TOOL_LIST_PAGES {
@@ -378,9 +454,12 @@ impl McpClient {
         cancel: CancellationToken,
     ) -> Result<McpCallResult, McpError> {
         let params = json!({ "name": name, "arguments": arguments });
-        let result =
+        let mut result =
             self.request_internal("tools/call", params, timeout_secs, cancel, true).await?;
         let is_error = result.get("isError").and_then(Value::as_bool).unwrap_or(false);
+        if is_error {
+            redact_diagnostic_value(&mut result, &self.redactions);
+        }
         let mut content = Vec::new();
         if let Some(blocks) = result.get("content").and_then(Value::as_array) {
             for block in blocks {
@@ -446,7 +525,8 @@ impl McpClient {
         // sent below once the child is reaped.
         self.stopping.store(true, Ordering::SeqCst);
         {
-            let ids: Vec<u64> = self.pending.lock().await.keys().copied().collect();
+            let ids: Vec<u64> =
+                self.pending.lock().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
             for id in ids {
                 self.send_cancelled_notification(id, Some("client shutting down")).await;
             }
@@ -458,10 +538,13 @@ impl McpClient {
             Ok(Err(e)) => return Err(McpError::from(e)),
             Err(_elapsed) => {
                 tracing::info!(server = %self.server_id, "server did not exit within grace period; killing");
-                child.kill().await.map_err(McpError::from)?;
+                terminate_server_tree(&mut child);
+                child.start_kill().map_err(McpError::from)?;
                 child.wait().await.map_err(McpError::from)?
             }
         };
+        // The parent may exit while descendants still hold inherited pipes.
+        terminate_process_id(self.process_id.take());
         let exit_code = status.code();
         fail_all_pending(&self.pending, || McpError::ServerExited {
             status: exit_code,
@@ -490,76 +573,57 @@ impl McpClient {
         }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, tx);
-
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        });
-
-        let write_result = {
-            let stdin = match self.stdin.as_ref() {
-                Some(stdin) => stdin,
-                None => {
-                    self.pending.lock().await.remove(&id);
-                    return Err(McpError::NotConnected);
-                }
-            };
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).insert(id, tx);
+        let mut guard = RequestGuard {
+            id,
+            pending: self.pending.clone(),
+            child: self.child.clone(),
+            process_id: self.process_id,
+            died: self.server_died.clone(),
+            write_started: false,
+            write_complete: false,
+        };
+        let request = json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params});
+        let exchange = async {
+            let stdin = self.stdin.as_ref().ok_or(McpError::NotConnected)?;
             let mut stdin = stdin.lock().await;
-            transport::write_message(&mut *stdin, &request).await
+            guard.write_started = true;
+            transport::write_message(&mut *stdin, &request).await?;
+            guard.write_complete = true;
+            drop(stdin);
+            rx.await.map_err(|_| McpError::Protocol {
+                detail: "request slot dropped without a response".into(),
+            })?
         };
-        if let Err(e) = write_result {
-            // A failed stdin write means the server's read end is gone
-            // (EPIPE) — the connection is definitively dead. Mark it now
-            // rather than waiting for the reader task to observe EOF, so
-            // `connected()` is false immediately after the failed call.
+        let outcome = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(McpError::Cancelled),
+            result = timeout(Duration::from_secs(timeout_secs.clamp(1, 300)), exchange) =>
+                result.unwrap_or_else(|_| Err(McpError::Timeout { method: method.into() })),
+        };
+        if outcome.is_err() && guard.write_started && !guard.write_complete {
             self.server_died.store(true, Ordering::SeqCst);
-            self.pending.lock().await.remove(&id);
-            return Err(e);
         }
-
-        // Watch the caller's token: resolve the pending slot if it fires
-        // mid-flight. Aborted once the request settles.
-        let watcher = {
-            let pending = self.pending.clone();
-            tokio::spawn(async move {
-                cancel.cancelled().await;
-                if let Some(tx) = pending.lock().await.remove(&id) {
-                    let _ = tx.send(Err(McpError::Cancelled));
-                }
-            })
-        };
-
-        let outcome = timeout(Duration::from_secs(timeout_secs), rx).await;
-        watcher.abort();
-        match outcome {
-            // oneshot::Receiver yields Result<T, RecvError>; timeout wraps that.
-            Ok(Ok(Ok(value))) => Ok(value),
-            Ok(Ok(Err(McpError::Cancelled))) => {
-                if send_cancel_notification {
-                    self.send_cancelled_notification(id, Some("cancelled by caller")).await;
-                }
-                Err(McpError::Cancelled)
-            }
-            Ok(Ok(Err(e))) => Err(e),
-            Ok(Err(_)) => {
-                // The pending slot was dropped without a value: the reader
-                // removed it without sending, which is a client bug. Fail
-                // loudly rather than hanging the caller.
-                Err(McpError::Protocol { detail: "request slot dropped without a response".into() })
-            }
-            Err(_elapsed) => {
-                // Do not leak the pending slot; the server's late response
-                // (if any) will be ignored by the reader.
-                self.pending.lock().await.remove(&id);
-                if send_cancel_notification {
-                    self.send_cancelled_notification(id, Some("request timed out")).await;
-                }
-                Err(McpError::Timeout { method: method.to_string() })
-            }
+        let notify = send_cancel_notification
+            && guard.write_complete
+            && matches!(&outcome, Err(McpError::Cancelled | McpError::Timeout { .. }));
+        drop(guard);
+        if notify {
+            self.send_cancelled_notification(id, Some("request cancelled or timed out")).await;
         }
+        outcome.map_err(|error| match error {
+            McpError::JsonRpc { code, message, mut data } => {
+                if let Some(data) = data.as_mut() {
+                    redact_diagnostic_value(data, &self.redactions);
+                }
+                McpError::JsonRpc {
+                    code,
+                    message: redact_diagnostic_text(message, &self.redactions),
+                    data,
+                }
+            }
+            error => error,
+        })
     }
 
     /// Best-effort `notifications/cancelled` for `id`. Write failures are
@@ -572,13 +636,78 @@ impl McpClient {
         let notification =
             json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": params });
         let Some(stdin) = self.stdin.as_ref() else { return };
-        let mut stdin = stdin.lock().await;
-        let _ = transport::write_message(&mut *stdin, &notification).await;
+        let mut started = false;
+        let result = timeout(Duration::from_millis(100), async {
+            let mut stdin = stdin.lock().await;
+            started = true;
+            transport::write_message(&mut *stdin, &notification).await
+        })
+        .await;
+        if started && !matches!(result, Ok(Ok(()))) {
+            self.server_died.store(true, Ordering::SeqCst);
+            terminate_process_id(self.process_id);
+            terminate_shared_tree(&self.child);
+        }
+    }
+}
+
+struct RequestGuard {
+    id: u64,
+    pending: Arc<std::sync::Mutex<PendingMap>>,
+    child: Option<Arc<Mutex<Option<Child>>>>,
+    process_id: Option<u32>,
+    died: Arc<AtomicBool>,
+    write_started: bool,
+    write_complete: bool,
+}
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id);
+        if self.write_started && !self.write_complete {
+            self.died.store(true, Ordering::SeqCst);
+            terminate_process_id(self.process_id);
+            if let Some(shared) = &self.child {
+                if let Ok(mut child) = shared.try_lock() {
+                    if let Some(child) = child.as_mut() {
+                        terminate_server_tree(child);
+                        let _ = child.start_kill();
+                    }
+                }
+            }
+        }
+    }
+}
+fn terminate_server_tree(child: &mut Child) {
+    #[cfg(windows)]
+    let _ = child.start_kill(); // The retained Job Object outlives its immediate parent.
+    #[cfg(not(windows))]
+    terminate_process_id(child.id());
+}
+fn terminate_process_id(id: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(id) = id {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-(id as i32)),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    #[cfg(not(unix))]
+    let _ = id;
+}
+
+fn terminate_shared_tree(child: &Option<Arc<Mutex<Option<Child>>>>) {
+    if let Some(child) = child {
+        if let Ok(mut guard) = child.try_lock() {
+            if let Some(child) = guard.as_mut() {
+                terminate_server_tree(child);
+            }
+        }
     }
 }
 
 impl Drop for McpClient {
     fn drop(&mut self) {
+        terminate_process_id(self.process_id.take());
         // `tokio::process::Child` detaches from the OS process on drop, which
         // would orphan the server. tokio 1.52 has no `Child::into_std`, so
         // reap synchronously: SIGKILL via `start_kill()` (sync), then poll
@@ -589,6 +718,7 @@ impl Drop for McpClient {
         if let Some(child) = self.child.as_mut() {
             if let Ok(mut guard) = child.try_lock() {
                 if let Some(child) = guard.as_mut() {
+                    terminate_server_tree(child);
                     let _ = child.start_kill();
                     for _ in 0..100 {
                         match child.try_wait() {
@@ -625,7 +755,7 @@ fn pipe_error(what: &str) -> McpError {
 #[allow(clippy::too_many_arguments)]
 async fn reader_task(
     mut stdout: ChildStdout,
-    pending: Arc<Mutex<PendingMap>>,
+    pending: Arc<std::sync::Mutex<PendingMap>>,
     server_died: Arc<AtomicBool>,
     stopping: Arc<AtomicBool>,
     child_weak: Weak<Mutex<Option<Child>>>,
@@ -633,6 +763,7 @@ async fn reader_task(
     server_id: String,
     state_tx: watch::Sender<McpServerState>,
     last_failure: Arc<std::sync::Mutex<Option<String>>>,
+    process_id: Option<u32>,
 ) {
     let mut reader = BufReader::new(&mut stdout);
     let mut buf: Vec<u8> = Vec::new();
@@ -640,10 +771,25 @@ async fn reader_task(
         match transport::read_message(&mut reader, &mut buf).await {
             Ok(Some(message)) => {
                 if transport::is_server_request(&message) {
-                    handle_server_request(&stdin_weak, &message, &server_id).await;
+                    if !handle_server_request(&stdin_weak, &message, &server_id).await {
+                        server_died.store(true, Ordering::SeqCst);
+                        terminate_process_id(process_id);
+                        terminate_shared_tree(&child_weak.upgrade());
+                        record_reader_failure(
+                            &last_failure,
+                            &state_tx,
+                            &server_id,
+                            &None,
+                            "server request reply timed out or failed",
+                        );
+                        fail_all_pending(&pending, || McpError::NotConnected).await;
+                        break;
+                    }
                 } else if transport::is_response(&message) {
                     if let Some(id) = transport::response_id(&message) {
-                        if let Some(tx) = pending.lock().await.remove(&id) {
+                        if let Some(tx) =
+                            pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id)
+                        {
                             let _ = tx.send(transport::extract_result(&message));
                         } else {
                             tracing::warn!(server = %server_id, id, "response for unknown request id; ignoring");
@@ -658,6 +804,8 @@ async fn reader_task(
             Ok(None) => {
                 server_died.store(true, Ordering::SeqCst);
                 let status = child_exit_code(&child_weak).await;
+                terminate_process_id(process_id);
+                terminate_shared_tree(&child_weak.upgrade());
                 if !stopping.load(Ordering::SeqCst) {
                     record_reader_failure(
                         &last_failure,
@@ -679,6 +827,8 @@ async fn reader_task(
                 server_died.store(true, Ordering::SeqCst);
                 tracing::error!(server = %server_id, error = %e, "reader failure; disconnecting");
                 let status = child_exit_code(&child_weak).await;
+                terminate_process_id(process_id);
+                terminate_shared_tree(&child_weak.upgrade());
                 if !stopping.load(Ordering::SeqCst) {
                     record_reader_failure(
                         &last_failure,
@@ -743,45 +893,93 @@ async fn handle_server_request(
     stdin_weak: &Weak<Mutex<ChildStdin>>,
     message: &Value,
     server_id: &str,
-) {
+) -> bool {
     let method = message.get("method").and_then(Value::as_str).unwrap_or_default();
-    let Some(reply) = transport::ping_reply(message) else { return };
+    let Some(reply) = transport::ping_reply(message) else { return true };
     if method != "ping" {
         tracing::warn!(server = %server_id, method, "ignoring unsupported server request");
-        return;
+        return true;
     }
-    let Some(stdin) = stdin_weak.upgrade() else { return };
-    let mut stdin = stdin.lock().await;
-    let _ = transport::write_message(&mut *stdin, &reply).await;
+    let Some(stdin) = stdin_weak.upgrade() else { return false };
+    matches!(
+        timeout(Duration::from_millis(100), async {
+            let mut stdin = stdin.lock().await;
+            transport::write_message(&mut *stdin, &reply).await
+        })
+        .await,
+        Ok(Ok(()))
+    )
 }
 
 /// Stderr pump: stream the server's stderr into the log at warn level so
 /// server-side diagnostics are visible without blocking (bounded 1 KiB
 /// chunks).
-async fn stderr_pump(mut stderr: ChildStderr, server_id: String) {
-    let mut reader = BufReader::new(&mut stderr);
+async fn stderr_pump(
+    mut stderr: ChildStderr,
+    server_id: String,
+    redactions: Vec<concerto_core::SecretString>,
+) {
     let mut chunk = [0u8; 1024];
-    loop {
-        match reader.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                let text = String::from_utf8_lossy(&chunk[..n]);
-                for line in text.lines() {
-                    tracing::warn!(server = %server_id, "mcp server stderr: {line}");
+    let mut line = Vec::new();
+    let mut oversized = false;
+    while let Ok(n) = stderr.read(&mut chunk).await {
+        if n == 0 {
+            if !line.is_empty() && !oversized {
+                log_stderr_line(&server_id, &line, &redactions);
+            }
+            break;
+        }
+        for byte in &chunk[..n] {
+            if *byte == b'\n' {
+                if oversized {
+                    tracing::warn!(server = %server_id, "mcp oversized stderr line omitted");
+                } else {
+                    log_stderr_line(&server_id, &line, &redactions);
                 }
+                line.clear();
+                oversized = false;
+            } else if line.len() < 4096 && !oversized {
+                line.push(*byte);
+            } else {
+                line.clear();
+                oversized = true;
             }
         }
     }
+}
+fn redact_diagnostic_text(mut text: String, secrets: &[concerto_core::SecretString]) -> String {
+    for secret in secrets {
+        if !secret.expose().is_empty() {
+            text = text.replace(secret.expose(), "[redacted]");
+        }
+    }
+    text
+}
+fn redact_diagnostic_value(value: &mut Value, secrets: &[concerto_core::SecretString]) {
+    match value {
+        Value::String(text) => *text = redact_diagnostic_text(std::mem::take(text), secrets),
+        Value::Array(items) => {
+            items.iter_mut().for_each(|item| redact_diagnostic_value(item, secrets))
+        }
+        Value::Object(items) => {
+            items.values_mut().for_each(|item| redact_diagnostic_value(item, secrets))
+        }
+        _ => {}
+    }
+}
+fn log_stderr_line(server_id: &str, bytes: &[u8], secrets: &[concerto_core::SecretString]) {
+    let line = redact_diagnostic_text(String::from_utf8_lossy(bytes).into_owned(), secrets);
+    tracing::warn!(server = %server_id, "mcp server stderr: {line}");
 }
 
 /// Fail every still-pending request with the error produced by `make_error`
 /// (called per recipient so the error need not be `Clone`). Idempotent:
 /// already-resolved slots are simply absent.
-async fn fail_all_pending<F>(pending: &Arc<Mutex<PendingMap>>, make_error: F)
+async fn fail_all_pending<F>(pending: &Arc<std::sync::Mutex<PendingMap>>, make_error: F)
 where
     F: Fn() -> McpError,
 {
-    let mut map = pending.lock().await;
+    let mut map = pending.lock().unwrap_or_else(|e| e.into_inner());
     for (_, tx) in map.drain() {
         let _ = tx.send(Err(make_error()));
     }

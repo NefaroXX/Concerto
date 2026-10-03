@@ -40,6 +40,7 @@ pub struct InstalledPluginInfo {
     pub provides: String,
     pub capability_summary: String,
     pub wasm_path: PathBuf,
+    pub binary_hash: String,
     pub load_error: Option<String>,
 }
 
@@ -275,6 +276,7 @@ pub struct State {
     // ADR-43 — MCP configuration
     /// Master MCP toggle (`mcp.enabled`).
     pub mcp_enabled: bool,
+    pub mcp_credentials_pending: usize,
     /// Configured MCP servers (editable in v1: per-server enabled flag,
     /// add, edit, and delete; all persisted on Save Settings).
     pub mcp_servers: Vec<McpServerConfig>,
@@ -341,8 +343,9 @@ pub struct State {
 pub struct McpEditDraft {
     /// Executable to spawn.
     pub command: String,
-    /// Arguments joined with spaces (split back on save).
+    /// Exact arguments encoded as a JSON array.
     pub args: String,
+    pub args_error: Option<String>,
     /// Environment variables as key → value rows, rendered from the map's key
     /// order (same editor pattern as the shell profiles). An empty map saves
     /// as `env = none`.
@@ -373,8 +376,9 @@ pub struct McpAddDraft {
     pub id: String,
     /// Executable to spawn.
     pub command: String,
-    /// Arguments joined with spaces (split back on save).
+    /// Exact arguments encoded as a JSON array.
     pub args: String,
+    pub args_error: Option<String>,
     /// Environment variables as key → value rows, rendered from the map's key
     /// order (same editor pattern as the shell profiles). An empty map saves
     /// as `env = none`.
@@ -572,6 +576,7 @@ impl State {
             skill_editing_id: None,
             skill_edit_draft: None,
             skill_delete_confirm: None,
+            mcp_credentials_pending: 0,
             mcp_enabled: mcp.enabled,
             mcp_servers: mcp.servers.clone(),
             mcp_probe_results: HashMap::new(),
@@ -2220,10 +2225,16 @@ impl State {
                 }
             }
             Message::McpProbePressed(id) => {
+                if !self.mcp_enabled || self.mcp_probing.contains(&id) {
+                    return iced::Task::none();
+                }
                 let Some(server) = self.mcp_servers.iter().find(|server| server.id == id).cloned()
                 else {
                     return iced::Task::none();
                 };
+                if !server.enabled {
+                    return iced::Task::none();
+                }
                 self.mcp_probing.insert(id.clone());
                 return iced::Task::perform(
                     super::helpers::probe_mcp_server(server),
@@ -2249,7 +2260,8 @@ impl State {
                 self.mcp_editing_id = Some(server.id.clone());
                 self.mcp_edit_draft = Some(McpEditDraft {
                     command: server.command,
-                    args: server.args.join(" "),
+                    args: serde_json::to_string(&server.args).unwrap_or_else(|_| "[]".into()),
+                    args_error: None,
                     env: server.env.unwrap_or_default(),
                     timeout: server.timeout_secs.map(|secs| secs.to_string()).unwrap_or_default(),
                     command_error: None,
@@ -2270,6 +2282,7 @@ impl State {
             Message::McpEditArgsChanged(value) => {
                 if let Some(draft) = &mut self.mcp_edit_draft {
                     draft.args = value;
+                    draft.args_error = None;
                 }
             }
             Message::McpEditEnvKeyChanged(index, value) => {
@@ -2304,6 +2317,55 @@ impl State {
                     draft.env_error = None;
                 }
             }
+            Message::McpCredentialStore(editing, key) => {
+                let (id, env) = if editing {
+                    let Some(id) = self.mcp_editing_id.clone() else {
+                        return iced::Task::none();
+                    };
+                    let Some(draft) = self.mcp_edit_draft.as_mut() else {
+                        return iced::Task::none();
+                    };
+                    (id, &mut draft.env)
+                } else {
+                    let Some(draft) = self.mcp_add_draft.as_mut() else {
+                        return iced::Task::none();
+                    };
+                    if Self::mcp_add_id_error(&self.mcp_servers, draft.id.trim()).is_some() {
+                        draft.id_error = Some(
+                            "Enter a valid unique server id before storing credentials".into(),
+                        );
+                        return iced::Task::none();
+                    }
+                    (draft.id.trim().to_owned(), &mut draft.env)
+                };
+                let Some(value) = env.get_mut(&key) else {
+                    return iced::Task::none();
+                };
+                if key.trim().is_empty() || value.is_empty() || value.starts_with("keyring:") {
+                    return iced::Task::none();
+                }
+                let account = format!("mcp/{id}/{key}");
+                let secret = concerto_core::SecretString::from(std::mem::replace(
+                    value,
+                    format!("keyring:{account}"),
+                ));
+                self.mcp_credentials_pending += 1;
+                return iced::Task::perform(
+                    super::helpers::store_mcp_credential(account, secret),
+                    move |result| Message::McpCredentialStored(editing, result),
+                );
+            }
+            Message::McpCredentialStored(editing, result) => {
+                self.mcp_credentials_pending = self.mcp_credentials_pending.saturating_sub(1);
+                let error = result.err();
+                if editing {
+                    if let Some(draft) = self.mcp_edit_draft.as_mut() {
+                        draft.env_error = error;
+                    }
+                } else if let Some(draft) = self.mcp_add_draft.as_mut() {
+                    draft.env_error = error;
+                }
+            }
             Message::McpEditEnvRemove(index) => {
                 if let Some(draft) = &mut self.mcp_edit_draft {
                     let keys: Vec<String> = draft.env.keys().cloned().collect();
@@ -2316,10 +2378,14 @@ impl State {
             Message::McpEditTimeoutChanged(value) => {
                 if let Some(draft) = &mut self.mcp_edit_draft {
                     draft.timeout = value;
+                    draft.args_error = parse_mcp_args(&draft.args).err();
                     draft.timeout_error = Self::validate_mcp_timeout(&draft.timeout);
                 }
             }
             Message::McpEditSaved => {
+                if self.mcp_credentials_pending > 0 {
+                    return iced::Task::none();
+                }
                 let Some(id) = self.mcp_editing_id.clone() else {
                     return iced::Task::none();
                 };
@@ -2333,13 +2399,12 @@ impl State {
                 } else {
                     None
                 };
-                draft.env_error = if draft.env.keys().any(|key| key.trim().is_empty()) {
-                    Some("Environment keys must not be empty".into())
-                } else {
-                    None
-                };
+                draft.env_error =
+                    McpServerConfig::validate_env(&draft.env).err().map(|e| e.to_string());
+                draft.args_error = parse_mcp_args(&draft.args).err();
                 draft.timeout_error = Self::validate_mcp_timeout(&draft.timeout);
                 if draft.command_error.is_some()
+                    || draft.args_error.is_some()
                     || draft.env_error.is_some()
                     || draft.timeout_error.is_some()
                 {
@@ -2348,7 +2413,7 @@ impl State {
                 }
                 if let Some(server) = self.mcp_servers.iter_mut().find(|server| server.id == id) {
                     server.command = draft.command.trim().to_string();
-                    server.args = draft.args.split_whitespace().map(String::from).collect();
+                    server.args = parse_mcp_args(&draft.args).unwrap_or_default();
                     server.env = Some(draft.env).filter(|vars| !vars.is_empty());
                     server.timeout_secs = draft.timeout.trim().parse::<u64>().ok();
                     self.settings_dirty = true;
@@ -2414,7 +2479,8 @@ impl State {
                 self.mcp_add_draft = Some(McpAddDraft {
                     id: String::new(),
                     command: String::new(),
-                    args: String::new(),
+                    args: "[]".into(),
+                    args_error: None,
                     env: BTreeMap::new(),
                     timeout: String::new(),
                     id_error: None,
@@ -2441,6 +2507,7 @@ impl State {
             Message::McpAddArgsChanged(value) => {
                 if let Some(draft) = &mut self.mcp_add_draft {
                     draft.args = value;
+                    draft.args_error = None;
                 }
             }
             Message::McpAddEnvKeyChanged(index, value) => {
@@ -2487,10 +2554,14 @@ impl State {
             Message::McpAddTimeoutChanged(value) => {
                 if let Some(draft) = &mut self.mcp_add_draft {
                     draft.timeout = value;
+                    draft.args_error = parse_mcp_args(&draft.args).err();
                     draft.timeout_error = Self::validate_mcp_timeout(&draft.timeout);
                 }
             }
             Message::McpAddSaved => {
+                if self.mcp_credentials_pending > 0 {
+                    return iced::Task::none();
+                }
                 let Some(mut draft) = self.mcp_add_draft.take() else {
                     return iced::Task::none();
                 };
@@ -2503,14 +2574,13 @@ impl State {
                 } else {
                     None
                 };
-                draft.env_error = if draft.env.keys().any(|key| key.trim().is_empty()) {
-                    Some("Environment keys must not be empty".into())
-                } else {
-                    None
-                };
+                draft.env_error =
+                    McpServerConfig::validate_env(&draft.env).err().map(|e| e.to_string());
+                draft.args_error = parse_mcp_args(&draft.args).err();
                 draft.timeout_error = Self::validate_mcp_timeout(&draft.timeout);
                 if draft.id_error.is_some()
                     || draft.command_error.is_some()
+                    || draft.args_error.is_some()
                     || draft.env_error.is_some()
                     || draft.timeout_error.is_some()
                 {
@@ -2521,7 +2591,7 @@ impl State {
                 self.mcp_servers.push(McpServerConfig {
                     id: id.clone(),
                     command: draft.command.trim().to_string(),
-                    args: draft.args.split_whitespace().map(String::from).collect(),
+                    args: parse_mcp_args(&draft.args).unwrap_or_default(),
                     env: Some(draft.env).filter(|vars| !vars.is_empty()),
                     enabled: true,
                     timeout_secs: draft.timeout.trim().parse::<u64>().ok(),
@@ -2601,6 +2671,16 @@ impl State {
     }
 }
 
+fn parse_mcp_args(input: &str) -> Result<Vec<String>, String> {
+    if input.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str::<Vec<String>>(input).map_err(|_| {
+        "Arguments must be a JSON array of strings, for example [\"-y\", \"path with spaces\"]"
+            .into()
+    })
+}
+
 /// Collapse duplicates while preserving first-occurrence order.
 ///
 /// Discovery diagnostics can repeat — e.g. two configured search paths that
@@ -2651,7 +2731,14 @@ mod tests {
     fn mcp_edit_preserves_exact_arguments() {
         let mut state = State::from_config(&AppConfig::default());
         let mut configured = server("quoted");
-        configured.args = vec!["path with spaces".into(), "".into(), "$(literal)".into()];
+        configured.args = vec![
+            "path with spaces".into(),
+            "".into(),
+            "$(literal)".into(),
+            "quoted\"text".into(),
+            "back\\slash".into(),
+            "世界".into(),
+        ];
         let expected = configured.args.clone();
         state.mcp_servers.push(configured);
         let _ = state.update(Message::McpEditPressed("quoted".into()));
@@ -3075,6 +3162,24 @@ mod tests {
         assert!(state.mcp_probing.is_empty());
     }
 
+    /// Verifies both enable switches gate probes and malformed argument arrays cannot save.
+    #[test]
+    fn mcp_disabled_probes_and_invalid_arguments_fail_closed() {
+        let mut state = State::from_config(&AppConfig::default());
+        state.mcp_servers.push(server("demo"));
+        assert_eq!(state.update(Message::McpProbePressed("demo".into())).units(), 0);
+        state.mcp_enabled = true;
+        state.mcp_servers[0].enabled = false;
+        assert_eq!(state.update(Message::McpProbePressed("demo".into())).units(), 0);
+        assert!(state.mcp_probing.is_empty());
+        let original = state.mcp_servers[0].args.clone();
+        let _ = state.update(Message::McpEditPressed("demo".into()));
+        let _ = state.update(Message::McpEditArgsChanged("[1]".into()));
+        let _ = state.update(Message::McpEditSaved);
+        assert_eq!(state.mcp_servers[0].args, original);
+        assert!(state.mcp_edit_draft.as_ref().unwrap().args_error.is_some());
+    }
+
     // ── ADR-43 — MCP server edit/delete ───────────────────────────────────
 
     #[test]
@@ -3085,22 +3190,24 @@ mod tests {
         };
         let mut state = State::from_config(&base);
         // Seed an env and timeout so the draft seed + apply path covers them.
-        state.mcp_servers[0].env = Some([("API_KEY".to_string(), "s3cret".to_string())].into());
+        state.mcp_servers[0].env =
+            Some([("API_KEY".to_string(), "keyring:mcp/demo/credential".to_string())].into());
         state.mcp_servers[0].timeout_secs = Some(120);
 
         let _ = state.update(Message::McpEditPressed("files".into()));
         let draft = state.mcp_edit_draft.as_ref().expect("edit pressed must seed a draft");
         assert_eq!(state.mcp_editing_id.as_deref(), Some("files"));
         assert_eq!(draft.command, "npx");
-        assert_eq!(draft.args, "-y @example/files");
-        assert_eq!(draft.env.get("API_KEY"), Some(&"s3cret".to_string()));
+        assert_eq!(draft.args, r#"["-y","@example/files"]"#);
+        assert_eq!(draft.env.get("API_KEY"), Some(&"keyring:mcp/demo/credential".to_string()));
         assert_eq!(draft.timeout, "120");
         assert!(!state.settings_dirty, "entering edit mode must not arm the dirty flag by itself");
 
         // Mutate the draft and save.
         let _ = state.update(Message::McpEditCommandChanged("node".into()));
-        let _ = state.update(Message::McpEditArgsChanged("server.js --port 3000".into()));
-        let _ = state.update(Message::McpEditEnvValueChanged(0, "new-secret".into()));
+        let _ =
+            state.update(Message::McpEditArgsChanged(r#"["server.js", "--port", "3000"]"#.into()));
+        let _ = state.update(Message::McpEditEnvValueChanged(0, "keyring:mcp/demo/updated".into()));
         let _ = state.update(Message::McpEditTimeoutChanged("45".into()));
         let _ = state.update(Message::McpEditSaved);
 
@@ -3114,7 +3221,7 @@ mod tests {
         assert_eq!(server.args, vec!["server.js", "--port", "3000"]);
         assert_eq!(
             server.env.as_ref().and_then(|env| env.get("API_KEY")),
-            Some(&"new-secret".to_string())
+            Some(&"keyring:mcp/demo/updated".to_string())
         );
         assert_eq!(server.timeout_secs, Some(45));
 
@@ -3124,7 +3231,7 @@ mod tests {
         assert_eq!(mcp.servers[0].command, "node");
         assert_eq!(
             mcp.servers[0].env.as_ref().and_then(|e| e.get("API_KEY")),
-            Some(&"new-secret".to_string())
+            Some(&"keyring:mcp/demo/updated".to_string())
         );
     }
 
@@ -3301,10 +3408,12 @@ mod tests {
         let _ = state.update(Message::McpAddPressed);
         let _ = state.update(Message::McpAddIdChanged("github".into()));
         let _ = state.update(Message::McpAddCommandChanged("npx".into()));
-        let _ = state.update(Message::McpAddArgsChanged("-y @example/github-server".into()));
+        let _ =
+            state.update(Message::McpAddArgsChanged(r#"["-y", "@example/github-server"]"#.into()));
         let _ = state.update(Message::McpAddEnvAdd);
         let _ = state.update(Message::McpAddEnvKeyChanged(0, "TOKEN".into()));
-        let _ = state.update(Message::McpAddEnvValueChanged(0, "s3cret".into()));
+        let _ =
+            state.update(Message::McpAddEnvValueChanged(0, "keyring:mcp/demo/credential".into()));
         let _ = state.update(Message::McpAddTimeoutChanged("45".into()));
 
         let _ = state.update(Message::McpAddSaved);
@@ -3316,7 +3425,10 @@ mod tests {
         assert_eq!(added.id, "github");
         assert_eq!(added.command, "npx");
         assert_eq!(added.args, vec!["-y", "@example/github-server"]);
-        assert_eq!(added.env.as_ref().and_then(|e| e.get("TOKEN")), Some(&"s3cret".to_string()));
+        assert_eq!(
+            added.env.as_ref().and_then(|e| e.get("TOKEN")),
+            Some(&"keyring:mcp/demo/credential".to_string())
+        );
         assert_eq!(added.timeout_secs, Some(45));
         assert!(added.enabled, "new servers are enabled by default");
         assert_eq!(

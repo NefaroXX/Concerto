@@ -176,6 +176,40 @@ impl VirtualFs {
         }
     }
 
+    /// Read staged or disk content with an allocation bound before cloning or reading.
+    pub fn read_bounded(&self, path: &Utf8Path, max_bytes: usize) -> Result<String, ToolError> {
+        use std::io::Read;
+        reject_reserved_device_name(path)?;
+        let fail = || ToolError::ExecutionFailed {
+            message: format!("read exceeds {max_bytes} byte limit"),
+        };
+        if let Some(entry) = self.entries.get(path) {
+            let content = match entry {
+                VirtualFsEntry::Original { content, .. } => content,
+                VirtualFsEntry::Modified { current, .. }
+                | VirtualFsEntry::Created { current, .. } => current,
+                VirtualFsEntry::Deleted { .. } => {
+                    return Err(ToolError::ExecutionFailed {
+                        message: "file is staged for deletion".into(),
+                    })
+                }
+            };
+            if content.len() > max_bytes {
+                return Err(fail());
+            }
+            return Ok(content.clone());
+        }
+        let file = std::fs::File::open(path)?;
+        let mut bytes = Vec::new();
+        file.take((max_bytes as u64).saturating_add(1)).read_to_end(&mut bytes)?;
+        if bytes.len() > max_bytes {
+            return Err(fail());
+        }
+        String::from_utf8(bytes).map_err(|_| ToolError::ExecutionFailed {
+            message: "plugin read requires UTF-8 text".into(),
+        })
+    }
+
     /// Writes content to a file at the given path.
     ///
     /// If the file exists, it becomes `Modified`. If it does not exist, it
@@ -930,6 +964,21 @@ fn preflight_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Verifies bounded reads reject oversized disk and staged content before returning a copy.
+    #[test]
+    fn bounded_read_checks_disk_and_overlay_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("bounded.txt")).unwrap();
+        std::fs::write(&path, "12345").unwrap();
+        let mut vfs = VirtualFs::default();
+        assert!(vfs.read_bounded(&path, 4).is_err());
+        assert_eq!(vfs.read_bounded(&path, 5).unwrap(), "12345");
+        vfs.write(&path, "ééé".into()).unwrap();
+        assert!(vfs.read_bounded(&path, 5).is_err());
+        assert_eq!(vfs.read_bounded(&path, 6).unwrap(), "ééé");
+        assert!(vfs.read_bounded(&path, 0).is_err());
+    }
 
     #[test]
     fn virtual_fs_read_write() {

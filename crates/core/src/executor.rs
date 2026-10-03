@@ -724,6 +724,31 @@ impl ToolExecutor {
             message: format!("tool not found: {tool_name}"),
         })?;
 
+        self.execute_resolved(tool_name, tool, input, session, cancel, orchestrator_authority).await
+    }
+
+    /// Execute a host-owned operation through the same policy, approval, and audit gates.
+    /// Extensions supply input only; the host constructs the operation and never grants authority.
+    pub async fn execute_host_operation(
+        &self,
+        tool: &dyn Tool,
+        input: serde_json::Value,
+        session: &SessionContext,
+        cancel: CancellationToken,
+    ) -> Result<ToolOutput, ToolError> {
+        self.execute_resolved(tool.name(), tool, input, session, cancel, false).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_resolved(
+        &self,
+        tool_name: &str,
+        tool: &dyn Tool,
+        input: serde_json::Value,
+        session: &SessionContext,
+        cancel: CancellationToken,
+        orchestrator_authority: bool,
+    ) -> Result<ToolOutput, ToolError> {
         // Policy evaluates the tool's canonical view (alias tools present the
         // canonical tool name and operation-bearing input); execution and
         // audit below still use the registered name and the caller's input.

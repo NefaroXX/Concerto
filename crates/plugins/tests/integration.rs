@@ -875,7 +875,7 @@ async fn plugin_tool_identifiers() {
     );
 
     assert_eq!(tool.plugin_id(), "my-plugin");
-    assert_eq!(tool.name(), "echo");
+    assert_eq!(tool.name(), "plugin:my-plugin:echo");
     assert_eq!(tool.description(), "Echo input");
     assert_eq!(tool.input_schema(), serde_json::json!({}));
     assert!(tool.capability_requirements() == concerto_core::types::CapabilitySet::default());

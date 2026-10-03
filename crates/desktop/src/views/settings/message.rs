@@ -275,6 +275,8 @@ pub enum Message {
     McpEditEnvAdd,
     /// Remove an environment-variable row from the edit draft.
     McpEditEnvRemove(usize),
+    McpCredentialStore(bool, String),
+    McpCredentialStored(bool, Result<(), String>),
     /// Change the per-call timeout field of the edit draft.
     McpEditTimeoutChanged(String),
     /// Validate and apply the edit draft to its server. Leaves edit mode on
