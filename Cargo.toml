@@ -143,7 +143,7 @@ tower-http = { version = "0.7", features = ["cors", "trace"] }
 # ---- OpenAPI (Phase 3) ----
 utoipa = { version = "5", features = ["axum_extras"] }
 utoipa-axum = "0.1"
-utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
+utoipa-swagger-ui = { version = "10", features = ["axum", "vendored"] }
 
 # ---- Indexing / RAG pipeline (Phase 4) ----
 # swiftide = { version = "0.1", features = ["tree-sitter", "fastembed"] }  # Decision (2026-07-07): Ship Feature 4 v1 on entities.rs only. Revisit swiftide or hand-rolled tree-sitter only if entities.rs proves insufficient. See roadmap §3.3 option (c).
