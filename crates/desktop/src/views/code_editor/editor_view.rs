@@ -1,24 +1,18 @@
 use std::collections::HashSet;
 
-use iced::widget::tooltip::Position;
 use iced::widget::{
-    button, column, container, pane_grid, row, scrollable, text, text_editor, text_input, tooltip,
+    button, column, container, pane_grid, row, scrollable, stack, text, text_editor,
 };
 use iced::{Alignment, Background, Element, Length};
 
 use crate::theme::AppTheme;
 use crate::widgets::confirm_modal::ConfirmMessage;
-use crate::widgets::file_tree;
 
-use super::{
-    cursor_line_col, BracketStatus, Diagnostic, Message, State, FIND_INPUT_ID, GOTO_INPUT_ID,
-};
+use super::{BracketStatus, Diagnostic, Message, State};
 
 impl State {
     /// Render the editor view.
     pub fn view<'a>(&'a self, theme: &'a AppTheme) -> Element<'a, Message> {
-        let palette = &theme.palette;
-
         // --- Delete confirmation (armed by Message::DeleteFile) ---
         // Destructive actions get a confirm gate before anything is removed
         // (same pattern as the memory view's ConfirmModal).
@@ -29,163 +23,47 @@ impl State {
             });
         }
 
-        // --- File tree sidebar ---
-        // Built per-pane in `tree_pane_view` (pane_grid renders panes from
-        // the closure inside `PaneGrid::new`).
-
-        // --- Toolbar ---
-        let toolbar = row![
-                button(text("💾 Save").size(12)).padding(6).on_press(Message::Save),
-                button(text("✚ New").size(12)).padding(6).on_press(Message::NewFile),
-                button(text("🗑 Delete").size(12)).padding(6).on_press(Message::DeleteFile),
-                button(text("↻ Refresh").size(12)).padding(6).on_press(Message::RefreshTree),
-                button(text(if self.show_diagnostics { "▲ Diag" } else { "▼ Diag" }).size(12))
-                    .padding(6)
-                    .on_press(Message::ToggleDiagnostics),
-                button(text(self.tab_mode.label()).size(12))
-                    .padding(6)
-                    .on_press(Message::CycleTabMode),
-                button(text("Fold all").size(12)).padding(6).on_press(Message::FoldAll),
-                button(text("Unfold").size(12)).padding(6).on_press(Message::UnfoldAll),
-                button(
-                    text(if self.trim_trailing_on_save { "✓ Trim ws" } else { "Trim ws" }).size(12),
-                )
-                .padding(6)
-                .on_press(Message::ToggleTrimTrailing),
-                // Screenshot, restored for this page only: Ctrl+S is Save in
-                // the editor, and the chat input bar no longer carries one.
-                // Sits at the toolbar's end, directly above the find/replace
-                // bar, and dispatches the app-level capture.
-                button(text("📷 Screenshot").size(12)).padding(6).on_press(Message::TakeScreenshot),
-            ]
-        .spacing(6)
-        .align_y(Alignment::Center);
-
-        let toolbar_container =
-            container(toolbar).padding(8).style(move |_theme: &iced::Theme| container::Style {
-                background: Some(Background::Color(palette.surface)),
-                border: iced::Border { color: palette.border, width: 1.0, radius: 0.0.into() },
-                ..container::Style::default()
-            });
-
-        // --- Find / replace bar (optional) ---
-        let find_bar: Option<Element<'a, Message>> = if self.find_open {
-            let match_label = if self.find_query.is_empty() {
-                String::new()
-            } else if self.find_matches.is_empty() {
-                "No matches".to_string()
-            } else {
-                let current = self.find_current.map(|i| i + 1).unwrap_or(0);
-                let overflow = if self.find_overflow { "+" } else { "" };
-                format!("{current}/{}{overflow}", self.find_matches.len())
-            };
-            let find_row = row![
-                text_input("Find...", &self.find_query)
-                    .id(iced::widget::Id::from(FIND_INPUT_ID))
-                    .on_input(Message::FindQueryChanged)
-                    .on_submit(Message::FindNext)
-                    .padding(6)
-                    .width(Length::Fixed(240.0)),
-                text(match_label).size(11).color(palette.text_muted),
-                button(text("↑").size(12)).padding(6).on_press(Message::FindPrev),
-                button(text("↓").size(12)).padding(6).on_press(Message::FindNext),
-                button(text(if self.find_case_sensitive { "✓ Aa" } else { "Aa" }).size(12))
-                    .padding(6)
-                    .on_press(Message::ToggleFindCase),
-                button(text("✕").size(12)).padding(6).on_press(Message::CloseFind),
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center);
-
-            let bar_content: Element<'a, Message> = if self.replace_open {
-                let replace_row = row![
-                    text_input("Replace...", &self.replace_query)
-                        .on_input(Message::ReplaceQueryChanged)
-                        .on_submit(Message::ReplaceCurrent)
-                        .padding(6)
-                        .width(Length::Fixed(240.0)),
-                    button(text("Replace").size(12)).padding(6).on_press(Message::ReplaceCurrent),
-                    button(text("All").size(12)).padding(6).on_press(Message::ReplaceAll),
-                ]
-                .spacing(6)
-                .align_y(Alignment::Center);
-                column![find_row, replace_row].spacing(4).into()
-            } else {
-                find_row.into()
-            };
-
-            Some(
-                container(bar_content)
-                    .padding(6)
-                    .width(Length::Fill)
-                    .style(move |_theme: &iced::Theme| container::Style {
-                        background: Some(Background::Color(palette.surface)),
-                        border: iced::Border {
-                            color: palette.border,
-                            width: 1.0,
-                            radius: 0.0.into(),
-                        },
-                        ..container::Style::default()
-                    })
-                    .into(),
-            )
-        } else {
-            None
-        };
-
-        // --- Go-to-line bar (optional) ---
-        let goto_bar: Option<Element<'a, Message>> = if self.goto_open {
-            Some(
-                container(
+        if let Some(path) = &self.pending_close {
+            return container(
+                column![
+                    text("Discard unsaved changes?").size(20),
+                    text(format!("{} has unsaved edits.", path.file_name().unwrap_or("This file")))
+                        .size(13),
                     row![
-                        text("Go to line:").size(12).color(palette.text_muted),
-                        text_input("Line number", &self.goto_input)
-                            .id(iced::widget::Id::from(GOTO_INPUT_ID))
-                            .on_input(Message::GotoInputChanged)
-                            .on_submit(Message::GotoSubmit)
-                            .padding(6)
-                            .width(Length::Fixed(160.0)),
-                        button(text("Go").size(12)).padding(6).on_press(Message::GotoSubmit),
-                        button(text("✕").size(12)).padding(6).on_press(Message::CloseGoto),
+                        button("Discard and close").on_press(Message::CloseTabConfirmed),
+                        button("Keep editing").on_press(Message::CloseTabCancelled),
                     ]
-                    .spacing(6)
-                    .align_y(Alignment::Center),
-                )
-                .padding(6)
-                .width(Length::Fill)
-                .style(move |_theme: &iced::Theme| container::Style {
-                    background: Some(Background::Color(palette.surface)),
-                    border: iced::Border { color: palette.border, width: 1.0, radius: 0.0.into() },
-                    ..container::Style::default()
-                })
-                .into(),
+                    .spacing(10),
+                ]
+                .spacing(16)
+                .padding(24),
             )
-        } else {
-            None
-        };
-
-        // --- Layout ---
-        let mut layout = column![toolbar_container].spacing(0);
-        if let Some(bar) = find_bar {
-            layout = layout.push(bar);
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .into();
         }
-        if let Some(bar) = goto_bar {
-            layout = layout.push(bar);
-        }
-        layout.push(self.pane_grid_view(theme)).into()
+        column![
+            self.tabs_view(theme),
+            self.tools_view(theme),
+            self.pane_grid_view(theme),
+            self.status_view(theme),
+        ]
+        .spacing(0)
+        .height(Length::Fill)
+        .into()
     }
-    /// The resizable tree | editor | diagnostics pane grid (#90, #108).
+    /// Explorer at left, with the editor and Problems stacked on the right.
     ///
     /// Each divider is clamped in `Message::PaneResized` to its own ratio
     /// regime (see `editor_core.rs`); `min_size` is the secondary pixel floor.
     /// `PaneGrid::min_size` is global — it applies to every pane on both axes —
-    /// so it is set to a floor that suits the narrow diagnostics pane without
+    /// so it is set to a floor that suits the compact Problems panel without
     /// breaking the tree/editor behavior (whose ratio clamps remain the
     /// primary guard).
     fn pane_grid_view<'a>(&'a self, theme: &'a AppTheme) -> Element<'a, Message> {
         let palette = &theme.palette;
         pane_grid::PaneGrid::new(&self.pane_state, |pane, (), _maximized| {
-            // Three panes: tree (left) | editor (center) | diagnostics (right).
+            // Explorer at left; code above Problems on the right.
             if pane == self.tree_pane {
                 pane_grid::Content::new(self.tree_pane_view(theme))
             } else if pane == self.editor_pane {
@@ -213,25 +91,102 @@ impl State {
         .into()
     }
 
-    /// The file-tree pane content.
     fn tree_pane_view<'a>(&'a self, theme: &'a AppTheme) -> Element<'a, Message> {
-        let palette = &theme.palette;
-        let tree_view =
-            file_tree::view(&self.tree, self.active_file.as_deref()).map(Message::FileTree);
-        container(tree_view)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(move |_theme: &iced::Theme| container::Style {
-                background: Some(Background::Color(palette.surface)),
-                ..container::Style::default()
-            })
-            .into()
+        self.explorer_view(theme)
     }
 
-    /// The editor pane: the editor area (+ gutter marks and completion popup).
-    /// The diagnostics / status column now lives in its own resizable pane
-    /// (`diag_pane_view`), so this pane renders only the editing surface.
     fn editor_pane<'a>(&'a self, theme: &'a AppTheme) -> Element<'a, Message> {
+        let mut contents = column![self.breadcrumbs_view(theme)].spacing(0);
+        if let Some(banner) = self.staged_banner(theme) {
+            contents = contents.push(banner);
+        }
+        if self.review_open {
+            contents = contents.push(self.review_view(theme));
+        } else {
+            if let Some(hover) = &self.hover {
+                contents = contents.push(
+                    container(
+                        row![
+                            text(hover).size(12).width(Length::Fill),
+                            button("×")
+                                .padding(4)
+                                .style(button::text)
+                                .on_press(Message::ClearHover),
+                        ]
+                        .spacing(8),
+                    )
+                    .padding([6, 12]),
+                );
+            } else if let Some((line, _)) = self.cursor_position() {
+                if let Some(diagnostic) = self.diagnostics.iter().find(|d| d.line == line) {
+                    contents = contents.push(
+                        container(
+                            text(&diagnostic.message)
+                                .size(12)
+                                .color(diagnostic.severity.color(&theme.palette)),
+                        )
+                        .padding([6, 12]),
+                    );
+                }
+            }
+            contents = contents.push(self.editor_surface(theme));
+        }
+        contents.height(Length::Fill).into()
+    }
+
+    fn review_view<'a>(&'a self, theme: &'a AppTheme) -> Element<'a, Message> {
+        use concerto_api_types::diff::DiffLine;
+        let Some(result) = self.staged_file() else {
+            return text("No staged changes for this file").into();
+        };
+        let mut lines: Vec<Element<'a, Message>> = Vec::new();
+        use concerto_tools::virtual_fs::VirtualFsEntry;
+        let operation = match self.staged_entries.get(&result.path) {
+            Some(VirtualFsEntry::Created { .. }) => Some("New file"),
+            Some(VirtualFsEntry::Deleted { .. }) => Some("File deletion"),
+            _ => None,
+        };
+        if let Some(operation) = operation {
+            lines.push(text(operation).size(14).color(theme.palette.secondary).into());
+        }
+        for hunk in &result.hunks {
+            lines.push(
+                text(format!(
+                    "@@ -{},{} +{},{} @@",
+                    hunk.old_start, hunk.old_len, hunk.new_start, hunk.new_len
+                ))
+                .size(12)
+                .font(theme.font_stack.mono)
+                .color(theme.palette.secondary)
+                .into(),
+            );
+            for line in &hunk.lines {
+                let (prefix, number, content, color) = match line {
+                    DiffLine::Addition { content, line_num } => {
+                        ("+", line_num, content, theme.palette.success)
+                    }
+                    DiffLine::Deletion { content, line_num } => {
+                        ("−", line_num, content, theme.palette.danger)
+                    }
+                    DiffLine::Context { content, line_num } => {
+                        (" ", line_num, content, theme.palette.text_muted)
+                    }
+                    _ => continue,
+                };
+                lines.push(
+                    text(format!("{prefix} {number:>5}  {content}"))
+                        .size(13)
+                        .font(theme.font_stack.mono)
+                        .color(color)
+                        .into(),
+                );
+            }
+        }
+        scrollable(column(lines).spacing(4).padding(14)).height(Length::Fill).into()
+    }
+
+    /// Editing surface with gutter markers and floating search/completion.
+    fn editor_surface<'a>(&'a self, theme: &'a AppTheme) -> Element<'a, Message> {
         let palette = &theme.palette;
 
         // --- Editor area ---
@@ -245,6 +200,15 @@ impl State {
                 .height(Length::Fill)
                 .font(theme.font_stack.mono)
                 .size(theme.font_stack.base_size)
+                .line_height(iced::widget::text::LineHeight::Absolute(iced::Pixels(24.0)))
+                .padding(8)
+                .style(move |_theme, _status| text_editor::Style {
+                    background: palette.surface_variant.into(),
+                    border: iced::Border { color: palette.border, width: 0.0, radius: 0.0.into() },
+                    placeholder: palette.text_muted,
+                    value: palette.text,
+                    selection: palette.primary,
+                })
                 .highlight(lang, iced::highlighter::Theme::SolarizedDark)
                 .key_binding(move |key_press| {
                     crate::views::code_editor::editor_key_binding(
@@ -268,7 +232,8 @@ impl State {
             } else {
                 HashSet::new()
             };
-            let any_marks = !diag_lines.is_empty()
+            let any_marks = line_count > 0
+                || !diag_lines.is_empty()
                 || bracket_line.is_some()
                 || !occurrence_lines.is_empty()
                 || !fold_anchors.is_empty()
@@ -314,10 +279,12 @@ impl State {
                         row![chevron, text(line_num).size(11).color(palette.text_muted), marker]
                             .spacing(4)
                             .align_y(Alignment::Center)
+                            .height(Length::Fixed(24.0))
                             .into(),
                     );
                 }
-                let gutter_col = scrollable(column(gutter).spacing(0)).width(Length::Shrink);
+                let gutter_col =
+                    scrollable(column(gutter).spacing(0).padding([8, 4])).width(Length::Shrink);
 
                 row![gutter_col, editor].spacing(0).into()
             };
@@ -353,8 +320,13 @@ impl State {
         let completion_panel: Option<Element<'a, Message>> = if self.completion_open
             && !self.completion_items.is_empty()
         {
-            let items: Vec<(usize, &super::CompletionItem)> =
-                self.completion_items.iter().enumerate().take(20).collect();
+            let items: Vec<(usize, &super::CompletionItem)> = self
+                .completion_items
+                .iter()
+                .enumerate()
+                .skip(self.completion_selected.saturating_sub(3))
+                .take(8)
+                .collect();
             let selected = self.completion_selected;
             let rows: Vec<Element<'a, Message>> = items
                 .into_iter()
@@ -387,155 +359,53 @@ impl State {
                 })
                 .collect();
             Some(
-                container(scrollable(column(rows).spacing(0)).height(Length::Fixed(180.0)))
-                    .width(Length::Fill)
-                    .style(move |_theme: &iced::Theme| container::Style {
-                        background: Some(Background::Color(palette.surface)),
-                        border: iced::Border {
-                            color: palette.border,
-                            width: 1.0,
-                            radius: 0.0.into(),
-                        },
-                        ..container::Style::default()
-                    })
-                    .into(),
+                container(
+                    column![
+                        scrollable(column(rows).spacing(0)).height(Length::Fixed(200.0)),
+                        text("Tab / Enter accept · Esc close").size(11).color(palette.text_muted),
+                    ]
+                    .spacing(6)
+                    .padding(8),
+                )
+                .width(Length::Fill)
+                .style(move |_theme: &iced::Theme| container::Style {
+                    background: Some(Background::Color(palette.surface)),
+                    border: iced::Border { color: palette.border, width: 1.0, radius: 0.0.into() },
+                    ..container::Style::default()
+                })
+                .into(),
             )
         } else {
             None
         };
 
-        // Wrap the editor area with the completion panel when open.
-        let editor_el: Element<'a, Message> = match completion_panel {
-            Some(panel) => column![editor_area, panel].spacing(0).into(),
-            None => editor_area.into(),
-        };
-
-        editor_el
+        let mut layers: Vec<Element<'a, Message>> = vec![editor_area.into()];
+        if let Some(panel) = completion_panel {
+            layers.push(
+                container(container(panel).max_width(440))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_x(iced::alignment::Horizontal::Right)
+                    .align_y(iced::alignment::Vertical::Bottom)
+                    .padding(12)
+                    .into(),
+            );
+        }
+        if let Some(panel) = self.find_widget(theme).or_else(|| self.goto_widget(theme)) {
+            layers.push(
+                container(container(panel).max_width(540))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_x(iced::alignment::Horizontal::Right)
+                    .align_y(iced::alignment::Vertical::Top)
+                    .padding(12)
+                    .into(),
+            );
+        }
+        stack(layers).into()
     }
 
-    /// The diagnostics / status pane content (#108).
-    ///
-    /// Rendered by the pane grid for the diagnostics pane. It shows the LSP
-    /// diagnostics list, else the current hover tooltip, else a slim status
-    /// panel (the empty state when there is nothing to show). Every variant
-    /// fills the pane on both axes with a palette background so the column
-    /// reads as an intentional panel rather than dead vertical space; width
-    /// tracks the pane (`Length::Fill`) instead of `FillPortion` constants.
     fn diag_pane_view<'a>(&'a self, theme: &'a AppTheme) -> Element<'a, Message> {
-        let palette = &theme.palette;
-
-        // --- Diagnostics list (when enabled and non-empty) ---
-        if self.show_diagnostics && !self.diagnostics.is_empty() {
-            let mut rows: Vec<Element<'a, Message>> = Vec::new();
-            for diag in &self.diagnostics {
-                let color = diag.severity.color(palette);
-                rows.push(
-                    row![
-                        text(format!("{}:{} ", diag.line + 1, diag.character + 1))
-                            .size(11)
-                            .color(palette.text_muted),
-                        text(diag.severity.label()).size(11).color(color),
-                        text(&diag.message).size(11),
-                    ]
-                    .spacing(6)
-                    .align_y(Alignment::Center)
-                    .into(),
-                );
-            }
-            container(column(rows).spacing(4).padding(8))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(move |_theme: &iced::Theme| container::Style {
-                    background: Some(Background::Color(palette.surface)),
-                    ..container::Style::default()
-                })
-                .into()
-        } else if let Some(hover) = &self.hover {
-            // --- Hover tooltip (transient) ---
-            container(text(hover).size(12).color(palette.text))
-                .padding(8)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(move |_theme: &iced::Theme| container::Style {
-                    background: Some(Background::Color(palette.surface_variant)),
-                    ..container::Style::default()
-                })
-                .into()
-        } else {
-            // --- Slim status panel: the empty state when the pane has no
-            // diagnostics and no hover (#108). Stacked vertically so it fits
-            // the narrow default width instead of overflowing.
-            let file_label = self
-                .active_file
-                .as_ref()
-                .map(|p| p.file_name().unwrap_or("?").to_string())
-                .unwrap_or_else(|| "No file open".to_string());
-            let dirty_label = if self.dirty { "●" } else { "" };
-            let diag_count = self.diagnostics.len();
-            let (cursor_line, cursor_col) =
-                self.content.as_ref().map(cursor_line_col).unwrap_or((1, 1));
-            let bracket_label = match self.bracket_status {
-                BracketStatus::None => String::new(),
-                BracketStatus::Matched { other_line, .. } => {
-                    format!(" · ⇄ Ln {}", other_line + 1)
-                }
-                BracketStatus::Unmatched => " · ⚠ unmatched".to_string(),
-            };
-            let word_label = match &self.current_word {
-                Some(word) if !self.word_occurrences.is_empty() => {
-                    format!(" · {word} ×{}", self.word_occurrences.len())
-                }
-                _ => String::new(),
-            };
-            let fold_label = if self.folds.is_empty() {
-                String::new()
-            } else {
-                format!(" · {} folded", self.folds.len())
-            };
-
-            // The file label shows the full path on hover — the pane is
-            // narrow, so on-screen it is clipped without an ellipsis API.
-            let file_label_el: Element<'a, Message> = match &self.active_file {
-                Some(path) => tooltip(
-                    text(format!("{file_label}{dirty_label}")).size(13),
-                    text(path.to_string()).size(12).color(palette.text_muted),
-                    Position::Top,
-                )
-                .into(),
-                None => text(format!("{file_label}{dirty_label}")).size(13).into(),
-            };
-
-            let mut status: Vec<Element<'a, Message>> = vec![
-                file_label_el,
-                text(format!(" · {diag_count} diagnostics · {}", self.lang))
-                    .size(11)
-                    .color(palette.text_muted)
-                    .into(),
-                text(format!(" · Ln {cursor_line}, Col {cursor_col}"))
-                    .size(11)
-                    .color(palette.text_muted)
-                    .into(),
-            ];
-            if !bracket_label.is_empty() {
-                status.push(text(bracket_label).size(11).color(palette.success).into());
-            }
-            if !word_label.is_empty() {
-                status.push(text(word_label).size(11).color(palette.accent).into());
-            }
-            if !fold_label.is_empty() {
-                status.push(text(fold_label).size(11).color(palette.secondary).into());
-            }
-            status.push(text(self.tab_mode.label()).size(11).color(palette.text_muted).into());
-
-            container(column(status).spacing(4))
-                .padding(8)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(move |_theme: &iced::Theme| container::Style {
-                    background: Some(Background::Color(palette.surface)),
-                    ..container::Style::default()
-                })
-                .into()
-        }
+        self.problems_view(theme)
     }
 }

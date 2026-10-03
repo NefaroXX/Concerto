@@ -8,6 +8,28 @@ use super::{CompletionItem, Diagnostic};
 /// Messages emitted by the editor view.
 #[derive(Debug, Clone)]
 pub enum Message {
+    /// Close a tab, prompting before discarding unsaved edits.
+    CloseTab(Utf8PathBuf),
+    CloseActiveTab,
+    NextTab,
+    PreviousTab,
+    CloseTabConfirmed,
+    CloseTabCancelled,
+    ExplorerFilterChanged(String),
+    ToggleEditorTools,
+    /// Navigate to a diagnostic in an open document (LSP UTF-16 column).
+    DiagnosticSelected(Utf8PathBuf, usize, usize),
+    ReviewStaged,
+    CloseReview,
+    AcceptStaged,
+    DiscardStaged,
+    /// Scope asynchronous responses to their originating document.
+    DocumentReply {
+        path: Utf8PathBuf,
+        revision: u64,
+        cursor: Option<(usize, usize)>,
+        reply: Box<Message>,
+    },
     /// A file was selected in the tree.
     FileSelected(Utf8PathBuf),
     /// A directory node was toggled.
@@ -43,6 +65,10 @@ pub enum Message {
     ClearHover,
     /// LSP request completed (open file, etc.).
     LspReady,
+    /// Refresh cached diagnostics without implying a successful connection.
+    RefreshDiagnostics,
+    /// Closing a document does not change the active document's status.
+    LspClosed,
     /// LSP error occurred.
     LspError(String),
     /// Messages from the file tree widget.

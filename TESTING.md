@@ -280,6 +280,22 @@ For each failure, record:
 7. files changed before failure and whether they were preserved;
 8. frequency (`always`, `intermittent`, or `once`).
 
+Editor workspace release checks (ADR-78):
+
+| Interaction | Expected result | Pass/fail |
+|---|---|---|
+| Edit two tabs, switch, undo/redo | Each document keeps its text, cursor, dirty flag and history; disk is unchanged until Save | |
+| Close a dirty active or inactive tab | Keep editing cancels; Discard and close removes only the selected buffer | |
+| Filter Explorer | Matching descendants appear through collapsed parents; clearing the filter restores the tree | |
+| Click a Problem | Correct tab opens at the LSP location, including UTF-16 positions in Unicode text | |
+| Hide/show and resize Problems | Explorer remains visible; the panel returns below the editor with clamped height | |
+| Find/replace and completion | Widgets float in the code area; keyboard acceptance/dismissal works; the selected completion stays visible | |
+| Stage changes in two files; accept one | Only the selected file reaches disk; the other overlay and any dirty buffer remain | |
+| Discard a staged file, including a new file | Disk remains unchanged; the discarded overlay is removed; a nonexistent file's tab closes | |
+| Edit while review is available; change a proposal during review | Unsaved edits and a changed proposal block accept/discard until the latest contents are reviewed | |
+| Switch or edit while an LSP reply is pending | Old document/revision/cursor replies do not alter the current editor | |
+| Use a narrow window and each theme | Toolbar/tabs remain scrollable; Problems, status and review controls remain readable | |
+
 Severity guide:
 
 - **Critical:** credential exposure, destructive escape, or unrecoverable data loss.

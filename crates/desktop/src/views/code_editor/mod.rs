@@ -27,6 +27,8 @@ mod editor_view;
 mod helpers;
 mod message;
 mod text_helpers;
+mod workspace;
+mod workspace_view;
 
 use concerto_tools::virtual_fs::VirtualFs;
 pub use message::Message;
@@ -119,13 +121,11 @@ pub(crate) const TREE_PANE_DEFAULT_RATIO: f32 = 0.22;
 pub(crate) const TREE_PANE_MIN_RATIO: f32 = 0.15;
 pub(crate) const TREE_PANE_MAX_RATIO: f32 = 0.65;
 
-/// Default share of the editor|diag split given to the diagnostics pane
-/// (#108). The split ratio itself is the *editor's* share of that width, so
-/// the pane is initialized at `1 - DIAG_PANE_DEFAULT_SHARE`.
+/// Default height share of the bottom Problems panel.
 pub(crate) const DIAG_PANE_DEFAULT_SHARE: f32 = 0.20;
 
 /// Clamp bounds for the editor|diag divider, expressed as the diagnostics
-/// pane's share of the split width. These keep the column narrow and the
+/// pane's share of the split height. These keep the panel compact and the
 /// editor dominant regardless of how far the divider is dragged.
 pub(crate) const DIAG_PANE_MIN_SHARE: f32 = 0.1;
 pub(crate) const DIAG_PANE_MAX_SHARE: f32 = 0.35;
@@ -210,6 +210,19 @@ impl TabMode {
 
 /// Internal editor state.
 pub struct State {
+    /// Tab order; the active document lives in the existing editing fields.
+    pub(crate) tabs: Vec<Utf8PathBuf>,
+    pub(crate) buffers: std::collections::HashMap<Utf8PathBuf, workspace::Buffer>,
+    pub(crate) explorer_filter: String,
+    pub(crate) editor_tools_open: bool,
+    pub(crate) pending_close: Option<Utf8PathBuf>,
+    pub(crate) document_revision: u64,
+    pub(crate) lsp_status: String,
+    pub(crate) line_ending: &'static str,
+    pub(crate) review_open: bool,
+    pub(crate) staged: Vec<concerto_api_types::diff::DiffResult>,
+    pub(crate) staged_entries:
+        std::collections::HashMap<Utf8PathBuf, concerto_tools::virtual_fs::VirtualFsEntry>,
     /// The file tree root node.
     pub(crate) tree: TreeNode,
     /// Whether the tree needs to be rebuilt from disk.
@@ -280,18 +293,18 @@ pub struct State {
     /// When `Some`, the destructive delete awaits confirmation (the modal is
     /// rendered from this; `DeleteConfirmed`/`DeleteCancelled` resolve it).
     pub(crate) pending_delete: Option<ConfirmModal>,
-    /// pane_grid layout for the tree | editor | diagnostics split (#90, #108).
+    /// Explorer split with the editor above the Problems panel.
     pub(crate) pane_state: pane_grid::State<()>,
     /// The pane holding the file tree (leftmost pane).
     pub(crate) tree_pane: pane_grid::Pane,
     /// The pane holding the code editor (center pane).
     pub(crate) editor_pane: pane_grid::Pane,
-    /// The pane holding the diagnostics / status column (rightmost pane).
+    /// The pane holding the bottom Problems panel.
     pub(crate) diag_pane: pane_grid::Pane,
     /// The divider between the tree and editor panes. `None` only in the
     /// degenerate single-pane fallback.
     pub(crate) tree_split: Option<pane_grid::Split>,
-    /// The divider between the editor and diagnostics panes.
+    /// The horizontal divider between the editor and Problems.
     pub(crate) diag_split: Option<pane_grid::Split>,
 }
 
@@ -306,8 +319,8 @@ impl State {
     pub fn new(project_dir: Utf8PathBuf) -> Self {
         let tree = TreeNode::from_disk(&project_dir);
         // The pane grid starts as a single tree pane, then splits off the
-        // editor to its right and finally the diagnostics column to the
-        // editor's right. A fresh single-pane grid always has a splittable
+        // editor to its right and Problems below the editor.
+        // A fresh single-pane grid always has a splittable
         // leaf; the fallbacks keep a valid (degenerate) layout.
         let (mut pane_state, tree_pane) = pane_grid::State::new(());
         let tree_split = pane_state.split(pane_grid::Axis::Vertical, tree_pane, ());
@@ -319,17 +332,27 @@ impl State {
             // Degenerate fallback: the tree pane doubles as the editor.
             None => (tree_pane, None),
         };
-        let diag_split = pane_state.split(pane_grid::Axis::Vertical, editor_pane, ());
+        let diag_split = pane_state.split(pane_grid::Axis::Horizontal, editor_pane, ());
         let (diag_pane, diag_split) = match diag_split {
             Some((pane, split)) => {
-                // The split ratio is the *editor's* share of the editor|diag
-                // width; the diagnostics pane gets `DIAG_PANE_DEFAULT_SHARE`.
+                // The editor's share of the height; Problems occupies the rest.
                 pane_state.resize(split, 1.0 - DIAG_PANE_DEFAULT_SHARE);
                 (pane, Some(split))
             }
             None => (editor_pane, None),
         };
         Self {
+            tabs: Vec::new(),
+            buffers: std::collections::HashMap::new(),
+            explorer_filter: String::new(),
+            editor_tools_open: false,
+            pending_close: None,
+            document_revision: 0,
+            lsp_status: "LSP idle".into(),
+            line_ending: "LF",
+            review_open: false,
+            staged: Vec::new(),
+            staged_entries: std::collections::HashMap::new(),
             tree,
             tree_dirty: false,
             active_file: None,
@@ -338,7 +361,7 @@ impl State {
             dirty: false,
             diagnostics: Vec::new(),
             hover: None,
-            show_diagnostics: false,
+            show_diagnostics: true,
             lsp_version: 0,
             undo_stack: VecDeque::new(),
             redo_stack: Vec::new(),
@@ -380,6 +403,17 @@ impl State {
 
     /// Open a file: read from VFS if staged, otherwise from disk.
     pub(crate) fn open_file(&mut self, path: &Utf8Path, vfs: &Arc<Mutex<VirtualFs>>) {
+        self.refresh_staged(vfs);
+        if self.active_file.as_deref() == Some(path) {
+            return;
+        }
+        self.store_active_buffer();
+        self.document_revision = self.document_revision.wrapping_add(1);
+        if self.restore_buffer(path) {
+            self.tree.expand_to(path);
+            self.reset_document_widgets();
+            return;
+        }
         // Try VFS first (for staged changes), then disk. A poisoned VFS lock
         // degrades gracefully to a plain disk read.
         let from_vfs = vfs.lock().ok().and_then(|guard| {
@@ -395,6 +429,10 @@ impl State {
         };
 
         self.active_file = Some(path.to_path_buf());
+        if !self.tabs.iter().any(|p| p == path) {
+            self.tabs.push(path.to_path_buf());
+        }
+        self.line_ending = if content_text.contains("\r\n") { "CRLF" } else { "LF" };
         self.content = Some(text_editor::Content::with_text(&content_text));
         self.lang = crate::widgets::file_tree::lang_for_file(path);
         self.dirty = false;
@@ -406,15 +444,14 @@ impl State {
         self.last_edit_kind = None;
         self.folds.clear();
         self.completion_open = false;
+        self.reset_document_widgets();
 
         // Expand the tree to show the file.
         self.tree.expand_to(path);
         self.refresh_cursor_insights();
     }
 
-    /// Open a file and run the full post-open LSP handshake: reset per-file
-    /// state (dirty, version, diagnostics, hover) and send `textDocument/
-    /// didOpen`. Shared by every file-open path so behavior cannot diverge.
+    /// Restore an open document, or initialize a new buffer and send didOpen.
     fn dispatch_file_open(
         &mut self,
         path: &Utf8Path,
@@ -422,24 +459,32 @@ impl State {
         project_dir: &Utf8Path,
         cancel: &CancellationToken,
     ) -> iced::Task<Message> {
+        if self.active_file.as_deref() == Some(path) {
+            return iced::Task::none();
+        }
+        let already_open = self.buffers.contains_key(path);
         self.open_file(path, vfs);
-        self.dirty = false;
-        self.lsp_version = 0;
-        self.diagnostics.clear();
         self.hover = None;
+        self.refresh_staged(vfs);
+        if already_open {
+            return self.update(Message::RefreshDiagnostics, vfs, project_dir, cancel);
+        }
+        self.lsp_version = 1;
+        self.lsp_status = "LSP connecting".into();
 
         let project_dir = project_dir.to_path_buf();
         let cancel = cancel.clone();
         let file_path = path.to_path_buf();
         let content = self.content.as_ref().map(|c| c.text()).unwrap_or_default();
         let lang = self.lang;
-        iced::Task::perform(
+        let task = iced::Task::perform(
             async move { lsp_did_open(project_dir, file_path, content, lang, cancel).await },
             |result| match result {
                 Ok(()) => Message::LspReady,
                 Err(e) => Message::LspError(e),
             },
-        )
+        );
+        self.scope_task(task, false)
     }
 
     /// Capture the current buffer and cursor as an undo snapshot.
@@ -499,6 +544,7 @@ impl State {
         cancel: &CancellationToken,
     ) -> iced::Task<Message> {
         self.dirty = true;
+        self.document_revision = self.document_revision.wrapping_add(1);
         self.lsp_version += 1;
         self.refresh_cursor_insights();
         let Some(file_path) = self.active_file.clone() else {
@@ -510,13 +556,14 @@ impl State {
         let version = self.lsp_version;
         let project_dir = project_dir.to_path_buf();
         let cancel = cancel.clone();
-        iced::Task::perform(
+        let task = iced::Task::perform(
             async move { lsp_did_change(project_dir, file_path, content_text, version, cancel).await },
             |result| match result {
                 Ok(()) => Message::LspReady,
                 Err(e) => Message::LspError(e),
             },
-        )
+        );
+        self.scope_task(task, false)
     }
 
     /// Open the find bar (optionally with the replace row), pre-filling the
@@ -897,6 +944,30 @@ pub(crate) async fn lsp_did_open(
         .send_notification("textDocument/didOpen", params)
         .await
         .map_err(|e| format!("LSP didOpen failed: {e}"))?;
+    Ok(())
+}
+
+/// Notify the language server when a tab is closed.
+pub(crate) async fn lsp_did_close(
+    project_dir: Utf8PathBuf,
+    file_path: Utf8PathBuf,
+    cancel: CancellationToken,
+) -> Result<(), String> {
+    let project_id =
+        ProjectIdHelper::from_dir(&project_dir).map_err(|e| format!("Project ID: {e}"))?;
+    let client =
+        LspManager::get_or_start(project_id, project_dir.as_std_path().to_path_buf(), cancel).await;
+    client
+        .lock()
+        .await
+        .send_notification(
+            "textDocument/didClose",
+            serde_json::json!({
+                "textDocument": { "uri": format!("file://{}", file_path) },
+            }),
+        )
+        .await
+        .map_err(|e| format!("LSP didClose failed: {e}"))?;
     Ok(())
 }
 
