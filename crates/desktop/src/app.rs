@@ -4209,11 +4209,16 @@ impl App {
             column![content_column, status_bar].width(Length::Fill)
         };
 
-        let sep2 = rule::vertical(1);
-        let right_panel: Element<'_, Message> = if self.quick_panel_open {
-            views::quick_panel::quick_panel_view(self)
+        // Studio owns the full configuration workspace. The session rail is
+        // restored on return without changing the user's panel preference.
+        let studio_active = self.page == Page::OrchestrationStudio;
+        let sep2 = (!studio_active).then(|| rule::vertical(1));
+        let right_panel: Option<Element<'_, Message>> = if studio_active {
+            None
+        } else if self.quick_panel_open {
+            Some(views::quick_panel::quick_panel_view(self))
         } else {
-            views::quick_panel::quick_panel_collapsed(self)
+            Some(views::quick_panel::quick_panel_collapsed(self))
         };
 
         // Explicit `Fill` on the shell row: the sidebar and right panel keep
