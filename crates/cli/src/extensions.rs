@@ -272,7 +272,7 @@ pub fn run_plugin(args: &[String]) -> anyhow::Result<()> {
             if args[1].is_empty() || args[1] == "." || args[1] == ".." || !args[1].chars().all(|ch| ch.is_ascii_alphanumeric() || "._-".contains(ch)) { bail!("invalid plugin id"); }
             concerto_plugins::installer::delete_plugin_file(&directory.join(format!("{}.wasm", args[1])))?;
             concerto_plugins::capability::CapabilityManager::open(&directory)?.revoke_plugin(&args[1])?;
-            println!("Removed plugin file and persisted capability grants. Existing processes reload on their next run.");
+            println!("Removed plugin file and persisted capability grants. Restart running Desktop instances to reload installed plugins.");
         }
         _ => bail!("usage: concerto plugin <list|installed|install FILE [--replace]|remove ID --yes|revoke ID>"),
     }
