@@ -286,3 +286,16 @@ Severity guide:
 - **High:** normal use is blocked and there is no in-app recovery.
 - **Medium:** a feature fails but another workflow remains usable.
 - **Low:** confusing copy, layout, inaccurate status, or minor inconvenience.
+
+### Extension authorization and credential release checks (ADR-78)
+
+| Check | Expected result | Result |
+|---|---|---|
+| Plugin approval | An unapproved capability-bearing WASM is skipped; approve its binary in Settings, then start a new run | |
+| Revocation/hash/TTL | Revoke, replace the WASM, or expire the grant; the next run cannot reactivate its old authority | |
+| Host effects | Plugin file writes appear in tracked changes; file/shell/HTTP denial applies to the concrete nested operation | |
+| MCP arguments | JSON arguments containing spaces, quotes, backslashes, Unicode, and an empty string survive save/reopen | |
+| MCP credentials | Store a token in keychain; TOML contains only its reference, unrelated parent tokens are absent in the child | |
+| Disabled probes | Master off or server off disables Test; enabled Test explains that it starts a trusted executable | |
+| Process teardown | Stop/drop a fixture that launches a worker; no worker remains (Linux/macOS/Windows) | |
+| Theme/layout | Inspect MCP add/edit and plugin approval/detail at normal and narrow window widths in light/dark themes | |

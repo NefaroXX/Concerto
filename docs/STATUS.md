@@ -102,6 +102,9 @@ installer packages.
 - **Extensibility:** WASM tool/provider/memory-adapter plugin loading, manifests,
   capability checks, lifecycle management with grant TTL/hash pinning/revocation
   (ADR-37), guest SDK, and three example plugins (tool, provider, adapter).
+  Runtime approval enforcement, shared executor host effects, bounded Wasmtime
+  growth, and stable `plugin:<id>:<tool>` names follow ADR-78. Initialization has
+  no active run authority. Memory-adapter selection remains a support limitation.
 - **Skills (ADR-43):** local instruction packs (`skill.toml` or `SKILL.md` +
   resources) discovered by `SkillManager` (`crates/skills`) and injected into
   every prompt path as one budgeted, truncation-marked `## Skills` section by

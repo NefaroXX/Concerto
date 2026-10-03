@@ -81,7 +81,10 @@ re-indexing (`concerto-memory`). SQLite is the only vector-store backend.
 
 **Extensibility.** WASM plugins for tools, providers, and memory adapters via
 `concerto-plugin-sdk`, with manifest validation and capability grants
-(TTL/hash pinning/revocation). MCP stdio servers (protocol `2025-11-25`)
+(TTL/hash pinning/revocation). Runtime discovery requires persisted approval;
+plugin tools use `plugin:<id>:<tool>` names. Host file, shell, and HTTP effects
+pass through shared policy, with file writes tracked in the shared `VirtualFs` for diff and undo.
+MCP stdio servers (protocol `2025-11-25`)
 expose tools namespaced `mcp:<server>:<tool>`, collision-checked and
 policy-gated like any tool. Local Skills (`skill.toml` or `SKILL.md`
 instruction packs) are injected into prompts by `SkillsContext` and never
