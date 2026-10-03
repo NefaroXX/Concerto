@@ -1759,16 +1759,30 @@ impl App {
                 // editor state — the Editor page is the one page whose
                 // Ctrl+S means Save, and this is its screenshot access.
                 views::code_editor::Message::TakeScreenshot => self.update(Message::TakeScreenshot),
-                msg => self
-                    .editor
-                    .update(
+                msg => {
+                    let refresh_diff = matches!(
                         msg,
-                        &self.vfs,
-                        &Utf8PathBuf::from_path_buf(self.project_dir.clone())
-                            .unwrap_or_else(|p| Utf8PathBuf::from(p.to_string_lossy().as_ref())),
-                        &self.cancel_token,
-                    )
-                    .map(Message::Editor),
+                        views::code_editor::Message::AcceptStaged
+                            | views::code_editor::Message::DiscardStaged
+                            | views::code_editor::Message::Save
+                            | views::code_editor::Message::DeleteConfirmed
+                    );
+                    let task = self
+                        .editor
+                        .update(
+                            msg,
+                            &self.vfs,
+                            &Utf8PathBuf::from_path_buf(self.project_dir.clone()).unwrap_or_else(
+                                |p| Utf8PathBuf::from(p.to_string_lossy().as_ref()),
+                            ),
+                            &self.cancel_token,
+                        )
+                        .map(Message::Editor);
+                    if refresh_diff {
+                        self.load_diff_from_vfs();
+                    }
+                    task
+                }
             },
             Message::ThemeChanged => {
                 // Re-read the single source (prefs) and re-apply it to every
@@ -2339,7 +2353,19 @@ impl App {
                         self.update(Message::Editor(views::code_editor::Message::CloseFind));
                     let close_goto =
                         self.update(Message::Editor(views::code_editor::Message::CloseGoto));
-                    return iced::Task::batch([close_find, close_goto]);
+                    let cancel_close = self
+                        .update(Message::Editor(views::code_editor::Message::CloseTabCancelled));
+                    let close_completion =
+                        self.update(Message::Editor(views::code_editor::Message::CompletionClose));
+                    let close_review =
+                        self.update(Message::Editor(views::code_editor::Message::CloseReview));
+                    return iced::Task::batch([
+                        close_find,
+                        close_goto,
+                        cancel_close,
+                        close_completion,
+                        close_review,
+                    ]);
                 }
                 iced::Task::none()
             }
@@ -2361,6 +2387,17 @@ impl App {
                 self.page = Page::Editor;
                 iced::Task::none()
             }
+            Shortcut::EditorCloseTab | Shortcut::EditorNextTab | Shortcut::EditorPreviousTab => {
+                if self.page != Page::Editor {
+                    return iced::Task::none();
+                }
+                let message = match shortcut {
+                    Shortcut::EditorCloseTab => views::code_editor::Message::CloseActiveTab,
+                    Shortcut::EditorNextTab => views::code_editor::Message::NextTab,
+                    _ => views::code_editor::Message::PreviousTab,
+                };
+                self.update(Message::Editor(message))
+            }
         }
     }
 
@@ -2369,6 +2406,7 @@ impl App {
     fn load_diff_from_vfs(&mut self) {
         let Ok(vfs) = self.vfs.lock() else { return };
         let diff_results = compute_diffs_from_virtual_fs(&vfs);
+        self.editor.set_staged_results(&vfs, diff_results.clone());
 
         if diff_results.is_empty() {
             self.diff.files.clear();

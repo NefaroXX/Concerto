@@ -32,6 +32,85 @@ impl State {
         cancel: &CancellationToken,
     ) -> iced::Task<Message> {
         match message {
+            Message::CloseActiveTab => match self.active_file.clone() {
+                Some(path) => self.update(Message::CloseTab(path), vfs, project_dir, cancel),
+                None => iced::Task::none(),
+            },
+            Message::NextTab | Message::PreviousTab => {
+                if self.tabs.len() < 2 {
+                    return iced::Task::none();
+                }
+                let index = self
+                    .tabs
+                    .iter()
+                    .position(|path| Some(path) == self.active_file.as_ref())
+                    .unwrap_or(0);
+                let index = if matches!(message, Message::PreviousTab) {
+                    (index + self.tabs.len() - 1) % self.tabs.len()
+                } else {
+                    (index + 1) % self.tabs.len()
+                };
+                let path = self.tabs[index].clone();
+                self.dispatch_file_open(&path, vfs, project_dir, cancel)
+            }
+            Message::DocumentReply { path, revision, cursor, reply } => {
+                if self.active_file.as_deref() != Some(path.as_path())
+                    || self.document_revision != revision
+                    || cursor.is_some_and(|position| self.cursor_position() != Some(position))
+                {
+                    return iced::Task::none();
+                }
+                self.update(*reply, vfs, project_dir, cancel)
+            }
+            Message::CloseTab(path) => {
+                if self.tab_dirty(&path) {
+                    self.pending_close = Some(path);
+                    iced::Task::none()
+                } else {
+                    self.close_tab(&path, vfs, project_dir, cancel)
+                }
+            }
+            Message::CloseTabConfirmed => {
+                let Some(path) = self.pending_close.take() else { return iced::Task::none() };
+                self.close_tab(&path, vfs, project_dir, cancel)
+            }
+            Message::CloseTabCancelled => {
+                self.pending_close = None;
+                iced::Task::none()
+            }
+            Message::ExplorerFilterChanged(query) => {
+                self.explorer_filter = query;
+                iced::Task::none()
+            }
+            Message::ToggleEditorTools => {
+                self.editor_tools_open = !self.editor_tools_open;
+                iced::Task::none()
+            }
+            Message::DiagnosticSelected(path, line, character) => {
+                let task = self.dispatch_file_open(&path, vfs, project_dir, cancel);
+                self.expand_intersecting(0, usize::MAX);
+                if let Some(content) = &mut self.content {
+                    let column = content
+                        .line(line)
+                        .map(|l| utf16_col_to_byte(&l.text, character))
+                        .unwrap_or(0);
+                    content.move_to(clamp_cursor(content, line, column));
+                }
+                self.refresh_cursor_insights();
+                task
+            }
+            Message::ReviewStaged => {
+                self.refresh_staged(vfs);
+                self.review_open = self.staged_file().is_some();
+                self.completion_open = false;
+                iced::Task::none()
+            }
+            Message::CloseReview => {
+                self.review_open = false;
+                iced::Task::none()
+            }
+            Message::AcceptStaged => self.decide_staged(true, vfs, project_dir, cancel),
+            Message::DiscardStaged => self.decide_staged(false, vfs, project_dir, cancel),
             Message::FileSelected(path) => self.dispatch_file_open(&path, vfs, project_dir, cancel),
             Message::DirToggled(path) => {
                 self.tree.toggle_path(&path);
@@ -44,7 +123,7 @@ impl State {
                 // has its own clamp regime:
                 //   - tree|editor: the tree's share is clamped directly.
                 //   - editor|diag: the split ratio is the editor's share of
-                //     the editor|diag width, so the diagnostics pane's share
+                //     the editor|diag height, so the diagnostics pane's share
                 //     (1 - ratio) is what gets clamped (#108).
                 let ratio = if self.tree_split == Some(event.split) {
                     event.ratio.clamp(TREE_PANE_MIN_RATIO, TREE_PANE_MAX_RATIO)
@@ -143,24 +222,27 @@ impl State {
                     return iced::Task::done(Message::LspError(format!("Failed to save: {e}")));
                 }
                 self.dirty = false;
+                self.line_ending = if text.contains("\r\n") { "CRLF" } else { "LF" };
                 // Disk is now authoritative: drop any staged VFS entry so the
                 // next open_file() reads the just-saved content instead of
                 // shadowing it with stale staged text.
                 if let Ok(mut guard) = vfs.lock() {
                     guard.unstage(&path);
                 }
+                self.refresh_staged(vfs);
                 // Some language servers gate a full diagnostics pass on
                 // didSave; didChange alone can leave diagnostics stale.
                 let project_dir = project_dir.to_path_buf();
                 let cancel = cancel.clone();
                 let file_path = path.clone();
-                iced::Task::perform(
+                let task = iced::Task::perform(
                     async move { lsp_did_save(project_dir, file_path, text, cancel).await },
                     |result| match result {
                         Ok(()) => Message::LspReady,
                         Err(e) => Message::LspError(e),
                     },
-                )
+                );
+                self.scope_task(task, false)
             }
             Message::NewFile => {
                 // In a full implementation, this would open a dialog.
@@ -222,10 +304,9 @@ impl State {
                 if let Ok(mut guard) = vfs.lock() {
                     guard.unstage(&path);
                 }
-                self.active_file = None;
-                self.content = None;
                 self.tree_dirty = true;
-                iced::Task::none()
+                self.refresh_staged(vfs);
+                self.close_tab(&path, vfs, project_dir, cancel)
             }
             Message::DeleteCancelled => {
                 self.pending_delete = None;
@@ -234,6 +315,7 @@ impl State {
             Message::RefreshTree => {
                 self.tree = crate::widgets::file_tree::TreeNode::from_disk(project_dir);
                 self.tree_dirty = false;
+                self.refresh_staged(vfs);
                 iced::Task::none()
             }
             Message::LspHover(text) => {
@@ -246,6 +328,20 @@ impl State {
             }
             Message::ToggleDiagnostics => {
                 self.show_diagnostics = !self.show_diagnostics;
+                if self.show_diagnostics {
+                    if let Some((pane, split)) = self.pane_state.split(
+                        iced::widget::pane_grid::Axis::Horizontal,
+                        self.editor_pane,
+                        (),
+                    ) {
+                        self.diag_pane = pane;
+                        self.diag_split = Some(split);
+                        self.pane_state.resize(split, 1.0 - super::DIAG_PANE_DEFAULT_SHARE);
+                    }
+                } else {
+                    let _ = self.pane_state.close(self.diag_pane);
+                    self.diag_split = None;
+                }
                 iced::Task::none()
             }
             Message::ClearHover => {
@@ -253,25 +349,32 @@ impl State {
                 iced::Task::none()
             }
             Message::LspReady => {
+                self.lsp_status = "rust-analyzer connected".into();
+                self.update(Message::RefreshDiagnostics, vfs, project_dir, cancel)
+            }
+            Message::LspClosed => iced::Task::none(),
+            Message::RefreshDiagnostics => {
                 // LSP operation completed successfully.
                 // Request diagnostics for the current file.
                 if let Some(path) = &self.active_file {
                     let project_dir = project_dir.to_path_buf();
                     let cancel = cancel.clone();
                     let file_path = path.clone();
-                    return iced::Task::perform(
+                    let task = iced::Task::perform(
                         async move { lsp_get_diagnostics(project_dir, file_path, cancel).await },
                         |result| match result {
                             Ok(diags) => Message::LspDiagnostics(diags),
                             Err(e) => Message::LspError(e),
                         },
                     );
+                    return self.scope_task(task, false);
                 }
                 iced::Task::none()
             }
-            Message::LspError(_) => {
-                // Error already logged; clear hover.
-                self.hover = None;
+            Message::LspError(error) => {
+                tracing::warn!(%error, "editor operation failed");
+                self.lsp_status = "Editor issue".into();
+                self.hover = Some(error);
                 iced::Task::none()
             }
             Message::Undo => {
@@ -516,13 +619,14 @@ impl State {
                 let (line, character) = lsp_position(content);
                 let project_dir = project_dir.to_path_buf();
                 let cancel = cancel.clone();
-                iced::Task::perform(
+                let task = iced::Task::perform(
                     async move {
                         lsp_request_completion(project_dir, file_path, line, character, cancel)
                             .await
                     },
                     Message::CompletionReceived,
-                )
+                );
+                self.scope_task(task, true)
             }
             Message::CompletionReceived(items) => {
                 if items.is_empty() {
@@ -594,7 +698,7 @@ impl State {
                 let (line, character) = lsp_position(content);
                 let project_dir = project_dir.to_path_buf();
                 let cancel = cancel.clone();
-                iced::Task::perform(
+                let task = iced::Task::perform(
                     async move {
                         lsp_request_definition(project_dir, file_path, line, character, cancel)
                             .await
@@ -603,7 +707,8 @@ impl State {
                         Ok(def) => Message::DefinitionReceived(def),
                         Err(e) => Message::LspError(e),
                     },
-                )
+                );
+                self.scope_task(task, true)
             }
             Message::DefinitionReceived(def) => {
                 let Some((path, line, utf16_col)) = def else {
@@ -639,7 +744,7 @@ impl State {
                 let (line, character) = lsp_position(content);
                 let project_dir = project_dir.to_path_buf();
                 let cancel = cancel.clone();
-                iced::Task::perform(
+                let task = iced::Task::perform(
                     async move {
                         lsp_request_hover(project_dir, file_path, line, character, cancel).await
                     },
@@ -647,7 +752,8 @@ impl State {
                         Ok(text) => Message::LspHover(text),
                         Err(e) => Message::LspError(e),
                     },
-                )
+                );
+                self.scope_task(task, true)
             }
             Message::FileTree(tree_msg) => match tree_msg {
                 file_tree::TreeMessage::FileSelected(path) => {

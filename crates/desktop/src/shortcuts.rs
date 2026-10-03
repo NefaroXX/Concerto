@@ -28,6 +28,8 @@ pub const ALL: &[ShortcutInfo] = &[
     ShortcutInfo { keys: "Ctrl+F", label: "Editor: find" },
     ShortcutInfo { keys: "Ctrl+H", label: "Editor: find & replace" },
     ShortcutInfo { keys: "Ctrl+G", label: "Editor: go to line" },
+    ShortcutInfo { keys: "Ctrl+W", label: "Editor: close active tab" },
+    ShortcutInfo { keys: "Ctrl+PageDown / Ctrl+PageUp", label: "Editor: next / previous tab" },
     ShortcutInfo { keys: "F3 / Shift+F3", label: "Editor: find next / previous" },
     ShortcutInfo { keys: "Ctrl+Shift+Z / Ctrl+Y", label: "Editor: redo" },
     ShortcutInfo { keys: "?", label: "Toggle this shortcuts panel" },
@@ -59,6 +61,9 @@ pub enum Shortcut {
     EditorFind,
     EditorReplace,
     EditorGoto,
+    EditorCloseTab,
+    EditorNextTab,
+    EditorPreviousTab,
     EditorFindNext,
     EditorFindPrev,
 }
@@ -85,6 +90,11 @@ pub fn resolve(key: &Key, mods: Modifiers, text_focused: bool) -> Option<Shortcu
         }
         // Editor commands bypass text_focused: they must work while the
         // code editor or the find bar owns the keyboard.
+        Key::Character(ch) if ch.as_str().eq_ignore_ascii_case("w") && mods.control() => {
+            return Some(Shortcut::EditorCloseTab);
+        }
+        Key::Named(Named::PageDown) if mods.control() => return Some(Shortcut::EditorNextTab),
+        Key::Named(Named::PageUp) if mods.control() => return Some(Shortcut::EditorPreviousTab),
         Key::Character(ch) if ch.as_str() == "f" && mods.control() => {
             return Some(Shortcut::EditorFind);
         }
@@ -139,6 +149,27 @@ pub fn resolve_terminal(key: &Key, mods: Modifiers) -> Option<Shortcut> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Editor tab commands remain available in text fields and do not consume unmodified typing keys.
+    #[test]
+    fn editor_tab_shortcuts_bypass_text_focus_only_with_control() {
+        for focused in [false, true] {
+            assert_eq!(
+                resolve(&Key::Character("w".into()), Modifiers::CTRL, focused),
+                Some(Shortcut::EditorCloseTab)
+            );
+            assert_eq!(
+                resolve(&Key::Named(Named::PageDown), Modifiers::CTRL, focused),
+                Some(Shortcut::EditorNextTab)
+            );
+            assert_eq!(
+                resolve(&Key::Named(Named::PageUp), Modifiers::CTRL, focused),
+                Some(Shortcut::EditorPreviousTab)
+            );
+            assert_eq!(resolve(&Key::Character("w".into()), Modifiers::empty(), focused), None);
+            assert_eq!(resolve(&Key::Named(Named::PageDown), Modifiers::empty(), focused), None);
+        }
+    }
     use iced::keyboard::key::Named;
     use iced::keyboard::{Key, Modifiers};
 

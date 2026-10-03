@@ -84,7 +84,13 @@ installer packages.
 - **Desktop:** Iced chat, agent graph, memory explorer, tool log, diff viewer,
   integrated terminal, settings, screenshot capture, provider/model quick
   selection, policy editor, relationship manager, and shell profiles. The
-  Dashboard page is removed: recent sessions live in Chat's empty state, live
+  code editor includes session-local tabs with dirty-close confirmation,
+  filterable Explorer, breadcrumbs, floating find/replace and completion,
+  a bottom Problems panel and selected-file staged review. Diagnostics cover
+  received results for open documents. The current LSP manager starts
+  rust-analyzer; other language servers, cursor-anchored completion, diagnostic
+  squiggles, persisted tabs and synchronized gutter scrolling remain follow-up
+  work. The Dashboard page is removed: recent sessions live in Chat's empty state, live
   session spend in the status-bar chip (palette warning at ≥80% of the session
   cap, danger at ≥100%), and a Spend Log modal lists persisted per-call spend
   records.
