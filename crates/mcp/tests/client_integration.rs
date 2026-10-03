@@ -434,47 +434,35 @@ async fn stop_and_drop_terminate_descendants() {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        let pid = pid.expect("worker starts");
-        assert!(!worker_terminated(pid), "fixture worker must be alive before teardown");
+        let _pid = pid.expect("worker starts");
+        let heartbeat = std::path::PathBuf::from(format!("{filename}.heartbeat"));
+        let initial = std::fs::read_to_string(&heartbeat).unwrap_or_default();
+        let mut alive = false;
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let beat = std::fs::read_to_string(&heartbeat).unwrap_or_default();
+            if !beat.is_empty() && beat != initial {
+                alive = true;
+                break;
+            }
+        }
+        assert!(alive, "fixture worker must make progress before teardown");
         if stop {
             client.stop().await.unwrap();
         }
         drop(client);
-        let mut terminated = false;
-        for _ in 0..100 {
-            terminated = worker_terminated(pid);
-            if terminated {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(terminated, "worker survives {stop:?} teardown");
+        // Observe actual worker progress; virtualized /proc can misreport PID existence.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let stopped = std::fs::read_to_string(&heartbeat).unwrap_or_default();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            std::fs::read_to_string(&heartbeat).unwrap_or_default(),
+            stopped,
+            "worker survives {stop:?} teardown"
+        );
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&heartbeat);
     }
-}
-
-#[cfg(target_os = "linux")]
-fn worker_terminated(pid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .map(|s| s.split_whitespace().nth(2) == Some("Z"))
-        .unwrap_or(true)
-}
-#[cfg(all(unix, not(target_os = "linux")))]
-fn worker_terminated(pid: u32) -> bool {
-    let output = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "stat="])
-        .output()
-        .expect("ps is available");
-    let state = String::from_utf8_lossy(&output.stdout);
-    state.trim().is_empty() || state.trim().starts_with('Z')
-}
-#[cfg(windows)]
-fn worker_terminated(pid: u32) -> bool {
-    let output = std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-        .output()
-        .expect("tasklist is available");
-    !String::from_utf8_lossy(&output.stdout).contains(&format!(",\"{pid}\","))
 }
 
 /// Verifies configured credentials are redacted from remote JSON-RPC diagnostic messages and data.

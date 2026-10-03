@@ -22,11 +22,17 @@ const PROTOCOL_VERSION: &str = "2025-11-25";
 
 fn main() {
     if std::env::args().any(|arg| arg == "--worker") {
-        if let Ok(path) = std::env::var("FIXTURE_CHILD_PID_FILE") {
+        let path = std::env::var("FIXTURE_CHILD_PID_FILE").ok();
+        if let Some(path) = &path {
             let _ = std::fs::write(path, std::process::id().to_string());
         }
+        let mut beat = 0_u64;
         loop {
-            std::thread::park();
+            if let Some(path) = &path {
+                beat += 1;
+                let _ = std::fs::write(format!("{path}.heartbeat"), beat.to_string());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
         }
     }
     if std::env::var_os("FIXTURE_CHILD_PID_FILE").is_some() {
@@ -107,7 +113,7 @@ fn handle(message: Value, fixture_version: Option<&str>, reject_initialize: bool
             Some(error_response(
                 &id,
                 -32603,
-                &format!("failure: {secret}"),
+                format!("failure: {secret}"),
                 Some(json!({"nested":[secret]})),
             ))
         }
