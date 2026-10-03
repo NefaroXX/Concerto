@@ -20,7 +20,21 @@
 //! - **F-SUPERSEDE**: a fact that names an artifact path is `Stale` when the
 //!   event window holds a NEWER effective write to that path (higher
 //!   `gate_seq`) than the fact's derivation event — the artifact moved on
-//!   after the fact was derived.
+//!   after the fact was derived. Non-write executions that observed EXACTLY
+//!   ONE path record it, so they are covered by the same path-level rule.
+//! - **F-WORKSPACE-SUPERSEDE**: a fact that names NO single artifact — a
+//!   pathless build/test/check execution (which observed the workspace as a
+//!   whole) or a read of SEVERAL paths (any of them may be the one that
+//!   moved) — is `Stale` when the window holds ANY effective write newer
+//!   than the fact — there is no single path to key on, so any later write
+//!   moves the workspace it observed. Weaker than F-SUPERSEDE, never
+//!   stronger. The label stays an observation ("ran …") and never claims an
+//!   outcome.
+//!   **Known limit**: the effective writes this rule can see are exactly the
+//!   model's own — `WriteApplied` records plus file-affecting tools — so a
+//!   shell-driven edit (`sed -i`, `cargo fmt`) does NOT stale an earlier
+//!   test run's observation unless the write gate records a `WriteApplied`
+//!   for it.
 //! - **F-GENERATION**: when the resume workspace-change verdict fired
 //!   (checkpoint generation ≠ current snapshot generation), every log-
 //!   derived fact drops to `Stale` until a fresh observation re-verifies it
@@ -169,8 +183,10 @@ pub enum FactStatus {
     Verified,
     /// Backed only by an assertion (F-ASSUME).
     Assumed,
-    /// Invalidated by a newer write or a workspace-generation change
-    /// (F-SUPERSEDE / F-GENERATION).
+    /// Invalidated by a newer write, a later write to the workspace an
+    /// observation with no single artifact keyed on saw, or a
+    /// workspace-generation change
+    /// (F-SUPERSEDE / F-WORKSPACE-SUPERSEDE / F-GENERATION).
     Stale,
 }
 
@@ -276,7 +292,7 @@ pub struct WorldFact {
     #[serde(default)]
     pub artifact: Option<String>,
     /// Whiteboard `gate_seq` of the derivation event (0 when not log-derived)
-    /// — drives the F-SUPERSEDE ordering.
+    /// — drives the F-SUPERSEDE / F-WORKSPACE-SUPERSEDE ordering.
     #[serde(default)]
     pub seq: u64,
 }
@@ -426,6 +442,12 @@ struct FactCandidate {
     status: FactStatus,
     artifact: Option<String>,
     seq: u64,
+    /// F-WORKSPACE-SUPERSEDE: the candidate named no SINGLE artifact to
+    /// key its staleness on — either a pathless execution (build/test/check)
+    /// or a read of SEVERAL paths — so ANY effective write newer than `seq`
+    /// supersedes it (weaker, never stronger, than the path-level rule).
+    /// Set only by the non-write `ToolExecuted` arm.
+    workspace_supersede: bool,
 }
 
 /// The event window's extraction result (issue #140): the effective writes
@@ -475,6 +497,7 @@ fn extract_writes_and_facts(events: &[WhiteboardEvent]) -> Extraction {
                     status: FactStatus::Verified,
                     artifact: Some(path.to_owned()),
                     seq: event.gate_seq,
+                    workspace_supersede: false,
                 });
                 writes.push(RecordedWrite {
                     path: path.to_owned(),
@@ -510,6 +533,7 @@ fn extract_writes_and_facts(events: &[WhiteboardEvent]) -> Extraction {
                             status: FactStatus::Verified,
                             artifact: Some((*path).to_owned()),
                             seq: event.gate_seq,
+                            workspace_supersede: false,
                         });
                         writes.push(RecordedWrite {
                             path: (*path).to_owned(),
@@ -520,8 +544,22 @@ fn extract_writes_and_facts(events: &[WhiteboardEvent]) -> Extraction {
                     }
                     continue;
                 }
-                // A non-write execution: a verified observation WITHOUT a
-                // written artifact (reads, builds, checks).
+                // A non-write execution: a verified observation, never a
+                // write (reads, builds, checks). A READ that observed
+                // EXACTLY ONE path names that artifact, so path-level
+                // F-SUPERSEDE keys its staleness on it; a PATHLESS run
+                // (build/test/check) and a MULTI-PATH read name no single
+                // artifact to key on, so both fall under
+                // F-WORKSPACE-SUPERSEDE instead — a later effective write
+                // to ANY path supersedes them (weaker, never stronger,
+                // consistent with #139's rule). The label stays an
+                // observation ("ran …") — it never claims an outcome
+                // ("tests passed" is not what was observed).
+                let artifact = match view.paths.as_slice() {
+                    [one] => Some((*one).to_owned()),
+                    _ => None,
+                };
+                let pathless = artifact.is_none();
                 let subject = view
                     .paths
                     .first()
@@ -531,8 +569,9 @@ fn extract_writes_and_facts(events: &[WhiteboardEvent]) -> Extraction {
                     ref_id: event.event_id.clone(),
                     label: bounded(format!("ran {tool_label} ({subject})")),
                     status: FactStatus::Verified,
-                    artifact: None,
+                    artifact,
                     seq: event.gate_seq,
+                    workspace_supersede: pathless,
                 });
             }
             WhiteboardKind::Finding => {
@@ -549,6 +588,7 @@ fn extract_writes_and_facts(events: &[WhiteboardEvent]) -> Extraction {
                     status: FactStatus::Assumed,
                     artifact: None,
                     seq: event.gate_seq,
+                    workspace_supersede: false,
                 });
             }
             WhiteboardKind::DesignDoc => {
@@ -566,6 +606,7 @@ fn extract_writes_and_facts(events: &[WhiteboardEvent]) -> Extraction {
                     status: FactStatus::Assumed,
                     artifact: None,
                     seq: event.gate_seq,
+                    workspace_supersede: false,
                 });
             }
             _ => {}
@@ -577,6 +618,12 @@ fn extract_writes_and_facts(events: &[WhiteboardEvent]) -> Extraction {
 /// Whether the window holds an effective write to `path` newer than `seq`.
 fn has_newer_write(writes: &[RecordedWrite], path: &str, seq: u64) -> bool {
     writes.iter().any(|write| write.path == path && write.seq > seq)
+}
+
+/// Whether the window holds ANY effective write newer than `seq`
+/// (F-WORKSPACE-SUPERSEDE — the fact named no path to key its staleness on).
+fn has_any_newer_write(writes: &[RecordedWrite], seq: u64) -> bool {
+    writes.iter().any(|write| write.seq > seq)
 }
 
 /// Stable question identity from kind + subject: the same underlying
@@ -996,7 +1043,14 @@ impl WorldModel {
                     // artifact invalidates the older fact.
                     candidate.artifact.as_ref().is_some_and(|path| {
                         has_newer_write(&writes, path, candidate.seq)
-                    });
+                    })
+                    ||
+                    // F-WORKSPACE-SUPERSEDE: the candidate named no single
+                    // artifact to key on (pathless run, multi-path read), so
+                    // any effective write recorded after it moves the
+                    // workspace it observed.
+                    (candidate.workspace_supersede
+                        && has_any_newer_write(&writes, candidate.seq));
                 WorldFact {
                     ref_id: candidate.ref_id,
                     label: candidate.label,
@@ -1994,6 +2048,195 @@ mod tests {
         assert_eq!(artifact.status, ArtifactStatus::Written);
         assert_eq!(artifact.owner.as_deref(), Some("coder"));
         assert_eq!(artifact.last_ref.as_deref(), Some("ev-new"));
+    }
+
+    /// Issue #139, acceptance 1: a read observation names the path it
+    /// observed, so a later write to THAT path supersedes it (path-level
+    /// F-SUPERSEDE); a read of an untouched path keeps its Verified status.
+    #[test]
+    fn read_fact_goes_stale_after_later_write_to_its_path() {
+        let events = vec![
+            event(
+                WhiteboardKind::ToolExecuted,
+                "ev-read",
+                10,
+                serde_json::json!({
+                    "tool": "read_file", "args": {"path": "src/a.rs"},
+                    "success": true, "paths": [{"path": "src/a.rs"}]
+                }),
+            ),
+            event(
+                WhiteboardKind::ToolExecuted,
+                "ev-read-clean",
+                11,
+                serde_json::json!({
+                    "tool": "read_file", "args": {"path": "src/clean.rs"},
+                    "success": true, "paths": [{"path": "src/clean.rs"}]
+                }),
+            ),
+            event(WhiteboardKind::WriteApplied, "ev-write", 30, write_applied("src/a.rs")),
+        ];
+        let model = WorldModel::build(&input(&events, Vec::new(), &[], &[], Vec::new()));
+        let read = model.facts.iter().find(|f| f.ref_id == "ev-read").expect("read fact tracked");
+        assert_eq!(
+            read.artifact.as_deref(),
+            Some("src/a.rs"),
+            "the read fact names the path it observed"
+        );
+        assert_eq!(read.status, FactStatus::Stale, "the later write supersedes the read");
+        let untouched =
+            model.facts.iter().find(|f| f.ref_id == "ev-read-clean").expect("clean read fact");
+        assert_eq!(
+            untouched.status,
+            FactStatus::Verified,
+            "a read with no later write to its path stays verified"
+        );
+    }
+
+    /// Issue #139 follow-up (review): a read of SEVERAL paths names no
+    /// single artifact, so it falls back to F-WORKSPACE-SUPERSEDE — a later
+    /// write to ANY observed path supersedes it, including the SECOND one
+    /// (the first-path keying the review caught would have missed it).
+    /// Weaker, never stronger: with no later write it still stands.
+    #[test]
+    fn multi_path_read_goes_stale_after_write_to_any_observed_path() {
+        let read = || {
+            event(
+                WhiteboardKind::ToolExecuted,
+                "ev-read-many",
+                10,
+                serde_json::json!({
+                    "tool": "grep", "args": {"pattern": "fn "}, "success": true,
+                    "paths": [{"path": "src/a.rs"}, {"path": "src/b.rs"}]
+                }),
+            )
+        };
+
+        // No later effective write: the multi-path observation still stands.
+        let quiet = WorldModel::build(&input(&[read()], Vec::new(), &[], &[], Vec::new()));
+        let standing = quiet
+            .facts
+            .iter()
+            .find(|f| f.ref_id == "ev-read-many")
+            .expect("multi-path read fact tracked");
+        assert_eq!(standing.artifact, None, "a multi-path read keys on no single artifact");
+        assert_eq!(
+            standing.status,
+            FactStatus::Verified,
+            "no later effective write: the observation still stands"
+        );
+
+        // A later write to the SECOND observed path supersedes it — a
+        // write to the first would have staled it under F-SUPERSEDE too;
+        // the workspace rule is what covers the paths beyond the first.
+        let events = vec![
+            read(),
+            event(WhiteboardKind::WriteApplied, "ev-write", 30, write_applied("src/b.rs")),
+        ];
+        let model = WorldModel::build(&input(&events, Vec::new(), &[], &[], Vec::new()));
+        let stale = model
+            .facts
+            .iter()
+            .find(|f| f.ref_id == "ev-read-many")
+            .expect("multi-path read fact still tracked");
+        assert_eq!(
+            stale.status,
+            FactStatus::Stale,
+            "any later effective write supersedes a multi-path read"
+        );
+    }
+
+    /// Issue #139, acceptance 2 (F-WORKSPACE-SUPERSEDE): a pathless
+    /// execution names no artifact, so ANY later effective write — even to
+    /// an unrelated path — supersedes it; with no later write the
+    /// observation still stands, and the label never implies an outcome.
+    #[test]
+    fn pathless_execution_goes_stale_after_any_later_write() {
+        let run = || {
+            event(
+                WhiteboardKind::ToolExecuted,
+                "ev-run",
+                10,
+                serde_json::json!({
+                    "tool": "bash", "args": {"command": "cargo test"}, "success": true
+                }),
+            )
+        };
+
+        // No effective write at all: the standing observation stays Verified.
+        let quiet = WorldModel::build(&input(&[run()], Vec::new(), &[], &[], Vec::new()));
+        let standing = quiet.facts.iter().find(|f| f.ref_id == "ev-run").expect("run fact tracked");
+        assert_eq!(standing.artifact, None, "a pathless run names no artifact");
+        assert_eq!(
+            standing.status,
+            FactStatus::Verified,
+            "no later effective write: the observation still stands"
+        );
+        assert!(
+            standing.label.starts_with("ran "),
+            "the label stays an observation, never an outcome claim: {}",
+            standing.label
+        );
+
+        // A later effective write to an UNRELATED path still supersedes it.
+        let events = vec![
+            run(),
+            event(WhiteboardKind::WriteApplied, "ev-write", 30, write_applied("src/elsewhere.rs")),
+        ];
+        let model = WorldModel::build(&input(&events, Vec::new(), &[], &[], Vec::new()));
+        let stale =
+            model.facts.iter().find(|f| f.ref_id == "ev-run").expect("run fact still tracked");
+        assert_eq!(
+            stale.status,
+            FactStatus::Stale,
+            "any later effective write supersedes a pathless execution"
+        );
+        assert!(
+            stale.label.starts_with("ran "),
+            "the superseded label still reads as an observation: {}",
+            stale.label
+        );
+    }
+
+    /// Issue #139, acceptance 3: the rendered verified/stale counts reflect
+    /// the new staleness rules.
+    #[test]
+    fn render_counts_reflect_superseded_observations() {
+        let run = event(
+            WhiteboardKind::ToolExecuted,
+            "ev-run",
+            10,
+            serde_json::json!({"tool": "bash", "args": {"command": "cargo test"}, "success": true}),
+        );
+        let quiet =
+            WorldModel::build(&input(std::slice::from_ref(&run), Vec::new(), &[], &[], Vec::new()));
+        let quiet_render = quiet.render();
+        // #153's render splits the counts: the verified header carries only
+        // its own count, and the stale section is omitted when nothing is
+        // stale (`push_section` drops empty sections).
+        assert!(
+            quiet_render.contains("facts (1 verified):"),
+            "no later write: nothing is stale yet: {quiet_render}"
+        );
+        assert!(
+            !quiet_render.contains("stale facts ("),
+            "an empty stale section is not rendered at all: {quiet_render}"
+        );
+
+        let events = vec![
+            run,
+            event(WhiteboardKind::WriteApplied, "ev-write", 30, write_applied("src/elsewhere.rs")),
+        ];
+        let model = WorldModel::build(&input(&events, Vec::new(), &[], &[], Vec::new()));
+        let rendered = model.render();
+        assert!(
+            rendered.contains("facts (1 verified):"),
+            "the surviving write fact is the only verified one: {rendered}"
+        );
+        assert!(
+            rendered.contains("stale facts (1 — invalidated, trust none):"),
+            "the superseded run is counted stale: {rendered}"
+        );
     }
 
     /// F-GENERATION + V-CHANGE: a workspace-generation change stales every
