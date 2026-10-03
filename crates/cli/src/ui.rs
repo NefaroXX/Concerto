@@ -339,7 +339,7 @@ fn run_stage_label(stage: RunStage) -> &'static str {
 
 fn draw_settings_screen(frame: &mut Frame, app: &App) {
     let area = frame.area();
-    let block = Block::default().borders(Borders::ALL).title("Settings  (Esc to return)");
+    let block = Block::default().borders(Borders::ALL).title("Global settings  (Esc to return)");
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -347,7 +347,10 @@ fn draw_settings_screen(frame: &mut Frame, app: &App) {
     // Split into fields list + help.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(if inner.height < 10 { 2 } else { 6 }),
+        ])
         .split(inner);
 
     draw_settings_list(frame, chunks[0], app);
@@ -358,7 +361,9 @@ fn draw_settings_list(frame: &mut Frame, area: Rect, app: &App) {
     let fields = SettingsField::ALL;
     let mut lines: Vec<Line> = Vec::new();
 
-    for (i, &field) in fields.iter().enumerate() {
+    let visible = usize::from(area.height).max(1);
+    let first = app.settings_index.saturating_sub(visible.saturating_sub(1));
+    for (i, &field) in fields.iter().enumerate().skip(first).take(visible) {
         let selected = i == app.settings_index;
         let value = field.display_value(app);
         let label = field.label();
@@ -378,11 +383,17 @@ fn draw_settings_list(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_settings_help(frame: &mut Frame, area: Rect) {
-    let help_lines = vec![
-        Line::from("Up/Down or j/k: navigate"),
-        Line::from("Enter/Right: next value  Left: previous value"),
-        Line::from("Esc or q: return to Chat"),
-    ];
+    let help_lines = if area.height < 5 {
+        vec![Line::from("j/k select · Enter change · Esc back")]
+    } else {
+        vec![
+            Line::from("Up/Down or j/k: navigate"),
+            Line::from("Enter/Right: next value  Left: previous value"),
+            Line::from("Esc or q: return to Chat"),
+            Line::from("Structured settings: concerto config help"),
+            Line::from("Saved changes apply next run; project/env/flags can override."),
+        ]
+    };
     let block = Block::default().borders(Borders::TOP).title("Help");
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -833,6 +844,25 @@ fn closes(chars: &[char], from: usize, marker: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn settings_selection_stays_visible_at_narrow_and_short_terminal_sizes() {
+        use crate::app::{App, Screen, SettingsField};
+        use ratatui::{backend::TestBackend, Terminal};
+        for (width, height) in [(24, 8), (40, 12), (80, 24), (120, 40)] {
+            let mut app = App::new();
+            app.screen = Screen::Settings;
+            app.settings_index = SettingsField::ALL.len() - 1;
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| super::draw(frame, &app)).unwrap();
+            let text: String =
+                terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+            assert!(
+                text.contains("> Check updates"),
+                "selected setting is outside {width}x{height}: {text}"
+            );
+        }
+    }
+
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
