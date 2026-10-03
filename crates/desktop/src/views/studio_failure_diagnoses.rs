@@ -75,6 +75,8 @@ mod tests {
             alternate_agent_viable: true,
             replan_required: false,
             evidence: "connection reset".into(),
+            decision_id: None,
+            artifact_path: None,
         }
     }
 

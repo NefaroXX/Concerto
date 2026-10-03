@@ -120,6 +120,21 @@ pub struct FailureDiagnosis {
     pub replan_required: bool,
     /// Bounded excerpt of the source error (evidence for the diagnosis).
     pub evidence: String,
+    /// The journal decision this failure belongs to, when the diagnosing
+    /// surface knows it (issue #135 add-linkage): the `call_specialist`
+    /// dispatch decision whose work failed. `None` when the surface cannot
+    /// attribute the failure to one decision (graph-execution failures,
+    /// tool/provider faults, consult/investigate failures). Additive serde
+    /// (`default`), so old checkpoints load with `None`.
+    #[serde(default)]
+    pub decision_id: Option<String>,
+    /// The expected artifact the failed work was to produce — the FIRST
+    /// expected artifact of the dispatch, matching the world model's
+    /// single-`blocks` convention (issue #135 add-linkage). `None` when no
+    /// artifact is attributable. Additive serde (`default`), so old
+    /// checkpoints load with `None`.
+    #[serde(default)]
+    pub artifact_path: Option<String>,
 }
 
 impl FailureKind {
@@ -163,7 +178,29 @@ impl FailureDiagnosis {
             alternate_agent_viable,
             replan_required,
             evidence: bounded_evidence(evidence),
+            // Linkage is attached by the informed surfaces afterwards
+            // (`with_linkage`) — the generic normalizers cannot attribute a
+            // failure to one decision.
+            decision_id: None,
+            artifact_path: None,
         }
+    }
+
+    /// Attach the issue-#135 add-linkage: the journal decision the failure
+    /// belongs to and the expected artifact the failed work was to produce.
+    /// [`Self::new`] leaves both `None`; only the surfaces that KNOW the
+    /// linkage (the coordinator's `call_specialist` failure/settle paths)
+    /// attach it. The artifact follows the world model's single-`blocks`
+    /// convention — the FIRST expected artifact of the dispatch.
+    #[must_use]
+    pub fn with_linkage(
+        mut self,
+        decision_id: Option<String>,
+        artifact_path: Option<String>,
+    ) -> Self {
+        self.decision_id = decision_id;
+        self.artifact_path = artifact_path;
+        self
     }
 
     /// Whether this diagnosis describes a Cancellation (not a failure —
@@ -196,9 +233,11 @@ impl FailureDiagnosis {
     }
 
     /// The diagnosis as a tool-result JSON object the Coordinator's model
-    /// reads (issue #54: the decision loop decides from the diagnosis).
+    /// reads (issue #54: the decision loop decides from the diagnosis). The
+    /// issue-#135 add-linkage rides it when the surface knew it, so the
+    /// recovery decision can cite the subject decision / artifact.
     pub fn tool_summary(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut summary = serde_json::json!({
             "kind": self.kind.as_str(),
             "code": self.code,
             "transient": self.transient,
@@ -206,7 +245,14 @@ impl FailureDiagnosis {
             "same_agent_viable": self.same_agent_viable,
             "alternate_agent_viable": self.alternate_agent_viable,
             "replan_required": self.replan_required,
-        })
+        });
+        if let Some(decision_id) = &self.decision_id {
+            summary["decision_id"] = serde_json::Value::String(decision_id.clone());
+        }
+        if let Some(artifact_path) = &self.artifact_path {
+            summary["artifact_path"] = serde_json::Value::String(artifact_path.clone());
+        }
+        summary
     }
 }
 
@@ -1287,6 +1333,52 @@ mod tests {
         let brief = diagnosis.brief();
         assert!(brief.contains("provider [rate-limit]"), "{brief}");
         assert!(brief.contains("transient"), "{brief}");
+    }
+
+    // ── Issue #135 add-linkage: decision/artifact linkage ────────────────
+
+    /// The linkage fields are additive: a diagnosis recorded before linkage
+    /// existed (no keys) loads with both `None`, and a linked diagnosis
+    /// round-trips its fields through serde.
+    #[test]
+    fn diagnosis_linkage_fields_are_additive_in_serde() {
+        let old_json = r#"{
+            "kind": "contract",
+            "code": "artifact-contract-missed",
+            "transient": false,
+            "retryable": true,
+            "same_agent_viable": true,
+            "alternate_agent_viable": true,
+            "replan_required": true,
+            "evidence": "expected artifacts not produced (src/lib.rs missing)"
+        }"#;
+        let old: FailureDiagnosis =
+            serde_json::from_str(old_json).expect("a pre-linkage record loads");
+        assert_eq!(old.decision_id, None, "the absent decision link defaults");
+        assert_eq!(old.artifact_path, None, "the absent artifact link defaults");
+
+        let linked = old.with_linkage(Some("d-1".to_owned()), Some("src/lib.rs".to_owned()));
+        assert_eq!(linked.decision_id.as_deref(), Some("d-1"));
+        assert_eq!(linked.artifact_path.as_deref(), Some("src/lib.rs"));
+        let round_tripped: FailureDiagnosis =
+            serde_json::from_str(&serde_json::to_string(&linked).expect("serializes"))
+                .expect("deserializes");
+        assert_eq!(round_tripped, linked, "the linkage survives the round trip");
+    }
+
+    /// The tool summary carries the linkage only when the surface knew it —
+    /// an unlinkable diagnosis renders without the keys.
+    #[test]
+    fn tool_summary_carries_linkage_only_when_known() {
+        let unlinkable = diagnose_outcome_failure("expected artifacts not produced");
+        let bare = unlinkable.tool_summary();
+        assert!(bare.get("decision_id").is_none(), "no decision link — no key: {bare}");
+        assert!(bare.get("artifact_path").is_none(), "no artifact link — no key: {bare}");
+
+        let linked = unlinkable.with_linkage(Some("d-9".to_owned()), Some("src/a.rs".to_owned()));
+        let summary = linked.tool_summary();
+        assert_eq!(summary["decision_id"], "d-9");
+        assert_eq!(summary["artifact_path"], "src/a.rs");
     }
 
     // ── Identical-failure repetition guard (smoke: clap-derive 101) ─────

@@ -13323,7 +13323,11 @@ impl CoordinatorAgent {
                 // Issue #54: the diagnosis (Environment/model-unavailable,
                 // alternate viable) rides the tool result so the Coordinator's
                 // next decision is diagnosis-informed, and the audit trail.
-                let diagnosis = crate::failure_diagnosis::diagnose(&error);
+                // Issue #135 add-linkage: this dispatch's decision id and
+                // expected artifact ride the diagnosis, so the world-model
+                // question it opens is linkable (Q-RESOLVE-LINKED).
+                let diagnosis = crate::failure_diagnosis::diagnose(&error)
+                    .with_linkage(Some(decision_id.clone()), dispatch_artifacts.first().cloned());
                 self.record_failure_diagnosis(
                     task.session_id,
                     Some(subtask_id),
@@ -13394,7 +13398,11 @@ impl CoordinatorAgent {
                 // agent, environment, task dimensions) into the structured
                 // diagnosis; it rides the tool result and the audit trail,
                 // and the recovery decision is diagnosis-shaped.
-                let diagnosis = crate::failure_diagnosis::diagnose(&error);
+                // Issue #135 add-linkage: this dispatch's decision id and
+                // expected artifact ride the diagnosis, so the world-model
+                // question it opens is linkable (Q-RESOLVE-LINKED).
+                let diagnosis = crate::failure_diagnosis::diagnose(&error)
+                    .with_linkage(Some(decision_id.clone()), dispatch_artifacts.first().cloned());
                 self.record_failure_diagnosis(
                     task.session_id,
                     Some(subtask_id),
@@ -13626,13 +13634,18 @@ impl CoordinatorAgent {
             // with an unresolved failure surfaces as `Partial`, never as a
             // vacuous completion.
             _ => {
+                // Issue #135 add-linkage: the failing dispatch's decision id
+                // and expected artifact ride the diagnosis, so the
+                // world-model question it opens is linkable
+                // (Q-RESOLVE-LINKED) instead of standing unlinkable forever.
                 let diagnosis = match &result.outcome {
                     AgentOutcome::Failed { error } => {
                         crate::failure_diagnosis::diagnose_outcome_failure(error)
                     }
                     AgentOutcome::Blocked { on } => crate::failure_diagnosis::diagnose_blocked(on),
                     _ => crate::failure_diagnosis::diagnose_outcome_failure(&summary_text),
-                };
+                }
+                .with_linkage(Some(decision_id.clone()), dispatch_artifacts.first().cloned());
                 self.suitability.record(
                     agent_id.as_str(),
                     suitability_class,
@@ -19021,9 +19034,12 @@ mod tests {
     /// [`CONSULT_TRIGGER_MIN_CYCLES`] rebuilds, the decision loop injects
     /// the consultation request BEFORE the next decision turn (exactly
     /// once), the consultation runs and records advisory findings — and the
-    /// question STILL stands afterwards (issue #135, Q-RESOLVE-UNLINKABLE):
-    /// a settled consult is advisory evidence, not recovery, so it never
-    /// resolves the failure question by coincidence.
+    /// question STILL stands afterwards (issue #135, Q-RESOLVE-LINKED): a
+    /// settled consult is advisory evidence, not recovery. The question is
+    /// linked to the failing dispatch's decision, and the consult decision
+    /// is unrelated to that subject — no Freeze naming it, no expected
+    /// artifacts touching the blocked path — so it never resolves by
+    /// coincidence.
     #[tokio::test]
     async fn low_confidence_question_triggers_consultation_deterministically() {
         let (_dir, pool) = resume_log_pool().await;
@@ -19109,11 +19125,13 @@ mod tests {
         assert_eq!(finding.kind, WhiteboardKind::Finding);
         assert_eq!(finding.payload["consultative"], serde_json::Value::Bool(true));
         // The settled consultation does NOT resolve the standing question
-        // (issue #135, Q-RESOLVE-UNLINKABLE): advisory findings are citable
-        // evidence, not recovery — the failure still needs its
-        // retry/replacement/reconsider descendant (or settled work touching
-        // its artifact) before the question closes. The question stands and
-        // keeps aging instead of resolving by coincidence.
+        // (issue #135, Q-RESOLVE-LINKED): advisory findings are citable
+        // evidence, not recovery — the question closes only on its subject's
+        // reconsider descendant (the Freeze payload names the subject
+        // decision; no decision carries a retry-of link). This question
+        // names no blocked artifact, so only the reconsider-descendant
+        // channel applies. The question stands and keeps aging instead of
+        // resolving by coincidence.
         let standing = coordinator
             .world_model
             .questions
@@ -19124,6 +19142,11 @@ mod tests {
             standing.kind,
             crate::world_model::QuestionKind::OpenProblem,
             "the standing question is the failure one"
+        );
+        assert!(
+            standing.subject_decision_id.is_some(),
+            "issue #135 add-linkage: the dispatch failure's question is linked to its \
+             failing dispatch decision"
         );
         assert_eq!(standing.resolved_by, None, "no coincidence resolution recorded");
     }

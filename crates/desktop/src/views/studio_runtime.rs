@@ -373,6 +373,8 @@ mod tests {
             alternate_agent_viable: false,
             replan_required: false,
             evidence: "tool exploded".into(),
+            decision_id: None,
+            artifact_path: None,
         }
     }
 
