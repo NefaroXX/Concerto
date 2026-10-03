@@ -6,8 +6,8 @@
 // - Persistence of custom agents / prompts / relationships / presets to config
 
 use iced::widget::{
-    button, checkbox, column, container, pick_list, row, scrollable, text, text_input, toggler,
-    tooltip, Space,
+    button, checkbox, column, container, pick_list, row, scrollable, text, text_editor, text_input,
+    toggler, tooltip, Space,
 };
 use iced::{Alignment, Color, Element, Length};
 
@@ -186,6 +186,39 @@ pub enum InspectorSection {
     Permissions,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkspaceSection {
+    #[default]
+    Agents,
+    Blueprint,
+    Configuration,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum PromptField {
+    Instructions,
+    Constraints,
+    Output,
+}
+
+/// Editor buffers are presentation state; the roster remains the save model.
+#[derive(Debug, Default)]
+pub struct PromptEditors {
+    instructions: text_editor::Content,
+    constraints: text_editor::Content,
+    output: text_editor::Content,
+}
+
+impl Clone for PromptEditors {
+    fn clone(&self) -> Self {
+        Self {
+            instructions: text_editor::Content::with_text(&self.instructions.text()),
+            constraints: text_editor::Content::with_text(&self.constraints.text()),
+            output: text_editor::Content::with_text(&self.output.text()),
+        }
+    }
+}
+
 /// Which stage-mask flag a `StageMaskToggled` targets. The blueprint model
 /// stores each as `StageFlags.{fs_write,shell}: Option<bool>` (ADR-58 D1); a
 /// toggle writes the explicit flag, which overlays the stage-kind default
@@ -208,7 +241,7 @@ pub struct AgentConfig {
     pub stage: Option<AgentStage>,
     /// Additional stage tags this agent can cover beyond its own `stage`
     /// (owner doctrine: agent-axis takeover before provider escalation).
-    /// Round-tripped verbatim; edited via config, not this first-pass UI.
+    /// Round-tripped verbatim; editable as built-in or custom coverage tags.
     pub can_cover: Vec<AgentStage>,
     /// Structured submission contract (Freeform = plain text output; the others
     /// tie the agent into the typed `submit_design_doc` / `submit_research_report`
@@ -225,6 +258,10 @@ pub struct AgentConfig {
 
 #[derive(Debug, Clone)]
 pub struct State {
+    pub workspace_section: WorkspaceSection,
+    pub prompt_editors: PromptEditors,
+    pub pending_agent_removal: Option<String>,
+    pub coverage_draft: String,
     pub agents: Vec<AgentConfig>,
     pub relationships: Vec<AgentRelationshipConfig>,
     pub model_assignments: Vec<AgentModelAssignment>,
@@ -233,6 +270,7 @@ pub struct State {
     /// "New" button switches the studio to a fresh untitled pipeline.
     pub active_pipeline_name: String,
     pub available_providers: Vec<String>,
+    pub provider_labels: HashMap<String, String>,
     /// The global default model from Settings (bare model string). Rendered in
     /// `model_pane` when an agent has no per-agent override. `None` means no
     /// global default has been set.
@@ -350,12 +388,17 @@ pub struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
+            workspace_section: WorkspaceSection::Agents,
+            prompt_editors: PromptEditors::default(),
+            pending_agent_removal: None,
+            coverage_draft: String::new(),
             agents: Vec::new(),
             relationships: Vec::new(),
             model_assignments: Vec::new(),
             presets: Vec::new(),
             active_pipeline_name: "Standard Pipeline".into(),
             available_providers: vec!["openai".into(), "anthropic".into(), "ollama".into()],
+            provider_labels: HashMap::new(),
             global_default_model: None,
             cached_models_by_provider: HashMap::new(),
             selected_agent_id: None,
@@ -471,6 +514,16 @@ pub struct RunTuning {
 
 #[derive(Debug, Clone)]
 pub enum StudioMessage {
+    WorkspaceSelected(WorkspaceSection),
+    PromptEdited(PromptField, text_editor::Action),
+    AgentNameChanged(String),
+    AgentRoleChanged(String),
+    DuplicateAgent(String),
+    RequestAgentRemoval(String),
+    CancelAgentRemoval,
+    ConfirmAgentRemoval,
+    CoverageDraftChanged(String),
+    AddCoverage,
     NewAgentName(String),
     NewAgentRole(String),
     AddAgent,
@@ -735,9 +788,8 @@ fn badge<'a>(theme: &'a AppTheme, label: &'a str) -> Element<'a, Message> {
 /// The agent `can_cover` toggle control (owner doctrine: agent-axis takeover
 /// before provider escalation). Renders one chip per known lifecycle stage:
 /// the agent's own `stage` is shown as always-covered and is not removable;
-/// other known stages toggle membership in `can_cover` (add when absent,
-/// remove when present). Unknown/legacy tags already in `can_cover` are shown
-/// read-only and are left untouched, so a save never drops them.
+/// other stages toggle membership in `can_cover`. Custom tags round-trip
+/// unchanged until the user explicitly removes them.
 fn can_cover_control<'a>(agent: &'a AgentConfig, theme: &'a AppTheme) -> Element<'a, Message> {
     let ts = &theme.type_scale;
     let sp = &theme.spacing;
@@ -778,13 +830,17 @@ fn can_cover_control<'a>(agent: &'a AgentConfig, theme: &'a AppTheme) -> Element
         }
     }
 
-    // Unknown/legacy tags survive the save path verbatim; surface them so the
-    // user can see them without an edit that would silently drop them.
+    // Custom tags remain first-class values and can be removed explicitly.
     let unknown: Vec<Element<'a, Message>> = agent
         .can_cover
         .iter()
         .filter(|s| !s.is_known())
-        .map(|s| badge(theme, s.as_str()))
+        .map(|s| {
+            button(text(format!("{} ×", s.as_str())).size(ts.caption))
+                .style(crate::ui::button::secondary)
+                .on_press(Message::OrchestrationStudio(StudioMessage::CanCoverToggled(s.clone())))
+                .into()
+        })
         .collect();
 
     let mut content = column![
@@ -801,8 +857,8 @@ fn can_cover_control<'a>(agent: &'a AgentConfig, theme: &'a AppTheme) -> Element
     if !unknown.is_empty() {
         content = content.push(
             row![
-                text("Preserved (unknown):").size(ts.caption).color(theme.palette.text_muted),
-                row(unknown).spacing(sp.sm),
+                text("Custom coverage:").size(ts.caption).color(theme.palette.text_muted),
+                row(unknown).spacing(sp.sm).wrap(),
             ]
             .spacing(sp.xs)
             .align_y(Alignment::Center),
@@ -1334,6 +1390,11 @@ impl State {
         self.run_spend_draft = multi.spend_cap_multiplier.to_string();
 
         let ms = config.model_settings.clone().unwrap_or_default();
+        self.provider_labels = ms
+            .providers
+            .iter()
+            .map(|provider| (provider.id.clone(), provider.name.clone()))
+            .collect();
         self.global_default_model = ms.global_default_model.clone();
         self.model_assignments = ms.agent_assignments.clone();
         // A persisted coordinator assignment needs the engine-owned row to land
@@ -1384,6 +1445,8 @@ impl State {
         } else {
             ms.providers.iter().map(|p| p.id.clone()).collect()
         };
+        self.pending_agent_removal = None;
+        self.sync_prompt_editors();
         self.unsaved = false;
         self.save_error = None;
         // load_from_config does not go through mark_dirty(); invalidate the
@@ -2136,12 +2199,140 @@ impl State {
         (characters as u64).div_ceil(4)
     }
 
+    fn sync_prompt_editors(&mut self) {
+        let prompt = self
+            .agents
+            .iter()
+            .find(|agent| Some(&agent.id) == self.selected_agent_id.as_ref())
+            .map(|agent| agent.prompt_sections.clone())
+            .unwrap_or_default();
+        self.prompt_editors = PromptEditors {
+            instructions: text_editor::Content::with_text(&prompt.system_instructions),
+            constraints: text_editor::Content::with_text(&prompt.constraints),
+            output: text_editor::Content::with_text(&prompt.output_format),
+        };
+    }
+
     pub fn update(&mut self, message: StudioMessage) -> iced::Task<Message> {
         match message {
+            StudioMessage::WorkspaceSelected(section) => {
+                self.workspace_section = section;
+                self.pending_agent_removal = None;
+            }
+            StudioMessage::CoverageDraftChanged(value) => self.coverage_draft = value,
+            StudioMessage::AddCoverage => {
+                let value = self.coverage_draft.trim();
+                if !value.is_empty() {
+                    let stage = AgentStage::new(value);
+                    if let Some(agent) = self
+                        .agents
+                        .iter_mut()
+                        .find(|agent| Some(&agent.id) == self.selected_agent_id.as_ref())
+                    {
+                        if agent.stage.as_ref() != Some(&stage) && !agent.can_cover.contains(&stage)
+                        {
+                            agent.can_cover.push(stage);
+                            self.mark_dirty();
+                        }
+                    }
+                    self.coverage_draft.clear();
+                }
+            }
+            StudioMessage::RequestAgentRemoval(id) => {
+                let pending = self
+                    .visible_agents()
+                    .find(|agent| agent.id == id)
+                    .map(|agent| agent.id.clone());
+                self.pending_agent_removal = pending;
+            }
+            StudioMessage::CancelAgentRemoval => self.pending_agent_removal = None,
+            StudioMessage::ConfirmAgentRemoval => {
+                if let Some(id) = self.pending_agent_removal.take() {
+                    return self.update(StudioMessage::RemoveAgent(id));
+                }
+            }
+            StudioMessage::AgentNameChanged(name) => {
+                if let Some(agent) = self.agents.iter_mut().find(|agent| {
+                    Some(&agent.id) == self.selected_agent_id.as_ref()
+                        && !is_coordinator_agent(agent)
+                }) {
+                    agent.name = name;
+                    self.mark_dirty();
+                }
+            }
+            StudioMessage::AgentRoleChanged(role) => {
+                // Coordinator identity is reserved on both id and role.
+                if !is_coordinator_key(role.trim()) {
+                    if let Some(agent) = self.agents.iter_mut().find(|agent| {
+                        Some(&agent.id) == self.selected_agent_id.as_ref()
+                            && !is_coordinator_agent(agent)
+                    }) {
+                        agent.role = role;
+                        self.mark_dirty();
+                    }
+                }
+            }
+            StudioMessage::DuplicateAgent(id) => {
+                let source = self.visible_agents().find(|agent| agent.id == id).cloned();
+                if let Some(mut agent) = source {
+                    let mut suffix = 1;
+                    let new_id = loop {
+                        let candidate = format!("{id}-copy-{suffix}");
+                        if self.agents.iter().all(|agent| agent.id != candidate) {
+                            break candidate;
+                        }
+                        suffix += 1;
+                    };
+                    agent.name = format!("{} copy", agent.name);
+                    agent.id = new_id.clone();
+                    agent.role = new_id.clone();
+                    agent.is_custom = true;
+                    if let Some(provider) = &agent.provider_id {
+                        self.model_assignments.push(AgentModelAssignment {
+                            agent_role: new_id.clone(),
+                            provider_config_id: provider.clone(),
+                            model_override: agent.model_override.clone(),
+                        });
+                    }
+                    self.agents.push(agent);
+                    self.selected_agent_id = Some(new_id);
+                    self.pending_agent_removal = None;
+                    self.inspector_section = InspectorSection::Prompt;
+                    self.sync_prompt_editors();
+                    self.mark_dirty();
+                }
+            }
+            StudioMessage::PromptEdited(field, action) => {
+                let Some(id) = self.selected_agent_id.clone() else {
+                    return iced::Task::none();
+                };
+                let editor = match field {
+                    PromptField::Instructions => &mut self.prompt_editors.instructions,
+                    PromptField::Constraints => &mut self.prompt_editors.constraints,
+                    PromptField::Output => &mut self.prompt_editors.output,
+                };
+                let edited = action.is_edit();
+                editor.perform(action);
+                if edited {
+                    let value = editor.text();
+                    if let Some(agent) = self.agents.iter_mut().find(|agent| agent.id == id) {
+                        match field {
+                            PromptField::Instructions => {
+                                agent.prompt_sections.system_instructions = value
+                            }
+                            PromptField::Constraints => agent.prompt_sections.constraints = value,
+                            PromptField::Output => agent.prompt_sections.output_format = value,
+                        }
+                        self.mark_dirty();
+                    }
+                }
+            }
             StudioMessage::NewAgentName(s) => self.new_agent_name = s,
             StudioMessage::NewAgentRole(s) => self.new_agent_role = s,
             StudioMessage::AddAgent => {
-                if !self.new_agent_name.trim().is_empty() {
+                if !self.new_agent_name.trim().is_empty()
+                    && !is_coordinator_key(self.new_agent_role.trim())
+                {
                     let mut suffix = self.agents.len();
                     let new_id = loop {
                         let candidate = format!("custom_{suffix}");
@@ -2172,6 +2363,7 @@ impl State {
                     self.new_agent_role.clear();
                     self.selected_agent_id = Some(new_id);
                     self.inspector_section = InspectorSection::Prompt;
+                    self.sync_prompt_editors();
                     self.mark_dirty();
                 }
             }
@@ -2183,10 +2375,23 @@ impl State {
                 // ADR-35 §5). Guard the invariant at the message level, not
                 // only in the view's "Remove" affordance, so no future code
                 // path (renamed role, loaded preset) can delete it.
-                if id == "coordinator" {
+                if self.agents.iter().any(|agent| agent.id == id && is_coordinator_agent(agent)) {
                     return iced::Task::none();
                 }
+                let removed_role =
+                    self.agents.iter().find(|agent| agent.id == id).map(|agent| agent.role.clone());
                 self.agents.retain(|a| a.id != id);
+                self.model_assignments.retain(|assignment| {
+                    assignment.agent_role != id
+                        && (removed_role.as_ref() != Some(&assignment.agent_role)
+                            || self.agents.iter().any(|agent| agent.role == assignment.agent_role))
+                });
+                if let Some(blueprint) = &mut self.blueprint {
+                    for stage in &mut Arc::make_mut(blueprint).pipeline.stages {
+                        stage.agents.retain(|agent_id| agent_id != &id);
+                    }
+                }
+                self.pending_agent_removal = None;
                 if self.selected_agent_id.as_ref() == Some(&id) {
                     self.selected_agent_id = None;
                 }
@@ -2206,6 +2411,10 @@ impl State {
             }
             StudioMessage::SelectAgent(opt) => {
                 self.selected_agent_id = opt;
+                self.coverage_draft.clear();
+                self.pending_agent_removal = None;
+                self.workspace_section = WorkspaceSection::Agents;
+                self.sync_prompt_editors();
                 self.selected_relationship = None;
                 self.show_relationship_editor = false;
                 self.clear_relationship_draft();
@@ -2460,11 +2669,14 @@ impl State {
             }
             StudioMessage::ShowPipeline => {
                 self.selected_agent_id = None;
+                self.pending_agent_removal = None;
+                self.workspace_section = WorkspaceSection::Agents;
                 self.show_relationship_editor = false;
                 self.clear_relationship_draft();
             }
             StudioMessage::InspectorSection(s) => self.inspector_section = s,
             StudioMessage::SysPromptChanged(s) => {
+                self.prompt_editors.instructions = text_editor::Content::with_text(&s);
                 if let Some(id) = &self.selected_agent_id {
                     if let Some(a) = self.agents.iter_mut().find(|a| &a.id == id) {
                         a.prompt_sections.system_instructions = s;
@@ -2473,6 +2685,7 @@ impl State {
                 }
             }
             StudioMessage::ConstraintsChanged(s) => {
+                self.prompt_editors.constraints = text_editor::Content::with_text(&s);
                 if let Some(id) = &self.selected_agent_id {
                     if let Some(a) = self.agents.iter_mut().find(|a| &a.id == id) {
                         a.prompt_sections.constraints = s;
@@ -2481,6 +2694,7 @@ impl State {
                 }
             }
             StudioMessage::OutputFormatChanged(s) => {
+                self.prompt_editors.output = text_editor::Content::with_text(&s);
                 if let Some(id) = &self.selected_agent_id {
                     if let Some(a) = self.agents.iter_mut().find(|a| &a.id == id) {
                         a.prompt_sections.output_format = s;
@@ -2772,203 +2986,183 @@ impl State {
     pub fn view<'a>(&'a self, theme: &'a AppTheme) -> Element<'a, Message> {
         let ts = &theme.type_scale;
         let sp = &theme.spacing;
-        // B2: computed once and reused by the toolbar, library, and workspace
-        // branches below so the legacy hides cannot drift apart.
-        let blueprint_path = self.on_blueprint_path();
-        let preset_options: Vec<String> = self.presets.iter().map(|p| p.name.clone()).collect();
         let report = self.validation();
-        let validation_status: Element<'_, Message> = if report.ok {
-            text("Pipeline valid").color(theme.palette.success).size(ts.body).into()
+        let status: Element<'_, Message> = if report.ok {
+            text("Configuration valid").size(ts.label).color(theme.palette.success).into()
         } else {
-            let arrow = if self.show_validation_detail { " ▴" } else { " ▾" };
-            if self.orchestration.is_some() {
-                // ADR-59 D5: persistent blueprint-error badge — alert icon +
-                // error count (never color alone), danger text on the
-                // secondary style, mirroring the status-bar config badge.
-                button(
-                    text(validation_badge_label(
-                        self.blueprint_error_count(),
-                        self.show_validation_detail,
-                    ))
-                    .size(ts.body)
-                    .color(theme.palette.danger),
-                )
-                .style(crate::ui::button::secondary)
-                .on_press(Message::OrchestrationStudio(StudioMessage::ToggleValidationDetail))
-                .into()
-            } else {
-                button(text(format!("{} issue(s){arrow}", report.messages.len())).size(ts.body))
-                    .style(crate::ui::button::danger)
-                    .on_press(Message::OrchestrationStudio(StudioMessage::ToggleValidationDetail))
-                    .into()
-            }
-        };
-        let save_button = if self.unsaved && report.ok {
-            button("Save")
-                .style(crate::ui::button::primary)
-                .on_press(Message::OrchestrationStudio(StudioMessage::SaveOrchestration))
-        } else {
-            button("Save").style(crate::ui::button::primary)
-        };
-        // Save success/failure is surfaced as a toast at the App level (the
-        // same channel Settings uses); the toolbar keeps only the persistent
-        // validation status, which is a status indicator, not a one-off
-        // notification.
-        // Keep the toolbar single-line so every action (Save, + New, preset
-        // picker) stays visible even with the app sidebar expanded — the
-        // subtitle was the widest element and pushed the Save button out of
-        // the window. The subtitle now lives full-width above the panes.
-        //
-        // "+ New" and the preset picker are LEGACY pipeline actions (they
-        // mutate the legacy `multi_agent` tables and emit `LoadPreset`); on
-        // the blueprint path they are hidden, not disabled (B2): the stage
-        // cards are the only editor, and legacy edits would target a pipeline
-        // nothing loads after P4 (ADR-59 D2 — the Studio never calls
-        // `save_config`). `None` renders as a zero-size widget, so the
-        // toolbar layout is unchanged on the legacy path.
-        let legacy_actions: Option<Element<'_, Message>> = if blueprint_path {
-            None
-        } else {
-            Some(
-                row![
-                    button("+ New")
-                        .style(button::secondary)
-                        .on_press(Message::OrchestrationStudio(StudioMessage::NewPipeline)),
-                    pick_list(preset_options, Option::<String>::None, |name| {
-                        Message::OrchestrationStudio(StudioMessage::LoadPreset(name))
-                    })
-                    .placeholder("Load preset…"),
-                ]
-                .spacing(sp.sm)
-                .align_y(Alignment::Center)
-                .into(),
+            button(
+                text(validation_badge_label(report.messages.len(), self.show_validation_detail))
+                    .size(ts.label),
             )
+            .style(crate::ui::button::danger)
+            .on_press(Message::OrchestrationStudio(StudioMessage::ToggleValidationDetail))
+            .into()
+        };
+        let save = button("Save changes").style(crate::ui::button::primary);
+        let save = if self.unsaved && report.ok {
+            save.on_press(Message::OrchestrationStudio(StudioMessage::SaveOrchestration))
+        } else {
+            save
         };
         let toolbar = row![
             text("Orchestration Studio").size(ts.display),
             Space::new().width(Length::Fill),
-            validation_status,
-            text(format!("Pipeline: {}", self.active_pipeline_name))
-                .size(ts.label)
-                .color(theme.palette.text_muted),
-            legacy_actions,
-            // UX spec §8 defect 3: a quiet "Modified" caption while the
-            // studio holds unsaved changes; nothing renders once saved.
-            // `Option<Element>` renders nothing (zero-sized) when `None`.
             Self::modified_caption(self.unsaved, theme),
-            save_button,
+            save,
         ]
-        .spacing(sp.md)
+        .spacing(sp.sm)
         .align_y(Alignment::Center);
-
-        // ADR-58/59 (rewritten) Slice 3: the roster is a one-surface editor on BOTH
-        // paths — the left 280px pane lists every agent (engine-owned
-        // coordinator locked, the five seeds, and user agents) with
-        // Edit/Delete affordances and the "+ New Agent" form. On the legacy
-        // path this is exactly today's library; on the blueprint path the same
-        // list doubles as the roster editor (its edits persist through the
-        // roster Save arm, so they are no longer silently dropped).
-        let library: Element<'_, Message> = self.library_view(theme);
-        let workspace = if blueprint_path {
-            // Slice 3 drill-down: selecting a roster agent routes the workspace
-            // to the per-agent inspector (whose edits now persist through the
-            // roster Save arm); otherwise the stage-card + relationship
-            // surface renders as before.
-            if self.selected_agent_id.is_some() {
-                self.inspector_view(theme)
-            } else {
-                self.stage_cards_view(theme)
-            }
-        } else if self.selected_agent_id.is_some() {
-            self.inspector_view(theme)
-        } else {
-            // ADR-58/59 (rewritten) Slice 2: no splash and no manual-init button — the
-            // roster is auto-seeded and a missing blueprint selection is filled
-            // on Studio open, so this inactive fallback renders only as a
-            // defensive placeholder (a broken/torn-down config).
-            self.blueprint_inactive_view(theme)
-        };
-        let panes = row![
-            container(library).width(Length::Fixed(280.0)).height(Length::Fill),
-            container(scrollable(workspace).height(Length::Fill))
-                .padding([0.0, sp.md])
-                .width(Length::Fill)
-                .height(Length::Fill),
-        ]
-        .spacing(sp.md)
-        .height(Length::Fill);
-
-        // Inline issue summary expanded from the toolbar badge. Rendered as a
-        // zero-height space when hidden so the layout height is unchanged. On
-        // the blueprint path each item carries the field path + rule code +
-        // message (ADR-59 D5); on the legacy path the pre-existing message
-        // bullets are kept byte-identical.
-        let validation_detail_bar: Element<'_, Message> = if self.show_validation_detail
-            && !report.ok
-        {
-            let mut issues = column![].spacing(sp.xs);
-            if self.orchestration.is_some() {
-                issues = issues.push(
-                    text(format!("{} blueprint validation error(s)", self.blueprint_error_count()))
-                        .size(ts.caption)
-                        .color(theme.palette.danger),
-                );
-                for error in &self.blueprint_errors {
-                    let BlueprintErrorView { field, code, message } = blueprint_error_view(error);
-                    let field = field.unwrap_or_else(|| "(blueprint)".to_string());
-                    issues = issues.push(
-                        row![
-                            text(field).size(ts.caption).color(theme.palette.danger),
-                            text(format!("[{code}]"))
-                                .size(ts.caption)
-                                .color(theme.palette.text_muted),
-                            text(message).size(ts.caption).color(theme.palette.danger),
-                        ]
-                        .spacing(sp.xs)
-                        .align_y(Alignment::Center),
-                    );
+        let mut navigation = row![].spacing(sp.sm);
+        for (section, label) in [
+            (WorkspaceSection::Agents, "Agents"),
+            (WorkspaceSection::Blueprint, "Blueprint · advisory"),
+            (WorkspaceSection::Configuration, "Configuration guide"),
+        ] {
+            navigation = navigation.push(
+                button(label)
+                    .style(if self.workspace_section == section {
+                        crate::ui::button::primary
+                    } else {
+                        crate::ui::button::secondary
+                    })
+                    .on_press(Message::OrchestrationStudio(StudioMessage::WorkspaceSelected(
+                        section,
+                    ))),
+            );
+        }
+        let body: Element<'_, Message> = match self.workspace_section {
+            WorkspaceSection::Agents => iced::widget::responsive(move |size| {
+                let workspace = if self.selected_agent_id.is_some() {
+                    self.inspector_view(theme)
+                } else {
+                    self.roster_overview(theme)
+                };
+                if size.width < 720.0 {
+                    // On narrow windows, selection opens a full-width inspector.
+                    // Its Back to Agents action restores the full-width roster.
+                    if self.selected_agent_id.is_some() {
+                        scrollable(workspace).height(Length::Fill).into()
+                    } else {
+                        self.library_view(theme)
+                    }
+                } else {
+                    row![
+                        container(self.library_view(theme))
+                            .width(Length::Fixed(230.0))
+                            .height(Length::Fill),
+                        container(scrollable(workspace).height(Length::Fill))
+                            .width(Length::Fill)
+                            .height(Length::Fill),
+                    ]
+                    .spacing(sp.lg)
+                    .height(Length::Fill)
+                    .into()
                 }
-            } else {
-                issues = issues.push(
-                    text(format!("{} validation issue(s)", report.messages.len()))
-                        .size(ts.caption)
-                        .color(theme.palette.danger),
-                );
-                for message in &report.messages {
-                    issues = issues.push(
-                        text(format!("• {message}")).size(ts.caption).color(theme.palette.danger),
-                    );
-                }
+            })
+            .into(),
+            WorkspaceSection::Blueprint => {
+                let workspace = if self.on_blueprint_path() {
+                    self.stage_cards_view(theme)
+                } else {
+                    self.blueprint_inactive_view(theme)
+                };
+                scrollable(workspace).height(Length::Fill).into()
             }
-            container(issues)
-                .width(Length::Fill)
-                .padding([sp.xs, sp.sm])
-                .style(move |_t: &iced::Theme| iced::widget::container::Style {
-                    background: Some(iced::Background::Color(theme.palette.surface_variant)),
-                    border: iced::Border {
-                        color: theme.palette.border,
-                        width: 1.0,
-                        radius: 8.0.into(),
-                    },
-                    ..iced::widget::container::Style::default()
-                })
-                .into()
-        } else {
-            Space::new().height(0.0).into()
+            WorkspaceSection::Configuration => {
+                scrollable(self.configuration_guide(theme)).height(Length::Fill).into()
+            }
         };
-
+        let issues: Option<Element<'_, Message>> = if self.show_validation_detail && !report.ok {
+            let mut list = column![text("Resolve before saving").size(ts.label)].spacing(sp.xs);
+            for message in &report.messages {
+                list = list.push(text(message.clone()).size(ts.body).color(theme.palette.danger));
+            }
+            Some(container(scrollable(list).height(Length::Fixed(100.0))).into())
+        } else {
+            None
+        };
+        let save_error = self.save_error.as_ref().map(|error| {
+            text(format!("Save failed: {error}. Your draft is still here."))
+                .size(ts.body)
+                .color(theme.palette.danger)
+        });
         column![
             toolbar,
-            text("Configure the agents and relationships used by multi-agent mode.")
-                .size(ts.body)
-                .color(theme.palette.text_muted),
-            validation_detail_bar,
+            row![
+                text("Global agent configuration · Coordinator-directed execution")
+                    .size(ts.body)
+                    .color(theme.palette.text_muted),
+                status,
+            ]
+            .spacing(sp.md)
+            .wrap(),
+            navigation.wrap(),
+            issues,
+            save_error,
             iced::widget::rule::horizontal(1),
-            panes,
+            body,
         ]
         .spacing(sp.md)
+        .padding(sp.lg)
         .height(Length::Fill)
         .into()
+    }
+
+    fn roster_overview<'a>(&'a self, theme: &'a AppTheme) -> Element<'a, Message> {
+        let ts = &theme.type_scale;
+        let sp = &theme.spacing;
+        let agents: Vec<_> = self.visible_agents().collect();
+        let enabled = agents.iter().filter(|agent| !agent.disabled).count();
+        let pinned = agents.iter().filter(|agent| agent.model_override.is_some()).count();
+        column![
+            text("Build your agent team").size(ts.display),
+            text("Select an agent to edit its instructions, model, and tool access.")
+                .size(ts.body).color(theme.palette.text_muted),
+            section_card(theme, "Roster", column![
+                text(format!("{enabled} enabled · {} disabled · {pinned} model overrides", agents.len() - enabled)).size(ts.body),
+                text("Changes are drafts until saved. The roster is shared across projects.")
+                    .size(ts.body).color(theme.palette.text_muted),
+            ].spacing(sp.sm)),
+            section_card_with_subtitle(theme, "Coordinator-directed execution",
+                "The Coordinator chooses who works, in what order, and when work is complete.",
+                text("Lifecycle and coverage describe an agent's suitability. Blueprint stages and relationships provide guidance; they do not force dispatch order.").size(ts.body)),
+            section_card_with_subtitle(theme, "Tool access stays policy-governed",
+                "An enabled capability is not an approval to execute.",
+                text("Shell profiles, policy rules, approvals, and runtime write gates still apply. Configure those controls in Settings.").size(ts.body)),
+        ].spacing(sp.md).into()
+    }
+
+    fn configuration_guide<'a>(&'a self, theme: &'a AppTheme) -> Element<'a, Message> {
+        let ts = &theme.type_scale;
+        let sp = &theme.spacing;
+        let cap = self
+            .global_max_dispatch_cycles
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "Unlimited".into());
+        let mut sections = column![
+            text("What controls an orchestration run?").size(ts.title),
+            text("Studio edits the global roster and advisory blueprint. The values below reflect loaded configuration; edit execution and security settings in Settings or the config file.")
+                .size(ts.body).color(theme.palette.text_muted),
+            button("Open Settings").style(crate::ui::button::secondary)
+                .on_press(Message::Navigate(crate::app::Page::Settings)),
+            section_card(theme, "Loaded execution limits · read only", column![
+
+                text(format!("Dispatch cap: {cap} · spend multiplier: {}×", self.spend_cap_multiplier)).size(ts.body),
+                text("A spend multiplier only bounds cost when a session spend cap is configured. Legacy concurrency fields are stored but are not connected to the runtime; they are not editable here.")
+                    .size(ts.body).color(theme.palette.text_muted),
+            ].spacing(sp.sm)),
+        ].spacing(sp.md);
+        for (title, scope, description) in [
+            ("Agents and models", "Editable here · global", "Names, roles, instructions, examples, output contracts, lifecycle, takeover coverage, enabled state, and model overrides. Provider credentials and default models belong in Settings."),
+            ("Blueprint", "Editable here · advisory", "Stage order, staffing hints, relationships, conditions, and fallback personas are configuration data. The Coordinator remains the dispatch authority."),
+            ("Budgets and recovery", "Settings / config · execution limits", "Session spend cap, total dispatch cap, per-subtask attempts, fallback model/provider, provider retry attempts, and timeouts. Planning hold budgets are runtime constants, not Studio controls."),
+            ("Security and approvals", "Settings / config · enforced separately", "Policy rules, shell profiles, filesystem and network restrictions, environment handling, and approval timeouts. Agent tool access cannot weaken these boundaries."),
+            ("Context and extensions", "Settings / config · run context", "Memory, context compaction, project instructions, skills, MCP servers, and plugins. Extension access remains policy-governed."),
+            ("Live run inspection", "Chat runtime view · session", "Inspect decisions, failures, evidence, and progress from the run's runtime view. Configuration validity does not establish provider availability or predict run success."),
+        ] {
+            sections = sections.push(section_card_with_subtitle(theme, title, scope, text(description).size(ts.body)));
+        }
+        sections.into()
     }
 
     // ------------------------------------------------------------------
@@ -3041,7 +3235,9 @@ impl State {
             })
             .unwrap_or_else(|| Space::new().into());
         column![
-            text(&blueprint.name).size(ts.title),
+            text(format!("{} · advisory blueprint", blueprint.name)).size(ts.title),
+            text("Stages, staffing, relationships, and fallback personas guide the Coordinator. They do not enforce dispatch order or grant tool access.")
+                .size(ts.body).color(theme.palette.text_muted),
             description,
             iced::widget::rule::horizontal(1),
             cards,
@@ -3603,10 +3799,6 @@ impl State {
     fn library_view<'a>(&'a self, theme: &'a AppTheme) -> Element<'a, Message> {
         let ts = &theme.type_scale;
         let sp = &theme.spacing;
-        // Slice 3: on the blueprint path the library doubles as the one-surface
-        // roster editor with Edit/Delete CRUD; on the legacy path it is the
-        // byte-identical historical agent library.
-        let blueprint_path = self.on_blueprint_path();
         let search = text_input("Search agents...", &self.search_query)
             .on_input(|s| Message::OrchestrationStudio(StudioMessage::SearchChanged(s)));
 
@@ -3634,17 +3826,13 @@ impl State {
                         row![text(&agent.name).size(ts.label), disabled_badge]
                             .spacing(sp.xs)
                             .align_y(Alignment::Center),
-                        row![
-                            role_badge,
-                            text(model_hint).size(ts.caption).color(theme.palette.text_muted)
-                        ]
-                        .spacing(sp.xs)
-                        .align_y(Alignment::Center),
+                        role_badge,
+                        text(model_hint).size(ts.caption).color(theme.palette.text_muted),
                     ]
                     .spacing(sp.xs)
                     .width(Length::Fill),
                 )
-                .style(if selected { button::primary } else { button::text })
+                .style(if selected { crate::ui::button::secondary } else { button::text })
                 .width(Length::Fill);
                 // The coordinator is filtered from `visible_agents`, so every
                 // rendered row is selectable/editable (no engine-owned special
@@ -3652,45 +3840,14 @@ impl State {
                 let select = select.on_press(Message::OrchestrationStudio(
                     StudioMessage::SelectAgent(Some(agent.id.clone())),
                 ));
-                // Slice 3 roster CRUD: on the blueprint path every agent is a
-                // fully editable template. Edit routes to the per-agent
-                // inspector (persisted through the roster Save arm); Delete
-                // removes the agent from config on the next Save. The legacy
-                // path keeps its historical "Remove custom agent only"
-                // affordance.
-                let agent_row = if blueprint_path {
-                    row![
-                        select,
-                        button("Edit").style(button::text).on_press(Message::OrchestrationStudio(
-                            StudioMessage::SelectAgent(Some(agent.id.clone())),
-                        )),
-                        button("Delete").style(button::text).on_press(
-                            Message::OrchestrationStudio(StudioMessage::RemoveAgent(
-                                agent.id.clone()
-                            ),)
-                        ),
-                    ]
-                    .spacing(sp.xs)
-                    .align_y(Alignment::Center)
-                } else if agent.is_custom {
-                    row![
-                        select,
-                        button("Remove").style(button::text).on_press(
-                            Message::OrchestrationStudio(StudioMessage::RemoveAgent(
-                                agent.id.clone(),
-                            ))
-                        ),
-                    ]
-                    .spacing(sp.xs)
-                    .align_y(Alignment::Center)
-                } else {
-                    row![select].align_y(Alignment::Center)
-                };
+                let agent_row = row![select].width(Length::Fill);
                 list = list.push(agent_row).push(iced::widget::rule::horizontal(1));
             }
         }
 
-        let add_button = if self.new_agent_name.trim().is_empty() {
+        let add_button = if self.new_agent_name.trim().is_empty()
+            || is_coordinator_key(self.new_agent_role.trim())
+        {
             button("Add agent").style(button::secondary)
         } else {
             button("Add agent")
@@ -3727,7 +3884,7 @@ impl State {
         };
 
         column![
-            text(format!("{} agents", self.agents.len()))
+            text(format!("{} agents", self.visible_agents().count()))
                 .size(ts.caption)
                 .color(theme.palette.text_muted),
             search,
@@ -4076,7 +4233,7 @@ impl State {
                 let tabs = row![
                     inspector_tab(
                         self.inspector_section == InspectorSection::Prompt,
-                        "Prompt",
+                        "Instructions",
                         InspectorSection::Prompt,
                     ),
                     inspector_tab(
@@ -4086,7 +4243,7 @@ impl State {
                     ),
                     inspector_tab(
                         self.inspector_section == InspectorSection::Permissions,
-                        "Permissions",
+                        "Tool access",
                         InspectorSection::Permissions,
                     ),
                 ]
@@ -4097,9 +4254,24 @@ impl State {
                     InspectorSection::Model => self.model_pane(agent, theme),
                     InspectorSection::Permissions => self.permissions_pane(agent, theme),
                 };
+                let removal: Option<Element<'_, Message>> = if self.pending_agent_removal.as_ref()
+                    == Some(id)
+                {
+                    Some(section_card(theme, format!("Remove {}?", agent.name), column![
+                        text("This removes the agent and its blueprint staffing from the draft. Save applies the removal globally. Existing run history is retained.").size(ts.body),
+                        row![
+                            button("Remove agent").style(crate::ui::button::danger)
+                                .on_press(Message::OrchestrationStudio(StudioMessage::ConfirmAgentRemoval)),
+                            button("Keep agent").style(crate::ui::button::secondary)
+                                .on_press(Message::OrchestrationStudio(StudioMessage::CancelAgentRemoval)),
+                        ].spacing(sp.sm).wrap(),
+                    ].spacing(sp.sm)))
+                } else {
+                    None
+                };
                 return column![
                     row![
-                        button("← Pipeline")
+                        button("← Agents")
                             .style(button::secondary)
                             .on_press(Message::OrchestrationStudio(StudioMessage::ShowPipeline)),
                         column![
@@ -4121,7 +4293,20 @@ impl State {
                     ]
                     .spacing(sp.md)
                     .align_y(Alignment::Center),
-                    tabs,
+                    row![
+                        button("Duplicate agent").style(crate::ui::button::secondary).on_press(
+                            Message::OrchestrationStudio(StudioMessage::DuplicateAgent(id.clone()))
+                        ),
+                        button("Remove…").style(button::text).on_press(
+                            Message::OrchestrationStudio(StudioMessage::RequestAgentRemoval(
+                                id.clone()
+                            ))
+                        ),
+                    ]
+                    .spacing(sp.sm)
+                    .wrap(),
+                    removal,
+                    tabs.wrap(),
                     iced::widget::rule::horizontal(1),
                     body,
                 ]
@@ -4155,28 +4340,45 @@ impl State {
         })
         .width(Length::Fill);
 
-        // "Lifecycle" (pipeline stage) picker. Only known stages are mapped;
-        // anything else (e.g. a stage the studio doesn't know) renders as
-        // Freeform WITHOUT side effects — selection only mutates on a user pick.
-        let mut stage_options: Vec<StageOption> =
-            vec![StageOption { value: None, label: "Freeform (no lifecycle)" }];
-        stage_options.extend(known_stage_options());
-        let stage_current = agent.stage.as_ref().filter(|s| s.is_known()).cloned();
-        let stage_selected = stage_options.iter().find(|o| o.value == stage_current).cloned();
-        let stage_pick = pick_list(stage_options, stage_selected, |s| {
-            Message::OrchestrationStudio(StudioMessage::StageChanged(s.value))
+        let stage_pick = text_input(
+            "Freeform (no lifecycle)",
+            agent.stage.as_ref().map(|stage| stage.as_str()).unwrap_or_default(),
+        )
+        .on_input(|value| {
+            Message::OrchestrationStudio(StudioMessage::StageChanged(if value.trim().is_empty() {
+                None
+            } else {
+                Some(AgentStage::new(value.trim()))
+            }))
         })
         .width(Length::Fill);
-
-        let sys = text_input("System Instructions", &p.system_instructions)
-            .on_input(|s| Message::OrchestrationStudio(StudioMessage::SysPromptChanged(s)))
-            .width(Length::Fill);
-        let cons = text_input("Constraints & Safety", &p.constraints)
-            .on_input(|s| Message::OrchestrationStudio(StudioMessage::ConstraintsChanged(s)))
-            .width(Length::Fill);
-        let out = text_input("Output Format", &p.output_format)
-            .on_input(|s| Message::OrchestrationStudio(StudioMessage::OutputFormatChanged(s)))
-            .width(Length::Fill);
+        let sys = text_editor(&self.prompt_editors.instructions)
+            .placeholder("Describe the agent's responsibilities…")
+            .on_action(|action| {
+                Message::OrchestrationStudio(StudioMessage::PromptEdited(
+                    PromptField::Instructions,
+                    action,
+                ))
+            })
+            .height(180);
+        let cons = text_editor(&self.prompt_editors.constraints)
+            .placeholder("Constraints and safety guidance…")
+            .on_action(|action| {
+                Message::OrchestrationStudio(StudioMessage::PromptEdited(
+                    PromptField::Constraints,
+                    action,
+                ))
+            })
+            .height(100);
+        let out = text_editor(&self.prompt_editors.output)
+            .placeholder("Expected output and formatting…")
+            .on_action(|action| {
+                Message::OrchestrationStudio(StudioMessage::PromptEdited(
+                    PromptField::Output,
+                    action,
+                ))
+            })
+            .height(100);
 
         let mut few = column![text("Few-Shot Examples").size(ts.body)];
         for (i, ex) in p.few_shot.iter().enumerate() {
@@ -4215,22 +4417,36 @@ impl State {
         ]
         .spacing(sp.sm);
         column![
+            column![
+                text("Agent name").size(ts.label),
+                text_input("Name", &agent.name).on_input(|value| Message::OrchestrationStudio(StudioMessage::AgentNameChanged(value))),
+                text("Role").size(ts.label),
+                text_input("Role", &agent.role).on_input(|value| Message::OrchestrationStudio(StudioMessage::AgentRoleChanged(value))),
+            ].spacing(sp.xs),
             contract_row,
             text(
-                "Typed contracts travel via submit_design_doc / submit_research_report / \
-                 submit_review_report and are validated field-by-field."
+                "Structured contracts require the agent to submit the corresponding typed result."
             )
             .size(ts.caption)
             .color(theme.palette.text_muted),
             text(
-                "Stage ties an agent into the Coordinator's lifecycle (Review / Validate \
-                 cycles) and defaults to Freeform for custom agents."
+                "Lifecycle is an open tag used for suitability and takeover coverage. It does not enforce execution order."
             )
             .size(ts.caption)
             .color(theme.palette.text_muted),
             can_cover_control(agent, theme),
+            row![
+                text_input("Add a custom coverage tag", &self.coverage_draft)
+                    .on_input(|value| Message::OrchestrationStudio(StudioMessage::CoverageDraftChanged(value)))
+                    .on_submit(Message::OrchestrationStudio(StudioMessage::AddCoverage)),
+                button("Add coverage").style(crate::ui::button::secondary)
+                    .on_press(Message::OrchestrationStudio(StudioMessage::AddCoverage)),
+            ].spacing(sp.sm),
+            text("System instructions").size(ts.label),
             sys,
+            text("Constraints and safety guidance").size(ts.label),
             cons,
+            text("Output format").size(ts.label),
             out,
             few,
             add_ex,
@@ -4259,17 +4475,29 @@ impl State {
         pairs.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
 
         for (provider_id, model) in &pairs {
-            let label = format!("{} — {}", model, provider_id);
+            let provider_label = self.provider_labels.get(provider_id).unwrap_or(provider_id);
+            let label = format!("{} — {}", model, provider_label);
             let key = format!("{}|{}", provider_id, model);
             options.push(ModelOption { key, label });
         }
 
         // Determine currently-selected option.
         let current_key = agent
-            .provider_id
+            .model_override
             .as_ref()
-            .and_then(|pid| agent.model_override.as_ref().map(|m| format!("{}|{}", pid, m)))
+            .map(|model| format!("{}|{}", agent.provider_id.as_deref().unwrap_or_default(), model))
             .unwrap_or_default();
+        // Keep the configured pin visible if a provider is offline or its
+        // model cache no longer lists this model. Never silently show default.
+        if !options.iter().any(|option| option.key == current_key) {
+            options.push(ModelOption {
+                key: current_key.clone(),
+                label: format!(
+                    "{} · configured, not in model cache",
+                    agent.model_override.as_deref().unwrap_or_default()
+                ),
+            });
+        }
         let selected = options.iter().find(|o| o.key == current_key).cloned();
 
         let model_pick = pick_list(options, selected, {
@@ -4287,13 +4515,14 @@ impl State {
                     model,
                 })
             }
-        });
+        })
+        .width(Length::Fill);
 
         let name =
             self.global_default_model.as_deref().map(|m| format!(": {m}")).unwrap_or_default();
         let help_text =
             format!("Using the global default model{name} — set it in Settings › Model.");
-        let help = if agent.provider_id.is_some() {
+        let help = if agent.model_override.is_some() {
             text("A specific model is selected for this agent. Choose 'Use global default' to use the default model.")
         } else {
             text(help_text)
@@ -4305,7 +4534,8 @@ impl State {
         column![
             text("Model Selection").size(ts.label),
             model_pick,
-            row![help.size(ts.body), open_settings].spacing(sp.sm).align_y(Alignment::Center),
+            help.size(ts.body),
+            open_settings,
         ]
         .spacing(sp.sm)
         .into()
@@ -4372,7 +4602,9 @@ impl State {
         };
 
         column![
-            text("Permissions / Capabilities").size(ts.label),
+            text("Requested tool access").size(ts.label),
+            text("These capabilities make tools available to this agent. Policy rules, shell profiles, approvals, and runtime gates still decide whether each operation may execute.")
+                .size(ts.body).color(theme.palette.text_muted),
             fs_read,
             fs_write,
             shell,
@@ -4380,8 +4612,7 @@ impl State {
             lsp,
             eval,
             text(
-                "Enables the acceptance gate (C-06): a multi-agent Build fails with \
-                 'validation disabled' when the Validator has this off.",
+                "Makes evaluation tools available. The Coordinator decides when evaluation is needed; enabling this does not guarantee validation or run success.",
             )
             .size(ts.caption)
             .color(theme.palette.text_muted),
@@ -4399,6 +4630,146 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiline_prompt_edits_follow_selection_and_persist() {
+        let mut state = standard_blueprint_state();
+        let _ = state.update(StudioMessage::SelectAgent(Some("architect".into())));
+        let _ = state.update(StudioMessage::SysPromptChanged("First line\nSecond line".into()));
+        assert_eq!(state.prompt_editors.instructions.text(), "First line\nSecond line");
+        let _ = state.update(StudioMessage::PromptEdited(
+            PromptField::Instructions,
+            text_editor::Action::SelectAll,
+        ));
+        state.mark_saved();
+        let _ = state.update(StudioMessage::PromptEdited(
+            PromptField::Instructions,
+            text_editor::Action::Move(text_editor::Motion::DocumentEnd),
+        ));
+        assert!(!state.unsaved, "moving the cursor is not a config edit");
+        let _ = state.update(StudioMessage::PromptEdited(
+            PromptField::Instructions,
+            text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new("\nThird line".into()))),
+        ));
+        let (agents, _, _) = state.persisted_parts();
+        let architect = agents.iter().find(|agent| agent.id == "architect").expect("architect");
+        assert_eq!(
+            architect.prompt_sections.system_instructions,
+            "First line\nSecond line\nThird line"
+        );
+        assert!(state.unsaved);
+        let _ = state.update(StudioMessage::SelectAgent(Some("coder".into())));
+        let coder = state.agents.iter().find(|agent| agent.id == "coder").expect("coder");
+        assert_eq!(
+            state.prompt_editors.instructions.text(),
+            coder.prompt_sections.system_instructions
+        );
+        let _ = state.update(StudioMessage::SelectAgent(Some("architect".into())));
+        assert_eq!(state.prompt_editors.instructions.text(), "First line\nSecond line\nThird line");
+    }
+
+    #[test]
+    fn duplicate_has_independent_identity_and_preserves_configuration() {
+        let mut state = standard_blueprint_state();
+        let _ = state.update(StudioMessage::AssignModel {
+            agent_id: "architect".into(),
+            provider_id: "local-provider".into(),
+            model: "local-model".into(),
+        });
+        let original =
+            state.agents.iter().find(|agent| agent.id == "architect").cloned().expect("architect");
+        let _ = state.update(StudioMessage::DuplicateAgent("architect".into()));
+        let _ = state.update(StudioMessage::DuplicateAgent("architect".into()));
+        assert_eq!(state.selected_agent_id.as_deref(), Some("architect-copy-2"));
+        let copy = state.agents.iter().find(|agent| agent.id == "architect-copy-2").expect("copy");
+        assert_eq!(copy.role, copy.id);
+        assert_eq!(copy.stage, original.stage);
+        assert_eq!(copy.provider_id, original.provider_id);
+        assert_eq!(copy.model_override, original.model_override);
+        assert_eq!(copy.prompt_sections, original.prompt_sections);
+        assert_eq!(copy.capabilities, original.capabilities);
+        assert!(state
+            .blueprint
+            .as_ref()
+            .expect("blueprint")
+            .pipeline
+            .stages
+            .iter()
+            .all(|stage| !stage.agents.contains(&copy.id)));
+        let (persisted, _, _) = state.persisted_parts();
+        let mut loaded = State::new();
+        loaded.load_from_config(&AppConfig {
+            agent_files_authoritative: true,
+            multi_agent: Some(concerto_config::MultiAgentConfig {
+                custom_agents: persisted,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let loaded_copy =
+            loaded.agents.iter().find(|agent| agent.id == "architect-copy-2").expect("loaded copy");
+        assert_eq!(loaded_copy.provider_id, original.provider_id);
+        assert_eq!(loaded_copy.model_override, original.model_override);
+    }
+
+    #[test]
+    fn removal_requires_confirmation_and_cleans_draft_references() {
+        let mut state = standard_blueprint_state();
+        let _ = state.update(StudioMessage::RequestAgentRemoval("architect".into()));
+        assert!(state.agents.iter().any(|agent| agent.id == "architect"));
+        assert!(!state.unsaved);
+        let _ = state.update(StudioMessage::CancelAgentRemoval);
+        let _ = state.update(StudioMessage::ConfirmAgentRemoval);
+        assert!(state.agents.iter().any(|agent| agent.id == "architect"));
+        let _ = state.update(StudioMessage::AssignModel {
+            agent_id: "architect".into(),
+            provider_id: "provider".into(),
+            model: "model".into(),
+        });
+        let _ = state.update(StudioMessage::RequestAgentRemoval("architect".into()));
+        let _ = state.update(StudioMessage::ConfirmAgentRemoval);
+        assert!(!state.agents.iter().any(|agent| agent.id == "architect"));
+        assert!(state
+            .blueprint
+            .as_ref()
+            .expect("blueprint")
+            .pipeline
+            .stages
+            .iter()
+            .all(|stage| !stage.agents.iter().any(|id| id == "architect")));
+        assert!(!state
+            .model_assignments
+            .iter()
+            .any(|assignment| assignment.agent_role == "architect"));
+        assert!(
+            !state
+                .relationships
+                .iter()
+                .any(|relationship| relationship.from == "architect"
+                    || relationship.to == "architect")
+        );
+    }
+
+    #[test]
+    fn workspace_switches_keep_drafts_and_custom_lifecycle() {
+        let mut state = standard_blueprint_state();
+        let _ = state.update(StudioMessage::SelectAgent(Some("architect".into())));
+        let _ = state.update(StudioMessage::StageChanged(Some(AgentStage::new("security-audit"))));
+        let _ = state.update(StudioMessage::AgentNameChanged("Security specialist".into()));
+        let theme = AppTheme::by_name("Midnight");
+        for section in
+            [WorkspaceSection::Blueprint, WorkspaceSection::Configuration, WorkspaceSection::Agents]
+        {
+            let _ = state.update(StudioMessage::WorkspaceSelected(section));
+            let _ = state.view(&theme);
+        }
+        assert!(state.unsaved);
+        assert_eq!(state.selected_agent_id.as_deref(), Some("architect"));
+        let (agents, _, _) = state.persisted_parts();
+        let agent = agents.iter().find(|agent| agent.id == "architect").expect("architect");
+        assert_eq!(agent.name, "Security specialist");
+        assert_eq!(agent.stage, Some(AgentStage::new("security-audit")));
+    }
 
     fn load_standard(state: &mut State) {
         let _ = state.update(StudioMessage::LoadPreset("Standard Pipeline".into()));
