@@ -104,6 +104,16 @@
 //! dispatch label (it quotes `required_output`). The boundary is
 //! SECTION-granular, not per-line: a stale fact is a runtime signal, but
 //! its label may quote an earlier claim that a generation reset staled.
+//!
+//! Fact cap (issue #142): of the [`MAX_WORLD_FACTS`] fact slots, at most
+//! [`MAX_PINNED_FACTS`] are reserved for facts about artifacts active work
+//! depends on — a non-terminal decision's `expected_artifacts` or an open
+//! question's `blocks` path — so a burst of irrelevant reads cannot evict
+//! them. The remaining slots fill newest-first as before. This is
+//! deterministic pinning by membership, never a weighted relevance score.
+//! Pinning is applied OVER the staleness rules above (F-GENERATION,
+//! F-SUPERSEDE, F-WORKSPACE-SUPERSEDE): a reserved slot keeps a fact in
+//! the cap, it never makes a stale fact fresh.
 
 use std::collections::HashSet;
 
@@ -120,6 +130,15 @@ use crate::failure_diagnosis::FailureDiagnosis;
 
 /// Upper bound on referenced facts (event id + label), never prose-proportional.
 pub const MAX_WORLD_FACTS: usize = 32;
+/// Slots of [`MAX_WORLD_FACTS`] reserved (issue #142) for facts about the
+/// artifacts active work depends on: at most this many facts whose `artifact`
+/// names a non-terminal decision's `expected_artifacts` entry or an open
+/// question's `blocks` path are held against newest-first eviction. The
+/// remaining slots fill newest-first as before — deterministic pinning, never
+/// a weighted relevance score.
+pub const MAX_PINNED_FACTS: usize = 8;
+/// The reservation can never exceed the fact cap itself.
+const _: () = assert!(MAX_PINNED_FACTS <= MAX_WORLD_FACTS);
 /// Upper bound on tracked tasks (one journal dispatch entry each).
 pub const MAX_WORLD_TASKS: usize = 24;
 /// Upper bound on tracked artifact entries.
@@ -701,6 +720,73 @@ fn break_tag_name(text: &str) -> String {
     text.replace(TAG, "world model")
 }
 
+/// Whether a decision is terminal for pinning purposes (issue #142):
+/// `Settled` (the work is done), `Rejected` (refused) and `Superseded`
+/// (voided by a RECONSIDER) no longer hold the run's attention, so their
+/// expected artifacts are not active dependencies.
+fn decision_is_terminal(status: DecisionStatus) -> bool {
+    matches!(
+        status,
+        DecisionStatus::Settled | DecisionStatus::Rejected | DecisionStatus::Superseded
+    )
+}
+
+/// The artifacts active work currently depends on (issue #142): every
+/// expected artifact of a non-terminal decision plus every path an OPEN
+/// question blocks on. A set, so duplicated paths cost one entry.
+fn active_artifact_paths(
+    input: &WorldModelInput<'_>,
+    questions: &[UnresolvedQuestion],
+) -> HashSet<String> {
+    let mut paths = HashSet::new();
+    let in_flight =
+        input.decisions.iter().filter(|decision| !decision_is_terminal(decision.status));
+    for decision in in_flight {
+        paths.extend(decision.expected_artifacts.iter().cloned());
+    }
+    for question in questions.iter().filter(|question| question.is_open()) {
+        if let Some(blocks) = question.blocks.as_deref() {
+            paths.insert(blocks.to_owned());
+        }
+    }
+    paths
+}
+
+/// The deterministic fact cap (issue #142): `facts` may be any order;
+/// up to [`MAX_PINNED_FACTS`] slots are reserved for facts whose artifact is
+/// in `pinned_paths` (reserved tier, newest-first, K newest when the pinned
+/// tier overflows), and every remaining slot fills newest-first over whatever
+/// is left — pinned overflow included, so no slot is wasted. Pure: the same
+/// input yields the same selection in the same order.
+fn select_facts(mut facts: Vec<WorldFact>, pinned_paths: &HashSet<String>) -> Vec<WorldFact> {
+    // Newest-first; the sort is stable, so equal `seq` keeps event order.
+    facts.sort_by_key(|fact| core::cmp::Reverse(fact.seq));
+    // Walk newest-first and mark at most MAX_PINNED_FACTS reserved slots, so
+    // an over-long pinned tier reserves exactly the K newest pinned facts.
+    let mut reserved = vec![false; facts.len()];
+    let mut pinned_kept = 0;
+    for (index, fact) in facts.iter().enumerate() {
+        if pinned_kept >= MAX_PINNED_FACTS {
+            break;
+        }
+        if fact.artifact.as_deref().is_some_and(|path| pinned_paths.contains(path)) {
+            reserved[index] = true;
+            pinned_kept += 1;
+        }
+    }
+    let mut out: Vec<WorldFact> = Vec::with_capacity(MAX_WORLD_FACTS.min(facts.len()));
+    let mut fill: Vec<WorldFact> = Vec::with_capacity(facts.len());
+    for (index, fact) in facts.into_iter().enumerate() {
+        if reserved[index] {
+            out.push(fact);
+        } else {
+            fill.push(fact);
+        }
+    }
+    out.extend(fill.into_iter().take(MAX_WORLD_FACTS.saturating_sub(out.len())));
+    out
+}
+
 /// Sanitize, then bound a label to [`MAX_LABEL_CHARS`] characters with a
 /// deterministic truncation ellipsis. Sanitization runs FIRST, so every
 /// stored label (Finding summaries, task text, risk/question/pending
@@ -1029,9 +1115,13 @@ impl WorldModel {
                  freshness may be overstated"
             );
         }
+        // The question lifecycle is a pure function of the inputs alone, so it
+        // runs first: its open `blocks` paths feed the fact reservation below
+        // (issue #142).
+        let questions = resolve_and_feed_questions(input);
 
-        // ── Facts (capped from the NEWEST side; staleness per F-*) ──────
-        let mut facts: Vec<WorldFact> = candidates
+        // ── Facts (reserved for active work, then newest-first; staleness per F-*) ──
+        let candidates: Vec<WorldFact> = candidates
             .into_iter()
             .map(|candidate| {
                 let stale = input.workspace_changed
@@ -1060,8 +1150,8 @@ impl WorldModel {
                 }
             })
             .collect();
-        facts.sort_by_key(|fact| core::cmp::Reverse(fact.seq));
-        facts.truncate(MAX_WORLD_FACTS);
+        let pinned_paths = active_artifact_paths(input, &questions);
+        let facts = select_facts(candidates, &pinned_paths);
 
         // ── Artifacts (union of observation rows + write attribution) ────
         // Pass 1: real observation rows are authoritative — the only source
@@ -1277,9 +1367,7 @@ impl WorldModel {
             ))
         });
 
-        // ── Questions (resolve → feed → cap) ─────────────────────────────
-        let questions = resolve_and_feed_questions(input);
-
+        // ── Questions (resolved + fed above, open ones first) ────────────
         Self {
             built_at_ms: input.now_ms,
             generation: input.current_generation.clone(),
@@ -2421,6 +2509,121 @@ mod tests {
         assert!(model.tasks.len() <= MAX_WORLD_TASKS, "tasks are capped");
         assert!(model.risks.len() <= MAX_WORLD_RISKS, "risks are capped");
         assert!(model.render().chars().count() <= MAX_RENDER_CHARS, "the render is hard-bounded");
+    }
+
+    /// A burst of `count` newer, artifact-less read facts (non-file-affecting
+    /// tool executions — the "irrelevant reads" of issue #142).
+    fn unrelated_reads(count: u64, first_seq: u64) -> Vec<WhiteboardEvent> {
+        (0..count)
+            .map(|index| {
+                event(
+                    WhiteboardKind::ToolExecuted,
+                    &format!("ev-read-{index}"),
+                    first_seq + index,
+                    serde_json::json!({
+                        "tool": "read_file", "args": {}, "success": true,
+                        "paths": [{"path": format!("noise/{index}.rs")}]
+                    }),
+                )
+            })
+            .collect()
+    }
+
+    /// Issue #142: a fact about an artifact a NON-TERMINAL decision expects
+    /// keeps its reserved slot — 100 newer unrelated reads cannot evict it.
+    /// A terminal decision reserves nothing, so the same burst evicts it.
+    #[test]
+    fn pinned_artifact_fact_survives_100_newer_unrelated_facts() {
+        let mut events = vec![event(
+            WhiteboardKind::WriteApplied,
+            "ev-pinned",
+            1,
+            write_applied("src/pinned.rs"),
+        )];
+        events.extend(unrelated_reads(100, 10));
+
+        let active = vec![decision("d-active", DecisionStatus::Dispatched, &["src/pinned.rs"])];
+        let model = WorldModel::build(&input(&events, Vec::new(), &active, &[], Vec::new()));
+        assert_eq!(model.facts.len(), MAX_WORLD_FACTS, "the cap still fills completely");
+        assert!(
+            model.facts.iter().any(|fact| fact.ref_id == "ev-pinned"),
+            "the pinned fact survives 100 newer unrelated facts"
+        );
+        assert_eq!(
+            model.facts[0].ref_id, "ev-pinned",
+            "reserved facts rank first so the rendered head shows active work"
+        );
+
+        // A settled decision's artifacts are no longer active dependencies.
+        let done = vec![decision("d-done", DecisionStatus::Settled, &["src/pinned.rs"])];
+        let evicted = WorldModel::build(&input(&events, Vec::new(), &done, &[], Vec::new()));
+        assert_eq!(evicted.facts.len(), MAX_WORLD_FACTS, "the cap still fills completely");
+        assert!(
+            !evicted.facts.iter().any(|fact| fact.ref_id == "ev-pinned"),
+            "a terminal decision reserves no slot — the newest-first fill evicts it"
+        );
+    }
+
+    /// Issue #142: the second reservation source — an OPEN question's
+    /// `blocks` path pins the fact about that artifact.
+    #[test]
+    fn open_question_blocks_path_fact_is_pinned() {
+        let mut events = vec![event(
+            WhiteboardKind::WriteApplied,
+            "ev-blocked",
+            1,
+            write_applied("src/blocked.rs"),
+        )];
+        events.extend(unrelated_reads(100, 10));
+        let rows =
+            vec![observation("src/blocked.rs", true, true, Some(GENERATION), Some("obs-dirty"))];
+
+        let model = WorldModel::build(&input(&events, rows, &[], &[], Vec::new()));
+        assert_eq!(model.open_question_count(), 1, "the dirty row opens one question");
+        assert_eq!(model.facts.len(), MAX_WORLD_FACTS, "the cap still fills completely");
+        assert!(
+            model.facts.iter().any(|fact| fact.ref_id == "ev-blocked"),
+            "an open question's blocks path pins its fact against the newer burst"
+        );
+    }
+
+    /// Issue #142: the reservation is bounded — at most `MAX_PINNED_FACTS`
+    /// slots go to pinned facts, the rest fills newest-first, and the total
+    /// stays exactly at the cap with a deterministic order.
+    #[test]
+    fn pinned_reservation_is_capped_and_fill_is_newest_first() {
+        let mut events = Vec::new();
+        let mut pinned_paths: Vec<String> = Vec::new();
+        for index in 0..20u64 {
+            let path = format!("src/pinned-{index}.rs");
+            events.push(event(
+                WhiteboardKind::WriteApplied,
+                &format!("ev-pin-{index}"),
+                index,
+                write_applied(&path),
+            ));
+            pinned_paths.push(path);
+        }
+        events.extend(unrelated_reads(100, 100));
+
+        let refs: Vec<&str> = pinned_paths.iter().map(String::as_str).collect();
+        let active = vec![decision("d-active", DecisionStatus::Validated, &refs)];
+        let model = WorldModel::build(&input(&events, Vec::new(), &active, &[], Vec::new()));
+
+        assert_eq!(model.facts.len(), MAX_WORLD_FACTS, "total stays at the cap");
+        let kept: Vec<&str> = model.facts.iter().map(|fact| fact.ref_id.as_str()).collect();
+        let pinned_kept: Vec<&&str> = kept.iter().filter(|id| id.starts_with("ev-pin-")).collect();
+        assert_eq!(pinned_kept.len(), MAX_PINNED_FACTS, "the reservation is capped at K slots");
+        // Reserved tier: the K NEWEST pinned facts, newest-first.
+        let expected_reserved: Vec<String> =
+            (0..MAX_PINNED_FACTS as u64).map(|i| format!("ev-pin-{}", 20 - 1 - i)).collect();
+        assert_eq!(
+            &kept[..MAX_PINNED_FACTS],
+            expected_reserved.iter().map(String::as_str).collect::<Vec<_>>(),
+            "the reserved tier is the newest pinned facts, newest-first"
+        );
+        // Fill tier: pure newest-first over the remaining facts.
+        assert_eq!(kept[MAX_PINNED_FACTS], "ev-read-99", "the fill is newest-first");
     }
 
     /// Every stored label is characters-bounded and every fact is a
