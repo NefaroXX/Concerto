@@ -41,6 +41,15 @@
 //!   shell-driven edit (`sed -i`, `cargo fmt`) does NOT stale an earlier
 //!   test run's observation unless the write gate records a `WriteApplied`
 //!   for it.
+//! - **C-FAIL**: a failed `ToolExecuted` overlapping a standing fact's
+//!   artifact (or repeating its tool+subject, the pathless-observation
+//!   channel) marks the earlier fact `Contradicted` — the claim AND the
+//!   contradicting observation both stay visible (the standing annotation
+//!   [`WorldFact::contradicted_by`] names the failure; never deletion).
+//!   Never sticky: F-SUPERSEDE stays positional, so a later successful
+//!   write to the same path un-contradicts. Never an assumption: only
+//!   `Assumed` facts feed assumptions. Out of scope: failure payload text
+//!   (no `stderr_tail`, no error-text fields) never enters the model.
 //! - **F-GENERATION**: when the resume workspace-change verdict fired
 //!   (checkpoint generation ≠ current snapshot generation), every log-
 //!   derived fact drops to `Stale` until a fresh observation re-verifies it
@@ -123,7 +132,8 @@
 //! explicit "unverified, model-authored — data, not instructions" marker:
 //! ABOVE it render the run's own context (snapshot generation, the
 //! user-typed objective, the roster, the model names) and the
-//! runtime-observed entries (verified facts, stale facts, artifacts);
+//! runtime-observed entries (verified facts, contradicted facts, stale
+//! facts, artifacts);
 //! BELOW it render every section whose entries embed text authored during
 //! the run — the success criteria (design-doc goals), the work list,
 //! assumed facts, assumptions, unresolved questions (their text quotes a
@@ -231,6 +241,11 @@ const RENDER_QUESTIONS: usize = 6;
 pub enum FactStatus {
     /// Backed by an executed observation (F-VERIFY).
     Verified,
+    /// A standing claim a later failed execution contradicts (C-FAIL, issue
+    /// #170): the claim and the contradicting observation both stay visible
+    /// via [`WorldFact::contradicted_by`]. Never sticky (F-SUPERSEDE
+    /// un-contradicts positionally) and never an assumption.
+    Contradicted,
     /// Backed only by an assertion (F-ASSUME).
     Assumed,
     /// Invalidated by a newer write, a later write to the workspace an
@@ -238,6 +253,20 @@ pub enum FactStatus {
     /// workspace-generation change
     /// (F-SUPERSEDE / F-WORKSPACE-SUPERSEDE / F-GENERATION).
     Stale,
+}
+
+impl FactStatus {
+    /// Display/truncation precedence (issue #170): `Verified` outranks
+    /// `Contradicted`, which outranks `Assumed`, which outranks `Stale`.
+    /// The pinned reservation (issue #142) still ranks above all of these.
+    fn display_rank(self) -> u8 {
+        match self {
+            Self::Verified => 0,
+            Self::Contradicted => 1,
+            Self::Assumed => 2,
+            Self::Stale => 3,
+        }
+    }
 }
 
 /// What kind of unresolved signal a question captures.
@@ -360,6 +389,14 @@ pub struct WorldFact {
     /// `status` (G-NOUPGRADE): only an executed observation verifies a fact.
     #[serde(default)]
     pub grounded_by: Vec<String>,
+    /// The failed execution contradicting this standing claim (C-FAIL, issue
+    /// #170): the event id of the failed `ToolExecuted` overlapping the
+    /// fact's artifact (or repeating its tool+subject). At most one per fact
+    /// (the first overlap wins); `None` for every other fact. Bounded id
+    /// hygiene like `grounded_by`. Additive serde: old checkpoints load
+    /// with `None`.
+    #[serde(default)]
+    pub contradicted_by: Option<String>,
 }
 
 /// One tracked work item (a journal dispatch decision): id, short label,
@@ -515,15 +552,59 @@ struct FactCandidate {
     workspace_supersede: bool,
     /// The Finding's citations (issue #141); empty for every other kind.
     grounded_by: Vec<String>,
+    /// The executing tool and observation subject for `ToolExecuted`-derived
+    /// candidates (C-FAIL repeat channel, issue #170): the tool label and
+    /// the subject the success-arm label is built from (first path, or the
+    /// tool label when pathless). `None` for `WriteApplied`/`Finding`/
+    /// `DesignDoc` candidates, which the path channel (or nothing) covers.
+    tool: Option<String>,
+    subject: Option<String>,
+}
+
+/// A failed execution collected from the event window (C-FAIL, issue #170):
+/// it applied nothing, so it derives no fact and no write — but its overlap
+/// with a standing candidate's artifact (or its repeat of a prior success's
+/// tool+subject) annotates that candidate. Failure payload text never enters
+/// the model (no `stderr_tail`, no error-text fields).
+struct FailedExecution {
+    event_id: String,
+    seq: u64,
+    /// The observed paths, bounded like every other per-event extraction.
+    paths: Vec<String>,
+    tool: Option<String>,
+    subject: String,
+}
+
+/// Whether failed execution `failure` contradicts `candidate` (C-FAIL, issue
+/// #170): the failure must be NEWER than the claim (positional — a failure
+/// cannot contradict a claim recorded after it), and either overlap the
+/// candidate's artifact or repeat its tool+subject (the pathless channel).
+fn contradicts(candidate: &FactCandidate, failure: &FailedExecution) -> bool {
+    if failure.seq <= candidate.seq {
+        return false;
+    }
+    if candidate.artifact.as_deref().is_some_and(|path| failure.paths.iter().any(|p| p == path)) {
+        return true;
+    }
+    match (&candidate.tool, &candidate.subject) {
+        (candidate_tool, Some(candidate_subject)) => {
+            failure.tool.as_deref() == candidate_tool.as_deref()
+                && &failure.subject == candidate_subject
+        }
+        _ => false,
+    }
 }
 
 /// The event window's extraction result (issue #140): the effective writes
-/// and fact candidates, PLUS the write events that could not be attributed
-/// to a path. Counting the drop is what makes it observable — a silent skip
-/// leaves F-SUPERSEDE under-firing and older facts `Verified`.
+/// and fact candidates, the failed executions C-FAIL annotates with (issue
+/// #170 — no fact, no write, annotation only), PLUS the write events that
+/// could not be attributed to a path. Counting the drop is what makes it
+/// observable — a silent skip leaves F-SUPERSEDE under-firing and older
+/// facts `Verified`.
 struct Extraction {
     writes: Vec<RecordedWrite>,
     facts: Vec<FactCandidate>,
+    failures: Vec<FailedExecution>,
     /// How many `WriteApplied` events carried no usable `input.path`.
     unattributed_writes: usize,
     /// The first dropped event's id — the risk entry's `ref_id`, so it
@@ -538,6 +619,7 @@ struct Extraction {
 fn extract_writes_and_facts(events: &[WhiteboardEvent]) -> Extraction {
     let mut writes = Vec::new();
     let mut facts = Vec::new();
+    let mut failures = Vec::new();
     let mut unattributed_writes = 0usize;
     let mut first_unattributed: Option<String> = None;
     for event in events {
@@ -566,6 +648,8 @@ fn extract_writes_and_facts(events: &[WhiteboardEvent]) -> Extraction {
                     seq: event.gate_seq,
                     workspace_supersede: false,
                     grounded_by: Vec::new(),
+                    tool: None,
+                    subject: None,
                 });
                 writes.push(RecordedWrite {
                     path: path.to_owned(),
@@ -580,8 +664,30 @@ fn extract_writes_and_facts(events: &[WhiteboardEvent]) -> Extraction {
                 // appends.
                 let view = tool_executed_view(&event.payload);
                 if !view.success {
-                    // A failed execution applied nothing, so there is no
-                    // write to attribute — not counted by issue #140.
+                    // C-FAIL (issue #170): a failed execution applied
+                    // nothing, so there is no write to attribute and no fact
+                    // to derive (not counted by issue #140) — but the
+                    // failure may contradict a standing claim, so it is
+                    // collected for the annotation pass in `build`. Only the
+                    // tool name and the bounded paths travel; payload text
+                    // never enters the model.
+                    let tool_label = view.tool.unwrap_or("tool");
+                    failures.push(FailedExecution {
+                        event_id: event.event_id.clone(),
+                        seq: event.gate_seq,
+                        paths: view
+                            .paths
+                            .iter()
+                            .take(MAX_PATHS_PER_EVENT)
+                            .map(|path| (*path).to_owned())
+                            .collect(),
+                        tool: view.tool.map(str::to_owned),
+                        subject: view
+                            .paths
+                            .first()
+                            .map(|path| (*path).to_owned())
+                            .unwrap_or_else(|| tool_label.to_owned()),
+                    });
                     continue;
                 }
                 let file_affecting = view
@@ -603,6 +709,8 @@ fn extract_writes_and_facts(events: &[WhiteboardEvent]) -> Extraction {
                             seq: event.gate_seq,
                             workspace_supersede: false,
                             grounded_by: Vec::new(),
+                            tool: Some(tool_label.to_owned()),
+                            subject: Some((*path).to_owned()),
                         });
                         writes.push(RecordedWrite {
                             path: (*path).to_owned(),
@@ -642,6 +750,8 @@ fn extract_writes_and_facts(events: &[WhiteboardEvent]) -> Extraction {
                     seq: event.gate_seq,
                     workspace_supersede: pathless,
                     grounded_by: Vec::new(),
+                    tool: view.tool.map(str::to_owned),
+                    subject: Some(subject),
                 });
             }
             WhiteboardKind::Finding => {
@@ -662,6 +772,8 @@ fn extract_writes_and_facts(events: &[WhiteboardEvent]) -> Extraction {
                     // Provenance, never status: G-NOUPGRADE keeps the fact
                     // Assumed no matter how many citations back it.
                     grounded_by: extract_grounded_by(&event.payload),
+                    tool: None,
+                    subject: None,
                 });
             }
             WhiteboardKind::DesignDoc => {
@@ -681,12 +793,14 @@ fn extract_writes_and_facts(events: &[WhiteboardEvent]) -> Extraction {
                     seq: event.gate_seq,
                     workspace_supersede: false,
                     grounded_by: Vec::new(),
+                    tool: None,
+                    subject: None,
                 });
             }
             _ => {}
         }
     }
-    Extraction { writes, facts, unattributed_writes, first_unattributed }
+    Extraction { writes, facts, failures, unattributed_writes, first_unattributed }
 }
 
 /// Whether the window holds an effective write to `path` newer than `seq`.
@@ -832,9 +946,11 @@ fn active_artifact_paths(
 /// The deterministic fact cap (issue #142): `facts` may be any order;
 /// up to [`MAX_PINNED_FACTS`] slots are reserved for facts whose artifact is
 /// in `pinned_paths` (reserved tier, newest-first, K newest when the pinned
-/// tier overflows), and every remaining slot fills newest-first over whatever
-/// is left — pinned overflow included, so no slot is wasted. Pure: the same
-/// input yields the same selection in the same order.
+/// tier overflows), and every remaining slot fills in status precedence —
+/// `Verified`, then `Contradicted` (issue #170), then `Assumed`, then
+/// `Stale` — newest-first within each tier, pinned overflow included, so no
+/// slot is wasted. Pure: the same input yields the same selection in the
+/// same order.
 fn select_facts(mut facts: Vec<WorldFact>, pinned_paths: &HashSet<String>) -> Vec<WorldFact> {
     // Newest-first; the sort is stable, so equal `seq` keeps event order.
     facts.sort_by_key(|fact| core::cmp::Reverse(fact.seq));
@@ -860,6 +976,10 @@ fn select_facts(mut facts: Vec<WorldFact>, pinned_paths: &HashSet<String>) -> Ve
             fill.push(fact);
         }
     }
+    // Status precedence below the pinned tier (issue #170): contradicted
+    // claims outrank assumed and stale facts for the surviving slots. The
+    // sort is stable, so newest-first holds within each status tier.
+    fill.sort_by_key(|fact| fact.status.display_rank());
     out.extend(fill.into_iter().take(MAX_WORLD_FACTS.saturating_sub(out.len())));
     out
 }
@@ -1179,8 +1299,13 @@ impl WorldModel {
     /// same render). No model calls, no I/O, no randomness.
     #[must_use]
     pub fn build(input: &WorldModelInput<'_>) -> Self {
-        let Extraction { writes, facts: candidates, unattributed_writes, first_unattributed } =
-            extract_writes_and_facts(input.events);
+        let Extraction {
+            writes,
+            facts: candidates,
+            failures,
+            unattributed_writes,
+            first_unattributed,
+        } = extract_writes_and_facts(input.events);
         // Issue #140: a write that could not be attributed is a drop, and
         // every drop is observable — warn once per build (bounded count),
         // then carry the same count into the risk list below.
@@ -1218,13 +1343,34 @@ impl WorldModel {
                     // workspace it observed.
                     (candidate.workspace_supersede
                         && has_any_newer_write(&writes, candidate.seq));
+                // C-FAIL (issue #170): the first failed execution in event
+                // order overlapping the candidate annotates it — at most one
+                // annotation per fact, deterministic. Stale wins over
+                // contradicted: F-SUPERSEDE stays positional, so a later
+                // successful write to the same path un-contradicts (the
+                // annotation is never sticky).
+                let contradicted_by = if stale {
+                    None
+                } else {
+                    failures
+                        .iter()
+                        .find(|failure| contradicts(&candidate, failure))
+                        .map(|failure| bounded(failure.event_id.clone()))
+                };
                 WorldFact {
                     ref_id: candidate.ref_id,
                     label: candidate.label,
-                    status: if stale { FactStatus::Stale } else { candidate.status },
+                    status: if stale {
+                        FactStatus::Stale
+                    } else if contradicted_by.is_some() {
+                        FactStatus::Contradicted
+                    } else {
+                        candidate.status
+                    },
                     artifact: candidate.artifact,
                     seq: candidate.seq,
                     grounded_by: candidate.grounded_by,
+                    contradicted_by,
                 }
             })
             .collect();
@@ -1325,6 +1471,9 @@ impl WorldModel {
             .collect();
 
         // ── Assumptions (Assumed-fact labels, deduped) ─────────────────────
+        // Assumed-only (issue #170): contradicted claims are standing
+        // runtime signals, never assumptions — the filter below admits
+        // exactly `Assumed`.
         let mut assumptions: Vec<WorldAssumption> = Vec::new();
         for fact in &facts {
             if fact.status != FactStatus::Assumed
@@ -1559,8 +1708,8 @@ impl WorldModel {
 
     /// The render sections, split at the trust marker. `trusted` carries
     /// the run's context (generation, objective, roster, model names) and
-    /// the runtime-observed entries (facts, stale facts, artifacts) —
-    /// ABOVE the marker. `unverified` carries every section whose entries
+    /// the runtime-observed entries (verified facts, contradicted facts,
+    /// stale facts, artifacts) — ABOVE the marker. `unverified` carries every section whose entries
     /// embed text authored during the run (the success criteria from the
     /// design doc, the work list, assumed facts, assumptions, unresolved
     /// questions — their text quotes a rejected decision's
@@ -1570,6 +1719,8 @@ impl WorldModel {
     fn render_sections(&self) -> (Vec<RenderSection>, Vec<RenderSection>) {
         let verified: Vec<&WorldFact> =
             self.facts.iter().filter(|f| f.status == FactStatus::Verified).collect();
+        let contradicted: Vec<&WorldFact> =
+            self.facts.iter().filter(|f| f.status == FactStatus::Contradicted).collect();
         let stale: Vec<&WorldFact> =
             self.facts.iter().filter(|f| f.status == FactStatus::Stale).collect();
         let assumed: Vec<&WorldFact> =
@@ -1598,14 +1749,24 @@ impl WorldModel {
         push_section(
             &mut trusted,
             RenderSection::new(
-                &format!("facts ({} verified):", verified.len()),
+                &format!(
+                    "facts ({} verified, {} contradicted, {} assumed, {} stale):",
+                    verified.len(),
+                    contradicted.len(),
+                    assumed.len(),
+                    stale.len()
+                ),
                 verified
                     .iter()
+                    .chain(contradicted.iter())
                     .take(RENDER_ENTRIES_PER_SECTION)
                     .map(|fact| render_fact_line(fact))
                     .collect(),
                 None,
-                verified.len().saturating_sub(RENDER_ENTRIES_PER_SECTION),
+                verified
+                    .len()
+                    .saturating_add(contradicted.len())
+                    .saturating_sub(RENDER_ENTRIES_PER_SECTION),
             ),
         );
         push_section(
@@ -1723,26 +1884,35 @@ fn inline_section<'a>(
     RenderSection::new(heading, items, Some(separator), capped)
 }
 
-/// One fact list line: status, sanitized label, sanitized reference.
+/// One fact list line: status, sanitized label, sanitized reference — a
+/// contradicted fact names its contradicting observation
+/// (`[ev-claim contradicted by ev-fail]`, issue #170).
 fn render_fact_line(fact: &WorldFact) -> String {
     format!(
         "- (status: {:?}) {} {}",
         fact.status,
         sanitize_text(&fact.label),
-        render_fact_ref(&fact.ref_id, &fact.grounded_by)
+        render_fact_ref(&fact.ref_id, &fact.grounded_by, fact.contradicted_by.as_deref())
     )
 }
 
 /// One fact's reference bracket: `[ev2]`, or — with grounding —
-/// `[ev2 ← ev9, ev11]` (issue #141). An ungrounded fact renders exactly as
-/// it did before grounding existed, and every id it prints passes the same
-/// render-time sanitizer as the label and the reference itself (#137), so
-/// a citation cannot forge the block tag or open a line. Duplicates and ids
-/// that sanitize to nothing are dropped (deduped AFTER sanitization, so two
-/// spellings of the same hostile id collapse too) and at most
-/// [`MAX_GROUNDED_BY`] distinct refs render — the bracket can never repeat
-/// one id or pad itself with empties.
-fn render_fact_ref(ref_id: &str, grounded_by: &[String]) -> String {
+/// `[ev2 ← ev9, ev11]` (issue #141), or — contradicted —
+/// `[ev2 contradicted by ev-fail]` (issue #170; the annotation wins over
+/// grounding, which verified claims never carry). An ungrounded,
+/// un-contradicted fact renders exactly as it did before grounding
+/// existed, and every id it prints passes the same render-time sanitizer
+/// as the label and the reference itself (#137), so a citation cannot
+/// forge the block tag or open a line. Duplicates and ids that sanitize to
+/// nothing are dropped (deduped AFTER sanitization, so two spellings of the
+/// same hostile id collapse too) and at most [`MAX_GROUNDED_BY`] distinct
+/// refs render — the bracket can never repeat one id or pad itself with
+/// empties.
+fn render_fact_ref(ref_id: &str, grounded_by: &[String], contradicted_by: Option<&str>) -> String {
+    if let Some(failure) = contradicted_by.map(sanitize_text).filter(|id| !id.is_empty()) {
+        let reference = sanitize_text(ref_id);
+        return format!("[{reference} contradicted by {failure}]");
+    }
     let mut refs: Vec<String> = Vec::new();
     for id in grounded_by {
         if refs.len() == MAX_GROUNDED_BY {
@@ -2186,6 +2356,33 @@ mod tests {
         serde_json::json!({ "input": { "path": path } })
     }
 
+    /// A failed `ToolExecuted` event (C-FAIL, issue #170): `success: false`
+    /// with the tool name and observed paths a failure still carries. It
+    /// applies nothing — no fact, no write — but its overlap with a standing
+    /// claim annotates that claim.
+    fn failed_tool(event_id: &str, seq: u64, tool: &str, paths: &[&str]) -> WhiteboardEvent {
+        event(
+            WhiteboardKind::ToolExecuted,
+            event_id,
+            seq,
+            serde_json::json!({
+                "tool": tool, "args": {}, "success": false,
+                "paths": paths.iter().map(|path| serde_json::json!({"path": path})).collect::<Vec<_>>(),
+            }),
+        )
+    }
+
+    /// A pathless failed execution (no `paths` key at all): only the
+    /// tool+subject repeat channel can match it.
+    fn failed_tool_pathless(event_id: &str, seq: u64, tool: &str) -> WhiteboardEvent {
+        event(
+            WhiteboardKind::ToolExecuted,
+            event_id,
+            seq,
+            serde_json::json!({ "tool": tool, "args": {}, "success": false }),
+        )
+    }
+
     /// A Finding event built through the production consultative writer
     /// (issue #141, contract of #136): the payload shape — the assertion's
     /// text AND the ids it rests on — is what production appends, so the
@@ -2523,11 +2720,11 @@ mod tests {
         let quiet =
             WorldModel::build(&input(std::slice::from_ref(&run), Vec::new(), &[], &[], Vec::new()));
         let quiet_render = quiet.render();
-        // #153's render splits the counts: the verified header carries only
-        // its own count, and the stale section is omitted when nothing is
+        // #153's render splits the counts: the facts header carries every
+        // status count, and the stale section is omitted when nothing is
         // stale (`push_section` drops empty sections).
         assert!(
-            quiet_render.contains("facts (1 verified):"),
+            quiet_render.contains("facts (1 verified, 0 contradicted, 0 assumed, 0 stale):"),
             "no later write: nothing is stale yet: {quiet_render}"
         );
         assert!(
@@ -2542,7 +2739,7 @@ mod tests {
         let model = WorldModel::build(&input(&events, Vec::new(), &[], &[], Vec::new()));
         let rendered = model.render();
         assert!(
-            rendered.contains("facts (1 verified):"),
+            rendered.contains("facts (1 verified, 0 contradicted, 0 assumed, 1 stale):"),
             "the surviving write fact is the only verified one: {rendered}"
         );
         assert!(
@@ -3309,6 +3506,7 @@ mod tests {
                     artifact: None,
                     seq: i as u64,
                     grounded_by: Vec::new(),
+                    contradicted_by: None,
                 })
                 .collect(),
             tasks: (0..MAX_WORLD_TASKS)
@@ -3523,6 +3721,7 @@ mod tests {
                 artifact: None,
                 seq: i as u64,
                 grounded_by: Vec::new(),
+                contradicted_by: None,
             })
             .collect();
         let model = WorldModel { facts, ..WorldModel::default() };
@@ -3650,7 +3849,7 @@ mod tests {
         // empties drop, duplicates collapse, and the distinct refs stay
         // capped at MAX_GROUNDED_BY.
         assert_eq!(
-            render_fact_ref("ev1", &["\n".to_owned(), String::new()]),
+            render_fact_ref("ev1", &["\n".to_owned(), String::new()], None),
             "[ev1]",
             "ids that sanitize to nothing never pad the bracket"
         );
@@ -3664,7 +3863,8 @@ mod tests {
                     "c".to_owned(),
                     "d".to_owned(),
                     "e".to_owned()
-                ]
+                ],
+                None,
             ),
             "[ev1 ← a, b, c, d]",
             "distinct refs dedupe first, then cap at MAX_GROUNDED_BY"
@@ -3928,5 +4128,247 @@ mod tests {
             !model.risks.iter().any(|risk| risk.label.contains("could not be attributed")),
             "unknown/ignored kinds stay silent — no attribution risk"
         );
+    }
+
+    /// Issue #170 (C-FAIL): a failed execution overlapping a standing
+    /// claim's artifact marks the earlier fact `Contradicted` — the claim
+    /// stays (standing annotation, never deletion) and the contradicting
+    /// observation stays visible as the `contradicted_by` ref. The failure
+    /// itself derives no fact.
+    #[test]
+    fn failure_marks_prior_claim_contradicted() {
+        let events = vec![
+            event(WhiteboardKind::WriteApplied, "ev-ok", 10, write_applied("src/ok.rs")),
+            event(WhiteboardKind::WriteApplied, "ev-claim", 20, write_applied("src/claim.rs")),
+            failed_tool("ev-fail", 30, "edit_file", &["src/claim.rs"]),
+        ];
+        let model = WorldModel::build(&input(&events, Vec::new(), &[], &[], Vec::new()));
+        let claim =
+            model.facts.iter().find(|f| f.ref_id == "ev-claim").expect("the claim stays visible");
+        assert_eq!(
+            claim.status,
+            FactStatus::Contradicted,
+            "the overlapping failure contradicts the earlier claim"
+        );
+        assert_eq!(
+            claim.contradicted_by.as_deref(),
+            Some("ev-fail"),
+            "the annotation names the contradicting observation"
+        );
+        assert!(
+            model.facts.iter().all(|f| f.ref_id != "ev-fail"),
+            "a failed execution derives no fact of its own: {:?}",
+            model.facts
+        );
+        let untouched =
+            model.facts.iter().find(|f| f.ref_id == "ev-ok").expect("untouched claim tracked");
+        assert_eq!(untouched.status, FactStatus::Verified, "no overlap: no contradiction");
+        assert_eq!(untouched.contradicted_by, None);
+        let rendered = model.render();
+        assert!(
+            rendered.contains("facts (1 verified, 1 contradicted, 0 assumed, 0 stale):"),
+            "the facts header counts every status: {rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "- (status: Contradicted) wrote src/claim.rs by coder [ev-claim contradicted by ev-fail]"
+            ),
+            "the contradicted line names claim and observation: {rendered}"
+        );
+    }
+
+    /// Issue #170 (C-FAIL repeat channel): a pathless observation names no
+    /// artifact, so only a failure repeating its tool+subject contradicts
+    /// it — a failure from a different tool on the same subject does not.
+    #[test]
+    fn failed_repeat_of_pathless_run_contradicts_by_tool_and_subject() {
+        let run = || {
+            event(
+                WhiteboardKind::ToolExecuted,
+                "ev-run",
+                10,
+                serde_json::json!({"tool": "bash", "args": {"command": "cargo test"}, "success": true}),
+            )
+        };
+        let repeated = WorldModel::build(&input(
+            &[run(), failed_tool_pathless("ev-fail", 20, "bash")],
+            Vec::new(),
+            &[],
+            &[],
+            Vec::new(),
+        ));
+        let claim =
+            repeated.facts.iter().find(|f| f.ref_id == "ev-run").expect("the run claim tracked");
+        assert_eq!(
+            claim.status,
+            FactStatus::Contradicted,
+            "the same tool re-run on the same subject contradicts the pathless observation"
+        );
+        assert_eq!(claim.contradicted_by.as_deref(), Some("ev-fail"));
+
+        let other_tool = WorldModel::build(&input(
+            &[run(), failed_tool_pathless("ev-fail", 20, "other-tool")],
+            Vec::new(),
+            &[],
+            &[],
+            Vec::new(),
+        ));
+        let standing =
+            other_tool.facts.iter().find(|f| f.ref_id == "ev-run").expect("the run claim tracked");
+        assert_eq!(
+            standing.status,
+            FactStatus::Verified,
+            "a different tool's failure is not a repeat of this observation"
+        );
+        assert_eq!(standing.contradicted_by, None);
+    }
+
+    /// Issue #170 (never sticky): a later successful write to the same path
+    /// un-contradicts positionally — the earlier claim goes `Stale` under
+    /// F-SUPERSEDE and the newest write stays `Verified`.
+    #[test]
+    fn later_successful_write_un_contradicts() {
+        let events = vec![
+            event(WhiteboardKind::WriteApplied, "ev-claim", 10, write_applied("src/a.rs")),
+            failed_tool("ev-fail", 20, "edit_file", &["src/a.rs"]),
+            event(WhiteboardKind::WriteApplied, "ev-new", 30, write_applied("src/a.rs")),
+        ];
+        let model = WorldModel::build(&input(&events, Vec::new(), &[], &[], Vec::new()));
+        let old =
+            model.facts.iter().find(|f| f.ref_id == "ev-claim").expect("old fact still tracked");
+        assert_eq!(
+            old.status,
+            FactStatus::Stale,
+            "the later write supersedes the claim — contradiction never sticks"
+        );
+        assert_eq!(old.contradicted_by, None, "a superseded fact carries no annotation");
+        let fresh =
+            model.facts.iter().find(|f| f.ref_id == "ev-new").expect("new write fact tracked");
+        assert_eq!(fresh.status, FactStatus::Verified, "the newest write stays verified");
+    }
+
+    /// Issue #170 + #142: the cap keeps pinned facts first, then fills
+    /// newest-first per status tier — `Verified`, then `Contradicted`, then
+    /// `Assumed`, then `Stale` — so a contradicted claim outranks stale and
+    /// assumed facts for the surviving slots.
+    #[test]
+    fn contradicted_facts_rank_below_verified_above_assumed_in_cap() {
+        let mut events = vec![
+            event(WhiteboardKind::WriteApplied, "ev-pinned", 1, write_applied("src/pinned.rs")),
+            event(WhiteboardKind::WriteApplied, "ev-claim", 2, write_applied("src/claim.rs")),
+            failed_tool("ev-fail", 3, "edit_file", &["src/claim.rs"]),
+        ];
+        for index in 0..15u64 {
+            events.push(event(
+                WhiteboardKind::ToolExecuted,
+                &format!("ev-run-{index}"),
+                4 + index,
+                serde_json::json!({"tool": "bash", "args": {"command": "cargo test"}, "success": true}),
+            ));
+        }
+        events.push(event(
+            WhiteboardKind::WriteApplied,
+            "ev-write",
+            19,
+            write_applied("src/other.rs"),
+        ));
+        for index in 0..15u64 {
+            events.push(event(
+                WhiteboardKind::Finding,
+                &format!("ev-find-{index}"),
+                20 + index,
+                serde_json::json!({"summary": format!("assertion {index}")}),
+            ));
+        }
+        events.extend(unrelated_reads(20, 40));
+        let active = vec![decision("d-active", DecisionStatus::Dispatched, &["src/pinned.rs"])];
+        let model = WorldModel::build(&input(&events, Vec::new(), &active, &[], Vec::new()));
+
+        assert_eq!(model.facts.len(), MAX_WORLD_FACTS, "the cap still fills completely");
+        assert_eq!(
+            model.facts[0].ref_id, "ev-pinned",
+            "the pinned fact still ranks first (issue #142)"
+        );
+        let contradicted_at = model
+            .facts
+            .iter()
+            .position(|fact| fact.ref_id == "ev-claim")
+            .expect("the contradicted claim survives the burst");
+        let last_verified = model
+            .facts
+            .iter()
+            .rposition(|fact| fact.status == FactStatus::Verified)
+            .expect("verified facts fill the cap");
+        assert!(
+            contradicted_at > last_verified,
+            "contradicted ranks below verified: claim at {contradicted_at}, last verified at {last_verified}"
+        );
+        assert!(
+            model
+                .facts
+                .iter()
+                .take(contradicted_at)
+                .all(|fact| { fact.ref_id == "ev-pinned" || fact.status == FactStatus::Verified }),
+            "nothing but pinned/verified outranks the contradicted claim"
+        );
+        assert!(
+            model.facts.iter().all(|fact| fact.status != FactStatus::Stale),
+            "stale facts rank last — the burst evicts every one of them"
+        );
+        assert!(
+            model.facts.iter().any(|fact| fact.status == FactStatus::Assumed),
+            "assumed facts fill the slots stale vacated"
+        );
+    }
+
+    /// Issue #170: a contradicted claim never feeds assumptions
+    /// (Assumed-only holds), renders on the trusted runtime side of the
+    /// marker, and never disturbs the artifact verified-clean verdict.
+    #[test]
+    fn contradicted_facts_never_feed_assumptions_and_stay_trusted() {
+        let events = vec![
+            event(WhiteboardKind::WriteApplied, "ev-claim", 10, write_applied("src/claim.rs")),
+            failed_tool("ev-fail", 20, "edit_file", &["src/claim.rs"]),
+        ];
+        let model = WorldModel::build(&input(&events, Vec::new(), &[], &[], Vec::new()));
+        assert!(model.assumptions.is_empty(), "contradicted claims feed no assumptions");
+        assert!(
+            model.artifact_verified_clean("src/claim.rs"),
+            "C-FAIL annotates the claim; the artifact verdict is unaffected"
+        );
+        let rendered = model.render();
+        let marker_at = rendered.find(UNVERIFIED_SECTION_MARKER).expect("the marker is rendered");
+        let line = "- (status: Contradicted) wrote src/claim.rs by coder [ev-claim contradicted by ev-fail]";
+        assert!(
+            rendered[..marker_at].contains(line),
+            "the contradicted claim renders with the runtime-observed facts: {rendered}"
+        );
+        assert!(
+            !rendered[marker_at..].contains("ev-claim"),
+            "the contradicted claim never leaks below the marker: {rendered}"
+        );
+    }
+
+    /// Issue #170 additive serde: the `contradicted` status and the
+    /// `contradicted_by` ref round-trip, and a fact recorded before either
+    /// existed loads with no annotation instead of failing to deserialize.
+    #[test]
+    fn contradicted_status_and_ref_are_additive_in_serde() {
+        let fact: WorldFact = serde_json::from_str(
+            r#"{"ref_id":"ev-1","label":"wrote a.rs by coder","status":"contradicted","contradicted_by":"ev-fail"}"#,
+        )
+        .expect("a contradicted fact loads");
+        assert_eq!(fact.status, FactStatus::Contradicted);
+        assert_eq!(fact.contradicted_by.as_deref(), Some("ev-fail"));
+        let round_tripped: WorldFact =
+            serde_json::from_value(serde_json::to_value(&fact).expect("serializes"))
+                .expect("deserializes");
+        assert_eq!(round_tripped, fact, "the annotation survives the round trip");
+
+        let old: WorldFact = serde_json::from_str(
+            r#"{"ref_id":"ev-1","label":"wrote a.rs by coder","status":"verified"}"#,
+        )
+        .expect("a pre-#170 fact loads");
+        assert_eq!(old.contradicted_by, None, "the absent key defaults to no annotation");
     }
 }

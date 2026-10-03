@@ -2583,10 +2583,11 @@ mod tests {
             facts: vec![crate::world_model::WorldFact {
                 ref_id: "ev-1".to_owned(),
                 label: "wrote src/main.rs by coder".to_owned(),
-                status: crate::world_model::FactStatus::Verified,
+                status: crate::world_model::FactStatus::Contradicted,
                 artifact: Some("src/main.rs".to_owned()),
                 seq: 12,
                 grounded_by: vec!["ev-9".to_owned(), "ev-11".to_owned()],
+                contradicted_by: Some("ev-fail".to_owned()),
             }],
             tasks: vec![crate::world_model::WorldTask {
                 ref_id: "dec-1".to_owned(),
