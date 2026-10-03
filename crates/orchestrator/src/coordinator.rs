@@ -12532,33 +12532,41 @@ impl CoordinatorAgent {
                 // Placement: immediately after the projection the next
                 // decision consumes, riding the same reconsideration-nudge
                 // pattern as issue #53 (a bounded user message into the
-                // existing conversation — never a forced tool call). A
-                // settled consultation resolves the question (issue #56
-                // Q-RESOLVE rules read the Settled consult decision), so
-                // the request stops once the advice lands.
-                if let Some((question_id, nudge)) =
-                    crate::consultation::consultation_nudge(&self.world_model)
-                {
-                    if consult_nudged_questions.insert(question_id) {
-                        let _ = self.bus.publish_for_session(
-                            task.session_id,
-                            task.id.0,
-                            EventKind::AgentThought {
-                                agent_id: "coordinator".into(),
-                                content: nudge.clone(),
-                                kind: ThinkingKind::Detail,
-                            },
-                        );
-                        messages.push(Message {
-                            role: Role::User,
-                            content: nudge,
-                            tool_calls: None,
-                            tool_results: None,
-                            reasoning_content: None,
-                            tokens_in: None,
-                            tokens_out: None,
-                        });
-                    }
+                // existing conversation — never a forced tool call). The
+                // pick skips the questions this loop already raised (issue
+                // #135 starvation fix): each standing question is requested
+                // exactly once and the next aged question gets the next
+                // turn. The request does not promise resolution — a
+                // consult's findings are advisory evidence; under
+                // Q-RESOLVE-LINKED the question closes only when RELATED
+                // settled work lands (the subject's reconsider descendant
+                // or settled work touching its blocked path).
+                if let Some((question_id, nudge)) = crate::consultation::consultation_nudge(
+                    &self.world_model,
+                    &consult_nudged_questions,
+                ) {
+                    // The pick already skips raised ids, so this insert is
+                    // the bookkeeping that keeps the NEXT pick skipping it
+                    // too (each question fires at most once per loop).
+                    consult_nudged_questions.insert(question_id);
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        task.id.0,
+                        EventKind::AgentThought {
+                            agent_id: "coordinator".into(),
+                            content: nudge.clone(),
+                            kind: ThinkingKind::Detail,
+                        },
+                    );
+                    messages.push(Message {
+                        role: Role::User,
+                        content: nudge,
+                        tool_calls: None,
+                        tool_results: None,
+                        reasoning_content: None,
+                        tokens_in: None,
+                        tokens_out: None,
+                    });
                 }
             }
             match self.progress_tracker.observe(&observation) {
@@ -13315,7 +13323,11 @@ impl CoordinatorAgent {
                 // Issue #54: the diagnosis (Environment/model-unavailable,
                 // alternate viable) rides the tool result so the Coordinator's
                 // next decision is diagnosis-informed, and the audit trail.
-                let diagnosis = crate::failure_diagnosis::diagnose(&error);
+                // Issue #135 add-linkage: this dispatch's decision id and
+                // expected artifact ride the diagnosis, so the world-model
+                // question it opens is linkable (Q-RESOLVE-LINKED).
+                let diagnosis = crate::failure_diagnosis::diagnose(&error)
+                    .with_linkage(Some(decision_id.clone()), dispatch_artifacts.first().cloned());
                 self.record_failure_diagnosis(
                     task.session_id,
                     Some(subtask_id),
@@ -13386,7 +13398,11 @@ impl CoordinatorAgent {
                 // agent, environment, task dimensions) into the structured
                 // diagnosis; it rides the tool result and the audit trail,
                 // and the recovery decision is diagnosis-shaped.
-                let diagnosis = crate::failure_diagnosis::diagnose(&error);
+                // Issue #135 add-linkage: this dispatch's decision id and
+                // expected artifact ride the diagnosis, so the world-model
+                // question it opens is linkable (Q-RESOLVE-LINKED).
+                let diagnosis = crate::failure_diagnosis::diagnose(&error)
+                    .with_linkage(Some(decision_id.clone()), dispatch_artifacts.first().cloned());
                 self.record_failure_diagnosis(
                     task.session_id,
                     Some(subtask_id),
@@ -13618,13 +13634,18 @@ impl CoordinatorAgent {
             // with an unresolved failure surfaces as `Partial`, never as a
             // vacuous completion.
             _ => {
+                // Issue #135 add-linkage: the failing dispatch's decision id
+                // and expected artifact ride the diagnosis, so the
+                // world-model question it opens is linkable
+                // (Q-RESOLVE-LINKED) instead of standing unlinkable forever.
                 let diagnosis = match &result.outcome {
                     AgentOutcome::Failed { error } => {
                         crate::failure_diagnosis::diagnose_outcome_failure(error)
                     }
                     AgentOutcome::Blocked { on } => crate::failure_diagnosis::diagnose_blocked(on),
                     _ => crate::failure_diagnosis::diagnose_outcome_failure(&summary_text),
-                };
+                }
+                .with_linkage(Some(decision_id.clone()), dispatch_artifacts.first().cloned());
                 self.suitability.record(
                     agent_id.as_str(),
                     suitability_class,
@@ -19012,8 +19033,13 @@ mod tests {
     /// unresolved question (issue #56); once it has stood
     /// [`CONSULT_TRIGGER_MIN_CYCLES`] rebuilds, the decision loop injects
     /// the consultation request BEFORE the next decision turn (exactly
-    /// once), and a settled consultation resolves the question (the #56
-    /// lifecycle reads the Settled consult decision as recovery evidence).
+    /// once), the consultation runs and records advisory findings — and the
+    /// question STILL stands afterwards (issue #135, Q-RESOLVE-LINKED): a
+    /// settled consult is advisory evidence, not recovery. The question is
+    /// linked to the failing dispatch's decision, and the consult decision
+    /// is unrelated to that subject — no Freeze naming it, no expected
+    /// artifacts touching the blocked path — so it never resolves by
+    /// coincidence.
     #[tokio::test]
     async fn low_confidence_question_triggers_consultation_deterministically() {
         let (_dir, pool) = resume_log_pool().await;
@@ -19098,21 +19124,31 @@ mod tests {
             .expect("the finding event exists on the whiteboard");
         assert_eq!(finding.kind, WhiteboardKind::Finding);
         assert_eq!(finding.payload["consultative"], serde_json::Value::Bool(true));
-        // The settled consultation RESOLVED the standing question (the #56
-        // lifecycle consumes the Settled consult decision as recovery
-        // evidence). The finding event's causation IS the consult decision
-        // id the resolution recorded.
-        let resolved = coordinator
+        // The settled consultation does NOT resolve the standing question
+        // (issue #135, Q-RESOLVE-LINKED): advisory findings are citable
+        // evidence, not recovery — the question closes only on its subject's
+        // reconsider descendant (the Freeze payload names the subject
+        // decision; no decision carries a retry-of link). This question
+        // names no blocked artifact, so only the reconsider-descendant
+        // channel applies. The question stands and keeps aging instead of
+        // resolving by coincidence.
+        let standing = coordinator
             .world_model
             .questions
             .iter()
-            .find(|question| question.state == crate::world_model::QuestionState::Resolved)
-            .expect("the standing question was resolved by the consultation");
+            .find(|question| question.state == crate::world_model::QuestionState::Open)
+            .expect("the failure question still stands after advisory consultation");
         assert_eq!(
-            resolved.resolved_by.as_deref(),
-            finding.causation.as_deref(),
-            "the question was resolved by the consult decision"
+            standing.kind,
+            crate::world_model::QuestionKind::OpenProblem,
+            "the standing question is the failure one"
         );
+        assert!(
+            standing.subject_decision_id.is_some(),
+            "issue #135 add-linkage: the dispatch failure's question is linked to its \
+             failing dispatch decision"
+        );
+        assert_eq!(standing.resolved_by, None, "no coincidence resolution recorded");
     }
 
     // ------------------------------------------------------------------

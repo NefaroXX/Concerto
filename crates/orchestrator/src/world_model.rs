@@ -72,9 +72,28 @@
 //! - **Q-DEDUPE**: a rebuilt question matching a standing question by
 //!   stable key does NOT open again — the standing entry survives (one id,
 //!   growing age) until resolved. This is the repeated-question reduction.
-//! - **Q-RESOLVE-PROBLEM/MISSING**: a journal decision with status `Settled`
-//!   recorded at or after the question's opening journal length resolves
-//!   the question (subsequent settled work is the recovery evidence).
+//! - **Q-RESOLVE-LINKED**: a linked `OpenProblem`/`MissingEvidence`
+//!   question (one carrying a `subject_decision_id`) resolves only on a
+//!   journal decision with status `Settled` recorded at or after the
+//!   question's opening journal length that is *related* to its subject:
+//!   the decision is the subject's RECONSIDER descendant (its Freeze
+//!   payload names the subject decision) or its `expected_artifacts` touch
+//!   the question's blocked path. A retry/replacement dispatch is
+//!   recognized only through that artifact touch — no decision carries a
+//!   retry-of link — so a replacement naming different artifacts never
+//!   resolves an older question. An unrelated parallel settle is
+//!   coincidence, never resolution (issue #135).
+//! - **Q-RESOLVE-LEGACY** (transitional): a `MissingEvidence` question
+//!   restored from a pre-#135 checkpoint carries no subject — new code
+//!   always records one — so it keeps the old any-settled-decision rule
+//!   until it resolves and cycles out of the ledger.
+//! - **Q-RESOLVE-UNLINKABLE**: a question with no decision subject — an
+//!   `OpenProblem` whose diagnosis surface knew no linkage
+//!   (`FailureDiagnosis.decision_id`/`artifact_path`: graph-execution
+//!   failures, tool/provider faults; the dispatch surfaces attach the
+//!   linkage) — never resolves by settle: it stands and ages
+//!   (`cycles_open`) rather than resolving by coincidence. A linked
+//!   diagnosis question resolves through Q-RESOLVE-LINKED instead.
 //! - **Q-RESOLVE-AMBIGUOUS**: the pending dispatch decision cleared.
 //! - **Q-RESOLVE-BLOCKED**: a newer CLEAN observation of the path (an
 //!   observation event id different from the one the question was opened
@@ -135,6 +154,7 @@ use concerto_sessions::WhiteboardKind;
 use crate::checkpoint::CheckpointPendingDecision;
 use crate::decisions::{CoordinatorDecision, DecisionStatus};
 use crate::failure_diagnosis::FailureDiagnosis;
+use crate::task_transform::TaskTransformSpec;
 
 /// Upper bound on referenced facts (event id + label), never prose-proportional.
 pub const MAX_WORLD_FACTS: usize = 32;
@@ -265,6 +285,16 @@ pub struct UnresolvedQuestion {
     /// for Q-RESOLVE-PROBLEM/MISSING.
     #[serde(default)]
     pub opened_journal_len: usize,
+    /// The journal decision this question is about (issue #135): the
+    /// rejected decision for `MissingEvidence`; the failing dispatch's
+    /// decision for `OpenProblem` when its diagnosis carried linkage
+    /// (`FailureDiagnosis.decision_id`). `None` for OpenProblem questions
+    /// whose surface knew no decision (graph-execution failures,
+    /// tool/provider faults — Q-RESOLVE-UNLINKABLE) and for pre-#135
+    /// checkpoints (transitional legacy — see the Q-RESOLVE rules).
+    /// Additive serde (`default`), so old checkpoints load with `None`.
+    #[serde(default)]
+    pub subject_decision_id: Option<String>,
     /// The observation event id the question was opened against
     /// (BlockedPath).
     #[serde(default)]
@@ -1842,6 +1872,39 @@ fn write_latest_per_path(writes: &[RecordedWrite]) -> Vec<(String, &RecordedWrit
     out
 }
 
+/// Whether a settled journal decision resolves a LINKED open question
+/// (issue #135, Q-RESOLVE-LINKED): the decision is the subject's
+/// RECONSIDER descendant — its Freeze payload names the subject decision —
+/// or its settled work touches the question's blocked artifact path. A
+/// retry/replacement dispatch is recognized ONLY through that artifact
+/// touch: no decision carries a retry-of link, so a replacement naming
+/// different artifacts is not relatedness. The subject's own entry is never
+/// its recovery (resolution needs NEW work), and anything unlinked is
+/// coincidence, never evidence. Pure and deterministic: journal ids,
+/// payload ids, and artifact paths only.
+fn settled_decision_resolves(
+    question: &UnresolvedQuestion,
+    decision: &CoordinatorDecision,
+) -> bool {
+    let Some(subject) = question.subject_decision_id.as_deref() else {
+        return false;
+    };
+    if decision.id == subject {
+        return false;
+    }
+    if let Some(TaskTransformSpec::Freeze { decision_id, .. }) = decision.transform.as_ref() {
+        if decision_id == subject {
+            return true;
+        }
+    }
+    if let Some(blocks) = question.blocks.as_deref() {
+        if decision.expected_artifacts.iter().any(|path| path == blocks) {
+            return true;
+        }
+    }
+    false
+}
+
 /// The question lifecycle pass: resolve carried standing questions with
 /// fresh evidence, feed the current signals (deduping against open AND
 /// resolved entries), then cap both lists deterministically.
@@ -1854,12 +1917,25 @@ fn resolve_and_feed_questions(input: &WorldModelInput<'_>) -> Vec<UnresolvedQues
             continue;
         }
         let resolved_now = match question.kind {
-            QuestionKind::OpenProblem | QuestionKind::MissingEvidence => input
-                .decisions
-                .iter()
-                .skip(question.opened_journal_len)
-                .find(|decision| decision.status == DecisionStatus::Settled)
-                .map(|decision| decision.id.clone()),
+            QuestionKind::OpenProblem | QuestionKind::MissingEvidence => {
+                // Transitional: a MissingEvidence question without a subject
+                // is a pre-#135 checkpoint restore (new code always records
+                // the rejected decision) — it keeps the legacy any-settle
+                // rule. Anything else resolves only on RELATED settled work
+                // (Q-RESOLVE-LINKED); unlinkable OpenProblem questions stay
+                // open and age (Q-RESOLVE-UNLINKABLE).
+                let use_legacy = question.subject_decision_id.is_none()
+                    && question.kind == QuestionKind::MissingEvidence;
+                input
+                    .decisions
+                    .iter()
+                    .skip(question.opened_journal_len)
+                    .find(|decision| {
+                        decision.status == DecisionStatus::Settled
+                            && (use_legacy || settled_decision_resolves(question, decision))
+                    })
+                    .map(|decision| decision.id.clone())
+            }
             QuestionKind::AmbiguousRecovery => {
                 (!input.pending_stale).then(|| "pending-cleared".to_owned())
             }
@@ -1888,7 +1964,15 @@ fn resolve_and_feed_questions(input: &WorldModelInput<'_>) -> Vec<UnresolvedQues
     }
 
     // ── Feeding pass (Q-OPEN-*), each deduping against standing entries ──
-    // 1) failure diagnoses → OpenProblem
+    // 1) failure diagnoses → OpenProblem. The linkage the diagnosing surface
+    //    attached — the failing dispatch's journal decision and its expected
+    //    artifact (`FailureDiagnosis.decision_id`/`artifact_path`, attached
+    //    at the `call_specialist` failure/settle paths) — becomes the
+    //    question's subject and blocked path, so the question is born
+    //    LINKABLE and resolves through Q-RESOLVE-LINKED. Surfaces that knew
+    //    no decision (graph-execution failures, tool/provider faults) leave
+    //    it unlinkable (Q-RESOLVE-UNLINKABLE): it stands and ages rather
+    //    than resolving by coincidence.
     for diagnosis in input.diagnoses {
         if !(diagnosis.replan_required || (!diagnosis.retryable && !diagnosis.same_agent_viable)) {
             continue;
@@ -1904,11 +1988,12 @@ fn resolve_and_feed_questions(input: &WorldModelInput<'_>) -> Vec<UnresolvedQues
                     diagnosis.code, diagnosis.evidence
                 ))
             },
-            None,
+            diagnosis.artifact_path.clone(),
             Vec::new(),
             input.decisions.len(),
             None,
             input.now_ms,
+            diagnosis.decision_id.clone(),
         );
     }
 
@@ -1935,6 +2020,12 @@ fn resolve_and_feed_questions(input: &WorldModelInput<'_>) -> Vec<UnresolvedQues
             index,
             None,
             decision_time_ms(&decision.created_at).unwrap_or(input.now_ms),
+            // The rejected decision IS the subject: only its reconsider
+            // descendant (the Freeze payload names it) or settled work
+            // touching its blocked artifact resolves the question — no
+            // decision carries a retry-of link, so replacement work is
+            // recognized through the artifact touch, never by identity.
+            Some(decision.id.clone()),
         );
     }
 
@@ -1961,6 +2052,7 @@ fn resolve_and_feed_questions(input: &WorldModelInput<'_>) -> Vec<UnresolvedQues
                 input.decisions.len(),
                 None,
                 input.now_ms,
+                None,
             );
         }
     }
@@ -1984,6 +2076,7 @@ fn resolve_and_feed_questions(input: &WorldModelInput<'_>) -> Vec<UnresolvedQues
             input.decisions.len(),
             row.last_event_id.clone(),
             input.now_ms,
+            None,
         );
     }
 
@@ -2018,7 +2111,8 @@ fn resolve_and_feed_questions(input: &WorldModelInput<'_>) -> Vec<UnresolvedQues
 /// keeps standing (cycles_open grows); an existing RESOLVED entry blocks
 /// re-opening (Q-RESOLVE-STAY); otherwise the closure builds a fresh
 /// question. `opened_journal_len`/`opened_ref`/`opened_at_ms` differ per
-/// signal, so they arrive as plain parameters.
+/// signal, so they arrive as plain parameters, as does the linkage subject
+/// (`subject_decision_id`, issue #135).
 #[allow(clippy::too_many_arguments)]
 fn feed_or_advance(
     kind: QuestionKind,
@@ -2030,6 +2124,7 @@ fn feed_or_advance(
     opened_journal_len: usize,
     opened_ref: Option<String>,
     opened_at_ms: i64,
+    subject_decision_id: Option<String>,
 ) {
     let id = question_key(kind, &subject);
     if let Some(question) = questions.iter_mut().find(|question| question.id == id) {
@@ -2050,6 +2145,7 @@ fn feed_or_advance(
         cycles_open: 1,
         state: QuestionState::Open,
         resolved_by: None,
+        subject_decision_id,
     });
 }
 
@@ -2128,6 +2224,33 @@ mod tests {
         }
     }
 
+    fn rejected(id: &str, artifacts: &[&str]) -> CoordinatorDecision {
+        decision(id, DecisionStatus::Rejected, artifacts)
+    }
+
+    fn settled_with(
+        id: &str,
+        kind: crate::decisions::DecisionKind,
+        artifacts: &[&str],
+        transform: Option<crate::task_transform::TaskTransformSpec>,
+    ) -> CoordinatorDecision {
+        let mut made = decision(id, DecisionStatus::Settled, artifacts);
+        made.kind = kind;
+        made.transform = transform;
+        made
+    }
+
+    /// A settled RECONSIDER decision's Freeze payload naming the superseded
+    /// subject decision — the journal's reconsider-descendant link.
+    fn freeze_for(decision_id: &str) -> crate::task_transform::TaskTransformSpec {
+        use concerto_core::ids::Ulid;
+        use concerto_core::types::TaskId;
+        crate::task_transform::TaskTransformSpec::Freeze {
+            decision_id: decision_id.to_owned(),
+            task_ids: vec![TaskId(Ulid::from(7))],
+        }
+    }
+
     fn diagnosis(code: &str, replan_required: bool, retryable: bool) -> FailureDiagnosis {
         FailureDiagnosis {
             kind: FailureKind::Provider,
@@ -2138,6 +2261,10 @@ mod tests {
             alternate_agent_viable: false,
             replan_required,
             evidence: format!("evidence for {code}"),
+            // No linkage: a surface that knew no decision — the unlinkable
+            // shape (Q-RESOLVE-UNLINKABLE).
+            decision_id: None,
+            artifact_path: None,
         }
     }
 
@@ -2478,12 +2605,15 @@ mod tests {
         assert_eq!(blocked.open_question_count(), 1);
     }
 
-    /// Q lifecycle (issue acceptance): a diagnosis opens a question (cycle
-    /// 1), the same signal keeps THE SAME question standing with a growing
-    // age (cycle 2, Q-DEDUPE), and a settled decision recorded after the
-    /// opening resolves it (cycle 3, Q-RESOLVE-PROBLEM).
+    /// Q lifecycle (issue #135): a diagnosis opens a question (cycle 1), the
+    /// same signal keeps THE SAME question standing with a growing age
+    /// (cycle 2, Q-DEDUPE), and an UNRELATED settled decision recorded after
+    /// the opening does NOT resolve it (cycle 3) — this diagnosis carries no
+    /// decision/artifact linkage (a surface that knew none), so the
+    /// question is unlinkable and stays open instead of resolving by
+    /// coincidence (Q-RESOLVE-UNLINKABLE).
     #[test]
-    fn question_opens_persists_then_resolves_by_settled_work() {
+    fn question_opens_persists_and_ignores_unrelated_settled_work() {
         let diagnoses = vec![diagnosis("repl-required", true, false)];
         let first = WorldModel::build(&input(&[], Vec::new(), &[], &diagnoses, Vec::new()));
         let opened = first
@@ -2492,6 +2622,7 @@ mod tests {
             .find(|q| q.kind == QuestionKind::OpenProblem && q.is_open())
             .expect("the failure opened one question");
         assert_eq!(opened.cycles_open, 1, "a fresh question starts at age 1");
+        assert_eq!(opened.subject_decision_id, None, "no linkage: the surface knew no decision");
 
         // Cycle 2: the same signal again — one standing entry, older.
         let second =
@@ -2505,8 +2636,9 @@ mod tests {
         assert_eq!(standing.cycles_open, 2, "the standing question ages, not duplicates");
         assert_eq!(second.open_question_count(), 1, "no duplicated question");
 
-        // Cycle 3: settled work recorded after the question's opening.
-        let decisions = vec![decision("d-resolved", DecisionStatus::Settled, &[])];
+        // Cycle 3: an unrelated parallel task settles — coincidence, never
+        // resolution. The question stands and keeps aging.
+        let decisions = vec![decision("d-unrelated", DecisionStatus::Settled, &[])];
         let third = WorldModel::build(&input(
             &[],
             Vec::new(),
@@ -2514,28 +2646,313 @@ mod tests {
             &diagnoses,
             second.questions.clone(),
         ));
-        let resolved = third
+        let still_open = third
             .questions
             .iter()
             .find(|q| q.kind == QuestionKind::OpenProblem)
-            .expect("the resolved question is remembered");
-        assert_eq!(resolved.state, QuestionState::Resolved, "resolved by the settled decision");
-        assert_eq!(resolved.resolved_by.as_deref(), Some("d-resolved"));
-        assert_eq!(third.open_question_count(), 0);
+            .expect("the question is remembered");
+        assert_eq!(still_open.state, QuestionState::Open, "unrelated settle never resolves");
+        assert_eq!(still_open.resolved_by, None);
+        assert_eq!(still_open.cycles_open, 3, "the unlinkable question ages");
+        assert_eq!(third.open_question_count(), 1);
+    }
+
+    /// Issue #135: a question linked to task X is NOT resolved by an
+    /// unrelated task Y settling — coincidence is never resolution.
+    #[test]
+    fn unrelated_settle_does_not_resolve_linked_question() {
+        let open_decisions = vec![rejected("d-x", &["src/x.rs"])];
+        let first = WorldModel::build(&input(&[], Vec::new(), &open_decisions, &[], Vec::new()));
+        let opened = first
+            .questions
+            .iter()
+            .find(|q| q.kind == QuestionKind::MissingEvidence && q.is_open())
+            .expect("the rejection opened one question");
+        assert_eq!(opened.subject_decision_id.as_deref(), Some("d-x"));
+        assert_eq!(opened.blocks.as_deref(), Some("src/x.rs"));
+
+        // An unrelated parallel task settles, touching only its own artifact.
+        let later = vec![
+            rejected("d-x", &["src/x.rs"]),
+            decision("d-y", DecisionStatus::Settled, &["src/y.rs"]),
+        ];
+        let second =
+            WorldModel::build(&input(&[], Vec::new(), &later, &[], first.questions.clone()));
+        let standing =
+            second.questions.iter().find(|q| q.id == opened.id).expect("standing entry kept");
+        assert_eq!(standing.state, QuestionState::Open, "unrelated settle is not resolution");
+        assert_eq!(standing.resolved_by, None);
+        assert_eq!(standing.cycles_open, opened.cycles_open + 1, "the question ages instead");
+        assert_eq!(second.open_question_count(), 1);
+    }
+
+    /// Issue #135: a settled reconsider-descendant (its Freeze payload names
+    /// the subject decision) resolves the linked question, and the
+    /// resolution stays sticky (Q-RESOLVE-STAY).
+    #[test]
+    fn reconsider_descendant_resolves_and_stays_resolved() {
+        let open_decisions = vec![rejected("d-x", &["src/x.rs"])];
+        let first = WorldModel::build(&input(&[], Vec::new(), &open_decisions, &[], Vec::new()));
+        let opened = first
+            .questions
+            .iter()
+            .find(|q| q.kind == QuestionKind::MissingEvidence && q.is_open())
+            .expect("the rejection opened one question");
+
+        let later = vec![
+            rejected("d-x", &["src/x.rs"]),
+            settled_with(
+                "d-reconsider",
+                crate::decisions::DecisionKind::Reconsider,
+                &[],
+                Some(freeze_for("d-x")),
+            ),
+        ];
+        let second =
+            WorldModel::build(&input(&[], Vec::new(), &later, &[], first.questions.clone()));
+        let resolved =
+            second.questions.iter().find(|q| q.id == opened.id).expect("the entry is kept");
+        assert_eq!(
+            resolved.state,
+            QuestionState::Resolved,
+            "the reconsider-descendant resolves it"
+        );
+        assert_eq!(resolved.resolved_by.as_deref(), Some("d-reconsider"));
+        assert_eq!(second.open_question_count(), 0);
 
         // The question is not re-opened while the resolution stands.
-        let fourth = WorldModel::build(&input(
-            &[],
-            Vec::new(),
-            &decisions,
-            &diagnoses,
-            third.questions.clone(),
-        ));
+        let third =
+            WorldModel::build(&input(&[], Vec::new(), &later, &[], second.questions.clone()));
         assert!(
-            fourth.questions.iter().all(|q| q.state == QuestionState::Resolved),
+            third.questions.iter().all(|q| q.state == QuestionState::Resolved),
             "Q-RESOLVE-STAY: resolved questions never re-open"
         );
-        assert_eq!(fourth.open_question_count(), 0);
+        assert_eq!(third.open_question_count(), 0);
+    }
+
+    /// Issue #135: settled replacement work touching the blocked artifact
+    /// resolves the linked question even without a Freeze link — the retry
+    /// of X redoing X's artifact is recovery evidence.
+    #[test]
+    fn artifact_touch_resolves_linked_question() {
+        let open_decisions = vec![rejected("d-x", &["src/x.rs"])];
+        let first = WorldModel::build(&input(&[], Vec::new(), &open_decisions, &[], Vec::new()));
+        let opened = first
+            .questions
+            .iter()
+            .find(|q| q.kind == QuestionKind::MissingEvidence && q.is_open())
+            .expect("the rejection opened one question");
+
+        let later = vec![
+            rejected("d-x", &["src/x.rs"]),
+            settled_with("d-retry", crate::decisions::DecisionKind::Retry, &["src/x.rs"], None),
+        ];
+        let second =
+            WorldModel::build(&input(&[], Vec::new(), &later, &[], first.questions.clone()));
+        let resolved =
+            second.questions.iter().find(|q| q.id == opened.id).expect("the entry is kept");
+        assert_eq!(
+            resolved.state,
+            QuestionState::Resolved,
+            "the artifact-touching retry resolves it"
+        );
+        assert_eq!(resolved.resolved_by.as_deref(), Some("d-retry"));
+        assert_eq!(second.open_question_count(), 0);
+    }
+
+    /// Issue #135: the linked rule is kind-agnostic — an `OpenProblem`
+    /// carrying a decision subject (the shape a linkage-carrying diagnosis
+    /// now opens, exercised end-to-end through the feed in
+    /// `linked_diagnosis_open_problem_resolves_on_related_work`) ignores
+    /// unrelated settles and resolves on related work.
+    #[test]
+    fn linked_open_problem_resolves_only_on_related_work() {
+        let linked = UnresolvedQuestion {
+            id: "q-linked".to_owned(),
+            kind: QuestionKind::OpenProblem,
+            question: "how does the run recover from its failure?".to_owned(),
+            blocks: Some("src/x.rs".to_owned()),
+            needed: Vec::new(),
+            opened_journal_len: 0,
+            opened_ref: None,
+            subject_decision_id: Some("d-x".to_owned()),
+            opened_at_ms: NOW_MS,
+            cycles_open: 1,
+            state: QuestionState::Open,
+            resolved_by: None,
+        };
+        // Unrelated settle: stays open.
+        let unrelated = vec![decision("d-y", DecisionStatus::Settled, &["src/y.rs"])];
+        let still =
+            WorldModel::build(&input(&[], Vec::new(), &unrelated, &[], vec![linked.clone()]));
+        let standing = still.questions.iter().find(|q| q.id == "q-linked").expect("kept");
+        assert_eq!(standing.state, QuestionState::Open, "unrelated settle never resolves");
+
+        // Related reconsider-descendant: resolves.
+        let related = vec![
+            decision("d-y", DecisionStatus::Settled, &["src/y.rs"]),
+            settled_with(
+                "d-reconsider",
+                crate::decisions::DecisionKind::Reconsider,
+                &[],
+                Some(freeze_for("d-x")),
+            ),
+        ];
+        let done = WorldModel::build(&input(&[], Vec::new(), &related, &[], vec![linked]));
+        let resolved = done.questions.iter().find(|q| q.id == "q-linked").expect("kept");
+        assert_eq!(resolved.state, QuestionState::Resolved);
+        assert_eq!(resolved.resolved_by.as_deref(), Some("d-reconsider"));
+    }
+
+    /// Issue #135 add-linkage (DEFERRED #49 landed): a diagnosis carrying
+    /// decision/artifact linkage opens a LINKED `OpenProblem` — the subject
+    /// is the failing dispatch's decision, the blocked path its expected
+    /// artifact — and it resolves on related settled work only: the
+    /// subject's reconsider descendant, or a settled replacement touching
+    /// the artifact (no decision carries a retry-of link, so the replacement
+    /// is recognized through the artifact touch).
+    #[test]
+    fn linked_diagnosis_open_problem_resolves_on_related_work() {
+        let mut linked = diagnosis("repl-required", true, false);
+        linked.decision_id = Some("d-x".to_owned());
+        linked.artifact_path = Some("src/x.rs".to_owned());
+        let diagnoses = vec![linked];
+
+        let first = WorldModel::build(&input(&[], Vec::new(), &[], &diagnoses, Vec::new()));
+        let opened = first
+            .questions
+            .iter()
+            .find(|q| q.kind == QuestionKind::OpenProblem && q.is_open())
+            .expect("the failure opened one question");
+        assert_eq!(
+            opened.subject_decision_id.as_deref(),
+            Some("d-x"),
+            "the linkage subject is recorded at open"
+        );
+        assert_eq!(
+            opened.blocks.as_deref(),
+            Some("src/x.rs"),
+            "the failed work's expected artifact is the blocked path"
+        );
+
+        // An unrelated parallel task settles — coincidence, never resolution.
+        let unrelated = vec![decision("d-y", DecisionStatus::Settled, &["src/y.rs"])];
+        let still = WorldModel::build(&input(
+            &[],
+            Vec::new(),
+            &unrelated,
+            &diagnoses,
+            first.questions.clone(),
+        ));
+        let standing = still
+            .questions
+            .iter()
+            .find(|q| q.kind == QuestionKind::OpenProblem)
+            .expect("the question is kept");
+        assert_eq!(
+            standing.state,
+            QuestionState::Open,
+            "an unrelated settle never resolves a linked question"
+        );
+
+        // The subject's reconsider descendant settles — its Freeze payload
+        // names d-x — and resolves the question.
+        let reconsider = vec![
+            decision("d-y", DecisionStatus::Settled, &["src/y.rs"]),
+            settled_with(
+                "d-reconsider",
+                crate::decisions::DecisionKind::Reconsider,
+                &[],
+                Some(freeze_for("d-x")),
+            ),
+        ];
+        let done = WorldModel::build(&input(
+            &[],
+            Vec::new(),
+            &reconsider,
+            &diagnoses,
+            still.questions.clone(),
+        ));
+        let resolved = done
+            .questions
+            .iter()
+            .find(|q| q.kind == QuestionKind::OpenProblem)
+            .expect("the question is kept");
+        assert_eq!(
+            resolved.state,
+            QuestionState::Resolved,
+            "the subject's reconsider descendant resolves it"
+        );
+        assert_eq!(resolved.resolved_by.as_deref(), Some("d-reconsider"));
+
+        // A settled replacement touching the failed artifact also resolves
+        // (the artifact-touch channel; no retry-of identity link exists).
+        let replacement = vec![settled_with(
+            "d-replacement",
+            crate::decisions::DecisionKind::Retry,
+            &["src/x.rs"],
+            None,
+        )];
+        let done_touch = WorldModel::build(&input(
+            &[],
+            Vec::new(),
+            &replacement,
+            &diagnoses,
+            first.questions.clone(),
+        ));
+        let resolved_touch = done_touch
+            .questions
+            .iter()
+            .find(|q| q.kind == QuestionKind::OpenProblem)
+            .expect("the question is kept");
+        assert_eq!(
+            resolved_touch.state,
+            QuestionState::Resolved,
+            "a settled replacement touching the artifact resolves it"
+        );
+        assert_eq!(resolved_touch.resolved_by.as_deref(), Some("d-replacement"));
+    }
+
+    /// Issue #135 (transitional): a `MissingEvidence` question restored from
+    /// a pre-#135 checkpoint carries no subject — it keeps the legacy
+    /// any-settle rule. Old JSON (no `subject_decision_id` key) loads with
+    /// the subject defaulting to `None`, and new questions round-trip it.
+    #[test]
+    fn old_checkpoint_question_without_subject_keeps_legacy_rule() {
+        let old_json = serde_json::json!({
+            "id": "q-old",
+            "kind": "missing-evidence",
+            "question": "the decision was rejected — what now?",
+            "blocks": "src/x.rs",
+            "needed": ["d-x"],
+            "opened_journal_len": 0,
+            "opened_ref": null,
+            "opened_at_ms": NOW_MS,
+            "cycles_open": 4,
+            "state": "open",
+            "resolved_by": null,
+        });
+        let loaded: UnresolvedQuestion =
+            serde_json::from_value(old_json).expect("old checkpoints still load");
+        assert_eq!(loaded.subject_decision_id, None, "the additive field defaults");
+
+        let later = vec![decision("d-y", DecisionStatus::Settled, &["src/y.rs"])];
+        let model = WorldModel::build(&input(&[], Vec::new(), &later, &[], vec![loaded.clone()]));
+        let resolved = model.questions.iter().find(|q| q.id == "q-old").expect("kept");
+        assert_eq!(
+            resolved.state,
+            QuestionState::Resolved,
+            "transitional legacy: subject-less MissingEvidence keeps any-settle"
+        );
+        assert_eq!(resolved.resolved_by.as_deref(), Some("d-y"));
+
+        // New questions round-trip the subject through serde.
+        let with_subject =
+            UnresolvedQuestion { subject_decision_id: Some("d-x".to_owned()), ..loaded };
+        let round_tripped: UnresolvedQuestion =
+            serde_json::from_value(serde_json::to_value(&with_subject).expect("serializes"))
+                .expect("deserializes");
+        assert_eq!(round_tripped, with_subject, "the subject survives the round trip");
     }
 
     /// Q-OPEN-BLOCKED + Q-RESOLVE-BLOCKED: a dirty row opens the question;
@@ -2917,6 +3334,7 @@ mod tests {
                 needed: vec![hostile.clone()],
                 opened_journal_len: 0,
                 opened_ref: None,
+                subject_decision_id: None,
                 opened_at_ms: 0,
                 cycles_open: 1,
                 state: QuestionState::Open,

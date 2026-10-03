@@ -90,6 +90,7 @@ Cut (resumable; scope recorded so the cut can be reversed without re-investigati
 29. STATUS-tracked follow-ups (row 35, cut 2026-09-27) — a reclassification, not a cancellation: these are per-release human checklists (`TESTING.md`, `docs/live-test-template.md`) that have no terminal state and are not deferred work.
 30. Binary installers deb/rpm/tar (row 39, cut 2026-09-27) — wanted eventually; the 4-target tag-triggered release pipeline already exists and has never run (the repo has zero tags), so the real gap is everything downstream of a raw binary.
 31. crates.io publish (row 40, cut 2026-09-27) — wanted eventually; no blocker exists (licence allowed, no external path/git deps), so the open question is which subset is published, since the internal graph is coupled.
+32. Row 49 issue #135 add-linkage — `FailureDiagnosis` gained `decision_id`/`artifact_path` (serde-additive, `#[serde(default)]`) and the `call_specialist` model-selection/dispatch/settle failure surfaces attach them, so the failure-diagnosis → `OpenProblem` feed records a real `subject_decision_id` + `blocks` path and the question resolves through Q-RESOLVE-LINKED (PR #154). Residual, accepted: surfaces that know no decision (graph-execution failures, tool/provider faults, consult/investigate failures) still open unlinkable questions that stand and age (Q-RESOLVE-UNLINKABLE) — see the world-model module rules.
 
 ## Maintenance
 

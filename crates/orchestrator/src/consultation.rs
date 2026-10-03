@@ -21,6 +21,7 @@
 //! consultant cannot even see mutating tools; combined with the policy gate
 //! this is the "writes denied even under an Acting run grant" guarantee.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -296,10 +297,24 @@ pub(crate) fn consult_read_only_executor(
 /// [`CONSULT_TRIGGER_MIN_CYCLES`] world-model rebuilds without resolution,
 /// the decision loop injects a bounded message asking the Coordinator to
 /// consult before re-dispatching related work. The pick is deterministic:
-/// the question with the highest standing age, ties broken by the smallest
-/// id. `None` when no question qualifies.
+/// among the aged open questions this loop has NOT already raised
+/// (`already_nudged` — the ids the decision loop recorded, issue #135
+/// starvation fix), the one with the highest standing age, ties broken by
+/// the smallest id. Each question is requested at most once per decision
+/// loop: after a question is raised the pick advances to the next aged
+/// question, so several standing questions each get a turn instead of the
+/// oldest one starving every later trigger.
+///
+/// The request does not promise resolution (issue #135): a consultation's
+/// findings are advisory evidence, and under Q-RESOLVE-LINKED the question
+/// closes only when RELATED settled work lands — the subject's
+/// reconsider descendant (its Freeze payload names the subject decision)
+/// or settled work touching the question's blocked path. An unrelated
+/// settle never resolves it, so the request must not claim it would.
+#[must_use]
 pub(crate) fn consultation_nudge(
     world: &crate::world_model::WorldModel,
+    already_nudged: &HashSet<String>,
 ) -> Option<(String, String)> {
     let candidate = world
         .questions
@@ -307,13 +322,16 @@ pub(crate) fn consultation_nudge(
         .filter(|question| {
             question.state == crate::world_model::QuestionState::Open
                 && question.cycles_open >= CONSULT_TRIGGER_MIN_CYCLES
+                && !already_nudged.contains(&question.id)
         })
         .max_by_key(|question| (question.cycles_open, std::cmp::Reverse(question.id.clone())))?;
     let message = format!(
         "CONSULTATION REQUEST: unresolved question {} — \"{}\" — has stood {} decision \
          cycles without resolution. Use the consult_specialist tool (read-only; its \
-         findings are recorded as citable evidence) to resolve it before \
-         re-dispatching related work, or resolve it deliberately another way.",
+         findings are recorded as citable evidence) for advice on it before \
+         re-dispatching related work. Its findings are advisory evidence: the question \
+         itself closes only when related work settles, and this request is raised for \
+         each question once.",
         candidate.id, candidate.question, candidate.cycles_open,
     );
     Some((candidate.id.clone(), message))
@@ -322,6 +340,7 @@ pub(crate) fn consultation_nudge(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world_model::{QuestionKind, QuestionState, UnresolvedQuestion};
     use concerto_core::ids::Ulid;
     use concerto_core::traits::policy::AuditEntry;
     use concerto_core::types::Condition;
@@ -497,25 +516,27 @@ mod tests {
         assert!(definition.description.contains("Read-only"));
     }
 
+    /// One open/unresolved question with a given standing age.
+    fn question(id: &str, cycles_open: u32, state: QuestionState) -> UnresolvedQuestion {
+        UnresolvedQuestion {
+            id: id.to_owned(),
+            kind: QuestionKind::OpenProblem,
+            question: format!("the {id} question"),
+            blocks: None,
+            needed: Vec::new(),
+            opened_journal_len: 0,
+            opened_ref: None,
+            subject_decision_id: None,
+            opened_at_ms: 1,
+            cycles_open,
+            state,
+            resolved_by: None,
+        }
+    }
+
     #[test]
     fn consultation_nudge_fires_only_for_aged_open_questions() {
-        use crate::world_model::{QuestionKind, QuestionState, UnresolvedQuestion, WorldModel};
-
-        fn question(id: &str, cycles_open: u32, state: QuestionState) -> UnresolvedQuestion {
-            UnresolvedQuestion {
-                id: id.to_owned(),
-                kind: QuestionKind::OpenProblem,
-                question: format!("the {id} question"),
-                blocks: None,
-                needed: Vec::new(),
-                opened_journal_len: 0,
-                opened_ref: None,
-                opened_at_ms: 1,
-                cycles_open,
-                state,
-                resolved_by: None,
-            }
-        }
+        use crate::world_model::WorldModel;
 
         // Below the trigger age: no nudge.
         let mut world = WorldModel {
@@ -526,7 +547,8 @@ mod tests {
             )],
             ..Default::default()
         };
-        assert!(consultation_nudge(&world).is_none(), "a young question does not trigger");
+        let nudged = HashSet::new();
+        assert!(consultation_nudge(&world, &nudged).is_none(), "a young question does not trigger");
 
         // An aged OPEN question triggers, deterministically picking the
         // oldest standing one (ties broken by the smallest id).
@@ -536,12 +558,69 @@ mod tests {
             question("q-old", CONSULT_TRIGGER_MIN_CYCLES + 3, QuestionState::Open),
             question("q-resolved", CONSULT_TRIGGER_MIN_CYCLES + 9, QuestionState::Resolved),
         ];
-        let (id, message) = consultation_nudge(&world).expect("an aged question triggers");
+        let (id, message) = consultation_nudge(&world, &nudged).expect("an aged question triggers");
         assert_eq!(id, "q-old", "the oldest standing question wins");
         assert!(message.contains("consult_specialist"), "the nudge names the tool: {message}");
         assert!(message.contains("q-old"), "the nudge names the question id");
 
         // Determinism: identical input, identical output.
-        assert_eq!(consultation_nudge(&world), Some((id, message)));
+        assert_eq!(consultation_nudge(&world, &nudged), Some((id, message)));
+    }
+
+    /// Issue #135 starvation fix: the pick skips questions this loop already
+    /// raised — the next aged question gets its turn, a raised question can
+    /// never fire twice, and once every aged question has been raised the
+    /// trigger fires no further.
+    #[test]
+    fn nudge_skips_already_raised_questions_and_never_refires() {
+        use crate::world_model::WorldModel;
+
+        let world = WorldModel {
+            questions: vec![
+                question("q-old", CONSULT_TRIGGER_MIN_CYCLES + 2, QuestionState::Open),
+                question("q-mid", CONSULT_TRIGGER_MIN_CYCLES + 1, QuestionState::Open),
+                // Young and resolved entries never qualify.
+                question("q-young", CONSULT_TRIGGER_MIN_CYCLES - 1, QuestionState::Open),
+                question("q-done", CONSULT_TRIGGER_MIN_CYCLES + 9, QuestionState::Resolved),
+            ],
+            ..Default::default()
+        };
+
+        // First pick: the oldest aged question.
+        let (first_id, _) = consultation_nudge(&world, &HashSet::new()).expect("the oldest fires");
+        assert_eq!(first_id, "q-old", "the highest standing age wins first");
+
+        // The next pick skips the raised id — the next aged question gets
+        // its turn.
+        let raised = HashSet::from([first_id.clone()]);
+        let (second_id, second_message) =
+            consultation_nudge(&world, &raised).expect("the next aged question fires");
+        assert_eq!(second_id, "q-mid", "the pick advances past the raised question");
+        assert!(second_message.contains("q-mid"), "the nudge names its own question");
+        assert!(
+            !second_message.contains(&first_id),
+            "the raised question is not re-raised: {second_message}"
+        );
+
+        // Every aged question raised: nothing further fires.
+        let all_raised = HashSet::from(["q-old".to_owned(), "q-mid".to_owned()]);
+        assert!(
+            consultation_nudge(&world, &all_raised).is_none(),
+            "no further nudge once every aged question has been raised"
+        );
+
+        // A single aged question fires exactly once: after it is raised the
+        // same id never fires again, however long it stands.
+        let single = WorldModel {
+            questions: vec![question("q-only", CONSULT_TRIGGER_MIN_CYCLES, QuestionState::Open)],
+            ..Default::default()
+        };
+        let (only_id, _) = consultation_nudge(&single, &HashSet::new()).expect("fires once");
+        assert_eq!(only_id, "q-only");
+        let raised_once = HashSet::from([only_id]);
+        assert!(
+            consultation_nudge(&single, &raised_once).is_none(),
+            "the same question is never nudged twice"
+        );
     }
 }
