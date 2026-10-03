@@ -32,7 +32,7 @@ Child environments contain only platform launch essentials plus explicitly
 configured values. Secret-like environment keys require keyring references;
 configuration never serializes the resolved secret. Desktop argument editing uses
 JSON arrays for exact round trips and displays the executable trust boundary.
-MCP stop/drop kills process groups on Unix and process trees on Windows.
+MCP stop/drop kills process groups on Unix and retained Job Objects on Windows.
 
 ## Consequences
 Previously auto-approved plugins require persistent approval in Settings or CLI.

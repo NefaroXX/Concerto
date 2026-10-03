@@ -45,11 +45,11 @@ explicitly deferred.
 - **Graceful stop** (`McpClient::stop`): sends `notifications/cancelled` for
   every in-flight request, closes stdin (the server observes EOF), waits up to
   a 2-second grace period for a voluntary exit, then escalates to
-  `kill().await` + `wait().await` (SIGKILL on POSIX; SIGTERM→SIGKILL escalation
-  is a later revision).
-- **Never orphaned:** the `Drop` impl SIGKILLs (`start_kill`) any child that
-  was never stopped and polls `try_wait()` (bounded, ~1s) so no server is left
-  behind on panic, cancellation, or teardown.
+  process-group termination on Unix or a retained kill-on-close Job Object on Windows.
+  Descendants are terminated even if the immediate server has exited.
+- **Drop cleanup:** the client terminates the retained process group/tree and
+  polls the immediate child for exit. Unix descendants that deliberately detach
+  from the process group are outside this lifecycle boundary.
 - **States:** `Disabled` (idle) → `Connecting` (spawn) → `Connected`
   (`initialize`) → `Failed` (reader EOF/error or registration failure) →
   `Stopped` (graceful stop). Subscribe via `McpClient::subscribe_state()`.
@@ -97,8 +97,12 @@ Every request is bounded by a caller-supplied timeout. For bridge calls
 - `timeout_secs` is a concerto-side reserved input key, consumed by the bridge
   and stripped before forwarding — it never collides with a server-defined
   argument. Default comes from the server config (60s);
-  `min(requested or default, 300)` is the enforced hard cap
+  `clamp(requested or default, 1, 300)` is the enforced range
   (`HARD_TIMEOUT_CAP_SECS`).
+- The deadline includes client/transport lock waits, pipe writes, and response
+  receipt. Handshake and paginated listing each have a total budget. Cancellation
+  notifications are best effort and bounded; an interrupted partial write closes
+  the damaged transport.
 - An elapsed call surfaces as `ToolError::Timeout` (via `McpError::Timeout`) —
   never `Cancelled`. `initialize` is never cancellable (the spec forbids
   `notifications/cancelled` for it) and takes no cancellation token.
@@ -119,9 +123,21 @@ timeout_secs = 60               # per-call default; hard cap in the bridge
 ```
 
 `McpServerConfig` fields: `id`, `command`, `args`, `env`, `enabled`,
-`timeout_secs`. `env` entries are appended to the child's environment and come
-from the config only — **secrets are never stored in TOML** (keyring-backed MCP
-tokens are deferred).
+`timeout_secs`. Children inherit only platform launch essentials (`PATH`, home,
+locale, temporary directory, and Windows launch variables), plus configured
+`env` entries. Credential-like keys such as `API_TOKEN` require a reference:
+
+```toml
+env = { API_TOKEN = "keyring:mcp/filesystem/API_TOKEN" }
+```
+
+Settings can store a value in the OS keychain and replace it with this reference.
+References resolve only when launching a server. Missing credentials prevent
+launch; configured values are redacted from bounded stderr diagnostics. Existing
+plaintext credential entries must be moved to the keychain before saving.
+Arguments in Settings are edited as a JSON array so spaces, quotes, and empty
+arguments round-trip exactly. Testing requires both master and server switches
+and starts the executable with your user privileges.
 
 ## Security boundary
 

@@ -1,7 +1,8 @@
 # Concerto WASM Plugin System
 
-Current scope: runtime support for WASM **tool** plugins. Provider and memory
-adapter descriptors remain non-executable.
+The host executes WASM tool, provider, and memory-adapter plugins. Tool names
+are always `plugin:<id>:<tool>`. Runtime discovery requires approved persisted
+capabilities; discovery never grants authority (ADR-78).
 
 ## What tool plugins can do
 
@@ -14,15 +15,19 @@ adapter descriptors remain non-executable.
 
 ## What plugins cannot do yet
 
-- **Provider plugins**: `PluginProvides::Provider` descriptors are accepted in the manifest but are not executable — the host makes no `completion` call to plugins.
-- **Memory adapter plugins**: `PluginProvides::MemoryAdapter` descriptors are similarly reserved for later phases.
-- **Async completion requests**: The host `completion` function is stubbed and returns an error ("not implemented in Phase 7").
+- Provider wrappers execute `call_provider`, but plugin-backed providers are
+  restricted to AnswerOnly requests; tool-carrying requests are refused.
+- Memory adapters execute `call_adapter` through `PluginBackedVectorStore`;
+  selecting one as the runtime memory backend remains unsupported.
+- Host completion requests require an explicitly attached LLM provider. The
+  shared runtime does not attach one to the plugin manager by default.
 
 ## ABI Overview
 
 ### Required Exports
 
-Every plugin must export:
+Every plugin must export the common memory, scratch, manifest, and init exports,
+plus the call export for its kind (`call_tool`, `call_provider`, or `call_adapter`):
 
 | Export | Signature | Description |
 |--------|-----------|-------------|
@@ -55,8 +60,7 @@ Return values are encoded as a packed `i64`: high 32 bits = pointer into WASM li
 The host sets `scratch_buffer` (a mutable global) to point to a region in linear memory. The plugin uses this region for `manifest()` output. For `call_tool()`, the host passes a scratch buffer via the last two parameters (`scratch_ptr`, `scratch_len`).
 
 - Default size: 64 KiB
-- ABI ceiling: 256 MiB via `resize_scratch`; the default host instance memory
-  reservation is 64 MiB, so the effective limit can be lower
+- Host scratch/input/output ceiling: 1 MiB; `resize_scratch` rejects larger requests
 - Plugin can call `resize_scratch(new_size)` to grow the buffer (returns 0 on success, -1 on failure)
 
 ### Host Functions
@@ -69,11 +73,11 @@ Plugins import these from the `concerto` module:
 | `last_error` | `(scratch_ptr: i32, scratch_len: i32) -> i64` | None | Retrieve the last error string |
 | `resize_scratch` | `(new_size: i32) -> i32` | None | Resize the scratch buffer |
 | `read_file` | `(path_ptr: i32, path_len: i32, scratch_ptr: i32, scratch_len: i32) -> i64` | FilesystemRead | Read a file's contents |
-| `write_file` | `(path_ptr: i32, path_len: i32, content_ptr: i32, content_len: i32) -> i32` | FilesystemWrite | Write content to a file |
-| `http_get` | `(url_ptr: i32, url_len: i32, scratch_ptr: i32, scratch_len: i32) -> i64` | NetworkOutbound | Perform an HTTP GET request (30s timeout, 10 MB cap) |
+| `write_file` | `(path_ptr: i32, path_len: i32, content_ptr: i32, content_len: i32) -> i32` | FilesystemWrite | Write UTF-8 content through shared VirtualFs tracking |
+| `http_get` | `(url_ptr: i32, url_len: i32, scratch_ptr: i32, scratch_len: i32) -> i64` | NetworkOutbound | Policy-gated HTTP GET (30s total timeout, 1 MiB body cap) |
 | `shell_exec` | `(cmd_ptr: i32, cmd_len: i32, scratch_ptr: i32, scratch_len: i32) -> i64` | ShellExecute | Execute a shell command (30s timeout) |
 | `emit_event` | `(event_ptr: i32, event_len: i32) -> ()` | None | Emit a JSON event to the event bus |
-| `completion` | `(req_ptr: i32, req_len: i32, scratch_ptr: i32, scratch_len: i32) -> i64` | None | **Stubbed** — returns error in P7.1 |
+| `completion` | `(req_ptr: i32, req_len: i32, scratch_ptr: i32, scratch_len: i32) -> i64` | None | Async completion via an attached provider (30s, bounded output) |
 
 ## Guest SDK
 
@@ -154,7 +158,7 @@ The `plugin_entry!` macro generates the required WASM exports (`manifest`, `call
 | `FilesystemRead` | `globs: Vec<String>` | Read files matching glob patterns (empty = all files) |
 | `FilesystemWrite` | `globs: Vec<String>` | Write files matching glob patterns (empty = all files) |
 | `NetworkOutbound` | `domains: Vec<String>` | HTTP requests to allowed domains (empty = all domains) |
-| `ShellExecute` | `allowlist: Vec<String>` | Shell commands in allowlist (empty = all commands; entries ending with `*` are prefix-matched) |
+| `ShellExecute` | `allowlist: Vec<String>` | Shell commands in allowlist (empty = all commands; non-empty entries match the whole command exactly) |
 | `Other` | `description: String` | Application-specific capability (not enforced by the host) |
 
 ### `provides` Variants
@@ -162,8 +166,8 @@ The `plugin_entry!` macro generates the required WASM exports (`manifest`, `call
 | Variant | Fields | Status |
 |---------|--------|--------|
 | `Tool` | `name, description, input_schema` | Executable |
-| `Provider` | `name, model` | 🔲 Descriptor only — not executable |
-| `MemoryAdapter` | `name, kind` | 🔲 Descriptor only — not executable |
+| `Provider` | `name, model` | Executable wrapper |
+| `MemoryAdapter` | `name, kind` | Executable wrapper |
 
 ## Sidecar Manifests
 
@@ -201,18 +205,28 @@ auto_load = true
 
 When a plugin requires capabilities:
 
-- **Desktop**: An Iced capability dialog shows the requested capabilities with Grant Once / Always Allow / Deny options.
+- **Desktop installation**: The capability dialog shows the full requested
+  scopes and offers binary-pinned approval for 30 days or denial.
 - **CLI interactive**: A text prompt asks for grant (g), always allow (a), or deny (d).
 - **CLI non-interactive**: All capabilities are auto-denied.
 
-Persistent grants are stored in `~/.local/share/concerto/plugin_cap_grants.json` and survive restarts. The grant file stores the full capability scope (globs, domains, allowlist) for fine-grained re-approval.
+Runtime activation accepts only unexpired persistent approvals for the current
+SHA-256 binary and exact manifest scopes. Revocation is re-read on each load;
+changed binaries and incomplete approval decisions fail closed. Session-only
+installer approval cannot authorize a later run. Grants live in the manager's
+plugin data directory as `plugin_cap_grants.json`.
 
 ## Security
 
 - **WASM sandboxing**: All plugin code runs inside a `wasmtime` instance with no access to the host OS except through explicitly imported host functions.
 - **Fuel-based execution limits**: Each plugin starts with 1,000,000 fuel units; exhaustion traps execution.
 - **Epoch-based interruption**: An epoch ticker periodically increments the engine epoch counter; stores set an epoch deadline as a belt-and-suspenders measure.
-- **Memory size limits**: Linear memory is capped at 64 MB per instance.
+- **Memory size limits**: StoreLimits enforce 64 MiB linear memory and bounded
+  tables/instance counts during manifest extraction, init, and growth.
+- **Host effects**: File/shell effects use the active run's ToolExecutor,
+  VirtualFs, and configured shell. HTTP initial and redirect URLs each pass
+  through shared policy, including global network denial. Init has no run
+  authority. Revoked/previous-run handles are disabled.
 - **Unauthorized host calls**: If a plugin calls a host function without the required capability, its violation counter is incremented. After 1 violation (`MAX_VIOLATIONS = 1`), the plugin is disabled.
 - **Module size limit**: WASM modules larger than 10 MB are rejected at load time.
 
@@ -246,4 +260,4 @@ RUST_LOG=plugin=trace concerto
 - **CapabilityManager**: Handles capability grants (session + persistent) with scope-aware enforcement (globs, domains, allowlists).
 - **ToolBridge**: Wraps plugin-provided tools as `dyn Tool` instances for the agent's `ToolRegistry`.
 - **Loader**: Compiles WASM modules, extracts manifests, validates sidecar files, checks ABI version, and calls `init()`.
-- **Host Functions**: Exposes `read_file`, `write_file`, `http_get`, `shell_exec`, `emit_event`, `log`, `last_error`, `resize_scratch`, and `completion` (stubbed).
+- **Host Functions**: Exposes `read_file`, `write_file`, `http_get`, `shell_exec`, `emit_event`, `log`, `last_error`, `resize_scratch`, and async `completion`.
