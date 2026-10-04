@@ -589,9 +589,75 @@ pub mod benchmarks {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ToolExecuted payload builder (W9)
+// ---------------------------------------------------------------------------
+
+/// Build the `ToolExecuted` payload tests used to hand-build inline, in one
+/// place so W1's `outcome` key cannot drift between the production writer and
+/// the payloads tests feed back through the whiteboard projection.
+///
+/// The `outcome` value matches the fallback shape W1's read side falls back
+/// to when the key is absent: `success` `true` → `"ok"`, `false` → `"failed"`.
+/// (The production writer also spells `denied` and `interrupted`; no
+/// hand-built test payload claims those today.) A payload carrying *neither*
+/// key reads back as `Unknown` and derives no fact — that shape is reachable
+/// only by omitting both keys, which this builder never does.
+///
+/// * `paths: None` omits the key entirely (the pathless-execution shape).
+/// * `paths: Some(...)` renders the `ObservedPath` rows the writer produces.
+#[cfg(test)]
+pub(crate) fn tool_executed_payload(
+    tool: &str,
+    args: serde_json::Value,
+    success: bool,
+    paths: Option<&[&str]>,
+) -> serde_json::Value {
+    let outcome = if success { "ok" } else { "failed" };
+    let mut payload = serde_json::json!({
+        "tool": tool,
+        "args": args,
+        "success": success,
+        "outcome": outcome,
+    });
+    if let Some(paths) = paths {
+        let observed = paths.iter().map(|path| serde_json::json!({ "path": path })).collect();
+        payload["paths"] = serde_json::Value::Array(observed);
+    }
+    payload
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_executed_payload_stamps_outcome() {
+        let ok = tool_executed_payload(
+            "read_file",
+            serde_json::json!({ "path": "a.rs" }),
+            true,
+            Some(&["a.rs"]),
+        );
+        assert_eq!(ok["outcome"], "ok", "W1 reads `outcome` first: {ok}");
+        assert_eq!(ok["success"], true);
+        assert_eq!(ok["paths"], serde_json::json!([{ "path": "a.rs" }]));
+
+        let failed =
+            tool_executed_payload("write_file", serde_json::json!({}), false, Some(&["b.rs"]));
+        assert_eq!(failed["outcome"], "failed", "failure maps to failed: {failed}");
+        assert_eq!(failed["success"], false);
+    }
+
+    #[test]
+    fn tool_executed_payload_omits_paths_when_absent() {
+        // The pathless shape must stay absent, not `[]`: a present-but-empty
+        // `paths` key is a different payload than the writer's omission.
+        let pathless =
+            tool_executed_payload("shell", serde_json::json!({ "cmd": "ls" }), false, None);
+        assert!(pathless.get("paths").is_none(), "omitted, not empty: {pathless}");
+        assert_eq!(pathless["outcome"], "failed");
+    }
 
     #[test]
     fn mock_expert_agent_always_succeeds() {
