@@ -38,7 +38,7 @@ use concerto_sessions::spend::SpendTracker;
 use concerto_sessions::whiteboard::append_whiteboard_event;
 use concerto_sessions::whiteboard::{
     consult_finding_payload, latest_gate_seq, load_newest_session_events, load_whiteboard_events,
-    WhiteboardLoadOpts,
+    tool_executed_view, ToolOutcome, WhiteboardLoadOpts,
 };
 use concerto_sessions::{
     NewWhiteboardEvent, OrchestrationCheckpointRecord, ResourceFactRow, ResourceFacts,
@@ -375,7 +375,9 @@ Superseding a decision whose assumptions proved wrong (issue #64):
 - Completed work, valid evidence, and accepted artifacts are never touched; frozen tasks never re-dispatch on their own. Re-plan the frozen work yourself, under fresh decisions, from the current world state. An unknown or already-rejected decision id is a structured rejection you can read and fix.
 
 Dismissing a stale question (Q-DISMISS):
-- dismiss_question resolves one of this run's standing world-model questions (cite its real id from the context) when YOU judge it answered, moot, or unresolvable — e.g. a failure with no linkable recovery whose subject work already landed. Name the question id and the reason; the dismissal journals a decision and the question never re-opens.
+- dismiss_question resolves one of this run's standing world-model questions (cite its real id from the context) when YOU judge it answered, moot, or unresolvable — e.g. a failure with no linkable recovery whose subject work already landed. Name the question id, the reason, and at least one supporting evidence id, and the dismissal journals a decision and the question never re-opens.
+- Evidence is required, not optional: cite a real write-applied or tool-executed (outcome ok) event recorded AFTER the question opened. Findings, decisions, and design docs are assertions, never observations, so they never justify a dismissal; an empty, non-observed, or older citation set is rejected with a structured error naming the rule.
+- Only OpenProblem and MissingEvidence questions are dismissable. BlockedPath and AmbiguousRecovery answer from observation — a fresh clean observation or the verified dispatch — so they answer not_dismissable instead of being judged away.
 - Dismissal is judgment, never cleanup: never dismiss a question to make a count look better, and no rule dismisses for you — age, cap pressure, and unrelated settles never resolve anything.
 
 Artifact ownership (issue #61):
@@ -645,15 +647,28 @@ fn reconsider_tool_definition() -> ToolDefinition {
 /// text and is kept on the resolved entry. Unknown ids are rejected; an
 /// already-resolved question answers idempotent success (dismissed entries
 /// never re-open, so re-dismissing decides nothing new).
+///
+/// W2 (Q-DISMISS-KIND/EVIDENCE): only `OpenProblem`/`MissingEvidence`
+/// questions are dismissable — `BlockedPath`/`AmbiguousRecovery` answer
+/// `not_dismissable` — and every dismissal must cite at least one observed
+/// event id recorded after the question opened (`dismissal_requires_
+/// observed_evidence` / `dismissal_evidence_not_newer` otherwise).
+/// `supporting_evidence_ids` stays schema-optional so the model reads those
+/// structured errors as instruction rather than a schema violation.
 fn dismiss_question_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: DISMISS_QUESTION_TOOL.to_string(),
         description: "Dismiss a standing world-model question you judge answered, moot, \
                       or unresolvable (Q-DISMISS): name its real question id from the \
-                      context and the reason. The dismissal is journaled as a decision \
-                      and whiteboard-recorded, and the question never re-opens. \
-                      Judgment, never cleanup — age, cap pressure, and unrelated \
-                      settles never resolve anything on their own."
+                      context, the reason, and at least one supporting evidence id — a \
+                      whiteboard write-applied or tool-executed (outcome ok) event \
+                      recorded AFTER the question opened; findings and decisions never \
+                      count as evidence. Only OpenProblem and MissingEvidence questions \
+                      are dismissable; BlockedPath and AmbiguousRecovery resolve from \
+                      observation, so they answer not_dismissable. The dismissal is \
+                      journaled as a decision and whiteboard-recorded, and the question \
+                      never re-opens. Judgment, never cleanup — age, cap pressure, and \
+                      unrelated settles never resolve anything on their own."
             .to_string(),
         parameters: serde_json::json!({
             "type": "object",
@@ -676,8 +691,12 @@ fn dismiss_question_tool_definition() -> ToolDefinition {
                 "supporting_evidence_ids": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Optional real whiteboard event ids that justify the dismissal. \
-                                    Fabricated ids are rejected."
+                    "description": "At least one REAL whiteboard event id justifying the \
+                                    dismissal, recorded after the question opened: only a \
+                                    write-applied or a tool-executed event with outcome ok \
+                                    counts (findings and decisions never do). Fabricated, \
+                                    non-observed, or older ids are rejected with a \
+                                    structured error."
                 }
             },
             "required": ["question_id", "reason"]
@@ -3877,6 +3896,77 @@ impl CoordinatorAgent {
             }
         }
         missing
+    }
+
+    /// W2 (Q-DISMISS-EVIDENCE): resolve cited dismissal-evidence ids against
+    /// the whiteboard log into the input the pure evidence rule reads — the
+    /// recorded kind, its `gate_seq` coordinate, and the W1-classified
+    /// outcome of a `ToolExecuted` payload. One tiny indexed lookup per cited
+    /// id (the same log the validation above checked existence against),
+    /// bounded by that path's cite cap; cancellation observed up front.
+    ///
+    /// Fail-closed: no pool, a cancelled token, or a failing query returns
+    /// `None`, which the rule answers with `dismissal_requires_observed_
+    /// evidence` — a dismissal never rides evidence the run could not read.
+    /// A row that does not resolve (missing id, unknown kind, payload that is
+    /// not JSON) becomes a `kind: None` entry, which is never observed-class.
+    async fn dismissal_evidence(
+        &self,
+        cited: &[String],
+        cancel: &CancellationToken,
+    ) -> Option<Vec<crate::world_model::CitedEvidence>> {
+        if cited.is_empty() {
+            // Count-check territory: report an empty cite list as empty even
+            // when no log is configured.
+            return Some(Vec::new());
+        }
+        if cancel.is_cancelled() {
+            return None;
+        }
+        let pool = self.review_store.as_ref()?;
+        let mut resolved = Vec::with_capacity(cited.len());
+        for id in cited {
+            let row: Option<(String, i64, String)> = match sqlx::query_as(
+                "SELECT kind, gate_seq, payload FROM whiteboard_events WHERE event_id = ?",
+            )
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            {
+                Ok(row) => row,
+                Err(error) => {
+                    warn!(%error, "dismissal evidence row lookup failed (fail closed)");
+                    return None;
+                }
+            };
+            let Some((kind, gate_seq, payload)) = row else {
+                resolved.push(crate::world_model::CitedEvidence {
+                    id: id.clone(),
+                    kind: None,
+                    gate_seq: 0,
+                    outcome: ToolOutcome::Unknown,
+                });
+                continue;
+            };
+            let kind = serde_json::from_str::<WhiteboardKind>(&format!("\"{kind}\"")).ok();
+            // Only an observed `ToolExecuted` row carries an outcome the
+            // class check reads; every other kind classifies through its own
+            // kind match, so its payload is never parsed here.
+            let outcome = if kind == Some(WhiteboardKind::ToolExecuted) {
+                serde_json::from_str::<serde_json::Value>(&payload)
+                    .map(|value| tool_executed_view(&value).outcome)
+                    .unwrap_or(ToolOutcome::Unknown)
+            } else {
+                ToolOutcome::Unknown
+            };
+            resolved.push(crate::world_model::CitedEvidence {
+                id: id.clone(),
+                kind,
+                gate_seq: u64::try_from(gate_seq).unwrap_or(0),
+                outcome,
+            });
+        }
+        Some(resolved)
     }
 
     /// Build a validator for one decision: the registry's registered ids are
@@ -16741,13 +16831,21 @@ impl CoordinatorAgent {
         }
 
         // ── 2. The question must stand in the current model ──────────────
-        let standing_state = self
-            .world_model
-            .questions
-            .iter()
-            .find(|question| question.id == question_id)
-            .map(|question| (question.is_open(), question.resolved_by.clone()));
-        let Some((is_open, resolved_by)) = standing_state else {
+        // Both the kind (S1) and the first-sighting coordinate (S2) are read
+        // by value here: the checks below cross `&mut self` calls, so no
+        // model entry is ever held borrowed.
+        let standing_state =
+            self.world_model.questions.iter().find(|question| question.id == question_id).map(
+                |question| {
+                    (
+                        question.is_open(),
+                        question.resolved_by.clone(),
+                        question.kind,
+                        question.opened_gate_seq,
+                    )
+                },
+            );
+        let Some((is_open, resolved_by, kind, opened_gate_seq)) = standing_state else {
             return serde_json::json!({
                 "error": "unknown_question",
                 "message": format!(
@@ -16767,6 +16865,16 @@ impl CoordinatorAgent {
                      re-opens, so nothing new was decided"
                 ),
             });
+        }
+
+        // ── 2b. W2 (Q-DISMISS-KIND): only OpenProblem/MissingEvidence
+        //       exit through judgment — BlockedPath/AmbiguousRecovery
+        //       answer `not_dismissable` naming the observation that
+        //       closes them. Pure check, no mutation, no journal entry. ──
+        if let Some(refusal) = crate::world_model::dismissal_kind_refusal(kind) {
+            warn!(code = %refusal.code, ?kind, "a non-dismissable question kind refused the \
+                dismissal (structured error, no state mutation)");
+            return refusal.tool_value();
         }
 
         // ── 3. Decision validation (a dismissal rejects a target; the reason
@@ -16789,6 +16897,23 @@ impl CoordinatorAgent {
             Ok(decision) => decision,
             Err(error) => return error,
         };
+
+        // ── 3b. W2 (Q-DISMISS-EVIDENCE): at least one supporting evidence
+        //       id, every id observed-class (write-applied / tool-executed
+        //       outcome ok), and at least one NEWER than the question's
+        //       first sighting — resolved against the same log the
+        //       validation above checked existence against, fail-closed.
+        //       A rejection returns the structured error and journals
+        //       nothing (no decision, no whiteboard record, no ledger). ────
+        let cited = self.dismissal_evidence(&args.supporting_evidence_ids, cancel).await;
+        if let Some(refusal) =
+            crate::world_model::dismissal_evidence_refusal(opened_gate_seq, cited.as_deref())
+        {
+            warn!(code = %refusal.code, question_id, "dismissal evidence failed the \
+                observed/newer rule (structured error, no state mutation)");
+            return refusal.tool_value();
+        }
+
         decision.dismissed_question_id = Some(question_id.to_owned());
         let decision_id = decision.id.clone();
         self.decision_journal.record(decision);
@@ -37194,16 +37319,31 @@ mod tests {
     // ── Q-DISMISS: question dismissal — journaled coordinator judgment ───
 
     /// One standing OPEN world-model question with the given id/state, as the
-    /// dismissal handler reads it from the coordinator's current model.
+    /// dismissal handler reads it from the coordinator's current model. The
+    /// kind defaults to `OpenProblem` and the first-sighting coordinate to 0,
+    /// so any real row is newer — W2 rules reach for their own kind and
+    /// coordinate through [`standing_question_of`].
     fn standing_question(id: &str, open: bool) -> crate::world_model::UnresolvedQuestion {
+        standing_question_of(id, open, crate::world_model::QuestionKind::OpenProblem, Some(0))
+    }
+
+    /// [`standing_question`] with an explicit kind (S1) and first-sighting
+    /// `gate_seq` coordinate (S2 freshness).
+    fn standing_question_of(
+        id: &str,
+        open: bool,
+        kind: crate::world_model::QuestionKind,
+        opened_gate_seq: Option<u64>,
+    ) -> crate::world_model::UnresolvedQuestion {
         crate::world_model::UnresolvedQuestion {
             id: id.to_owned(),
-            kind: crate::world_model::QuestionKind::OpenProblem,
+            kind,
             question: "how does the run recover from its failure?".to_owned(),
             blocks: None,
             needed: Vec::new(),
             opened_journal_len: 0,
             opened_ref: None,
+            opened_gate_seq,
             subject_decision_id: Some("d-1".to_owned()),
             opened_at_ms: 1_000,
             cycles_open: 3,
@@ -37217,20 +37357,156 @@ mod tests {
         }
     }
 
+    /// W2 (reachability): one real log pool with the same migrations the run
+    /// applies, so every row cited below is an ordinary production row.
+    /// The tempdir guard keeps the pool's file alive for the test.
+    async fn dismissal_log() -> (tempfile::TempDir, sqlx::SqlitePool) {
+        resume_log_pool().await
+    }
+
+    /// W2 (reachability): an observed-class `ToolExecuted` row appended by
+    /// the REAL fact writer ([`crate::tool_facts::ToolFactContext`]), so the
+    /// evidence rule is exercised against the event the run actually records.
+    /// `outcome` is the call site's own classification (W1): an `Ok` row is
+    /// citable, a `Failed` one is not.
+    async fn observed_tool_row(
+        pool: &sqlx::SqlitePool,
+        root: &std::path::Path,
+        outcome: concerto_sessions::whiteboard::ToolOutcome,
+    ) -> String {
+        let ctx = crate::tool_facts::ToolFactContext::new(Some(pool.clone()), "coder");
+        let args = serde_json::json!({ "operation": "write", "path": "w2.md" });
+        let paths = vec!["w2.md".to_owned()];
+        let fact = crate::tool_facts::ToolExecutedFact {
+            session_id: "session-w2",
+            task_id: None,
+            run_id: None,
+            generation: "",
+            project_root: root,
+            tool: "filesystem",
+            args: &args,
+            success: outcome == concerto_sessions::whiteboard::ToolOutcome::Ok,
+            outcome,
+            exit_code: None,
+            paths: &paths,
+            file_affecting: false,
+            pre_image_hashes: std::collections::HashMap::new(),
+        };
+        ctx.record_tool_executed(&fact, &CancellationToken::new()).await;
+        newest_row_id(pool, "tool-executed").await
+    }
+
+    /// W2 (reachability): a `WriteApplied` row appended by the REAL write
+    /// gate — the observed record of a write that actually landed —
+    /// returned as its citable event id.
+    async fn observed_write_row(gate: &Arc<crate::gate::WriteGate>, call_id: &str) -> String {
+        let request = crate::gate::GateRequest {
+            call_id: call_id.to_owned(),
+            agent_id: "coder".to_owned(),
+            tool: "filesystem".to_owned(),
+            input: serde_json::json!({ "operation": "write", "path": "w2.md", "content": "v1" }),
+            session_id: None,
+            scope: "fs".to_owned(),
+            plan_id: None,
+            causation: None,
+            base_versions: std::collections::BTreeMap::new(),
+            orchestrator_authority: false,
+        };
+        let applied = gate.submit(request, CancellationToken::new()).await.expect("write applies");
+        applied.event_id
+    }
+
+    /// W2 (reachability): a `Finding` row — the assertion class the evidence
+    /// rule must never accept — appended the same way its writer does.
+    async fn finding_row(pool: &sqlx::SqlitePool) -> String {
+        let event = NewWhiteboardEvent {
+            event_id: format!("ev-finding-{}", Ulid::new()),
+            agent_id: "researcher".to_owned(),
+            kind: WhiteboardKind::Finding,
+            scope: String::new(),
+            session_id: None,
+            plan_id: None,
+            causation: None,
+            payload: serde_json::json!({ "summary": "the recovery is impossible" }),
+            pre_image_hash: None,
+            created_at: crate::tool_facts::unix_ms(),
+        };
+        let stored = append_whiteboard_event(pool, &event).await.expect("finding appends");
+        stored.event_id
+    }
+
+    /// W2: the newest recorded row id of one kind — the citable id a
+    /// single-row pool holds.
+    async fn newest_row_id(pool: &sqlx::SqlitePool, kind: &str) -> String {
+        sqlx::query_scalar(
+            "SELECT event_id FROM whiteboard_events WHERE kind = ? ORDER BY gate_seq DESC LIMIT 1",
+        )
+        .bind(kind)
+        .fetch_one(pool)
+        .await
+        .expect("one row of this kind exists in the pool")
+    }
+
+    /// S3: a refused dismissal changes nothing — structured tool error, no
+    /// journaled decision, no ledger mirror, and the question still stands.
+    fn assert_refusal_untouched(
+        result: &serde_json::Value,
+        code: &str,
+        question_id: &str,
+        coordinator: &CoordinatorAgent,
+        ledger: &DispatchLedger,
+    ) {
+        assert_eq!(result["error"], code, "structured refusal: {result}");
+        assert!(
+            result["message"].as_str().is_some_and(|message| !message.is_empty()),
+            "the refusal names why: {result}"
+        );
+        assert!(
+            !coordinator
+                .decision_journal
+                .entries()
+                .iter()
+                .any(|entry| entry.kind == crate::decisions::DecisionKind::DismissQuestion),
+            "a rejected dismissal journals no decision"
+        );
+        assert!(ledger.action_ledger.is_empty(), "a rejected dismissal mirrors no ledger row");
+        let standing = coordinator
+            .world_model
+            .questions
+            .iter()
+            .find(|question| question.id == question_id)
+            .expect("the question is untouched");
+        assert_eq!(
+            standing.state,
+            crate::world_model::QuestionState::Open,
+            "a rejected dismissal resolves nothing"
+        );
+        assert!(standing.resolved_by.is_none());
+    }
+
     /// Q-DISMISS acceptance: dismissing a standing open question journals a
     /// settled `DismissQuestion` decision carrying the question id, resolves
-    /// the entry with the reason, and mirrors the ledger.
+    /// the entry with the reason, and mirrors the ledger — over real
+    /// observed evidence, as W2 requires.
     #[tokio::test]
     async fn dismiss_question_journals_decision_and_resolves_open_question() {
         let bus = EventBus::new(256);
         let workspace = tempfile::tempdir().expect("tempdir for the dismissal workspace");
-        let (mut coordinator, _store, session_id) = coordinator_with_store(
+        let (_log_dir, pool) = dismissal_log().await;
+        let evidence = observed_tool_row(
+            &pool,
+            workspace.path(),
+            concerto_sessions::whiteboard::ToolOutcome::Ok,
+        )
+        .await;
+        let (coordinator, _store, session_id) = coordinator_with_store(
             bus.clone(),
             Arc::new(AgentRegistry::from_mocks(vec![])),
             vec![CoordinatorTurn::Text(String::new())],
             workspace.path(),
         )
         .await;
+        let mut coordinator = coordinator.with_review_store(Some(pool.clone()));
         let task = AgentTask::new(session_id, "build the thing");
         let context = AgentContext::new(concerto_core::types::SessionContext::new(
             session_id,
@@ -37252,6 +37528,7 @@ mod tests {
                 &serde_json::json!({
                     "question_id": "q-abc123",
                     "reason": "the provider fault is moot",
+                    "supporting_evidence_ids": [evidence.as_str()],
                 }),
             )
             .await;
@@ -37266,6 +37543,11 @@ mod tests {
             dismissal.dismissed_question_id.as_deref(),
             Some("q-abc123"),
             "the decision names the dismissed question"
+        );
+        assert_eq!(
+            dismissal.supporting_evidence_ids,
+            vec![evidence],
+            "the decision carries the observed evidence that justified it"
         );
         assert_eq!(dismissal.status, crate::decisions::DecisionStatus::Settled);
         assert_eq!(result["decision_id"], dismissal.id.as_str());
@@ -37469,18 +37751,27 @@ mod tests {
 
     /// Q-DISMISS addressability: a question the render cut (past
     /// `RENDER_QUESTIONS`) still cites a real id — it appears in the
-    /// omitted-count line and `dismiss_question` accepts it.
+    /// omitted-count line and `dismiss_question` accepts it, observed
+    /// evidence in hand (W2).
     #[tokio::test]
     async fn dismiss_question_reaches_a_render_omitted_question() {
         let bus = EventBus::new(256);
         let workspace = tempfile::tempdir().expect("tempdir for the dismissal workspace");
-        let (mut coordinator, _store, session_id) = coordinator_with_store(
+        let (_log_dir, pool) = dismissal_log().await;
+        let evidence = observed_tool_row(
+            &pool,
+            workspace.path(),
+            concerto_sessions::whiteboard::ToolOutcome::Ok,
+        )
+        .await;
+        let (coordinator, _store, session_id) = coordinator_with_store(
             bus.clone(),
             Arc::new(AgentRegistry::from_mocks(vec![])),
             vec![CoordinatorTurn::Text(String::new())],
             workspace.path(),
         )
         .await;
+        let mut coordinator = coordinator.with_review_store(Some(pool.clone()));
         let task = AgentTask::new(session_id, "build the thing");
         let context = AgentContext::new(concerto_core::types::SessionContext::new(
             session_id,
@@ -37504,7 +37795,11 @@ mod tests {
                 &CancellationToken::new(),
                 &mut scope,
                 &mut ledger,
-                &serde_json::json!({ "question_id": "q-evict-6", "reason": "moot" }),
+                &serde_json::json!({
+                    "question_id": "q-evict-6",
+                    "reason": "moot",
+                    "supporting_evidence_ids": [evidence.as_str()],
+                }),
             )
             .await;
         assert_eq!(result["outcome"], "dismissed", "the omitted id is dismissible: {result}");
@@ -37516,6 +37811,452 @@ mod tests {
             .find(|question| question.id == "q-evict-6")
             .expect("the entry is kept");
         assert_eq!(resolved.state, crate::world_model::QuestionState::Resolved);
+    }
+
+    // ── W2 (Q-DISMISS-KIND / Q-DISMISS-EVIDENCE): who may dismiss, and
+    //    what an allowed dismissal must cite ──────────────────────────────
+
+    /// One dismissal harness over a REAL log: a coordinator whose review
+    /// store is the pooled log (migrations applied), a temp workspace, and
+    /// the given questions standing in its model. The log guard is held for
+    /// the harness's lifetime so every cited row outlives the call.
+    struct DismissalHarness {
+        coordinator: CoordinatorAgent,
+        task: AgentTask,
+        context: AgentContext,
+        pool: sqlx::SqlitePool,
+        workspace: tempfile::TempDir,
+        _log: tempfile::TempDir,
+    }
+
+    impl DismissalHarness {
+        /// Run ONE `dismiss_question` call, returning its structured result
+        /// plus the ledger the call saw, so a refusal can be asserted to
+        /// have mirrored nothing.
+        async fn dismiss(
+            &mut self,
+            args: serde_json::Value,
+        ) -> (serde_json::Value, DispatchLedger) {
+            let mut graph = TaskGraph::new();
+            let mut ledger = DispatchLedger::default();
+            let mut scope = self.coordinator.fresh_checkpoint_scope(&self.task, &self.context);
+            let result = self
+                .coordinator
+                .handle_dismiss_question(
+                    &mut graph,
+                    &self.task,
+                    &self.context,
+                    &CancellationToken::new(),
+                    &mut scope,
+                    &mut ledger,
+                    &args,
+                )
+                .await;
+            (result, ledger)
+        }
+    }
+
+    /// The harness above with the questions standing open in the model.
+    async fn dismissal_harness(
+        questions: Vec<crate::world_model::UnresolvedQuestion>,
+    ) -> DismissalHarness {
+        let bus = EventBus::new(256);
+        let workspace = tempfile::tempdir().expect("tempdir for the dismissal harness");
+        let (_log, pool) = dismissal_log().await;
+        let (coordinator, _store, session_id) = coordinator_with_store(
+            bus,
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+            workspace.path(),
+        )
+        .await;
+        let mut coordinator = coordinator.with_review_store(Some(pool.clone()));
+        coordinator.world_model.questions = questions;
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        DismissalHarness { coordinator, task, context, pool, workspace, _log }
+    }
+
+    /// S1: a `BlockedPath` question answers `not_dismissable` naming the
+    /// observation that closes it. The citation below is genuine observed
+    /// evidence, so the refusal is unmistakably about the KIND, and it
+    /// journals/mirrors/resolves nothing.
+    #[tokio::test]
+    async fn dismiss_blocked_path_question_answers_not_dismissable() {
+        let mut harness = dismissal_harness(vec![standing_question_of(
+            "q-blocked",
+            true,
+            crate::world_model::QuestionKind::BlockedPath,
+            Some(0),
+        )])
+        .await;
+        let evidence = observed_tool_row(
+            &harness.pool,
+            harness.workspace.path(),
+            concerto_sessions::whiteboard::ToolOutcome::Ok,
+        )
+        .await;
+        let (result, ledger) = harness
+            .dismiss(serde_json::json!({
+                "question_id": "q-blocked",
+                "reason": "the path looks fine to me",
+                "supporting_evidence_ids": [evidence.as_str()],
+            }))
+            .await;
+        assert_refusal_untouched(
+            &result,
+            "not_dismissable",
+            "q-blocked",
+            &harness.coordinator,
+            &ledger,
+        );
+        assert!(
+            result["message"].as_str().is_some_and(|message| message.contains("observation")),
+            "the refusal names the observation that would close it: {result}"
+        );
+    }
+
+    /// S1: an `AmbiguousRecovery` question answers the same structured
+    /// refusal — its pending dispatch is verified, never judged away.
+    #[tokio::test]
+    async fn dismiss_ambiguous_recovery_question_answers_not_dismissable() {
+        let mut harness = dismissal_harness(vec![standing_question_of(
+            "q-ambiguous",
+            true,
+            crate::world_model::QuestionKind::AmbiguousRecovery,
+            Some(0),
+        )])
+        .await;
+        let evidence = observed_tool_row(
+            &harness.pool,
+            harness.workspace.path(),
+            concerto_sessions::whiteboard::ToolOutcome::Ok,
+        )
+        .await;
+        let (result, ledger) = harness
+            .dismiss(serde_json::json!({
+                "question_id": "q-ambiguous",
+                "reason": "it probably completed",
+                "supporting_evidence_ids": [evidence.as_str()],
+            }))
+            .await;
+        assert_refusal_untouched(
+            &result,
+            "not_dismissable",
+            "q-ambiguous",
+            &harness.coordinator,
+            &ledger,
+        );
+        assert!(
+            result["message"].as_str().is_some_and(|message| message.contains("observation")),
+            "the refusal names the observation that would close it: {result}"
+        );
+    }
+
+    /// S2 + S3: an allowed-kind dismissal citing NOTHING is refused with
+    /// `dismissal_requires_observed_evidence`, and the refusal journals no
+    /// decision, mirrors no ledger row, and resolves nothing.
+    #[tokio::test]
+    async fn dismiss_question_without_evidence_is_refused_and_changes_nothing() {
+        let mut harness = dismissal_harness(vec![standing_question("q-open", true)]).await;
+        let (result, ledger) = harness
+            .dismiss(serde_json::json!({
+                "question_id": "q-open",
+                "reason": "the provider fault is moot",
+            }))
+            .await;
+        assert_refusal_untouched(
+            &result,
+            "dismissal_requires_observed_evidence",
+            "q-open",
+            &harness.coordinator,
+            &ledger,
+        );
+        assert!(
+            result["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("at least one supporting evidence id")),
+            "the refusal names the count rule: {result}"
+        );
+    }
+
+    /// S2: a real `Finding` — an assertion, never an observation — is
+    /// refused even though the row exists in the log, and nothing moves.
+    #[tokio::test]
+    async fn dismiss_question_rejects_finding_evidence() {
+        let mut harness = dismissal_harness(vec![standing_question("q-open", true)]).await;
+        let finding = finding_row(&harness.pool).await;
+        let (result, ledger) = harness
+            .dismiss(serde_json::json!({
+                "question_id": "q-open",
+                "reason": "moot",
+                "supporting_evidence_ids": [finding.as_str()],
+            }))
+            .await;
+        assert_refusal_untouched(
+            &result,
+            "dismissal_requires_observed_evidence",
+            "q-open",
+            &harness.coordinator,
+            &ledger,
+        );
+        assert!(
+            result["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("not observed-class")),
+            "the refusal names the class rule: {result}"
+        );
+    }
+
+    /// S2 × W1: a real `ToolExecuted` row whose recorded outcome is `failed`
+    /// is not observed-class — the rule reads the W1 classification, not the
+    /// row's mere existence.
+    #[tokio::test]
+    async fn dismiss_question_rejects_failed_tool_evidence() {
+        let mut harness = dismissal_harness(vec![standing_question("q-open", true)]).await;
+        let failed = observed_tool_row(
+            &harness.pool,
+            harness.workspace.path(),
+            concerto_sessions::whiteboard::ToolOutcome::Failed,
+        )
+        .await;
+        let (result, ledger) = harness
+            .dismiss(serde_json::json!({
+                "question_id": "q-open",
+                "reason": "moot",
+                "supporting_evidence_ids": [failed.as_str()],
+            }))
+            .await;
+        assert_refusal_untouched(
+            &result,
+            "dismissal_requires_observed_evidence",
+            "q-open",
+            &harness.coordinator,
+            &ledger,
+        );
+        assert!(
+            result["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("not observed-class")),
+            "the refusal names the class rule: {result}"
+        );
+    }
+
+    /// S2: observed evidence that predates the question's first sighting is
+    /// refused with `dismissal_evidence_not_newer` — an answer from before
+    /// the question existed is no answer at all.
+    #[tokio::test]
+    async fn dismiss_question_rejects_evidence_older_than_the_question() {
+        let mut harness = dismissal_harness(vec![standing_question_of(
+            "q-late",
+            true,
+            crate::world_model::QuestionKind::OpenProblem,
+            Some(u64::MAX),
+        )])
+        .await;
+        let evidence = observed_tool_row(
+            &harness.pool,
+            harness.workspace.path(),
+            concerto_sessions::whiteboard::ToolOutcome::Ok,
+        )
+        .await;
+        let (result, ledger) = harness
+            .dismiss(serde_json::json!({
+                "question_id": "q-late",
+                "reason": "moot",
+                "supporting_evidence_ids": [evidence.as_str()],
+            }))
+            .await;
+        assert_refusal_untouched(
+            &result,
+            "dismissal_evidence_not_newer",
+            "q-late",
+            &harness.coordinator,
+            &ledger,
+        );
+        assert!(
+            result["message"].as_str().is_some_and(|message| message.contains("not newer")),
+            "the refusal names the freshness rule: {result}"
+        );
+    }
+
+    /// S2 acceptance: a `WriteApplied` row the REAL write gate recorded
+    /// AFTER the question opened justifies the dismissal — the decision
+    /// carries it and the ledger mirrors the resolution.
+    #[tokio::test]
+    async fn dismiss_question_accepts_newer_write_applied_evidence() {
+        let mut harness = dismissal_harness(vec![standing_question("q-open", true)]).await;
+        let gate = transfer_test_gate(harness.pool.clone(), harness.workspace.path()).await;
+        let write = observed_write_row(&gate, &format!("w2-{}", Ulid::new())).await;
+        let (result, ledger) = harness
+            .dismiss(serde_json::json!({
+                "question_id": "q-open",
+                "reason": "the write landed, the concern is moot",
+                "supporting_evidence_ids": [write.as_str()],
+            }))
+            .await;
+        assert_eq!(result["outcome"], "dismissed", "structured success: {result}");
+        assert_eq!(ledger.action_ledger.len(), 1, "the ledger mirrors the dismissal");
+        let dismissal = harness
+            .coordinator
+            .decision_journal
+            .entries()
+            .last()
+            .expect("the dismissal decision is journaled");
+        assert_eq!(
+            dismissal.supporting_evidence_ids,
+            vec![write],
+            "the decision carries the observed write"
+        );
+        let resolved = harness
+            .coordinator
+            .world_model
+            .questions
+            .iter()
+            .find(|question| question.id == "q-open")
+            .expect("the entry is kept");
+        assert_eq!(resolved.state, crate::world_model::QuestionState::Resolved);
+    }
+
+    /// S2 transition: an old checkpoint carries no first-sighting
+    /// coordinate, so freshness is relaxed — but the observed-class check
+    /// still binds, then observed evidence passes.
+    #[tokio::test]
+    async fn old_checkpoint_question_relaxes_freshness_but_not_class() {
+        let mut harness = dismissal_harness(vec![standing_question_of(
+            "q-legacy",
+            true,
+            crate::world_model::QuestionKind::OpenProblem,
+            None,
+        )])
+        .await;
+        let finding = finding_row(&harness.pool).await;
+        let (refusal, ledger) = harness
+            .dismiss(serde_json::json!({
+                "question_id": "q-legacy",
+                "reason": "moot",
+                "supporting_evidence_ids": [finding.as_str()],
+            }))
+            .await;
+        assert_refusal_untouched(
+            &refusal,
+            "dismissal_requires_observed_evidence",
+            "q-legacy",
+            &harness.coordinator,
+            &ledger,
+        );
+        let observed = observed_tool_row(
+            &harness.pool,
+            harness.workspace.path(),
+            concerto_sessions::whiteboard::ToolOutcome::Ok,
+        )
+        .await;
+        let (result, _ledger) = harness
+            .dismiss(serde_json::json!({
+                "question_id": "q-legacy",
+                "reason": "moot",
+                "supporting_evidence_ids": [observed.as_str()],
+            }))
+            .await;
+        assert_eq!(
+            result["outcome"], "dismissed",
+            "no coordinate means class check only: {result}"
+        );
+    }
+
+    /// S2 scope: dismissing one question leaves its sibling standing — a
+    /// dismissal resolves the question it names, never the model's other
+    /// open entries.
+    #[tokio::test]
+    async fn dismissing_one_question_leaves_its_sibling_open() {
+        let mut harness = dismissal_harness(vec![
+            standing_question_of(
+                "q-alpha",
+                true,
+                crate::world_model::QuestionKind::OpenProblem,
+                Some(0),
+            ),
+            standing_question_of(
+                "q-beta",
+                true,
+                crate::world_model::QuestionKind::OpenProblem,
+                Some(0),
+            ),
+        ])
+        .await;
+        let evidence = observed_tool_row(
+            &harness.pool,
+            harness.workspace.path(),
+            concerto_sessions::whiteboard::ToolOutcome::Ok,
+        )
+        .await;
+        let (result, _ledger) = harness
+            .dismiss(serde_json::json!({
+                "question_id": "q-alpha",
+                "reason": "moot",
+                "supporting_evidence_ids": [evidence.as_str()],
+            }))
+            .await;
+        assert_eq!(result["outcome"], "dismissed", "structured success: {result}");
+        let alpha = harness
+            .coordinator
+            .world_model
+            .questions
+            .iter()
+            .find(|question| question.id == "q-alpha")
+            .expect("the dismissed entry is kept");
+        assert_eq!(alpha.state, crate::world_model::QuestionState::Resolved);
+        let beta = harness
+            .coordinator
+            .world_model
+            .questions
+            .iter()
+            .find(|question| question.id == "q-beta")
+            .expect("the sibling is kept");
+        assert_eq!(beta.state, crate::world_model::QuestionState::Open, "the sibling is untouched");
+        assert!(beta.resolved_by.is_none());
+    }
+
+    /// S4: the tool surface and the dispatch prompt both state the evidence
+    /// rule, and the parameter stays schema-optional so the structured
+    /// refusals reach the model as instruction rather than schema noise.
+    #[test]
+    fn dismiss_tool_surface_requires_observed_evidence() {
+        let definition = dismiss_question_tool_definition();
+        let description = definition.description.as_str();
+        assert!(
+            description.contains("supporting evidence id"),
+            "the description names the rule: {description}"
+        );
+        assert!(
+            description.contains("outcome ok"),
+            "the observed classes are spelled out: {description}"
+        );
+        assert!(description.contains("question opened"), "freshness is stated: {description}");
+        let cited = &definition.parameters["properties"]["supporting_evidence_ids"]["description"];
+        let cited = cited.as_str().expect("the parameter is described");
+        assert!(cited.contains("write-applied"), "observed classes are spelled out: {cited}");
+        assert!(cited.contains("older ids are rejected"), "refusal is stated: {cited}");
+        assert_eq!(
+            definition.parameters["required"],
+            serde_json::json!(["question_id", "reason"]),
+            "evidence stays schema-optional so the structured error is read, not skipped"
+        );
+        assert!(
+            COORDINATOR_DISPATCH_PROMPT.contains("Evidence is required"),
+            "the prompt states the requirement"
+        );
+        assert!(
+            COORDINATOR_DISPATCH_PROMPT.contains("never observations"),
+            "the prompt names what never counts"
+        );
+        assert!(
+            COORDINATOR_DISPATCH_PROMPT.contains("not_dismissable"),
+            "the prompt names the kind refusal"
+        );
     }
 
     // ── Issue #61: artifact ownership — coordinator lifecycle wiring ────

@@ -391,6 +391,16 @@ pub struct UnresolvedQuestion {
     /// (BlockedPath).
     #[serde(default)]
     pub opened_ref: Option<String>,
+    /// The whiteboard `gate_seq` head of the event window at the question's
+    /// FIRST feed — its first-sighting coordinate (W2, Q-DISMISS-EVIDENCE):
+    /// a dismissal must cite at least one observed event recorded after it.
+    /// Set once when the entry is created; aging an open entry never moves
+    /// it, so it stays the coordinate of the sighting, not of the last
+    /// refresh. `None` for pre-W2 checkpoints (transitional) and for a feed
+    /// against an empty event window, which relaxes the dismissal rule to
+    /// the observed-class check alone. Additive serde (`default`).
+    #[serde(default)]
+    pub opened_gate_seq: Option<u64>,
     /// Unix ms when the question was first opened (the age anchor).
     #[serde(default)]
     pub opened_at_ms: i64,
@@ -2329,6 +2339,144 @@ fn apply_dismissal(question: &mut UnresolvedQuestion, dismissal: &CoordinatorDec
     question.cycles_open = 0;
 }
 
+/// W2 (Q-DISMISS-KIND): why `kind` refuses coordinator dismissal — or
+/// `None` when judgment may dismiss it.
+///
+/// Only `OpenProblem` and `MissingEvidence` exit through judgment: both ask
+/// something no observation in the run can settle on its own (a recovery
+/// nobody has produced, a corrected approach nobody has recorded), so the
+/// coordinator weighs them. `BlockedPath` and `AmbiguousRecovery` are
+/// answerable by observation — a fresh clean observation of the path, or a
+/// pending dispatch that is no longer ambiguous — so an observation they
+/// cannot be judged away: they answer a structured `not_dismissable`
+/// naming why instead. Pure and deterministic: the kind alone.
+#[must_use]
+pub fn dismissal_kind_refusal(kind: QuestionKind) -> Option<crate::decisions::DecisionRejection> {
+    match kind {
+        QuestionKind::OpenProblem | QuestionKind::MissingEvidence => None,
+        QuestionKind::BlockedPath => Some(crate::decisions::DecisionRejection {
+            code: "not_dismissable",
+            message: format!(
+                "a {kind:?} question is not dismissable: it resolves from observation, never \
+                 from judgment — a fresh clean observation of the blocked path supersedes the \
+                 standing dirt and closes it, so re-verify the path instead of dismissing"
+            ),
+        }),
+        QuestionKind::AmbiguousRecovery => Some(crate::decisions::DecisionRejection {
+            code: "not_dismissable",
+            message: format!(
+                "a {kind:?} question is not dismissable: it resolves from observation, never \
+                 from judgment — whether the pending dispatch completed is observed, not \
+                 decided, so verify the dispatch instead of dismissing"
+            ),
+        }),
+    }
+}
+
+/// W2 (Q-DISMISS-EVIDENCE): one cited dismissal-evidence id resolved against
+/// the whiteboard log — the shape the evidence rule reads. `kind` is `None`
+/// when the row is missing or carries a kind this build does not recognize;
+/// neither is ever observed-class.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CitedEvidence {
+    /// The cited event id, echoed in a refusal so the model can fix it.
+    pub id: String,
+    /// The recorded event kind, `None` for an unreadable or unknown row.
+    pub kind: Option<WhiteboardKind>,
+    /// The recorded global order coordinate (the log assigns it).
+    pub gate_seq: u64,
+    /// The W1-classified outcome of a `ToolExecuted` payload; the class
+    /// check reads it only for that kind.
+    pub outcome: ToolOutcome,
+}
+
+impl CitedEvidence {
+    /// W2 (Q-DISMISS-EVIDENCE): observed-class — a `WriteApplied`, or a
+    /// `ToolExecuted` whose recorded outcome is `ok`. `Finding`,
+    /// `Decision`, `DesignDoc` and every other kind are assertions or
+    /// records of judgment, never observations, so they never count as
+    /// dismissal evidence.
+    #[must_use]
+    pub fn is_observed(&self) -> bool {
+        match self.kind {
+            Some(WhiteboardKind::WriteApplied) => true,
+            Some(WhiteboardKind::ToolExecuted) => self.outcome == ToolOutcome::Ok,
+            _ => false,
+        }
+    }
+}
+
+/// W2 (Q-DISMISS-EVIDENCE): the evidence rule for a dismissal, evaluated
+/// pure over cited ids already resolved against the log: at least one id,
+/// every id observed-class ([`CitedEvidence::is_observed`]), and — when the
+/// question carries its first-sighting `opened_gate_seq` — at least one
+/// cited event NEWER than that coordinate. An old checkpoint's `None`
+/// relaxes ONLY the freshness clause; `cited = None` (the log could not be
+/// read) fails closed, so a dismissal never rides unverifiable evidence.
+/// Deterministic over its inputs: ids, kinds, outcomes, seqs.
+#[must_use]
+pub fn dismissal_evidence_refusal(
+    opened_gate_seq: Option<u64>,
+    cited: Option<&[CitedEvidence]>,
+) -> Option<crate::decisions::DecisionRejection> {
+    const CODE: &str = "dismissal_requires_observed_evidence";
+    let Some(cited) = cited else {
+        return Some(crate::decisions::DecisionRejection {
+            code: CODE,
+            message: "the cited evidence could not be verified against this run's whiteboard \
+                      log; cite a real observed event id from the context"
+                .to_owned(),
+        });
+    };
+    if cited.is_empty() {
+        return Some(crate::decisions::DecisionRejection {
+            code: CODE,
+            message: "dismiss_question requires at least one supporting evidence id: cite a \
+                      real write-applied or tool-executed (outcome ok) event recorded after \
+                      the question opened — a reason alone never dismisses a question"
+                .to_owned(),
+        });
+    }
+    let observed: Vec<&CitedEvidence> = cited.iter().filter(|entry| entry.is_observed()).collect();
+    if observed.is_empty() {
+        // Bounded echo (cites are already count/length-bounded upstream, and
+        // the message travels back to the model, never into the render).
+        let listed = cited
+            .iter()
+            .take(4)
+            .map(|entry| {
+                let kind = entry
+                    .kind
+                    .map_or_else(|| "unknown".to_owned(), |kind| kind.as_str().to_owned());
+                format!("{} ({kind})", entry.id)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(crate::decisions::DecisionRejection {
+            code: CODE,
+            message: format!(
+                "cited evidence [{listed}] is not observed-class: only a write-applied or a \
+                 tool-executed event with outcome ok counts — findings, decisions and design \
+                 docs are assertions, not observations; cite an observed event"
+            ),
+        });
+    }
+    if let Some(opened) = opened_gate_seq {
+        let newest = observed.iter().map(|entry| entry.gate_seq).max().unwrap_or(opened);
+        if newest <= opened {
+            return Some(crate::decisions::DecisionRejection {
+                code: "dismissal_evidence_not_newer",
+                message: format!(
+                    "the cited observed evidence is not newer than the question's first \
+                     sighting (opened at gate_seq {opened}, newest cited at gate_seq \
+                     {newest}); cite an event recorded after the question opened"
+                ),
+            });
+        }
+    }
+    None
+}
+
 /// The question lifecycle pass: resolve carried standing questions with
 /// fresh evidence, feed the current signals (deduping against open AND
 /// resolved entries), then cap both lists deterministically. Returns the
@@ -2337,6 +2485,14 @@ fn resolve_and_feed_questions(
     input: &WorldModelInput<'_>,
 ) -> (Vec<UnresolvedQuestion>, Vec<QuestionAgeMemory>) {
     let mut questions: Vec<UnresolvedQuestion> = input.previous_questions.clone();
+
+    // W2 (Q-DISMISS-EVIDENCE): the first-sighting coordinate a FRESHLY
+    // created entry stamps — the highest `gate_seq` in this window, the
+    // newest event the builder saw. Carried entries keep the coordinate
+    // their own first feed stamped (the anchor never moves on aging), and a
+    // window with no events yields `None`, the same relaxation an old
+    // checkpoint carries.
+    let window_head = input.events.iter().map(|event| event.gate_seq).max();
 
     // Journaled dismissals (Q-DISMISS): coordinator judgment recorded as
     // settled `DismissQuestion` decisions naming the question. First journal
@@ -2487,6 +2643,7 @@ fn resolve_and_feed_questions(
             Vec::new(),
             input.decisions.len(),
             None,
+            window_head,
             input.now_ms,
             diagnosis.decision_id.clone(),
             &remembered,
@@ -2515,6 +2672,7 @@ fn resolve_and_feed_questions(
             needed,
             index,
             None,
+            window_head,
             decision_time_ms(&decision.created_at).unwrap_or(input.now_ms),
             // The rejected decision IS the subject: only its reconsider
             // descendant (the Freeze payload names it) or settled work
@@ -2548,6 +2706,7 @@ fn resolve_and_feed_questions(
                 needed,
                 input.decisions.len(),
                 None,
+                window_head,
                 input.now_ms,
                 None,
                 &remembered,
@@ -2573,6 +2732,7 @@ fn resolve_and_feed_questions(
             vec![row.last_event_id.clone().unwrap_or_else(|| "unknown".to_owned())],
             input.decisions.len(),
             row.last_event_id.clone(),
+            window_head,
             input.now_ms,
             None,
             &remembered,
@@ -2652,9 +2812,11 @@ fn resolve_and_feed_questions(
 /// re-opening (Q-RESOLVE-STAY); otherwise the closure builds a fresh
 /// question, resuming at remembered age + 1 when the cap dropped it on an
 /// earlier cycle (Q-AGE-MEMORY) instead of restarting at 1.
-/// `opened_journal_len`/`opened_ref`/`opened_at_ms` differ per
-/// signal, so they arrive as plain parameters, as does the linkage subject
-/// (`subject_decision_id`, issue #135).
+/// `opened_journal_len`/`opened_ref`/`opened_gate_seq`/`opened_at_ms`
+/// differ per signal, so they arrive as plain parameters, as does the
+/// linkage subject (`subject_decision_id`, issue #135). The
+/// `opened_gate_seq` coordinate is stamped only on the fresh entry below —
+/// a standing entry keeps the coordinate of ITS first feed (W2).
 #[allow(clippy::too_many_arguments)]
 fn feed_or_advance(
     kind: QuestionKind,
@@ -2665,6 +2827,7 @@ fn feed_or_advance(
     needed: Vec<String>,
     opened_journal_len: usize,
     opened_ref: Option<String>,
+    opened_gate_seq: Option<u64>,
     opened_at_ms: i64,
     subject_decision_id: Option<String>,
     age_memory: &HashMap<String, u32>,
@@ -2687,6 +2850,7 @@ fn feed_or_advance(
         needed,
         opened_journal_len,
         opened_ref,
+        opened_gate_seq,
         opened_at_ms,
         cycles_open,
         state: QuestionState::Open,
@@ -3473,6 +3637,7 @@ mod tests {
                 needed: Vec::new(),
                 opened_journal_len: 0,
                 opened_ref: None,
+                opened_gate_seq: None,
                 subject_decision_id: None,
                 opened_at_ms: NOW_MS + 10 + index as i64,
                 cycles_open: 0,
@@ -3558,6 +3723,132 @@ mod tests {
             assert_eq!(standing.resolved_by, None);
             assert_eq!(standing.dismiss_reason, None);
         }
+    }
+
+    /// W2 (Q-DISMISS-KIND): only the two judgment kinds pass; the two
+    /// observation-answerable kinds refuse with a code and a reason that
+    /// names the observation that would close them. Pure over the kind.
+    #[test]
+    fn dismissal_kind_refusal_covers_only_judgment_kinds() {
+        for kind in [QuestionKind::OpenProblem, QuestionKind::MissingEvidence] {
+            assert_eq!(dismissal_kind_refusal(kind), None, "{kind:?} may be judged");
+        }
+        for kind in [QuestionKind::BlockedPath, QuestionKind::AmbiguousRecovery] {
+            let refusal = dismissal_kind_refusal(kind).expect("observation kinds refuse");
+            assert_eq!(refusal.code, "not_dismissable");
+            assert!(
+                refusal.message.contains("observation"),
+                "{kind:?} names why it cannot be judged away: {}",
+                refusal.message
+            );
+            assert!(refusal.message.contains(&format!("{kind:?}")));
+        }
+    }
+
+    /// W2 (Q-DISMISS-EVIDENCE): the observed-class rule — a `WriteApplied`
+    /// and a `ToolExecuted` with outcome `ok` count; a failed execution,
+    /// every assertion kind, and an unreadable row never do.
+    #[test]
+    fn dismissal_evidence_class_counts_only_observed_rows() {
+        let cited = |kind: Option<WhiteboardKind>, outcome| CitedEvidence {
+            id: "ev-1".to_owned(),
+            kind,
+            gate_seq: 7,
+            outcome,
+        };
+        assert!(cited(Some(WhiteboardKind::WriteApplied), ToolOutcome::Unknown).is_observed());
+        assert!(cited(Some(WhiteboardKind::ToolExecuted), ToolOutcome::Ok).is_observed());
+        assert!(!cited(Some(WhiteboardKind::ToolExecuted), ToolOutcome::Failed).is_observed());
+        assert!(!cited(None, ToolOutcome::Ok).is_observed(), "an unreadable row is never observed");
+        for kind in [WhiteboardKind::Finding, WhiteboardKind::Decision, WhiteboardKind::DesignDoc] {
+            assert!(
+                !cited(Some(kind), ToolOutcome::Ok).is_observed(),
+                "{kind:?} is an assertion, never an observation"
+            );
+        }
+    }
+
+    /// W2 (Q-DISMISS-EVIDENCE): the evidence rule over its inputs alone —
+    /// empty cites, non-class cites and unverifiable cites refuse; observed
+    /// cites newer than the opening coordinate pass; `None` coordinates
+    /// relax freshness only; every refusal names its own code.
+    #[test]
+    fn dismissal_evidence_refusal_rules_are_pure() {
+        let observed = |gate_seq| CitedEvidence {
+            id: "ev-ok".to_owned(),
+            kind: Some(WhiteboardKind::ToolExecuted),
+            gate_seq,
+            outcome: ToolOutcome::Ok,
+        };
+        let asserted = |gate_seq| CitedEvidence {
+            id: "ev-finding".to_owned(),
+            kind: Some(WhiteboardKind::Finding),
+            gate_seq,
+            outcome: ToolOutcome::Ok,
+        };
+
+        // Fail closed: an unreadable log never justifies a dismissal.
+        let unverifiable =
+            dismissal_evidence_refusal(Some(0), None).expect("no log means no dismissal");
+        assert_eq!(unverifiable.code, "dismissal_requires_observed_evidence");
+
+        // Count rule: no ids at all.
+        let empty = dismissal_evidence_refusal(Some(0), Some(&[])).expect("empty refuses");
+        assert_eq!(empty.code, "dismissal_requires_observed_evidence");
+        assert!(empty.message.contains("at least one supporting evidence id"));
+
+        // Class rule: only assertions cited, however recent.
+        let asserted_only = dismissal_evidence_refusal(Some(0), Some(&[asserted(99)]))
+            .expect("assertions never dismiss");
+        assert_eq!(asserted_only.code, "dismissal_requires_observed_evidence");
+        assert!(asserted_only.message.contains("not observed-class"));
+
+        // Freshness rule: observed, but from before the question opened.
+        let stale = dismissal_evidence_refusal(Some(10), Some(&[observed(10), observed(4)]))
+            .expect("nothing newer than the opening");
+        assert_eq!(stale.code, "dismissal_evidence_not_newer");
+
+        // Mixed citations: every id must be observed AND one must be newer.
+        let mixed = dismissal_evidence_refusal(Some(10), Some(&[asserted(99), observed(4)]))
+            .expect("a stale observed cite is still stale");
+        assert_eq!(mixed.code, "dismissal_evidence_not_newer");
+
+        // Acceptance: one observed id recorded after the opening coordinate.
+        assert_eq!(dismissal_evidence_refusal(Some(10), Some(&[observed(11)])), None);
+        assert_eq!(dismissal_evidence_refusal(Some(10), Some(&[asserted(99), observed(11)])), None);
+
+        // Transition: no coordinate relaxes freshness, never the class.
+        assert_eq!(dismissal_evidence_refusal(None, Some(&[observed(0)])), None);
+        assert_eq!(
+            dismissal_evidence_refusal(None, Some(&[asserted(99)]))
+                .expect("class still binds without a coordinate")
+                .code,
+            "dismissal_requires_observed_evidence"
+        );
+    }
+
+    /// W2: the first-sighting coordinate is additive serde — old checkpoints
+    /// load it as `None`, and a stamp survives the round trip untouched.
+    #[test]
+    fn opened_gate_seq_is_additive_serde() {
+        let old_json = serde_json::json!({
+            "id": "q-old",
+            "kind": "open-problem",
+            "question": "how does the run recover?",
+            "opened_journal_len": 0,
+            "opened_at_ms": NOW_MS,
+            "cycles_open": 1,
+            "state": "open",
+        });
+        let loaded: UnresolvedQuestion =
+            serde_json::from_value(old_json).expect("old checkpoints still load");
+        assert_eq!(loaded.opened_gate_seq, None, "the coordinate defaults away");
+
+        let stamped = UnresolvedQuestion { opened_gate_seq: Some(42), ..loaded };
+        let round_tripped: UnresolvedQuestion =
+            serde_json::from_value(serde_json::to_value(&stamped).expect("serializes"))
+                .expect("deserializes");
+        assert_eq!(round_tripped.opened_gate_seq, Some(42), "the coordinate survives the trip");
     }
 
     /// Q-AGE-MEMORY bound: no matter how many questions the open cap drops,
@@ -3717,6 +4008,7 @@ mod tests {
             needed: Vec::new(),
             opened_journal_len: 0,
             opened_ref: None,
+            opened_gate_seq: None,
             subject_decision_id: Some("d-x".to_owned()),
             opened_at_ms: NOW_MS,
             cycles_open: 1,
@@ -4506,6 +4798,7 @@ mod tests {
                 needed: vec![hostile.clone()],
                 opened_journal_len: 0,
                 opened_ref: None,
+                opened_gate_seq: None,
                 subject_decision_id: None,
                 opened_at_ms: 0,
                 cycles_open: 1,
