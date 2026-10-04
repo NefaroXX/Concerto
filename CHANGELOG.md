@@ -21,6 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Extension authorization and lifecycle:** runtime plugin discovery requires
+  persisted scope/TTL/binary approvals; startup avoids blocking async mutexes.
+  File/shell/HTTP host effects use shared policy and shared file diff/undo tracking, with
+  bounded guest memory and host output. MCP deadlines include lock/write waits,
+  launch environments exclude unrelated credentials, keychain references replace
+  plaintext tokens, and stop/drop terminates process groups/trees. Settings
+  preserves exact argument arrays and blocks disabled probes (ADR-79).
+
 - **Coordinator no longer fabricates a missing source.** A rename/move/edit of a
   named artifact that does not exist is now surfaced to the user instead of being
   satisfied by creating the file first (`caadb2d`, doctrine in `bc40806`).

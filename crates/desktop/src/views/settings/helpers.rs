@@ -216,12 +216,14 @@ pub(crate) fn delete_skill_pack(pack_dir: String) -> Result<String, String> {
 pub(crate) async fn probe_mcp_server(
     server: McpServerConfig,
 ) -> Result<Vec<McpToolDescriptor>, String> {
-    let timeout = server.timeout_secs.unwrap_or(60);
-    let env_pairs: Vec<(&str, &str)> = server
-        .env
-        .as_ref()
-        .map(|map| map.iter().map(|(key, value)| (key.as_str(), value.as_str())).collect())
-        .unwrap_or_default();
+    if !server.enabled {
+        return Err("Enable the server before testing its executable".into());
+    }
+    let timeout = server.timeout_secs.unwrap_or(60).clamp(1, 300);
+    let resolved =
+        server.resolved_env(&concerto_config::CredentialStore::new()).map_err(|e| e.to_string())?;
+    let env_pairs: Vec<(&str, &str)> =
+        resolved.iter().map(|(key, value)| (key.as_str(), value.expose())).collect();
 
     let mut client = concerto_mcp::McpClient::new(&server.id);
     if let Err(error) = client.spawn(&server.command, &server.args, &env_pairs).await {
@@ -351,9 +353,37 @@ pub(crate) async fn list_installed_plugins() -> Result<Vec<super::InstalledPlugi
             }
         };
         let id = manifest.as_ref().map(|m| m.id.clone()).unwrap_or_else(|| stem.clone());
-        let grants = cap_mgr.load_grants(&id, None);
-        let capability_summary =
-            grants.iter().map(|(d, _, _)| format!("{d:?}")).collect::<Vec<_>>().join(", ");
+        let binary_hash = concerto_plugins::loader::PluginLoader::read_wasm_bytes(&wasm_path)
+            .map(|bytes| concerto_plugins::capability::sha256_hex(&bytes))
+            .unwrap_or_default();
+        let grants = if binary_hash.is_empty() {
+            Vec::new()
+        } else {
+            cap_mgr.load_grants(&id, Some(&binary_hash))
+        };
+        let capability_summary = grants
+            .iter()
+            .map(|(d, scope, expiry)| {
+                let expires = i64::try_from(*expiry)
+                    .ok()
+                    .and_then(|stamp| time::OffsetDateTime::from_unix_timestamp(stamp).ok())
+                    .map(|time| {
+                        format!("{} {:02}:{:02} UTC", time.date(), time.hour(), time.minute())
+                    })
+                    .unwrap_or_else(|| "invalid timestamp".into());
+                let scope = scope
+                    .globs
+                    .iter()
+                    .chain(&scope.domains)
+                    .chain(&scope.allowlist)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let scope = if scope.is_empty() { "all, subject to host policy" } else { &scope };
+                format!("{d:?} ({scope}) — expires {expires}")
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
         installed.push(super::InstalledPluginInfo {
             id,
             name: manifest.as_ref().map(|m| m.name.clone()).unwrap_or_else(|| stem.clone()),
@@ -364,6 +394,7 @@ pub(crate) async fn list_installed_plugins() -> Result<Vec<super::InstalledPlugi
                 .unwrap_or_else(|| format!("Unreadable plugin at {}", wasm_path.display())),
             provides: manifest.as_ref().map(|m| provides_label(&m.provides)).unwrap_or_default(),
             capability_summary,
+            binary_hash,
             wasm_path,
             load_error,
         });
@@ -583,6 +614,20 @@ fn provides_label(provides: &[concerto_api_types::plugin::PluginProvides]) -> St
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Store the typed secret without persisting its plaintext in config or task results.
+pub(crate) async fn store_mcp_credential(
+    account: String,
+    secret: concerto_core::SecretString,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        concerto_config::CredentialStore::new().set(&account, secret.expose()).map_err(|_| {
+            "Could not store credential in the OS keychain; re-enter it and retry".to_string()
+        })
+    })
+    .await
+    .map_err(|_| "Credential storage task failed".to_string())?
 }
 
 #[cfg(test)]

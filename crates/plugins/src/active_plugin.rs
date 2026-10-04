@@ -100,6 +100,21 @@ impl ActivePlugin {
         op_name: &str,
         input: &serde_json::Value,
     ) -> Result<serde_json::Value, PluginError> {
+        let result = self.call_json_export_inner(export_name, op_name, input).await;
+        self.store.data_mut().cancel = None;
+        result
+    }
+    async fn call_json_export_inner(
+        &mut self,
+        export_name: &str,
+        op_name: &str,
+        input: &serde_json::Value,
+    ) -> Result<serde_json::Value, PluginError> {
+        if self.store.data().disabled {
+            return Err(PluginError::NotActive { id: self.manifest.id.clone() });
+        }
+        self.store.set_epoch_deadline(crate::host::PluginHost::EPOCH_DEADLINE);
+        self.store.data_mut().last_error = None;
         // Replenish fuel before each call to ensure fresh computation budget.
         // This prevents fuel exhaustion from accumulating across multiple calls.
         if let Err(e) = self.store.set_fuel(crate::host::PluginHost::MAX_FUEL) {
@@ -129,11 +144,23 @@ impl ActivePlugin {
         let scratch_ptr = self.store.data().scratch.ptr;
         let scratch_len = self.store.data().scratch.len;
 
-        let op_offset = scratch_len + 16;
-        let input_offset = op_offset + op_bytes.len() as i32 + 8;
+        let op_len = i32::try_from(op_bytes.len())
+            .map_err(|_| PluginError::MemoryViolation { ptr: 0, len: -1 })?;
+        let input_len = i32::try_from(input_bytes.len())
+            .map_err(|_| PluginError::MemoryViolation { ptr: 0, len: -1 })?;
+        let invalid = || PluginError::MemoryViolation { ptr: scratch_ptr, len: scratch_len };
+        if scratch_ptr < 0 || scratch_len < 0 || input_len > self.store.data().max_scratch_size {
+            return Err(invalid());
+        }
+        let op_offset = scratch_ptr
+            .checked_add(scratch_len)
+            .and_then(|n| n.checked_add(16))
+            .ok_or_else(invalid)?;
+        let input_offset =
+            op_offset.checked_add(op_len).and_then(|n| n.checked_add(8)).ok_or_else(invalid)?;
 
         let mem_size = mem.data(&self.store).len();
-        let needed = (input_offset + input_bytes.len() as i32) as usize;
+        let needed = input_offset.checked_add(input_len).ok_or_else(invalid)? as usize;
         if needed > mem_size {
             return Err(PluginError::MemoryViolation {
                 ptr: input_offset,
@@ -151,19 +178,22 @@ impl ActivePlugin {
             .get_typed_func::<(i32, i32, i32, i32, i32, i32), i64>(&mut self.store, export_name)
             .map_err(|_| PluginError::InvalidManifest(format!("missing {export_name} export")))?;
 
-        let result = func
-            .call_async(
-                &mut self.store,
-                (
-                    op_offset,
-                    op_bytes.len() as i32,
-                    input_offset,
-                    input_bytes.len() as i32,
-                    scratch_ptr,
-                    scratch_len,
-                ),
-            )
-            .await;
+        let cancel = self.store.data().cancel.clone().unwrap_or_default();
+        let execution = func.call_async(
+            &mut self.store,
+            (
+                op_offset,
+                op_bytes.len() as i32,
+                input_offset,
+                input_bytes.len() as i32,
+                scratch_ptr,
+                scratch_len,
+            ),
+        );
+        let result = tokio::select! {
+            _ = cancel.cancelled() => Err(anyhow::anyhow!(crate::host_fns::COMPLETION_CANCELLED)),
+            result = tokio::time::timeout(std::time::Duration::from_secs(crate::host::PluginHost::EPOCH_BUDGET_SECS), execution) => result.unwrap_or_else(|_| Err(anyhow::anyhow!("WASM call timed out"))),
+        };
 
         // M2: the caller's token was threaded into the store (via `set_cancel`)
         // for the duration of this wasm call. Reset it now, on BOTH the Ok and
@@ -180,10 +210,18 @@ impl ActivePlugin {
             return Err(PluginError::ToolCallFailed(err_msg));
         }
 
-        let (_ptr, len) = crate::guest_abi::unpack_ptr_len(result);
+        let (ptr, len) = crate::guest_abi::unpack_ptr_len(result);
+        if ptr != scratch_ptr
+            || len < 0
+            || len > scratch_len
+            || len > self.store.data().max_scratch_size
+        {
+            return Err(PluginError::MemoryViolation { ptr, len });
+        }
+        let end = scratch_ptr.checked_add(len).ok_or(PluginError::MemoryViolation { ptr, len })?;
         let output_bytes = mem
             .data(&self.store)
-            .get(scratch_ptr as usize..(scratch_ptr + len) as usize)
+            .get(scratch_ptr as usize..end as usize)
             .ok_or_else(|| PluginError::MemoryViolation { ptr: scratch_ptr, len })?;
 
         let output: serde_json::Value = serde_json::from_slice(output_bytes)

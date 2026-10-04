@@ -344,3 +344,137 @@ async fn drop_reaps_child_without_orphan() {
     );
     let _ = std::fs::remove_file(&pid_file);
 }
+
+/// Verifies a server that stops reading stdin cannot exceed the complete request deadline.
+#[tokio::test]
+async fn stalled_stdin_write_obeys_deadline() {
+    let mut client = spawn_initialized(&[("FIXTURE_STALL_STDIN", "1")]).await;
+    let request = client.request(
+        "fixture/stall",
+        json!({"payload":"x".repeat(2 * 1024 * 1024)}),
+        1,
+        CancellationToken::new(),
+    );
+    let result = tokio::time::timeout(std::time::Duration::from_secs(3), request)
+        .await
+        .expect("write deadline must fire");
+    assert!(matches!(result, Err(McpError::Timeout { .. })));
+    assert!(!client.connected(), "partial writes invalidate framing");
+    let _ = client.stop().await;
+}
+/// Verifies cancellation interrupts a blocked pipe write and terminates the transport.
+#[tokio::test]
+async fn stalled_stdin_write_obeys_cancellation() {
+    let mut client = spawn_initialized(&[("FIXTURE_STALL_STDIN", "1")]).await;
+    let cancel = CancellationToken::new();
+    let token = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        token.cancel();
+    });
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        client.request("fixture/stall", json!({"payload":"x".repeat(2 * 1024 * 1024)}), 60, cancel),
+    )
+    .await
+    .expect("cancel must interrupt writing");
+    assert!(matches!(result, Err(McpError::Cancelled)));
+    let _ = client.stop().await;
+}
+/// Verifies the tool deadline includes acquisition of a busy client mutex.
+#[tokio::test]
+async fn tool_timeout_includes_client_lock() {
+    let shared = Arc::new(Mutex::new(McpClient::new("locked")));
+    let _guard = shared.lock().await;
+    let tool = McpTool::new(
+        "locked".into(),
+        shared.clone(),
+        McpToolDescriptor { name: "echo".into(), description: None, input_schema: json!({}) },
+    );
+    let session = SessionContext::new(Ulid::new(), PathBuf::new());
+    let policy = SimplePolicyEngine::new(vec![], Arc::new(NoopAudit));
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tool.execute(json!({"timeout_secs":1}), &policy, &session, CancellationToken::new()),
+    )
+    .await
+    .expect("client lock has a deadline");
+    assert!(matches!(result, Err(ToolError::Timeout { .. })));
+}
+/// Verifies unconfigured provider credentials are absent from the server environment.
+#[tokio::test]
+async fn child_environment_excludes_unrelated_credentials() {
+    const KEY: &str = "CONCERTO_MCP_INHERITANCE_TEST_SECRET";
+    std::env::set_var(KEY, "synthetic-unrelated-secret");
+    let mut client = spawn_initialized(&[]).await;
+    std::env::remove_var(KEY);
+    let result = client
+        .request("fixture/env", json!({"key":KEY}), 5, CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(result["value"].is_null());
+    let _ = client.stop().await;
+}
+/// Verifies both teardown paths terminate workers even if the parent exits gracefully.
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn stop_and_drop_terminate_descendants() {
+    for stop in [true, false] {
+        let path = std::env::temp_dir()
+            .join(format!("concerto-mcp-worker-{}-{stop}", concerto_core::ids::Ulid::new()));
+        let filename = path.to_string_lossy().into_owned();
+        let mut client = spawn_initialized(&[("FIXTURE_CHILD_PID_FILE", &filename)]).await;
+        let mut pid = None;
+        for _ in 0..100 {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                pid = text.parse::<u32>().ok();
+                if pid.is_some() {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let _pid = pid.expect("worker starts");
+        let heartbeat = std::path::PathBuf::from(format!("{filename}.heartbeat"));
+        let initial = std::fs::read_to_string(&heartbeat).unwrap_or_default();
+        let mut alive = false;
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let beat = std::fs::read_to_string(&heartbeat).unwrap_or_default();
+            if !beat.is_empty() && beat != initial {
+                alive = true;
+                break;
+            }
+        }
+        assert!(alive, "fixture worker must make progress before teardown");
+        if stop {
+            client.stop().await.unwrap();
+        }
+        drop(client);
+        // Observe actual worker progress; virtualized /proc can misreport PID existence.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let stopped = std::fs::read_to_string(&heartbeat).unwrap_or_default();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            std::fs::read_to_string(&heartbeat).unwrap_or_default(),
+            stopped,
+            "worker survives {stop:?} teardown"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&heartbeat);
+    }
+}
+
+/// Verifies configured credentials are redacted from remote JSON-RPC diagnostic messages and data.
+#[tokio::test]
+async fn configured_credentials_are_redacted_from_diagnostics() {
+    let secret = "synthetic-diagnostic-token";
+    let mut client = spawn_initialized(&[("FIXTURE_TOKEN", secret)]).await;
+    let error = client
+        .request("fixture/diagnostics", json!({}), 5, CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(!error.to_string().contains(secret));
+    assert!(error.to_string().contains("[redacted]"));
+    let _ = client.stop().await;
+}

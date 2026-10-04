@@ -59,6 +59,7 @@ pub fn new_shared_plugin_manager() -> SharedPluginManager {
 /// Central plugin lifecycle manager.
 pub struct PluginManager {
     loader: PluginLoader,
+    manifests: HashMap<String, PluginManifest>,
     capability_manager: CapabilityManager,
     /// Active plugins keyed by plugin ID.
     active: HashMap<String, Arc<Mutex<ActivePlugin>>>,
@@ -99,6 +100,7 @@ impl PluginManager {
         loader.set_provider(provider);
         Self {
             loader,
+            manifests: HashMap::new(),
             capability_manager,
             active: HashMap::new(),
             status: HashMap::new(),
@@ -108,6 +110,25 @@ impl PluginManager {
             event_bus: None,
             audit: None,
         }
+    }
+
+    /// Invalidate previous-run handles before rebuilding grants and discovery.
+    pub async fn prepare_run(&mut self, context: crate::host::PluginHostContext) {
+        self.set_execution_context(context);
+        for plugin in self.active.values() {
+            let mut plugin = plugin.lock().await;
+            plugin.store.data_mut().disabled = true;
+            plugin.store.data_mut().granted_caps = GrantedCapabilities::new();
+        }
+        self.active.clear();
+        self.manifests.clear();
+        self.status.clear();
+        self.plugin_tools.clear();
+        self.resolved_grants.clear();
+    }
+
+    pub fn set_execution_context(&mut self, context: crate::host::PluginHostContext) {
+        self.loader.set_execution_context(context);
     }
 
     /// Attach an event bus for `PluginStateChanged` lifecycle events.
@@ -164,6 +185,7 @@ impl PluginManager {
         source: &std::path::Path,
         approval_ui: &dyn CapabilityApprovalUI,
     ) -> Result<LoadedPlugin, PluginError> {
+        self.capability_manager.reload()?;
         let loaded = match self.loader.load_from_bytes(wasm_bytes, source).await {
             Ok(loaded) => loaded,
             Err(error) => {
@@ -229,7 +251,7 @@ impl PluginManager {
             }
             let all_covered = loaded.manifest.capabilities_required.iter().all(|req| {
                 let disc: CapabilityDiscriminant = req.into();
-                persisted.iter().any(|(d, _, _)| *d == disc)
+                persisted.iter().any(|(d, scope, _)| *d == disc && *scope == req.into())
             });
             if all_covered {
                 tracing::info!(
@@ -254,13 +276,14 @@ impl PluginManager {
                 .await?;
 
             // Check if all required capabilities were granted.
-            let all_granted = decisions.iter().all(|d| {
-                matches!(
-                    d,
-                    crate::capability::GrantDecision::Granted
-                        | crate::capability::GrantDecision::GrantedPersistent
-                )
-            });
+            let all_granted = decisions.len() == loaded.manifest.capabilities_required.len()
+                && decisions.iter().all(|d| {
+                    matches!(
+                        d,
+                        crate::capability::GrantDecision::Granted
+                            | crate::capability::GrantDecision::GrantedPersistent
+                    )
+                });
             if !all_granted {
                 self.emit_state(
                     &loaded.manifest.id,
@@ -278,6 +301,17 @@ impl PluginManager {
                     "one or more required capabilities were denied".into(),
                 ));
             }
+            let hash = crate::capability::sha256_hex(wasm_bytes);
+            let mut caps = GrantedCapabilities::with_persistent(
+                &loaded.manifest.id,
+                self.capability_manager.load_grants(&loaded.manifest.id, Some(&hash)),
+            );
+            for (req, decision) in loaded.manifest.capabilities_required.iter().zip(&decisions) {
+                if matches!(decision, crate::capability::GrantDecision::Granted) {
+                    caps.grant_session(req.into(), req.into());
+                }
+            }
+            self.resolved_grants.insert(loaded.manifest.id.clone(), caps);
         }
 
         Ok(loaded)
@@ -296,9 +330,11 @@ impl PluginManager {
         // persisted grants without prompting, prefer those over the
         // (typically empty) caller-provided set. Consumed once so an
         // un-initialised plugin never lingers in the map.
-        let effective_caps =
+        let root = granted_caps.root_dir.clone();
+        let mut effective_caps =
             self.resolved_grants.remove(&loaded.manifest.id).unwrap_or(granted_caps);
-        let active = match self.loader.initialise(loaded, effective_caps).await {
+        effective_caps.root_dir = root;
+        let mut active = match self.loader.initialise(loaded, effective_caps).await {
             Ok(active) => active,
             Err(error) => {
                 // Init failures (including fuel/epoch exhaustion traps, which
@@ -324,13 +360,13 @@ impl PluginManager {
         let plugin_id = active.manifest.id.clone();
 
         // Track active plugin wrapped in Arc<Mutex> for tool registration.
-        let active = Arc::new(Mutex::new(active));
         // Thread the infra audit sink into the store so host-function
         // violations/disables are audited from inside the WASM host call.
         if let Some(audit) = self.audit.as_ref() {
-            active.blocking_lock().store.data_mut().audit_log = Some(audit.clone());
+            active.store.data_mut().audit_log = Some(audit.clone());
         }
-        self.active.insert(plugin_id.clone(), active);
+        self.manifests.insert(plugin_id.clone(), active.manifest.clone());
+        self.active.insert(plugin_id.clone(), Arc::new(Mutex::new(active)));
         self.status.insert(plugin_id.clone(), PluginStatus::Active);
         self.emit_state(&plugin_id, PluginState::Active, None);
 
@@ -354,10 +390,10 @@ impl PluginManager {
             .ok_or_else(|| PluginError::NotActive { id: plugin_id.to_string() })?;
 
         // Extract tool descriptors from provides.
-        let manifest = {
-            let active = plugin_arc.blocking_lock();
-            active.manifest.clone()
-        };
+        let manifest = self
+            .manifests
+            .get(plugin_id)
+            .ok_or_else(|| PluginError::NotActive { id: plugin_id.into() })?;
 
         let tools: Vec<_> = manifest
             .provides
@@ -419,11 +455,7 @@ impl PluginManager {
 
     /// Get info about an active plugin.
     pub fn get_plugin_info(&self, plugin_id: &str) -> Option<ActivePluginInfo> {
-        let plugin_arc = self.active.get(plugin_id)?;
-        let manifest = {
-            let active = plugin_arc.blocking_lock();
-            active.manifest.clone()
-        };
+        let manifest = self.manifests.get(plugin_id)?.clone();
         let status = self.status.get(plugin_id)?.clone();
         let tool_names = self.plugin_tools.get(plugin_id).cloned().unwrap_or_default();
 
@@ -448,6 +480,7 @@ impl PluginManager {
 
         // Remove from tracking.
         self.active.remove(plugin_id);
+        self.manifests.remove(plugin_id);
         self.status.remove(plugin_id);
         self.violations.remove(plugin_id);
         self.resolved_grants.remove(plugin_id);
@@ -467,6 +500,7 @@ impl PluginManager {
         self.revoke_grants_best_effort(plugin_id).await;
         self.plugin_tools.remove(plugin_id);
         self.active.remove(plugin_id);
+        self.manifests.remove(plugin_id);
         self.status.remove(plugin_id);
         self.violations.remove(plugin_id);
         self.resolved_grants.remove(plugin_id);
@@ -542,8 +576,7 @@ impl PluginManager {
     ///
     /// Already-active plugins are skipped. New plugins are initialised with the
     /// grants produced by `grant` — callers typically pass an empty set so
-    /// host functions stay fail-closed until a run re-initialises the plugin
-    /// with its run-scoped, auto-approved grant set. Tools are NOT registered
+    /// host functions stay fail-closed until an approved run context is bound. Tools are NOT registered
     /// here (there is no per-run registry at this point); the next agent run
     /// registers them. Returns the number of newly loaded plugins.
     pub async fn refresh_new_plugins(
@@ -554,7 +587,7 @@ impl PluginManager {
         let candidates = self.discover(config)?;
         let mut newly_loaded = 0;
         for candidate in &candidates {
-            let wasm_bytes = match std::fs::read(&candidate.wasm_path) {
+            let wasm_bytes = match PluginLoader::read_wasm_bytes(&candidate.wasm_path) {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     tracing::warn!(
@@ -567,7 +600,9 @@ impl PluginManager {
             };
             // The manifest id is only known after loading; a previously-loaded
             // plugin is then skipped so a refresh never displaces it.
-            let loaded = match self.loader.load_from_bytes(&wasm_bytes, &candidate.wasm_path).await
+            let loaded = match self
+                .load_plugin(&wasm_bytes, &candidate.wasm_path, &crate::capability::DenyUnapproved)
+                .await
             {
                 Ok(loaded) => loaded,
                 Err(error) => {
@@ -581,6 +616,7 @@ impl PluginManager {
             };
             let plugin_id = loaded.manifest.id.clone();
             if self.active.contains_key(&plugin_id) {
+                self.resolved_grants.remove(&plugin_id);
                 tracing::debug!(plugin_id, "plugin refresh: already active — skipping");
                 continue;
             }

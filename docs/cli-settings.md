@@ -119,8 +119,10 @@ concerto shell managed remove --yes
 ```
 
 MCP input files are flat records with `id`, `command`, optional `args`,
-`enabled`, `env`, `timeout_secs`. Skill create/edit accepts the shared full
-SkillManifest: id/name/version/description, optional instructions,
+`enabled`, `env`, `timeout_secs`. Credential-like `env` keys must be
+`keyring:<account>` references — plaintext credential values are rejected when
+the record is saved (see [mcp.md](mcp.md)). Skill create/edit accepts the
+shared full SkillManifest: id/name/version/description, optional instructions,
 instructions_path, tools/resources. SKILL.md-only edits remain file-based;
 removing a skill keeps recoverable manifest backups.
 

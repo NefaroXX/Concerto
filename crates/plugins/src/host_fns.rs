@@ -35,7 +35,7 @@ fn read_bytes(
     if ptr < 0 {
         return Err(PluginError::MemoryViolation { ptr, len });
     }
-    if len < 0 {
+    if len < 0 || len > caller.data().max_scratch_size {
         return Err(PluginError::MemoryViolation { ptr, len });
     }
     let start = ptr as usize;
@@ -158,10 +158,8 @@ fn handle_violation(caller: &mut Caller<'_, PluginStoreData>, capability: &str) 
 /// refused. Emission is detached and best-effort: a slow or broken sink can
 /// never affect the host call's outcome.
 ///
-/// `rt` is resolved by the caller rather than inside this function so the
-/// redirect callback — which runs on a blocking thread inside
-/// `spawn_blocking` — can still emit a row: the handle is captured before
-/// the offload and moved into the redirect closure.
+/// Initial and redirect refusals both carry sanitized URL facts. No userinfo,
+/// query, or fragment is recorded.
 fn emit_egress_audit(
     rt: Option<tokio::runtime::Handle>,
     audit: Option<Arc<dyn AuditLog>>,
@@ -181,7 +179,12 @@ fn emit_egress_audit(
         plugin_id,
         concerto_core::traits::policy::InfraVerdict::CapabilityDenied,
         "egress_denied",
-        format!("network egress to {url} denied: {detail}"),
+        format!(
+            "network egress to {} denied: {detail}",
+            concerto_core::types::PathPolicyFacts::for_url("get", &url)
+                .attempted_path
+                .unwrap_or_default()
+        ),
     );
     rt.spawn(async move {
         if let Err(error) = audit.record_infra(entry, concerto_core::CancellationToken::new()).await
@@ -204,99 +207,6 @@ fn check_event_allowed(
         return Err(PluginError::CapabilityDenied("EventEmit".into()));
     }
     Ok(())
-}
-
-fn shell_command(command: &str) -> std::process::Command {
-    #[cfg(windows)]
-    {
-        let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
-        let mut process = std::process::Command::new(shell);
-        process.arg("/D").arg("/S").arg("/C").arg(command);
-        process
-    }
-    #[cfg(not(windows))]
-    {
-        use std::os::unix::process::CommandExt;
-
-        let mut process = std::process::Command::new("sh");
-        process.arg("-c").arg(command);
-        // Isolate the plugin command in its own process group so timeout
-        // cleanup can terminate descendants as well as the shell process.
-        process.process_group(0);
-        process
-    }
-}
-
-fn terminate_process_tree(child_id: u32) {
-    #[cfg(windows)]
-    {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &child_id.to_string(), "/T", "/F"])
-            .status();
-    }
-    #[cfg(not(windows))]
-    {
-        use nix::sys::signal::{kill, Signal};
-        use nix::unistd::Pid;
-
-        // Negative pid targets the whole process group (the child is its
-        // own group leader via `process_group(0)`), killing descendants
-        // as well as the shell itself. A direct syscall — no subprocess
-        // spawn, which could itself stall under load.
-        let _ = kill(Pid::from_raw(-(child_id as i32)), Signal::SIGKILL);
-    }
-}
-
-fn execute_shell_with_timeout(
-    command: &str,
-    timeout: Duration,
-) -> std::io::Result<Option<std::process::Output>> {
-    use std::io::{Read, Seek};
-    use std::process::Stdio;
-    use std::sync::mpsc;
-
-    let mut stdout_file = tempfile::tempfile()?;
-    let mut stderr_file = tempfile::tempfile()?;
-    let mut child = shell_command(command)
-        .stdout(Stdio::from(stdout_file.try_clone()?))
-        .stderr(Stdio::from(stderr_file.try_clone()?))
-        .spawn()?;
-    let child_id = child.id();
-
-    // Block on a kernel-timer deadline (`recv_timeout`) instead of
-    // polling `try_wait` with short sleeps. A polling loop is fragile on
-    // a loaded machine: every scheduling stall stretches each iteration,
-    // so the deadline can be missed by seconds (observed in CI: 3.5s
-    // elapsed for a 100ms timeout). `recv_timeout` wakes exactly at the
-    // deadline and is reaped by the waiter thread.
-    let (done_tx, done_rx) = mpsc::channel::<std::io::Result<std::process::ExitStatus>>();
-    let waiter = std::thread::spawn(move || {
-        let status = child.wait();
-        let _ = done_tx.send(status);
-    });
-
-    let status = match done_rx.recv_timeout(timeout) {
-        Ok(Ok(status)) => status,
-        Ok(Err(error)) => return Err(error),
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            terminate_process_tree(child_id);
-            // The waiter thread reaps the child once it is dead.
-            let _ = waiter.join();
-            return Ok(None);
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            return Err(std::io::Error::other("shell waiter thread exited without a status"));
-        }
-    };
-    let _ = waiter.join();
-
-    stdout_file.rewind()?;
-    stderr_file.rewind()?;
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    stdout_file.read_to_end(&mut stdout)?;
-    stderr_file.read_to_end(&mut stderr)?;
-    Ok(Some(std::process::Output { status, stdout, stderr }))
 }
 
 // ── Individual host function implementations ────────────────────────
@@ -355,6 +265,25 @@ async fn host_resize_scratch(
     Ok(0)
 }
 
+async fn execute_host_tool(
+    caller: &Caller<'_, PluginStoreData>,
+    name: &str,
+    input: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let context = caller
+        .data()
+        .execution
+        .read()
+        .map_err(|_| anyhow::anyhow!("plugin execution context unavailable"))?
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("plugin host effects require an active agent run"))?;
+    let executor =
+        context.executor.upgrade().ok_or_else(|| anyhow::anyhow!("plugin agent run has ended"))?;
+    let cancel = caller.data().cancel.clone().unwrap_or_default();
+    let result = executor.execute(name, input, &context.session, cancel).await?;
+    Ok(result.data)
+}
+
 async fn host_read_file(
     mut caller: Caller<'_, PluginStoreData>,
     path_ptr: i32,
@@ -376,22 +305,16 @@ async fn host_read_file(
         }
         Err(e) => return Err(into_anyhow(e)),
     }
-    // std::fs is blocking; offload to a blocking thread so a slow filesystem
-    // cannot stall the wasmtime async executor (ADR-38 Decision 5).
-    // The closure must not touch `Caller`; only the collected `path_str` is
-    // moved in and the content comes back out.
-    let content =
-        match tokio::task::spawn_blocking(move || std::fs::read_to_string(&path_str)).await {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => {
-                caller.data_mut().last_error = Some(format!("read_file failed: {e}"));
-                return Ok(RESULT_ERROR);
-            }
-            Err(e) => {
-                caller.data_mut().last_error = Some(format!("read_file offload failed: {e}"));
-                return Ok(RESULT_ERROR);
-            }
-        };
+    let output = execute_host_tool(&caller, "filesystem", serde_json::json!({"operation":"read", "path":path_str, "max_bytes":caller.data().max_scratch_size})).await;
+    let content = match output {
+        Ok(output) => {
+            output.get("content").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned()
+        }
+        Err(error) => {
+            caller.data_mut().last_error = Some(error.to_string());
+            return Ok(RESULT_ERROR);
+        }
+    };
     caller.data_mut().scratch = ScratchBuffer { ptr: scratch_ptr, len: scratch_len };
     let result = write_to_scratch(&mut caller, content.as_bytes()).map_err(into_anyhow)?;
     Ok(result)
@@ -419,21 +342,98 @@ async fn host_write_file(
         Err(e) => return Err(into_anyhow(e)),
     }
     let content = read_bytes(&mut caller, content_ptr, content_len).map_err(into_anyhow)?;
-    // std::fs::write is blocking (ADR-38 Decision 5). Move the path and bytes
-    // into the offloaded closure; the `Caller` must not be touched inside.
-    match tokio::task::spawn_blocking(move || std::fs::write(&path_str, content)).await {
-        Ok(Ok(_)) => Ok(0),
-        Ok(Err(e)) => {
-            caller.data_mut().last_error = Some(format!("write_file failed: {e}"));
-            Ok(-1)
-        }
-        Err(e) => {
-            caller.data_mut().last_error = Some(format!("write_file offload failed: {e}"));
+    let content = String::from_utf8(content).map_err(|_| into_anyhow(PluginError::InvalidUtf8))?;
+    match execute_host_tool(
+        &caller,
+        "filesystem",
+        serde_json::json!({"operation":"write", "path":path_str, "content":content}),
+    )
+    .await
+    {
+        Ok(_) => Ok(0),
+        Err(error) => {
+            caller.data_mut().last_error = Some(error.to_string());
             Ok(-1)
         }
     }
 }
 
+/// One HTTP hop; the executor mediates each concrete URL, including redirects.
+struct HttpHostOperation {
+    max_bytes: usize,
+}
+#[async_trait::async_trait]
+impl concerto_core::traits::tool::Tool for HttpHostOperation {
+    fn name(&self) -> &str {
+        "http"
+    }
+    fn description(&self) -> &str {
+        "Plugin HTTP GET through shared policy"
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object"})
+    }
+    fn capability_requirements(&self) -> concerto_core::types::CapabilitySet {
+        Default::default()
+    }
+    fn path_facts(
+        &self,
+        input: &serde_json::Value,
+        _: &concerto_core::types::SessionContext,
+    ) -> Option<concerto_core::types::PathPolicyFacts> {
+        input
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .map(|url| concerto_core::types::PathPolicyFacts::for_url("get", url))
+    }
+    async fn execute(
+        &self,
+        input: serde_json::Value,
+        _: &dyn concerto_core::traits::PolicyEngine,
+        _: &concerto_core::types::SessionContext,
+        cancel: concerto_core::CancellationToken,
+    ) -> Result<concerto_core::types::ToolOutput, concerto_core::error::ToolError> {
+        use concerto_core::error::ToolError;
+        let fetch = async {
+            let url = input
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("missing URL"))?;
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(30))
+                .build()?;
+            let mut response = client.get(url).send().await?;
+            if response.status().is_redirection() {
+                let location = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|h| h.to_str().ok())
+                    .ok_or_else(|| anyhow::anyhow!("redirect missing Location"))?;
+                let next = response.url().join(location)?;
+                return Ok::<_, anyhow::Error>(concerto_core::types::ToolOutput {
+                    summary: "HTTP redirect".into(),
+                    data: serde_json::json!({"redirect":next.as_str()}),
+                });
+            }
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await? {
+                if chunk.len() > self.max_bytes.saturating_sub(body.len()) {
+                    return Err(anyhow::anyhow!("HTTP body exceeds plugin output limit"));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(concerto_core::types::ToolOutput {
+                summary: format!("HTTP {} bytes", body.len()),
+                data: serde_json::json!({"body":body}),
+            })
+        };
+        tokio::select! {
+            _ = cancel.cancelled() => Err(ToolError::Cancelled),
+            result = fetch => result.map_err(|_| ToolError::ExecutionFailed { message: "Plugin HTTP request failed".into() }),
+        }
+    }
+}
 async fn host_http_get(
     mut caller: Caller<'_, PluginStoreData>,
     url_ptr: i32,
@@ -441,99 +441,80 @@ async fn host_http_get(
     scratch_ptr: i32,
     scratch_len: i32,
 ) -> anyhow::Result<i64> {
-    use std::io::Read;
-    const HTTP_BODY_CAP: usize = 10 * 1024 * 1024;
-
     check_enabled(&caller).map_err(into_anyhow)?;
-    let url = read_string(&mut caller, url_ptr, url_len).map_err(into_anyhow)?;
-    // Capture the runtime handle up front: the redirect callback below runs
-    // on a blocking thread, where `Handle::try_current()` may be unavailable,
-    // yet a refused redirect must still be audited.
-    let rt = tokio::runtime::Handle::try_current().ok();
-    match check_url_allowed(&caller.data().granted_caps, &caller.data().plugin_id, &url) {
-        Ok(()) => {}
-        Err(PluginError::CapabilityDenied(detail)) => {
-            // Audit the refusal (naming the rule) before the generic
-            // violation accounting below, so the row records *what* egress
-            // was attempted and *which* rule refused it.
+    let mut url = read_string(&mut caller, url_ptr, url_len).map_err(into_anyhow)?;
+    if let Err(error) =
+        check_url_allowed(&caller.data().granted_caps, &caller.data().plugin_id, &url)
+    {
+        if let PluginError::CapabilityDenied(detail) = error {
             emit_egress_audit(
-                rt.clone(),
+                tokio::runtime::Handle::try_current().ok(),
                 caller.data().audit_log.clone(),
                 caller.data().plugin_id.clone(),
-                url.clone(),
+                url,
                 detail,
             );
             return Err(handle_violation(&mut caller, "NetworkOutbound"));
         }
-        Err(e) => return Err(into_anyhow(e)),
+        return Err(into_anyhow(error));
     }
-    let granted_caps = caller.data().granted_caps.clone();
-    let plugin_id = caller.data().plugin_id.clone();
-    let redirect_audit = caller.data().audit_log.clone();
-    let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
-        let target = attempt.url().as_str().to_string();
-        match check_url_allowed(&granted_caps, &plugin_id, &target) {
-            Ok(()) => attempt.follow(),
+    let context = caller
+        .data()
+        .execution
+        .read()
+        .map_err(|_| anyhow::anyhow!("plugin execution context unavailable"))?
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("HTTP requires an active agent run"))?;
+    let executor = context.executor.upgrade().ok_or_else(|| anyhow::anyhow!("agent run ended"))?;
+    let cancel = caller.data().cancel.clone().unwrap_or_default();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    for _ in 0..=10 {
+        match check_url_allowed(&caller.data().granted_caps, &caller.data().plugin_id, &url) {
+            Ok(()) => {}
             Err(PluginError::CapabilityDenied(detail)) => {
-                // A redirect is attacker-influenced egress: audit it the same
-                // way as a refused first-hop request, then fail the fetch.
                 emit_egress_audit(
-                    rt.clone(),
-                    redirect_audit.clone(),
-                    plugin_id.clone(),
-                    target,
-                    detail.clone(),
+                    tokio::runtime::Handle::try_current().ok(),
+                    caller.data().audit_log.clone(),
+                    caller.data().plugin_id.clone(),
+                    url,
+                    detail,
                 );
-                attempt.error(format!("redirect target refused by network egress filter: {detail}"))
+                return Err(handle_violation(&mut caller, "NetworkOutbound"));
             }
-            Err(error) => attempt.error(error.to_string()),
+            Err(error) => return Err(into_anyhow(error)),
         }
-    });
-
-    // `reqwest::blocking` is a blocking HTTP client; offload the whole fetch
-    // (client build + send + capped body read) to a blocking thread so it can
-    // never stall the wasmtime async executor (ADR-38 Decision 5). Everything
-    // the closure needs (`url`, redirect policy) is collected before offload;
-    // the `Caller` is not touched inside the closure.
-    let body_result = tokio::task::spawn_blocking(move || {
-        let client = reqwest::blocking::Client::builder()
-            .redirect(redirect_policy)
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|e| e.to_string())?;
-        let mut resp = client.get(&url).send().map_err(|e| e.to_string())?;
-        let mut body = Vec::with_capacity(HTTP_BODY_CAP.min(4096));
-        let mut buf = [0u8; 8192];
-        loop {
-            let n = resp.read(&mut buf).map_err(|e| e.to_string())?;
-            if n == 0 {
-                break;
+        let operation =
+            HttpHostOperation { max_bytes: caller.data().max_scratch_size.max(0) as usize };
+        let result = tokio::time::timeout_at(
+            deadline,
+            executor.execute_host_operation(
+                &operation,
+                serde_json::json!({"url":url}),
+                &context.session,
+                cancel.clone(),
+            ),
+        )
+        .await;
+        let output = match result {
+            Ok(Ok(output)) => output,
+            _ => {
+                caller.data_mut().last_error =
+                    Some("HTTP denied, cancelled, timed out, or exceeded its output limit".into());
+                return Ok(RESULT_ERROR);
             }
-            let remaining = HTTP_BODY_CAP.saturating_sub(body.len());
-            if remaining == 0 {
-                break;
-            }
-            let take = n.min(remaining);
-            body.extend_from_slice(&buf[..take]);
+        };
+        if let Some(next) = output.data.get("redirect").and_then(serde_json::Value::as_str) {
+            url = next.to_owned();
+            continue;
         }
-        Ok::<Vec<u8>, String>(body)
-    })
-    .await;
-
-    let body = match body_result {
-        Ok(Ok(body)) => body,
-        Ok(Err(e)) => {
-            caller.data_mut().last_error = Some(format!("http_get failed: {e}"));
-            return Err(into_anyhow(PluginError::Http(e)));
-        }
-        Err(e) => {
-            caller.data_mut().last_error = Some(format!("http_get offload failed: {e}"));
-            return Err(into_anyhow(PluginError::Http(e.to_string())));
-        }
-    };
-    caller.data_mut().scratch = ScratchBuffer { ptr: scratch_ptr, len: scratch_len };
-    let result = write_to_scratch(&mut caller, &body).map_err(into_anyhow)?;
-    Ok(result)
+        let body: Vec<u8> =
+            serde_json::from_value(output.data.get("body").cloned().unwrap_or_default())
+                .map_err(|_| anyhow::anyhow!("invalid HTTP body"))?;
+        caller.data_mut().scratch = ScratchBuffer { ptr: scratch_ptr, len: scratch_len };
+        return write_to_scratch(&mut caller, &body).map_err(into_anyhow);
+    }
+    caller.data_mut().last_error = Some("too many HTTP redirects".into());
+    Ok(RESULT_ERROR)
 }
 
 async fn host_shell_exec(
@@ -543,9 +524,6 @@ async fn host_shell_exec(
     scratch_ptr: i32,
     scratch_len: i32,
 ) -> anyhow::Result<i64> {
-    const SHELL_TIMEOUT_SECS: u64 = 30;
-    const SHELL_OUTPUT_CAP: usize = 10 * 1024 * 1024;
-
     check_enabled(&caller).map_err(into_anyhow)?;
     let cmd = read_string(&mut caller, cmd_ptr, cmd_len).map_err(into_anyhow)?;
     match check_shell_allowed(&caller.data().granted_caps, &caller.data().plugin_id, &cmd) {
@@ -556,42 +534,22 @@ async fn host_shell_exec(
         Err(e) => return Err(into_anyhow(e)),
     }
 
-    // Shell execution blocks on `recv_timeout`/`wait` (bounded to
-    // `SHELL_TIMEOUT_SECS`); offload it to a blocking thread so it cannot
-    // stall the wasmtime async executor (ADR-38 Decision 5). Only `cmd` and
-    // the duration are moved into the closure; the `Caller` is untouched.
-    let output = match tokio::task::spawn_blocking(move || {
-        execute_shell_with_timeout(&cmd, std::time::Duration::from_secs(SHELL_TIMEOUT_SECS))
-    })
+    let output = match execute_host_tool(
+        &caller,
+        "shell",
+        serde_json::json!({"command":cmd, "timeout_secs":30}),
+    )
     .await
     {
-        Ok(Ok(Some(output))) => output,
-        Ok(Ok(None)) => {
-            caller.data_mut().last_error = Some("shell execution timed out".into());
-            return Ok(RESULT_ERROR);
-        }
-        Ok(Err(error)) => {
-            caller.data_mut().last_error = Some(format!("shell execution failed: {error}"));
-            return Ok(RESULT_ERROR);
-        }
-        Err(e) => {
-            caller.data_mut().last_error = Some(format!("shell execution offload failed: {e}"));
+        Ok(output) => output,
+        Err(error) => {
+            caller.data_mut().last_error = Some(error.to_string());
             return Ok(RESULT_ERROR);
         }
     };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        caller.data_mut().last_error = Some(format!(
-            "shell exited with code {}: {}",
-            output.status.code().unwrap_or(-1),
-            stderr,
-        ));
-    }
-
-    let stdout = &output.stdout[..output.stdout.len().min(SHELL_OUTPUT_CAP)];
+    let stdout = output.get("stdout").and_then(serde_json::Value::as_str).unwrap_or_default();
     caller.data_mut().scratch = ScratchBuffer { ptr: scratch_ptr, len: scratch_len };
-    write_to_scratch(&mut caller, stdout).map_err(into_anyhow)
+    write_to_scratch(&mut caller, stdout.as_bytes()).map_err(into_anyhow)
 }
 
 async fn host_emit_event(
@@ -685,7 +643,13 @@ async fn host_completion(
     // `CancellationToken::default()` == `CancellationToken::new()` (tokio_util),
     // so a missing store token still yields a live, never-cancelled token.
     let cancel = caller.data().cancel.clone().unwrap_or_default();
-    let mut stream = match provider.stream_completion(request, cancel.clone()).await {
+    check_enabled(&caller).map_err(into_anyhow)?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let start = tokio::select! {
+        _ = cancel.cancelled() => Err(ProviderError::Cancelled),
+        result = tokio::time::timeout_at(deadline, provider.stream_completion(request, cancel.clone())) => result.unwrap_or_else(|_| Err(ProviderError::Cancelled)),
+    };
+    let mut stream = match start {
         Ok(s) => s,
         Err(ProviderError::Cancelled) => {
             caller.data_mut().last_error = Some(COMPLETION_CANCELLED.into());
@@ -697,7 +661,15 @@ async fn host_completion(
         }
     };
     let mut content = String::new();
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let next = tokio::select! {
+            _ = cancel.cancelled() => { caller.data_mut().last_error = Some(COMPLETION_CANCELLED.into()); return Ok(RESULT_ERROR); },
+            next = tokio::time::timeout_at(deadline, stream.next()) => match next {
+                Ok(next) => next,
+                Err(_) => { caller.data_mut().last_error = Some("completion timed out".into()); return Ok(RESULT_ERROR); }
+            }
+        };
+        let Some(chunk) = next else { break };
         // M1: observe cancellation on every iteration so a provider that
         // ignores the token cannot let a cancelled host call run on.
         if cancel.is_cancelled() {
@@ -715,6 +687,12 @@ async fn host_completion(
                 return Ok(RESULT_ERROR);
             }
         };
+        if chunk.delta.len()
+            > (caller.data().max_scratch_size.max(0) as usize).saturating_sub(content.len())
+        {
+            caller.data_mut().last_error = Some("completion exceeds plugin output limit".into());
+            return Ok(RESULT_ERROR);
+        }
         content.push_str(&chunk.delta);
     }
 
@@ -897,34 +875,4 @@ pub fn register_minimal_host_functions(
         .ok();
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn shell_timeout_returns_without_waiting_for_command_completion() {
-        // Deterministic check: the command writes a marker file only after
-        // finishing. The timeout must kill it well before that, so the
-        // marker must never appear. No wall-clock assertion — those flake
-        // under load (a 100ms timeout once took 3.5s of wall time on CI
-        // while the mechanism itself worked). `sleep 15` leaves huge
-        // headroom: even a multi-second scheduling stall cannot create
-        // the marker.
-        let marker = std::env::temp_dir()
-            .join(format!("concerto_shell_timeout_marker_{}", std::process::id()));
-        let _ = std::fs::remove_file(&marker);
-
-        #[cfg(windows)]
-        let command = format!("ping -n 16 127.0.0.1 >NUL && echo done > \"{}\"", marker.display());
-        #[cfg(not(windows))]
-        let command = format!("sleep 15 && touch \"{}\"", marker.display());
-
-        let output = execute_shell_with_timeout(&command, Duration::from_millis(100)).unwrap();
-
-        assert!(output.is_none(), "expected timeout, got: {output:?}");
-        assert!(!marker.exists(), "command must not complete before the timeout fires");
-        let _ = std::fs::remove_file(&marker);
-    }
 }

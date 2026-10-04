@@ -87,7 +87,7 @@ impl PluginInstaller {
                 ));
             }
         }
-        let wasm_bytes: Arc<[u8]> = Arc::from(std::fs::read(source)?);
+        let wasm_bytes: Arc<[u8]> = Arc::from(PluginLoader::read_wasm_bytes(source)?);
         // Size check before compiling so a huge file never reaches the engine.
         if wasm_bytes.len() > PluginHost::MAX_WASM_MODULE_SIZE {
             return Err(PluginError::InvalidManifest("module too large".into()));

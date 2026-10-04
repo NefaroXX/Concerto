@@ -289,12 +289,26 @@ pub fn view(state: &SharedPending) -> Option<Element<'static, Message>> {
     let mut cap_items: Vec<Element<'static, Message>> = Vec::new();
     for cap in &capabilities {
         let label = match cap {
-            CapabilityRequest::FilesystemRead { .. } => "\u{1f4d6} Read files".to_string(),
-            CapabilityRequest::FilesystemWrite { .. } => {
-                "\u{270f}\u{fe0f}  Write files".to_string()
-            }
-            CapabilityRequest::NetworkOutbound { .. } => "\u{1f310} Network access".to_string(),
-            CapabilityRequest::ShellExecute { .. } => "\u{26a1} Execute commands".to_string(),
+            CapabilityRequest::FilesystemRead { globs } => format!(
+                "Read files: {}",
+                if globs.is_empty() { "all workspace paths".into() } else { globs.join(", ") }
+            ),
+            CapabilityRequest::FilesystemWrite { globs } => format!(
+                "Write files: {}",
+                if globs.is_empty() { "all workspace paths".into() } else { globs.join(", ") }
+            ),
+            CapabilityRequest::NetworkOutbound { domains } => format!(
+                "Network: {}",
+                if domains.is_empty() { "all destinations".into() } else { domains.join(", ") }
+            ),
+            CapabilityRequest::ShellExecute { allowlist } => format!(
+                "Shell: {}",
+                if allowlist.is_empty() {
+                    "any command (broad native authority)".into()
+                } else {
+                    allowlist.join(", ")
+                }
+            ),
             CapabilityRequest::Other { description } => description.clone(),
             _ => "Unknown capability".to_string(),
         };
@@ -305,19 +319,15 @@ pub fn view(state: &SharedPending) -> Option<Element<'static, Message>> {
 
     let details = column![text("Capabilities requested:").size(16), cap_list,].spacing(8);
 
-    let grant_btn = button(text("Grant for this session"))
-        .style(crate::ui::button::primary)
-        .on_press(Message::GrantSession);
-
-    let persist_btn = button(text("Always allow"))
+    let persist_btn = button(text("Approve this binary for 30 days"))
         .style(crate::ui::button::primary)
         .on_press(Message::GrantAlways);
 
     let deny_btn = button(text("Deny")).style(crate::ui::button::danger).on_press(Message::Deny);
 
-    let buttons = row![deny_btn, grant_btn, persist_btn].spacing(10).padding(10);
+    let buttons = row![deny_btn, persist_btn].spacing(10).padding(10);
 
-    let content = column![header, desc, details, buttons].spacing(12).padding(24).width(460);
+    let content = column![header, desc, details, text("Approval is pinned to this binary and expires after 30 days. Host policy and shell restrictions still apply. Revoke it in Settings → Plugins."), buttons].spacing(12).padding(24).width(460);
 
     let surface = container(scrollable(content))
         .width(500)
