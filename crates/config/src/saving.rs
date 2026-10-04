@@ -1099,6 +1099,12 @@ name = "tdd"
         if is_root {
             return;
         }
+        // Windows does not honor the directory read-only bit for file
+        // creation, so the failure injection below cannot fail there.
+        // Skip on Windows; Unix coverage above exercises the atomicity path.
+        if cfg!(windows) {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("config.toml");
         let previous = "schema_version = 7\n[retry]\nfixed_delay_ms = 30000\n";
