@@ -3,13 +3,23 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use concerto_core::CancellationToken;
 use concerto_tools::diff::compute_diffs_from_virtual_fs;
 use concerto_tools::virtual_fs::VirtualFs;
 use iced::widget::text_editor;
 
-use super::{ActiveFold, Diagnostic, EditKind, HistoryEntry, Message, State, TabMode};
+use super::{
+    clamp_cursor, expand_all_in_text, lsp_did_save, trim_trailing_whitespace, ActiveFold,
+    Diagnostic, EditKind, HistoryEntry, Message, State, TabMode,
+};
+
+/// A dirty document that could not be written during a Save All.
+#[derive(Debug, Clone)]
+pub(crate) struct SaveFailure {
+    pub(crate) path: Utf8PathBuf,
+    pub(crate) message: String,
+}
 
 pub(crate) struct Buffer {
     content: text_editor::Content,
@@ -89,6 +99,133 @@ impl State {
         } else {
             self.buffers.get(path).is_some_and(|buffer| buffer.dirty)
         }
+    }
+
+    /// Paths of every tab with unsaved edits, active or in a background
+    /// buffer, in tab order. Used by the window-close guard so no unsaved
+    /// work is dropped silently.
+    pub(crate) fn dirty_files(&self) -> Vec<Utf8PathBuf> {
+        self.tabs.iter().filter(|path| self.tab_dirty(path)).cloned().collect()
+    }
+
+    /// Write every dirty document and report the ones that failed. An empty
+    /// result means every dirty document is now on disk.
+    ///
+    /// LSP `didSave` notifications are deliberately not scheduled here: the
+    /// only caller is the window-close guard, which exits immediately after a
+    /// clean save, so no editor session outlives the write.
+    pub(crate) fn save_all(
+        &mut self,
+        vfs: &Arc<Mutex<VirtualFs>>,
+        project_dir: &Utf8Path,
+        cancel: &CancellationToken,
+    ) -> Vec<SaveFailure> {
+        let mut failures = Vec::new();
+        for path in self.dirty_files() {
+            let result = if self.active_file.as_deref() == Some(path.as_path()) {
+                self.save_active(vfs, project_dir, cancel).map(|_task| ())
+            } else {
+                self.save_background(&path, vfs)
+            };
+            if let Err(message) = result {
+                failures.push(SaveFailure { path, message });
+            }
+        }
+        failures
+    }
+
+    /// Save the active document. Returns the LSP `didSave` task on success.
+    /// Mirrors the `Message::Save` arm so single-save and Save All agree.
+    pub(crate) fn save_active(
+        &mut self,
+        vfs: &Arc<Mutex<VirtualFs>>,
+        project_dir: &Utf8Path,
+        cancel: &CancellationToken,
+    ) -> Result<iced::Task<Message>, String> {
+        // Expand folds first so placeholders never reach disk.
+        self.expand_intersecting(0, usize::MAX);
+        let Some(path) = self.active_file.clone() else {
+            return Ok(iced::Task::none());
+        };
+        let text = {
+            let Some(content) = self.content.as_mut() else {
+                return Ok(iced::Task::none());
+            };
+            let mut text = content.text();
+            if self.trim_trailing_on_save {
+                let trimmed = trim_trailing_whitespace(&text);
+                if trimmed != text {
+                    // Rebuild content with the trimmed text, keeping the
+                    // cursor at a clamped equivalent position.
+                    let cursor = content.cursor();
+                    *content = text_editor::Content::with_text(&trimmed);
+                    let clamped =
+                        clamp_cursor(content, cursor.position.line, cursor.position.column);
+                    content.move_to(clamped);
+                    text = trimmed;
+                }
+            }
+            text
+        };
+        std::fs::write(path.as_std_path(), &text).map_err(|error| error.to_string())?;
+        self.dirty = false;
+        self.line_ending = if text.contains("\r\n") { "CRLF" } else { "LF" };
+        // Disk is now authoritative: drop any staged VFS entry so the next
+        // open_file() reads the just-saved content instead of shadowing it
+        // with stale staged text.
+        if let Ok(mut guard) = vfs.lock() {
+            guard.unstage(&path);
+        }
+        self.refresh_staged(vfs);
+        // Some language servers gate a full diagnostics pass on didSave;
+        // didChange alone can leave diagnostics stale.
+        let project_dir = project_dir.to_path_buf();
+        let cancel = cancel.clone();
+        let file_path = path.clone();
+        let task = iced::Task::perform(
+            async move { lsp_did_save(project_dir, file_path, text, cancel).await },
+            |result| match result {
+                Ok(()) => Message::LspReady,
+                Err(error) => Message::LspError(error),
+            },
+        );
+        Ok(self.scope_task(task, false))
+    }
+
+    /// Save a background document without disturbing the active buffer. Folds
+    /// are expanded before the write so placeholders never reach disk.
+    fn save_background(
+        &mut self,
+        path: &Utf8Path,
+        vfs: &Arc<Mutex<VirtualFs>>,
+    ) -> Result<(), String> {
+        let trim = self.trim_trailing_on_save;
+        let Some(buffer) = self.buffers.get_mut(path) else {
+            return Ok(());
+        };
+        if !buffer.dirty {
+            return Ok(());
+        }
+        let mut text = buffer.content.text();
+        if !buffer.folds.is_empty() {
+            text = expand_all_in_text(&text, &buffer.folds);
+            buffer.folds.clear();
+        }
+        if trim {
+            text = trim_trailing_whitespace(&text);
+        }
+        std::fs::write(path.as_std_path(), &text).map_err(|error| error.to_string())?;
+        // Keep the in-memory buffer consistent with what reached disk.
+        let cursor = buffer.content.cursor();
+        buffer.content = text_editor::Content::with_text(&text);
+        let clamped = clamp_cursor(&buffer.content, cursor.position.line, cursor.position.column);
+        buffer.content.move_to(clamped);
+        buffer.dirty = false;
+        buffer.line_ending = if text.contains("\r\n") { "CRLF" } else { "LF" };
+        if let Ok(mut guard) = vfs.lock() {
+            guard.unstage(path);
+        }
+        Ok(())
     }
 
     pub(crate) fn close_tab(

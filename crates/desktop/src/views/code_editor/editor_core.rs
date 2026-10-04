@@ -10,11 +10,11 @@ use concerto_tools::virtual_fs::VirtualFs;
 use super::helpers::{lsp_position, utf16_col_to_byte};
 use super::{
     clamp_cursor, classify_edit, compute_fold_regions, continuation_prefix, cursor_byte_offset,
-    find_word_span, fold_regions_in_text, lsp_did_save, lsp_get_diagnostics,
-    lsp_request_completion, lsp_request_definition, lsp_request_hover, map_line_on_fold,
-    offset_to_line_col, outermost_regions, selection_line_range, should_snapshot,
-    trim_trailing_whitespace, EditKind, Message, State, DIAG_PANE_MAX_SHARE, DIAG_PANE_MIN_SHARE,
-    GOTO_INPUT_ID, TREE_PANE_MAX_RATIO, TREE_PANE_MIN_RATIO,
+    find_word_span, fold_regions_in_text, lsp_get_diagnostics, lsp_request_completion,
+    lsp_request_definition, lsp_request_hover, map_line_on_fold, offset_to_line_col,
+    outermost_regions, selection_line_range, should_snapshot, EditKind, Message, State,
+    DIAG_PANE_MAX_SHARE, DIAG_PANE_MIN_SHARE, GOTO_INPUT_ID, TREE_PANE_MAX_RATIO,
+    TREE_PANE_MIN_RATIO,
 };
 use crate::widgets::confirm_modal::ConfirmModal;
 use crate::widgets::file_tree;
@@ -195,55 +195,12 @@ impl State {
             // before it ever reaches the editor state (the window pixels
             // live above this view). Arm kept only for exhaustiveness.
             Message::TakeScreenshot => iced::Task::none(),
-            Message::Save => {
-                // Expand folds first so placeholders never reach disk.
-                self.expand_intersecting(0, usize::MAX);
-                let Some(path) = self.active_file.clone() else {
-                    return iced::Task::none();
-                };
-                let Some(content) = &mut self.content else {
-                    return iced::Task::none();
-                };
-                let mut text = content.text();
-                if self.trim_trailing_on_save {
-                    let trimmed = trim_trailing_whitespace(&text);
-                    if trimmed != text {
-                        // Rebuild content with the trimmed text, keeping
-                        // the cursor at a clamped equivalent position.
-                        let cursor = content.cursor();
-                        *content = text_editor::Content::with_text(&trimmed);
-                        let clamped =
-                            clamp_cursor(content, cursor.position.line, cursor.position.column);
-                        content.move_to(clamped);
-                        text = trimmed;
-                    }
+            Message::Save => match self.save_active(vfs, project_dir, cancel) {
+                Ok(task) => task,
+                Err(error) => {
+                    iced::Task::done(Message::LspError(format!("Failed to save: {error}")))
                 }
-                if let Err(e) = std::fs::write(path.as_std_path(), &text) {
-                    return iced::Task::done(Message::LspError(format!("Failed to save: {e}")));
-                }
-                self.dirty = false;
-                self.line_ending = if text.contains("\r\n") { "CRLF" } else { "LF" };
-                // Disk is now authoritative: drop any staged VFS entry so the
-                // next open_file() reads the just-saved content instead of
-                // shadowing it with stale staged text.
-                if let Ok(mut guard) = vfs.lock() {
-                    guard.unstage(&path);
-                }
-                self.refresh_staged(vfs);
-                // Some language servers gate a full diagnostics pass on
-                // didSave; didChange alone can leave diagnostics stale.
-                let project_dir = project_dir.to_path_buf();
-                let cancel = cancel.clone();
-                let file_path = path.clone();
-                let task = iced::Task::perform(
-                    async move { lsp_did_save(project_dir, file_path, text, cancel).await },
-                    |result| match result {
-                        Ok(()) => Message::LspReady,
-                        Err(e) => Message::LspError(e),
-                    },
-                );
-                self.scope_task(task, false)
-            }
+            },
             Message::NewFile => {
                 // In a full implementation, this would open a dialog.
                 // For now, create a file named "new_file.rs" in the project root.

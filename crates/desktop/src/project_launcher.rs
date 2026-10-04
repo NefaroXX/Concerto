@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use camino::Utf8PathBuf;
 use concerto_config::projects::ProjectRegistry;
 use concerto_core::helpers::canonical_project_path;
 use iced::widget::{button, column, container, row, scrollable, stack, text, Column};
@@ -25,6 +26,13 @@ pub enum Message {
     /// (the run settled, or the bounded window lapsed) — the process may
     /// exit now.
     ExitAfterGracefulStop,
+    /// Window-close guard: write every dirty editor buffer, then continue
+    /// the close only when every write succeeded.
+    ExitGuardSaveAll,
+    /// Window-close guard: drop all unsaved edits and continue the close.
+    ExitGuardDiscardAll,
+    /// Window-close guard: abort the close and keep editing.
+    ExitGuardCancel,
     /// ADR-44 §4: user allowed opening the pending out-of-root first project
     /// (for the process lifetime). Proceeds to create the app.
     RootConsentAllow,
@@ -40,6 +48,29 @@ pub enum Message {
 /// headless from the evidence chain). The desktop executor's own shutdown
 /// grace (750 ms) only reaps already-finished tasks after this wait.
 const GRACEFUL_SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Unsaved editor documents that block a window close until the user chooses
+/// Save All / Discard All / Cancel. Dirty buffers can live in background tabs,
+/// so they are invisible from the active document alone.
+struct ExitGuard {
+    /// Dirty documents, in tab order, shown in the modal.
+    dirty: Vec<Utf8PathBuf>,
+    /// Last Save All failure summary, if any.
+    error: Option<String>,
+}
+
+/// What a window-close request should do next. Dirty editor buffers take
+/// precedence over the ADR-60 D7 run-cancel wait: unsaved work must be
+/// resolved before any close path runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseDecision {
+    /// Exit immediately (no project open, or no run in flight).
+    Exit,
+    /// Cancel the run and wait, bounded, before exiting.
+    WaitForRun,
+    /// Block the close behind the dirty-buffer guard.
+    Guard,
+}
 
 /// Top-level desktop state. The full application is only created after a
 /// project has been chosen, unless reopening the last project is explicitly
@@ -60,6 +91,9 @@ pub struct DesktopApp {
     /// at startup plus every canonical path allowed for this process. Empty =
     /// roots unset = no gating.
     effective_roots: Vec<PathBuf>,
+    /// Active window-close guard, if the user tried to close with unsaved
+    /// editor buffers. `None` means no close is pending.
+    exit_guard: Option<ExitGuard>,
 }
 
 impl DesktopApp {
@@ -102,6 +136,7 @@ impl DesktopApp {
                     error,
                     pending_root_consent: None,
                     effective_roots,
+                    exit_guard: None,
                 },
                 task.map(Message::App),
             );
@@ -116,6 +151,7 @@ impl DesktopApp {
                 error,
                 pending_root_consent: None,
                 effective_roots,
+                exit_guard: None,
             },
             Task::none(),
         )
@@ -178,49 +214,53 @@ impl DesktopApp {
                 }
                 Task::none()
             }
-            Message::CloseRequested => {
-                // ADR-60 D7 (interrupt-safe resume): a close with a run in
-                // flight cancels it and waits, bounded, for the run to
-                // settle — the coordinator's cancel path persists the
-                // interrupted (completed=0) checkpoint BEFORE
-                // `run_shared_agent` returns, so a settled epoch bump implies
-                // durable resumable state. Exiting over the run (the previous
-                // behavior) was the desktop's hard-kill: the executor drops
-                // its runtime 750 ms after exit and nothing lands.
-                let Some(app) = self.app.as_ref() else {
-                    // No project open: nothing can be running — exit as
-                    // before.
-                    return iced::exit();
+            Message::CloseRequested => match self.close_decision() {
+                CloseDecision::Guard => {
+                    // Unsaved editor buffers survive in background tabs, so a
+                    // window close must not silently drop them. Block the
+                    // exit behind a Save All / Discard All / Cancel decision.
+                    if let Some(app) = self.app.as_ref() {
+                        let dirty = app.editor.dirty_files();
+                        self.exit_guard = Some(ExitGuard { dirty, error: None });
+                    }
+                    Task::none()
+                }
+                CloseDecision::Exit | CloseDecision::WaitForRun => self.begin_close(),
+            },
+            Message::ExitAfterGracefulStop => iced::exit(),
+            Message::ExitGuardSaveAll => {
+                let Some(current) = self.app.as_mut() else {
+                    self.exit_guard = None;
+                    return Task::none();
                 };
-                let running = app.is_run_active();
-                let settle = app.run_settle_epoch();
-                app.cancel_token.cancel();
-                if !running {
-                    iced::exit()
+                let project_dir = Utf8PathBuf::from_path_buf(current.project_dir.clone())
+                    .unwrap_or_else(|path| Utf8PathBuf::from(path.to_string_lossy().as_ref()));
+                let app::App { editor, vfs, cancel_token, .. } = current;
+                let failures = editor.save_all(vfs, &project_dir, cancel_token);
+                if failures.is_empty() {
+                    self.exit_guard = None;
+                    self.begin_close()
                 } else {
-                    Task::perform(
-                        async move {
-                            let start = settle.load(std::sync::atomic::Ordering::Acquire);
-                            let deadline = tokio::time::Instant::now() + GRACEFUL_SHUTDOWN_WAIT;
-                            loop {
-                                if settle.load(std::sync::atomic::Ordering::Acquire) != start {
-                                    return;
-                                }
-                                if tokio::time::Instant::now() >= deadline {
-                                    tracing::warn!(
-                                        "window closed while a run was active; the \
-                                         graceful-stop window lapsed before the run settled"
-                                    );
-                                    return;
-                                }
-                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                            }
-                        },
-                        |()| Message::ExitAfterGracefulStop,
-                    )
+                    let detail = failures
+                        .iter()
+                        .map(|failure| format!("{}: {}", failure.path, failure.message))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    if let Some(guard) = self.exit_guard.as_mut() {
+                        guard.error =
+                            Some(format!("Could not save {} file(s): {detail}", failures.len()));
+                    }
+                    Task::none()
                 }
             }
-            Message::ExitAfterGracefulStop => iced::exit(),
+            Message::ExitGuardDiscardAll => {
+                self.exit_guard = None;
+                self.begin_close()
+            }
+            Message::ExitGuardCancel => {
+                self.exit_guard = None;
+                Task::none()
+            }
             Message::RootConsentAllow => {
                 let Some(canonical) = self.pending_root_consent.take() else {
                     return Task::none();
@@ -241,6 +281,63 @@ impl DesktopApp {
         }
     }
 
+    /// Decide how a window-close request is handled. Pure so the exit-guard
+    /// precedence is unit-testable without an iced runtime.
+    fn close_decision(&self) -> CloseDecision {
+        let Some(app) = self.app.as_ref() else {
+            return CloseDecision::Exit;
+        };
+        if !app.editor.dirty_files().is_empty() {
+            return CloseDecision::Guard;
+        }
+        if app.is_run_active() {
+            CloseDecision::WaitForRun
+        } else {
+            CloseDecision::Exit
+        }
+    }
+
+    /// ADR-60 D7 (interrupt-safe resume): a close with a run in flight cancels
+    /// it and waits, bounded, for the run to settle — the coordinator's cancel
+    /// path persists the interrupted (completed=0) checkpoint BEFORE
+    /// `run_shared_agent` returns, so a settled epoch bump implies durable
+    /// resumable state. Exiting over the run (the previous behavior) was the
+    /// desktop's hard-kill: the executor drops its runtime 750 ms after exit
+    /// and nothing lands.
+    fn begin_close(&mut self) -> Task<Message> {
+        let Some(app) = self.app.as_ref() else {
+            // No project open: nothing can be running — exit as before.
+            return iced::exit();
+        };
+        let running = app.is_run_active();
+        let settle = app.run_settle_epoch();
+        app.cancel_token.cancel();
+        if !running {
+            iced::exit()
+        } else {
+            Task::perform(
+                async move {
+                    let start = settle.load(std::sync::atomic::Ordering::Acquire);
+                    let deadline = tokio::time::Instant::now() + GRACEFUL_SHUTDOWN_WAIT;
+                    loop {
+                        if settle.load(std::sync::atomic::Ordering::Acquire) != start {
+                            return;
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            tracing::warn!(
+                                "window closed while a run was active; the \
+                                 graceful-stop window lapsed before the run settled"
+                            );
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                },
+                |()| Message::ExitAfterGracefulStop,
+            )
+        }
+    }
+
     pub fn view(&self) -> Element<'_, Message> {
         let base = if self.chooser_open {
             self.project_chooser()
@@ -251,22 +348,89 @@ impl DesktopApp {
                 .unwrap_or_else(|| self.project_chooser())
         };
 
+        let mut layered = base;
+
         // ADR-44 §4: overlay the consent gate over the chooser for the first
         // out-of-root open. Composed like the app-side system dialogs: a
         // centered modal card over a semi-transparent palette backdrop.
-        let Some(pending) = &self.pending_root_consent else {
-            return base;
-        };
-        let modal = container(root_consent::consent_card(
-            pending,
-            &self.theme(),
-            Message::RootConsentAllow,
-            Message::RootConsentDeny,
-        ))
-        .width(Length::FillPortion(2))
-        .height(Length::FillPortion(2))
-        .style(crate::ui::container::modal);
-        let backdrop = container(modal)
+        if let Some(pending) = &self.pending_root_consent {
+            let modal = container(root_consent::consent_card(
+                pending,
+                &self.theme(),
+                Message::RootConsentAllow,
+                Message::RootConsentDeny,
+            ))
+            .width(Length::FillPortion(2))
+            .height(Length::FillPortion(2))
+            .style(crate::ui::container::modal);
+            let backdrop = container(modal)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .style(|theme: &iced::Theme| container::Style {
+                    background: Some(iced::Background::Color(iced::Color {
+                        a: 0.55,
+                        ..theme.palette().background
+                    })),
+                    ..container::Style::default()
+                });
+            layered = stack![layered, backdrop].into();
+        }
+
+        // Window-close guard sits above every other surface: an unresolved
+        // close is a modal decision.
+        if let Some(guard) = &self.exit_guard {
+            layered = stack![layered, self.exit_guard_backdrop(guard)].into();
+        }
+
+        layered
+    }
+
+    /// The window-close guard modal: lists every dirty editor buffer and
+    /// offers Save All / Discard All / Cancel. Palette-only colors.
+    fn exit_guard_backdrop<'a>(&'a self, guard: &'a ExitGuard) -> Element<'a, Message> {
+        let palette = &self.current_theme.palette;
+
+        let mut files = Column::new().spacing(4);
+        for path in &guard.dirty {
+            files = files.push(text(path.as_str()).size(12).color(palette.text_muted));
+        }
+
+        let mut content = column![
+            text("Unsaved changes").size(20).color(palette.text),
+            text("These files have unsaved edits. Save them before closing?")
+                .size(13)
+                .color(palette.text_muted),
+            container(scrollable(files)).max_height(220.0),
+        ]
+        .spacing(12);
+
+        if let Some(error) = &guard.error {
+            content = content.push(text(error).size(12).color(palette.danger));
+        }
+
+        content = content.push(
+            row![
+                button(text("Save All").size(13))
+                    .style(crate::ui::button::primary)
+                    .padding([8, 16])
+                    .on_press(Message::ExitGuardSaveAll),
+                button(text("Discard All").size(13))
+                    .style(crate::ui::button::danger)
+                    .padding([8, 16])
+                    .on_press(Message::ExitGuardDiscardAll),
+                button(text("Cancel").size(13))
+                    .style(crate::ui::button::secondary)
+                    .padding([8, 16])
+                    .on_press(Message::ExitGuardCancel),
+            ]
+            .spacing(10),
+        );
+
+        let card = container(content).width(520).padding(24).style(crate::ui::container::modal);
+
+        container(card)
             .width(Length::Fill)
             .height(Length::Fill)
             .center_x(Length::Fill)
@@ -277,8 +441,8 @@ impl DesktopApp {
                     ..theme.palette().background
                 })),
                 ..container::Style::default()
-            });
-        stack![base, backdrop].into()
+            })
+            .into()
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
@@ -554,6 +718,7 @@ mod tests {
             error: None,
             pending_root_consent: None,
             effective_roots: Vec::new(),
+            exit_guard: None,
         };
 
         let _element: iced::Element<'_, Message> = launcher.view();
@@ -573,6 +738,7 @@ mod tests {
             error: None,
             pending_root_consent: None,
             effective_roots: roots,
+            exit_guard: None,
         }
     }
 
@@ -645,6 +811,7 @@ mod tests {
             error: None,
             pending_root_consent: None,
             effective_roots: Vec::new(),
+            exit_guard: None,
         };
 
         let _ = launcher.update(Message::OpenProject(target.path().to_path_buf()));
@@ -652,5 +819,179 @@ mod tests {
         assert!(gate_app.pending_root_consent.is_some(), "switch must be gated");
         assert!(!launcher.chooser_open, "chooser closes so the app gate modal shows");
         assert_eq!(launcher.error, None, "no false 'finish or cancel' error");
+    }
+
+    // -----------------------------------------------------------------------
+    // Window-close guard — dirty editor buffers (active and background)
+    // -----------------------------------------------------------------------
+
+    /// A launcher whose app has two dirty editor tabs: `first` was edited and
+    /// then parked in a background buffer, `second` is active and edited.
+    fn launcher_with_two_dirty_tabs(
+    ) -> Result<(DesktopApp, tempfile::TempDir, Utf8PathBuf, Utf8PathBuf), Box<dyn std::error::Error>>
+    {
+        let dir = tempfile::tempdir()?;
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .map_err(|path| std::io::Error::other(format!("Non-UTF8 test path: {path:?}")))?;
+        let first = root.join("first.rs");
+        let second = root.join("second.rs");
+        std::fs::write(&first, "fn first() {}\n")?;
+        std::fs::write(&second, "fn second() {}\n")?;
+
+        let (mut app, _) = app::App::new();
+        let cancel = app.cancel_token.clone();
+        app.editor.open_file(&first, &app.vfs);
+        let _ = app.editor.update(editor_edit('x'), &app.vfs, &root, &cancel);
+        app.editor.open_file(&second, &app.vfs);
+        let _ = app.editor.update(editor_edit('y'), &app.vfs, &root, &cancel);
+        assert_eq!(app.editor.dirty_files().len(), 2, "fixture must have two dirty tabs");
+
+        let launcher = DesktopApp {
+            app: Some(app),
+            current_theme: AppTheme::by_name("Midnight"),
+            registry: ProjectRegistry::default(),
+            chooser_open: false,
+            error: None,
+            pending_root_consent: None,
+            effective_roots: Vec::new(),
+            exit_guard: None,
+        };
+        Ok((launcher, dir, first, second))
+    }
+
+    fn editor_edit(ch: char) -> crate::views::code_editor::Message {
+        crate::views::code_editor::Message::Edit(iced::widget::text_editor::Action::Edit(
+            iced::widget::text_editor::Edit::Insert(ch),
+        ))
+    }
+
+    /// Closing with a dirty background tab must not exit; the guard lists
+    /// every dirty file.
+    #[test]
+    fn close_requested_with_dirty_background_tab_shows_guard_without_exiting(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (mut launcher, _dir, first, second) = launcher_with_two_dirty_tabs()?;
+
+        let _ = launcher.update(Message::CloseRequested);
+
+        let guard = launcher.exit_guard.as_ref().expect("dirty tabs must arm the exit guard");
+        assert_eq!(guard.dirty.len(), 2, "both dirty tabs must be listed");
+        assert!(guard.dirty.contains(&first));
+        assert!(guard.dirty.contains(&second));
+        assert_eq!(launcher.close_decision(), CloseDecision::Guard, "close must be blocked");
+        Ok(())
+    }
+
+    /// Cancel dismisses the guard and leaves both dirty buffers untouched.
+    #[test]
+    fn exit_guard_cancel_keeps_both_dirty_tabs() -> Result<(), Box<dyn std::error::Error>> {
+        let (mut launcher, _dir, first, second) = launcher_with_two_dirty_tabs()?;
+        let _ = launcher.update(Message::CloseRequested);
+
+        let _ = launcher.update(Message::ExitGuardCancel);
+
+        assert!(launcher.exit_guard.is_none(), "cancel must dismiss the guard");
+        let app = launcher.app.as_ref().expect("app exists");
+        assert_eq!(app.editor.dirty_files().len(), 2, "cancel must keep both dirty buffers");
+        assert!(app.editor.dirty_files().contains(&first));
+        assert!(app.editor.dirty_files().contains(&second));
+        assert_eq!(std::fs::read_to_string(&first)?, "fn first() {}\n", "cancel must not write");
+        assert_eq!(std::fs::read_to_string(&second)?, "fn second() {}\n");
+        Ok(())
+    }
+
+    /// Save All writes the active and background tabs, then the close proceeds.
+    #[test]
+    fn exit_guard_save_all_writes_every_dirty_tab_then_allows_exit(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (mut launcher, _dir, first, second) = launcher_with_two_dirty_tabs()?;
+        let _ = launcher.update(Message::CloseRequested);
+
+        let _ = launcher.update(Message::ExitGuardSaveAll);
+
+        assert!(launcher.exit_guard.is_none(), "successful Save All clears the guard");
+        let app = launcher.app.as_ref().expect("app exists");
+        assert!(app.editor.dirty_files().is_empty(), "no dirty buffers after Save All");
+        assert_eq!(std::fs::read_to_string(&first)?, "xfn first() {}\n", "background tab saved");
+        assert_eq!(std::fs::read_to_string(&second)?, "yfn second() {}\n", "active tab saved");
+        assert_eq!(launcher.close_decision(), CloseDecision::Exit, "close proceeds after save");
+        Ok(())
+    }
+
+    /// A failed write keeps the guard up and blocks the exit; other dirty
+    /// tabs still save.
+    #[test]
+    fn exit_guard_save_all_failure_keeps_guard_and_blocks_exit(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (mut launcher, _dir, first, second) = launcher_with_two_dirty_tabs()?;
+        // Sabotage the background tab's path so its write fails
+        // deterministically (writing to a directory always fails).
+        std::fs::remove_file(&first)?;
+        std::fs::create_dir(&first)?;
+
+        let _ = launcher.update(Message::CloseRequested);
+        let _ = launcher.update(Message::ExitGuardSaveAll);
+
+        let guard = launcher.exit_guard.as_ref().expect("failed save must keep the guard");
+        assert!(guard.error.is_some(), "the failure must be surfaced");
+        let app = launcher.app.as_ref().expect("app exists");
+        assert!(app.editor.dirty_files().contains(&first), "failed tab stays dirty");
+        assert_eq!(launcher.close_decision(), CloseDecision::Guard, "close stays blocked");
+        assert_eq!(std::fs::read_to_string(&second)?, "yfn second() {}\n", "other tab saved");
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR numbering integrity
+    // -----------------------------------------------------------------------
+
+    fn adr_number(name: &str) -> Option<&str> {
+        let rest = name.strip_prefix("ADR-")?;
+        let digits = rest.split(|c: char| !c.is_ascii_digit()).next()?;
+        (!digits.is_empty()).then_some(digits)
+    }
+
+    fn readme_adr_numbers(readme: &str) -> Vec<String> {
+        let mut numbers = Vec::new();
+        for line in readme.lines() {
+            // Only the canonical registry rows: `| [<n>](./ADR-<n>-… )`.
+            // Superseded/archive rows use `[ADR-<n>]` link text and are
+            // cross-references, not registry entries.
+            let Some(rest) = line.trim_start().strip_prefix("| [") else { continue };
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if digits.is_empty() {
+                continue;
+            }
+            if rest.starts_with(&format!("{digits}](./ADR-{digits}")) {
+                numbers.push(digits);
+            }
+        }
+        numbers
+    }
+
+    /// ADR numbers must be unique across filenames and README rows. Catches a
+    /// second `ADR-78-*.md` merging alongside the first.
+    #[test]
+    fn adr_numbers_are_unique_in_filenames_and_readme() -> Result<(), Box<dyn std::error::Error>> {
+        let adr_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/adrs");
+        let mut filenames: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&adr_dir)? {
+            let name = entry?.file_name();
+            if let Some(number) = adr_number(&name.to_string_lossy()) {
+                filenames.push(number.to_string());
+            }
+        }
+        filenames.sort();
+        for pair in filenames.windows(2) {
+            assert_ne!(pair[0], pair[1], "duplicate ADR filename number {}", pair[0]);
+        }
+
+        let readme = std::fs::read_to_string(adr_dir.join("README.md"))?;
+        let mut rows = readme_adr_numbers(&readme);
+        rows.sort();
+        for pair in rows.windows(2) {
+            assert_ne!(pair[0], pair[1], "duplicate ADR README row number {}", pair[0]);
+        }
+        Ok(())
     }
 }
