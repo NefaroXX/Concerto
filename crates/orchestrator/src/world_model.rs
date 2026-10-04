@@ -2885,6 +2885,7 @@ fn feed_or_advance(
 mod tests {
     use super::*;
     use crate::failure_diagnosis::{FailureDiagnosis, FailureKind};
+    use crate::testing::tool_executed_payload;
     use concerto_sessions::whiteboard::consult_finding_payload;
 
     const NOW_MS: i64 = 1_000_000;
@@ -2927,10 +2928,7 @@ mod tests {
             WhiteboardKind::ToolExecuted,
             event_id,
             seq,
-            serde_json::json!({
-                "tool": tool, "args": {}, "success": false,
-                "paths": paths.iter().map(|path| serde_json::json!({"path": path})).collect::<Vec<_>>(),
-            }),
+            tool_executed_payload(tool, serde_json::json!({}), false, Some(paths)),
         )
     }
 
@@ -2942,7 +2940,7 @@ mod tests {
             WhiteboardKind::ToolExecuted,
             event_id,
             seq,
-            serde_json::json!({ "tool": tool, "args": {}, "success": false }),
+            tool_executed_payload(tool, serde_json::json!({}), false, None),
         )
     }
 
@@ -3104,11 +3102,12 @@ mod tests {
                 WhiteboardKind::ToolExecuted,
                 "ev3",
                 30,
-                serde_json::json!({
-                    "tool": "filesystem", "args": {}, "success": true, "paths": [
-                        {"path": "src/a.rs"}
-                    ]
-                }),
+                tool_executed_payload(
+                    "filesystem",
+                    serde_json::json!({}),
+                    true,
+                    Some(&["src/a.rs"]),
+                ),
             ),
         ];
         let decisions = vec![decision("d1", DecisionStatus::Settled, &[])];
@@ -3127,10 +3126,12 @@ mod tests {
                 WhiteboardKind::ToolExecuted,
                 "ev-old",
                 10,
-                serde_json::json!({
-                    "tool": "edit_file", "args": {"path": "src/a.rs"},
-                    "success": true, "paths": [{"path": "src/a.rs"}]
-                }),
+                tool_executed_payload(
+                    "edit_file",
+                    serde_json::json!({"path": "src/a.rs"}),
+                    true,
+                    Some(&["src/a.rs"]),
+                ),
             ),
             event(WhiteboardKind::WriteApplied, "ev-new", 30, write_applied("src/a.rs")),
         ];
@@ -3156,19 +3157,23 @@ mod tests {
                 WhiteboardKind::ToolExecuted,
                 "ev-read",
                 10,
-                serde_json::json!({
-                    "tool": "read_file", "args": {"path": "src/a.rs"},
-                    "success": true, "paths": [{"path": "src/a.rs"}]
-                }),
+                tool_executed_payload(
+                    "read_file",
+                    serde_json::json!({"path": "src/a.rs"}),
+                    true,
+                    Some(&["src/a.rs"]),
+                ),
             ),
             event(
                 WhiteboardKind::ToolExecuted,
                 "ev-read-clean",
                 11,
-                serde_json::json!({
-                    "tool": "read_file", "args": {"path": "src/clean.rs"},
-                    "success": true, "paths": [{"path": "src/clean.rs"}]
-                }),
+                tool_executed_payload(
+                    "read_file",
+                    serde_json::json!({"path": "src/clean.rs"}),
+                    true,
+                    Some(&["src/clean.rs"]),
+                ),
             ),
             event(WhiteboardKind::WriteApplied, "ev-write", 30, write_applied("src/a.rs")),
         ];
@@ -3201,10 +3206,12 @@ mod tests {
                 WhiteboardKind::ToolExecuted,
                 "ev-read-many",
                 10,
-                serde_json::json!({
-                    "tool": "grep", "args": {"pattern": "fn "}, "success": true,
-                    "paths": [{"path": "src/a.rs"}, {"path": "src/b.rs"}]
-                }),
+                tool_executed_payload(
+                    "grep",
+                    serde_json::json!({"pattern": "fn "}),
+                    true,
+                    Some(&["src/a.rs", "src/b.rs"]),
+                ),
             )
         };
 
@@ -3253,9 +3260,12 @@ mod tests {
                 WhiteboardKind::ToolExecuted,
                 "ev-run",
                 10,
-                serde_json::json!({
-                    "tool": "bash", "args": {"command": "cargo test"}, "success": true
-                }),
+                tool_executed_payload(
+                    "bash",
+                    serde_json::json!({"command": "cargo test"}),
+                    true,
+                    None,
+                ),
             )
         };
 
@@ -3302,7 +3312,7 @@ mod tests {
             WhiteboardKind::ToolExecuted,
             "ev-run",
             10,
-            serde_json::json!({"tool": "bash", "args": {"command": "cargo test"}, "success": true}),
+            tool_executed_payload("bash", serde_json::json!({"command": "cargo test"}), true, None),
         );
         let quiet =
             WorldModel::build(&input(std::slice::from_ref(&run), Vec::new(), &[], &[], Vec::new()));
@@ -4513,14 +4523,17 @@ mod tests {
     fn unrelated_reads(count: u64, first_seq: u64) -> Vec<WhiteboardEvent> {
         (0..count)
             .map(|index| {
+                let path = format!("noise/{index}.rs");
                 event(
                     WhiteboardKind::ToolExecuted,
                     &format!("ev-read-{index}"),
                     first_seq + index,
-                    serde_json::json!({
-                        "tool": "read_file", "args": {}, "success": true,
-                        "paths": [{"path": format!("noise/{index}.rs")}]
-                    }),
+                    tool_executed_payload(
+                        "read_file",
+                        serde_json::json!({}),
+                        true,
+                        Some(&[path.as_str()]),
+                    ),
                 )
             })
             .collect()
@@ -5510,7 +5523,12 @@ mod tests {
                 WhiteboardKind::ToolExecuted,
                 "ev-tool-failed",
                 50,
-                serde_json::json!({"tool": "edit_file", "args": {"path": "src/a.rs"}, "success": false}),
+                tool_executed_payload(
+                    "edit_file",
+                    serde_json::json!({"path": "src/a.rs"}),
+                    false,
+                    None,
+                ),
             ),
             event(WhiteboardKind::MemoryFact, "ev-memory", 60, serde_json::json!({"note": "n"})),
         ];
@@ -5583,7 +5601,12 @@ mod tests {
                 WhiteboardKind::ToolExecuted,
                 "ev-run",
                 10,
-                serde_json::json!({"tool": "bash", "args": {"command": "cargo test"}, "success": true}),
+                tool_executed_payload(
+                    "bash",
+                    serde_json::json!({"command": "cargo test"}),
+                    true,
+                    None,
+                ),
             )
         };
         let repeated = WorldModel::build(&input(
@@ -5661,7 +5684,12 @@ mod tests {
                 WhiteboardKind::ToolExecuted,
                 &format!("ev-run-{index}"),
                 5 + index,
-                serde_json::json!({"tool": "bash", "args": {"command": "cargo test"}, "success": true}),
+                tool_executed_payload(
+                    "bash",
+                    serde_json::json!({"command": "cargo test"}),
+                    true,
+                    None,
+                ),
             ));
         }
         events.push(event(
@@ -5882,7 +5910,12 @@ mod tests {
                 WhiteboardKind::ToolExecuted,
                 id,
                 seq,
-                serde_json::json!({"tool": "bash", "args": {"command": command}, "success": success}),
+                tool_executed_payload(
+                    "bash",
+                    serde_json::json!({"command": command}),
+                    success,
+                    None,
+                ),
             )
         };
         let different = WorldModel::build(&input(
