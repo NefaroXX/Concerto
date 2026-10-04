@@ -689,6 +689,32 @@ fn session_summary_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SessionSumm
     })
 }
 
+/// Serialize a [`concerto_core::types::TaskExecutionMode`] for the
+/// `tasks.execution_mode` column (migration 036, serde-JSON TEXT so the
+/// `ActionRequired` payload round-trips).
+fn encode_task_execution_mode(
+    mode: &concerto_core::types::TaskExecutionMode,
+) -> Result<String, SessionError> {
+    serde_json::to_string(mode).map_err(|e| SessionError::Serialization(e.to_string()))
+}
+
+/// Decode the `tasks.execution_mode` column. `None` means the row was written
+/// before migration 036 and maps to
+/// [`concerto_core::types::TaskExecutionMode::default`], preserving the value
+/// those rows previously read back; corrupt JSON is a
+/// [`SessionError::Serialization`] rather than a silent default so a stored
+/// mode is never again fabricated on the read path.
+fn decode_task_execution_mode(
+    raw: Option<String>,
+) -> Result<concerto_core::types::TaskExecutionMode, SessionError> {
+    match raw {
+        None => Ok(concerto_core::types::TaskExecutionMode::default()),
+        Some(json) => {
+            serde_json::from_str(&json).map_err(|e| SessionError::Serialization(e.to_string()))
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl SessionStore for SqliteSessionStore {
     async fn create_session(
@@ -1534,14 +1560,16 @@ impl SessionStore for SqliteSessionStore {
     ) -> Result<(), SessionError> {
         // Cancellation checked at statement boundaries; single-statement fast path.
         let created_at_unix = task.created_at.unix_timestamp();
+        let execution_mode = encode_task_execution_mode(&task.execution_mode)?;
 
         sqlx::query(
-            "INSERT INTO tasks (id, session_id, description, status, created_at) VALUES (?, ?, ?, ?, ?)")
+            "INSERT INTO tasks (id, session_id, description, status, created_at, execution_mode) VALUES (?, ?, ?, ?, ?, ?)")
             .bind(task.id.to_string())
             .bind(task.session_id.to_string())
             .bind(&task.description)
             .bind("running")
             .bind(created_at_unix)
+            .bind(execution_mode)
             .execute(&self.pool)
             .await?;
 
@@ -1579,7 +1607,7 @@ impl SessionStore for SqliteSessionStore {
     ) -> Result<Option<concerto_core::types::AgentTask>, SessionError> {
         // Cancellation checked at statement boundaries; single-statement fast path.
         let row = sqlx::query(
-            "SELECT id, session_id, description, status, created_at FROM tasks WHERE id = ?",
+            "SELECT id, session_id, description, status, created_at, execution_mode FROM tasks WHERE id = ?",
         )
         .bind(task_id.to_string())
         .fetch_optional(&self.pool)
@@ -1604,13 +1632,17 @@ impl SessionStore for SqliteSessionStore {
                     row.try_get("created_at").map_err(|e| SessionError::Database(e.to_string()))?;
                 let created_at = time::OffsetDateTime::from_unix_timestamp(created_at_unix)
                     .map_err(|e| SessionError::Database(e.to_string()))?;
+                let execution_mode_raw: Option<String> = row
+                    .try_get("execution_mode")
+                    .map_err(|e| SessionError::Database(e.to_string()))?;
+                let execution_mode = decode_task_execution_mode(execution_mode_raw)?;
 
                 Ok(Some(concerto_core::types::AgentTask {
                     id,
                     session_id,
                     description,
                     created_at,
-                    execution_mode: Default::default(),
+                    execution_mode,
                 }))
             }
             None => Ok(None),
@@ -1625,7 +1657,7 @@ impl SessionStore for SqliteSessionStore {
         check_cancel(&cancel)?;
 
         let rows = sqlx::query(
-            "SELECT id, session_id, description, status, created_at FROM tasks WHERE session_id = ? ORDER BY created_at DESC")
+            "SELECT id, session_id, description, status, created_at, execution_mode FROM tasks WHERE session_id = ? ORDER BY created_at DESC")
             .bind(session_id.to_string())
             .fetch_all(&self.pool)
             .await?;
@@ -1651,13 +1683,16 @@ impl SessionStore for SqliteSessionStore {
                 row.try_get("created_at").map_err(|e| SessionError::Database(e.to_string()))?;
             let created_at = time::OffsetDateTime::from_unix_timestamp(created_at_unix)
                 .map_err(|e| SessionError::Database(e.to_string()))?;
+            let execution_mode_raw: Option<String> =
+                row.try_get("execution_mode").map_err(|e| SessionError::Database(e.to_string()))?;
+            let execution_mode = decode_task_execution_mode(execution_mode_raw)?;
 
             tasks.push(concerto_core::types::AgentTask {
                 id,
                 session_id: sid,
                 description,
                 created_at,
-                execution_mode: Default::default(),
+                execution_mode,
             });
         }
 
@@ -2908,6 +2943,81 @@ mod tests {
         let descs: Vec<&str> = tasks.iter().map(|t| t.description.as_str()).collect();
         assert!(descs.contains(&"task 1"));
         assert!(descs.contains(&"task 2"));
+    }
+
+    #[tokio::test]
+    /// Non-default `execution_mode` values survive a store round-trip exactly
+    /// (finding 2: the read path used to fabricate `Default::default()`).
+    async fn task_execution_mode_round_trip() {
+        use concerto_core::types::{AgentTask, TaskExecutionMode};
+        let store = SqliteSessionStore::connect_in_memory().await.unwrap();
+        let project_dir = camino::Utf8PathBuf::from("/tmp/test_task_mode_round_trip");
+        let session =
+            store.create_session(&project_dir, "p", "m", CancellationToken::new()).await.unwrap();
+        let modes = [
+            TaskExecutionMode::CoordinatorDecides,
+            TaskExecutionMode::ActionRequired { min_tool_calls: 3, require_verification: false },
+            TaskExecutionMode::ACTION_REQUIRED,
+        ];
+        for (i, mode) in modes.into_iter().enumerate() {
+            let task = AgentTask {
+                id: TaskId(Ulid::new()),
+                session_id: session.id,
+                description: format!("mode task {i}"),
+                created_at: time::OffsetDateTime::now_utc(),
+                execution_mode: mode,
+            };
+            store.create_task(&task, CancellationToken::new()).await.unwrap();
+            let loaded = store.get_task(task.id, CancellationToken::new()).await.unwrap().unwrap();
+            assert_eq!(loaded.execution_mode, mode, "get_task must read back the stored mode");
+        }
+        let tasks = store.list_tasks(session.id, CancellationToken::new()).await.unwrap();
+        assert_eq!(tasks.len(), modes.len());
+        for mode in modes {
+            assert!(
+                tasks.iter().any(|t| t.execution_mode == mode),
+                "list_tasks must read back the stored mode {mode:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    /// A row written before migration 036 (`execution_mode` NULL) reads back
+    /// as `TaskExecutionMode::default()` on both read paths.
+    async fn task_execution_mode_legacy_null_row_reads_default() {
+        use concerto_core::types::TaskExecutionMode;
+        let store = SqliteSessionStore::connect_in_memory().await.unwrap();
+        let project_dir = camino::Utf8PathBuf::from("/tmp/test_task_mode_legacy");
+        let session =
+            store.create_session(&project_dir, "p", "m", CancellationToken::new()).await.unwrap();
+        let task_id = Ulid::new();
+        let created_at = time::OffsetDateTime::now_utc().unix_timestamp();
+        // Raw insert omitting `execution_mode`: the shape of a pre-migration row.
+        sqlx::query(
+            "INSERT INTO tasks (id, session_id, description, status, created_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(task_id.to_string())
+        .bind(session.id.to_string())
+        .bind("legacy task")
+        .bind("running")
+        .bind(created_at)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        let loaded =
+            store.get_task(TaskId(task_id), CancellationToken::new()).await.unwrap().unwrap();
+        assert_eq!(
+            loaded.execution_mode,
+            TaskExecutionMode::default(),
+            "legacy NULL row must read the default mode"
+        );
+        let tasks = store.list_tasks(session.id, CancellationToken::new()).await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            tasks[0].execution_mode,
+            TaskExecutionMode::default(),
+            "legacy NULL row must list with the default mode"
+        );
     }
 
     #[tokio::test]
