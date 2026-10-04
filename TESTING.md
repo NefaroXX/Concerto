@@ -303,7 +303,7 @@ Severity guide:
 - **Medium:** a feature fails but another workflow remains usable.
 - **Low:** confusing copy, layout, inaccurate status, or minor inconvenience.
 
-### Extension authorization and credential release checks (ADR-78)
+### Extension authorization and credential release checks (ADR-79)
 
 | Check | Expected result | Result |
 |---|---|---|

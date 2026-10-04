@@ -1,4 +1,4 @@
-# ADR-78: Extension authorization and host execution
+# ADR-79: Extension authorization and host execution
 
 Status: Accepted
 Date: 2026-10-03

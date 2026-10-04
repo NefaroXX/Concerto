@@ -2,7 +2,7 @@
 
 The host executes WASM tool, provider, and memory-adapter plugins. Tool names
 are always `plugin:<id>:<tool>`. Runtime discovery requires approved persisted
-capabilities; discovery never grants authority (ADR-78).
+capabilities; discovery never grants authority (ADR-79).
 
 ## What tool plugins can do
 
