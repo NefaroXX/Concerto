@@ -53,7 +53,10 @@ pub fn run(args: &[String], project: &Path) -> anyhow::Result<()> {
         return security(&args[1..]);
     }
     if !args.is_empty() && args[0] != "exec" {
-        anyhow::bail!("usage: concerto --cli shell [exec COMMAND ARG ... | security show | security validate FILE | security apply FILE]");
+        anyhow::bail!(
+            "usage: concerto --cli shell [exec COMMAND ARG ... | security show | security validate FILE | security apply FILE]\n{}",
+            concerto_core::shell_security::PROTECTED_PATHS_SCOPE_NOTE
+        );
     }
     let config = concerto_config::load_config(None, Some(project))?;
     let (sender, receiver) = mpsc::channel(1);
@@ -108,7 +111,10 @@ fn security(args: &[String]) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("global config path is unavailable"))?;
     let current = concerto_config::load_global_config(Some(&path))?.shell_security;
     match args.first().map(String::as_str) {
-        None | Some("show") => println!("{}", serde_json::to_string_pretty(&current)?),
+        None | Some("show") => {
+            println!("{}", serde_json::to_string_pretty(&current)?);
+            println!("{}", concerto_core::shell_security::PROTECTED_PATHS_SCOPE_NOTE);
+        }
         Some("validate" | "apply") => {
             let file = args
                 .get(1)
@@ -149,7 +155,10 @@ fn security(args: &[String]) -> anyhow::Result<()> {
                 saved.revision
             );
         }
-        _ => anyhow::bail!("usage: shell security show | validate FILE | apply FILE"),
+        _ => anyhow::bail!(
+            "usage: shell security show | validate FILE | apply FILE\n{}",
+            concerto_core::shell_security::PROTECTED_PATHS_SCOPE_NOTE
+        ),
     }
     Ok(())
 }

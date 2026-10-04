@@ -358,7 +358,8 @@ impl State {
 
         let mut security = column![
             text("Native shell security").size(16),
-            text("Processes execute directly with explicit arguments. Host mode uses your OS permissions. Offline networking and resource limits require container isolation. Protected paths cover native file tools; approved host programs retain ambient access.").size(12).color(palette.text_muted),
+            text("Processes execute directly with explicit arguments. Host mode uses your OS permissions. Offline networking and resource limits require container isolation. Approved host programs retain ambient access.").size(12).color(palette.text_muted),
+            text(concerto_core::shell_security::PROTECTED_PATHS_SCOPE_NOTE).size(12).color(palette.warning),
             row![
                 button("Read only").on_press(Message::ShellSecurityPreset("read_only")),
                 button("Ask before changes").on_press(Message::ShellSecurityPreset("default")),

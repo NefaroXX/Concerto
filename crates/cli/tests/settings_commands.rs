@@ -198,3 +198,23 @@ fn providers_blueprints_and_desktop_preferences_are_cli_configurable() {
     let prefs = fixture.dir.path().join("data/concerto/prefs/user_prefs.json");
     assert!(Path::new(&prefs).exists());
 }
+
+// verifies: the protected-paths scope limit is stated in every shell help surface.
+#[test]
+fn shell_help_states_the_protected_paths_scope_limit() {
+    let fixture = Fixture::new();
+    let note = "protected_paths constrains only the built-in filesystem tool";
+
+    let help = fixture.command(&["--help"]);
+    assert!(help.status.success(), "--help must exit successfully");
+    let stderr = String::from_utf8_lossy(&help.stderr);
+    assert!(stderr.contains(note), "top-level help is missing the scope note: {stderr}");
+
+    let usage = fixture.command(&["shell", "help"]);
+    assert!(!usage.status.success(), "an unknown shell verb reports usage on stderr");
+    let stderr = String::from_utf8_lossy(&usage.stderr);
+    assert!(stderr.contains(note), "shell usage is missing the scope note: {stderr}");
+
+    let shown = fixture.success(&["shell", "security", "show"]);
+    assert!(shown.contains(note), "security show is missing the scope note: {shown}");
+}

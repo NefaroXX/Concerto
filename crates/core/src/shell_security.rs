@@ -3,6 +3,16 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Scope limitation of [`ShellSecurity::protected_paths`], shared verbatim by
+/// the CLI help and the desktop Settings → Shell view so those surfaces cannot
+/// drift from each other or from the documentation.
+///
+/// The list binds only Concerto's built-in filesystem tool. Native `run`
+/// commands and container project mounts are **not** covered: host programs
+/// keep their ambient OS access to the same paths.
+pub const PROTECTED_PATHS_SCOPE_NOTE: &str = "protected_paths constrains only the built-in \
+    filesystem tool; native run commands and container project mounts are not covered.";
+
 /// Additional permission ceiling applied after ordinary policy rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -187,5 +197,17 @@ mod tests {
             );
         }
         assert!(serde_json::from_str::<ShellSecurity>(r#"{"allow_everything":true}"#).is_err());
+    }
+
+    // verifies: the shared scope note keeps stating every limitation it exists to state.
+    #[test]
+    fn protected_paths_scope_note_states_its_limits() {
+        for claim in ["built-in filesystem tool", "native run commands", "container project mounts"]
+        {
+            assert!(
+                PROTECTED_PATHS_SCOPE_NOTE.contains(claim),
+                "the shared scope note must keep its {claim:?} claim"
+            );
+        }
     }
 }

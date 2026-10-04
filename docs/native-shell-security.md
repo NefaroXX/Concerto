@@ -76,7 +76,7 @@ when a security reload changes its settings.
 | `timeout_secs` | Wall-clock deadline; a command cannot raise the configured ceiling. |
 | `max_output_bytes` | Capture ceiling per stdout/stderr stream; excess output is drained without growing the capture buffer. |
 | `max_argument_bytes` | Bound on executable/argument bytes before spawn. |
-| `protected_paths` | Project-relative paths protected from filesystem-tool reads/writes, including copy/move destinations and writes to an ancestor. The global config is also protected in the normal runtime. Metadata-only built-ins can still list names. |
+| `protected_paths` | **Scope limit: this list constrains only the built-in filesystem tool — it does NOT constrain native `run` commands or container project mounts.** A host program launched with `run` (and any process writing through a writable container project mount) can still read or replace these files; rely on host/container isolation for those, not on this list. Within the filesystem tool it protects project-relative paths from reads/writes, including copy/move destinations and writes to an ancestor. The global config is also protected in the normal runtime. Metadata-only built-ins can still list names. |
 | `history_enabled` | Controls in-memory command-result history. Native file commands do not record content in that history. Execution/approval audit remains enabled. |
 | `network = "offline"` | Requires Docker/Podman isolation with networking disabled. Host mode refuses it. No destination/port allowlist is implemented yet. |
 | `memory_bytes`, `max_processes`, `cpu_seconds` | Require the container backend. Memory and PID limits are container limits; CPU seconds uses a per-process inherited `ulimit`, not an aggregate CPU-time allowance. Host mode refuses these requirements. |
@@ -97,8 +97,10 @@ writes bypass VirtualFs review. Cancellation kills ordinary Unix process
 groups; it is not confinement against descendants that escape the group.
 Automatic native test validation uses the same execution gate. Coverage helpers without a governed implementation refuse execution; run coverage explicitly through `run` or the shell tool.
 
-Windows currently terminates the direct child and lacks an enforced Job Object
-boundary. This implementation does not claim a complete OS sandbox.
+Windows cancellation terminates only the direct child. Descendants survive it,
+including any that have put themselves in a new process group, and there is no
+enforced Job Object boundary to reach them. This implementation does not claim
+a complete OS sandbox.
 
 Platform kernel confinement, destination-level networking, isolated workspace
 diff import, PTYs, streaming, background tasks, pipelines/workflows, and secret

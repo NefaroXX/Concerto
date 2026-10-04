@@ -68,6 +68,8 @@ pub const CLI_COMMAND_HELP: &str =
     plugin <list|installed|install|remove|revoke>
     shell <list|test|select|managed ACTION>
     shell [exec COMMAND ARG ...]   shell security <show|validate FILE|apply FILE>
+    Note: protected_paths constrains only the built-in filesystem tool; native
+    run commands and container project mounts are not covered.
     projects <list|current|use>
     sessions <list|show|events|resume|prune>
     memory <graph|explain>   health [--json]   audit   logs <path|show>
