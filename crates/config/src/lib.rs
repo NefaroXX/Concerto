@@ -19,6 +19,7 @@ mod migration;
 pub mod projects;
 mod saving;
 mod schema;
+pub mod settings;
 pub mod setup;
 pub mod shell;
 
@@ -128,6 +129,17 @@ fn load_config_layers(
     project_root: Option<&Path>,
     include_environment: bool,
 ) -> Result<AppConfig, ConfigError> {
+    load_config_documents(global_path, project_root, include_environment, None, None)
+}
+
+/// Validate a proposed document through the normal load seam without writing it.
+fn load_config_documents(
+    global_path: Option<&PathBuf>,
+    project_root: Option<&Path>,
+    include_environment: bool,
+    global_document: Option<&str>,
+    project_document: Option<&str>,
+) -> Result<AppConfig, ConfigError> {
     let defaults = AppConfig::default();
 
     let mut figment = Figment::new().merge(Serialized::defaults(&defaults));
@@ -135,7 +147,9 @@ fn load_config_layers(
     // 1) Global user-level config (with legacy fallback)
     // If no explicit path, try default_config_path() which handles new→old fallback.
     let global_config = global_path.cloned().or_else(default_config_path);
-    if let Some(ref p) = global_config {
+    if let Some(document) = global_document {
+        figment = figment.merge(Toml::string(document));
+    } else if let Some(ref p) = global_config {
         if p.exists() {
             figment = figment.merge(Toml::file(p));
         }
@@ -154,12 +168,14 @@ fn load_config_layers(
     // merged exactly as before (figment reads it, byte-identical behavior).
     if let Some(root) = project_root {
         let project_file = root.join(legacy::NEW_PROJECT_CONFIG_FILE);
-        if project_file.exists() {
-            let stripped = crate::saving::strip_project_orchestration_keys(
-                &std::fs::read_to_string(&project_file).map_err(|e| {
+        if project_document.is_some() || project_file.exists() {
+            let raw = match project_document {
+                Some(document) => document.to_string(),
+                None => std::fs::read_to_string(&project_file).map_err(|e| {
                     ConfigError::Load(format!("failed to read {}: {e}", project_file.display()))
                 })?,
-            )?;
+            };
+            let stripped = crate::saving::strip_project_orchestration_keys(&raw)?;
             match stripped {
                 Some(stripped) => {
                     tracing::warn!(
@@ -173,7 +189,10 @@ fn load_config_layers(
                 }
                 // Nothing to strip: the document merges exactly as before,
                 // straight from the file (byte-identical behavior).
-                None => figment = figment.merge(Toml::file(&project_file)),
+                None if project_document.is_none() => {
+                    figment = figment.merge(Toml::file(&project_file));
+                }
+                None => figment = figment.merge(Toml::string(&raw)),
             }
         }
     }

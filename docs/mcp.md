@@ -159,8 +159,12 @@ tokens are deferred).
   runtime-owned manager). "Test connection" spawns a temporary client
   (spawn → initialize → list_tools → stop) and reports the discovered tool
   names or a sanitized error. Servers are added/removed in the config file.
-- **CLI:** `concerto extensions list` shows `mcp.enabled` and the configured
-  servers (read-only in v1).
+- **CLI:** `concerto extensions list` shows effective extension configuration.
+  `concerto extensions mcp` provides list/show/add/set/remove, per-server
+  enable/disable, and a temporary connection probe. Use
+  `concerto config set mcp.enabled true` for the master switch. Saved changes
+  take effect on the next run; probes leave saved enable flags unchanged.
+  See the [CLI settings reference](cli-settings.md).
 
 ## fixture-mcp-server
 

@@ -19,19 +19,26 @@ fn main() {
     //  • (no flag)         → desktop if available, else CLI
     let force_cli = args.iter().any(|a| a == "--cli" || a == "-c");
     let force_desktop = args.iter().any(|a| a == "--desktop" || a == "-d");
+    #[cfg(feature = "cli")]
+    let cli_command = concerto_cli::has_cli_subcommand(&args);
 
     if force_cli && force_desktop {
         eprintln!("error: --cli and --desktop are mutually exclusive");
+        std::process::exit(1);
+    }
+    #[cfg(feature = "cli")]
+    if force_desktop && cli_command {
+        eprintln!("error: CLI commands cannot be combined with --desktop");
         std::process::exit(1);
     }
 
     // ── CLI path ──────────────────────────────────────────────────────
     #[cfg(feature = "cli")]
     {
-        let run_cli = force_cli || {
+        let run_cli = force_cli || cli_command || {
             #[cfg(feature = "desktop")]
             {
-                // Default to desktop when available; CLI is opt-in.
+                // Open desktop when no CLI command or mode flag is supplied.
                 false
             }
             #[cfg(not(feature = "desktop"))]
@@ -97,6 +104,9 @@ OPTIONS:
     -f, --fast             Skip memory retrieval for trivial tasks (CLI only)
     -r, --reconfigure      Re-run the setup wizard (CLI only)
     -p, --project <DIR>    Select a project for CLI commands and chat
+        --theme <NAME>    Select the CLI palette
+        --reduced-motion  Disable motion cues
+        --no-terminal-title  Disable terminal title broadcasts
     -V, --version          Print version
     -h, --help             Print this help
 
@@ -110,7 +120,18 @@ CLI SUBCOMMANDS:
     concerto --cli sessions <list|show|events|resume>
     concerto --cli providers list
     concerto --cli logs <path|show>
-    concerto --cli config <init|doctor>",
+    concerto --cli config <show|get|keys|set|unset|path|init|doctor|help>
+    concerto --cli agents <list|show|import|set|clone|remove>
+    concerto --cli blueprint <list|show|select|import>
+    concerto --cli providers <list|add|remove|refresh>
+    concerto --cli credentials <status|set|delete>
+    concerto --cli preferences <show|set ui_theme NAME|set ui_font_size SIZE>
+    concerto --cli extensions <list|skills ACTION|mcp ACTION>
+    concerto --cli plugin <list|installed|install|remove|revoke>
+    concerto --cli shell <list|test|select|managed ACTION>
+
+CLI commands automatically select CLI mode when the 'cli' feature is enabled.
+Run `concerto config help` for settings scopes, typed values, and dry runs.",
         env!("CARGO_PKG_VERSION")
     );
 }

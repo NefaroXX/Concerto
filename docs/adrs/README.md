@@ -105,6 +105,7 @@ the 2026 remediation wave (33–63) keeps its genuine recent dates. Numbers 09,
 | [75](./ADR-75-tool-argument-integrity-and-capability-resolution.md) | Tool-argument integrity and capability-driven schema resolution | 2026-09-29 | Accepted | One model-agnostic parse-and-repair entry point (`tool_args`) replaces the silent `Value::Null` tool-argument path (which ran tools with `{}`); unrepairable arguments fail loudly; the `"free"` price-tier name hint is removed; and the tool-schema/transport tier now follows the ADR-66 §3 precedence chain (`dial > advertised > family table > last-resort heuristic`), defaulting unknown models to the optimistic streamed/strict end. |
 | [76](./ADR-76-conversational-turns-vs-action-required-orchestration.md) | Conversational turns vs. action-required orchestration | 2026-10-01 | Accepted | Adds `TaskExecutionMode::CoordinatorDecides` (coordinator owns the turn; may answer directly or delegate) between `AnswerOnly` and `ActionRequired`; the runtime entry classifies the run shape structurally (Apply / resume / forced-single-agent / otherwise) with no word router; only `ActionRequired` arms the mandatory specialist-dispatch guards (as amended by the 2026-10-04 in-place addendum: the combined `dispatch_guard_arms` also arms on open graph obligations or a promised plan with no code artifact, and the guarantee covers declared/graphed work only), so ordinary conversation completes without manufactured delegation while real work still cannot close on prose alone. Refines ADR-71 and ADR-74. |
 | [77](./ADR-77-studio-configuration-workspace.md) | Studio configuration workspace | 2026-10-02 | Proposed | Separates agent configuration from advisory blueprints; adds focused multiline editing and truthful runtime configuration boundaries. |
+| [80](./ADR-80-cli-settings-and-studio-parity.md) | CLI settings and Studio parity | 2026-10-03 | Accepted | Parity applies to capabilities rather than whole graphical pages; adds validated scoped config commands, canonical agent edits, provider/extension/shell management and portable display preferences. |
 
 > **Partial supersession note (2026-09-24):**
 > [ADR-71](./ADR-71-coordinator-supremacy.md) makes **scoped partial
@@ -190,4 +191,3 @@ and none should be cited by line number — the text they replaced lives in
 - Routing lineage: [24 (archived)](./archive/ADR-24.md) →
   [31](./ADR-31.md) → [49](./ADR-49-config-first-catalog.md) →
   [56](./ADR-56-model-first-intent-classification.md).
-

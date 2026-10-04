@@ -156,13 +156,17 @@ Launch the terminal UI:
 cargo run -p concerto-cli --release
 ```
 
-The top-level binary also selects a frontend. Desktop is the default; the CLI
-build is behind its feature:
+The top-level binary includes both frontends by default. Desktop opens when no
+command is supplied; explicit commands automatically select the CLI:
 
 ```bash
 cargo run -p concerto -- --desktop
-cargo run -p concerto --features cli -- --cli
+cargo run -p concerto -- --cli
+cargo run -p concerto -- config keys
+cargo run -p concerto -- config set retry.max_attempts 5
 ```
+
+For a terminal-only build, use `--no-default-features --features cli`.
 
 ## Quick start
 
@@ -202,6 +206,8 @@ session roots, and binding to a non-loopback address requires both
 
 Useful guides:
 
+- [CLI settings and management commands](docs/cli-settings.md)
+- [Desktop/CLI capability parity and remaining work](docs/desktop-cli-parity.md)
 - [Provider and model configuration](docs/models.md)
 - [Multi-agent relationships](docs/agent-collaboration.md)
 - [Policy rules](docs/policy-rules.md)

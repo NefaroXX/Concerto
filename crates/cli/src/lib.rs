@@ -4,8 +4,10 @@
 
 pub mod app;
 pub mod approval;
+pub mod extensions;
 pub mod health;
 pub mod plugin_approval;
+pub mod settings;
 pub mod theme;
 pub mod ui;
 pub mod update;
@@ -18,6 +20,65 @@ use std::path::{Path, PathBuf};
 
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+
+/// Recognize explicit command invocations before the desktop default is chosen.
+/// Values belonging to startup options are skipped, so a project directory
+/// named `config` never accidentally selects command mode.
+pub fn has_cli_subcommand(args: &[String]) -> bool {
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--project" | "-p" | "--theme" => index += 2,
+            arg if arg.starts_with('-') => index += 1,
+            command => {
+                return matches!(
+                    command,
+                    "config"
+                        | "providers"
+                        | "sessions"
+                        | "projects"
+                        | "plugin"
+                        | "extensions"
+                        | "health"
+                        | "memory"
+                        | "audit"
+                        | "logs"
+                        | "agents"
+                        | "blueprint"
+                        | "credentials"
+                        | "shell"
+                        | "preferences"
+                )
+            }
+        }
+    }
+    false
+}
+
+pub const CLI_COMMAND_HELP: &str =
+    "CLI COMMANDS (also available without --cli in a CLI-enabled build):
+    config <show|get|keys|set|unset|path|init|doctor|help>
+    agents <list|show|import|set|clone|remove>
+    blueprint <list|show|select|import>
+    providers <list|add|remove|refresh>
+    credentials <status|set|delete>
+    preferences <show|set ui_theme NAME|set ui_font_size SIZE>
+    extensions <list|skills ACTION|mcp ACTION>
+    plugin <list|installed|install|remove|revoke>
+    shell <list|test|select|managed ACTION>
+    projects <list|current|use>
+    sessions <list|show|events|resume|prune>
+    memory <graph|explain>   health [--json]   audit   logs <path|show>
+
+SETTINGS EXAMPLES:
+    concerto config show --global
+    concerto config set retry.max_attempts 4 --dry-run
+    concerto config set memory.enabled false --project-scope
+    concerto agents set coder capabilities.shell false
+    concerto extensions mcp probe SERVER_ID
+    concerto credentials set providers/ID/api_key --prompt
+
+Run `config help` for typed values, scopes, indexed paths and file input.";
 
 /// Run the TUI/CLI interface.
 pub fn run_cli(
@@ -84,10 +145,15 @@ fn run_cli_inner(
             "health" => return run_health_subcommand(&remaining[1..], &project_root),
             "memory" => return run_memory_subcommand(&remaining[1..], &project_root),
             "audit" => return run_audit_subcommand(&remaining[1..]),
+            "agents" => return settings::run_agents(&remaining[1..], &project_root),
+            "blueprint" => return settings::run_blueprint(&remaining[1..], &project_root),
+            "credentials" => return settings::run_credentials(&remaining[1..]),
+            "shell" => return extensions::run_shell(&remaining[1..], &project_root),
+            "preferences" => return settings::run_preferences(&remaining[1..]),
             other => {
                 eprintln!("error: unknown subcommand '{other}'");
                 eprintln!(
-                    "available subcommands: config, providers, sessions, projects, plugin, extensions, health, memory, audit, logs"
+                    "available subcommands: config, providers, sessions, projects, plugin, extensions, health, memory, audit, logs, agents, blueprint, credentials, shell, preferences"
                 );
                 std::process::exit(1);
             }
@@ -229,6 +295,9 @@ fn run_cli_inner(
 // ── Subcommands ────────────────────────────────────────────────────────────────
 
 fn run_config_subcommand(args: &[String], project_root: &Path) -> anyhow::Result<()> {
+    if args.first().is_none_or(|arg| arg != "init" && arg != "doctor") {
+        return settings::run_config(args, project_root);
+    }
     if args.is_empty() {
         eprintln!("usage: concerto config <init|doctor>");
         std::process::exit(1);
@@ -262,8 +331,7 @@ fn run_config_subcommand(args: &[String], project_root: &Path) -> anyhow::Result
         }
         "doctor" => {
             let config_path = concerto_config::default_config_path();
-            let config = concerto_config::load_config(config_path.as_ref(), Some(project_root))
-                .unwrap_or_default();
+            let config = concerto_config::load_config(config_path.as_ref(), Some(project_root))?;
 
             println!("=== Concerto Config Doctor ===");
             match &config_path {
@@ -321,13 +389,15 @@ fn run_config_subcommand(args: &[String], project_root: &Path) -> anyhow::Result
 }
 
 fn run_providers_subcommand(args: &[String], project_root: &Path) -> anyhow::Result<()> {
+    if args.first().is_none_or(|arg| arg != "list") {
+        return settings::run_providers(args, project_root);
+    }
     if args.is_empty() || args[0] != "list" {
         eprintln!("usage: concerto providers list");
         std::process::exit(1);
     }
     let config_path = concerto_config::default_config_path();
-    let config =
-        concerto_config::load_config(config_path.as_ref(), Some(project_root)).unwrap_or_default();
+    let config = concerto_config::load_config(config_path.as_ref(), Some(project_root))?;
 
     let creds = concerto_config::CredentialStore::new();
 
@@ -892,6 +962,9 @@ fn run_projects_subcommand(args: &[String]) -> anyhow::Result<()> {
 }
 
 fn run_plugin_subcommand(args: &[String]) -> anyhow::Result<()> {
+    if args.first().is_none_or(|arg| arg != "list" && arg != "revoke") {
+        return extensions::run_plugin(args);
+    }
     if args.is_empty() {
         eprintln!("usage: concerto plugin <list|revoke <plugin-id>>");
         std::process::exit(1);
@@ -957,11 +1030,12 @@ fn run_plugin_subcommand(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `concerto extensions` — inspect the skills and MCP extension sections of
-/// the loaded config (ADR-43). v1 is read-only: skills are discovered from the
-/// configured search paths and listed; MCP servers are listed from the config.
-/// Edits are made in the config file or the desktop Settings page.
+/// `concerto extensions` — inspect effective skills/MCP configuration or
+/// delegate management and connection probes to the shared service commands.
 fn run_extensions_subcommand(args: &[String], project_root: &Path) -> anyhow::Result<()> {
+    if args.first().is_none_or(|arg| arg != "list") {
+        return extensions::run(args, project_root);
+    }
     if args.is_empty() {
         eprintln!("usage: concerto extensions <list>");
         std::process::exit(1);
@@ -969,8 +1043,7 @@ fn run_extensions_subcommand(args: &[String], project_root: &Path) -> anyhow::Re
     match args[0].as_str() {
         "list" => {
             let config_path = concerto_config::default_config_path();
-            let config = concerto_config::load_config(config_path.as_ref(), Some(project_root))
-                .unwrap_or_default();
+            let config = concerto_config::load_config(config_path.as_ref(), Some(project_root))?;
             let skills = config.skills.unwrap_or_default();
             let mcp = config.mcp.unwrap_or_default();
 
@@ -1562,7 +1635,7 @@ pub fn parse_cli_args<'a>(
                 eprintln!("                      flag beats CONCERTO_THEME env, which beats [display] theme");
                 eprintln!("  --project, -p DIR   Select the project used by chat and commands");
                 eprintln!("  --help, -h          Print this help");
-                eprintln!("  subcommands: config, providers, sessions, projects, plugin, extensions, health, audit, logs");
+                eprintln!("{CLI_COMMAND_HELP}");
                 std::process::exit(0);
             }
             _ => remaining.push(arg.clone()),
@@ -1574,6 +1647,21 @@ pub fn parse_cli_args<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_routing_skips_startup_values_and_recognizes_new_management_commands() {
+        for command in ["config", "agents", "blueprint", "credentials", "shell", "preferences"] {
+            assert!(has_cli_subcommand(&[
+                "--project".into(),
+                "config".into(),
+                command.into(),
+                "help".into()
+            ]));
+        }
+        assert!(!has_cli_subcommand(&["--project".into(), "config".into()]));
+        assert!(!has_cli_subcommand(&["--theme".into(), "config".into()]));
+        assert!(!has_cli_subcommand(&["--desktop".into()]));
+    }
 
     // ------------------------------------------------------------------
     // parse_cli_args
@@ -2006,7 +2094,8 @@ global_default_model = "gpt-4"
 id = "openai-1"
 provider = "openai"
 model = "gpt-4"
-api_key = "sk-test-key-for-provider-list-1234567890"
+timeout_seconds = 30
+keyring_key = "providers/openai-1/api_key"
 "#;
         std::fs::write(config_dir.join("config.toml"), config_content).unwrap();
 
@@ -2019,7 +2108,7 @@ api_key = "sk-test-key-for-provider-list-1234567890"
             Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
             None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
-        assert!(result.is_ok(), "providers list with model_settings should succeed");
+        assert!(result.is_ok(), "providers list with model_settings should succeed: {result:?}");
     }
 
     #[test]

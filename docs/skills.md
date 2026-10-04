@@ -184,7 +184,11 @@ once per `refresh`; the prompt hot path only clones the cached string.
   `.concerto.toml`) as above.
 - **CLI:** `concerto extensions list` shows the skills section state — enabled,
   search paths, auto-load, enabled ids — and the packs discovered under the
-  configured search paths. v1 is read-only; edits go through the config file.
+  configured search paths. `concerto extensions skills` provides pack
+  list/show/create/edit/remove and per-skill enable/disable. Use
+  `concerto config set skills.enabled true` for the master switch; structured
+  settings such as search paths are also editable with `config set`.
+  See the [CLI settings reference](cli-settings.md).
 - **Desktop:** Settings → Skills. v1 is config-driven: the enable toggle and
   per-skill checkboxes edit the *pending* config, persisted on Save Settings,
   and take effect on the next run. Search paths and auto-load are display-only.
@@ -199,8 +203,8 @@ once per `refresh`; the prompt hot path only clones the cached string.
 - The `tools` list is a prompt-level suggestion; there is no automatic tool
   gating or stripping in v1.
 - The desktop section is config-driven (next-run semantics); live toggles via a
-  held runtime handle are deferred (ADR-43 §3 v1 note). CLI support is
-  read-only.
+  held runtime handle are deferred (ADR-43 §3 v1 note). CLI configuration
+  changes also take effect on the next run.
 
 See [ADR-43](adrs/ADR-43-skills-mcp-and-extension-manager.md) for the
 architecture record and [architecture.md](architecture.md) for the crate

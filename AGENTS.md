@@ -151,7 +151,7 @@ cargo audit
 ## Skills & MCP (ADR-43)
 - Skills are local instruction packs (`skill.toml` or `SKILL.md` + resources) discovered by `SkillManager` (`crates/skills/`) and injected into prompts by `SkillsContext` (`crates/orchestrator/src/skills_context.rs`); they never execute code. Config: `[skills]` (`enabled` default **false**, `search_paths`, `auto_load`, `enabled_ids`, `max_chars`).
 - MCP servers are stdio child processes (protocol pin `2025-11-25`, newline-delimited JSON-RPC — no `Content-Length` framing). Tools are namespaced `mcp:<server_id>:<tool_name>`, collision-checked on registration, and policy-gated like any tool: unmatched `mcp:*` → `RequireApproval` preset. `[mcp]` defaults to disabled; no secrets in TOML.
-- Docs: `docs/skills.md`, `docs/mcp.md`. Desktop Settings → Skills/MCP are config-driven v1 (next-run semantics); CLI has `concerto extensions list`.
+- Docs: `docs/skills.md`, `docs/mcp.md`, `docs/cli-settings.md`. Desktop Settings → Skills/MCP and CLI configuration edits use next-run semantics. CLI extension commands support skill-pack management, MCP server edits, and temporary connection probes (ADR-80).
 
 ## LanceDB feature gate
 LanceDB support was removed in pre-release cleanup; `SqliteVectorStore` is the only vector store.

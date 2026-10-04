@@ -1222,6 +1222,7 @@ dependencies = [
  "concerto-core",
  "concerto-eval",
  "concerto-lsp",
+ "concerto-mcp",
  "concerto-memory",
  "concerto-orchestrator",
  "concerto-plugins",

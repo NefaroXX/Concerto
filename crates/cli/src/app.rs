@@ -146,6 +146,19 @@ pub enum SettingsField {
     MultiAgent,
     AgentAssignments,
     FastMode,
+    MemoryEnabled,
+    MemoryTtl,
+    RetryEnabled,
+    SkillsEnabled,
+    McpEnabled,
+    PluginsEnabled,
+    ProjectContextEnabled,
+    GitAutoInit,
+    ReducedMotion,
+    TerminalTitle,
+    Theme,
+    ShellProfile,
+    UpdateCheck,
 }
 
 impl SettingsField {
@@ -156,6 +169,19 @@ impl SettingsField {
         SettingsField::MultiAgent,
         SettingsField::AgentAssignments,
         SettingsField::FastMode,
+        SettingsField::MemoryEnabled,
+        SettingsField::MemoryTtl,
+        SettingsField::RetryEnabled,
+        SettingsField::SkillsEnabled,
+        SettingsField::McpEnabled,
+        SettingsField::PluginsEnabled,
+        SettingsField::ProjectContextEnabled,
+        SettingsField::GitAutoInit,
+        SettingsField::ReducedMotion,
+        SettingsField::TerminalTitle,
+        SettingsField::Theme,
+        SettingsField::ShellProfile,
+        SettingsField::UpdateCheck,
     ];
 
     pub fn label(self) -> &'static str {
@@ -166,6 +192,19 @@ impl SettingsField {
             SettingsField::MultiAgent => "Multi-agent",
             SettingsField::AgentAssignments => "Agent assignments",
             SettingsField::FastMode => "Fast mode",
+            SettingsField::MemoryEnabled => "Memory",
+            SettingsField::MemoryTtl => "Memory retention (days)",
+            SettingsField::RetryEnabled => "Provider retries",
+            SettingsField::SkillsEnabled => "Skills",
+            SettingsField::McpEnabled => "MCP servers",
+            SettingsField::PluginsEnabled => "WASM plugins",
+            SettingsField::ProjectContextEnabled => "Project AGENTS.md context",
+            SettingsField::GitAutoInit => "Initialize project Git",
+            SettingsField::ReducedMotion => "Reduced motion",
+            SettingsField::TerminalTitle => "Terminal title",
+            SettingsField::Theme => "Theme",
+            SettingsField::ShellProfile => "Shell profile",
+            SettingsField::UpdateCheck => "Check updates on startup",
         }
     }
 
@@ -184,7 +223,49 @@ impl SettingsField {
                 }
             }
             SettingsField::FastMode => if app.fast { "on" } else { "off" }.to_string(),
+            SettingsField::Theme => app
+                .global_config
+                .as_ref()
+                .and_then(|config| config.display.theme.clone())
+                .unwrap_or_else(|| crate::theme::DEFAULT_CLI_THEME.into()),
+            field => {
+                let config = app.global_config.clone().unwrap_or_default();
+                let example = concerto_config::settings::settings_example();
+                let current = serde_json::to_value(config).unwrap_or_default();
+                let defaults = serde_json::to_value(example).unwrap_or_default();
+                let key = field.config_key().unwrap_or_default();
+                let value = concerto_config::settings::value_at(&current, key)
+                    .filter(|value| !value.is_null())
+                    .or_else(|| concerto_config::settings::value_at(&defaults, key));
+                match value {
+                    Some(serde_json::Value::Bool(value)) => {
+                        if *value { "on" } else { "off" }.into()
+                    }
+                    Some(serde_json::Value::String(value)) => value.clone(),
+                    Some(value) => value.to_string(),
+                    None => "(default)".into(),
+                }
+            }
         }
+    }
+
+    fn config_key(self) -> Option<&'static str> {
+        Some(match self {
+            Self::MemoryEnabled => "memory.enabled",
+            Self::MemoryTtl => "memory.ttl_days",
+            Self::RetryEnabled => "retry.enabled",
+            Self::SkillsEnabled => "skills.enabled",
+            Self::McpEnabled => "mcp.enabled",
+            Self::PluginsEnabled => "plugins.enabled",
+            Self::ProjectContextEnabled => "project_context.enabled",
+            Self::GitAutoInit => "tool_settings.git_auto_init",
+            Self::ReducedMotion => "display.reduced_motion",
+            Self::TerminalTitle => "display.animated_terminal_title",
+            Self::Theme => "display.theme",
+            Self::ShellProfile => "shell_settings.selected_profile",
+            Self::UpdateCheck => "updates.check_on_startup",
+            _ => return None,
+        })
     }
 }
 
@@ -1521,9 +1602,15 @@ impl App {
                     self.agent_assignment_index = 0;
                 } else {
                     let reverse = key == KeyCode::Left;
-                    let persist = self.cycle_setting(field, reverse);
-                    if persist {
-                        self.save_global_config();
+                    if field.config_key().is_some() {
+                        if let Err(error) = self.cycle_shared_setting(field, reverse) {
+                            self.push_line(Line::from(format!("Could not save settings: {error}")));
+                        }
+                    } else {
+                        let persist = self.cycle_setting(field, reverse);
+                        if persist {
+                            self.save_global_config();
+                        }
                     }
                 }
             }
@@ -1779,7 +1866,82 @@ impl App {
                 // Handled in handle_settings_key directly (navigation, not cycle).
                 false
             }
+            _ => false, // Shared controls use the validated merge-aware writer.
         }
+    }
+
+    fn cycle_shared_setting(&mut self, field: SettingsField, reverse: bool) -> anyhow::Result<()> {
+        use concerto_config::settings::{value_at, SettingsEditor, SettingsScope};
+        let path = concerto_config::default_config_path()
+            .ok_or_else(|| anyhow::anyhow!("cannot determine config directory"))?;
+        let global = concerto_config::load_global_config(Some(&path))?;
+        let example = concerto_config::settings::settings_example();
+        let current = serde_json::to_value(&global)?;
+        let defaults = serde_json::to_value(example)?;
+        let key = field.config_key().ok_or_else(|| anyhow::anyhow!("not a shared setting"))?;
+        let value = value_at(&current, key)
+            .filter(|value| !value.is_null())
+            .or_else(|| value_at(&defaults, key));
+        let next = match field {
+            SettingsField::MemoryTtl => {
+                let days = global.memory.ttl_days;
+                if reverse {
+                    days.saturating_sub(1).max(1)
+                } else {
+                    days.saturating_add(1).min(365)
+                }
+                .to_string()
+            }
+            SettingsField::Theme => {
+                let names = crate::theme::CLI_THEME_NAMES;
+                let index = names
+                    .iter()
+                    .position(|name| Some(*name) == value.and_then(|value| value.as_str()))
+                    .unwrap_or(0);
+                let next = if reverse {
+                    (index + names.len() - 1) % names.len()
+                } else {
+                    (index + 1) % names.len()
+                };
+                serde_json::to_string(names[next])?
+            }
+            SettingsField::ShellProfile => {
+                let shells = global.shell_settings.clone().unwrap_or_default();
+                if shells.profiles.is_empty() {
+                    anyhow::bail!("no shell profiles configured");
+                }
+                let index = shells
+                    .profiles
+                    .iter()
+                    .position(|profile| profile.id == shells.selected_profile_id())
+                    .unwrap_or(0);
+                let next = if reverse {
+                    (index + shells.profiles.len() - 1) % shells.profiles.len()
+                } else {
+                    (index + 1) % shells.profiles.len()
+                };
+                serde_json::to_string(&shells.profiles[next].id)?
+            }
+            _ => (!value.and_then(|value| value.as_bool()).unwrap_or(false)).to_string(),
+        };
+        let editor = SettingsEditor {
+            global_path: path.clone(),
+            project_root: self.project_dir.clone(),
+            scope: SettingsScope::Global,
+        };
+        if field == SettingsField::ShellProfile && global.shell_settings.is_none() {
+            editor.edit(
+                "shell_settings",
+                Some(
+                    &toml::Value::try_from(global.shell_settings.unwrap_or_default())?.to_string(),
+                ),
+                false,
+            )?;
+        }
+        editor.edit(key, Some(&next), false)?;
+        self.global_config = Some(concerto_config::load_global_config(Some(&path))?);
+        self.reload_config_for_run();
+        Ok(())
     }
 
     fn save_global_config(&mut self) {

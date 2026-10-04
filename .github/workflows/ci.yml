@@ -130,17 +130,16 @@ jobs:
       - name: Build entire workspace
         run: cargo build --workspace
 
-      # The `cli` runtime is opt-in (`default = ["desktop"]`), so the workspace
-      # build above never compiles the `#[cfg(feature = "cli")]` path in
-      # crates/concerto/src/main.rs — a `concerto_cli::run_cli` signature change
-      # broke exactly that build while every CI job stayed green. Build the two
-      # distinct feature combinations CI otherwise misses: `cli` alongside the
-      # default `desktop`, and `cli` alone (which also exercises the
-      # `cfg(not(feature = "desktop"))` branch). Both reuse the artifacts the
-      # workspace build just produced.
-      - name: Build cli runtime feature combinations
+      # Both frontends are included by default. Prove command routing in that
+      # build before checking the two single-frontend feature combinations.
+      - name: Smoke-run default launcher commands
         run: |
-          cargo build -p concerto --features cli
+          ./target/debug/concerto config help
+          ./target/debug/concerto config keys retry
+
+      - name: Build single-frontend feature combinations
+        run: |
+          cargo build -p concerto --no-default-features --features desktop
           cargo build -p concerto --no-default-features --features cli
 
       # Compile success alone does not prove the CLI starts: the flag scan in
