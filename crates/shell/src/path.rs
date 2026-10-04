@@ -254,9 +254,15 @@ mod tests {
     use super::*;
 
     /// Fresh temp root; returns (root, TempDir) keeping the dir alive.
+    ///
+    /// The root is canonicalized once, here, so every assertion compares
+    /// canonical-to-canonical: production resolution always returns canonical
+    /// paths, while `TMPDIR` on macOS is a symlinked `/var/folders` →
+    /// `/private/var/folders`.
     fn temp_root() -> (Utf8PathBuf, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 temp path");
+        let root = root.canonicalize_utf8().expect("canonicalize temp root");
         (root, dir)
     }
 
@@ -370,8 +376,10 @@ mod tests {
     fn symlinked_workspace_root_keeps_new_files_in_root() {
         let (root, _dir) = temp_root();
         let real = tempfile::tempdir().expect("real dir");
-        let real_utf8 =
-            Utf8PathBuf::from_path_buf(real.path().to_path_buf()).expect("utf8 real path");
+        let real_utf8 = Utf8PathBuf::from_path_buf(real.path().to_path_buf())
+            .expect("utf8 real path")
+            .canonicalize_utf8()
+            .expect("canonicalize real dir");
         std::fs::create_dir_all(real_utf8.join("src")).expect("create src");
         let link = root.join("project-link");
         std::os::unix::fs::symlink(&real_utf8, &link).expect("symlink workspace");

@@ -640,6 +640,20 @@ mod tests {
         }
     }
 
+    /// Canonical temp project root, with the directory kept alive.
+    ///
+    /// Canonicalized once, here, so assertions compare canonical-to-canonical:
+    /// `resolve_cwd` returns canonical paths, while `TMPDIR` on macOS is a
+    /// symlinked `/var/folders` → `/private/var/folders`.
+    fn temp_project_root() -> (Utf8PathBuf, tempfile::TempDir) {
+        let directory = tempfile::tempdir().expect("temporary project");
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_path_buf())
+            .expect("UTF-8 temporary path")
+            .canonicalize_utf8()
+            .expect("canonical temporary path");
+        (root, directory)
+    }
+
     fn profiles() -> ShellProfileCatalog {
         let profile = ShellProfileConfig {
             id: "test".to_owned(),
@@ -798,9 +812,7 @@ mod tests {
 
     #[test]
     fn resolve_cwd_accepts_relative_subdir_inside_root() {
-        let directory = tempfile::tempdir().expect("temporary project");
-        let root = Utf8PathBuf::from_path_buf(directory.path().to_path_buf())
-            .expect("UTF-8 temporary path");
+        let (root, _directory) = temp_project_root();
         std::fs::create_dir(root.join("sub")).expect("create subdir");
         let context = ShellContext::new(root.clone());
         let result = resolve_cwd(&context, Some("sub")).expect("in-root relative cwd");
@@ -809,9 +821,7 @@ mod tests {
 
     #[test]
     fn resolve_cwd_accepts_absolute_path_inside_root() {
-        let directory = tempfile::tempdir().expect("temporary project");
-        let root = Utf8PathBuf::from_path_buf(directory.path().to_path_buf())
-            .expect("UTF-8 temporary path");
+        let (root, _directory) = temp_project_root();
         let context = ShellContext::new(root.clone());
         let result = resolve_cwd(&context, Some(root.as_str())).expect("in-root absolute cwd");
         assert_eq!(result, root);
