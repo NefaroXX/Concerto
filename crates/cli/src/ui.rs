@@ -361,6 +361,16 @@ fn draw_settings_list(frame: &mut Frame, area: Rect, app: &App) {
     let fields = SettingsField::ALL;
     let mut lines: Vec<Line> = Vec::new();
 
+    // Viewport contract: exactly `visible` rows are emitted, so entries and
+    // screen rows are interchangeable units. That is what makes the scroll
+    // clamp below exact — `first = selected - (visible - 1)` always lands the
+    // selected entry on the last visible row. Word-wrapping broke the 1:1
+    // mapping: a wrapped entry took two rows, the `take(visible)` window still
+    // counted it once, and the selection was pushed past the bottom edge
+    // (regression: `settings_selection_stays_visible_...` at 24x8). Long
+    // entries are therefore truncated to the viewport width with an ellipsis
+    // (same convention as `plan_hint`) instead of wrapped, keeping each entry
+    // on a single row at every terminal size.
     let visible = usize::from(area.height).max(1);
     let first = app.settings_index.saturating_sub(visible.saturating_sub(1));
     for (i, &field) in fields.iter().enumerate().skip(first).take(visible) {
@@ -374,11 +384,15 @@ fn draw_settings_list(frame: &mut Frame, area: Rect, app: &App) {
             (Style::default(), "  ")
         };
 
-        let line = Line::from(format!("{}{}: {}", indicator, label, value)).style(style);
+        let text = truncate_to(format!("{}{}: {}", indicator, label, value), area.width);
+        let line = Line::from(text).style(style);
         lines.push(line);
     }
 
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    // No `.wrap()`: the rows were already fitted to `area.width` above, and
+    // un-wrapped lines are clipped rather than re-flowed, so the row count the
+    // scroll clamp relies on is preserved at render time.
+    let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, area);
 }
 
