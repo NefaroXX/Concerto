@@ -1789,16 +1789,29 @@ impl SubTaskStatus {
         }
     }
 
+    /// Parse a status name. An unrecognized name still resolves to
+    /// [`Self::Pending`] (W9: fail toward the armed guards rather than
+    /// fabricating a terminal state) — but never silently: the unknown
+    /// string is logged at WARN so a corrupt/renamed status is diagnosable.
     pub fn from_name(s: &str) -> Self {
         match s {
             "declared" => Self::Declared,
+            // Explicit arm: `"pending"` is a real name and must not be
+            // logged as unknown by the fallback below.
+            "pending" => Self::Pending,
             "blocked" => Self::Blocked,
             "running" => Self::Running,
             "awaiting_review" => Self::AwaitingReview,
             "needs_revision" => Self::NeedsRevision,
             "completed" => Self::Completed,
             "failed" => Self::Failed,
-            _ => Self::Pending,
+            unknown => {
+                tracing::warn!(
+                    status = unknown,
+                    "unknown SubTaskStatus name; defaulting to Pending"
+                );
+                Self::Pending
+            }
         }
     }
 }
@@ -2450,6 +2463,132 @@ mod tests {
             assert_eq!(SubTaskStatus::from_name(name), status);
         }
         assert_eq!(SubTaskStatus::from_name("unknown"), SubTaskStatus::Pending);
+    }
+
+    /// Minimal `tracing::Subscriber` capturing WARN events while a closure
+    /// runs under `tracing::subscriber::with_default`, so `from_name`'s
+    /// warning can be asserted without a dev-dependency (workspace
+    /// precedent: `concerto-config` `schema::tests::WarnSink`,
+    /// `concerto-providers` `openai::tests::WarnSink`).
+    #[derive(Clone, Default)]
+    struct WarnSink {
+        warns: std::sync::Arc<std::sync::Mutex<Vec<CapturedWarn>>>,
+    }
+
+    /// One captured WARN event: its message plus the structured fields.
+    #[derive(Clone, Debug, Default)]
+    struct CapturedWarn {
+        message: String,
+        fields: Vec<(String, String)>,
+    }
+
+    impl CapturedWarn {
+        fn field(&self, name: &str) -> Option<&str> {
+            self.fields.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str())
+        }
+
+        fn push(&mut self, name: &str, rendered: String) {
+            if name == "message" {
+                self.message = rendered;
+            } else {
+                self.fields.push((name.to_string(), rendered));
+            }
+        }
+    }
+
+    impl WarnSink {
+        fn warns(&self) -> Vec<CapturedWarn> {
+            self.warns.lock().unwrap_or_else(|error| error.into_inner()).clone()
+        }
+    }
+
+    impl tracing::Subscriber for WarnSink {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _attributes: &tracing::span::Attributes<'_>) -> tracing::Id {
+            static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            tracing::Id::from_u64(NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+        }
+
+        fn record(&self, _span: &tracing::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::Id, _follows: &tracing::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if event.metadata().level() != &tracing::Level::WARN {
+                return;
+            }
+            let mut captured = CapturedWarn::default();
+            event.record(&mut captured);
+            self.warns.lock().unwrap_or_else(|error| error.into_inner()).push(captured);
+        }
+
+        fn enter(&self, _span: &tracing::Id) {}
+
+        fn exit(&self, _span: &tracing::Id) {}
+    }
+
+    impl tracing::field::Visit for CapturedWarn {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            // `fmt::Arguments` renders verbatim; a `&str`-backed debug value
+            // arrives quoted, so strip the quotes to keep assertions stable.
+            let rendered = format!("{value:?}").trim_matches('"').to_string();
+            self.push(field.name(), rendered);
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.push(field.name(), value.to_string());
+        }
+    }
+
+    /// W9: an unknown status name still resolves to `Pending` (fail toward
+    /// the armed guards) but is logged at WARN carrying the unknown string —
+    /// a fabricated status is never silent.
+    #[test]
+    fn unknown_subtask_status_name_warns_and_defaults_to_pending() {
+        let sink = WarnSink::default();
+        let handle = sink.clone();
+        let status = tracing::subscriber::with_default(sink, || SubTaskStatus::from_name("paused"));
+
+        assert_eq!(status, SubTaskStatus::Pending, "an unknown name fails toward Pending");
+        let warns = handle.warns();
+        assert_eq!(warns.len(), 1, "the unknown name must be logged, not silent: {warns:?}");
+        assert_eq!(
+            warns[0].field("status"),
+            Some("paused"),
+            "the warning carries the unknown string verbatim"
+        );
+        assert!(
+            warns[0].message.contains("unknown SubTaskStatus name"),
+            "the warning explains the default: {}",
+            warns[0].message
+        );
+    }
+
+    /// Negative (one per excluded class): every recognized name parses
+    /// without a warning — including `"pending"`, which the fallback used to
+    /// swallow, and would otherwise be logged as unknown on every read.
+    #[test]
+    fn known_subtask_status_names_do_not_warn() {
+        for name in [
+            "declared",
+            "pending",
+            "blocked",
+            "running",
+            "awaiting_review",
+            "needs_revision",
+            "completed",
+            "failed",
+        ] {
+            let sink = WarnSink::default();
+            let handle = sink.clone();
+            let parsed = tracing::subscriber::with_default(sink, || SubTaskStatus::from_name(name));
+
+            assert_eq!(parsed.as_str(), name, "{name:?} still round-trips");
+            assert!(handle.warns().is_empty(), "known name {name:?} must not warn");
+        }
     }
 
     #[test]
