@@ -190,7 +190,10 @@
 //! [`MAX_PINNED_FACTS`] are reserved for facts about artifacts active work
 //! depends on — a non-terminal decision's `expected_artifacts` or an open
 //! question's `blocks` path — so a burst of irrelevant reads cannot evict
-//! them. The remaining slots fill newest-first as before. This is
+//! them. Within that reserve the order is status first (W3: `Contradicted`,
+//! `Verified`, `Assumed`, `Stale`), then newest-first, so an older pinned
+//! disproof never loses its slot to newer pinned facts; the remaining slots
+//! fill in status precedence, newest-first within each tier. This is
 //! deterministic pinning by membership, never a weighted relevance score.
 //! Pinning is applied OVER the staleness rules above (F-GENERATION,
 //! F-SUPERSEDE, F-WORKSPACE-SUPERSEDE): a reserved slot keeps a fact in
@@ -217,8 +220,10 @@ pub const MAX_WORLD_FACTS: usize = 32;
 /// artifacts active work depends on: at most this many facts whose `artifact`
 /// names a non-terminal decision's `expected_artifacts` entry or an open
 /// question's `blocks` path are held against newest-first eviction. The
-/// remaining slots fill newest-first as before — deterministic pinning, never
-/// a weighted relevance score.
+/// reserve orders its own tier by status first (W3: `Contradicted` leads),
+/// then newest-first; the remaining slots fill in status precedence,
+/// newest-first within each tier — deterministic pinning, never a weighted
+/// relevance score.
 pub const MAX_PINNED_FACTS: usize = 8;
 /// The reservation can never exceed the fact cap itself.
 const _: () = assert!(MAX_PINNED_FACTS <= MAX_WORLD_FACTS);
@@ -309,11 +314,29 @@ impl FactStatus {
     /// `Verified` outranks `Contradicted`, which outranks `Assumed`, which
     /// outranks `Stale`. Disproof must not evict proof — the render order
     /// (contradicted first) deliberately differs from this eviction order.
-    /// The pinned reservation (issue #142) still ranks above all of these.
+    /// The pinned reservation (issue #142) still ranks above all of these,
+    /// and orders its own tier by [`Self::pinned_rank`] instead.
     fn display_rank(self) -> u8 {
         match self {
             Self::Verified => 0,
             Self::Contradicted => 1,
+            Self::Assumed => 2,
+            Self::Stale => 3,
+        }
+    }
+
+    /// Order INSIDE the pinned reserve (W3 — the #142 pinning rank against
+    /// contradiction, left open by ADR-65): `Contradicted` leads, then
+    /// `Verified`, `Assumed`, `Stale`, newest-first within each. An OLDER
+    /// pinned disproof must not be pushed out of its reserved slot by newer
+    /// pinned facts — falling to the fill tier it would sit below every
+    /// `Verified` fact there and be evicted. This order deliberately matches
+    /// the render's contradicted-first head; the unpinned fill tier keeps
+    /// [`Self::display_rank`] (proof before disproof).
+    fn pinned_rank(self) -> u8 {
+        match self {
+            Self::Contradicted => 0,
+            Self::Verified => 1,
             Self::Assumed => 2,
             Self::Stale => 3,
         }
@@ -1109,44 +1132,42 @@ fn active_artifact_paths(
     paths
 }
 
-/// The deterministic fact cap (issue #142): `facts` may be any order;
+/// The deterministic fact cap (issue #142, W3): `facts` may be any order;
 /// up to [`MAX_PINNED_FACTS`] slots are reserved for facts whose artifact is
-/// in `pinned_paths` (reserved tier, newest-first, K newest when the pinned
-/// tier overflows), and every remaining slot fills in status precedence —
-/// `Verified`, then `Contradicted` (issue #170), then `Assumed`, then
-/// `Stale` — newest-first within each tier, pinned overflow included, so no
-/// slot is wasted. Pure: the same input yields the same selection in the
-/// same order.
+/// in `pinned_paths` — the reserved tier orders by status first
+/// ([`FactStatus::pinned_rank`]: `Contradicted`, `Verified`, `Assumed`,
+/// `Stale`), then newest-first, K best when the pinned tier overflows, so an
+/// older pinned disproof never loses its slot to newer pinned facts — and
+/// every remaining slot fills in status precedence — `Verified`, then
+/// `Contradicted` (issue #170), then `Assumed`, then `Stale` — newest-first
+/// within each tier, so no slot is wasted. Pure: the same input yields the
+/// same selection in the same order.
 fn select_facts(mut facts: Vec<WorldFact>, pinned_paths: &HashSet<String>) -> Vec<WorldFact> {
     // Newest-first; the sort is stable, so equal `seq` keeps event order.
     facts.sort_by_key(|fact| core::cmp::Reverse(fact.seq));
-    // Walk newest-first and mark at most MAX_PINNED_FACTS reserved slots, so
-    // an over-long pinned tier reserves exactly the K newest pinned facts.
-    let mut reserved = vec![false; facts.len()];
-    let mut pinned_kept = 0;
-    for (index, fact) in facts.iter().enumerate() {
-        if pinned_kept >= MAX_PINNED_FACTS {
-            break;
-        }
-        if fact.artifact.as_deref().is_some_and(|path| pinned_paths.contains(path)) {
-            reserved[index] = true;
-            pinned_kept += 1;
-        }
-    }
-    let mut out: Vec<WorldFact> = Vec::with_capacity(MAX_WORLD_FACTS.min(facts.len()));
+    // Split into the reserved tier and the fill tier, preserving the
+    // newest-first order both tiers rank within. Membership test only —
+    // the `HashSet` is never iterated, so the split is deterministic.
+    let mut pinned: Vec<WorldFact> = Vec::new();
     let mut fill: Vec<WorldFact> = Vec::with_capacity(facts.len());
-    for (index, fact) in facts.into_iter().enumerate() {
-        if reserved[index] {
-            out.push(fact);
+    for fact in facts {
+        if fact.artifact.as_deref().is_some_and(|path| pinned_paths.contains(path)) {
+            pinned.push(fact);
         } else {
             fill.push(fact);
         }
     }
+    // The reserved tier (W3): status first, then newest-first. The sort is
+    // stable over the newest-first split, so ties keep that order, and the
+    // truncate selects AND orders the K reserved facts in one pass.
+    pinned.sort_by_key(|fact| fact.status.pinned_rank());
+    pinned.truncate(MAX_PINNED_FACTS);
     // Status precedence below the pinned tier (issue #170 as reviewed):
     // disproof must not evict proof — verified outranks contradicted for
     // the surviving slots (the render order is the reverse on purpose).
     // The sort is stable, so newest-first holds within each status tier.
     fill.sort_by_key(|fact| fact.status.display_rank());
+    let mut out = pinned;
     out.extend(fill.into_iter().take(MAX_WORLD_FACTS.saturating_sub(out.len())));
     out
 }
@@ -1543,7 +1564,7 @@ impl WorldModel {
         // (issue #142).
         let (questions, question_age_memory) = resolve_and_feed_questions(input);
 
-        // ── Facts (reserved for active work, then newest-first; staleness per F-*) ──
+        // ── Facts (reserved for active work, then status precedence; staleness per F-*) ──
         let candidates: Vec<WorldFact> = candidates
             .into_iter()
             .map(|candidate| {
@@ -4600,6 +4621,111 @@ mod tests {
         );
         // Fill tier: pure newest-first over the remaining facts.
         assert_eq!(kept[MAX_PINNED_FACTS], "ev-read-99", "the fill is newest-first");
+    }
+
+    /// W3 (the #142 pinning rank against contradiction, open in ADR-65): the
+    /// reserved tier orders by STATUS first — `Contradicted`, `Verified`,
+    /// `Assumed`, `Stale` — then newest-first. An OLDER pinned disproof keeps
+    /// its reserved slot instead of falling to the fill tier, where
+    /// `Verified` outranks it and the newer pinned burst would evict it.
+    /// The total stays capped and the build stays pure.
+    #[test]
+    fn pinned_reserve_keeps_older_contradicted_over_newer_verified() {
+        // One OLDER Contradicted fact about a pinned artifact …
+        let mut events = vec![
+            event(WhiteboardKind::WriteApplied, "ev-base", 1, write_applied("src/pinned.rs")),
+            grounded_finding("ev-claim", 2, "the claim about pinned.rs", &["ev-base"]),
+            failed_tool("ev-fail", 3, "edit_file", &["src/pinned.rs"]),
+        ];
+        // … plus MORE newer pinned Verified facts than the reserve holds …
+        let mut pinned_paths = vec!["src/pinned.rs".to_owned()];
+        for index in 0..(MAX_PINNED_FACTS + 4) as u64 {
+            let path = format!("src/newer-{index}.rs");
+            events.push(event(
+                WhiteboardKind::WriteApplied,
+                &format!("ev-newer-{index}"),
+                10 + index,
+                write_applied(&path),
+            ));
+            pinned_paths.push(path);
+        }
+        // … and an unpinned Verified burst that overfills the cap, so the
+        // fill tier alone (Verified first) would evict the contradicted claim.
+        events.extend(unrelated_reads(25, 100));
+
+        let refs: Vec<&str> = pinned_paths.iter().map(String::as_str).collect();
+        let active = vec![decision("d-active", DecisionStatus::Dispatched, &refs)];
+        let one = WorldModel::build(&input(&events, Vec::new(), &active, &[], Vec::new()));
+        let two = WorldModel::build(&input(&events, Vec::new(), &active, &[], Vec::new()));
+        assert_eq!(one, two, "the selection is pure: identical inputs, identical model");
+        let model = one;
+
+        assert!(model.facts.len() <= MAX_WORLD_FACTS, "the total stays within the fact cap");
+        assert_eq!(model.facts.len(), MAX_WORLD_FACTS, "the cap still fills completely");
+        let at = model
+            .facts
+            .iter()
+            .position(|fact| fact.ref_id == "ev-claim")
+            .expect("the older pinned disproof is retained against the newer pinned burst");
+        assert_eq!(
+            model.facts[at].status,
+            FactStatus::Contradicted,
+            "the older pinned fact is still the disproof it was"
+        );
+        assert!(
+            at < MAX_PINNED_FACTS,
+            "it holds a reserved slot: at {at}, the reserve is {MAX_PINNED_FACTS} slots"
+        );
+        assert_eq!(
+            model.facts[0].ref_id, "ev-claim",
+            "the reserved tier orders by status first: the pinned disproof leads it"
+        );
+        let reserved = &model.facts[..MAX_PINNED_FACTS];
+        assert!(
+            reserved.iter().all(|fact| fact
+                .artifact
+                .as_deref()
+                .is_some_and(|path| pinned_paths.iter().any(|p| p.as_str() == path))),
+            "the reserve still holds only facts about pinned artifacts"
+        );
+        assert!(
+            model.render().chars().count() <= MAX_RENDER_CHARS,
+            "the render stays hard-bounded"
+        );
+    }
+
+    /// W3 negative control: WITHOUT pinning nothing changes — the fill tier
+    /// keeps the reviewed order, `Verified` (newest-first) before
+    /// `Contradicted`, so an unpinned disproof is still outranked by every
+    /// verified fact. Reserving pinned disproofs never reorders this tier.
+    #[test]
+    fn unpinned_contradicted_is_still_outranked_by_verified() {
+        let mut events = vec![
+            event(WhiteboardKind::WriteApplied, "ev-base", 1, write_applied("src/claim.rs")),
+            grounded_finding("ev-claim", 2, "the claim about claim.rs", &["ev-base"]),
+            failed_tool("ev-fail", 3, "edit_file", &["src/claim.rs"]),
+        ];
+        events.extend(unrelated_reads(20, 10));
+
+        let model = WorldModel::build(&input(&events, Vec::new(), &[], &[], Vec::new()));
+
+        assert!(model.facts.len() <= MAX_WORLD_FACTS, "the total stays within the fact cap");
+        let at = model
+            .facts
+            .iter()
+            .position(|fact| fact.ref_id == "ev-claim")
+            .expect("under the cap the unpinned disproof still fits");
+        assert_eq!(model.facts[at].status, FactStatus::Contradicted, "it is still a disproof");
+        assert!(
+            model.facts[..at].iter().all(|fact| fact.status == FactStatus::Verified),
+            "every verified fact outranks the unpinned contradicted one"
+        );
+        assert_eq!(
+            at,
+            model.facts.len() - 1,
+            "unpinned tier order is unchanged: contradicted ranks last of the two"
+        );
+        assert_eq!(model.facts[0].ref_id, "ev-read-19", "the unpinned tier stays newest-first");
     }
 
     /// Every stored label is characters-bounded and every fact is a
