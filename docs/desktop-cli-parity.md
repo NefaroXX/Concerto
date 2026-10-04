@@ -2,7 +2,7 @@
 
 **Status: settings and configuration parity expanded 2026-10-03; interaction
 parity remains in progress.** The August R2–R4/P1–P7 checklist below is a
-historical milestone, not proof of complete parity. [ADR-78](adrs/ADR-78-cli-settings-and-studio-parity.md)
+historical milestone, not proof of complete parity. [ADR-80](adrs/ADR-80-cli-settings-and-studio-parity.md)
 corrects the former blanket exclusions. See [CLI settings reference](cli-settings.md).
 
 ## Objective

@@ -1,4 +1,4 @@
-# ADR-78: CLI settings and Studio parity
+# ADR-80: CLI settings and Studio parity
 
 **Status:** Accepted
 
