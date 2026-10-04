@@ -358,6 +358,7 @@ mod tests {
             transform: None,
             max_tool_calls: None,
             wait_record: None,
+            dismissed_question_id: None,
             created_at: OffsetDateTime::now_utc(),
             status,
         }

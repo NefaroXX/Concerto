@@ -57,6 +57,7 @@ fn kind_label(kind: DecisionKind) -> &'static str {
         DecisionKind::Reconsider => "reconsider",
         DecisionKind::DeclareObligations => "declare-obligations",
         DecisionKind::UpdateObligations => "update-obligations",
+        DecisionKind::DismissQuestion => "dismiss-question",
     }
 }
 
@@ -129,6 +130,7 @@ mod tests {
             transform: None,
             max_tool_calls: None,
             wait_record: None,
+            dismissed_question_id: None,
             created_at: OffsetDateTime::now_utc(),
             status,
         }

@@ -2187,6 +2187,7 @@ mod tests {
             transform: None,
             max_tool_calls: None,
             wait_record: None,
+            dismissed_question_id: None,
             created_at: time::OffsetDateTime::UNIX_EPOCH,
             status: crate::decisions::DecisionStatus::Settled,
         };
@@ -2613,6 +2614,7 @@ mod tests {
                 cycles_open: 2,
                 state: crate::world_model::QuestionState::Open,
                 resolved_by: None,
+                dismiss_reason: None,
             }],
             assumptions: vec![crate::world_model::WorldAssumption {
                 ref_id: "ev-2".to_owned(),
@@ -2622,6 +2624,7 @@ mod tests {
                 ref_id: "ev-2".to_owned(),
                 label: "expected artifact src/main.rs is stale".to_owned(),
             }],
+            question_age_memory: Vec::new(),
             pending: Some("dispatch to coder: implement".to_owned()),
         };
         let cp_json = serde_json::json!({

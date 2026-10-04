@@ -379,6 +379,8 @@ pub(crate) fn decision_kind_label(kind: DecisionKind) -> &'static str {
         // undispatched edits.
         DecisionKind::DeclareObligations => "declare-obligations",
         DecisionKind::UpdateObligations => "update-obligations",
+        // Q-DISMISS: question dismissal by coordinator judgment.
+        DecisionKind::DismissQuestion => "dismiss-question",
     }
 }
 

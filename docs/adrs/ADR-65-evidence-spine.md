@@ -800,6 +800,14 @@ detail of this one.
    add-linkage section above). Whether the Coordinator needs an explicit way to
    dismiss one is **undecided**; if it exists it must be a journaled decision,
    never a compiled rule (ADR-71). Unresolved as of this addendum.
+
+   **Decided (dismissal branch):** the Coordinator dismisses a standing
+   question by explicit judgment through the journaled `dismiss_question` tool
+   (a settled `DismissQuestion` decision naming the question id with the
+   reason; the entry resolves with the reason and never re-opens — see
+   `crates/orchestrator/src/world_model.rs` Q-DISMISS). Dismissal is terminal:
+   it is never reconsidered; revisit happens via a new signal opening a new
+   question.
 3. **#135 add-linkage half — landed; the residual set is accepted as-is.** The
    linkage (`FailureDiagnosis.decision_id`/`artifact_path` attached at the
    `call_specialist` surfaces) has shipped, so `OpenProblem` questions from those
