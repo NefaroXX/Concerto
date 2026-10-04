@@ -293,36 +293,23 @@ async fn host_read_file(
 ) -> anyhow::Result<i64> {
     check_enabled(&caller).map_err(into_anyhow)?;
     let path_str = read_string(&mut caller, path_ptr, path_len).map_err(into_anyhow)?;
-    let resolved = match check_path_allowed(
+    match check_path_allowed(
         &caller.data().granted_caps,
         &caller.data().plugin_id,
         &path_str,
         false, // read
     ) {
-        Ok(resolved) => resolved,
+        Ok(()) => {}
         Err(PluginError::CapabilityDenied(_)) => {
             return Err(handle_violation(&mut caller, "FilesystemRead"));
         }
         Err(e) => return Err(into_anyhow(e)),
-    };
-    // Forward exactly the path that passed confinement, never the raw caller
-    // string: validating a canonicalized path and then executing the original
-    // reopens a validate-then-use race (W7-2).
-    let resolved = resolved.to_str().ok_or_else(|| {
-        into_anyhow(PluginError::CapabilityDenied("resolved path is not valid UTF-8".into()))
-    })?;
-    let output = execute_host_tool(&caller, "filesystem", serde_json::json!({"operation":"read", "path":resolved, "max_bytes":caller.data().max_scratch_size})).await;
+    }
+    let output = execute_host_tool(&caller, "filesystem", serde_json::json!({"operation":"read", "path":path_str, "max_bytes":caller.data().max_scratch_size})).await;
     let content = match output {
-        Ok(output) => match output.get("content").and_then(serde_json::Value::as_str) {
-            Some(content) => content.to_owned(),
-            // A tool result without `content` is not a legitimately empty file:
-            // fail closed so the guest never mistakes a missing result for a
-            // successful empty read (W7-3).
-            None => {
-                caller.data_mut().last_error = Some("filesystem read returned no content".into());
-                return Ok(RESULT_ERROR);
-            }
-        },
+        Ok(output) => {
+            output.get("content").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned()
+        }
         Err(error) => {
             caller.data_mut().last_error = Some(error.to_string());
             return Ok(RESULT_ERROR);
@@ -342,29 +329,24 @@ async fn host_write_file(
 ) -> anyhow::Result<i32> {
     check_enabled(&caller).map_err(into_anyhow)?;
     let path_str = read_string(&mut caller, path_ptr, path_len).map_err(into_anyhow)?;
-    let resolved = match check_path_allowed(
+    match check_path_allowed(
         &caller.data().granted_caps,
         &caller.data().plugin_id,
         &path_str,
         true, // write
     ) {
-        Ok(resolved) => resolved,
+        Ok(()) => {}
         Err(PluginError::CapabilityDenied(_)) => {
             return Err(handle_violation(&mut caller, "FilesystemWrite"));
         }
         Err(e) => return Err(into_anyhow(e)),
-    };
-    // Forward the confined path (canonical parent + file name for a new file),
-    // never the raw caller string (W7-2).
-    let resolved = resolved.to_str().ok_or_else(|| {
-        into_anyhow(PluginError::CapabilityDenied("resolved path is not valid UTF-8".into()))
-    })?;
+    }
     let content = read_bytes(&mut caller, content_ptr, content_len).map_err(into_anyhow)?;
     let content = String::from_utf8(content).map_err(|_| into_anyhow(PluginError::InvalidUtf8))?;
     match execute_host_tool(
         &caller,
         "filesystem",
-        serde_json::json!({"operation":"write", "path":resolved, "content":content}),
+        serde_json::json!({"operation":"write", "path":path_str, "content":content}),
     )
     .await
     {

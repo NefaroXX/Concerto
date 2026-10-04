@@ -51,14 +51,9 @@ impl PluginLoader {
     }
 
     pub fn set_execution_context(&mut self, execution: crate::host::PluginHostContext) {
-        // Each store captures the context `Arc` at initialise time (see
-        // `initialise`), so replacing the loader's context must NOT clear the
-        // previous run's context. Clearing it here revokes an in-flight effect
-        // that belongs to an earlier run, so A's effect would fail against no
-        // context instead of resolving against A's own session after B starts
-        // (W7-4). An ended run's authority is revoked by dropping its
-        // `ToolExecutor` (stores hold only a `Weak`) and by
-        // `PluginManager::prepare_run` disabling the previous instances.
+        if let Ok(mut old) = self.execution.write() {
+            *old = None;
+        }
         self.execution = execution;
     }
 
