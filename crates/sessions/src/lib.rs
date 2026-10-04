@@ -704,14 +704,20 @@ fn encode_task_execution_mode(
 /// those rows previously read back; corrupt JSON is a
 /// [`SessionError::Serialization`] rather than a silent default so a stored
 /// mode is never again fabricated on the read path.
+///
+/// The error names `task_id` (W9): one corrupt row in an otherwise healthy
+/// table must be diagnosable from the error alone.
 fn decode_task_execution_mode(
+    task_id: &TaskId,
     raw: Option<String>,
 ) -> Result<concerto_core::types::TaskExecutionMode, SessionError> {
     match raw {
         None => Ok(concerto_core::types::TaskExecutionMode::default()),
-        Some(json) => {
-            serde_json::from_str(&json).map_err(|e| SessionError::Serialization(e.to_string()))
-        }
+        Some(json) => serde_json::from_str(&json).map_err(|e| {
+            SessionError::Serialization(format!(
+                "corrupt tasks.execution_mode for task {task_id}: {e}"
+            ))
+        }),
     }
 }
 
@@ -1635,7 +1641,7 @@ impl SessionStore for SqliteSessionStore {
                 let execution_mode_raw: Option<String> = row
                     .try_get("execution_mode")
                     .map_err(|e| SessionError::Database(e.to_string()))?;
-                let execution_mode = decode_task_execution_mode(execution_mode_raw)?;
+                let execution_mode = decode_task_execution_mode(&id, execution_mode_raw)?;
 
                 Ok(Some(concerto_core::types::AgentTask {
                     id,
@@ -1667,25 +1673,37 @@ impl SessionStore for SqliteSessionStore {
             // Cancellation checked at statement boundaries (row decode loop).
             check_cancel(&cancel)?;
 
-            let id_str: String =
-                row.try_get("id").map_err(|e| SessionError::Database(e.to_string()))?;
-            let id = TaskId(
-                Ulid::from_string(&id_str)
-                    .map_err(|_| SessionError::Serialization("invalid ULID".into()))?,
-            );
-            let sid_str: String =
-                row.try_get("session_id").map_err(|e| SessionError::Database(e.to_string()))?;
-            let sid = Ulid::from_string(&sid_str)
-                .map_err(|_| SessionError::Serialization("invalid ULID".into()))?;
-            let description: String =
-                row.try_get("description").map_err(|e| SessionError::Database(e.to_string()))?;
-            let created_at_unix: i64 =
-                row.try_get("created_at").map_err(|e| SessionError::Database(e.to_string()))?;
-            let created_at = time::OffsetDateTime::from_unix_timestamp(created_at_unix)
-                .map_err(|e| SessionError::Database(e.to_string()))?;
+            let id_str: String = row.try_get("id").map_err(|e| {
+                SessionError::Database(format!(
+                    "tasks row of session {session_id} has no readable id: {e}"
+                ))
+            })?;
+            let id = TaskId(Ulid::from_string(&id_str).map_err(|e| {
+                SessionError::Serialization(format!("invalid ULID task id {id_str}: {e}"))
+            })?);
+            let sid_str: String = row.try_get("session_id").map_err(|e| {
+                SessionError::Database(format!("task {id_str}: unreadable session_id: {e}"))
+            })?;
+            let sid = Ulid::from_string(&sid_str).map_err(|e| {
+                SessionError::Serialization(format!(
+                    "invalid ULID session_id for task {id_str}: {e}"
+                ))
+            })?;
+            let description: String = row.try_get("description").map_err(|e| {
+                SessionError::Database(format!("task {id_str}: unreadable description: {e}"))
+            })?;
+            let created_at_unix: i64 = row.try_get("created_at").map_err(|e| {
+                SessionError::Database(format!("task {id_str}: unreadable created_at: {e}"))
+            })?;
+            let created_at =
+                time::OffsetDateTime::from_unix_timestamp(created_at_unix).map_err(|e| {
+                    SessionError::Database(format!("task {id_str}: unreadable created_at: {e}"))
+                })?;
             let execution_mode_raw: Option<String> =
-                row.try_get("execution_mode").map_err(|e| SessionError::Database(e.to_string()))?;
-            let execution_mode = decode_task_execution_mode(execution_mode_raw)?;
+                row.try_get("execution_mode").map_err(|e| {
+                    SessionError::Database(format!("task {id_str}: unreadable execution_mode: {e}"))
+                })?;
+            let execution_mode = decode_task_execution_mode(&id, execution_mode_raw)?;
 
             tasks.push(concerto_core::types::AgentTask {
                 id,
@@ -3017,6 +3035,81 @@ mod tests {
             tasks[0].execution_mode,
             TaskExecutionMode::default(),
             "legacy NULL row must list with the default mode"
+        );
+    }
+
+    #[tokio::test]
+    /// W9: one corrupt `execution_mode` row makes `list_tasks` fail LOUD with
+    /// an error naming the offending task — never a silently defaulted mode,
+    /// never an error that hides which row broke.
+    async fn list_tasks_corrupt_execution_mode_names_the_task_id() {
+        use concerto_core::types::{AgentTask, TaskExecutionMode};
+        let store = SqliteSessionStore::connect_in_memory().await.unwrap();
+        let project_dir = camino::Utf8PathBuf::from("/tmp/test_list_tasks_corrupt");
+        let session =
+            store.create_session(&project_dir, "p", "m", CancellationToken::new()).await.unwrap();
+        let healthy = TaskId(Ulid::new());
+        let corrupt = TaskId(Ulid::new());
+        let now = time::OffsetDateTime::now_utc();
+        for (id, description) in [(healthy, "healthy task"), (corrupt, "corrupt task")] {
+            let task = AgentTask {
+                id,
+                session_id: session.id,
+                description: description.into(),
+                created_at: now,
+                execution_mode: TaskExecutionMode::default(),
+            };
+            store.create_task(&task, CancellationToken::new()).await.unwrap();
+        }
+        // Corrupt exactly one row in place, leaving the other intact.
+        sqlx::query("UPDATE tasks SET execution_mode = 'not-json-at-all' WHERE id = ?")
+            .bind(corrupt.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        let listed = store.list_tasks(session.id, CancellationToken::new()).await;
+        let err = listed.expect_err("a corrupt row must not list as a defaulted task");
+        let message = err.to_string();
+        assert!(
+            message.contains(&corrupt.to_string()),
+            "the error must name the offending task id, got: {message}"
+        );
+        assert!(
+            !message.contains(&healthy.to_string()),
+            "the healthy row must not be blamed: {message}"
+        );
+    }
+
+    #[tokio::test]
+    /// W9: `get_task` fails loud on the same corrupt row, naming that task.
+    async fn get_task_corrupt_execution_mode_names_the_task_id() {
+        use concerto_core::types::{AgentTask, TaskExecutionMode};
+        let store = SqliteSessionStore::connect_in_memory().await.unwrap();
+        let project_dir = camino::Utf8PathBuf::from("/tmp/test_get_task_corrupt");
+        let session =
+            store.create_session(&project_dir, "p", "m", CancellationToken::new()).await.unwrap();
+        let corrupt = TaskId(Ulid::new());
+        let task = AgentTask {
+            id: corrupt,
+            session_id: session.id,
+            description: "corrupt task".into(),
+            created_at: time::OffsetDateTime::now_utc(),
+            execution_mode: TaskExecutionMode::default(),
+        };
+        store.create_task(&task, CancellationToken::new()).await.unwrap();
+        sqlx::query("UPDATE tasks SET execution_mode = 'not-json-at-all' WHERE id = ?")
+            .bind(corrupt.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        let loaded = store.get_task(corrupt, CancellationToken::new()).await;
+        let err = loaded.expect_err("a corrupt row must not read as a defaulted task");
+        let message = err.to_string();
+        assert!(
+            message.contains(&corrupt.to_string()),
+            "the error must name the offending task id, got: {message}"
         );
     }
 
