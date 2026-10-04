@@ -778,6 +778,7 @@ mod tests {
             }),
             max_tool_calls: None,
             wait_record: None,
+            dismissed_question_id: None,
             created_at: now(),
             status: crate::decisions::DecisionStatus::Settled,
         };

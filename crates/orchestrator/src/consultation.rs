@@ -531,6 +531,7 @@ mod tests {
             cycles_open,
             state,
             resolved_by: None,
+            dismiss_reason: None,
         }
     }
 

@@ -122,6 +122,19 @@ pub enum DecisionKind {
     /// target (it names decisions and tasks, not a specialist) and requires
     /// a task description (the reason rides the task text, like WAIT).
     Reconsider,
+    /// World-model question dismissal (Q-DISMISS): the Coordinator's explicit
+    /// judgment that a standing [`crate::world_model::UnresolvedQuestion`] is
+    /// answered, moot, or unresolvable — the ONLY way a question without a
+    /// linkable resolver (notably a linked question with `blocks == None`,
+    /// whose dispatch named no expected artifacts) ever resolves. The
+    /// dismissed question id rides [`CoordinatorDecision::dismissed_question_id`]
+    /// (attached by the coordinator handler AFTER structural validation, the
+    /// same way the transform payload is); the reason rides the task
+    /// description. This kind rejects a target (it names a question, not a
+    /// specialist) and requires a task description. Dismissal is coordinator
+    /// judgment recorded as a decision, never a compiled rule (ADR-71): the
+    /// world-model builder records it, it never decides one.
+    DismissQuestion,
 }
 
 impl DecisionKind {
@@ -154,6 +167,7 @@ impl DecisionKind {
                 | DecisionKind::UpdateObligations
                 | DecisionKind::Wait
                 | DecisionKind::Reconsider // names decisions/tasks, not a specialist
+                | DecisionKind::DismissQuestion // names a question, not a specialist
         )
     }
 
@@ -166,6 +180,7 @@ impl DecisionKind {
                 | DecisionKind::Consult
                 | DecisionKind::Wait // the WAIT reason rides the task text
                 | DecisionKind::Reconsider // the RECONSIDER reason rides the task text
+                | DecisionKind::DismissQuestion // the dismissal reason rides the task text
                 | DecisionKind::DeclareObligations // the declaration summary rides the task text
                 | DecisionKind::UpdateObligations // the update summary rides the task text
         )
@@ -237,6 +252,14 @@ pub struct CoordinatorDecision {
     /// validated by the task-transform machinery against real graph state.
     #[serde(default)]
     pub wait_record: Option<crate::wait::WaitingRecord>,
+    /// World-model question dismissal (Q-DISMISS): the standing question id
+    /// this `DismissQuestion` decision dismisses. `None` for every other
+    /// kind. Additive serde (`default`), so old journal entries and old
+    /// checkpoints (no field) still load. Attached by the coordinator
+    /// handler AFTER structural validation, the same way the transform
+    /// payload, the consult effort cap, and the wait record are.
+    #[serde(default)]
+    pub dismissed_question_id: Option<String>,
     pub created_at: time::OffsetDateTime,
     pub status: DecisionStatus,
 }
@@ -435,6 +458,9 @@ impl<'a> DecisionValidator<'a> {
             // structural validation (issue #63), the same way the transform
             // payload and effort cap are.
             wait_record: None,
+            // The dismissed question id is attached by the coordinator
+            // handler AFTER structural validation (Q-DISMISS).
+            dismissed_question_id: None,
             created_at: time::OffsetDateTime::now_utc(),
             status: DecisionStatus::Validated,
         })
@@ -483,6 +509,7 @@ impl<'a> DecisionValidator<'a> {
             transform: None,
             max_tool_calls: None,
             wait_record: None,
+            dismissed_question_id: None,
             created_at: time::OffsetDateTime::now_utc(),
             status: DecisionStatus::Rejected,
         }
@@ -511,6 +538,7 @@ impl<'a> DecisionValidator<'a> {
             transform: None,
             max_tool_calls: None,
             wait_record: None,
+            dismissed_question_id: None,
             created_at: time::OffsetDateTime::now_utc(),
             status: DecisionStatus::Rejected,
         }
@@ -1187,5 +1215,76 @@ mod tests {
         value["status"] = serde_json::json!("superseded");
         let restored: CoordinatorDecision = serde_json::from_value(value).expect("deserialize");
         assert_eq!(restored.status, DecisionStatus::Superseded);
+    }
+
+    // ── Q-DISMISS: the DismissQuestion decision kind ───────────────────
+
+    #[test]
+    fn dismiss_question_decision_validates_with_reason_and_evidence() {
+        let roster_ids = roster(&["coder"]);
+        let known = events(&["ev-0001"]);
+        let decision = validator(&roster_ids, &known, None)
+            .validate(
+                DecisionKind::DismissQuestion,
+                None, // a dismissal never names a specialist target
+                "the provider fault is moot — the work landed",
+                Some("coordinator judgment"),
+                &["ev-0001".to_owned()],
+                &[],
+            )
+            .expect("a grounded dismissal validates");
+        assert_eq!(decision.kind, DecisionKind::DismissQuestion);
+        assert_eq!(decision.target_agent, None, "a dismissal never names a target");
+        assert_eq!(
+            decision.task_description, "the provider fault is moot — the work landed",
+            "the reason rides the task text"
+        );
+        assert_eq!(decision.supporting_evidence_ids, vec!["ev-0001"]);
+        assert_eq!(
+            decision.dismissed_question_id, None,
+            "the question id is attached by the handler"
+        );
+        assert!(DecisionKind::DismissQuestion.rejects_target());
+        assert!(DecisionKind::DismissQuestion.requires_task());
+        assert!(!DecisionKind::DismissQuestion.requires_target());
+    }
+
+    #[test]
+    fn dismiss_question_with_empty_reason_or_target_rejects() {
+        let roster_ids = roster(&["coder"]);
+        let known = events(&[]);
+        let validator = validator(&roster_ids, &known, None);
+        let error = validator
+            .validate(DecisionKind::DismissQuestion, None, "  ", None, &[], &[])
+            .expect_err("a dismissal requires a non-empty reason");
+        assert_eq!(error.code, "incomplete_decision");
+        let error = validator
+            .validate(DecisionKind::DismissQuestion, Some("coder"), "moot", None, &[], &[])
+            .expect_err("a dismissal rejects a specialist target");
+        assert_eq!(error.code, "conflicting_decision");
+        let error = validator
+            .validate(DecisionKind::DismissQuestion, None, "moot", None, &["ghost".to_owned()], &[])
+            .expect_err("fabricated evidence is rejected");
+        assert_eq!(error.code, "fabricated_evidence");
+    }
+
+    #[test]
+    fn dismiss_question_round_trips_and_old_entries_default_the_link() {
+        let mut decision = validator(&roster(&["coder"]), &events(&[]), None)
+            .validate(DecisionKind::DismissQuestion, None, "moot", None, &[], &[])
+            .expect("valid");
+        decision.dismissed_question_id = Some("q-abc123".to_owned());
+        let json = serde_json::to_string(&decision).expect("serialize");
+        assert!(json.contains("\"dismiss-question\""), "kebab-case kind: {json}");
+        assert!(json.contains("q-abc123"), "the dismissed question id travels: {json}");
+        let back: CoordinatorDecision = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, decision);
+
+        // A pre-dismissal entry: no `dismissed_question_id` key → default None.
+        let mut value = serde_json::to_value(&back).expect("serialize");
+        assert!(value.get("dismissed_question_id").is_some(), "current entries carry the key");
+        value.as_object_mut().expect("an object").remove("dismissed_question_id");
+        let old: CoordinatorDecision = serde_json::from_value(value).expect("an old entry loads");
+        assert_eq!(old.dismissed_question_id, None, "the additive link defaults");
     }
 }

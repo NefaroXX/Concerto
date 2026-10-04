@@ -137,6 +137,20 @@ pub(crate) const MERGE_TASKS_TOOL: &str = "merge_tasks";
 /// applies no policy gate (there is nothing to gate).
 pub(crate) const RECONSIDER_TOOL: &str = "reconsider";
 
+/// Q-DISMISS: the explicit question-dismissal surface. The Coordinator's
+/// model dismisses ONE standing world-model question it judges answered,
+/// moot, or unresolvable (notably a linked question with `blocks == None`,
+/// whose dispatch named no expected artifacts so no artifact touch can ever
+/// resolve it) by naming the real question id with the reason. The handler
+/// journals a `DismissQuestion` decision (settled, carrying the question id
+/// and the reason), records the whiteboard `Decision`, resolves the entry
+/// in the model with the reason, and checkpoints — the resolved entry then
+/// never re-opens, even against a recurring signal. Dismissal is coordinator
+/// judgment, never a compiled rule (ADR-71): the tool only records it.
+/// Dispatches no agents and touches no tools, so like reconsider it applies
+/// no policy gate.
+pub(crate) const DISMISS_QUESTION_TOOL: &str = "dismiss_question";
+
 /// The obligation-declaration surface: the Coordinator's structured decision
 /// creates obligation-bearing work BEFORE any dispatch. Each declared item
 /// becomes a `Declared` (Outstanding, not-yet-dispatched) graph node — the
@@ -359,6 +373,10 @@ Waiting on external reality (issue #63):
 Superseding a decision whose assumptions proved wrong (issue #64):
 - reconsider marks one of this run's journaled decisions Superseded and freezes ONLY the affected PENDING tasks whose plans it stood behind. Use it when new evidence or a settlement shows a decision's assumptions no longer hold. Name the real decision id, the pending task ids, and cite the evidence that changed your mind.
 - Completed work, valid evidence, and accepted artifacts are never touched; frozen tasks never re-dispatch on their own. Re-plan the frozen work yourself, under fresh decisions, from the current world state. An unknown or already-rejected decision id is a structured rejection you can read and fix.
+
+Dismissing a stale question (Q-DISMISS):
+- dismiss_question resolves one of this run's standing world-model questions (cite its real id from the context) when YOU judge it answered, moot, or unresolvable — e.g. a failure with no linkable recovery whose subject work already landed. Name the question id and the reason; the dismissal journals a decision and the question never re-opens.
+- Dismissal is judgment, never cleanup: never dismiss a question to make a count look better, and no rule dismisses for you — age, cap pressure, and unrelated settles never resolve anything.
 
 Artifact ownership (issue #61):
 - A write by a non-owner to an OWNED artifact is refused; the refusal names the owner and its acquiring event. To hand an owned artifact over to another agent, call transfer_ownership — the mediated handover is the only lawful way; ownership is never stolen.
@@ -587,8 +605,9 @@ fn reconsider_tool_definition() -> ToolDefinition {
                 "decision_id": {
                     "type": "string",
                     "description": "The id of a decision recorded in this run's journal (from the \
-                                    context) whose assumptions you are superseding. Unknown ids and \
-                                    already-rejected decisions are rejected."
+                                    context) whose assumptions you are superseding. Unknown ids, \
+                                    already-rejected decisions, and question dismissals (dismissal \
+                                    is terminal, never reconsidered) are rejected."
                 },
                 "reason": {
                     "type": "string",
@@ -616,6 +635,52 @@ fn reconsider_tool_definition() -> ToolDefinition {
                 }
             },
             "required": ["decision_id", "reason", "affected_task_ids"]
+        }),
+    }
+}
+
+/// Q-DISMISS: argument schema for `dismiss_question` — resolve ONE standing
+/// world-model question by coordinator judgment. The question id must stand
+/// open in the current model; the reason rides the dismissal decision's task
+/// text and is kept on the resolved entry. Unknown ids are rejected; an
+/// already-resolved question answers idempotent success (dismissed entries
+/// never re-open, so re-dismissing decides nothing new).
+fn dismiss_question_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: DISMISS_QUESTION_TOOL.to_string(),
+        description: "Dismiss a standing world-model question you judge answered, moot, \
+                      or unresolvable (Q-DISMISS): name its real question id from the \
+                      context and the reason. The dismissal is journaled as a decision \
+                      and whiteboard-recorded, and the question never re-opens. \
+                      Judgment, never cleanup — age, cap pressure, and unrelated \
+                      settles never resolve anything on their own."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "question_id": {
+                    "type": "string",
+                    "description": "The id of a standing OPEN world-model question (from the \
+                                    context, e.g. q-abc123) you are dismissing."
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Why the question is answered, moot, or unresolvable; \
+                                    recorded as the dismissal decision's reason and kept \
+                                    on the resolved entry."
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Optional extra guidance, recorded in the decision notes."
+                },
+                "supporting_evidence_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional real whiteboard event ids that justify the dismissal. \
+                                    Fabricated ids are rejected."
+                }
+            },
+            "required": ["question_id", "reason"]
         }),
     }
 }
@@ -2909,6 +2974,29 @@ impl ReconsiderArgs {
     }
 }
 
+/// Q-DISMISS: `dismiss_question` tool arguments — the standing question id,
+/// the reason (rides the dismissal decision's task text), optional notes,
+/// and supporting evidence.
+struct DismissQuestionArgs {
+    question_id: String,
+    reason: String,
+    notes: Option<String>,
+    supporting_evidence_ids: Vec<String>,
+}
+
+impl DismissQuestionArgs {
+    fn parse(arguments: &serde_json::Value) -> Option<Self> {
+        let question_id = arguments.get("question_id").and_then(serde_json::Value::as_str)?;
+        let reason = arguments.get("reason").and_then(serde_json::Value::as_str)?;
+        Some(Self {
+            question_id: question_id.to_owned(),
+            reason: reason.to_owned(),
+            notes: arguments.get("notes").and_then(serde_json::Value::as_str).map(str::to_owned),
+            supporting_evidence_ids: parse_string_array(arguments, "supporting_evidence_ids"),
+        })
+    }
+}
+
 /// Read an optional JSON array-of-strings field, dropping non-string
 /// entries (absent/non-array ⇒ empty). `pub(crate)`: the consultation
 /// machinery (issue #59) parses its evidence list with the same shape.
@@ -3981,6 +4069,7 @@ impl CoordinatorAgent {
                 pending: pending.as_ref(),
                 pending_stale,
                 previous_questions,
+                previous_age_memory: self.world_model.question_age_memory.clone(),
                 external_changes: &self.external_changes,
                 now_ms,
             });
@@ -4097,6 +4186,7 @@ impl CoordinatorAgent {
             transform: None,
             max_tool_calls: None,
             wait_record: None,
+            dismissed_question_id: None,
             created_at: time::OffsetDateTime::now_utc(),
             status: crate::decisions::DecisionStatus::Validated,
         };
@@ -11883,6 +11973,9 @@ impl CoordinatorAgent {
             // Issue #64: the reconsideration surface — supersede a decision
             // and freeze only its affected pending tasks.
             tool_defs.push(reconsider_tool_definition());
+            // Q-DISMISS: the question-dismissal surface — resolve one
+            // standing world-model question by coordinator judgment.
+            tool_defs.push(dismiss_question_tool_definition());
             // The obligation-declaration surfaces — structured work before
             // dispatch: `declare_obligations` creates Outstanding
             // (not-yet-dispatched) graph nodes, `update_obligations` revises
@@ -12364,6 +12457,23 @@ impl CoordinatorAgent {
                             scope,
                             ledger,
                             state,
+                            &tool_call.arguments,
+                        )
+                        .await
+                    }
+                    // Q-DISMISS: the question-dismissal surface — the model
+                    // resolves one standing world-model question by explicit
+                    // judgment (journaled decision + whiteboard record, the
+                    // entry never re-opens). Dispatches nothing, touches no
+                    // tools — the judgment itself is the record.
+                    DISMISS_QUESTION_TOOL if dispatching => {
+                        self.handle_dismiss_question(
+                            graph,
+                            task,
+                            base_ctx,
+                            cancel,
+                            scope,
+                            ledger,
                             &tool_call.arguments,
                         )
                         .await
@@ -14875,7 +14985,7 @@ impl CoordinatorAgent {
             Err(rejection) => {
                 warn!(
                     code = %rejection.code,
-                    "a split/merge decision failed validation (structured error, no state \
+                    "a no-target decision failed validation (structured error, no state \
                      mutation)"
                 );
                 Err(rejection.tool_value())
@@ -16416,9 +16526,9 @@ impl CoordinatorAgent {
 
         // ── 2. The superseded decision must exist in the journal; a
         //       rejected decision has nothing in operation to void ────────
-        let target_status =
+        let target =
             match self.decision_journal.entries().iter().find(|entry| entry.id == decision_id) {
-                Some(entry) => entry.status,
+                Some(entry) => entry,
                 None => {
                     return serde_json::json!({
                         "error": "unknown_decision",
@@ -16429,6 +16539,21 @@ impl CoordinatorAgent {
                     });
                 }
             };
+        // Q-DISMISS: a dismissal is terminal — reconsidering (Freeze /
+        // Superseded) over it would unsay the dismissal so the question
+        // could re-open, contradicting "never re-opens". Revisit happens by
+        // a new signal opening a new question, never by reconsidering the
+        // dismissal away.
+        if target.kind == crate::decisions::DecisionKind::DismissQuestion {
+            return serde_json::json!({
+                "error": "decision_not_reconsiderable",
+                "message": format!(
+                    "decision {decision_id} is a question dismissal — dismissal is terminal \
+                     and is never reconsidered; a recurring signal opens a new question instead"
+                ),
+            });
+        }
+        let target_status = target.status;
         if target_status == crate::decisions::DecisionStatus::Rejected {
             return serde_json::json!({
                 "error": "decision_not_reconsiderable",
@@ -16575,6 +16700,133 @@ impl CoordinatorAgent {
                 "superseded decision {decision_id} and froze {} pending task(s); re-plan the \
                  frozen work under fresh decisions",
                 frozen.len()
+            ),
+        })
+    }
+
+    /// Q-DISMISS: handle ONE `dismiss_question` tool call — resolve one
+    /// standing world-model question by coordinator judgment. Same failure
+    /// discipline as the sibling decision surfaces: parse → question lookup
+    /// → decision validation → journal the settled dismissal carrying the
+    /// question id → whiteboard `Decision` record + ledger row + checkpoint →
+    /// structured result. The resolved entry carries the reason and never
+    /// re-opens (the builder re-resolves through the journal); an already
+    /// resolved question answers idempotent success and journals nothing.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_dismiss_question(
+        &mut self,
+        graph: &mut TaskGraph,
+        task: &AgentTask,
+        base_ctx: &AgentContext,
+        cancel: &CancellationToken,
+        scope: &mut checkpoint::CheckpointScope,
+        ledger: &mut DispatchLedger,
+        arguments: &serde_json::Value,
+    ) -> serde_json::Value {
+        // ── 1. Parse (no partial dismissal) ──────────────────────────────
+        let Some(args) = DismissQuestionArgs::parse(arguments) else {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "dismiss_question requires a non-empty question_id (an open \
+                            world-model question from the context) and a non-empty reason",
+            });
+        };
+        let question_id = args.question_id.trim();
+        let reason = args.reason.trim();
+        if question_id.is_empty() || reason.is_empty() {
+            return serde_json::json!({
+                "error": "invalid_arguments",
+                "message": "dismiss_question requires a non-empty question_id and a non-empty reason",
+            });
+        }
+
+        // ── 2. The question must stand in the current model ──────────────
+        let standing_state = self
+            .world_model
+            .questions
+            .iter()
+            .find(|question| question.id == question_id)
+            .map(|question| (question.is_open(), question.resolved_by.clone()));
+        let Some((is_open, resolved_by)) = standing_state else {
+            return serde_json::json!({
+                "error": "unknown_question",
+                "message": format!(
+                    "no question {question_id} stands in the current world model; cite a real \
+                     open question id from the context"
+                ),
+            });
+        };
+        if !is_open {
+            return serde_json::json!({
+                "outcome": "dismissed",
+                "question_id": question_id,
+                "decision_id": resolved_by,
+                "already_dismissed": true,
+                "message": format!(
+                    "question {question_id} is already resolved; a dismissed question never \
+                     re-opens, so nothing new was decided"
+                ),
+            });
+        }
+
+        // ── 3. Decision validation (a dismissal rejects a target; the reason
+        //       rides the task text; fabricated evidence is rejected). The
+        //       dismissed question id is attached here, validated against the
+        //       REAL model by the previous step. ───────────────────────────
+        let mut decision = match self
+            .validate_transform_decision(
+                crate::decisions::DecisionKind::DismissQuestion,
+                None,
+                reason,
+                args.notes.as_deref(),
+                &args.supporting_evidence_ids,
+                &[],
+                cancel,
+                base_ctx,
+            )
+            .await
+        {
+            Ok(decision) => decision,
+            Err(error) => return error,
+        };
+        decision.dismissed_question_id = Some(question_id.to_owned());
+        let decision_id = decision.id.clone();
+        self.decision_journal.record(decision);
+        self.decision_journal.transition(&decision_id, crate::decisions::DecisionStatus::Settled);
+
+        // ── 4. The trail: resolve the entry in the model with the reason
+        //       (the next rebuild re-derives it from the journal), record the
+        //       whiteboard Decision, mirror the ledger, checkpoint. ────────
+        if let Some(question) =
+            self.world_model.questions.iter_mut().find(|question| question.id == question_id)
+        {
+            question.state = crate::world_model::QuestionState::Resolved;
+            question.resolved_by = Some(decision_id.clone());
+            question.dismiss_reason = Some(crate::world_model::bounded(reason.to_owned()));
+            question.cycles_open = 0;
+        }
+        ledger.action_ledger.push(checkpoint::CheckpointAction {
+            kind: "dismissed".into(),
+            task_id: None, // the dismissal spans no task; the decision names the question
+            timestamp: time::OffsetDateTime::now_utc(),
+            evidence: None,
+        });
+        self.append_transform_decision(
+            task.session_id,
+            None, // a dismissal leaves no per-node continuation behind
+            args.notes.as_deref().unwrap_or("coordinator_choice"),
+            &format!("dismiss question {question_id}: {reason}"),
+            &args.supporting_evidence_ids,
+        )
+        .await;
+        self.persist_dispatch_checkpoint(graph, task, base_ctx, scope, ledger).await;
+
+        serde_json::json!({
+            "outcome": "dismissed",
+            "question_id": question_id,
+            "decision_id": decision_id,
+            "message": format!(
+                "dismissed question {question_id} by coordinator judgment; it will never re-open"
             ),
         })
     }
@@ -18934,6 +19186,7 @@ mod tests {
             pending: None,
             pending_stale: false,
             previous_questions: Vec::new(),
+            previous_age_memory: Vec::new(),
             external_changes: &[],
             now_ms: 1_000,
         });
@@ -36536,6 +36789,7 @@ mod tests {
             transform: None,
             max_tool_calls: None,
             wait_record: None,
+            dismissed_question_id: None,
             created_at: time::OffsetDateTime::now_utc(),
             status: crate::decisions::DecisionStatus::Settled,
         }
@@ -36935,6 +37189,333 @@ mod tests {
             crate::decisions::DecisionStatus::Superseded,
             "the Superseded mark is stable"
         );
+    }
+
+    // ── Q-DISMISS: question dismissal — journaled coordinator judgment ───
+
+    /// One standing OPEN world-model question with the given id/state, as the
+    /// dismissal handler reads it from the coordinator's current model.
+    fn standing_question(id: &str, open: bool) -> crate::world_model::UnresolvedQuestion {
+        crate::world_model::UnresolvedQuestion {
+            id: id.to_owned(),
+            kind: crate::world_model::QuestionKind::OpenProblem,
+            question: "how does the run recover from its failure?".to_owned(),
+            blocks: None,
+            needed: Vec::new(),
+            opened_journal_len: 0,
+            opened_ref: None,
+            subject_decision_id: Some("d-1".to_owned()),
+            opened_at_ms: 1_000,
+            cycles_open: 3,
+            state: if open {
+                crate::world_model::QuestionState::Open
+            } else {
+                crate::world_model::QuestionState::Resolved
+            },
+            resolved_by: if open { None } else { Some("d-old".to_owned()) },
+            dismiss_reason: None,
+        }
+    }
+
+    /// Q-DISMISS acceptance: dismissing a standing open question journals a
+    /// settled `DismissQuestion` decision carrying the question id, resolves
+    /// the entry with the reason, and mirrors the ledger.
+    #[tokio::test]
+    async fn dismiss_question_journals_decision_and_resolves_open_question() {
+        let bus = EventBus::new(256);
+        let workspace = tempfile::tempdir().expect("tempdir for the dismissal workspace");
+        let (mut coordinator, _store, session_id) = coordinator_with_store(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+            workspace.path(),
+        )
+        .await;
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        coordinator.world_model.questions = vec![standing_question("q-abc123", true)];
+        let mut graph = TaskGraph::new();
+        let mut ledger = DispatchLedger::default();
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+
+        let result = coordinator
+            .handle_dismiss_question(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({
+                    "question_id": "q-abc123",
+                    "reason": "the provider fault is moot",
+                }),
+            )
+            .await;
+
+        assert_eq!(result["outcome"], "dismissed", "structured success: {result}");
+        assert_eq!(result["question_id"], "q-abc123");
+        // The trail: a settled DismissQuestion decision naming the question.
+        let entries = coordinator.decision_journal.entries();
+        let dismissal = entries.last().expect("the dismissal decision is journaled");
+        assert!(matches!(dismissal.kind, crate::decisions::DecisionKind::DismissQuestion));
+        assert_eq!(
+            dismissal.dismissed_question_id.as_deref(),
+            Some("q-abc123"),
+            "the decision names the dismissed question"
+        );
+        assert_eq!(dismissal.status, crate::decisions::DecisionStatus::Settled);
+        assert_eq!(result["decision_id"], dismissal.id.as_str());
+        // The model entry resolves with the reason and zeroed age.
+        let resolved = coordinator
+            .world_model
+            .questions
+            .iter()
+            .find(|question| question.id == "q-abc123")
+            .expect("the entry is kept");
+        assert_eq!(resolved.state, crate::world_model::QuestionState::Resolved);
+        assert_eq!(resolved.resolved_by.as_deref(), Some(dismissal.id.as_str()));
+        assert_eq!(resolved.dismiss_reason.as_deref(), Some("the provider fault is moot"));
+        assert_eq!(resolved.cycles_open, 0);
+        assert!(
+            ledger.action_ledger.iter().any(|action| action.kind == "dismissed"),
+            "the ledger mirrors the dismissal: {ledger:?}"
+        );
+    }
+
+    /// Q-DISMISS: unknown question ids and malformed arguments are structured
+    /// rejections journaling nothing; re-dismissing an already-resolved
+    /// question is idempotent success journaling nothing new.
+    #[tokio::test]
+    async fn dismiss_question_rejects_unknown_and_malformed_inputs() {
+        let bus = EventBus::new(256);
+        let workspace = tempfile::tempdir().expect("tempdir for the dismissal workspace");
+        let (mut coordinator, _store, session_id) = coordinator_with_store(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+            workspace.path(),
+        )
+        .await;
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        coordinator.world_model.questions = vec![standing_question("q-abc123", true)];
+        let mut graph = TaskGraph::new();
+        let mut ledger = DispatchLedger::default();
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+
+        let unknown = coordinator
+            .handle_dismiss_question(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({ "question_id": "q-ghost", "reason": "moot" }),
+            )
+            .await;
+        assert_eq!(unknown["error"], "unknown_question", "{unknown}");
+        assert!(coordinator.decision_journal.entries().is_empty(), "a rejection journals nothing");
+
+        let malformed = coordinator
+            .handle_dismiss_question(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({ "question_id": "q-abc123", "reason": "   " }),
+            )
+            .await;
+        assert_eq!(malformed["error"], "invalid_arguments", "{malformed}");
+        assert!(coordinator.decision_journal.entries().is_empty(), "a rejection journals nothing");
+
+        // An already-resolved question answers idempotent success.
+        coordinator.world_model.questions = vec![standing_question("q-done", false)];
+        let journaled = coordinator.decision_journal.len();
+        let repeated = coordinator
+            .handle_dismiss_question(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({ "question_id": "q-done", "reason": "moot again" }),
+            )
+            .await;
+        assert_eq!(
+            repeated["outcome"], "dismissed",
+            "re-dismissing a resolved question is not an error: {repeated}"
+        );
+        assert_eq!(repeated["already_dismissed"], true);
+        assert_eq!(
+            coordinator.decision_journal.len(),
+            journaled,
+            "idempotent re-dismissal journals nothing new"
+        );
+    }
+
+    /// A settled question dismissal the journal holds — the reconsideration
+    /// target that must be refused (Q-DISMISS terminality).
+    fn settled_dismissal_target() -> crate::decisions::CoordinatorDecision {
+        crate::decisions::CoordinatorDecision {
+            id: "d-dismiss".to_owned(),
+            kind: crate::decisions::DecisionKind::DismissQuestion,
+            target_agent: None,
+            task_description: "the provider fault is moot".to_owned(),
+            notes: None,
+            supporting_evidence_ids: vec![],
+            expected_artifacts: vec![],
+            transform: None,
+            max_tool_calls: None,
+            wait_record: None,
+            dismissed_question_id: Some("q-abc123".to_owned()),
+            created_at: time::OffsetDateTime::now_utc(),
+            status: crate::decisions::DecisionStatus::Settled,
+        }
+    }
+
+    /// Q-DISMISS terminality: reconsidering a `DismissQuestion` decision is
+    /// refused — a Freeze/Superseded over it would unsay the dismissal so the
+    /// question could re-open, contradicting "never re-opens". The refusal
+    /// journals nothing and mutates nothing; revisit happens via a new
+    /// signal opening a new question, never by reconsidering the dismissal.
+    #[tokio::test]
+    async fn reconsider_refuses_a_question_dismissal_target() {
+        let bus = EventBus::new(256);
+        let workspace = tempfile::tempdir().expect("tempdir for the reconsider workspace");
+        let (mut coordinator, _store, session_id) = coordinator_with_store(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+            workspace.path(),
+        )
+        .await;
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        coordinator.decision_journal.record(settled_dismissal_target());
+        let pending = TaskId::new();
+        let mut graph = TaskGraph::new();
+        graph.add_root(SubTask {
+            id: pending,
+            parent_id: None,
+            session_id,
+            role: AgentId::new("coder"),
+            description: "pending work".into(),
+            status: SubTaskStatus::Pending,
+            dependencies: vec![],
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        });
+        let mut ledger = DispatchLedger::default();
+        let mut state = DispatchSessionState {
+            doc: None,
+            doc_verdict: None,
+            last_node: None,
+            ..Default::default()
+        };
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+
+        let result = coordinator
+            .handle_reconsider(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &mut state,
+                &serde_json::json!({
+                    "decision_id": "d-dismiss",
+                    "reason": "the fault turned out to matter",
+                    "affected_task_ids": [pending.to_string()],
+                }),
+            )
+            .await;
+
+        assert_eq!(result["error"], "decision_not_reconsiderable", "{result}");
+        assert_eq!(coordinator.decision_journal.len(), 1, "the refusal journals nothing");
+        let dismissal = coordinator
+            .decision_journal
+            .entries()
+            .iter()
+            .find(|entry| entry.id == "d-dismiss")
+            .expect("the dismissal stays journaled");
+        assert_eq!(
+            dismissal.status,
+            crate::decisions::DecisionStatus::Settled,
+            "the dismissal stands — nothing unsaid it"
+        );
+        assert!(
+            matches!(dismissal.kind, crate::decisions::DecisionKind::DismissQuestion),
+            "the target is still the dismissal"
+        );
+        let task_node = graph.get(&pending).expect("the task stays in the graph");
+        assert_eq!(task_node.status, SubTaskStatus::Pending, "nothing froze");
+    }
+
+    /// Q-DISMISS addressability: a question the render cut (past
+    /// `RENDER_QUESTIONS`) still cites a real id — it appears in the
+    /// omitted-count line and `dismiss_question` accepts it.
+    #[tokio::test]
+    async fn dismiss_question_reaches_a_render_omitted_question() {
+        let bus = EventBus::new(256);
+        let workspace = tempfile::tempdir().expect("tempdir for the dismissal workspace");
+        let (mut coordinator, _store, session_id) = coordinator_with_store(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![CoordinatorTurn::Text(String::new())],
+            workspace.path(),
+        )
+        .await;
+        let task = AgentTask::new(session_id, "build the thing");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            workspace.path().to_path_buf(),
+        ));
+        coordinator.world_model.questions =
+            (0..7).map(|index| standing_question(&format!("q-evict-{index}"), true)).collect();
+        // The render shows six entries; the seventh survives only as an id
+        // in the omitted-count line — still a real, citable id.
+        let rendered = coordinator.world_model.render();
+        assert!(rendered.contains("q-evict-6"), "the render names the omitted id: {rendered:?}");
+
+        let mut graph = TaskGraph::new();
+        let mut ledger = DispatchLedger::default();
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+        let result = coordinator
+            .handle_dismiss_question(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut ledger,
+                &serde_json::json!({ "question_id": "q-evict-6", "reason": "moot" }),
+            )
+            .await;
+        assert_eq!(result["outcome"], "dismissed", "the omitted id is dismissible: {result}");
+        assert_eq!(result["question_id"], "q-evict-6");
+        let resolved = coordinator
+            .world_model
+            .questions
+            .iter()
+            .find(|question| question.id == "q-evict-6")
+            .expect("the entry is kept");
+        assert_eq!(resolved.state, crate::world_model::QuestionState::Resolved);
     }
 
     // ── Issue #61: artifact ownership — coordinator lifecycle wiring ────

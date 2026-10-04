@@ -2588,6 +2588,7 @@ mod tests {
             pending: None,
             pending_stale: false,
             previous_questions: Vec::new(),
+            previous_age_memory: Vec::new(),
             external_changes: &[],
             now_ms: 1_000,
         });

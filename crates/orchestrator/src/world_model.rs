@@ -127,6 +127,34 @@
 //! - **Q-PERSIST**: open questions persist across rebuild cycles until one
 //!   of the Q-RESOLVE rules fires, independent of whether the opening
 //!   signal still shows.
+//! - **Q-DISMISS**: the coordinator — and ONLY the coordinator, by explicit
+//!   judgment through the `dismiss_question` tool — dismisses a standing
+//!   question. The tool journals a `DismissQuestion` decision naming the
+//!   question id with the reason; the builder resolves the entry
+//!   (`Resolved`, `resolved_by` naming the dismissal decision, the reason
+//!   kept on the entry) on the next rebuild and never re-opens it: a
+//!   recurring signal re-resolves through the journal even after the
+//!   resolved entry aged out of the resolved cap. Dismissal is coordinator
+//!   judgment, never a compiled rule (ADR-71) — the builder records it, it
+//!   never decides one. The render's omitted-count line names every open
+//!   question the render cut, so each stays addressable by id.
+//! - **Q-AGE-MEMORY**: a question dropped by the open cap keeps its standing
+//!   age in a bounded memory (`WorldModel::question_age_memory`, at most
+//!   [`MAX_AGE_MEMORY`] entries): a dropped-and-rediscovered question resumes
+//!   at remembered age + 1 instead of restarting at 1. The ledger stays
+//!   authoritative — memory holds only ids absent from it — and every cap
+//!   drop stays observable through [`WorldModel::open_question_count`] and
+//!   the render's "+N more …" count.
+//! - **Q-NO-AUTO-RESOLVE**: no rule resolves a question by age, by cap
+//!   pressure, by an unrelated settle, or by completion of its subject's
+//!   work — including a `blocks == None` linked question whose subject work
+//!   already landed. The journal carries decision lifecycle, not dispatch
+//!   outcome (outcome lives in the execution ledger/graph, outside this
+//!   projection's inputs by design), so subject completion is NOT cheaply
+//!   knowable here; wiring it in would breach the pure-projection contract
+//!   for a new checkpoint surface. The dismissal tool is the resolution
+//!   path: the coordinator judges the work done or the failure moot and
+//!   records it.
 //!
 //! Bounds: every list is capped and every label is length-bounded; the
 //! facts reference ids, never prose. Grounding refs are capped at
@@ -168,7 +196,7 @@
 //! F-SUPERSEDE, F-WORKSPACE-SUPERSEDE): a reserved slot keeps a fact in
 //! the cap, it never makes a stale fact fresh.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -201,6 +229,10 @@ pub const MAX_WORLD_ARTIFACTS: usize = 32;
 pub const MAX_OPEN_QUESTIONS: usize = 12;
 /// Upper bound on remembered resolved questions (the evidence trail).
 pub const MAX_RESOLVED_QUESTIONS: usize = 8;
+/// Upper bound on remembered standing ages of questions the open cap dropped
+/// (Q-AGE-MEMORY): a bounded, deterministic memory — never a relevance score.
+/// Old checkpoints (no key) load with an empty memory (additive serde).
+pub const MAX_AGE_MEMORY: usize = 12;
 /// Upper bound on assumptions and risks each.
 pub const MAX_WORLD_ASSUMPTIONS: usize = 8;
 pub const MAX_WORLD_RISKS: usize = 8;
@@ -310,6 +342,18 @@ pub enum QuestionState {
     Resolved,
 }
 
+/// The standing age of one question the open cap dropped (Q-AGE-MEMORY): the
+/// ledger forgot the entry, the memory keeps its age so a rediscovery
+/// resumes aging instead of restarting at 1. Memory holds only ids absent
+/// from the ledger — the ledger stays authoritative.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuestionAgeMemory {
+    /// The dropped question's stable id.
+    pub id: String,
+    /// Its `cycles_open` at eviction (monotonic: only ever raised).
+    pub cycles_open: u32,
+}
+
 /// One explicit, actionable unresolved question: what is unknown, what it
 /// blocks, what evidence would answer it, and how long it has stood.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -356,6 +400,12 @@ pub struct UnresolvedQuestion {
     /// The evidence id that resolved the question.
     #[serde(default)]
     pub resolved_by: Option<String>,
+    /// The coordinator's dismissal reason (Q-DISMISS): `Some` only for
+    /// questions resolved by a journaled `DismissQuestion` decision, `None`
+    /// for every other resolution and every open question. Additive serde,
+    /// so old checkpoints load with `None`.
+    #[serde(default)]
+    pub dismiss_reason: Option<String>,
 }
 
 /// An artifact's freshness class (issue #56: basic ownership — current
@@ -478,6 +528,11 @@ pub struct WorldModel {
     /// Unresolved questions, open ones first then the resolved memory.
     #[serde(default)]
     pub questions: Vec<UnresolvedQuestion>,
+    /// Standing ages of questions the open cap dropped (Q-AGE-MEMORY):
+    /// bounded at [`MAX_AGE_MEMORY`], holding only ids absent from
+    /// [`Self::questions`]. Additive serde, so old checkpoints load empty.
+    #[serde(default)]
+    pub question_age_memory: Vec<QuestionAgeMemory>,
     #[serde(default)]
     pub assumptions: Vec<WorldAssumption>,
     #[serde(default)]
@@ -538,6 +593,8 @@ pub struct WorldModelInput<'a> {
     /// The question ledger carried from the previous model (lifecycle,
     /// Q-PERSIST).
     pub previous_questions: Vec<UnresolvedQuestion>,
+    /// The age memory carried from the previous model (Q-AGE-MEMORY).
+    pub previous_age_memory: Vec<QuestionAgeMemory>,
     /// Issue #65: the run's explicit external-workspace-change records
     /// detected so far (live wait scan + F3 resume reconciliation), each
     /// scoped to one affected path.
@@ -1063,8 +1120,10 @@ fn select_facts(mut facts: Vec<WorldFact>, pinned_paths: &HashSet<String>) -> Ve
 /// deterministic truncation ellipsis. Sanitization runs FIRST, so every
 /// stored label (Finding summaries, task text, risk/question/pending
 /// labels, criteria) is single-line, control-free and markup-free by
-/// construction (issue #137).
-fn bounded(text: impl Into<String>) -> String {
+/// construction (issue #137). `pub(crate)`: the coordinator's dismissal
+/// handler stores the model's reason on the resolved entry under the same
+/// hygiene.
+pub(crate) fn bounded(text: impl Into<String>) -> String {
     let text = sanitize_text(&text.into());
     if text.chars().count() <= MAX_LABEL_CHARS {
         text
@@ -1130,6 +1189,13 @@ struct RenderSection {
     inline_separator: Option<&'static str>,
     /// Entries the item cap dropped before budgeting.
     capped: usize,
+    /// Ids of `entries`, aligned 1:1 (the questions section only; empty
+    /// elsewhere): lets the omitted-count line name every open question the
+    /// budget left out, so each stays addressable (Q-DISMISS).
+    entry_ids: Vec<String>,
+    /// Ids the item cap dropped before budgeting (the questions section
+    /// only; empty elsewhere): the tail the "+N more …" count covers.
+    capped_ids: Vec<String>,
     /// The work/task section: its share is reserved before the others so
     /// truncation can never drop the task list.
     reserved: bool,
@@ -1151,7 +1217,19 @@ impl RenderSection {
             inline_separator: separator,
             capped,
             reserved: false,
+            entry_ids: Vec::new(),
+            capped_ids: Vec::new(),
         }
+    }
+
+    /// Name the dropped entries in the "+N more …" count line (the questions
+    /// section only): `entry_ids` aligns 1:1 with `entries`, `capped_ids`
+    /// names the tail the item cap already dropped. Every id listed is
+    /// sanitized at render time like every other interpolated value (#137).
+    fn with_omitted_ids(mut self, entry_ids: Vec<String>, capped_ids: Vec<String>) -> Self {
+        self.entry_ids = entry_ids;
+        self.capped_ids = capped_ids;
+        self
     }
 
     /// Mark the section whose budget share is reserved first (the work
@@ -1193,8 +1271,40 @@ impl RenderSection {
 
     /// Room held back while the entries are laid out for the "+N more …"
     /// count, so a drop the budget causes always has room to report itself.
+    /// A section naming its omitted ids (the questions section, Q-DISMISS)
+    /// additionally holds room for the id list — at most every open question
+    /// (`MAX_OPEN_QUESTIONS`), so the line stays bounded.
     fn reserve(&self) -> usize {
-        usize::from(!self.entries.is_empty() || self.capped > 0) * OMITTED_LINE_RESERVE
+        let base = usize::from(!self.entries.is_empty() || self.capped > 0) * OMITTED_LINE_RESERVE;
+        if self.entry_ids.is_empty() && self.capped_ids.is_empty() {
+            return base;
+        }
+        let ids_len: usize = self
+            .entry_ids
+            .iter()
+            .chain(self.capped_ids.iter())
+            .map(|id| sanitize_text(id).len() + 2) // the id plus its ", " join
+            .sum();
+        base + " (ids: )".len() + ids_len
+    }
+
+    /// The omitted-count line: the bare "+N more …" count, naming the
+    /// dropped ids when the section carries them (the questions section, so
+    /// every open question stays addressable for `dismiss_question`).
+    fn omitted_line(&self, dropped: usize, shown: usize) -> String {
+        let mut line = format!("+{dropped} more …");
+        let omitted: Vec<String> = self
+            .entry_ids
+            .iter()
+            .skip(shown)
+            .chain(self.capped_ids.iter())
+            .map(|id| sanitize_text(id))
+            .collect();
+        if !omitted.is_empty() {
+            line.push_str(&format!(" (ids: {})", omitted.join(", ")));
+        }
+        line.push('\n');
+        line
     }
 
     /// Line layout: the heading on its own line, one entry per line, then
@@ -1234,7 +1344,8 @@ impl RenderSection {
         }
         let dropped = self.capped + self.entries.len().saturating_sub(shown);
         if dropped > 0 {
-            push_within(&mut out, &format!("+{dropped} more …\n"), max_bytes);
+            let line = self.omitted_line(dropped, shown);
+            push_within(&mut out, &line, max_bytes);
         }
         let used = out.len();
         (out, used)
@@ -1395,7 +1506,7 @@ impl WorldModel {
         // The question lifecycle is a pure function of the inputs alone, so it
         // runs first: its open `blocks` paths feed the fact reservation below
         // (issue #142).
-        let questions = resolve_and_feed_questions(input);
+        let (questions, question_age_memory) = resolve_and_feed_questions(input);
 
         // ── Facts (reserved for active work, then newest-first; staleness per F-*) ──
         let candidates: Vec<WorldFact> = candidates
@@ -1685,6 +1796,7 @@ impl WorldModel {
             tasks,
             artifacts,
             questions,
+            question_age_memory,
             assumptions,
             risks,
             pending,
@@ -1931,6 +2043,13 @@ impl WorldModel {
                     .collect(),
                 None,
                 open.len().saturating_sub(RENDER_QUESTIONS),
+            )
+            // Q-DISMISS: the count line names the omitted ids (bounded: at
+            // most every open question), so a question the render cut still
+            // cites a real id the coordinator can dismiss.
+            .with_omitted_ids(
+                open.iter().take(RENDER_QUESTIONS).map(|question| question.id.clone()).collect(),
+                open.iter().skip(RENDER_QUESTIONS).map(|question| question.id.clone()).collect(),
             ),
         );
         push_section(
@@ -2157,15 +2276,58 @@ fn settled_decision_resolves(
     false
 }
 
+/// Mark a standing question dismissed by a journaled coordinator decision
+/// (Q-DISMISS): resolved, attributed to the dismissal decision, carrying
+/// the reason, its age zeroed like every other resolution.
+fn apply_dismissal(question: &mut UnresolvedQuestion, dismissal: &CoordinatorDecision) {
+    question.state = QuestionState::Resolved;
+    question.resolved_by = Some(dismissal.id.clone());
+    question.dismiss_reason = Some(bounded(dismissal.task_description.clone()));
+    question.cycles_open = 0;
+}
+
 /// The question lifecycle pass: resolve carried standing questions with
 /// fresh evidence, feed the current signals (deduping against open AND
-/// resolved entries), then cap both lists deterministically.
-fn resolve_and_feed_questions(input: &WorldModelInput<'_>) -> Vec<UnresolvedQuestion> {
+/// resolved entries), then cap both lists deterministically. Returns the
+/// ledger plus the rebuilt age memory (Q-AGE-MEMORY).
+fn resolve_and_feed_questions(
+    input: &WorldModelInput<'_>,
+) -> (Vec<UnresolvedQuestion>, Vec<QuestionAgeMemory>) {
     let mut questions: Vec<UnresolvedQuestion> = input.previous_questions.clone();
+
+    // Journaled dismissals (Q-DISMISS): coordinator judgment recorded as
+    // settled `DismissQuestion` decisions naming the question. First journal
+    // entry wins; anything but `Settled` decided nothing (a rejected
+    // dismissal never dismisses).
+    let mut dismissals: HashMap<String, &CoordinatorDecision> = HashMap::new();
+    for decision in input.decisions.iter().filter(|decision| {
+        decision.kind == crate::decisions::DecisionKind::DismissQuestion
+            && decision.status == DecisionStatus::Settled
+    }) {
+        if let Some(question_id) = decision.dismissed_question_id.as_deref() {
+            dismissals.entry(question_id.to_owned()).or_insert(decision);
+        }
+    }
+
+    // Ages the cap dropped on an earlier cycle (Q-AGE-MEMORY): only ids the
+    // ledger forgot still count — anything back in the ledger ages there.
+    let ledger_ids: HashSet<&str> = questions.iter().map(|question| question.id.as_str()).collect();
+    let remembered: HashMap<String, u32> = input
+        .previous_age_memory
+        .iter()
+        .filter(|entry| !ledger_ids.contains(entry.id.as_str()))
+        .map(|entry| (entry.id.clone(), entry.cycles_open))
+        .collect();
 
     // ── Resolution pass (Q-RESOLVE-*) ────────────────────────────────────
     for question in questions.iter_mut() {
         if question.state != QuestionState::Open {
+            continue;
+        }
+        // Coordinator judgment outranks every signal rule — and the builder
+        // only records it (Q-DISMISS), it never dismisses on its own.
+        if let Some(dismissal) = dismissals.get(question.id.as_str()) {
+            apply_dismissal(question, dismissal);
             continue;
         }
         let resolved_now = match question.kind {
@@ -2284,6 +2446,7 @@ fn resolve_and_feed_questions(input: &WorldModelInput<'_>) -> Vec<UnresolvedQues
             None,
             input.now_ms,
             diagnosis.decision_id.clone(),
+            &remembered,
         );
     }
 
@@ -2316,6 +2479,7 @@ fn resolve_and_feed_questions(input: &WorldModelInput<'_>) -> Vec<UnresolvedQues
             // decision carries a retry-of link, so replacement work is
             // recognized through the artifact touch, never by identity.
             Some(decision.id.clone()),
+            &remembered,
         );
     }
 
@@ -2343,6 +2507,7 @@ fn resolve_and_feed_questions(input: &WorldModelInput<'_>) -> Vec<UnresolvedQues
                 None,
                 input.now_ms,
                 None,
+                &remembered,
             );
         }
     }
@@ -2367,7 +2532,22 @@ fn resolve_and_feed_questions(input: &WorldModelInput<'_>) -> Vec<UnresolvedQues
             row.last_event_id.clone(),
             input.now_ms,
             None,
+            &remembered,
         );
+    }
+
+    // ── Dismissal enforcement (Q-DISMISS): a recurring signal re-feeds a
+    // journal-dismissed question as a fresh open entry above; the journal
+    // stays authoritative — resolve it again instead of letting it stand.
+    // (Q-RESOLVE-STAY covers the retained-ledger case; this covers a
+    // resolved entry that aged out of the resolved cap.)
+    for question in questions.iter_mut() {
+        if question.state != QuestionState::Open {
+            continue;
+        }
+        if let Some(dismissal) = dismissals.get(question.id.as_str()) {
+            apply_dismissal(question, dismissal);
+        }
     }
 
     // ── Caps (deterministic order: priority, then longest-standing first)
@@ -2386,7 +2566,10 @@ fn resolve_and_feed_questions(input: &WorldModelInput<'_>) -> Vec<UnresolvedQues
             .cmp(&question_cap_rank(b.kind))
             .then(b.cycles_open.cmp(&a.cycles_open))
     });
-    open.truncate(MAX_OPEN_QUESTIONS);
+    // Q-AGE-MEMORY: the cap drops the tail; remember its standing ages so a
+    // rediscovery resumes aging instead of restarting at 1. The drop itself
+    // stays observable through `open_question_count` and the render count.
+    let evicted: Vec<UnresolvedQuestion> = open.split_off(MAX_OPEN_QUESTIONS.min(open.len()));
     // Resolved memory keeps the NEWEST entries past the cap.
     resolved.sort_by_key(|question| question.opened_at_ms);
     if resolved.len() > MAX_RESOLVED_QUESTIONS {
@@ -2394,13 +2577,39 @@ fn resolve_and_feed_questions(input: &WorldModelInput<'_>) -> Vec<UnresolvedQues
         resolved.drain(0..excess);
     }
     open.extend(resolved);
-    open
+    // Rebuild the age memory: carried entries the ledger forgot, plus what
+    // this cycle's cap dropped (monotonic — only ever raised), bounded and
+    // deterministic (oldest-standing first). The ledger stays authoritative:
+    // anything back in it holds no memory.
+    let mut age_memory: Vec<QuestionAgeMemory> = input
+        .previous_age_memory
+        .iter()
+        .filter(|entry| !open.iter().any(|question| question.id == entry.id))
+        .cloned()
+        .collect();
+    for dropped in &evicted {
+        match age_memory.iter_mut().find(|entry| entry.id == dropped.id) {
+            Some(entry) => {
+                entry.cycles_open = entry.cycles_open.max(dropped.cycles_open);
+            }
+            None => age_memory.push(QuestionAgeMemory {
+                id: dropped.id.clone(),
+                cycles_open: dropped.cycles_open,
+            }),
+        }
+    }
+    age_memory.retain(|entry| !open.iter().any(|question| question.id == entry.id));
+    age_memory.sort_by(|a, b| b.cycles_open.cmp(&a.cycles_open).then(a.id.cmp(&b.id)));
+    age_memory.truncate(MAX_AGE_MEMORY);
+    (open, age_memory)
 }
 
 /// Feed or age one question attempt: an existing OPEN entry with this key
 /// keeps standing (cycles_open grows); an existing RESOLVED entry blocks
 /// re-opening (Q-RESOLVE-STAY); otherwise the closure builds a fresh
-/// question. `opened_journal_len`/`opened_ref`/`opened_at_ms` differ per
+/// question, resuming at remembered age + 1 when the cap dropped it on an
+/// earlier cycle (Q-AGE-MEMORY) instead of restarting at 1.
+/// `opened_journal_len`/`opened_ref`/`opened_at_ms` differ per
 /// signal, so they arrive as plain parameters, as does the linkage subject
 /// (`subject_decision_id`, issue #135).
 #[allow(clippy::too_many_arguments)]
@@ -2415,6 +2624,7 @@ fn feed_or_advance(
     opened_ref: Option<String>,
     opened_at_ms: i64,
     subject_decision_id: Option<String>,
+    age_memory: &HashMap<String, u32>,
 ) {
     let id = question_key(kind, &subject);
     if let Some(question) = questions.iter_mut().find(|question| question.id == id) {
@@ -2423,6 +2633,9 @@ fn feed_or_advance(
         }
         return; // resolved entries stay resolved (Q-RESOLVE-STAY)
     }
+    // A rediscovery resumes aging: the anchors refresh (the signal stands
+    // NOW), but the age continues from the remembered standing age.
+    let cycles_open = age_memory.get(&id).map(|age| age.saturating_add(1)).unwrap_or(1);
     questions.push(UnresolvedQuestion {
         id,
         kind,
@@ -2432,9 +2645,10 @@ fn feed_or_advance(
         opened_journal_len,
         opened_ref,
         opened_at_ms,
-        cycles_open: 1,
+        cycles_open,
         state: QuestionState::Open,
         resolved_by: None,
+        dismiss_reason: None,
         subject_decision_id,
     });
 }
@@ -2536,6 +2750,7 @@ mod tests {
             transform: None,
             max_tool_calls: None,
             wait_record: None,
+            dismissed_question_id: None,
             created_at: time::OffsetDateTime::from_unix_timestamp(1_240)
                 .unwrap_or(time::OffsetDateTime::UNIX_EPOCH),
             status,
@@ -2621,6 +2836,17 @@ mod tests {
         diagnoses: &'a [FailureDiagnosis],
         previous: Vec<UnresolvedQuestion>,
     ) -> WorldModelInput<'a> {
+        input_mem(events, artifacts, decisions, diagnoses, previous, Vec::new())
+    }
+
+    fn input_mem<'a>(
+        events: &'a [WhiteboardEvent],
+        artifacts: Vec<ArtifactObservation>,
+        decisions: &'a [CoordinatorDecision],
+        diagnoses: &'a [FailureDiagnosis],
+        previous: Vec<UnresolvedQuestion>,
+        age_memory: Vec<QuestionAgeMemory>,
+    ) -> WorldModelInput<'a> {
         WorldModelInput {
             objective: "fix the parser",
             criteria: vec!["tests pass".to_owned()],
@@ -2635,6 +2861,7 @@ mod tests {
             pending: None,
             pending_stale: false,
             previous_questions: previous,
+            previous_age_memory: age_memory,
             external_changes: &[],
             now_ms: NOW_MS,
         }
@@ -3089,6 +3316,349 @@ mod tests {
         assert_eq!(second.open_question_count(), 0);
     }
 
+    /// A journaled `DismissQuestion` decision recording coordinator judgment.
+    fn dismissal(id: &str, question_id: &str, reason: &str) -> CoordinatorDecision {
+        CoordinatorDecision {
+            id: id.to_owned(),
+            kind: crate::decisions::DecisionKind::DismissQuestion,
+            target_agent: None,
+            task_description: reason.to_owned(),
+            notes: None,
+            supporting_evidence_ids: Vec::new(),
+            expected_artifacts: Vec::new(),
+            transform: None,
+            max_tool_calls: None,
+            wait_record: None,
+            dismissed_question_id: Some(question_id.to_owned()),
+            created_at: time::OffsetDateTime::from_unix_timestamp(1_240)
+                .unwrap_or(time::OffsetDateTime::UNIX_EPOCH),
+            status: DecisionStatus::Settled,
+        }
+    }
+
+    /// Q-DISMISS (the fact-1 shape): a LINKED `OpenProblem` with
+    /// `blocks == None` — the dispatch carried no expected artifacts, so no
+    /// artifact touch can ever resolve it and only a Reconsider Freeze would.
+    /// A journaled coordinator dismissal resolves it with the reason, and it
+    /// never re-opens while the dismissal stands.
+    #[test]
+    fn dismiss_question_resolves_blockless_linked_question_with_reason() {
+        // Linked (subject d-1) but blockless (no expected artifacts).
+        let mut linked = linked_diagnosis("d-1");
+        linked.artifact_path = None;
+        let diagnoses = vec![linked];
+        let first = WorldModel::build(&input(&[], Vec::new(), &[], &diagnoses, Vec::new()));
+        let opened = first
+            .questions
+            .iter()
+            .find(|q| q.kind == QuestionKind::OpenProblem && q.is_open())
+            .expect("the failure opened one question");
+        assert_eq!(opened.subject_decision_id.as_deref(), Some("d-1"));
+        assert_eq!(opened.blocks, None, "no expected artifacts: nothing to touch");
+
+        // The coordinator judges the failure moot and dismisses the question.
+        let dismiss = dismissal("d-dismiss", &opened.id, "the provider fault is moot");
+        let second = WorldModel::build(&input(
+            &[],
+            Vec::new(),
+            &[dismiss],
+            &diagnoses,
+            first.questions.clone(),
+        ));
+        let resolved =
+            second.questions.iter().find(|q| q.id == opened.id).expect("the entry is kept");
+        assert_eq!(resolved.state, QuestionState::Resolved, "dismissal resolves it");
+        assert_eq!(resolved.resolved_by.as_deref(), Some("d-dismiss"));
+        assert_eq!(
+            resolved.dismiss_reason.as_deref(),
+            Some("the provider fault is moot"),
+            "the reason travels with the resolution"
+        );
+        assert_eq!(resolved.cycles_open, 0);
+        assert_eq!(second.open_question_count(), 0);
+
+        // The recurring signal never re-opens it (Q-RESOLVE-STAY via journal).
+        let third = WorldModel::build(&input(
+            &[],
+            Vec::new(),
+            &[dismissal("d-dismiss", &opened.id, "the provider fault is moot")],
+            &diagnoses,
+            second.questions.clone(),
+        ));
+        let standing = third.questions.iter().find(|q| q.id == opened.id).expect("kept");
+        assert_eq!(standing.state, QuestionState::Resolved, "a dismissed question never re-opens");
+        assert_eq!(third.open_question_count(), 0);
+    }
+
+    /// Q-DISMISS (the aged-out path): a resolved dismissal that aged out of
+    /// the `MAX_RESOLVED_QUESTIONS` cap is re-fed as a fresh open entry by a
+    /// recurring signal — and the journal re-resolves it, so it never stands
+    /// open. (Q-RESOLVE-STAY covers the retained-ledger case; this covers a
+    /// resolved entry the cap already forgot.)
+    #[test]
+    fn aged_out_dismissal_re_resolves_through_journal() {
+        // Open one blockless linked question and dismiss it.
+        let mut linked = linked_diagnosis("d-1");
+        linked.artifact_path = None;
+        let diagnoses = vec![linked];
+        let first = WorldModel::build(&input(&[], Vec::new(), &[], &diagnoses, Vec::new()));
+        let opened = first
+            .questions
+            .iter()
+            .find(|q| q.kind == QuestionKind::OpenProblem && q.is_open())
+            .expect("the failure opened one question")
+            .clone();
+        let second = WorldModel::build(&input(
+            &[],
+            Vec::new(),
+            &[dismissal("d-dismiss", &opened.id, "the provider fault is moot")],
+            &diagnoses,
+            first.questions.clone(),
+        ));
+        let resolved =
+            second.questions.iter().find(|q| q.id == opened.id).expect("dismissed").clone();
+        assert_eq!(resolved.state, QuestionState::Resolved);
+
+        // Eight newer resolutions crowd it out of the resolved cap.
+        let mut previous = vec![resolved];
+        for index in 0..MAX_RESOLVED_QUESTIONS {
+            previous.push(UnresolvedQuestion {
+                id: format!("q-other-{index}"),
+                kind: QuestionKind::MissingEvidence,
+                question: "what evidence corrects the rejected decision?".to_owned(),
+                blocks: None,
+                needed: Vec::new(),
+                opened_journal_len: 0,
+                opened_ref: None,
+                subject_decision_id: None,
+                opened_at_ms: NOW_MS + 10 + index as i64,
+                cycles_open: 0,
+                state: QuestionState::Resolved,
+                resolved_by: Some(format!("d-other-{index}")),
+                dismiss_reason: None,
+            });
+        }
+        let third = WorldModel::build(&input(
+            &[],
+            Vec::new(),
+            &[dismissal("d-dismiss", &opened.id, "the provider fault is moot")],
+            &[],
+            previous,
+        ));
+        assert!(
+            third.questions.iter().all(|question| question.id != opened.id),
+            "the dismissal aged out of the resolved cap"
+        );
+        assert_eq!(
+            third.questions.iter().filter(|question| !question.is_open()).count(),
+            MAX_RESOLVED_QUESTIONS,
+            "the cap holds the newest resolutions"
+        );
+
+        // The signal recurs against a later clock: the feed re-opens it
+        // fresh (nothing in the ledger blocks it), the journal re-resolves
+        // it — it never stands open.
+        let renew = [dismissal("d-dismiss", &opened.id, "the provider fault is moot")];
+        let mut later = input(&[], Vec::new(), &renew, &diagnoses, third.questions.clone());
+        later.now_ms = NOW_MS + 1_000;
+        let fourth = WorldModel::build(&later);
+        let standing =
+            fourth.questions.iter().find(|q| q.id == opened.id).expect("re-resolved, never open");
+        assert_eq!(
+            standing.state,
+            QuestionState::Resolved,
+            "an aged-out dismissal never re-opens while the journal stands"
+        );
+        assert_eq!(standing.resolved_by.as_deref(), Some("d-dismiss"));
+        assert_eq!(
+            standing.dismiss_reason.as_deref(),
+            Some("the provider fault is moot"),
+            "the reason travels with the re-resolution"
+        );
+        assert!(
+            fourth.questions.iter().all(|question| question.id != opened.id || !question.is_open()),
+            "no open entry for the dismissed question"
+        );
+    }
+
+    /// Q-DISMISS: anything but a `Settled` dismissal decision decides
+    /// nothing — a rejected (or merely validated) dismissal never dismisses.
+    #[test]
+    fn non_settled_dismissal_decides_nothing() {
+        let mut linked = linked_diagnosis("d-1");
+        linked.artifact_path = None;
+        let diagnoses = vec![linked];
+        let first = WorldModel::build(&input(&[], Vec::new(), &[], &diagnoses, Vec::new()));
+        let opened = first
+            .questions
+            .iter()
+            .find(|q| q.kind == QuestionKind::OpenProblem && q.is_open())
+            .expect("the failure opened one question")
+            .clone();
+
+        for status in [DecisionStatus::Rejected, DecisionStatus::Validated] {
+            let mut undecided = dismissal("d-dismiss", &opened.id, "moot");
+            undecided.status = status;
+            let next = WorldModel::build(&input(
+                &[],
+                Vec::new(),
+                &[undecided],
+                &diagnoses,
+                first.questions.clone(),
+            ));
+            let standing = next.questions.iter().find(|q| q.id == opened.id).expect("kept");
+            assert_eq!(
+                standing.state,
+                QuestionState::Open,
+                "a {status:?} dismissal never dismisses"
+            );
+            assert_eq!(standing.resolved_by, None);
+            assert_eq!(standing.dismiss_reason, None);
+        }
+    }
+
+    /// Q-AGE-MEMORY bound: no matter how many questions the open cap drops,
+    /// the age memory never exceeds `MAX_AGE_MEMORY` entries.
+    #[test]
+    fn age_memory_is_bounded_at_max() {
+        let diagnoses: Vec<FailureDiagnosis> =
+            (0..40).map(|i| diagnosis(&format!("diag-{i}"), true, false)).collect();
+        let model = WorldModel::build(&input(&[], Vec::new(), &[], &diagnoses, Vec::new()));
+        assert_eq!(model.open_question_count(), MAX_OPEN_QUESTIONS, "the cap holds");
+        assert!(
+            model.question_age_memory.len() <= MAX_AGE_MEMORY,
+            "the age memory is bounded: {} > {MAX_AGE_MEMORY}",
+            model.question_age_memory.len()
+        );
+        assert_eq!(
+            model.question_age_memory.len(),
+            MAX_AGE_MEMORY,
+            "28 drops truncate to exactly the bound"
+        );
+    }
+
+    /// Q-DISMISS addressability: the render names every open question id —
+    /// including the ones the entry cap cut — so the coordinator can cite
+    /// each one to `dismiss_question`.
+    #[test]
+    fn render_names_every_omitted_open_question_id() {
+        let diagnoses: Vec<FailureDiagnosis> =
+            (0..8).map(|i| diagnosis(&format!("diag-{i}"), true, false)).collect();
+        let model = WorldModel::build(&input(&[], Vec::new(), &[], &diagnoses, Vec::new()));
+        assert_eq!(model.open_question_count(), 8, "more open than the render shows");
+        let rendered = model.render();
+        assert!(rendered.contains("+2 more …"), "the cut is counted: {rendered:?}");
+        for question in model.questions.iter().filter(|question| question.is_open()) {
+            assert!(
+                rendered.contains(question.id.as_str()),
+                "every open question stays addressable — {} is missing: {rendered:?}",
+                question.id
+            );
+        }
+    }
+
+    /// Q-AGE-MEMORY: a question dropped by the open cap keeps its standing
+    /// age in the bounded memory, so when its signal rediscovers it the age
+    /// resumes instead of restarting at 1.
+    #[test]
+    fn evicted_question_rediscovered_resumes_age() {
+        let diagnoses = vec![diagnosis("repl-required", true, false)];
+        let first = WorldModel::build(&input(&[], Vec::new(), &[], &diagnoses, Vec::new()));
+        let second =
+            WorldModel::build(&input(&[], Vec::new(), &[], &diagnoses, first.questions.clone()));
+        let third =
+            WorldModel::build(&input(&[], Vec::new(), &[], &diagnoses, second.questions.clone()));
+        let aged = third
+            .questions
+            .iter()
+            .find(|q| q.kind == QuestionKind::OpenProblem && q.is_open())
+            .expect("the standing question");
+        assert_eq!(aged.cycles_open, 3);
+
+        // Twelve higher-priority questions crowd it out of the cap.
+        let mut crowded_decisions = Vec::new();
+        for index in 0..MAX_OPEN_QUESTIONS {
+            crowded_decisions.push(rejected(&format!("d-crowd-{index}"), &["src/a.rs"]));
+        }
+        let fourth = WorldModel::build(&input(
+            &[],
+            Vec::new(),
+            &crowded_decisions,
+            &diagnoses,
+            third.questions.clone(),
+        ));
+        assert_eq!(fourth.open_question_count(), MAX_OPEN_QUESTIONS, "the cap holds");
+        assert!(
+            fourth.questions.iter().all(|q| q.id != aged.id),
+            "the blockless question is the cap drop"
+        );
+        let remembered = fourth
+            .question_age_memory
+            .iter()
+            .find(|entry| entry.id == aged.id)
+            .expect("the drop keeps its age in memory");
+        assert_eq!(remembered.cycles_open, 4, "evicted at its standing age");
+
+        // Its competitors resolve (settled work touching their artifacts);
+        // its own signal recurs — it resumes aging instead of restarting.
+        let mut clearing = crowded_decisions.clone();
+        for index in 0..MAX_OPEN_QUESTIONS {
+            clearing.push(settled_with(
+                &format!("d-fix-{index}"),
+                crate::decisions::DecisionKind::Retry,
+                &["src/a.rs"],
+                None,
+            ));
+        }
+        let fifth = WorldModel::build(&input_mem(
+            &[],
+            Vec::new(),
+            &clearing,
+            &diagnoses,
+            fourth.questions.clone(),
+            fourth.question_age_memory.clone(),
+        ));
+        let resumed = fifth.questions.iter().find(|q| q.id == aged.id).expect("rediscovered");
+        assert_eq!(resumed.state, QuestionState::Open);
+        assert_eq!(resumed.cycles_open, 5, "rediscovery resumes at remembered age + 1, never 1");
+        assert!(
+            fifth.question_age_memory.iter().all(|entry| entry.id != aged.id),
+            "the ledger is authoritative again: no memory for a kept question"
+        );
+    }
+
+    /// Q-NO-AUTO-RESOLVE: cap pressure never resolves anything by rule — the
+    /// drops stay observable through the open count, the render's "+N more"
+    /// count, and the age memory, and no entry is silently marked resolved.
+    #[test]
+    fn cap_drop_is_counted_never_auto_resolved() {
+        let mut decisions = Vec::new();
+        for index in 0..40 {
+            decisions.push(rejected(&format!("d-{index}"), &["src/a.rs"]));
+        }
+        let diagnoses: Vec<FailureDiagnosis> =
+            (0..20).map(|i| diagnosis(&format!("diag-{i}"), true, false)).collect();
+        let rows: Vec<ArtifactObservation> = (0..50)
+            .map(|i| observation(&format!("r/{i}.rs"), true, true, Some(GENERATION), None))
+            .collect();
+        let model = WorldModel::build(&input(&[], rows, &decisions, &diagnoses, Vec::new()));
+        assert_eq!(model.open_question_count(), MAX_OPEN_QUESTIONS, "questions are capped");
+        assert!(
+            model.questions.iter().all(|q| q.is_open()),
+            "cap pressure resolves nothing: no silent resolution by rule"
+        );
+        assert!(
+            model.questions.iter().all(|q| q.dismiss_reason.is_none()),
+            "nothing is dismissed without coordinator judgment"
+        );
+        assert!(!model.question_age_memory.is_empty(), "the drops keep their ages");
+        let rendered = model.render();
+        assert!(
+            rendered.contains("+6 more …"),
+            "the render counts the capped-out questions: {rendered:?}"
+        );
+    }
+
     /// Issue #135: the linked rule is kind-agnostic — an `OpenProblem`
     /// carrying a decision subject (the shape a linkage-carrying diagnosis
     /// now opens, exercised end-to-end through the feed in
@@ -3109,6 +3679,7 @@ mod tests {
             cycles_open: 1,
             state: QuestionState::Open,
             resolved_by: None,
+            dismiss_reason: None,
         };
         // Unrelated settle: stays open.
         let unrelated = vec![decision("d-y", DecisionStatus::Settled, &["src/y.rs"])];
@@ -3896,6 +4467,7 @@ mod tests {
                 cycles_open: 1,
                 state: QuestionState::Open,
                 resolved_by: None,
+                dismiss_reason: None,
             }],
             assumptions: (0..MAX_WORLD_ASSUMPTIONS)
                 .map(|i| WorldAssumption {
