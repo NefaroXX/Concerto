@@ -90,6 +90,12 @@ turn.
 
 ### 3. Only `ActionRequired` arms the mandatory-dispatch guards
 
+> **Amended by the [addendum](#addendum-2026-10-04-the-obligation-model-and-combined-dispatch-guard)
+> below:** mode is the *first* arm of the combined guard, not the only one.
+> The statement in this section describes the mode term as shipped with issue
+> #145; the same merge train on `dev` later added the obligation and
+> promised-plan arms.
+
 Every guard that enforces "an action-required run cannot close on an empty
 dispatch graph" is scoped to `matches!(mode, TaskExecutionMode::ActionRequired
 { .. })`:
@@ -143,3 +149,71 @@ delegation doctrine (ADR-74) applies.
 - **A fourth mode or a separate "conversation" entry path.** The coordinator
   already owns every turn (ADR-71); the missing piece was the mode vocabulary
   and the guard's scope, not a new orchestration path.
+
+## Addendum (2026-10-04): the obligation model and combined dispatch guard
+
+**Amends §3 in place — no new ADR number, no supersession.** The merge that
+landed ADR-76 on `dev` also shipped `crates/orchestrator/src/obligations.rs`
+(the `ObligationLedger`) and the coordinator's combined `dispatch_guard_arms`
+predicate, so §3's "only `ActionRequired` arms the mandatory-dispatch guards"
+is incomplete as written: mode is the first arm of a three-arm predicate, not
+the whole of it.
+
+### The obligation model
+
+- **The graph is the source of truth; the ledger is a derived view.**
+  `ObligationLedger::sync_from_graph` rebuilds obligations from the `TaskGraph`
+  rows the checkpoint already persists (subtask statuses + dependency edges),
+  so interrupt/cancel/retry/resume continuity rides existing persistence. There
+  is no second obligation store, no keyword router, and no greeting list: the
+  coordinator interprets intent and creates graph work; the module only
+  validates the resulting state.
+- **Work is declared or graphed, then enforced.** `declare_obligations` creates
+  `Declared` (not-yet-dispatched) nodes — Outstanding obligations enforceable
+  *before* any dispatch runs; `update_obligations` revises only
+  still-undispatched work. Obligations chain investigate → implement → verify →
+  explain along the graph's dependency edges and settle only through validated
+  transitions (`Complete` / `Block` / `Fail` / `Retry` / `Supersede`); blocked
+  and failed work must be retried, and terminal states stay terminal.
+- **Evidence is structured, never prose.** A completion claim is backed by
+  whiteboard event ids / artifact paths recorded by a validated `Complete`
+  transition; an evidenceless `Complete` on an execution-kind obligation is
+  rejected. Agent prose (`SubTask::deliverable`) is never copied into the
+  ledger: a subtask synced as `Completed` takes its state from the graph (the
+  authoritative store) and carries an **empty** `evidence` set until a
+  transition fills it.
+- **Conversation changes nothing.** A prose turn neither resets, satisfies, nor
+  replaces obligations — the unchanged graph re-derives to the same view.
+  Communication and execution stay concurrent (a mixed turn is lawful); the
+  prose half discharges nothing.
+
+### `dispatch_guard_arms` = mode OR open graph obligations OR promised plan
+
+The coordinator's `dispatch_guard_arms(task, graph, all_files)` — the single
+funnel shared by the prose-only, vacuous-completion, zero-work,
+unattempted-implementation, and resume-drive guards — arms when **any** of:
+
+1. **mode** — `requires_mandatory_dispatch(task)`, i.e. an `ActionRequired`
+   run; or
+2. **open graph obligations** — `obligation_dispatch_pending(graph)`: any
+   Investigate / Implement / Verify obligation still open, in
+   `CoordinatorDecides` exactly as in `ActionRequired`; or
+3. **promised plan without code** — the run promised or was approved on a plan
+   and produced no code artifact: an unattempted plan is work even over an
+   empty graph.
+
+Any one source arms; no source disarms another. §3 survives as term 1, not as
+the whole predicate: `CoordinatorDecides` is prose-exempt *only* while it holds
+no declared/graphed work and owes no code.
+
+### Residual (explicit)
+
+**The guarantee covers declared/graphed work only.** Work the coordinator never
+declares with `declare_obligations` and never adds to the task graph during a
+`CoordinatorDecides` turn is indistinguishable from conversation: ADR-71 makes
+the coordinator the sole decision-maker for the turn, and §4 of this ADR
+forbids a word router, so nothing may infer latent work from the user's
+phrasing. A user who asks for real work that the coordinator chooses not to
+declare or graph receives prose and no dispatch — by design, not by defect.
+What is guaranteed: once work is declared or graphed, prose cannot close the
+run over it, in any mode.

@@ -9,29 +9,30 @@
 //! per conversational turn would be equally wrong.
 //!
 //! Revised model: communication and execution are concurrent capabilities, not
-//! mutually exclusive modes. Each turn carries four independent facets:
+//! mutually exclusive modes. A turn may be answered in prose *while* execution
+//! proceeds; the prose half discharges nothing. What the run owes is recorded
+//! as structured work:
 //!
-//! - **turn disposition** ([`TurnDisposition`]): how this turn was served —
-//!   [`TurnDisposition::DirectAnswer`], [`TurnDisposition::DelegatedExecution`],
-//!   or [`TurnDisposition::Mixed`] (answered in prose *while* execution
-//!   proceeds). A mixed turn is lawful; prose never discharges work.
 //! - **outstanding obligations** ([`ExecutionObligation`]): structured work the
 //!   run owes — multiple per message, chained
 //!   investigate → implement → verify → explain, each in
 //!   [`ObligationState`] (`Outstanding`/`Completed`/`Blocked`/`Failed`/
 //!   `Superseded`). Only validated [`ObligationEvent`] transitions move them;
-//!   a conversational message is explicitly a no-op
-//!   ([`ObligationLedger::note_conversational_turn`]).
-//! - **execution policy** ([`ExecutionPolicy`]): whether the run currently
-//!   requires a dispatch and/or verification, derived from the mode *or* the
-//!   outstanding obligations — never the mode alone.
-//! - **completion evidence** ([`CompletionEvidence`]): what backs a completion
-//!   claim (files, verification, declarations). Prose is never evidence.
+//!   a conversational message moves nothing — the graph stays authoritative
+//!   and the ledger is simply re-derived from it
+//!   ([`ObligationLedger::sync_from_graph`]).
+//! - **completion evidence** (the `evidence` field of [`ExecutionObligation`]):
+//!   the whiteboard event ids / artifact paths backing a completion claim.
+//!   Prose is never evidence, and [`ObligationLedger::apply`] rejects an
+//!   evidenceless [`ObligationEvent::Complete`] on execution kinds.
+//! - **the dispatch guard** ([`dispatch_guard_arms`]): whether the run owes a
+//!   dispatch, derived from the mode *or* the outstanding obligations — never
+//!   the mode alone.
 //!
 //! Obligations are a validated *view* over the existing [`TaskGraph`]
 //! (extended, not paralleled): [`ObligationLedger::sync_from_graph`]
 //! materializes them from subtask statuses, so checkpoint persistence,
-//! interrupt/cancel/retry/resume continuity, and follow-up accumulation all
+//! interrupt/cancel/retry/resume continuity, and declared follow-up work all
 //! ride the graph rows the checkpoint already stores. No keyword router, no
 //! greeting list: the coordinator interprets intent and creates graph work;
 //! this module (and the coordinator guards built on it) only validates the
@@ -148,7 +149,7 @@ pub fn obligation_state_for_status(status: SubTaskStatus) -> ObligationState {
 /// must complete first (investigation → implementation → verification →
 /// explanation); `evidence` holds the whiteboard event ids / artifact paths
 /// that back a [`ObligationState::Completed`] claim — prose is never stored
-/// here.
+/// here, and [`ObligationLedger::sync_from_graph`] never populates it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionObligation {
     /// Stable id — the backing subtask id when derived from the graph, or a
@@ -282,8 +283,8 @@ pub fn try_transition(
 /// The ledger is a validated *view*, not a second store: [`Self::sync_from_graph`]
 /// rebuilds it from the [`TaskGraph`] rows the checkpoint already persists, so
 /// interrupt/cancel/retry/resume continuity rides the existing checkpoint
-/// rows. Ledger-only mutations ([`Self::supersede`], follow-up additions) are
-/// run-scoped and re-derived on every resume — the graph stays authoritative.
+/// rows. Ledger-only mutations ([`Self::supersede`]) are run-scoped and
+/// re-derived on every resume — the graph stays authoritative.
 #[derive(Debug, Clone, Default)]
 pub struct ObligationLedger {
     obligations: HashMap<String, ExecutionObligation>,
@@ -299,6 +300,14 @@ impl ObligationLedger {
     /// advisory, freeform work) derive no execution obligation. Dependencies
     /// mirror the graph edges, giving the
     /// investigate → implement → verify → explain chain its order.
+    ///
+    /// Evidence is never derived from the subtask row: `SubTask::deliverable`
+    /// is agent prose, and the graph carries no structured file/evidence
+    /// record on the row. A synced obligation therefore starts with an
+    /// **empty** `evidence` set — including a subtask already `Completed`,
+    /// whose state comes from the graph (the authoritative store) rather than
+    /// from a ledger transition. Only [`Self::apply`] with a validated
+    /// [`ObligationEvent::Complete`] records evidence.
     pub fn sync_from_graph(
         &mut self,
         graph: &TaskGraph,
@@ -318,11 +327,6 @@ impl ObligationLedger {
                 ExecutionObligation::new(subtask.id.to_string(), kind, &subtask.description);
             obligation.state = obligation_state_for_status(subtask.status);
             obligation.depends_on = depends_on;
-            if let Some(deliverable) = subtask.deliverable.as_deref() {
-                if !deliverable.trim().is_empty() {
-                    obligation.evidence.push(deliverable.to_owned());
-                }
-            }
             self.obligations.insert(obligation.id.clone(), obligation);
         }
     }
@@ -386,23 +390,6 @@ impl ObligationLedger {
         Ok(next)
     }
 
-    /// Record a conversational turn against the ledger. Deliberately a no-op
-    /// returning the unchanged open count: a conversational message must not
-    /// reset, satisfy, or replace execution obligations. The return value lets
-    /// callers (and tests) assert nothing moved.
-    pub fn note_conversational_turn(&self) -> usize {
-        self.obligations.values().filter(|ob| ob.state.is_open()).count()
-    }
-
-    /// Add follow-up obligations without disturbing existing states: new ids
-    /// insert as `Outstanding`, known ids keep whatever state they hold. A
-    /// follow-up message therefore extends — never resets — the run's duties.
-    pub fn add_follow_up(&mut self, new: Vec<ExecutionObligation>) {
-        for obligation in new {
-            self.obligations.entry(obligation.id.clone()).or_insert(obligation);
-        }
-    }
-
     /// Retire an obligation a reconsider/split/merge replaced. Shorthand for
     /// `apply(id, ObligationEvent::Supersede { .. })`.
     pub fn supersede(
@@ -438,95 +425,11 @@ impl ObligationLedger {
     }
 }
 
-/// How one turn was served. Communication and execution are concurrent: a
-/// turn may answer directly, delegate, or do both in the same pass. The
-/// disposition names what happened; it never excuses open obligations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TurnDisposition {
-    /// Pure prose, no tool calls, no dispatches. Lawful only when no
-    /// execution obligation is open.
-    DirectAnswer,
-    /// Dispatched/delegated work with no direct prose answer.
-    DelegatedExecution,
-    /// Answered in prose *while* execution proceeded. Lawful — but the prose
-    /// half discharges nothing.
-    Mixed,
-}
-
-/// Derive the turn disposition from observable runtime state — graph
-/// emptiness, coordinator tool activity, and whether a prose answer was
-/// produced. No text classification: the inputs are counts and flags the
-/// runtime already records.
-pub fn derive_turn_disposition(
-    graph_empty: bool,
-    coordinator_tool_calls: u32,
-    answered_in_prose: bool,
-) -> TurnDisposition {
-    let executed = !graph_empty || coordinator_tool_calls > 0;
-    match (executed, answered_in_prose) {
-        (false, _) => TurnDisposition::DirectAnswer,
-        (true, false) => TurnDisposition::DelegatedExecution,
-        (true, true) => TurnDisposition::Mixed,
-    }
-}
-
-/// What the run currently requires, derived from the mode *and* the
-/// obligations. Either source can arm a requirement; neither can disarm the
-/// other's: a conversational mode never excuses open execution work, and a
-/// quiet ledger never excuses an action-required mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExecutionPolicy {
-    pub requires_dispatch: bool,
-    pub requires_verification: bool,
-}
-
-/// Derive the execution policy. `mode_requires_*` come from
-/// [`TaskExecutionMode`]; the obligation flags come from the ledger view.
-/// Pure: no I/O, no provider, no text.
-pub fn derive_execution_policy(
-    mode_requires_dispatch: bool,
-    mode_requires_verification: bool,
-    obligation_dispatch_pending: bool,
-    obligation_verification_pending: bool,
-) -> ExecutionPolicy {
-    ExecutionPolicy {
-        requires_dispatch: mode_requires_dispatch || obligation_dispatch_pending,
-        requires_verification: mode_requires_verification || obligation_verification_pending,
-    }
-}
-
-/// What backs a completion claim. Prose is not a field here by design: a
-/// claim with no files, no verification, and no recorded declaration is
-/// backed by nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct CompletionEvidence {
-    pub has_files: bool,
-    pub has_verification: bool,
-    pub has_no_verification_declaration: bool,
-}
-
-impl CompletionEvidence {
-    /// Whether prose may close the run: only when no execution obligation is
-    /// open. Evidence presence does not license a prose close on its own —
-    /// the obligations decide.
-    pub fn prose_may_close(self, open_execution_work: bool) -> bool {
-        let _ = self;
-        !open_execution_work
-    }
-
-    /// Whether an implement-bearing run may report success: execution
-    /// obligations are settled *and* some evidence backs the claim.
-    pub fn implement_may_complete(self, open_execution_work: bool) -> bool {
-        !open_execution_work
-            && (self.has_files || self.has_verification || self.has_no_verification_declaration)
-    }
-}
-
 /// Whether the dispatch guards must arm for this run state: the legacy mode
-/// predicate *or* an open execution obligation. This is the single funnel the
-/// coordinator's prose-only, vacuous-completion, zero-work, and
-/// unattempted-implementation guards share, so the predicate cannot drift
-/// between sites.
+/// predicate *or* an open execution obligation. Either source arms; neither
+/// disarms the other's. Module-level form of the combined predicate — the
+/// coordinator's `dispatch_guard_arms` arms on these two terms plus a
+/// promised plan that produced no code artifact.
 pub fn dispatch_guard_arms(mode_requires_dispatch: bool, ledger: &ObligationLedger) -> bool {
     mode_requires_dispatch || ledger.has_open_execution_work()
 }
@@ -577,6 +480,22 @@ mod tests {
         ledger
     }
 
+    /// Ledger built straight from obligations — the test-side stand-in for
+    /// ledger-only rows (production only ever derives the view from the graph).
+    fn ledger_with(obligations: Vec<ExecutionObligation>) -> ObligationLedger {
+        let mut ledger = ObligationLedger::new();
+        for obligation in obligations {
+            ledger.obligations.insert(obligation.id.clone(), obligation);
+        }
+        ledger
+    }
+
+    /// Count of obligations still constraining the run — the number a
+    /// conversational turn must leave untouched.
+    fn open_count(ledger: &ObligationLedger) -> usize {
+        ledger.all().iter().filter(|ob| ob.state.is_open()).count()
+    }
+
     // ── A. Conversational (1–5) ──────────────────────────────────────────
 
     #[test]
@@ -592,11 +511,17 @@ mod tests {
     #[test]
     fn a2_conversational_turn_leaves_outstanding_obligations_untouched() {
         let (graph, _, implement_id, _) = implement_graph();
-        let ledger = synced_ledger(&graph);
-        let open_before = ledger.note_conversational_turn();
+        let mut ledger = synced_ledger(&graph);
+        let open_before = open_count(&ledger);
         assert_eq!(open_before, 2, "implement + verify stay open, investigate is done");
-        let after = ledger.note_conversational_turn();
-        assert_eq!(after, open_before, "prose must not reset, satisfy, or replace execution work");
+        // A conversational turn mutates nothing: the graph is unchanged, so
+        // the derived view rebuilt the way production rebuilds it is identical.
+        ledger.sync_from_graph(&graph, classify);
+        assert_eq!(
+            open_count(&ledger),
+            open_before,
+            "prose must not reset, satisfy, or replace execution work"
+        );
         assert_eq!(
             ledger.get(&implement_id.to_string()).map(|ob| ob.state),
             Some(ObligationState::Outstanding)
@@ -604,25 +529,13 @@ mod tests {
     }
 
     #[test]
-    fn a3_empty_graph_no_tools_prose_answer_is_direct_answer() {
-        assert_eq!(derive_turn_disposition(true, 0, true), TurnDisposition::DirectAnswer);
-    }
-
-    #[test]
-    fn a4_policy_without_obligations_requires_neither_dispatch_nor_verification() {
-        let policy = derive_execution_policy(false, false, false, false);
-        assert_eq!(
-            policy,
-            ExecutionPolicy { requires_dispatch: false, requires_verification: false },
-            "a conversational follow-up with no new obligation completes without dispatch"
-        );
-    }
-
-    #[test]
     fn a5_conversational_follow_up_adds_nothing_and_preserves_states() {
         let (graph, _, implement_id, _) = implement_graph();
         let mut ledger = synced_ledger(&graph);
-        ledger.add_follow_up(Vec::new());
+        // A conversational follow-up declares no graph work, so the view
+        // re-derived from the unchanged graph gains no obligation and loses
+        // no state.
+        ledger.sync_from_graph(&graph, classify);
         assert_eq!(ledger.len(), 3);
         assert_eq!(
             ledger.get(&implement_id.to_string()).map(|ob| ob.state),
@@ -643,22 +556,9 @@ mod tests {
             dispatch_guard_arms(false, &ledger),
             "fresh implement work requires dispatch even in a prose-capable mode"
         );
-        let policy = derive_execution_policy(false, false, ledger.has_open_implementation(), false);
-        assert!(policy.requires_dispatch);
-    }
-
-    #[test]
-    fn b7_prose_may_not_close_with_open_implement() {
-        let (graph, _, _, _) = implement_graph();
-        let ledger = synced_ledger(&graph);
-        let evidence = CompletionEvidence { has_files: true, ..Default::default() };
         assert!(
-            !evidence.prose_may_close(ledger.has_open_execution_work()),
-            "prose never discharges an open implementation obligation"
-        );
-        assert!(
-            !evidence.implement_may_complete(ledger.has_open_execution_work()),
-            "files without settled obligations still cannot complete"
+            ledger.has_open_implementation(),
+            "the open implement obligation is what arms the guard without the mode"
         );
     }
 
@@ -670,28 +570,16 @@ mod tests {
         }
         let ledger = synced_ledger(&graph);
         assert!(!ledger.has_open_implementation(), "implement settled");
-        assert!(ledger.has_open_verification(), "verify still open");
-        let policy = derive_execution_policy(
-            false,
-            false,
-            ledger.has_open_implementation(),
-            ledger.has_open_verification(),
-        );
-        assert!(!policy.requires_dispatch);
         assert!(
-            policy.requires_verification,
+            ledger.has_open_verification(),
             "verification is still enforced after implement settles"
         );
     }
 
     #[test]
     fn b9_blocked_implement_stays_open_and_must_retry_first() {
-        let mut ledger = ObligationLedger::new();
-        ledger.add_follow_up(vec![ExecutionObligation::new(
-            "impl-1",
-            ObligationKind::Implement,
-            "fix",
-        )]);
+        let mut ledger =
+            ledger_with(vec![ExecutionObligation::new("impl-1", ObligationKind::Implement, "fix")]);
         assert_eq!(
             ledger.apply("impl-1", ObligationEvent::Block { reason: "waiting on dep".into() }),
             Ok(ObligationState::Blocked)
@@ -708,12 +596,8 @@ mod tests {
 
     #[test]
     fn b10_failed_implement_rejects_completion_and_accepts_retry() {
-        let mut ledger = ObligationLedger::new();
-        ledger.add_follow_up(vec![ExecutionObligation::new(
-            "impl-1",
-            ObligationKind::Implement,
-            "fix",
-        )]);
+        let mut ledger =
+            ledger_with(vec![ExecutionObligation::new("impl-1", ObligationKind::Implement, "fix")]);
         assert_eq!(
             ledger.apply("impl-1", ObligationEvent::Fail { reason: "tests red".into() }),
             Ok(ObligationState::Failed)
@@ -734,22 +618,11 @@ mod tests {
     // ── C. Mixed "fix X and explain" (11–15) ─────────────────────────────
 
     #[test]
-    fn c11_prose_answer_during_execution_is_mixed_not_direct() {
-        assert_eq!(
-            derive_turn_disposition(false, 2, true),
-            TurnDisposition::Mixed,
-            "answering before/during/after execution is lawful concurrency"
-        );
-        assert_eq!(derive_turn_disposition(false, 0, false), TurnDisposition::DelegatedExecution);
-    }
-
-    #[test]
     fn c12_explain_completes_in_prose_while_implement_stays_open() {
-        let mut ledger = ObligationLedger::new();
         let mut explain =
             ExecutionObligation::new("explain-1", ObligationKind::Explain, "explain fix");
         explain.depends_on = vec!["impl-1".into()];
-        ledger.add_follow_up(vec![
+        let mut ledger = ledger_with(vec![
             ExecutionObligation::new("impl-1", ObligationKind::Implement, "fix"),
             explain,
         ]);
@@ -913,12 +786,8 @@ mod tests {
 
     #[test]
     fn d18_cancelled_failed_work_retries_without_losing_the_obligation() {
-        let mut ledger = ObligationLedger::new();
-        ledger.add_follow_up(vec![ExecutionObligation::new(
-            "impl-1",
-            ObligationKind::Implement,
-            "fix",
-        )]);
+        let mut ledger =
+            ledger_with(vec![ExecutionObligation::new("impl-1", ObligationKind::Implement, "fix")]);
         assert_eq!(
             ledger.apply("impl-1", ObligationEvent::Fail { reason: "cancelled".into() }),
             Ok(ObligationState::Failed)
@@ -932,32 +801,8 @@ mod tests {
     }
 
     #[test]
-    fn d19_follow_up_adds_without_losing_prior_states() {
-        let (graph, _, implement_id, _) = implement_graph();
-        let mut ledger = synced_ledger(&graph);
-        assert_eq!(
-            ledger.apply(
-                &implement_id.to_string(),
-                ObligationEvent::Complete { evidence: vec!["event-1".into()] }
-            ),
-            Ok(ObligationState::Completed)
-        );
-        ledger.add_follow_up(vec![
-            ExecutionObligation::new("impl-1", ObligationKind::Implement, "fix"),
-            ExecutionObligation::new("verify-2", ObligationKind::Verify, "re-verify"),
-        ]);
-        assert_eq!(
-            ledger.get(&implement_id.to_string()).map(|ob| ob.state),
-            Some(ObligationState::Completed),
-            "follow-ups extend; settled work is never re-armed by a new message"
-        );
-        assert_eq!(ledger.len(), 5);
-    }
-
-    #[test]
     fn d20_terminal_states_reject_every_transition() {
-        let mut ledger = ObligationLedger::new();
-        ledger.add_follow_up(vec![
+        let mut ledger = ledger_with(vec![
             ExecutionObligation::new("done-1", ObligationKind::Implement, "done"),
             ExecutionObligation::new("old-1", ObligationKind::Investigate, "old"),
         ]);
@@ -1012,9 +857,6 @@ mod tests {
         assert!(ledger.has_open_implementation());
         assert!(ledger.has_open_execution_work());
         assert!(dispatch_guard_arms(false, &ledger));
-        let bare = CompletionEvidence::default();
-        assert!(!bare.prose_may_close(true));
-        assert!(!bare.implement_may_complete(true));
     }
 
     /// H. A conversational follow-up adds no obligation and resets none: a
@@ -1031,19 +873,14 @@ mod tests {
         declared.id = id;
         declared.status = SubTaskStatus::Declared;
         graph.add_root(declared);
-        let mut ledger = ObligationLedger::new();
-        ledger.sync_from_graph(&graph, |role| {
-            if role.as_str() == "coder" {
-                Some(ObligationKind::Implement)
-            } else {
-                None
-            }
-        });
-        // The follow-up is a direct answer: no new execution, no dispatch.
-        let open_before = ledger.note_conversational_turn();
-        ledger.add_follow_up(Vec::new());
+        let mut ledger = synced_ledger(&graph);
+        // The follow-up is a direct answer: no new execution, no dispatch —
+        // the graph is untouched, so the view re-derived from it the way the
+        // coordinator's guard derives it is identical.
+        let open_before = open_count(&ledger);
+        ledger.sync_from_graph(&graph, classify);
         assert_eq!(
-            ledger.note_conversational_turn(),
+            open_count(&ledger),
             open_before,
             "prose must not reset, satisfy, or replace declared work"
         );
@@ -1054,6 +891,41 @@ mod tests {
         );
         assert!(ledger.has_open_implementation());
         assert!(dispatch_guard_arms(false, &ledger));
-        assert_eq!(derive_turn_disposition(true, 0, true), TurnDisposition::DirectAnswer);
+    }
+
+    // ── E. Evidence provenance ─────────────────────────────────────────────
+
+    /// Sync carries no prose: a subtask completed with only an agent
+    /// `deliverable` derives an obligation with an **empty** evidence set.
+    /// Prose is never evidence, the graph row holds no structured
+    /// file/evidence record to cite, and the graph status alone settles the
+    /// state — only a validated `Complete` event fills `evidence`.
+    #[test]
+    fn e21_synced_completed_prose_only_subtask_has_empty_evidence() {
+        let mut graph = TaskGraph::new();
+        let id = TaskId::new();
+        let mut completed = subtask_with_status("coder", SubTaskStatus::Completed);
+        completed.id = id;
+        completed.deliverable = Some("fixed it; summary of the fix in prose".to_owned());
+        graph.add_root(completed);
+
+        let ledger = synced_ledger(&graph);
+        let obligation =
+            ledger.get(&id.to_string()).expect("the completed subtask derives an obligation");
+        assert_eq!(
+            obligation.state,
+            ObligationState::Completed,
+            "the graph status is authoritative for a synced obligation"
+        );
+        assert!(
+            obligation.evidence.is_empty(),
+            "agent prose is never evidence: {:?}",
+            obligation.evidence
+        );
+        assert_eq!(
+            graph.get(&id).and_then(|task| task.deliverable.as_deref()),
+            Some("fixed it; summary of the fix in prose"),
+            "the prose stays on the graph row; the ledger cites structured evidence only"
+        );
     }
 }
