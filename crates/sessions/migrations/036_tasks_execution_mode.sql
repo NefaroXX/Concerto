@@ -1,0 +1,18 @@
+-- Persist `AgentTask::execution_mode` on the tasks table (finding 2: task
+-- reads fabricated the mode as `Default::default()` instead of reading it
+-- back, so a non-default mode was silently dropped on every store round-trip).
+--
+-- Representation: `TaskExecutionMode` (`concerto_core::types`) is a serde
+-- enum with a payload-carrying variant (`ActionRequired { min_tool_calls,
+-- require_verification }`), so a bare discriminant string cannot round-trip
+-- it. The column stores the serde-JSON encoding (`"AnswerOnly"`,
+-- `"CoordinatorDecides"`, `{"ActionRequired":{...}}`) as TEXT — the same
+-- shape already used for JSON-text columns elsewhere in this store
+-- (transcript entries, event payloads).
+--
+-- NULL means "written before this migration": every pre-migration row
+-- defaults to NULL, and the read path maps NULL to
+-- `TaskExecutionMode::default()` (`AnswerOnly`), so old rows read back
+-- exactly as they did when the mode was fabricated. New writes always bind
+-- the column explicitly. Nullable keeps the change backward compatible.
+ALTER TABLE tasks ADD COLUMN execution_mode TEXT;
