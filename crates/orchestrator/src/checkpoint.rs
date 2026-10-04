@@ -400,8 +400,10 @@ pub struct GraphCheckpoint {
     /// "restore or rebuild" story: this field for current checkpoints, a
     /// deterministic rebuild from the restored state for older ones.
     /// Additive only (serde default = the empty model); old readers ignore
-    /// the key.
-    #[serde(default)]
+    /// the key. Read fail-soft (`deserialize_world_model_failsoft`): an
+    /// unreadable payload degrades to the empty model instead of failing the
+    /// whole load.
+    #[serde(default, deserialize_with = "deserialize_world_model_failsoft")]
     pub world_model: crate::world_model::WorldModel,
     /// Issue #60: the coordinator's suitability record — the bounded,
     /// decayed dispatch-outcome history per (specialist, task class),
@@ -450,6 +452,40 @@ pub struct GraphCheckpoint {
 
 const fn current_schema_version() -> u32 {
     GRAPH_CHECKPOINT_SCHEMA_VERSION
+}
+
+/// Field-level fail-soft reader for the persisted world model.
+///
+/// The projection is DERIVED state: the #56 "restore or rebuild" contract
+/// already rebuilds it from the restored run whenever the record carries no
+/// key. A payload this build cannot parse — an unknown `FactStatus` variant
+/// written by a newer runtime, or a wholesale wrong-typed value — is the same
+/// situation (no usable model), so it degrades to the empty model rather than
+/// failing the WHOLE checkpoint load and taking the subtasks, action ledger,
+/// and completed results down with it.
+///
+/// Additive: the JSON shape and the serialized form are unchanged; only the
+/// read of an unreadable payload differs. Serialization still uses
+/// `WorldModel`'s own `Serialize`, so a readable model round-trips
+/// bit-identically.
+fn deserialize_world_model_failsoft<'de, D>(
+    deserializer: D,
+) -> Result<crate::world_model::WorldModel, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    match serde_json::from_value(raw) {
+        Ok(model) => Ok(model),
+        Err(error) => {
+            tracing::warn!(
+                target: "concerto_orchestrator::checkpoint",
+                %error,
+                "checkpoint world model is unreadable; degrading to the empty model (rebuild)"
+            );
+            Ok(crate::world_model::WorldModel::default())
+        }
+    }
 }
 
 impl GraphCheckpoint {
@@ -2685,6 +2721,79 @@ mod tests {
             loaded.world_model.is_empty_beyond_objective(),
             "the empty model carries nothing to consume"
         );
+    }
+
+    /// Minimal valid checkpoint JSON whose `world_model` key carries
+    /// `world_model` verbatim — readable or not — so the fail-soft load
+    /// contract can be exercised against hostile payloads.
+    fn checkpoint_json_with_world_model(world_model: serde_json::Value) -> String {
+        serde_json::json!({
+            "schema_version": GRAPH_CHECKPOINT_SCHEMA_VERSION,
+            "objective": "keep the rest",
+            "subtasks": [],
+            "edges": [],
+            "completed_results": {},
+            "total_cost": 0.0,
+            "total_tool_calls": 0,
+            "provider_metrics": [],
+            "all_files": [],
+            "expected_artifacts": {},
+            "subtask_attempts": {},
+            "retry_feedback": {},
+            "world_model": world_model,
+        })
+        .to_string()
+    }
+
+    /// Assert the fail-soft contract shared by every unreadable-world-model
+    /// case: the load SUCCEEDS, the model degrades to the empty default (the
+    /// same "restore or rebuild" story as a record with no `world_model` key),
+    /// and the rest of the checkpoint survives.
+    fn assert_unreadable_world_model_degrades_to_empty(json: &str) {
+        let loaded = GraphCheckpoint::from_json(json)
+            .expect("an unreadable world model must not fail the checkpoint load");
+        assert_eq!(
+            loaded.world_model,
+            crate::world_model::WorldModel::default(),
+            "the unreadable model degrades to the empty projection to rebuild"
+        );
+        assert!(
+            loaded.world_model.is_empty_beyond_objective(),
+            "the degraded model carries nothing to consume"
+        );
+        assert_eq!(loaded.objective, "keep the rest", "the rest of the checkpoint loads intact");
+        assert_eq!(
+            loaded.schema_version, GRAPH_CHECKPOINT_SCHEMA_VERSION,
+            "the schema policy still applies to the readable parts"
+        );
+    }
+
+    /// A persisted fact whose `status` is a variant this build does not know
+    /// (a value written by a newer runtime) must not fail the checkpoint
+    /// load: only the world-model projection degrades; the rest of the
+    /// checkpoint — subtasks, ledger, results — still loads.
+    #[test]
+    fn checkpoint_with_unknown_world_model_status_loads_empty_model() {
+        let json = checkpoint_json_with_world_model(serde_json::json!({
+            "objective": "ship the slice",
+            "facts": [{
+                "ref_id": "ev-1",
+                "label": "a fact recorded by a future runtime",
+                "status": "frobnicated"
+            }],
+        }));
+
+        assert_unreadable_world_model_degrades_to_empty(&json);
+    }
+
+    /// Unknown `FactStatus` is one unreadable shape; a wholesale-unreadable
+    /// `world_model` payload (wrong type) must degrade the same way — the
+    /// field-level fail-soft covers the whole projection, not one variant.
+    #[test]
+    fn checkpoint_with_unreadable_world_model_payload_loads_empty_model() {
+        let json = checkpoint_json_with_world_model(serde_json::json!("frobnicated"));
+
+        assert_unreadable_world_model_degrades_to_empty(&json);
     }
 
     // ------------------------------------------------------------------
