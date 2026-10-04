@@ -457,7 +457,9 @@ fn killed_by_cpu_limit(_status: &std::process::ExitStatus) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use camino::Utf8PathBuf;
+    #[cfg(unix)]
     use std::sync::Arc;
 
     // verifies: direct execution clears inherited environment on every platform.
