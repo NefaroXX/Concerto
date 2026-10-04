@@ -84,9 +84,11 @@ fn agent_edits_clone_and_removal_use_the_authoritative_roster() {
 fn extension_records_preserve_argument_boundaries_and_redact_environment() {
     let fixture = Fixture::new();
     let server = fixture.dir.path().join("server.toml");
+    // Credential-like env keys must be keyring references (ADR-78); settings
+    // inspection redacts whatever value the record stores.
     std::fs::write(
         &server,
-        "id = 'demo'\ncommand = 'demo'\nargs = ['two words']\n[env]\nTOKEN = 'synthetic-secret'\n",
+        "id = 'demo'\ncommand = 'demo'\nargs = ['two words']\n[env]\nTOKEN = 'keyring:mcp/demo/TOKEN'\n",
     )
     .unwrap();
     fixture.success(&["extensions", "mcp", "add", server.to_str().unwrap()]);
@@ -96,11 +98,17 @@ fn extension_records_preserve_argument_boundaries_and_redact_environment() {
     assert!(
         output.contains("two words") && output.contains("1234") && output.contains("[REDACTED]")
     );
-    assert!(!output.contains("synthetic-secret"));
+    assert!(!output.contains("keyring:mcp/demo/TOKEN"));
     let output = fixture.success(&["config", "get", "mcp.servers.0.env.TOKEN"]);
-    assert!(!output.contains("synthetic-secret"));
+    assert!(!output.contains("keyring:mcp/demo/TOKEN"));
     fixture.success(&["extensions", "mcp", "remove", "demo", "--yes"]);
     assert!(!fixture.success(&["extensions", "mcp", "list"]).contains("demo"));
+    std::fs::write(&server, "id = 'plain'\ncommand = 'demo'\n[env]\nTOKEN = 'synthetic-secret'\n")
+        .unwrap();
+    assert!(!fixture
+        .command(&["extensions", "mcp", "add", server.to_str().unwrap()])
+        .status
+        .success());
     std::fs::write(&server, "id = 'bad'\ncommand = 'demo'\ntimeout_ms = 1\n").unwrap();
     assert!(!fixture
         .command(&["extensions", "mcp", "add", server.to_str().unwrap()])
