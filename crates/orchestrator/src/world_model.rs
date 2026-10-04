@@ -201,7 +201,8 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use concerto_sessions::whiteboard::{
-    finding_text, supporting_evidence_ids, tool_executed_view, write_applied_path, WhiteboardEvent,
+    finding_text, supporting_evidence_ids, tool_executed_view, write_applied_path, ToolOutcome,
+    WhiteboardEvent,
 };
 use concerto_sessions::WhiteboardKind;
 
@@ -465,6 +466,13 @@ pub struct WorldFact {
     /// `grounded_by`. Additive serde: old checkpoints load with `None`.
     #[serde(default)]
     pub contradicted_by: Option<String>,
+    /// The contradicting execution's exit code (W1, C-FAIL addendum): `Some`
+    /// only when the contradicting `ToolExecuted` carried a numeric
+    /// `exit_code` and annotated this fact; `None` everywhere else, so the
+    /// contradicted line renders exactly its legacy bracket. Additive serde:
+    /// checkpoints written before it existed load with `None`.
+    #[serde(default)]
+    pub contradicted_exit_code: Option<i32>,
 }
 
 /// One tracked work item (a journal dispatch decision): id, short label,
@@ -641,6 +649,9 @@ struct FailedExecution {
     seq: u64,
     /// The observed paths, bounded like every other per-event extraction.
     paths: Vec<String>,
+    /// The contradicting run's exit code (W1), when the payload carried a
+    /// numeric one — structure, never stderr or free-text failure.
+    exit_code: Option<i32>,
 }
 
 /// Whether failed execution `failure` contradicts `candidate` (C-FAIL, issue
@@ -731,30 +742,44 @@ fn extract_writes_and_facts(events: &[WhiteboardEvent]) -> Extraction {
                 });
             }
             WhiteboardKind::ToolExecuted => {
-                // One typed read of the payload (#136): tool, args, success
+                // One typed read of the payload (#136): tool, args, outcome
                 // and observed paths, all from the shape the tool-fact writer
                 // appends.
                 let view = tool_executed_view(&event.payload);
-                if !view.success {
-                    // C-FAIL (issue #170 as reviewed): a failed execution
-                    // applied nothing, so there is no write to attribute and
-                    // no fact to derive (not counted by issue #140) — but the
-                    // failure may contradict an `Assumed` claim naming the
-                    // same artifact, so it is collected for the annotation
-                    // pass in `build`. Only the bounded paths travel;
-                    // payload text (tool name included) never enters the
-                    // model.
-                    failures.push(FailedExecution {
-                        event_id: event.event_id.clone(),
-                        seq: event.gate_seq,
-                        paths: view
-                            .paths
-                            .iter()
-                            .take(MAX_PATHS_PER_EVENT)
-                            .map(|path| (*path).to_owned())
-                            .collect(),
-                    });
-                    continue;
+                match view.outcome {
+                    // W1 (C-FAIL, issue #170 as reviewed): only a `failed`
+                    // outcome is collected. A failed execution applied
+                    // nothing, so there is no write to attribute and no fact
+                    // to derive (not counted by issue #140) — but the failure
+                    // may contradict an `Assumed` claim naming the same
+                    // artifact, so it is collected for the annotation pass in
+                    // `build`. Only the bounded paths and the numeric exit
+                    // code travel; payload text (tool name included) never
+                    // enters the model. A legacy payload with `success: false`
+                    // and no `outcome` key still reads `Failed` here, so the
+                    // pre-W1 shape keeps collecting exactly as before.
+                    ToolOutcome::Failed => {
+                        failures.push(FailedExecution {
+                            event_id: event.event_id.clone(),
+                            seq: event.gate_seq,
+                            paths: view
+                                .paths
+                                .iter()
+                                .take(MAX_PATHS_PER_EVENT)
+                                .map(|path| (*path).to_owned())
+                                .collect(),
+                            exit_code: view.exit_code,
+                        });
+                        continue;
+                    }
+                    // A refusal or a cancelled/timed-out run never executed,
+                    // and a payload predating the outcome key cannot be
+                    // classified — none of them observes anything, so they
+                    // derive neither a fact nor a contradiction.
+                    ToolOutcome::Denied | ToolOutcome::Interrupted | ToolOutcome::Unknown => {
+                        continue;
+                    }
+                    ToolOutcome::Ok => {}
                 }
                 let file_affecting = view
                     .tool
@@ -1538,14 +1563,17 @@ impl WorldModel {
                 // F-SUPERSEDE stays positional, so a later successful write
                 // to the same path un-contradicts (the annotation is never
                 // sticky).
-                let contradicted_by = if stale || candidate.status != FactStatus::Assumed {
+                let contradiction = if stale || candidate.status != FactStatus::Assumed {
                     None
                 } else {
-                    failures
-                        .iter()
-                        .find(|failure| contradicts(&candidate, failure))
-                        .map(|failure| bounded(failure.event_id.clone()))
+                    failures.iter().find(|failure| contradicts(&candidate, failure))
                 };
+                let contradicted_by =
+                    contradiction.map(|failure| bounded(failure.event_id.clone()));
+                // W1: the contradicting run's exit code rides the fact it
+                // annotates (additive — absent whenever there is no
+                // contradiction or the failure carried no numeric code).
+                let contradicted_exit_code = contradiction.and_then(|failure| failure.exit_code);
                 WorldFact {
                     ref_id: candidate.ref_id,
                     label: candidate.label,
@@ -1560,6 +1588,7 @@ impl WorldModel {
                     seq: candidate.seq,
                     grounded_by: candidate.grounded_by,
                     contradicted_by,
+                    contradicted_exit_code,
                 }
             })
             .collect();
@@ -2092,7 +2121,12 @@ fn render_fact_line(fact: &WorldFact) -> String {
         "- (status: {:?}) {} {}",
         fact.status,
         sanitize_text(&fact.label),
-        render_fact_ref(&fact.ref_id, &fact.grounded_by, fact.contradicted_by.as_deref())
+        render_fact_ref(
+            &fact.ref_id,
+            &fact.grounded_by,
+            fact.contradicted_by.as_deref(),
+            fact.contradicted_exit_code
+        )
     )
 }
 
@@ -2100,7 +2134,10 @@ fn render_fact_line(fact: &WorldFact) -> String {
 /// `[ev2 ← ev9, ev11]` (issue #141), or — contradicted —
 /// `[ev2 contradicted by ev-fail]` (issue #170 as reviewed; the annotation
 /// wins over grounding, which the contradicted `Finding` anchor carries as
-/// provenance). An ungrounded,
+/// provenance). W1: a contradicting failure that carried an exit code
+/// appends it inside the bracket — `[ev2 contradicted by ev-fail, exit 101]`
+/// — and the suffix is omitted entirely (legacy rendering) when it did not.
+/// An ungrounded,
 /// un-contradicted fact renders exactly as it did before grounding
 /// existed, and every id it prints passes the same render-time sanitizer
 /// as the label and the reference itself (#137), so a citation cannot
@@ -2109,10 +2146,16 @@ fn render_fact_line(fact: &WorldFact) -> String {
 /// same hostile id collapse too) and at most [`MAX_GROUNDED_BY`] distinct
 /// refs render — the bracket can never repeat one id or pad itself with
 /// empties.
-fn render_fact_ref(ref_id: &str, grounded_by: &[String], contradicted_by: Option<&str>) -> String {
+fn render_fact_ref(
+    ref_id: &str,
+    grounded_by: &[String],
+    contradicted_by: Option<&str>,
+    contradicted_exit_code: Option<i32>,
+) -> String {
     if let Some(failure) = contradicted_by.map(sanitize_text).filter(|id| !id.is_empty()) {
         let reference = sanitize_text(ref_id);
-        return format!("[{reference} contradicted by {failure}]");
+        let exit = contradicted_exit_code.map(|code| format!(", exit {code}")).unwrap_or_default();
+        return format!("[{reference} contradicted by {failure}{exit}]");
     }
     let mut refs: Vec<String> = Vec::new();
     for id in grounded_by {
@@ -4437,6 +4480,7 @@ mod tests {
                     seq: i as u64,
                     grounded_by: Vec::new(),
                     contradicted_by: None,
+                    contradicted_exit_code: None,
                 })
                 .collect(),
             tasks: (0..MAX_WORLD_TASKS)
@@ -4653,6 +4697,7 @@ mod tests {
                 seq: i as u64,
                 grounded_by: Vec::new(),
                 contradicted_by: None,
+                contradicted_exit_code: None,
             })
             .collect();
         let model = WorldModel { facts, ..WorldModel::default() };
@@ -4780,7 +4825,7 @@ mod tests {
         // empties drop, duplicates collapse, and the distinct refs stay
         // capped at MAX_GROUNDED_BY.
         assert_eq!(
-            render_fact_ref("ev1", &["\n".to_owned(), String::new()], None),
+            render_fact_ref("ev1", &["\n".to_owned(), String::new()], None, None),
             "[ev1]",
             "ids that sanitize to nothing never pad the bracket"
         );
@@ -4795,6 +4840,7 @@ mod tests {
                     "d".to_owned(),
                     "e".to_owned()
                 ],
+                None,
                 None,
             ),
             "[ev1 ← a, b, c, d]",
@@ -5486,5 +5532,217 @@ mod tests {
             first_fact.contains("Contradicted"),
             "contradicted renders before verified: {rendered}"
         );
+    }
+
+    /// A `ToolExecuted` event with an explicit outcome and exit code (W1):
+    /// the writer's shape, with the observed paths a failure still carries.
+    fn outcome_tool(
+        event_id: &str,
+        seq: u64,
+        tool: &str,
+        paths: &[&str],
+        outcome: &str,
+        exit_code: Option<i32>,
+    ) -> WhiteboardEvent {
+        event(
+            WhiteboardKind::ToolExecuted,
+            event_id,
+            seq,
+            serde_json::json!({
+                "tool": tool, "args": {}, "success": false, "outcome": outcome,
+                "exit_code": exit_code,
+                "paths": paths.iter().map(|path| serde_json::json!({"path": path})).collect::<Vec<_>>(),
+            }),
+        )
+    }
+
+    /// W1 S3: only a `failed` outcome is collected into failures — denied,
+    /// interrupted and unknown outcomes never contradict, and the legacy
+    /// shape (`success: false`, no outcome key) still reads Failed.
+    #[test]
+    fn only_failed_outcome_is_collected_into_failures() {
+        for (outcome, exit_code, contradicts) in
+            [("failed", None, true), ("denied", None, false), ("interrupted", None, false)]
+        {
+            let events = vec![
+                event(WhiteboardKind::WriteApplied, "ev-base", 10, write_applied("src/a.rs")),
+                grounded_finding("ev-claim", 20, "anchor claim", &["ev-base"]),
+                outcome_tool("ev-end", 30, "exec", &["src/a.rs"], outcome, exit_code),
+            ];
+            let model = WorldModel::build(&input(&events, Vec::new(), &[], &[], Vec::new()));
+            let claim = model.facts.iter().find(|f| f.ref_id == "ev-claim").expect("claim tracked");
+            if contradicts {
+                assert_eq!(
+                    claim.status,
+                    FactStatus::Contradicted,
+                    "a failed outcome contradicts the assumed claim"
+                );
+                assert_eq!(claim.contradicted_by.as_deref(), Some("ev-end"));
+            } else {
+                assert_eq!(
+                    claim.status,
+                    FactStatus::Assumed,
+                    "a {outcome} outcome never contradicts the assumed claim"
+                );
+                assert_eq!(claim.contradicted_by, None);
+                assert_eq!(
+                    claim.contradicted_exit_code, None,
+                    "no contradiction means no exit code: {outcome}"
+                );
+            }
+        }
+
+        // Legacy shape (no outcome key): still Failed.
+        let legacy = vec![
+            event(WhiteboardKind::WriteApplied, "ev-base", 10, write_applied("src/a.rs")),
+            grounded_finding("ev-claim", 20, "anchor claim", &["ev-base"]),
+            failed_tool("ev-fail", 30, "exec", &["src/a.rs"]),
+        ];
+        let model = WorldModel::build(&input(&legacy, Vec::new(), &[], &[], Vec::new()));
+        let claim = model.facts.iter().find(|f| f.ref_id == "ev-claim").expect("claim tracked");
+        assert_eq!(
+            claim.status,
+            FactStatus::Contradicted,
+            "a legacy success:false event without an outcome key still contradicts"
+        );
+        assert_eq!(claim.contradicted_by.as_deref(), Some("ev-fail"));
+
+        // Unknown outcome (and a keyless payload): no fact, no failure.
+        let unknown = vec![
+            event(WhiteboardKind::WriteApplied, "ev-base", 10, write_applied("src/a.rs")),
+            grounded_finding("ev-claim", 20, "anchor claim", &["ev-base"]),
+            outcome_tool("ev-end", 30, "exec", &["src/a.rs"], "bogus", None),
+        ];
+        let model = WorldModel::build(&input(&unknown, Vec::new(), &[], &[], Vec::new()));
+        let claim = model.facts.iter().find(|f| f.ref_id == "ev-claim").expect("claim tracked");
+        assert_eq!(claim.status, FactStatus::Assumed, "an unknown outcome contradicts nothing");
+        assert_eq!(claim.contradicted_by, None);
+    }
+
+    /// W1 S3 (negative): a denied read on the same path a Finding is
+    /// grounded in leaves the claim Assumed — a refusal never executed, so
+    /// it observes nothing and contradicts nothing.
+    #[test]
+    fn denied_read_after_finding_grounded_in_same_path_stays_assumed() {
+        let events = vec![
+            event(WhiteboardKind::WriteApplied, "ev-base", 10, write_applied("src/a.rs")),
+            grounded_finding("ev-claim", 20, "anchor claim", &["ev-base"]),
+            outcome_tool("ev-denied", 30, "filesystem", &["src/a.rs"], "denied", None),
+        ];
+        let model = WorldModel::build(&input(&events, Vec::new(), &[], &[], Vec::new()));
+        let claim = model.facts.iter().find(|f| f.ref_id == "ev-claim").expect("claim tracked");
+        assert_eq!(
+            claim.status,
+            FactStatus::Assumed,
+            "a denied read contradicts nothing, even on the grounded path"
+        );
+        assert_eq!(claim.contradicted_by, None);
+        assert!(
+            model.facts.iter().all(|f| f.ref_id != "ev-denied"),
+            "a denied execution derives no fact of its own: {:?}",
+            model.facts
+        );
+    }
+
+    /// W1 S3 (negative): an interrupted execution derives no fact and no
+    /// contradiction, even on the grounded path.
+    #[test]
+    fn interrupted_failure_derives_no_fact_and_no_contradiction() {
+        let events = vec![
+            event(WhiteboardKind::WriteApplied, "ev-base", 10, write_applied("src/a.rs")),
+            grounded_finding("ev-claim", 20, "anchor claim", &["ev-base"]),
+            outcome_tool("ev-cancelled", 30, "shell", &["src/a.rs"], "interrupted", None),
+        ];
+        let model = WorldModel::build(&input(&events, Vec::new(), &[], &[], Vec::new()));
+        let claim = model.facts.iter().find(|f| f.ref_id == "ev-claim").expect("claim tracked");
+        assert_eq!(claim.status, FactStatus::Assumed, "an interrupted run contradicts nothing");
+        assert_eq!(claim.contradicted_by, None);
+        assert!(
+            model.facts.iter().all(|f| f.ref_id != "ev-cancelled"),
+            "an interrupted execution derives no fact of its own: {:?}",
+            model.facts
+        );
+    }
+
+    /// W1 S2/S3 (negative): a `ToolExecuted` event with missing keys reads
+    /// Unknown and derives nothing — no fact, no failure.
+    #[test]
+    fn tool_event_with_missing_keys_derives_nothing() {
+        let events = vec![
+            event(WhiteboardKind::WriteApplied, "ev-base", 10, write_applied("src/a.rs")),
+            grounded_finding("ev-claim", 20, "anchor claim", &["ev-base"]),
+            event(WhiteboardKind::ToolExecuted, "ev-empty", 30, serde_json::json!({})),
+        ];
+        let model = WorldModel::build(&input(&events, Vec::new(), &[], &[], Vec::new()));
+        let claim = model.facts.iter().find(|f| f.ref_id == "ev-claim").expect("claim tracked");
+        assert_eq!(claim.status, FactStatus::Assumed, "a keyless event contradicts nothing");
+        assert_eq!(claim.contradicted_by, None);
+        assert!(
+            model.facts.iter().all(|f| f.ref_id != "ev-empty"),
+            "a keyless event derives no fact of its own: {:?}",
+            model.facts
+        );
+    }
+
+    /// W1 S4: the contradicting failure's exit code surfaces additively on
+    /// the fact and renders on the contradicted line.
+    #[test]
+    fn contradicting_failure_exit_code_surfaces_in_fact_and_render() {
+        let events = vec![
+            event(WhiteboardKind::WriteApplied, "ev-base", 10, write_applied("src/a.rs")),
+            grounded_finding("ev-claim", 20, "anchor claim", &["ev-base"]),
+            outcome_tool("ev-fail", 30, "exec", &["src/a.rs"], "failed", Some(101)),
+        ];
+        let model = WorldModel::build(&input(&events, Vec::new(), &[], &[], Vec::new()));
+        let claim = model.facts.iter().find(|f| f.ref_id == "ev-claim").expect("claim tracked");
+        assert_eq!(claim.status, FactStatus::Contradicted);
+        assert_eq!(claim.contradicted_by.as_deref(), Some("ev-fail"));
+        assert_eq!(claim.contradicted_exit_code, Some(101), "the failure's exit code surfaces");
+        let rendered = model.render();
+        assert!(
+            rendered.contains("[ev-claim contradicted by ev-fail, exit 101]"),
+            "the contradicted line names claim, observation and exit: {rendered}"
+        );
+    }
+
+    /// W1 S4: without an exit code the contradicted line renders exactly as
+    /// before (the suffix is omitted, never a bare placeholder).
+    #[test]
+    fn contradiction_without_exit_code_renders_legacy_bracket() {
+        let events = vec![
+            event(WhiteboardKind::WriteApplied, "ev-base", 10, write_applied("src/a.rs")),
+            grounded_finding("ev-claim", 20, "anchor claim", &["ev-base"]),
+            outcome_tool("ev-fail", 30, "exec", &["src/a.rs"], "failed", None),
+        ];
+        let model = WorldModel::build(&input(&events, Vec::new(), &[], &[], Vec::new()));
+        let claim = model.facts.iter().find(|f| f.ref_id == "ev-claim").expect("claim tracked");
+        assert_eq!(claim.contradicted_exit_code, None, "absent exit code stays absent");
+        let rendered = model.render();
+        assert!(
+            rendered.contains("[ev-claim contradicted by ev-fail]"),
+            "legacy bracket unchanged when no exit code: {rendered}"
+        );
+        assert!(!rendered.contains("exit"), "no exit suffix without a code: {rendered}");
+    }
+
+    /// W1 S4 additive serde: the exit-code annotation round-trips, and a
+    /// fact recorded before it existed loads with no annotation.
+    #[test]
+    fn contradicted_exit_code_is_additive_in_serde() {
+        let fact: WorldFact = serde_json::from_str(
+            r#"{"ref_id":"ev-1","label":"anchor claim","status":"contradicted","contradicted_by":"ev-fail","contradicted_exit_code":101}"#,
+        )
+        .expect("a contradicted fact with an exit code loads");
+        assert_eq!(fact.contradicted_exit_code, Some(101));
+        let round_tripped: WorldFact =
+            serde_json::from_value(serde_json::to_value(&fact).expect("serializes"))
+                .expect("deserializes");
+        assert_eq!(round_tripped, fact, "the exit code survives the round trip");
+
+        let old: WorldFact = serde_json::from_str(
+            r#"{"ref_id":"ev-1","label":"anchor claim","status":"contradicted","contradicted_by":"ev-fail"}"#,
+        )
+        .expect("a pre-W1 fact loads");
+        assert_eq!(old.contradicted_exit_code, None, "the absent key defaults to no exit code");
     }
 }

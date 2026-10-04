@@ -24,6 +24,7 @@ use concerto_core::{CancellationToken, OrchestratorError, TaskId};
 use concerto_eval::EvalEngine;
 use concerto_memory::budget::ContextBudgetAllocator;
 use concerto_providers::retry::RetryPolicy;
+use concerto_sessions::whiteboard::ToolOutcome;
 use concerto_sessions::SessionStore;
 use concerto_tools::undo::UndoManager;
 
@@ -34,7 +35,7 @@ use crate::session_manager::message_row_usage;
 use crate::shell_repair::{self, ShellFailure};
 use crate::state::AgentState;
 use crate::tool_driver::{self, DriverTurn, TextToolDriver};
-use crate::tool_facts::{ToolExecutedFact, ToolFactContext};
+use crate::tool_facts::{tool_outcome_for_error, ToolExecutedFact, ToolFactContext};
 use crate::tool_guard;
 
 /// The single-agent loop driving plan → act → observe → plan cycles.
@@ -2731,6 +2732,7 @@ impl AgentLoop {
                     &tc.name,
                     &arguments,
                     true,
+                    ToolOutcome::Ok,
                     None,
                     crate::tool_facts::extract_affected_paths(&arguments, Some(&output.data)),
                     audited_mutation,
@@ -2866,6 +2868,7 @@ impl AgentLoop {
                     &tc.name,
                     &arguments,
                     false,
+                    ToolOutcome::Denied,
                     None,
                     crate::tool_facts::extract_affected_paths(&arguments, None),
                     file_affecting,
@@ -2944,6 +2947,7 @@ impl AgentLoop {
                     &tc.name,
                     &arguments,
                     false,
+                    tool_outcome_for_error(&e),
                     None,
                     crate::tool_facts::extract_affected_paths(&arguments, None),
                     file_affecting,
@@ -3042,7 +3046,9 @@ impl AgentLoop {
     /// The writer is fail-soft — a persistence failure can never fail the tool
     /// result this loop is already returning. The single-agent loop has no
     /// run/generation concept (no ADR-65 §2 barrier, no checkpoint run id), so
-    /// both are recorded honestly as absent.
+    /// both are recorded honestly as absent. W1: `outcome` is classified at
+    /// the call site (ok / denied / interrupted / failed) while `success`
+    /// stays the raw pass flag the loop already decided on.
     #[allow(clippy::too_many_arguments)]
     async fn record_tool_fact(
         &self,
@@ -3051,6 +3057,7 @@ impl AgentLoop {
         tool: &str,
         args: &serde_json::Value,
         success: bool,
+        outcome: ToolOutcome,
         exit_code: Option<i32>,
         paths: Vec<String>,
         file_affecting: bool,
@@ -3073,6 +3080,7 @@ impl AgentLoop {
                     tool,
                     args,
                     success,
+                    outcome,
                     exit_code,
                     paths: &paths,
                     file_affecting,
@@ -3112,6 +3120,7 @@ impl AgentLoop {
                     tool,
                     args,
                     success: true,
+                    outcome: ToolOutcome::Ok,
                     exit_code: None,
                     paths: &[],
                     file_affecting: false,

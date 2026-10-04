@@ -34,7 +34,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::tool_facts::{ToolExecutedFact, ToolFactContext};
+use crate::tool_facts::{tool_outcome_for_error, ToolExecutedFact, ToolFactContext};
 use crate::tool_guard;
 use concerto_config::{AgentCapabilities, PromptSections};
 use concerto_core::event::{EventBus, EventKind, ThinkingKind};
@@ -50,6 +50,7 @@ use concerto_core::types::{
 use concerto_core::{CancellationToken, OrchestratorError};
 use concerto_eval::EvalEngine;
 use concerto_providers::retry::RetryPolicy;
+use concerto_sessions::whiteboard::ToolOutcome;
 
 /// Maximum LLM ↔ tool iterations before the agent stops.
 const MAX_TOOL_ITERATIONS: u32 = 12;
@@ -223,7 +224,9 @@ impl GenericSpecialistAgent {
     /// `ToolFactContext` carries its own id, and the per-call fact carries the
     /// task id, run id, and workspace generation from the dispatch context.
     /// Recording is fail-soft — a writer failure never affects the tool
-    /// result already returned to the model.
+    /// result already returned to the model. W1: `outcome` is classified at
+    /// the call site (ok / denied / interrupted / failed) while `success`
+    /// stays the raw pass flag.
     #[allow(clippy::too_many_arguments)]
     async fn record_tool_fact(
         &self,
@@ -232,6 +235,7 @@ impl GenericSpecialistAgent {
         tool: &str,
         arguments: &serde_json::Value,
         success: bool,
+        outcome: ToolOutcome,
         output_data: Option<&serde_json::Value>,
         file_affecting: bool,
         pre_image_hashes: HashMap<String, Option<String>>,
@@ -254,6 +258,7 @@ impl GenericSpecialistAgent {
                     tool,
                     args: arguments,
                     success,
+                    outcome,
                     exit_code: None,
                     paths: &paths,
                     file_affecting,
@@ -294,6 +299,7 @@ impl GenericSpecialistAgent {
                     tool,
                     args: arguments,
                     success: true,
+                    outcome: ToolOutcome::Ok,
                     exit_code: None,
                     paths: &[],
                     file_affecting: false,
@@ -841,6 +847,7 @@ impl GenericSpecialistAgent {
                             &tool_call.name,
                             &arguments,
                             true,
+                            ToolOutcome::Ok,
                             Some(&output.data),
                             is_file_change,
                             pre_image_hashes.clone(),
@@ -884,6 +891,7 @@ impl GenericSpecialistAgent {
                             &tool_call.name,
                             &arguments,
                             false,
+                            tool_outcome_for_error(&error),
                             None,
                             is_file_change,
                             pre_image_hashes.clone(),
@@ -2336,6 +2344,7 @@ impl GenericSpecialistAgent {
                                     &tool_call.name,
                                     &arguments,
                                     true,
+                                    ToolOutcome::Ok,
                                     Some(&output.data),
                                     is_file_change,
                                     pre_image_hashes.clone(),
@@ -2379,6 +2388,7 @@ impl GenericSpecialistAgent {
                                     &tool_call.name,
                                     &arguments,
                                     false,
+                                    tool_outcome_for_error(&error),
                                     None,
                                     is_file_change,
                                     pre_image_hashes.clone(),

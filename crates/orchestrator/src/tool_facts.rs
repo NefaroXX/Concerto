@@ -31,6 +31,7 @@ use concerto_core::ids::Ulid;
 use concerto_core::CancellationToken;
 use concerto_sessions::resource_facts::CACHE_LIMIT_BYTES;
 use concerto_sessions::whiteboard::append_whiteboard_event;
+use concerto_sessions::whiteboard::ToolOutcome;
 use concerto_sessions::{
     NewWhiteboardEvent, ObservedPath, ResourceFacts, ToolExecutedPayload, WhiteboardKind,
 };
@@ -164,6 +165,7 @@ impl ToolFactContext {
                 "tool": fact.tool,
                 "args": canonical_args(fact.args),
                 "success": fact.success,
+                "outcome": fact.outcome.as_str(),
                 "exit_code": fact.exit_code,
                 "generation": fact.generation,
                 "project_root_hash": root_hash,
@@ -273,6 +275,7 @@ impl ToolFactContext {
                 "tool": fact.tool,
                 "args": canonical_args(fact.args),
                 "success": true,
+                "outcome": fact.outcome.as_str(),
                 "exit_code": serde_json::Value::Null,
                 "generation": fact.generation,
                 "project_root_hash": root_hash,
@@ -349,6 +352,9 @@ pub struct ToolExecutedFact<'a> {
     pub args: &'a serde_json::Value,
     /// Whether execution completed successfully (policy denial is `false`).
     pub success: bool,
+    /// How the call ended (W1): the writer stamps this on the payload's
+    /// `outcome` key while `success` stays exactly as passed (compatible).
+    pub outcome: ToolOutcome,
     /// Exit code when available (shell/git); `None` otherwise.
     pub exit_code: Option<i32>,
     /// Paths this execution affected/observed, in the tool's own naming.
@@ -366,6 +372,25 @@ impl ToolExecutedFact<'_> {
     /// `agent_id` column always carries the producing agent (never inferred).
     fn task_attribution(&self) -> Option<&str> {
         self.task_id
+    }
+}
+
+/// Classify a tool error for the `ToolExecuted` payload's `outcome` key
+/// (W1) — the single grammar every call site shares, so refused,
+/// interrupted and failed calls can never disagree on their outcome:
+///
+/// - `denied`: a policy/approval/capability refusal that never executed;
+/// - `interrupted`: the call was cancelled or timed out;
+/// - `failed`: the tool ran and reported failure.
+#[must_use]
+pub fn tool_outcome_for_error(error: &concerto_core::ToolError) -> ToolOutcome {
+    match error {
+        concerto_core::ToolError::PolicyDenied { .. }
+        | concerto_core::ToolError::PausedAwaitingApproval { .. } => ToolOutcome::Denied,
+        concerto_core::ToolError::Cancelled | concerto_core::ToolError::Timeout { .. } => {
+            ToolOutcome::Interrupted
+        }
+        _ => ToolOutcome::Failed,
     }
 }
 
@@ -754,6 +779,7 @@ mod tests {
                 tool: "filesystem",
                 args: &serde_json::json!({ "operation": "read", "path": "a.md" }),
                 success: true,
+                outcome: ToolOutcome::Ok,
                 exit_code: None,
                 paths: &["a.md".to_owned()],
                 file_affecting: false,
@@ -776,6 +802,7 @@ mod tests {
         assert_eq!(payload["run_id"], "run-2");
         assert_eq!(payload["tool"], "filesystem");
         assert_eq!(payload["success"], true);
+        assert_eq!(payload["outcome"], "ok", "the call-site outcome is stamped");
         assert_eq!(payload["generation"], "gen-abc");
         assert_eq!(
             payload["project_root_hash"].as_str().map(str::to_owned),
@@ -864,6 +891,7 @@ mod tests {
                 tool: "write_file",
                 args: &serde_json::json!({ "path": "b.rs", "content": "new content" }),
                 success: true,
+                outcome: ToolOutcome::Ok,
                 exit_code: None,
                 paths: &["b.rs".to_owned()],
                 file_affecting: true,
@@ -908,6 +936,7 @@ mod tests {
                 tool: "filesystem",
                 args: &serde_json::json!({ "operation": "read", "path": "c.txt" }),
                 success: false,
+                outcome: ToolOutcome::Failed,
                 exit_code: Some(1),
                 paths: &["c.txt".to_owned()],
                 file_affecting: false,
@@ -921,6 +950,7 @@ mod tests {
         assert_eq!(events.len(), 1, "failed execution still recorded");
         assert_eq!(events[0].payload["success"], false);
         assert_eq!(events[0].payload["exit_code"], 1);
+        assert_eq!(events[0].payload["outcome"], "failed");
     }
 
     #[tokio::test]
@@ -937,6 +967,7 @@ mod tests {
                 tool: "anything",
                 args: &serde_json::json!({}),
                 success: true,
+                outcome: ToolOutcome::Ok,
                 exit_code: None,
                 paths: &["x".to_owned()],
                 file_affecting: true,
@@ -984,6 +1015,7 @@ mod tests {
                 tool: "t",
                 args,
                 success: true,
+                outcome: ToolOutcome::Ok,
                 exit_code: None,
                 paths,
                 file_affecting,
@@ -1099,6 +1131,7 @@ mod tests {
             tool: "t",
             args: &args,
             success: true,
+            outcome: ToolOutcome::Ok,
             exit_code: None,
             paths: &paths,
             file_affecting: true,
@@ -1121,6 +1154,7 @@ mod tests {
             tool: "t",
             args: &args,
             success: true,
+            outcome: ToolOutcome::Ok,
             exit_code: None,
             paths: &paths,
             file_affecting: true,
@@ -1131,5 +1165,254 @@ mod tests {
             Some("h"),
             "raw + resolved spelling of one target still yields the pre-image"
         );
+    }
+
+    /// W1 S1: the writer stamps the call-site `outcome` on the payload while
+    /// keeping `success` exactly as passed (compatible).
+    #[tokio::test]
+    async fn writer_records_ok_outcome_for_success() {
+        use concerto_sessions::whiteboard::ToolOutcome;
+
+        let (_dir, pool) = test_pool().await;
+        let (ctx, _store) = facts_for(&pool);
+        let root = tempfile::tempdir().expect("tempdir created");
+        std::fs::write(root.path().join("a.md"), b"hello").expect("write fixture");
+        let cancel = cancel();
+
+        ctx.record_tool_executed(
+            &ToolExecutedFact {
+                session_id: "session-1",
+                task_id: None,
+                run_id: None,
+                generation: "",
+                project_root: root.path(),
+                tool: "filesystem",
+                args: &serde_json::json!({ "operation": "read", "path": "a.md" }),
+                success: true,
+                outcome: ToolOutcome::Ok,
+                exit_code: None,
+                paths: &["a.md".to_owned()],
+                file_affecting: false,
+                pre_image_hashes: HashMap::new(),
+            },
+            &cancel,
+        )
+        .await;
+
+        let events = load_tool_events(&pool).await;
+        assert_eq!(events.len(), 1, "one ToolExecuted event appended");
+        assert_eq!(events[0].payload["success"], true, "success kept as passed");
+        assert_eq!(events[0].payload["outcome"], "ok", "call-site outcome stamped");
+    }
+
+    /// W1 S1: a tool that ran and reported failure records `failed` through
+    /// the real writer (with the real call-site classification).
+    #[tokio::test]
+    async fn writer_records_failed_outcome_for_execution_failure() {
+        let (_dir, pool) = test_pool().await;
+        let (ctx, _store) = facts_for(&pool);
+        let root = tempfile::tempdir().expect("tempdir created");
+        std::fs::write(root.path().join("c.txt"), b"x").expect("write fixture");
+        let cancel = cancel();
+        let error = concerto_core::ToolError::ExecutionFailed { message: "boom".into() };
+
+        ctx.record_tool_executed(
+            &ToolExecutedFact {
+                session_id: "session-1",
+                task_id: None,
+                run_id: None,
+                generation: "",
+                project_root: root.path(),
+                tool: "filesystem",
+                args: &serde_json::json!({ "operation": "read", "path": "c.txt" }),
+                success: false,
+                outcome: tool_outcome_for_error(&error),
+                exit_code: None,
+                paths: &["c.txt".to_owned()],
+                file_affecting: false,
+                pre_image_hashes: HashMap::new(),
+            },
+            &cancel,
+        )
+        .await;
+
+        let events = load_tool_events(&pool).await;
+        assert_eq!(events.len(), 1, "failed execution still recorded");
+        assert_eq!(events[0].payload["success"], false, "success kept as passed");
+        assert_eq!(events[0].payload["outcome"], "failed", "execution failure is failed");
+    }
+
+    /// W1 S1: a policy refusal never executed — `denied` through the real
+    /// writer (with the real call-site classification).
+    #[tokio::test]
+    async fn writer_records_denied_outcome_for_policy_refusal() {
+        let (_dir, pool) = test_pool().await;
+        let (ctx, store) = facts_for(&pool);
+        let root = tempfile::tempdir().expect("tempdir created");
+        std::fs::write(root.path().join("d.txt"), b"x").expect("write fixture");
+        let cancel = cancel();
+        let error = concerto_core::ToolError::PolicyDenied { rule: "deny_all".into() };
+
+        ctx.record_tool_executed(
+            &ToolExecutedFact {
+                session_id: "session-1",
+                task_id: None,
+                run_id: None,
+                generation: "",
+                project_root: root.path(),
+                tool: "write_file",
+                args: &serde_json::json!({ "path": "d.txt" }),
+                success: false,
+                outcome: tool_outcome_for_error(&error),
+                exit_code: None,
+                paths: &["d.txt".to_owned()],
+                file_affecting: false,
+                pre_image_hashes: HashMap::new(),
+            },
+            &cancel,
+        )
+        .await;
+
+        let events = load_tool_events(&pool).await;
+        assert_eq!(events.len(), 1, "refused attempt still recorded");
+        assert_eq!(events[0].payload["success"], false, "success kept as passed");
+        assert_eq!(events[0].payload["outcome"], "denied", "policy refusal is denied");
+        let root_hash = project_root_hash(root.path());
+        assert!(
+            store.lookup(&root_hash, "d.txt", &cancel).await.expect("lookup succeeds").is_none(),
+            "a denied read syncs no derived row"
+        );
+    }
+
+    /// W1 S1: a cancelled/timed-out tool records `interrupted` through the
+    /// real writer (with the real call-site classification).
+    #[tokio::test]
+    async fn writer_records_interrupted_outcome_for_cancelled_tool() {
+        let (_dir, pool) = test_pool().await;
+        let (ctx, _store) = facts_for(&pool);
+        let root = tempfile::tempdir().expect("tempdir created");
+        std::fs::write(root.path().join("e.txt"), b"x").expect("write fixture");
+        let cancel = cancel();
+        let error = concerto_core::ToolError::Cancelled;
+
+        ctx.record_tool_executed(
+            &ToolExecutedFact {
+                session_id: "session-1",
+                task_id: None,
+                run_id: None,
+                generation: "",
+                project_root: root.path(),
+                tool: "shell",
+                args: &serde_json::json!({ "command": "sleep 60" }),
+                success: false,
+                outcome: tool_outcome_for_error(&error),
+                exit_code: None,
+                paths: &["e.txt".to_owned()],
+                file_affecting: false,
+                pre_image_hashes: HashMap::new(),
+            },
+            &cancel,
+        )
+        .await;
+
+        let events = load_tool_events(&pool).await;
+        assert_eq!(events.len(), 1, "interrupted execution still recorded");
+        assert_eq!(events[0].payload["success"], false, "success kept as passed");
+        assert_eq!(events[0].payload["outcome"], "interrupted", "cancellation is interrupted");
+    }
+
+    /// W1 S1: the call-site classification — denied is a policy/approval/
+    /// capability refusal that never executed, interrupted is cancellation
+    /// or timeout, everything else that ran and reported failure is failed.
+    #[test]
+    fn tool_error_classification_maps_denied_interrupted_and_failed() {
+        use concerto_core::ToolError;
+        use concerto_sessions::whiteboard::ToolOutcome;
+
+        assert_eq!(
+            tool_outcome_for_error(&ToolError::PolicyDenied { rule: "r".into() }),
+            ToolOutcome::Denied,
+            "policy denial never executed"
+        );
+        assert_eq!(
+            tool_outcome_for_error(&ToolError::PausedAwaitingApproval {
+                tool_name: "shell".into(),
+                detail: "d".into(),
+                input_hash: "h".into(),
+                correlation_id: concerto_core::ids::Ulid::new(),
+                timeout_secs: 30,
+            }),
+            ToolOutcome::Denied,
+            "approval pause never executed"
+        );
+        assert_eq!(
+            tool_outcome_for_error(&ToolError::Cancelled),
+            ToolOutcome::Interrupted,
+            "cancellation is interrupted"
+        );
+        assert_eq!(
+            tool_outcome_for_error(&ToolError::Timeout { timeout_secs: 30 }),
+            ToolOutcome::Interrupted,
+            "timeout is interrupted"
+        );
+        for error in [
+            ToolError::ExecutionFailed { message: "boom".into() },
+            ToolError::NotARepository { message: "no repo".into() },
+            ToolError::VirtualFsConflict {
+                path: camino::Utf8PathBuf::from("a.md"),
+                reason: "conflict".into(),
+            },
+            ToolError::RollbackNotSupported,
+            ToolError::LspError { message: "lsp down".into() },
+            ToolError::Io(std::io::Error::other("io")),
+        ] {
+            assert_eq!(
+                tool_outcome_for_error(&error),
+                ToolOutcome::Failed,
+                "a tool that ran and reported failure is failed: {error}"
+            );
+        }
+    }
+
+    /// W1 S5: the writer persists no free-text failure — no stderr, no
+    /// message/error-text keys on the event payload.
+    #[tokio::test]
+    async fn writer_payload_carries_no_free_text_failure() {
+        use concerto_sessions::whiteboard::ToolOutcome;
+
+        let (_dir, pool) = test_pool().await;
+        let (ctx, _store) = facts_for(&pool);
+        let root = tempfile::tempdir().expect("tempdir created");
+        let cancel = cancel();
+
+        ctx.record_tool_executed(
+            &ToolExecutedFact {
+                session_id: "session-1",
+                task_id: None,
+                run_id: None,
+                generation: "",
+                project_root: root.path(),
+                tool: "shell",
+                args: &serde_json::json!({ "command": "exit 101" }),
+                success: false,
+                outcome: ToolOutcome::Failed,
+                exit_code: Some(101),
+                paths: &[],
+                file_affecting: false,
+                pre_image_hashes: HashMap::new(),
+            },
+            &cancel,
+        )
+        .await;
+
+        let events = load_tool_events(&pool).await;
+        assert_eq!(events.len(), 1);
+        for key in ["stderr", "stderr_tail", "stdout_tail", "message", "error_text", "error"] {
+            assert!(
+                events[0].payload.get(key).is_none(),
+                "no free-text failure key {key:?} on the payload"
+            );
+        }
+        assert_eq!(events[0].payload["exit_code"], 101, "structure (exit code) still recorded");
     }
 }

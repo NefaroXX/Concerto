@@ -2625,6 +2625,7 @@ mod tests {
                 seq: 12,
                 grounded_by: vec!["ev-9".to_owned(), "ev-11".to_owned()],
                 contradicted_by: Some("ev-fail".to_owned()),
+                contradicted_exit_code: None,
             }],
             tasks: vec![crate::world_model::WorldTask {
                 ref_id: "dec-1".to_owned(),

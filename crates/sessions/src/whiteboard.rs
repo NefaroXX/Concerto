@@ -339,9 +339,60 @@ pub fn write_applied_path(payload: &serde_json::Value) -> Option<&str> {
         .and_then(serde_json::Value::as_str)
 }
 
+/// How a `ToolExecuted` event's tool call ended (W1 outcome
+/// classification): `ok` ran and succeeded, `failed` ran and reported
+/// failure, `denied` is a policy/approval/capability refusal that never
+/// executed, `interrupted` was cancelled or timed out. `Unknown` is the
+/// read-side fallback for payloads that predate the `outcome` key (or
+/// carry an unrecognized value) — it derives no fact and no failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolOutcome {
+    Ok,
+    Failed,
+    Denied,
+    Interrupted,
+    Unknown,
+}
+
+impl ToolOutcome {
+    /// The payload spelling the writer stamps (`"ok"`, `"failed"`,
+    /// `"denied"`, `"interrupted"`; `Unknown` is never written).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Failed => "failed",
+            Self::Denied => "denied",
+            Self::Interrupted => "interrupted",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Classify a `ToolExecuted` payload: an explicit `outcome` key wins
+    /// (unrecognized values read `Unknown`, never a guess); without one
+    /// the legacy `success` flag decides (`true` → `Ok`, `false` →
+    /// `Failed`); a missing `success` key reads `Unknown`.
+    #[must_use]
+    pub fn parse(outcome: Option<&str>, success: Option<bool>) -> Self {
+        match outcome {
+            Some("ok") => Self::Ok,
+            Some("failed") => Self::Failed,
+            Some("denied") => Self::Denied,
+            Some("interrupted") => Self::Interrupted,
+            Some(_) => Self::Unknown,
+            None => match success {
+                Some(true) => Self::Ok,
+                Some(false) => Self::Failed,
+                None => Self::Unknown,
+            },
+        }
+    }
+}
+
 /// What the world model reads from a `ToolExecuted` payload (issue #136):
-/// the tool name, its canonical arguments, the success flag and the observed
-/// paths — the fields its verified tool facts derive from.
+/// the tool name, its canonical arguments, the success flag, the outcome
+/// class, the observed paths and the exit code — the fields its verified
+/// tool facts and C-FAIL contradiction derive from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecutedView<'a> {
     /// The tool name; `None` when the payload carries no usable name.
@@ -350,8 +401,16 @@ pub struct ToolExecutedView<'a> {
     pub args: &'a serde_json::Value,
     /// Whether the execution succeeded — only successes project to facts.
     pub success: bool,
+    /// How the execution ended (W1): explicit `outcome` key, else the
+    /// legacy `success` fallback (`true` → `Ok`, `false` → `Failed`,
+    /// missing → `Unknown`).
+    pub outcome: ToolOutcome,
     /// The observed paths, in payload order.
     pub paths: Vec<&'a str>,
+    /// The numeric exit code the payload carried (W1 — the contradicting
+    /// failure's structure; `None` when absent, null, non-numeric or out of
+    /// `i32` range).
+    pub exit_code: Option<i32>,
 }
 
 /// The `args` stand-in for a payload that carries none — a view sentinel
@@ -364,10 +423,19 @@ static NO_TOOL_ARGS: serde_json::Value = serde_json::Value::Null;
 /// the caller instead of a panic or a fabricated observation.
 #[must_use]
 pub fn tool_executed_view(payload: &serde_json::Value) -> ToolExecutedView<'_> {
+    let success = payload.get("success").and_then(serde_json::Value::as_bool);
     ToolExecutedView {
         tool: payload.get("tool").and_then(serde_json::Value::as_str),
         args: payload.get("args").unwrap_or(&NO_TOOL_ARGS),
-        success: payload.get("success").and_then(serde_json::Value::as_bool) == Some(true),
+        success: success == Some(true),
+        outcome: ToolOutcome::parse(
+            payload.get("outcome").and_then(serde_json::Value::as_str),
+            success,
+        ),
+        exit_code: payload
+            .get("exit_code")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|code| i32::try_from(code).ok()),
         paths: payload
             .get("paths")
             .and_then(serde_json::Value::as_array)
@@ -1897,5 +1965,50 @@ mod tests {
         assert_eq!(empty.args, &json!(null), "missing args reads as Null");
         assert!(!empty.success);
         assert!(empty.paths.is_empty());
+    }
+
+    /// W1 S2: an explicit `outcome` key classifies the execution four ways —
+    /// ok, failed, denied, interrupted.
+    #[test]
+    fn tool_executed_view_reads_explicit_outcome() {
+        for (raw, expected) in [
+            ("ok", ToolOutcome::Ok),
+            ("failed", ToolOutcome::Failed),
+            ("denied", ToolOutcome::Denied),
+            ("interrupted", ToolOutcome::Interrupted),
+        ] {
+            let payload = json!({"tool": "shell", "success": false, "outcome": raw});
+            let view = tool_executed_view(&payload);
+            assert_eq!(
+                view.outcome, expected,
+                "explicit outcome {raw:?} classifies as {expected:?}"
+            );
+        }
+    }
+
+    /// W1 S2: with no `outcome` key the view falls back to `success`
+    /// (`true` → Ok, `false` → Failed); a missing `success` key reads
+    /// Unknown. An unrecognized outcome string is Unknown, never a guess.
+    #[test]
+    fn tool_executed_view_falls_back_to_success_without_outcome_key() {
+        let ok_payload = json!({"tool": "shell", "success": true});
+        let ok = tool_executed_view(&ok_payload);
+        assert_eq!(ok.outcome, ToolOutcome::Ok, "legacy success stays Ok");
+
+        let failed_payload = json!({"tool": "shell", "success": false});
+        let failed = tool_executed_view(&failed_payload);
+        assert_eq!(failed.outcome, ToolOutcome::Failed, "legacy failure stays Failed");
+
+        let missing_payload = json!({"tool": "shell"});
+        let missing = tool_executed_view(&missing_payload);
+        assert_eq!(missing.outcome, ToolOutcome::Unknown, "missing keys read Unknown");
+
+        let empty_payload = json!({});
+        let empty = tool_executed_view(&empty_payload);
+        assert_eq!(empty.outcome, ToolOutcome::Unknown, "empty payload reads Unknown");
+
+        let bogus_payload = json!({"tool": "shell", "success": true, "outcome": "x"});
+        let bogus = tool_executed_view(&bogus_payload);
+        assert_eq!(bogus.outcome, ToolOutcome::Unknown, "unrecognized outcome is Unknown");
     }
 }
