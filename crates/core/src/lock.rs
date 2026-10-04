@@ -32,8 +32,9 @@ const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub enum LockError {
     /// Another live Concerto instance holds the lock for this data directory.
     ///
-    /// `pid_hint` is the process ID the holder wrote into the lock file, when
-    /// it can be read back (best-effort, informational only).
+    /// `pid_hint` is the process ID the holder recorded in the lock file's
+    /// PID sidecar, when it can be read back (best-effort, informational
+    /// only).
     #[error(
         "another Concerto instance is using data directory {path}{}",
         crate::lock::format_pid_hint(.pid_hint)
@@ -123,9 +124,10 @@ pub fn acquire_data_dir_lock(
         return Ok(lock);
     }
 
-    // NOTE: never truncate here — a contender must preserve the holder's PID
-    // hint until it actually acquires the lock (then `write_pid_hint` opens
-    // the file again with truncation).
+    // NOTE: never truncate here — a live holder locks byte 0, and Windows
+    // denies cross-handle access to a locked range (ERROR_LOCK_VIOLATION).
+    // The holder's PID hint lives in a sidecar (see `pid_hint_path`), so
+    // nothing in this module rewrites the lock file at all.
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -229,19 +231,39 @@ fn registry_get(key: &PathBuf) -> Option<Arc<DataDirLock>> {
     registry.get(key).and_then(Weak::upgrade)
 }
 
+/// Sidecar path carrying the holder's PID hint: the lock file name plus
+/// `.pid` (`.concerto.lock.pid`), in the same directory.
+///
+/// The hint cannot live inside the lock file itself: `fd-lock` locks byte 0
+/// with `LockFileEx` on Windows, and an exclusive byte-range lock denies read
+/// and write access through *every other* handle — including a second handle
+/// opened by the locking process itself — so the holder's write and a
+/// contender's read would both fail with `ERROR_LOCK_VIOLATION` and the hint
+/// would never be observed (Unix `flock` is advisory and does not block I/O,
+/// which is why this only breaks on Windows). The sidecar is never locked, so
+/// the hint stays writable and readable on every platform.
+fn pid_hint_path(lock_path: &Path) -> PathBuf {
+    let mut file_name = lock_path.as_os_str().to_os_string();
+    file_name.push(".pid");
+    lock_path.with_file_name(file_name)
+}
+
 /// Best-effort PID record so a block-timed-out contender can report who holds
 /// the lock. Purely informational; never affects locking semantics.
 fn write_pid_hint(lock_path: &Path) {
     use std::io::Write;
 
-    if let Ok(mut file) = OpenOptions::new().write(true).truncate(true).open(lock_path) {
+    let hint_path = pid_hint_path(lock_path);
+    if let Ok(mut file) =
+        OpenOptions::new().create(true).write(true).truncate(true).open(&hint_path)
+    {
         let _ = file.write_all(std::process::id().to_string().as_bytes());
     }
 }
 
 /// Read back the PID another holder wrote, when parseable.
 fn read_pid_hint(lock_path: &Path) -> Option<u32> {
-    let content = std::fs::read(lock_path).ok()?;
+    let content = std::fs::read(pid_hint_path(lock_path)).ok()?;
     let text = std::str::from_utf8(&content).ok()?.trim();
     text.parse::<u32>().ok()
 }
@@ -309,6 +331,24 @@ mod tests {
         // (it would hang forever if the OS lock were not released).
         let again = acquire_data_dir_lock(dir.path(), Some(Duration::from_secs(1)), None).unwrap();
         assert!(again.lock_path().ends_with(LOCK_FILE_NAME));
+    }
+
+    #[test]
+    fn pid_hint_is_recorded_in_an_unlocked_sidecar_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = acquire_data_dir_lock(dir.path(), Some(Duration::from_secs(1)), None).unwrap();
+
+        // The hint must not live in the lock file: fd-lock holds an exclusive
+        // byte-range lock on byte 0, and Windows denies cross-handle access to
+        // a locked range — a holder's write or a contender's read through any
+        // other handle fails, so the holder could never be attributed. The
+        // sidecar is never locked, hence readable on every platform.
+        assert_eq!(read_pid_hint(lock.lock_path()), Some(std::process::id()));
+        assert!(pid_hint_path(lock.lock_path()).is_file());
+        // Metadata, not content: reading the locked lock file through a second
+        // handle is exactly what fails on Windows.
+        let lock_file = std::fs::metadata(lock.lock_path()).expect("lock file metadata");
+        assert_eq!(lock_file.len(), 0, "lock file must not carry the pid hint");
     }
 
     #[test]
