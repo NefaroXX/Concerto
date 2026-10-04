@@ -733,10 +733,16 @@ impl CapabilityManager {
 /// `is_write` must be `true` for write operations (FilesystemWrite capability),
 /// `false` for read-only operations (FilesystemRead capability).
 ///
-/// Rejects paths that are not absolute, or fall outside the optional root
+/// Rejects paths that are not absolute, or fall outside the configured root
 /// directory scope.  For existing paths the target is canonicalized; for
 /// non-existing paths (common during writes) the parent directory is
 /// canonicalized instead to avoid spurious `ENOENT` from `canonicalize`.
+///
+/// A missing root directory fails closed: an unconfined capability cannot
+/// confine any path, so it denies rather than skipping root and glob checks
+/// (defect W7-1). Callers receive the *resolved* canonical path so they can
+/// forward exactly what was validated to the executor, closing the
+/// validate-then-use race (defect W7-2).
 ///
 /// When the capability was granted with explicit glob patterns, the path
 /// (relative to root) must match at least one of them.  An empty globs list
@@ -746,7 +752,7 @@ pub fn check_path_allowed(
     plugin_id: &str,
     path: &str,
     is_write: bool,
-) -> Result<(), PluginError> {
+) -> Result<std::path::PathBuf, PluginError> {
     // 1. Capability check — caller states read vs write explicitly.
     let discriminant = if is_write {
         CapabilityDiscriminant::FilesystemWrite
@@ -771,42 +777,49 @@ pub fn check_path_allowed(
         ));
     }
 
-    // 3. Resolve the target path for root-scoped comparison.
+    // 3. A root directory is mandatory. A `GrantedCapabilities` value that
+    //    never had `set_root` called (e.g. `GrantedCapabilities::new()`) has
+    //    no confinement boundary, so deny instead of silently skipping the
+    //    root and glob checks below (fail-closed).
+    let root = caps
+        .root_dir
+        .as_ref()
+        .ok_or_else(|| PluginError::CapabilityDenied("no root directory configured".into()))?;
+
+    // 4. Resolve the target path for root-scoped comparison.
     //
     //    `canonicalize` fails for non-existent files (common on write), so
     //    we canonicalize parent + append filename as a fallback.
     let resolved = resolve_for_comparison(p, is_write)?;
 
-    // 4. Root-scoped access: target must live under root_dir.
-    if let Some(ref root) = caps.root_dir {
-        let root_path = std::fs::canonicalize(root)
-            .map_err(|_| PluginError::CapabilityDenied("invalid root directory".into()))?;
-        if !resolved.starts_with(&root_path) {
-            return Err(PluginError::CapabilityDenied(format!(
-                "FilesystemRead/Write: path {} is outside root directory {}",
-                path,
-                root.display(),
-            )));
-        }
+    // 5. Root-scoped access: target must live under root_dir.
+    let root_path = std::fs::canonicalize(root)
+        .map_err(|_| PluginError::CapabilityDenied("invalid root directory".into()))?;
+    if !resolved.starts_with(&root_path) {
+        return Err(PluginError::CapabilityDenied(format!(
+            "FilesystemRead/Write: path {} is outside root directory {}",
+            path,
+            root.display(),
+        )));
+    }
 
-        // 5. Glob scope check: if the grant has non-empty globs, the
-        //    relative path under root must match at least one pattern.
-        if let Some(scope) = caps.get_scope(plugin_id, &discriminant) {
-            if !scope.globs.is_empty() {
-                let relative = resolved.strip_prefix(&root_path).unwrap_or(&resolved);
-                let matched = scope.globs.iter().any(|g| glob_match(g, relative));
-                if !matched {
-                    return Err(PluginError::CapabilityDenied(format!(
-                        "Filesystem{}: path '{}' does not match any allowed glob pattern {:?}",
-                        if is_write { "Write" } else { "Read" },
-                        relative.display(),
-                        scope.globs,
-                    )));
-                }
+    // 6. Glob scope check: if the grant has non-empty globs, the
+    //    relative path under root must match at least one pattern.
+    if let Some(scope) = caps.get_scope(plugin_id, &discriminant) {
+        if !scope.globs.is_empty() {
+            let relative = resolved.strip_prefix(&root_path).unwrap_or(&resolved);
+            let matched = scope.globs.iter().any(|g| glob_match(g, relative));
+            if !matched {
+                return Err(PluginError::CapabilityDenied(format!(
+                    "Filesystem{}: path '{}' does not match any allowed glob pattern {:?}",
+                    if is_write { "Write" } else { "Read" },
+                    relative.display(),
+                    scope.globs,
+                )));
             }
         }
     }
-    Ok(())
+    Ok(resolved)
 }
 
 /// Resolve `p` to a real path for root-scoped comparison.

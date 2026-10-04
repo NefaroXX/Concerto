@@ -205,10 +205,22 @@ pub fn acquire_data_dir_lock(
 }
 
 /// Canonical registry key for a lock file path, so `./data` and an absolute
-/// path to the same file share one entry. Falls back to the raw path when the
-/// filesystem cannot canonicalise (the file normally exists by then).
+/// path to the same file share one entry.
+///
+/// The key is derived from the *data directory*, never the lock file itself:
+/// on first acquisition the lock file does not exist yet, so canonicalizing
+/// it fails and falls back to the raw path — while a later acquisition finds
+/// the file and canonicalizes through symlinks (e.g. macOS `/var` →
+/// `/private/var`), producing a different key for the same lock. The data
+/// directory is created just above, so it always canonicalizes the same way.
+/// Falls back to the raw path when the filesystem cannot canonicalise.
 fn canonical_key(lock_path: &Path) -> PathBuf {
-    std::fs::canonicalize(lock_path).unwrap_or_else(|_| lock_path.to_path_buf())
+    match lock_path.parent() {
+        Some(parent) => std::fs::canonicalize(parent)
+            .map(|dir| dir.join(LOCK_FILE_NAME))
+            .unwrap_or_else(|_| lock_path.to_path_buf()),
+        None => lock_path.to_path_buf(),
+    }
 }
 
 /// Look up a live in-process lock for `key`.
@@ -264,6 +276,26 @@ mod tests {
         // the same underlying guard (flock would deadlock against ourselves
         // on a fresh descriptor without the registry).
         let second = acquire_data_dir_lock(dir.path(), Some(Duration::from_secs(1)), None).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn reentry_through_symlinked_parent_shares_guard() {
+        // Regression: the registry key was canonicalized from the lock file,
+        // which does not exist on first acquisition — through a symlinked
+        // parent (e.g. macOS /var → /private/var) the two acquisitions keyed
+        // differently, missed the registry, and deadlocked against ourselves.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real");
+        std::fs::create_dir(&target).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, dir.path().join("link")).unwrap();
+        #[cfg(not(unix))]
+        std::os::windows::fs::symlink_dir(&target, dir.path().join("link")).unwrap();
+        let via_link = dir.path().join("link");
+
+        let first = acquire_data_dir_lock(&via_link, Some(Duration::from_secs(5)), None).unwrap();
+        let second = acquire_data_dir_lock(&via_link, Some(Duration::from_secs(5)), None).unwrap();
         assert!(Arc::ptr_eq(&first, &second));
     }
 
