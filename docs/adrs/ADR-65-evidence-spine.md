@@ -457,9 +457,10 @@ an initial implementation that bypassed the policy engine — that omission is
 fixed: `maybe_serve_read` supplies a candidate, but the gate opens only on an
 explicit `Allow` verdict. Commits: `0c5c14e`, `1bd993a`, `781505d`, `3e09dfa`.
 
-## Addendum (2026-10-03) — world-model projection rules and non-goals (#144)
+## Addendum (2026-10-03; reviewed 2026-10-04) — world-model projection rules and non-goals (#144)
 
-**Status: Accepted — covers rules through #142, verified against merged code.**
+**Status: Accepted — covers every world-model rule issue closed through #170
+plus the review-pass corrections, verified against `dev` @ `c6d295d`.**
 This addendum amends nothing above; it records the Coordinator's world-model
 rules (issue #56, parent #51) in this ADR, because they were previously
 documented only in source. The normative source remains the module docs of
@@ -467,18 +468,25 @@ documented only in source. The normative source remains the module docs of
 ever disagree, the module doc wins and this section is corrected.
 
 **Merge state.** Every rule below has landed on `dev` — the audit parent (#134)
-and its rule issues closed through #143, merged as PRs #152, #153, #155, #156,
-#157, #158, #160 and #154. There are **no pending markers left to read**: each
-row below was checked against the merged implementation while writing this
-section, and the ones that needed it were corrected here. #143's contradiction
-rule is the one deliberate exception and stays an open question (below).
+and its rule issues, merged as PRs #152, #153, #155, #156, #157, #158, #160 and
+#154, then the contradiction work: issue #170 (`FactStatus::Contradicted` + rule
+C-FAIL) as PR #171, refined by review in #173, and two review-pass fixes that
+carry no tracking issue: #174 (decision-scoped question key) and #175
+(journaled dismissal plus monotonic question age). There are **no pending
+markers left to read**: each row below was checked against the merged
+implementation while writing this section, and the ones that needed it were
+corrected here. Two fixes from the same review pass that sit outside the
+projection are recorded under "Adjacent review-pass fixes" below because they
+bear on §7 and on policy-gate legibility rather than on a projection rule. One
+item is **not on `dev`**: the checkpoint fail-soft read is still an open PR, and
+it is marked as such where it appears.
 
 **Issue-number systems (they do not share a counter).**
 
 | tracker | numbers cited here | meaning |
 |---------|--------------------|---------|
 | **Gitea** | **#56**, **#51** | #56 = the world model itself; #51 = its parent. Cited as bare `#56`/`#51` in the rule rows, matching the module docs. |
-| **GitHub** | **#134**–**#144** | #134 = the audit parent; #135–#142 = one issue per rule; #143 = the contradiction spike; #144 = this addendum. Cited as `(#13x)`/`(#14x)`. |
+| **GitHub** | **#134**–**#144**, **#170** | #134 = the audit parent; #135–#142 = one issue per rule; #143 = the contradiction spike; #144 = this addendum; #170 = the spike as implemented (`FactStatus::Contradicted` + rule C-FAIL, PR #171 refined by #173). Cited as `(#13x)`/`(#14x)`/`(#170)`. |
 
 **Standing invariants for all world-model work** (from the #134 audit, restated
 here because every rule below is subject to them):
@@ -510,6 +518,45 @@ evidence-backed `Decision` event.
 | **F-SUPERSEDE** | A fact naming an artifact path is `Stale` when the event window holds a **newer effective write** to that path (higher `gate_seq`) than the fact's derivation event — the artifact moved on after the fact was derived. A non-write execution that observed **exactly one** path names that path, so a read is covered by the same path-level rule. | #56, extended by #139 |
 | **F-WORKSPACE-SUPERSEDE** | A fact naming **no single** artifact — a pathless build/test/check execution (which observed the workspace as a whole), or a **multi-path read** (any observed path may be the one that moved) — is `Stale` when the window holds **any** effective write newer than the fact. There is no single path to key on, so any later write moves the workspace observed. Weaker than F-SUPERSEDE, never stronger: with no later write it still stands. | #139 |
 | **F-GENERATION** | When the resume workspace-change verdict fired (checkpoint generation ≠ current snapshot generation), every log-derived fact drops to `Stale` until a fresh observation re-verifies it — the conservative reset (ADR-65 §7). | #56 |
+| **F-CFAIL** | A **newer** failed `ToolExecuted` whose observed paths overlap an `Assumed` fact's artifact marks that fact `Contradicted` and annotates it with the failure ref. Only `Assumed` claims are eligible, and both the claim and the disproof stay visible. | #170 |
+
+**C-FAIL final semantics (#170, as reviewed in #173).** This is the one rule
+whose shipped behavior differs from what the #143 spike proposed, so the merged
+contract is recorded here in full:
+
+- **Assumed-only.** Only an `Assumed` claim can be contradicted. A `Verified`
+  observation is never relabelled by a later failure over the same path — what
+  was executed is what ran, whatever its outcome.
+- **Newer failures only.** The failure must sit **after** the claim in window
+  position. An earlier failure annotates nothing.
+- **First disproof wins.** At most one annotation per fact, from the first
+  overlapping failure in event order. A repeated failure does **not** append a
+  second annotation, and a failed execution derives no fact and no write of its
+  own — there is no separate "failure fact" or repeat channel. Only its bounded
+  observed paths travel; no failure payload text (stderr, error string, even the
+  tool name) enters the model.
+- **The artifact comes from the cited evidence.** A `Finding`'s artifact is
+  derived from its `grounded_by` evidence: when that evidence resolves to exactly
+  one observed path, that path is the claim's artifact and a later failure naming
+  it contradicts the claim. With zero or several paths the claim names no single
+  artifact — several behave like a multi-path read (F-WORKSPACE-SUPERSEDE) and
+  nothing is guessed.
+- **Stale wins.** A `Stale` claim is not annotated, and F-SUPERSEDE
+  un-contradicts positionally: a later successful write to the path returns the
+  claim to `Assumed`.
+- **Eviction precedence.** Under the fact cap, below the pinned reservation:
+  `Verified` → `Contradicted` → `Assumed` → `Stale`.
+- **Render order is the deliberate reverse of eviction order.** Within the single
+  `RENDER_ENTRIES_PER_SECTION = 8` facts budget a contradicted line renders
+  **first**, before the verified lines it qualifies, so a disproof can never hide
+  behind a corroborating fact. The reference bracket reads
+  `[ev-claim contradicted by ev-fail]`, which wins over the grounding bracket;
+  the contradicted claim keeps its grounding refs as provenance. All printed ids
+  pass the render-time sanitizer.
+- **Contradiction is annotation, not suppression.** Contradicted facts feed no
+  assumption and do not disturb `artifact_verified_clean`; they stay in the
+  trusted facts block (above the `UNVERIFIED_SECTION_MARKER`) as a standing
+  annotation of what the runtime actually observed.
 
 **Known limit of both supersede arms.** The effective writes these rules can
 see are exactly the model's own — `WriteApplied` records plus file-affecting
@@ -523,7 +570,9 @@ stale an earlier test run's observation unless the write gate recorded a
 
 **Supersession is positional, not sticky.** F-SUPERSEDE is decided by
 `gate_seq` ordering alone, so a later *successful* write re-verifies what it
-touches. There is no monotonic "disproved" state — see open question 1.
+touches. `Contradicted` is an **annotation** layered on that positional model,
+not a monotonic disproved state: it records which observed failure qualified the
+claim, and it is cleared positionally, so nothing about a claim is sticky.
 
 ### Artifact classification (`ArtifactStatus`)
 
@@ -548,18 +597,22 @@ checkpointed additively so a resume restores — or, for old checkpoints, rebuil
 
 | Rule | Statement |
 |------|-----------|
-| **Q-OPEN-PROBLEM** | A failure diagnosis requiring replanning, or a non-retryable unviable-retry one, opens an `OpenProblem`. |
+| **Q-OPEN-PROBLEM** | A failure diagnosis requiring replanning, or a non-retryable unviable-retry one, opens an `OpenProblem`. Its identity subject is `code:evidence`, plus the dispatch `decision_id` **only when the surface knew one**; the subject parts are delimiter-escaped for key composition only, so a resolution scoped to one dispatch decision can never mask the same code+evidence recurring under another (#174). |
 | **Q-OPEN-MISSING** | A journal decision that stood `Rejected` opens a `MissingEvidence` (the work needs a corrected decision). |
 | **Q-OPEN-AMBIGUOUS** | A stale pending dispatch decision opens an `AmbiguousRecovery`. |
 | **Q-OPEN-BLOCKED** | An artifact with status `Dirty` opens a `BlockedPath`. |
 | **Q-DEDUPE** | A rebuilt question matching a standing question by stable key does **not** open again — the standing entry survives (one id, growing age) until resolved. |
 | **Q-RESOLVE-LINKED** | A **linked** `OpenProblem`/`MissingEvidence` question (one carrying a `subject_decision_id`) resolves only on a `Settled` journal decision recorded at or after the question's opening journal length that is **related to its subject**, by exactly two routes: (a) the decision is the subject's **reconsider descendant** — its `Freeze` transform payload names the subject decision id; or (b) the decision's `expected_artifacts` touch the question's blocked path. **There is no retry-of link**: no decision records "this is a retry of that one", so a retry or replacement is recognized *only* through the artifact touch — a replacement naming different artifacts never resolves an older question. The subject's own entry is never its own recovery (resolution needs new work). An unrelated parallel settle is **coincidence, never resolution**. (#135) |
 | **Q-RESOLVE-LEGACY** | *Transitional.* A `MissingEvidence` question restored from a pre-#135 checkpoint carries no subject (new code always records one), so it keeps the old any-settled-decision rule until it resolves and cycles out of the ledger. Documented transitional behavior, not a license to resolve by coincidence. (#135) |
-| **Q-RESOLVE-UNLINKABLE** | A question with **no** decision subject never resolves by settle: it **stands and ages** (`cycles_open` grows) rather than resolving by coincidence. After the add-linkage change, this is now the residual set only — diagnosis surfaces that knew no decision (graph-execution failures, tool/provider faults). A linked diagnosis question resolves through Q-RESOLVE-LINKED instead. (#135) |
+| **Q-RESOLVE-UNLINKABLE** | A question with **no** decision subject never resolves by settle: it **stands and ages** (`cycles_open` grows) rather than resolving by coincidence. After the add-linkage change, this is the residual set only — every surface outside `call_specialist`'s dispatch failure/settle paths (graph-execution failures, tool/provider faults, consult and investigate failures). A linked diagnosis question resolves through Q-RESOLVE-LINKED instead. (#135) |
 | **Q-RESOLVE-AMBIGUOUS** | The pending dispatch decision was cleared. |
 | **Q-RESOLVE-BLOCKED** | A newer CLEAN observation of the path (an observation event id different from the one the question was opened against) resolves it. |
 | **Q-RESOLVE-STAY** | A resolved question is never re-opened. |
 | **Q-PERSIST** | Open questions persist across rebuild cycles until one of the Q-RESOLVE rules fires, independent of whether the opening signal still shows. |
+| **Q-DISMISS** | The Coordinator — and only the Coordinator — explicitly dismisses **one** standing question by naming its real id plus a reason, through the `dismiss_question` tool. The call journals a `Settled` `DismissQuestion` decision carrying that id and reason, records the whiteboard `Decision`, resolves the entry with the reason, and checkpoints. A resolved-then-dismissed entry never re-opens, even against a recurring signal. It dispatches no agents and touches no tools, so — like `reconsider` — it applies no policy gate. (#175) |
+| **Q-DISMISS-VALIDITY** | The tool requires a non-empty id and reason, and only a currently **open** question. An unknown id is rejected; an already-resolved id is an idempotent success that journals nothing. A `DismissQuestion` decision reaches the ledger only through a `Settled` decision — a `Rejected` one (or any other state) decides nothing. Where several qualifying entries exist, the first journal entry wins. |
+| **Q-AGE-MEMORY** | A question dropped by the open cap keeps its standing age in a **bounded deterministic memory** (`MAX_AGE_MEMORY = 12` entries), never a relevance score, so when its signal rediscovers it the age resumes at `cycles_open + 1` instead of restarting at 1. The ledger stays authoritative: no memory entry survives for a question the ledger kept. Checkpointed with the model and persisted on every build, because age is a monotonic resume fact, not derived state. (#175) |
+| **Q-NO-AUTO-RESOLVE** | Nothing resolves a question **by rule** — not age, not cap pressure, not an unrelated settle. The only two exits are explicit resolution through a Q-RESOLVE rule on fresh evidence, and Q-DISMISS. A cap drop is counted and observable (open count, the render's `+N more`, the age memory); it is never silently marked resolved. |
 
 **Why the linkage change exists (#135).** Under ADR-60 concurrent work, unrelated
 parallel tasks settle constantly, so the old "any later settled decision resolves
@@ -586,17 +639,21 @@ the failing dispatch's journal decision and its first expected artifact. So:
   unlinked diagnosis renders no `decision_id`/`artifact_path` key at all.
 
 **Known consequence of the residual UNLINKABLE set.** An unlinkable question has
-no settle route, so its age grows without bound and it holds its slot in the
-12-slot `MAX_OPEN_QUESTIONS` cap — and the cap ranks by kind then **longest
-standing first**, so a permanently unlinkable `OpenProblem` outranks newer
-lower-priority questions rather than being evicted. The consultation request is
-the only nudge it can ever receive, and that nudge is **raised once per
-dispatch decision loop**: once raised, the id is recorded and the pick advances
-to the next aged question, so a still-aged unlinkable question goes **silent**
-for the rest of that loop — visible in the projection (it is rendered and
-counted), but no longer re-requested. A later dispatch session starts a fresh
-set and may raise it again. Whether the Coordinator needs an explicit *dismissal*
-for such a question is undecided (open question 2).
+no settle route, so it never closes by rule: while it holds a slot it keeps
+aging, and if the cap drops it, its standing age survives in the bounded
+Q-AGE-MEMORY instead of restarting. It also holds its slot in the 12-slot
+`MAX_OPEN_QUESTIONS` cap — and the cap ranks by kind then **longest standing
+first**, so a permanently unlinkable `OpenProblem` outranks newer lower-priority
+questions rather than being evicted. The consultation request is the only nudge
+it can ever receive, and that nudge is **raised once per dispatch decision loop**:
+once raised, the id is recorded and the pick advances to the next aged question,
+so a still-aged unlinkable question goes **silent** for the rest of that loop —
+visible in the projection (it is rendered and counted, and its id is named even
+when the render cuts the entry to `+N more`), but no longer re-requested. A later
+dispatch session starts a fresh set and may raise it again. The second exit is
+now explicit rather than undecided: the Coordinator can name such a question and
+dismiss it through `dismiss_question` (Q-DISMISS), which is the only way a
+standing question leaves the ledger without fresh evidence.
 
 ### Consultation nudge (#135 starvation fix)
 
@@ -609,7 +666,9 @@ most once per dispatch decision loop**, so a burst of standing questions each ge
 a turn instead of the oldest one starving every later trigger. The request
 explicitly does **not** promise resolution: a consultation's findings are advisory
 evidence, and under Q-RESOLVE-LINKED the question closes only when *related*
-settled work lands.
+settled work lands. An unlinkable question has no related work to wait for, so
+its only remaining exit is Q-DISMISS — which is why the render names **every**
+open question id, including the entries the display cap cuts to `+N more`.
 
 ### Grounding is provenance, never promotion
 
@@ -733,17 +792,48 @@ Scope discipline (deliberate):
 - **Unknown event kinds stay silently ignored** — the established log-compat
   convention (older/newer readers treat unknown kinds as opaque), not a defect.
 
+### Checkpoint fail-soft read (merged via PR #178)
+
+Recorded because it is review-pass work on this projection's own persistence.
+An unreadable checkpointed world model — an unknown `FactStatus` variant or a
+malformed `world_model` payload — degrades to an empty, rebuilt model with a
+warning instead of failing resume. Previously it failed the resume and cleared
+the checkpoint, taking the question ledger with it (ADR-65 §7).
+
+### Adjacent review-pass fixes (not projection rules)
+
+Two fixes merged in the same review pass as C-FAIL bear on this ADR without
+being world-model rules, so they are recorded here with their real homes named:
+
+- **Persisted `execution_mode` (#177, migration `036_tasks_execution_mode.sql`).**
+  A task's execution mode now survives a checkpoint instead of being
+  reconstructed on read. The column is nullable TEXT holding the serde JSON of
+  `TaskExecutionMode`; a legacy `NULL` reads back as the default `AnswerOnly`,
+  new writes persist the mode explicitly, and **malformed JSON is an error**.
+  This is §7's own contract — a resume restores recorded state, it never
+  fabricates a default to keep going. Natural home: ADR-76.
+- **Fail-loud `PolicyConfig` action validation (#176).**
+  `PolicyConfig::validate` now runs at the config load seam, so an action string
+  outside `POLICY_ACTIONS` **fails the load** with the rule index, the bad value
+  and the allowed set, instead of being silently mapped to `AutoDeny(Always)`
+  later. The defensive `AutoDeny(Always)` fallback in `to_rules` stays, still
+  fail-closed and still warning: the change is that a typo surfaces at startup
+  rather than as a permanently denied tool at first use. Natural home:
+  `docs/policy-rules.md`.
+
 ### Non-goals (explicit — do not re-propose)
 
 These are recorded to stop the same redesign recurring. A proposal that violates
 one of these is a **new decision requiring a new ADR**, not an implementation
 detail of this one.
 
-1. **No confidence scalars.** Facts carry a discrete `FactStatus`
-   (`Verified` / `Assumed` / `Stale`, plus proposed `Contradicted` — see open
-   question 1) and bounded evidence ids. No float, score, probability, weight,
-   or "how much do we believe this" field. Grounding refs are provenance, never
-   a score (G-NOUPGRADE); pinning is membership, never relevance (see #142).
+1. **No confidence scalars.** Facts carry a discrete `FactStatus` from a closed
+   set of four — `Verified` / `Contradicted` / `Assumed` / `Stale`,
+   `Contradicted` having shipped with #170 — and bounded evidence ids. No float,
+   score, probability, weight, or "how much do we believe this" field. Grounding
+   refs are provenance, never a score (G-NOUPGRADE); the contradiction annotation
+   is a citation of the qualifying observation, never a score; pinning is
+   membership, never relevance (see #142).
 2. **No persistent cross-run claim store.** The projection is rebuilt from
    state the run already holds and is **not** a claims database. The only
    persistence is the checkpointed `WorldModel` (`checkpoint.rs`, additive,
@@ -765,63 +855,72 @@ detail of this one.
    projection (consistent with ADR-65 §1's authorship boundary: only runtime
    code authors facts, only policy code authors decisions).
 
-## Open questions (recorded, **not** settled rules)
+## Question register (all three settled — none left open)
 
-1. **#143 spike — contradiction is recommended, not adopted.** The spike
-   concluded **implement**, tight scope: add `FactStatus::Contradicted` with
-   rule **C-FAIL** (an `Assumed` fact naming path P is contradicted by a later
-   *failed* execution touching P). **Not implemented and not a rule.** Spike
-   findings worth carrying forward:
-   - `FactStatus` **is** persisted — inside the checkpointed `WorldModel`, not
-     in `resource_facts` or the event log (status is derived at build time).
-     This corrects #143's step-0 assumption; a fourth variant therefore touches
+1. **#143 spike — adopted as #170, with two spike follow-ups still open.**
+   The spike concluded **implement**, tight scope: add `FactStatus::Contradicted`
+   with rule **C-FAIL**. That shipped as issue #170 (PR #171), refined by review
+   in #173; the merged contract is F-CFAIL and the "C-FAIL final semantics" block
+   above. The spike's findings that still hold, and are worth carrying forward:
+   - `FactStatus` **is** persisted — inside the checkpointed `WorldModel`, not in
+     `resource_facts` or the event log (status is derived at build time). This
+     corrected #143's step-0 assumption, and a fourth variant therefore touched
      every exhaustive consumer (staleness fold, assumptions filter, render
      counts and per-fact render, checkpoint fixture, module-doc rule list).
    - Failed `ToolExecuted` facts exist in the log (tool, canonical args,
-     `success: false`, `exit code`, paths, attribution) but carry **no error or
+     `success: false`, exit code, paths, attribution) but carry **no error or
      output string** — a contradiction can cite *that* a check failed, not *why*.
-   - Contradiction must **reduce standing, not flip a boolean**: both the claim
-     and the contradicting observation stay visible (a bounded
-     `contradicted_by` annotation, same id hygiene as `grounded_by`); F-SUPERSEDE
-     stays positional, so a later successful write un-contradicts (never
-     sticky); `Contradicted` facts must not feed `assumptions` nor
+     The shipped rule holds that line deliberately: no failure payload text
+     enters the model.
+   - Contradiction **reduced standing rather than flipping a boolean**, in the
+     shipped shape: the claim and the contradicting observation both stay visible
+     (a bounded `contradicted_by` annotation, the same id hygiene as
+     `grounded_by`), F-SUPERSEDE stays positional so a later successful write
+     un-contradicts, and `Contradicted` feeds neither `assumptions` nor
      `artifact_verified_clean`.
-   - Display/truncation precedence: Verified > Contradicted > Assumed > Stale,
-     and contradiction annotations must rank **below** Verified writes so
-     disproof never evicts proof — which interacts with the #142 pinned slots.
-   - Follow-ups raised by the spike, also unimplemented: record a bounded
-     `stderr_tail` on failure payloads (the missing error text is the main
-     evidence gap), and confirm the #142 pinning rank against contradiction.
-2. **#135 open design question — dismissing unlinkable questions.** A question
-   with no linkable resolver can stand indefinitely and compete for the 12-slot
-   `MAX_OPEN_QUESTIONS` cap (Q-RESOLVE-UNLINKABLE), aging without bound and
-   outranking newer lower-priority questions in the cap order; its consultation
-   request is raised once per dispatch loop and then goes silent (see the
-   add-linkage section above). Whether the Coordinator needs an explicit way to
-   dismiss one is **undecided**; if it exists it must be a journaled decision,
-   never a compiled rule (ADR-71). Unresolved as of this addendum.
-
-   **Decided (dismissal branch):** the Coordinator dismisses a standing
-   question by explicit judgment through the journaled `dismiss_question` tool
-   (a settled `DismissQuestion` decision naming the question id with the
-   reason; the entry resolves with the reason and never re-opens — see
-   `crates/orchestrator/src/world_model.rs` Q-DISMISS). Dismissal is terminal:
-   it is never reconsidered; revisit happens via a new signal opening a new
-   question.
-3. **#135 add-linkage half — landed; the residual set is accepted as-is.** The
-   linkage (`FailureDiagnosis.decision_id`/`artifact_path` attached at the
-   `call_specialist` surfaces) has shipped, so `OpenProblem` questions from those
-   surfaces are linkable and resolve through Q-RESOLVE-LINKED. What is *not*
-   settled is whether the residual unlinkable set (graph-execution failures,
-   tool/provider faults) should stay permanently unlinkable or gain a dismissal
-   route — that is open question 2, not a defect in the linkage change.
+   - Display/truncation precedence shipped, but **not** as the spike sketched it.
+     Eviction is `Verified` > `Contradicted` > `Assumed` > `Stale`, so disproof
+     never evicts proof (consistent with #142's pinned slots) — while **render
+     order is deliberately the reverse**, contradicted first, so a disproof
+     never hides behind the verified line it qualifies. The cost is that
+     disproof is put in view ahead of proof.
+   - **Still open from the spike:** recording a bounded `stderr_tail` on failure
+     payloads (the missing error text remains the main evidence gap, and the
+     no-failure-text-into-the-model line must not regress to accommodate it), and
+     confirming the #142 pinning rank against contradiction.
+2. **#135 open design question — decided and landed (#175).** The question was
+   whether the Coordinator needs an explicit way to dismiss a standing question
+   that no rule can resolve, and the constraint was that it must be a journaled
+   decision, never a compiled rule (ADR-71). Answer: **yes** — the
+   `dismiss_question` tool (Q-DISMISS, Q-DISMISS-VALIDITY), with the age
+   side-effects bounded by Q-AGE-MEMORY and the "nothing closes itself"
+   guarantee stated as Q-NO-AUTO-RESOLVE. Dismissal is coordinator judgment that
+   the tool only records: it dispatches no agents and touches no tools, so it
+   applies no policy gate, and it is terminal — never reconsidered, because a
+   revisit is a new signal opening a new question.
+3. **#135 add-linkage residual — settled: stays unlinkable, and is now
+   dismissable.** The linkage (`FailureDiagnosis.decision_id`/`artifact_path`
+   attached at the `call_specialist` surfaces) shipped in #154, so `OpenProblem`
+   questions from those surfaces are born linkable and resolve through
+   Q-RESOLVE-LINKED. The question left open was whether the residual unlinkable
+   set — graph-execution failures, tool/provider faults, consult and investigate
+   failures, i.e. every surface outside `call_specialist` — should stay
+   permanently unlinkable or gain another route. Answer: it **stays unlinkable**
+   (that is the point of #135: no coincidence, no guessed linkage), and the
+   second route is **dismissal**, which landed in #175. So a residual question
+   has exactly two exits and neither is a rule firing on its own: fresh related
+   evidence, or an explicit Coordinator judgment. Registered as closed in
+   `docs/DEFERRED.md`.
 
 ### Provenance
 
 - Issues, by tracker: **Gitea** #56 (world model), #51 (parent). **GitHub** #134
-  (audit parent), #135–#142 (the rules above), #143 (spike, open question 1),
-  #144 (this addendum); merged as PRs #152, #153, #155, #156, #157, #158, #160,
-  #154.
+  (audit parent), #135–#142 (the rules above), #143 (spike, register item 1),
+  #144 (this addendum), #170 (C-FAIL as implemented); merged as PRs #152, #153,
+  #155, #156, #157, #158, #160, #154, #171, #173, #174 (question key), #175
+  (dismissal plus age memory), #176 (`PolicyConfig` action validation), #177
+  (persisted `execution_mode`). Open, not merged: #178 (checkpoint fail-soft
+  read).
 - Source of truth for rule text: module docs of
   `crates/orchestrator/src/world_model.rs`; event-payload accessors in
   `crates/sessions/src/whiteboard.rs`; event-window loading in
@@ -829,6 +928,11 @@ detail of this one.
   consultation-nudge pick in `crates/orchestrator/src/consultation.rs`
   (`consultation_nudge`); diagnosis linkage in
   `crates/orchestrator/src/failure_diagnosis.rs` (`with_linkage`);
-  checkpoint persistence in `crates/orchestrator/src/checkpoint.rs`.
+  dismissal surface in `crates/orchestrator/src/coordinator.rs`
+  (`DISMISS_QUESTION_TOOL`) and `crates/orchestrator/src/decisions.rs`
+  (`DecisionKind::DismissQuestion`); checkpoint persistence in
+  `crates/orchestrator/src/checkpoint.rs`; policy action validation in
+  `crates/config/src/schema.rs` (`PolicyConfig::validate`, `POLICY_ACTIONS`)
+  wired at the load seam in `crates/config/src/lib.rs`.
 - Compose with: ADR-71 (coordinator supremacy — no compiled authority),
   ADR-64 (derived views), ADR-60 D3 (append-only audit log).
