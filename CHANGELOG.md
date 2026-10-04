@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Native editor workspace with session-local file tabs that preserve unsaved
+  buffers, cursor positions and undo history; dirty-tab closure requires an
+  explicit discard decision. Includes a filterable Explorer, breadcrumbs,
+  floating find/replace and completion, a resizable bottom Problems panel,
+  diagnostic navigation and a compact status bar.
+- Selected-file staged review with a unified diff and per-file accept/discard
+  actions. Unsaved edits and changed proposals block a review decision;
+  unrelated staged files are retained. LSP replies are scoped to the originating
+  document revision and cursor.
+
 ### Fixed
 
 - **Coordinator no longer fabricates a missing source.** A rename/move/edit of a
