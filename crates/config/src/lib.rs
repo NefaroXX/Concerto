@@ -247,6 +247,13 @@ fn load_config_layers(
         project_context.validate()?;
     }
 
+    // Validate policy rule actions: an unrecognized `action` must fail load
+    // here, otherwise `PolicyConfig::to_rules` would silently degrade it to a
+    // blanket `AutoDeny(Always)` with no signal (see `POLICY_ACTIONS`).
+    if let Some(policy) = &config.policy {
+        policy.validate()?;
+    }
+
     // ADR-58: resolve the blueprint on EVERY load path — the `[orchestration]`
     // selection when present, the default `standard` blueprint otherwise —
     // and enforce the load-time extension (B4: unknown agent stage tags are
@@ -661,6 +668,45 @@ mod tests {
         )
         .unwrap();
         assert!(load_config(Some(&path), None).is_err());
+    }
+
+    /// A typo'd policy `action` must fail config load — naming the rule index,
+    /// the bad string, and the allowed set — instead of silently becoming a
+    /// blanket `AutoDeny(Always)` in `PolicyConfig::to_rules`.
+    #[test]
+    fn typoed_policy_action_fails_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "schema_version = {SCHEMA_VERSION}\n\
+                 \n\
+                 [[policy.rules]]\n\
+                 action = \"auto_deny\"\n\
+                 condition = {{ always = true }}\n\
+                 \n\
+                 [[policy.rules]]\n\
+                 action = \"autoaprove\"\n\
+                 condition = {{ always = true }}\n"
+            ),
+        )
+        .unwrap();
+
+        let err =
+            load_config(Some(&path), None).expect_err("a typo'd action must fail config load");
+        let text = format!("{err}");
+        assert!(
+            text.contains("policy.rules[1]"),
+            "error must name the rule index (the bad rule is second), got: {text}"
+        );
+        assert!(text.contains("autoaprove"), "error must name the bad action string, got: {text}");
+        for allowed in crate::schema::POLICY_ACTIONS {
+            assert!(
+                text.contains(allowed),
+                "error must list allowed action '{allowed}', got: {text}"
+            );
+        }
     }
 
     #[test]

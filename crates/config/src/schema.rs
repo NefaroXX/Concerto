@@ -1358,14 +1358,52 @@ pub enum ConditionDef {
     Always { always: bool },
 }
 
+/// Action strings accepted in a `[[policy.rules]]` entry.
+///
+/// Single source of truth for load-time validation ([`PolicyConfig::validate`])
+/// and conversion ([`PolicyConfig::to_rules`]): an unrecognized action must
+/// fail config load rather than silently degrade to a blanket deny.
+///
+/// Keep in sync with the `match` in [`PolicyConfig::to_rules`] — every entry
+/// here must map to a real `PolicyRule` variant (the
+/// `all_valid_policy_actions_map_as_before` test enforces that direction).
+pub const POLICY_ACTIONS: [&str; 6] = [
+    "auto_approve",
+    "auto_deny",
+    "require_approval",
+    "require_managed_tool_approval",
+    "require_toolchain_approval",
+    "deny_network_egress",
+];
+
 impl PolicyConfig {
+    /// Validate rule actions at config load time.
+    ///
+    /// Every `action` must be one of [`POLICY_ACTIONS`]. Without this check a
+    /// typo (e.g. `"autoaprove"`) would silently become
+    /// `PolicyRule::AutoDeny(Condition::Always)` in [`Self::to_rules`] — a
+    /// blanket deny with no signal to the user.
+    pub fn validate(&self) -> Result<(), crate::ConfigError> {
+        for (index, rule) in self.rules.iter().enumerate() {
+            if !POLICY_ACTIONS.contains(&rule.action.as_str()) {
+                return Err(crate::ConfigError::InvalidValue(format!(
+                    "policy.rules[{index}]: unrecognized action '{}' — allowed actions: {}",
+                    rule.action,
+                    POLICY_ACTIONS.join(", ")
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Convert config definitions to `concerto_core` `PolicyRule` enums.
     pub fn to_rules(&self) -> Vec<concerto_core::types::PolicyRule> {
         use concerto_core::types::{Condition, PolicyRule};
 
         self.rules
             .iter()
-            .map(|def| {
+            .enumerate()
+            .map(|(index, def)| {
                 let condition = def.condition.to_condition();
                 match def.action.as_str() {
                     "auto_approve" => PolicyRule::AutoApprove(condition),
@@ -1376,7 +1414,20 @@ impl PolicyConfig {
                     }
                     "require_toolchain_approval" => PolicyRule::RequireToolchainApproval(condition),
                     "deny_network_egress" => PolicyRule::DenyNetworkEgress(condition),
-                    _ => PolicyRule::AutoDeny(Condition::Always),
+                    // Defensive only: `PolicyConfig::validate` rejects unknown
+                    // actions at config load, so this arm is unreachable for
+                    // loaded configs. Keep the historical blanket-deny outcome
+                    // (fail closed) but make it observable.
+                    _ => {
+                        tracing::warn!(
+                            rule_index = index,
+                            action = %def.action,
+                            allowed = %POLICY_ACTIONS.join(", "),
+                            "unrecognized policy rule action; defaulting rule to \
+                             AutoDeny(Always) — config load should have rejected it"
+                        );
+                        PolicyRule::AutoDeny(Condition::Always)
+                    }
                 }
             })
             .collect()
@@ -3880,6 +3931,52 @@ mod tests {
                 concerto_core::types::Condition::ToolNamePrefix("mcp:".into())
             )]
         );
+    }
+
+    /// Load-time validation and `to_rules` must stay in lockstep: every action
+    /// in `POLICY_ACTIONS` still validates AND maps to the same `PolicyRule`
+    /// variant it always did (the arm table below is the pinned contract; a
+    /// const entry with no matching `to_rules` arm falls through to the
+    /// defensive `AutoDeny(Always)` and fails here).
+    #[test]
+    fn all_valid_policy_actions_map_as_before() {
+        use concerto_core::types::{Condition, PolicyRule};
+
+        for action in POLICY_ACTIONS {
+            let config = PolicyConfig {
+                rules: vec![PolicyRuleDef {
+                    action: action.to_string(),
+                    condition: ConditionDef::Always { always: true },
+                }],
+                time_window: None,
+                approval_timeout_secs: None,
+            };
+
+            assert!(
+                config.validate().is_ok(),
+                "action '{action}' from POLICY_ACTIONS must pass validation"
+            );
+
+            let expected = match action {
+                "auto_approve" => PolicyRule::AutoApprove(Condition::Always),
+                "auto_deny" => PolicyRule::AutoDeny(Condition::Always),
+                "require_approval" => PolicyRule::RequireApproval(Condition::Always),
+                "require_managed_tool_approval" => {
+                    PolicyRule::RequireManagedToolApproval(Condition::Always)
+                }
+                "require_toolchain_approval" => {
+                    PolicyRule::RequireToolchainApproval(Condition::Always)
+                }
+                "deny_network_egress" => PolicyRule::DenyNetworkEgress(Condition::Always),
+                other => panic!("POLICY_ACTIONS entry '{other}' has no mapping test arm"),
+            };
+
+            assert_eq!(
+                config.to_rules(),
+                vec![expected],
+                "action '{action}' must keep its historical PolicyRule mapping"
+            );
+        }
     }
 
     // ------------------------------------------------------------------
