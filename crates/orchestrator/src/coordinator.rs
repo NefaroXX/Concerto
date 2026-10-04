@@ -10286,23 +10286,32 @@ impl CoordinatorAgent {
         }
 
         // ── ADR-60 D7 (interrupt-safe resume, 2026-09-05): zero-work guard ─
-        // An action-required (build-classified) run that reaches the success
-        // exit with ZERO executed tool calls never performed the work it
-        // reports completing: subtasks were dispatched, every one answered in
-        // prose, and no tool ever ran — the live F1 acceptance failure (a
-        // "build" prompt produced a "completed" message with zero tool work
-        // past the single-agent and zero-file guards). Run-level mirror of
-        // the single-agent loop's zero-tool guard, evaluated where the whole
-        // run's tool count is known:
+        // A run that reaches the success exit with ZERO executed tool calls
+        // never performed the work it reports completing: subtasks were
+        // dispatched, every one answered in prose, and no tool ever ran — the
+        // live F1 acceptance failure (a "build" prompt produced a "completed"
+        // message with zero tool work past the single-agent and zero-file
+        // guards). Run-level mirror of the single-agent loop's zero-tool
+        // guard, evaluated where the whole run's tool count is known:
         // - fully resolver-served runs are exempt — no subtask was
         //   dispatched (the work was proven done from the timeline);
         // - checkpoint-resumed runs keep the checkpoint's own tool count, so
         //   only a run with genuinely zero tool work trips;
-        // - answer-only root tasks are out of scope by construction.
+        // - the arming predicate is the combined [`Self::dispatch_guard_arms`]
+        //   — ActionRequired mode OR open execution work OR a promised-but-
+        //   unattempted plan — the same predicate the vacuous-completion
+        //   guard above uses, so a `CoordinatorDecides` run holding a
+        //   declared/dispatched Implement obligation is caught exactly like
+        //   an `ActionRequired` one. Prose-exempt roots stay exempt by
+        //   construction: AnswerOnly and conversational `CoordinatorDecides`
+        //   turns arm neither source (no mode, no open work, no plan).
         // The note downgrades the exit to Partial, and the stall gate below
         // keeps the checkpoint resumable for a later resume.
         let dispatched_subtasks = action_ledger.iter().any(|action| action.kind == "dispatched");
-        if requires_mandatory_dispatch(&task) && dispatched_subtasks && total_tool_calls == 0 {
+        if self.dispatch_guard_arms(&task, &graph, &all_files)
+            && dispatched_subtasks
+            && total_tool_calls == 0
+        {
             recoverable_notes.push(
                 "Zero-work guard: the task required tool work but zero tool calls executed \
                  across the run; the completion claim was not backed by any executed tool."
@@ -21169,6 +21178,163 @@ mod tests {
         assert!(
             output.checkpoint_json.is_some(),
             "a Partial run preserves its checkpoint for resume"
+        );
+    }
+
+    /// Completion-tail zero-work guard: a `CoordinatorDecides` run holding a
+    /// DECLARED Implement obligation (open execution work) that dispatches a
+    /// prose-only subtask and executes ZERO tool calls is reported Partial
+    /// with the run-level zero-work note. The guard predicate is the combined
+    /// [`Self::dispatch_guard_arms`], so the open obligation arms it exactly
+    /// like `ActionRequired` mode does. The dispatched role is deliberately
+    /// research-stage: the per-subtask zero-work guard only covers
+    /// implement-stage calls, so this run reaches the tail with nothing but
+    /// the run-level guard to catch it — the route this regression pins.
+    #[tokio::test]
+    async fn coordinator_decides_declared_implement_prose_only_run_reports_zero_work_guard() {
+        let bus = EventBus::new(256);
+        let mocks = vec![
+            MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented"),
+            MockExpertAgent::always_succeed(AgentId::new("researcher"), "found"),
+        ];
+        let mut coordinator = coordinator_for_ladder(
+            bus.clone(),
+            mocks,
+            concerto_config::ModelPinConfig::default(),
+            Arc::new(MockProvider::default()),
+        );
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let task = AgentTask::new_coordinator_decides(session_id, "fix the bug and explain");
+        // Declare the Implement obligation through the real handler: the
+        // graph gains a `Declared` (Outstanding) implement-stage node that
+        // arms `dispatch_guard_arms` in ANY execution mode.
+        let mut graph = TaskGraph::new();
+        let mut declared_ledger = DispatchLedger::default();
+        let mut scope = coordinator.fresh_checkpoint_scope(&task, &context);
+        coordinator
+            .handle_declare_obligations(
+                &mut graph,
+                &task,
+                &context,
+                &CancellationToken::new(),
+                &mut scope,
+                &mut declared_ledger,
+                &serde_json::json!({
+                    "obligations": [{ "agent_id": "coder", "task": "fix the bug" }],
+                }),
+            )
+            .await;
+        assert!(coordinator.dispatch_guard_arms(&task, &graph, &[]));
+        // The prose-only subtask the dispatch loop settles without a single
+        // tool call: research-stage, so the per-call guard skips it and the
+        // run-level guard is the only one that can name the omission.
+        graph.add_root(SubTask::new(session_id, AgentId::new("researcher"), "explain the cause"));
+
+        let (output, _notes) = coordinator
+            .execute_graph(
+                task,
+                context,
+                CancellationToken::new(),
+                graph,
+                HashMap::new(), // completed_results
+                0.0,            // total_cost
+                0,              // total_tool_calls
+                vec![],         // all_files
+                vec![],         // provider_metrics
+                HashMap::new(), // subtask_attempts
+                HashMap::new(), // retry_feedback
+                HashMap::new(), // model_assignments
+                Vec::new(),     // action_ledger
+                "fix the bug and explain".to_string(),
+                blake3::hash("fix the bug and explain".as_bytes()).to_hex().to_string(),
+                Vec::new(), // loop_notes
+                None,       // requested_user_input
+                None,       // pending_approval
+                None,       // dispatch_direct_answer
+            )
+            .await
+            .expect("execute_graph returns");
+
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "declared implement + prose-only dispatch + zero tool calls must not claim \
+             completion, got: {:?} — {}",
+            output.completion_status,
+            output.final_message
+        );
+        assert!(
+            output.final_message.contains("Zero-work guard"),
+            "the run-level zero-work guard names the omission, got: {}",
+            output.final_message
+        );
+        assert!(
+            output.tool_call_count == 0,
+            "the scenario is zero-tool by construction, got {}",
+            output.tool_call_count
+        );
+        assert!(
+            output.checkpoint_json.is_some(),
+            "a Partial run preserves its checkpoint for resume"
+        );
+    }
+
+    /// Negative control for the completion-tail zero-work guard: a pure
+    /// conversational `CoordinatorDecides` turn — empty graph, nothing
+    /// dispatched, no plan, no obligations — still exits Completed. The
+    /// combined `dispatch_guard_arms` stays disarmed for it, so widening the
+    /// guard from the mode predicate to the combined predicate changes
+    /// nothing here.
+    #[tokio::test]
+    async fn coordinator_decides_conversational_turn_completes_without_zero_work_guard() {
+        let bus = EventBus::new(256);
+        let mocks = vec![MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")];
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(mocks)),
+            vec![CoordinatorTurn::Text("Hello! How can I help?".into())],
+        );
+        let mut rx = bus.subscribe();
+        let session_id = Ulid::new();
+        let project_dir = tempfile::tempdir().expect("tempdir for test workspace");
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            project_dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_coordinator_decides(session_id, "Hi there"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("run should succeed");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.kind.clone());
+        }
+
+        assert!(
+            !events.iter().any(|kind| matches!(kind, EventKind::SubTaskStarted { .. })),
+            "a conversational turn dispatches nothing: {events:?}"
+        );
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed,
+            "a conversational turn stays Completed, got: {:?} — {}",
+            output.completion_status,
+            output.final_message
+        );
+        assert!(
+            !output.final_message.contains("Zero-work guard"),
+            "nothing was dispatched, so the zero-work guard must stay silent, got: {}",
+            output.final_message
         );
     }
 
