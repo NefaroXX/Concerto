@@ -936,3 +936,32 @@ detail of this one.
   wired at the load seam in `crates/config/src/lib.rs`.
 - Compose with: ADR-71 (coordinator supremacy — no compiled authority),
   ADR-64 (derived views), ADR-60 D3 (append-only audit log).
+
+## Addendum (2026-10-04): Resync with dev (W1–W5)
+
+**Status reference:** reconciled against dev `843c4b8` (Merge PR #187, current HEAD of `origin/dev` at reconciliation).
+
+### W1 — C-FAIL counter-evidence (tri-state, failed only)
+- Counter-evidence for `FactStatus::Contradicted` is produced only when a `ToolExecuted` outcome is `failed` (`success: false`). The contradiction pass scans failed tool executions from the event window and marks only `Assumed` claims with path overlap (C-FAIL). No outcome text is promoted to the model. ([`world_model.rs:783`](crates/orchestrator/src/world_model.rs#L783), [`world_model.rs:1588-1620`](crates/orchestrator/src/world_model.rs#L1588-L1620), [`world_model.rs:2922-2950`](crates/orchestrator/src/world_model.rs#L2922-L2950))
+- **stderr non-goal + WHY:** failure payload text (stderr, error string, tool output) is not stored or promoted into the model. Rationale: no redaction facility for arbitrary stderr, storing full stderr in the persistent store/transcript is a leakage surface, and the transcript already contains output; contradiction cites the failed execution by id/paths/exit code, not free-form text. ([`world_model.rs:57`](crates/orchestrator/src/world_model.rs#L57), [`world_model.rs:678-686`](crates/orchestrator/src/world_model.rs#L678-L686), [`world_model.rs:2934-2949`](crates/orchestrator/src/world_model.rs#L2934-L2949))
+
+### W2 — Dismissal evidence/kind rules
+- Dismissal is a Coordinator-only journaled decision (`DecisionKind::DismissQuestion`) via `dismiss_question` tool; resolved questions store `dismiss_reason` and are never re-opened. ([`coordinator.rs:152`](crates/orchestrator/src/coordinator.rs#L152), [`decisions.rs:137`](crates/orchestrator/src/decisions.rs#L137), [`world_model.rs:2285`](crates/orchestrator/src/world_model.rs#L2285))
+- Evidence/kind constraints: dismissal cites a real question id with a reason. Age memory (`MAX_AGE_MEMORY = 12`) preserves standing age when questions are dropped from cap and does not auto-resolve by age/cap pressure (Q-NO-AUTO-RESOLVE). Standing entries keep their first `opened_gate_seq` coordinate; new discoveries resume from remembered age. ([`world_model.rs:210-235`](crates/orchestrator/src/world_model.rs#L210-L235), [`world_model.rs:2809-2865`](crates/orchestrator/src/world_model.rs#L2809-L2865), [`world_model.rs:2872-2945`](crates/orchestrator/src/world_model.rs#L2872-L2945))
+- Kind limits: questions keyed by `question_key(kind, subject)`; open questions increment `cycles_open`, resolved entries stay resolved; dismissal is the explicit exit. ([`world_model.rs:2952-3045`](crates/orchestrator/src/world_model.rs#L2952-L3045), [`world_model.rs:1175-1190`](crates/orchestrator/src/world_model.rs#L1175-L1190))
+
+### W3 — Pinned-tier precedence
+- Pinned reserve: up to `MAX_PINNED_FACTS` slots reserved for facts whose artifact is in `pinned_paths` (active expected artifacts of non-terminal decisions + blocks of open questions). Inside reserve, order is status-first by pinned rank: `Contradicted` > `Verified` > `Assumed` > `Stale`, then newest-first; pinned tier truncates to cap. ([`world_model.rs:1136-1168`](crates/orchestrator/src/world_model.rs#L1136-L1168), [`world_model.rs:328-335`](crates/orchestrator/src/world_model.rs#L328-L335), [`world_model.rs:1113-1134`](crates/orchestrator/src/world_model.rs#L1113-L1134))
+- Outside pinned tier (fill), `Verified` outranks `Contradicted` in selection so proof is not evicted by disproof; render order is the reverse (contradicted lines render first). ([`world_model.rs:1169-1188`](crates/orchestrator/src/world_model.rs#L1169-L1188), [`world_model.rs:544-557`](crates/orchestrator/src/world_model.rs#L544-L557))
+
+### W4 — Zero-work guard arming
+- Per-call zero-work guard flags `Success` with zero tool executions and no artifacts/files modified; recorded as coordinator note/agent-thought in ledger when on implement-stage call. ([`coordinator.rs:13730-13800`](crates/orchestrator/src/coordinator.rs#L13730-L13800), [`coordinator.rs:20442-20450`](crates/orchestrator/src/coordinator.rs#L20442-L20450))
+- Combined dispatch-guard arming is three-arm: `TaskExecutionMode::CoordinatorDecides` OR open graph obligations (outstanding/blocked/failed) OR promised plan exists without executable code work yet. ([`coordinator.rs:5377-5425`](crates/orchestrator/src/coordinator.rs#L5377-L5425), [`coordinator.rs:5384-5420`](crates/orchestrator/src/coordinator.rs#L5384-L5420))
+
+### W5 — Obligations cleanup
+- Dead types removed: `ExecutionPolicy`, `TurnDisposition`, `CompletionEvidence`, `ObligationLedger::note_conversational_turn`, `ObligationLedger::add_follow_up` (commit `439d2a9`).
+- Evidence never prose: `sync_from_graph` no longer copies `SubTask::deliverable` into obligation evidence; only validated `Complete` transition records evidence; synced obligations start with empty evidence set. (per `439d2a9`, regression `e21_synced_completed_prose_only_subtask_has_empty_evidence`.)
+- Residual: coordinator work never declared/graphed in `CoordinatorDecides` is indistinguishable from conversation (ADR-71/76); guarantee applies only to declared/graphed work.
+
+### Scoping/design (merged)
+- Question-key scoping and explicit dismissal design as above (Q-NO-AUTO-RESOLVE; dismissal never re-opens).
