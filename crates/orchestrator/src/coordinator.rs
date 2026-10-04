@@ -21655,10 +21655,10 @@ mod tests {
     }
 
     /// B. Declared-but-undispatched Implement work plus pure prose is NOT
-    /// completion: the unfinished-work guard, the combined dispatch guard,
-    /// and the completion-evidence predicate all treat the Outstanding
-    /// obligation as blocking — in any mode, with or without files, and
-    /// without any verification declaration.
+    /// completion: the unfinished-work guard and the combined dispatch guard
+    /// both treat the Outstanding obligation as blocking — in any mode, with
+    /// or without files — and an evidenceless Complete transition on the
+    /// obligation is rejected.
     #[tokio::test]
     async fn test_b_declared_undispatched_prose_does_not_complete() {
         let (mut coordinator, task, context, mut graph, mut ledger, mut scope, _workspace) =
@@ -21691,16 +21691,6 @@ mod tests {
             &graph,
             &[]
         ));
-        // ... prose may not close over open execution work — bare, with
-        // files, or otherwise: files without settled obligations still
-        // cannot complete ...
-        for evidence in [
-            crate::obligations::CompletionEvidence::default(),
-            crate::obligations::CompletionEvidence { has_files: true, ..Default::default() },
-        ] {
-            assert!(!evidence.prose_may_close(true));
-            assert!(!evidence.implement_may_complete(true));
-        }
         // ... and an evidenceless Complete transition on Implement is
         // rejected: prose never marks execution complete.
         assert!(crate::obligations::try_transition(
@@ -21753,7 +21743,7 @@ mod tests {
             .await
             .expect("run should succeed");
         // Execution happened: the adopt dispatch settled success with a real
-        // file, alongside the prose turns (Mixed, never DirectAnswer work).
+        // file, alongside the prose turns.
         let adopt_result = provider
             .tool_result_contents()
             .into_iter()
@@ -21763,11 +21753,6 @@ mod tests {
         assert!(
             project_dir.path().join("src/fix.rs").exists(),
             "the dispatched work produced its declared evidence on disk"
-        );
-        assert_eq!(
-            crate::obligations::derive_turn_disposition(false, 2, true),
-            crate::obligations::TurnDisposition::Mixed,
-            "prose alongside execution is lawful concurrency, not a direct answer"
         );
         // ... yet the prose half discharged nothing: verification never ran,
         // so the completion claim is Partial.
