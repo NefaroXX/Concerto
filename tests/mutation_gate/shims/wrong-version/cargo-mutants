@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+#
+# [simulated] Setup-edge shim for the Q03 wrong-pin contract case.
+#
+# Presents a cargo-mutants that does NOT satisfy the pinned 27.1.0 version,
+# so the runner must reject it with setup_error / version_mismatch instead of
+# silently proceeding. This fake exists only to exercise the version-pin edge;
+# it never replaces the real cargo-mutants 27.1.0 caught/missed evidence.
+set -euo pipefail
+
+case " $* " in
+    *" --version "*)
+        printf 'cargo-mutants 26.0.0\n'
+        exit 0
+        ;;
+esac
+printf '[simulated] wrong-version shim: unexpected invocation: %s\n' "$*" >&2
+exit 97
