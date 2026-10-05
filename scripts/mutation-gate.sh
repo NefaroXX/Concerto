@@ -380,6 +380,9 @@ prepare_scratch_dir() {
     # Keep every tool build tree on the (disk-backed) scratch directory.
     TMPDIR="$SCRATCH_DIR/tmp"
     export TMPDIR
+    # An inherited CARGO_TARGET_DIR would redirect every tool build tree out of
+    # this isolation; the contract harness unsets it, production callers may not.
+    unset CARGO_TARGET_DIR 2>/dev/null || true
 }
 
 # The worktree must match HEAD: file existence checks below rely on it, and a
@@ -696,7 +699,9 @@ run_child() {
             log "budget of ${BUDGET_SECONDS}s exceeded; terminating the tool run"
             terminate_child TERM
         fi
-        sleep 1
+        # Sub-second poll: a 1s sleep here pushed every budget kill one full
+        # second past the deadline (and the post-kill recheck another second).
+        sleep 0.1
     done
     wait "$pid" || rc=$?
     CHILD_PID=""
