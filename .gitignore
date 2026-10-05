@@ -66,3 +66,6 @@ AGENTS.md
 
 # Local-only agent skill (my own working notes; not shared).
 /.opencode/skills/concerto-maintainer/
+
+# Local OpenCode state (per-machine skills, sessions, credentials; not shared).
+/.opencode/
