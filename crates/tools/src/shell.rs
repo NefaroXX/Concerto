@@ -2057,8 +2057,12 @@ mod tests {
         let tool = test_tool();
 
         // cwd not specified — should default to project_dir
+        // On Windows the shell is MSYS Git-Bash, whose bare `pwd` prints its
+        // own `/tmp`-mounted spelling that no normalization can map back;
+        // `pwd -W` reports the Win32 form instead.
+        let command = if cfg!(windows) { "pwd -W" } else { "pwd" };
         let input = json!({
-            "command": "pwd",
+            "command": command,
             "args": []
         });
 
