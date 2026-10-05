@@ -1502,7 +1502,7 @@ mod tests {
         let allowlist = vec![
             Regex::new(r"^echo( .*)?$").unwrap(),
             Regex::new(r"^sleep( .*)?$").unwrap(),
-            Regex::new(r"^pwd$").unwrap(),
+            Regex::new(r"^pwd( -W)?$").unwrap(),
         ];
         ShellTool::with_config(ShellConfig {
             allowlist,
