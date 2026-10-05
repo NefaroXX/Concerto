@@ -55,13 +55,6 @@ concerto-sessions-2026-07-13.csv
 # deepwork session state (local only, not versioned)
 .slim/deepwork/
 
-# Agent instruction files (local only). These are per-machine guidance for
-# coding agents working in this tree, not project source: they are rewritten
-# constantly, carry local paths and session context, and are not part of the
-# shipped program. The product feature that *reads* a project's AGENTS.md is
-# unaffected — see docs/adrs/ADR-70-project-agents-md-context-injection.md.
-AGENTS.md
-
 # Private research — not for public until ready
 
 # Local-only agent skill (my own working notes; not shared).
