@@ -2060,10 +2060,11 @@ mod tests {
         // On Windows the shell is MSYS Git-Bash, whose bare `pwd` prints its
         // own `/tmp`-mounted spelling that no normalization can map back;
         // `pwd -W` reports the Win32 form instead.
-        let command = if cfg!(windows) { "pwd -W" } else { "pwd" };
+        let (command, args): (&str, &[&str]) =
+            if cfg!(windows) { ("pwd", &["-W"]) } else { ("pwd", &[]) };
         let input = json!({
             "command": command,
-            "args": []
+            "args": args
         });
 
         let result = tool.execute(input, &policy, &session, cancel).await;
