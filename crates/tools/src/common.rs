@@ -332,9 +332,14 @@ mod tests {
     use super::*;
     use std::fs;
 
-    /// Creates a fresh, unique temp root and returns its path.
+    /// Creates a fresh, unique temp root and returns its **canonical** path.
     /// Each call returns a different directory so parallel tests don't race
     /// on `create_dir_all` / `remove_dir_all`.
+    ///
+    /// The root is canonicalized once, here, so every assertion compares
+    /// canonical-to-canonical: `resolve_path` returns canonical paths by
+    /// contract, while `TMPDIR` on macOS is a symlinked `/var/folders` →
+    /// `/private/var/folders`.
     fn temp_root() -> Utf8PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -344,7 +349,8 @@ mod tests {
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = fs::create_dir_all(&base);
-        Utf8PathBuf::from_path_buf(base).expect("temp root is valid UTF-8")
+        let base = Utf8PathBuf::from_path_buf(base).expect("temp root is valid UTF-8");
+        base.canonicalize_utf8().expect("temp root canonicalizes")
     }
 
     #[test]

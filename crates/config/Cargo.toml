@@ -26,5 +26,5 @@ chrono-tz = { workspace = true }
 blake3 = { workspace = true }
 camino = { workspace = true }
 
-[dev-dependencies]
+fd-lock = { workspace = true }
 tempfile = "3"

@@ -18,6 +18,18 @@ use concerto_tools::shell_backend::ShellProfileFactory;
 use thiserror::Error;
 use tokio::process::Command;
 
+/// Governed process execution supplied by the application's tool executor.
+#[async_trait::async_trait]
+pub trait EvalProcessExecutor: Send + Sync {
+    async fn execute(
+        &self,
+        program: &str,
+        args: &[&str],
+        cwd: &Path,
+        cancel: CancellationToken,
+    ) -> Result<concerto_core::types::ToolOutput, EvalError>;
+}
+
 pub mod categories;
 pub mod persona_mem;
 pub mod runner;
@@ -47,10 +59,12 @@ pub enum EvalError {
 // EvalEngine
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct EvalEngine {
     project_dir: PathBuf,
     timeout: Duration,
     shell_profile: Option<ShellProfileConfig>,
+    process_executor: Option<std::sync::Arc<dyn EvalProcessExecutor>>,
 }
 
 impl EvalEngine {
@@ -62,12 +76,27 @@ impl EvalEngine {
             project_dir: project_dir.into(),
             timeout: Duration::from_secs(300),
             shell_profile: None,
+            process_executor: None,
         }
     }
 
     /// Create a new eval engine with a custom timeout.
     pub fn with_timeout(project_dir: impl Into<PathBuf>, timeout: Duration) -> Self {
-        Self { project_dir: project_dir.into(), timeout, shell_profile: None }
+        Self {
+            project_dir: project_dir.into(),
+            timeout,
+            shell_profile: None,
+            process_executor: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_process_executor(
+        mut self,
+        executor: std::sync::Arc<dyn EvalProcessExecutor>,
+    ) -> Self {
+        self.process_executor = Some(executor);
+        self
     }
 
     /// Run validation commands through a configured build/validation profile.
@@ -191,6 +220,43 @@ impl EvalEngine {
             }
             _ => "unknown",
         };
+        if let Some(executor) = &self.process_executor {
+            let execution_cancel = cancel.child_token();
+            let execution = executor.execute(cmd, args, project_dir, execution_cancel.clone());
+            tokio::pin!(execution);
+            let output = tokio::select! {
+                result = &mut execution => result?,
+                _ = tokio::time::sleep(self.timeout) => {
+                    execution_cancel.cancel();
+                    let _ = execution.await;
+                    return Err(EvalError::Timeout(self.timeout));
+                }
+            };
+            let exit_code = output
+                .data
+                .get("exit_code")
+                .and_then(serde_json::Value::as_i64)
+                .and_then(|code| i32::try_from(code).ok())
+                .ok_or_else(|| {
+                    EvalError::TestRunnerFailed("native executor returned no exit code".into())
+                })?;
+            let combined = format!(
+                "{}{}",
+                output.data.get("stdout").and_then(serde_json::Value::as_str).unwrap_or_default(),
+                output.data.get("stderr").and_then(serde_json::Value::as_str).unwrap_or_default(),
+            );
+            let output_tail =
+                combined.chars().rev().take(2000).collect::<String>().chars().rev().collect();
+            return Ok(EvalResult {
+                runner,
+                exit_code,
+                passed: exit_code == 0,
+                duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                output_tail,
+                coverage: None,
+                provenance: EvalProvenance::Harness,
+            });
+        }
         let mut command = if let Some(profile) = &self.shell_profile {
             let backend = ShellProfileFactory::backend_for(profile);
             backend.check_available(profile).map_err(|error| {
@@ -509,6 +575,9 @@ impl EvalEngine {
         &self,
         _cancel: CancellationToken,
     ) -> Result<concerto_core::types::CoverageInfo, EvalError> {
+        if self.process_executor.is_some() {
+            return Err(EvalError::HarnessSetupFailed("native coverage execution is not implemented; run coverage through the governed shell tool".into()));
+        }
         let tool = Self::detect_coverage_tool().ok_or_else(|| {
             EvalError::HarnessSetupFailed(
                 "no coverage tool found — install cargo-llvm-cov or cargo-tarpaulin".into(),
@@ -580,6 +649,9 @@ impl EvalEngine {
         &self,
         cancel: CancellationToken,
     ) -> Result<concerto_core::types::EvalResult, EvalError> {
+        if self.process_executor.is_some() {
+            return Err(EvalError::HarnessSetupFailed("native coverage execution is not implemented; run coverage through the governed shell tool".into()));
+        }
         let start = std::time::Instant::now();
         let tool = Self::detect_coverage_tool()
             .ok_or_else(|| EvalError::HarnessSetupFailed("no coverage tool found".into()))?;
@@ -760,6 +832,84 @@ impl EvalEngine {
 mod tests {
     use super::*;
     use concerto_config::ShellBackendType;
+
+    struct GovernedExecutor {
+        deny: bool,
+        wait_for_cancel: bool,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl EvalProcessExecutor for GovernedExecutor {
+        async fn execute(
+            &self,
+            program: &str,
+            args: &[&str],
+            _cwd: &Path,
+            cancel: CancellationToken,
+        ) -> Result<concerto_core::types::ToolOutput, EvalError> {
+            use std::sync::atomic::Ordering;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(program, "cargo");
+            assert_eq!(args, &["test"]);
+            if self.wait_for_cancel {
+                cancel.cancelled().await;
+                return Err(EvalError::Cancelled);
+            }
+            if self.deny {
+                return Err(EvalError::TestRunnerFailed("policy denied".into()));
+            }
+            Ok(concerto_core::types::ToolOutput {
+                summary: "validated".into(),
+                data: serde_json::json!({"exit_code":0,"stdout":"🙂".repeat(2100),"stderr":""}),
+            })
+        }
+    }
+
+    // verifies: governed validation uses explicit argv, keeps Unicode tails intact, and propagates denials.
+    #[tokio::test]
+    async fn validation_uses_governed_process_executor() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let directory = tempfile::tempdir().expect("project");
+        std::fs::write(directory.path().join("Cargo.toml"), "[package]").expect("manifest");
+        for deny in [false, true] {
+            let calls = std::sync::Arc::new(AtomicUsize::new(0));
+            let engine = EvalEngine::new(directory.path())
+                .with_shell_profile(ShellProfileConfig {
+                    executable: "unavailable-system-shell".into(),
+                    ..Default::default()
+                })
+                .with_process_executor(std::sync::Arc::new(GovernedExecutor {
+                    deny,
+                    wait_for_cancel: false,
+                    calls: calls.clone(),
+                }));
+            let result = engine.run(CancellationToken::new()).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            if deny {
+                assert!(result.is_err());
+            } else {
+                let result = result.expect("validation");
+                assert!(result.passed);
+                assert_eq!(result.output_tail.chars().count(), 2000);
+            }
+            assert!(engine.run_with_coverage(CancellationToken::new()).await.is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "coverage must not bypass the gate");
+        }
+    }
+
+    // verifies: an eval deadline cancels and awaits backend cleanup instead of abandoning the process future.
+    #[tokio::test(start_paused = true)]
+    async fn governed_validation_timeout_cancels_backend() {
+        let directory = tempfile::tempdir().expect("project");
+        std::fs::write(directory.path().join("Cargo.toml"), "[package]").expect("manifest");
+        let engine = EvalEngine::with_timeout(directory.path(), Duration::from_secs(1))
+            .with_process_executor(std::sync::Arc::new(GovernedExecutor {
+                deny: false,
+                wait_for_cancel: true,
+                calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }));
+        assert!(matches!(engine.run(CancellationToken::new()).await, Err(EvalError::Timeout(_))));
+    }
 
     #[test]
     fn detect_runner_cargo() {

@@ -9,6 +9,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+concerto-shell = { path = "../shell", version = "0.1.0" }
 concerto-core = { path = "../core", version = "0.1.0" }
 concerto-memory = { path = "../memory", version = "0.1.0" }
 concerto-orchestrator = { path = "../orchestrator", version = "0.1.0" }
@@ -43,10 +44,9 @@ once_cell = { workspace = true }
 petgraph = { workspace = true }
 walkdir = { workspace = true }
 
-iced = { workspace = true, features = ["highlighter"] }
+iced = { workspace = true, features = ["highlighter", "advanced"] }
 iced_core = "0.14.0"
 iced_futures = "0.14.0"
-iced_term = "0.8.0"
 rfd = "0.17.2"
 
 dirs = "5.0"

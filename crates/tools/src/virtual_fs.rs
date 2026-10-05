@@ -1367,9 +1367,13 @@ mod tests {
         assert!(err.to_string().contains("not absolute"));
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 
-        // Parent traversal is rejected too, before anything touches disk.
+        // Parent traversal is rejected too, before anything touches disk. The
+        // traversal is anchored on this platform's workspace root: `/tmp/...`
+        // is absolute only off Windows, and `path_legality_error` reports the
+        // absoluteness failure first, which would hide the `'..'` refusal the
+        // second half of this test is about.
         let mut fs2 = VirtualFs::new();
-        fs2.write(Utf8Path::new("/tmp/opencode/../escape.txt"), "z".to_string()).unwrap();
+        fs2.write(&root.join("../escape.txt"), "z".to_string()).unwrap();
         let err2 = fs2.commit_to_disk().unwrap_err();
         assert!(!err2.rejected.is_empty());
         assert!(err2.rejected[0].reason.contains("'..'"));

@@ -1075,10 +1075,18 @@ mod tests {
         })
     }
 
-    /// Commit `entries`-shaped tree as the initial commit on `refs/heads/main`.
+    /// Commit `entries`-shaped tree as the initial commit on whatever branch
+    /// `HEAD` actually names.
     ///
     /// Builds a tree from the given blob entries — the same recipe `init_repo`
     /// uses — so tests can seed HEAD with more than one tracked file.
+    ///
+    /// The branch is read from `HEAD` rather than assumed: `gix::init` rewrites
+    /// the built-in `ref: refs/heads/main` HEAD to whatever the ambient
+    /// `init.defaultBranch` says, so a hard-coded `refs/heads/main` leaves `HEAD`
+    /// unborn (and every HEAD-relative helper failing) wherever that config
+    /// resolves to another name — `master` on the Windows CI runner. Seeding the
+    /// branch `HEAD` points at keeps the repository born on every platform.
     fn write_initial_commit(repo: &gix::Repository, entries: Vec<gix::objs::tree::Entry>) {
         let tree = gix::objs::Tree { entries };
         let tree_id = repo.write_object(&tree).unwrap();
@@ -1092,11 +1100,18 @@ mod tests {
         };
         let sig_ref = sig.to_ref(&mut time_buf);
 
+        // A freshly initialized repository always has a symbolic `HEAD`, but
+        // the branch it names is an ambient-config decision, not ours.
+        let head_branch = repo
+            .head_name()
+            .expect("HEAD is readable")
+            .expect("HEAD is symbolic in a freshly initialized repository");
+
         // Create the initial commit with no parents.
         repo.commit_as(
             sig_ref,
             sig_ref,
-            "refs/heads/main",
+            head_branch,
             "initial",
             tree_id,
             [] as [gix::hash::ObjectId; 0],

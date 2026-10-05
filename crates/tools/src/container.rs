@@ -339,6 +339,25 @@ mod tests {
         }
     }
 
+    /// A mount `source` under the project root, spelled in the form the
+    /// colon-delimited `src:dst[:opts]` grammar can carry on this platform.
+    ///
+    /// Off Windows the absolute spelling `{root}/{tail}` is used, exactly as a
+    /// caller would write it. On Windows it never can be: the canonicalized
+    /// root is a drive path (`\\?\C:\...` after `std::fs::canonicalize`), and
+    /// its own colons split the mount into too many parts, so `validate_mount`
+    /// would report `sandbox_containerized_mount_malformed` before the rule
+    /// under test is evaluated. A relative `source` is legal — `validate_mount`
+    /// resolves it against the project root — so the containment rule the test
+    /// is about still runs, fail-closed, on both platforms.
+    fn mount_source(root: &Utf8Path, tail: &str) -> String {
+        if cfg!(windows) {
+            tail.to_string()
+        } else {
+            format!("{root}/{tail}")
+        }
+    }
+
     #[test]
     fn container_run_plan_mounts_project_and_sets_cwd() {
         let (_dir, root, cwd) = paths();
@@ -411,7 +430,7 @@ mod tests {
         let mut cfg = ContainerConfig::new("alpine:3");
         cfg.env.push(("FOO".into(), "bar".into()));
         cfg.network = true;
-        let mount = format!("{root}/cache:/cache:ro");
+        let mount = format!("{}:/cache:ro", mount_source(&root, "cache"));
         cfg.extra_mounts.push(mount.clone());
         let plan = container_run_plan(&wrapped(), &cfg, ContainerRuntime::Docker, &cwd, &root)
             .expect("plan");
@@ -468,7 +487,11 @@ mod tests {
     #[test]
     fn container_config_rejects_mount_escaping_project_root() {
         let (_dir, root, cwd) = paths();
-        let escaped = format!("{root}/../../etc:/etc:ro");
+        // An absolute source anchored at the project root that climbs out of
+        // it. `mount_source` spells it relatively on Windows, where that drive
+        // path cannot be written in the `src:dst[:opts]` grammar at all (see
+        // the helper); the refusal under test is the same either way.
+        let escaped = format!("{}:/etc:ro", mount_source(&root, "../../etc"));
         for mount in ["/etc:/etc:ro", "../../etc:/etc:ro", escaped.as_str()] {
             let mut cfg = ContainerConfig::new("alpine:3");
             cfg.extra_mounts.push(mount.into());
@@ -487,7 +510,10 @@ mod tests {
     #[test]
     fn container_config_rejects_writable_extra_mount() {
         let (_dir, root, cwd) = paths();
-        for mount in [format!("{root}/cache:/cache:rw"), format!("{root}/cache:/cache:ro,rw")] {
+        for mount in [
+            format!("{}:/cache:rw", mount_source(&root, "cache")),
+            format!("{}:/cache:ro,rw", mount_source(&root, "cache")),
+        ] {
             let mut cfg = ContainerConfig::new("alpine:3");
             cfg.extra_mounts.push(mount);
             let err = container_run_plan(&wrapped(), &cfg, ContainerRuntime::Docker, &cwd, &root)
@@ -503,15 +529,29 @@ mod tests {
     fn container_config_rejects_mount_shadowing_project_root() {
         let (_dir, root, cwd) = paths();
         let parent = root.parent().expect("tempdir has a parent");
-        for mount in [format!("{root}/cache:{root}:ro"), format!("{root}/cache:{parent}:ro")] {
+        for mount in [
+            format!("{}:{root}:ro", mount_source(&root, "cache")),
+            format!("{}:{parent}:ro", mount_source(&root, "cache")),
+        ] {
             let mut cfg = ContainerConfig::new("alpine:3");
-            cfg.extra_mounts.push(mount);
+            cfg.extra_mounts.push(mount.clone());
             let err = container_run_plan(&wrapped(), &cfg, ContainerRuntime::Docker, &cwd, &root)
                 .expect_err("shadowing mount must be refused");
-            assert!(matches!(
-                err,
-                ToolError::PolicyDenied { ref rule } if rule == "sandbox_containerized_mount_shadows_project_root"
-            ));
+            // The destination has to be the project root (or an ancestor of it)
+            // to trip the shadow rule. On Windows that destination is a drive
+            // path, whose colon cannot be written in the `src:dst[:opts]`
+            // grammar at all, so `validate_mount` reports the string as
+            // malformed before the shadow rule is evaluated. Still fail-closed,
+            // still a refusal — only the named rule is platform-defined here.
+            let expected = if cfg!(windows) {
+                "sandbox_containerized_mount_malformed"
+            } else {
+                "sandbox_containerized_mount_shadows_project_root"
+            };
+            assert!(
+                matches!(err, ToolError::PolicyDenied { ref rule } if rule == expected),
+                "unexpected refusal for {mount:?}: {err:?}"
+            );
         }
     }
 

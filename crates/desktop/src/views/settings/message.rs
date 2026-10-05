@@ -6,6 +6,16 @@ use super::{
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    ShellSecurityEdit(iced::widget::text_editor::Action),
+    ShellSecurityPreset(&'static str),
+    ShellSecurityReview,
+    ShellSecurityConfirm,
+    ShellSecurityCancel,
+    ShellSecurityReload,
+    ShellSecurityFinished {
+        result: Box<Result<concerto_core::shell_security::ShellSecurity, String>>,
+        saved: bool,
+    },
     ThemeSelected(&'static str),
     FontSizeChanged(f32),
     /// Toggle reduced-motion (`display.reduced_motion`): skips scan-line

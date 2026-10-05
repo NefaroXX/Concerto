@@ -1479,6 +1479,23 @@ mod tests {
         (dir, root, cwd)
     }
 
+    /// ADR-72 §5: the one refusal Windows produces for a containerized plan,
+    /// checked before runtime detection or any routing decision.
+    const WINDOWS_UNSUPPORTED_RULE: &str = "sandbox_containerized_unsupported_platform";
+
+    /// The named refusal rule a containerization attempt must produce on this
+    /// platform for an outcome that only holds off Windows: Windows refuses the
+    /// profile itself (`WINDOWS_UNSUPPORTED_RULE`) before the caller's condition
+    /// is ever evaluated, so both expectations stay asserted instead of one
+    /// being compiled out.
+    fn expected_rule(off_windows: &'static str) -> &'static str {
+        if cfg!(windows) {
+            WINDOWS_UNSUPPORTED_RULE
+        } else {
+            off_windows
+        }
+    }
+
     fn test_tool() -> ShellTool {
         // The allowlist is matched against the full command string
         // (command + " " + shell-quoted args joined), so anchors must account for args.
@@ -1533,18 +1550,40 @@ mod tests {
         let full = tool.full_command(&input.command, &input.args);
         let plan = tool.shell_plan(&input, &full);
         let (_dir, root, _cwd) = container_paths();
-        let routed = tool.containerized_plan(plan, &root, &root).expect("routed");
-        let ShellPlan::Direct { program, args } = routed else {
-            panic!("container plan must be argv-direct");
-        };
-        assert_eq!(program, "docker");
-        assert_eq!(args[0], "run");
-        assert!(args.contains(&"alpine:3".to_string()));
-        assert!(args.contains(&format!("{root}:{root}")));
+        let routed = tool.containerized_plan(plan, &root, &root);
+        // ADR-72 §5: the expected outcome is platform-defined. Windows refuses
+        // the containerized profile outright (no POSIX shell in the default
+        // images; Job Object isolation needs the unsafe FFI this workspace
+        // denies), everything else routes. Both are asserted — neither is
+        // skipped.
+        #[cfg(windows)]
+        {
+            let err = routed.expect_err("windows must refuse the containerized profile");
+            assert!(
+                matches!(
+                    err,
+                    ToolError::PolicyDenied { ref rule } if rule == WINDOWS_UNSUPPORTED_RULE
+                ),
+                "unexpected refusal: {err:?}"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            let routed = routed.expect("routed");
+            let ShellPlan::Direct { program, args } = routed else {
+                panic!("container plan must be argv-direct");
+            };
+            assert_eq!(program, "docker");
+            assert_eq!(args[0], "run");
+            assert!(args.contains(&"alpine:3".to_string()));
+            assert!(args.contains(&format!("{root}:{root}")));
+        }
     }
 
     /// ADR-72: a working directory outside the mount is refused fail-closed
-    /// with the named unenforceable rule.
+    /// with the named unenforceable rule — or, on Windows, with the rule that
+    /// refuses the containerized profile itself before containment is ever
+    /// evaluated (ADR-72 §5). Either way the refusal is `PolicyDenied`.
     #[test]
     fn containerized_plan_refuses_out_of_root_cwd() {
         let tool = ShellTool::new().with_container(ContainerConfig {
@@ -1562,10 +1601,14 @@ mod tests {
         )
         .expect("utf8 outside");
         let err = tool.containerized_plan(plan, &cwd, &root).expect_err("must refuse");
-        assert!(matches!(
-            err,
-            ToolError::PolicyDenied { ref rule } if rule == "sandbox_containerized_unenforceable"
-        ));
+        assert!(
+            matches!(
+                err,
+                ToolError::PolicyDenied { ref rule }
+                    if rule == expected_rule("sandbox_containerized_unenforceable")
+            ),
+            "unexpected refusal: {err:?}"
+        );
     }
 
     /// ADR-72 test double: a container-runtime probe with a fixed verdict, so
@@ -1581,8 +1624,8 @@ mod tests {
     /// ADR-72 §2: with a container config attached but detection reporting no
     /// runtime, the invocation is refused fail-closed — the unconfined inner
     /// plan is never returned. Deterministic (injected probe), no runtime
-    /// required.
-    #[cfg(not(windows))]
+    /// required. Windows refuses the profile before detection runs, so the
+    /// named rule is platform-defined; both are asserted.
     #[test]
     fn containerized_plan_refuses_when_probe_reports_absent() {
         let tool = ShellTool::new()
@@ -1600,10 +1643,14 @@ mod tests {
         let err = tool
             .containerized_plan(plan, &root, &root)
             .expect_err("absent runtime must refuse, never pass through");
-        assert!(matches!(
-            err,
-            ToolError::PolicyDenied { ref rule } if rule == "sandbox_containerized_runtime_unavailable"
-        ));
+        assert!(
+            matches!(
+                err,
+                ToolError::PolicyDenied { ref rule }
+                    if rule == expected_rule("sandbox_containerized_runtime_unavailable")
+            ),
+            "unexpected refusal: {err:?}"
+        );
     }
 
     /// ADR-72 §3: an injected probe reporting an available runtime routes the
@@ -1622,10 +1669,28 @@ mod tests {
         let full = tool.full_command(&input.command, &input.args);
         let plan = tool.shell_plan(&input, &full);
         let (_dir, root, _cwd) = container_paths();
-        let routed = tool.containerized_plan(plan, &root, &root).expect("routed");
-        let ShellPlan::Direct { program, args } = routed else { panic!("argv-direct") };
-        assert_eq!(program, "podman");
-        assert_eq!(args[0], "run");
+        let routed = tool.containerized_plan(plan, &root, &root);
+        // ADR-72 §5: Windows refuses the containerized profile before the
+        // injected verdict is even consulted; elsewhere the probe's verdict
+        // routes the plan. Both outcomes are asserted.
+        #[cfg(windows)]
+        {
+            let err = routed.expect_err("windows must refuse the containerized profile");
+            assert!(
+                matches!(
+                    err,
+                    ToolError::PolicyDenied { ref rule } if rule == WINDOWS_UNSUPPORTED_RULE
+                ),
+                "unexpected refusal: {err:?}"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            let routed = routed.expect("routed");
+            let ShellPlan::Direct { program, args } = routed else { panic!("argv-direct") };
+            assert_eq!(program, "podman");
+            assert_eq!(args[0], "run");
+        }
     }
 
     /// ADR-72 §4 / row 45: the CPU `ulimit` prelude built by `with_cpu_limit`
@@ -1664,18 +1729,36 @@ mod tests {
         assert!(operand.starts_with("ulimit -S -t 5; "));
 
         let (_dir, root, _cwd) = container_paths();
-        let routed = tool.containerized_plan(plan, &root, &root).expect("routed");
-        let ShellPlan::Direct { program, args } = &routed else { panic!("argv-direct") };
-        assert_eq!(program, "docker");
-        let image = args.iter().position(|a| a == "alpine:3").expect("image");
-        let expected: Vec<String> =
-            vec!["/bin/sh".into(), "-c".into(), format!("ulimit -S -t 5; {full}")];
-        assert_eq!(&args[image + 1..], expected.as_slice());
-        // The runtime itself is never asked to impose a CPU ceiling.
-        assert!(!args.iter().any(|a| a == "--ulimit" || a == "--cpus"));
-        // The outer container argv takes no kernel backstop; the prelude inside
-        // is the enforcement, exactly as ADR-72 §4 requires.
-        assert!(!plan_takes_cpu_backstop(&routed, tool.cpu_budget()));
+        let routed = tool.containerized_plan(plan, &root, &root);
+        // ADR-72 §5: Windows refuses the containerized profile outright, so the
+        // container argv this test audits can only exist off Windows. The
+        // refusal itself is asserted on Windows rather than skipped.
+        #[cfg(windows)]
+        {
+            let err = routed.expect_err("windows must refuse the containerized profile");
+            assert!(
+                matches!(
+                    err,
+                    ToolError::PolicyDenied { ref rule } if rule == WINDOWS_UNSUPPORTED_RULE
+                ),
+                "unexpected refusal: {err:?}"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            let routed = routed.expect("routed");
+            let ShellPlan::Direct { program, args } = &routed else { panic!("argv-direct") };
+            assert_eq!(program, "docker");
+            let image = args.iter().position(|a| a == "alpine:3").expect("image");
+            let expected: Vec<String> =
+                vec!["/bin/sh".into(), "-c".into(), format!("ulimit -S -t 5; {full}")];
+            assert_eq!(&args[image + 1..], expected.as_slice());
+            // The runtime itself is never asked to impose a CPU ceiling.
+            assert!(!args.iter().any(|a| a == "--ulimit" || a == "--cpus"));
+            // The outer container argv takes no kernel backstop; the prelude inside
+            // is the enforcement, exactly as ADR-72 §4 requires.
+            assert!(!plan_takes_cpu_backstop(&routed, tool.cpu_budget()));
+        }
     }
 
     /// ADR-72: the audited command facts describe the container argv that
@@ -1688,14 +1771,30 @@ mod tests {
         });
         let session = test_session();
         let input = json!({"command": "echo", "args": ["hi"]});
-        let facts = tool.command_facts(&input, &session).expect("container facts");
-        assert_eq!(facts.argv.first().map(String::as_str), Some("docker"));
-        assert_eq!(facts.argv.get(1).map(String::as_str), Some("run"));
-        assert!(facts.argv.contains(&"alpine:3".to_string()));
-        assert!(facts.working_directory.is_some());
-        // The marker is set only on the branch that actually routed, so the gate
-        // cannot be satisfied by a bare working directory.
-        assert_eq!(facts.container_routing, CommandRouting::Containerized);
+        let facts = tool.command_facts(&input, &session);
+        // A refusal must produce no facts at all: the policy gate can never be
+        // satisfied by a `Containerized` claim for a plan that never routed.
+        // Windows refuses the containerized profile (ADR-72 §5), so `None` is
+        // the expected outcome there; every other platform must produce the
+        // routed argv below.
+        #[cfg(windows)]
+        {
+            assert!(
+                facts.is_none(),
+                "a refused containerization must yield no facts, got {facts:?}"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            let facts = facts.expect("container facts");
+            assert_eq!(facts.argv.first().map(String::as_str), Some("docker"));
+            assert_eq!(facts.argv.get(1).map(String::as_str), Some("run"));
+            assert!(facts.argv.contains(&"alpine:3".to_string()));
+            assert!(facts.working_directory.is_some());
+            // The marker is set only on the branch that actually routed, so the gate
+            // cannot be satisfied by a bare working directory.
+            assert_eq!(facts.container_routing, CommandRouting::Containerized);
+        }
     }
 
     /// ADR-72 §2: a tool with no container config produces `Direct` routing, so
@@ -1967,7 +2066,26 @@ mod tests {
         assert!(result.is_ok());
         let output = result.unwrap();
         let stdout = output.data["stdout"].as_str().unwrap();
-        assert!(stdout.contains(dir.path().to_str().unwrap()));
+
+        // Compare leaf names, not spellings: on Windows the child is MSYS
+        // `pwd`, which prints its own `/tmp`-mounted spelling that no
+        // normalization can map back to the Win32 path. The leaf is preserved
+        // across every spelling (POSIX, verbatim, 8.3 short), and tempfile
+        // names are unique, so the leaf identifies the directory on all
+        // platforms. (`cmd /c cd` cannot serve here: containment rejects
+        // `/c` as an absolute path.)
+        let reported = stdout.trim();
+        let reported_leaf = reported.rsplit(['/', '\\']).next().unwrap_or(reported);
+        let expected_leaf = dir
+            .path()
+            .file_name()
+            .expect("tempdir has a leaf name")
+            .to_str()
+            .expect("UTF-8 tempdir");
+        assert_eq!(
+            reported_leaf, expected_leaf,
+            "pwd reported {reported:?}, which must be the project directory"
+        );
     }
 
     #[tokio::test]

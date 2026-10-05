@@ -110,6 +110,7 @@ the 2026 remediation wave (33–63) keeps its genuine recent dates. Numbers 09,
 | [78](./ADR-78-editor-workspace.md) | Native editor workspace | 2026-10-03 | Proposed | Session-local document tabs, scoped LSP replies, bottom Problems panel and selected-file staged review. |
 | [79](./ADR-79-extension-security-enforcement.md) | Extension authorization and host execution | 2026-10-03 | Accepted | Discovery never creates grants; runtime activation requires deny-by-default capability approval matched to the current binary/scope/TTL; plugin file and shell effects use the shared executor, VirtualFs, and shell profile; MCP deadlines include transport waits; guest growth is bounded and workers are torn down with the server. |
 | [80](./ADR-80-cli-settings-and-studio-parity.md) | CLI settings and Studio parity | 2026-10-03 | Accepted | Parity applies to capabilities rather than whole graphical pages; adds validated scoped config commands, canonical agent edits, provider/extension/shell management and portable display preferences. |
+| [81](./ADR-81-native-shell-security.md) | Native shell execution and user-owned security settings | 2026-10-02 | Accepted for implementation | Native argv execution, protected global settings, shared client approvals, and fail-closed container requirements; partially supersedes ADR-30. |
 
 > **Partial supersession note (2026-09-24):**
 > [ADR-71](./ADR-71-coordinator-supremacy.md) makes **scoped partial

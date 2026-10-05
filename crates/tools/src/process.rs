@@ -144,7 +144,34 @@ impl ProcessHandle {
             #[cfg(not(windows))]
             command.arg(tail);
         }
-        Self::spawn_and_collect(command, timeout, cpu_budget, kernel_backstop, cancel).await
+        Self::spawn_and_collect(
+            command,
+            timeout,
+            cpu_budget,
+            kernel_backstop,
+            MAX_OUTPUT_SIZE,
+            cancel,
+        )
+        .await
+    }
+
+    /// Native execution inherits only explicitly supplied environment variables.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_native(
+        cmd: &str,
+        args: &[&str],
+        cwd: &Utf8Path,
+        env: &HashMap<String, String>,
+        timeout: Duration,
+        max_output_bytes: u64,
+        cancel: CancellationToken,
+    ) -> Result<ProcessOutput, ToolError> {
+        if cancel.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
+        let mut command = Self::base_command(cmd, args, cwd, None);
+        command.env_clear().envs(env).stdin(std::process::Stdio::null());
+        Self::spawn_and_collect(command, timeout, None, false, max_output_bytes, cancel).await
     }
 
     /// Common `Command` setup shared by every spawn entrypoint so piped
@@ -172,6 +199,7 @@ impl ProcessHandle {
         timeout: Duration,
         cpu_budget: Option<CpuBudget>,
         kernel_backstop: bool,
+        max_output_bytes: u64,
         cancel: CancellationToken,
     ) -> Result<ProcessOutput, ToolError> {
         #[cfg(unix)]
@@ -237,8 +265,8 @@ impl ProcessHandle {
                 // so pipe buffers never fill up while the child is alive.
                 let (status_result, stdout, stderr) = tokio::join!(
                     child.wait(),
-                    Self::read_with_limit(stdout),
-                    Self::read_with_limit(stderr),
+                    Self::read_bounded(stdout, max_output_bytes),
+                    Self::read_bounded(stderr, max_output_bytes),
                 );
 
                 let status = match status_result {
@@ -276,6 +304,10 @@ impl ProcessHandle {
     /// to prevent resource exhaustion (spinning the loop without
     /// allocation).
     pub(crate) async fn read_with_limit<R: AsyncRead + Unpin>(reader: Option<R>) -> String {
+        Self::read_bounded(reader, MAX_OUTPUT_SIZE).await
+    }
+
+    async fn read_bounded<R: AsyncRead + Unpin>(reader: Option<R>, limit: u64) -> String {
         let Some(mut r) = reader else {
             return String::new();
         };
@@ -288,16 +320,15 @@ impl ProcessHandle {
                 Ok(0) => break,
                 Ok(n) => {
                     total += n as u64;
-                    if total > MAX_OUTPUT_SIZE {
+                    if total > limit {
                         if !over_limit {
                             // Capture up to the limit, then stop buffering.
-                            let cap = n.saturating_sub((total - MAX_OUTPUT_SIZE) as usize);
+                            let cap = n.saturating_sub((total - limit) as usize);
                             output.extend_from_slice(&buf[..cap]);
                             over_limit = true;
                         }
                         // Drain the rest without allocating.
                         // Using a fixed-size loop to avoid unbounded read_to_end.
-                        let _ = r.read(&mut buf).await;
                         continue;
                     }
                     output.extend_from_slice(&buf[..n]);
@@ -430,6 +461,61 @@ mod tests {
     use camino::Utf8PathBuf;
     #[cfg(unix)]
     use std::sync::Arc;
+
+    // verifies: direct execution clears inherited environment on every platform.
+    #[test]
+    fn native_environment_fixture() {
+        if std::env::var("CONCERTO_NATIVE_FIXTURE").ok().as_deref() == Some("environment") {
+            assert!(std::env::var_os("PATH").is_none());
+            assert_eq!(std::env::var("CONCERTO_NATIVE_ALLOWED").expect("allowed"), "visible");
+            println!("native-environment-ok");
+        }
+    }
+
+    #[tokio::test]
+    async fn native_execution_inherits_only_explicit_environment() {
+        let directory = tempfile::tempdir().expect("project");
+        let root = Utf8Path::from_path(directory.path()).expect("UTF-8");
+        let program = std::env::current_exe().expect("test executable");
+        let env = HashMap::from([
+            ("CONCERTO_NATIVE_FIXTURE".into(), "environment".into()),
+            ("CONCERTO_NATIVE_ALLOWED".into(), "visible".into()),
+        ]);
+        let output = ProcessHandle::run_native(
+            program.to_str().expect("UTF-8 executable"),
+            &["--exact", "process::tests::native_environment_fixture", "--nocapture"],
+            root,
+            &env,
+            Duration::from_secs(10),
+            4096,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("native process");
+        assert_eq!(output.exit_code, 0, "{}", output.stderr);
+        assert!(output.stdout.contains("native-environment-ok"), "{}", output.stdout);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_arguments_are_literal_and_capture_is_bounded() {
+        let directory = tempfile::tempdir().expect("project");
+        let root = Utf8Path::from_path(directory.path()).expect("UTF-8");
+        let output = ProcessHandle::run_native(
+            "/usr/bin/printf",
+            &["%s", "$(touch injected);literal"],
+            root,
+            &HashMap::new(),
+            Duration::from_secs(5),
+            8,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("native process");
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout, "$(touch ");
+        assert!(!directory.path().join("injected").exists());
+    }
 
     #[cfg(unix)]
     #[tokio::test]

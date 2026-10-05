@@ -48,7 +48,7 @@ fn build_action<'a>(
         session_id: session.session_id,
         correlation_id: crate::ids::new_id(),
         capability_requirements: tool.capability_requirements(),
-        sandbox_profile: None,
+        sandbox_profile: tool.sandbox_profile(),
         // Estimate cost based on tool type — provider calls get a default estimate,
         // other tools have zero estimated cost.
         estimated_cost_usd: if tool_name == "provider" {
@@ -749,6 +749,18 @@ impl ToolExecutor {
         cancel: CancellationToken,
         orchestrator_authority: bool,
     ) -> Result<ToolOutput, ToolError> {
+        if cancel.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
+        let mut input = input;
+        if let Err(error) = tool.prepare_input(&mut input, session) {
+            // Preparation can refuse unsupported security requirements before
+            // policy evaluation; the refusal is persisted without claiming a
+            // resolved executable or an execution that never happened.
+            self.record_preparation_refusal(tool_name, &input, session, &error, cancel).await;
+            return Err(error);
+        }
+
         // Policy evaluates the tool's canonical view (alias tools present the
         // canonical tool name and operation-bearing input); execution and
         // audit below still use the registered name and the caller's input.
@@ -844,6 +856,57 @@ impl ToolExecutor {
         }
     }
 
+    /// Persist a [`Tool::prepare_input`] refusal as an audit row.
+    ///
+    /// Shared by [`Self::execute_resolved`] and [`Self::execute_read_only`] so
+    /// both paths write the identical `Deny` (for `PolicyDenied`) or
+    /// `PreparationFailed` verdict, `rule_matched`, and input hash, without
+    /// claiming a resolved executable or an execution that never happened.
+    /// Fail-soft: an audit write failure is logged, never surfaced over the
+    /// original refusal.
+    async fn record_preparation_refusal(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+        session: &SessionContext,
+        error: &ToolError,
+        cancel: CancellationToken,
+    ) {
+        let entry = AuditEntry {
+            tool_name: tool_name.to_owned(),
+            verdict: match error {
+                ToolError::PolicyDenied { .. } => "Deny".into(),
+                _ => "PreparationFailed".into(),
+            },
+            input_hash: crate::policy::compute_input_hash(input),
+            session_id: session.session_id,
+            correlation_id: crate::ids::new_id(),
+            timestamp: OffsetDateTime::now_utc(),
+            user_response: None,
+            rule_matched: match error {
+                ToolError::PolicyDenied { rule } => Some(rule.clone()),
+                _ => None,
+            },
+            profile_id: None,
+            resolved_executable: None,
+            argv: None,
+            working_directory: None,
+            network_requested: None,
+            filesystem_scope: None,
+            destructive_classification: None,
+            exit_code: None,
+            duration_ms: None,
+            toolchain_version: None,
+            plan_id: None,
+            source_revision: None,
+            path_facts: None,
+            result_facts: None,
+        };
+        if let Err(audit_error) = self.policy.audit_log().record(entry, cancel).await {
+            tracing::error!(%audit_error, "preparation refusal audit write failed");
+        }
+    }
+
     /// Execute a tool **without** a policy decision, for gate-routed
     /// read-only operations.
     ///
@@ -852,7 +915,10 @@ impl ToolExecutor {
     /// policy gate: a read must never be denied by a write-oriented policy
     /// (nor persisted as a `write-rejected` whiteboard decision). Policy is
     /// still consulted *advisorily* by the gate — this method performs no
-    /// evaluation and writes no decision row; it does keep the
+    /// ordinary policy evaluation. Input preparation runs first, exactly as on
+    /// [`Self::execute_resolved`], so a tool that refuses its input is refused
+    /// (and audited) here too; only then are the user security ceilings
+    /// evaluated, and their refusals fail closed. It does keep the
     /// post-execution audit completion row, exactly like [`Self::execute`]'s
     /// allowed path.
     ///
@@ -869,11 +935,28 @@ impl ToolExecutor {
         let tool = self.registry.get(tool_name).ok_or_else(|| ToolError::ExecutionFailed {
             message: format!("tool not found: {tool_name}"),
         })?;
+        // Preparation must run before the security ceiling: a tool that
+        // refuses its input can never reach execution from this fast path
+        // either, and the refusal is audited like the ordinary path's.
+        let mut input = input;
+        if let Err(error) = tool.prepare_input(&mut input, session) {
+            self.record_preparation_refusal(tool_name, &input, session, &error, cancel.clone())
+                .await;
+            return Err(error);
+        }
         // Build the audit context the same way `execute`'s allowed path does,
         // but without evaluating the action: the canonical policy view still
         // names the completion row's tool, and `command_facts` still enrich it.
         let (policy_name, policy_input) = tool.policy_view(&input);
         let action = build_action(&policy_name, &policy_input, tool, session, false);
+        if !matches!(
+            self.policy.evaluate_security_ceiling(&action, cancel.clone()).await,
+            Ok(PolicyVerdict::Allow)
+        ) {
+            return Err(ToolError::PolicyDenied {
+                rule: "shell_security_read_only_ceiling".into(),
+            });
+        }
         let audit = ExecutionAuditContext {
             correlation_id: action.correlation_id,
             input_hash: crate::policy::compute_input_hash(&input),
@@ -1321,6 +1404,89 @@ mod tests {
         let mut reg = ToolRegistry::default();
         reg.register(Box::new(EchoTool));
         Arc::new(reg)
+    }
+
+    struct RefusingPreparationTool;
+    #[async_trait]
+    impl Tool for RefusingPreparationTool {
+        fn name(&self) -> &str {
+            "refuse"
+        }
+        fn description(&self) -> &str {
+            "test preparation refusal"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn capability_requirements(&self) -> CapabilitySet {
+            CapabilitySet::default()
+        }
+        fn prepare_input(
+            &self,
+            _input: &mut serde_json::Value,
+            _session: &SessionContext,
+        ) -> Result<(), ToolError> {
+            Err(ToolError::PolicyDenied { rule: "unsupported_boundary".into() })
+        }
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _policy: &dyn PolicyEngine,
+            _session: &SessionContext,
+            _cancel: CancellationToken,
+        ) -> Result<ToolOutput, ToolError> {
+            panic!("refused preparation must never execute")
+        }
+    }
+
+    // verifies: backend refusals are audited even when ordinary policy would allow the request.
+    #[tokio::test]
+    async fn preparation_refusal_is_audited_without_execution_facts() {
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(RefusingPreparationTool));
+        let audit = Arc::new(RecordingAudit::default());
+        let policy = Arc::new(RecordingPolicy { audit: audit.clone() });
+        let executor = ToolExecutor::new(Arc::new(registry), policy);
+        let input = serde_json::json!({"command":"unresolved"});
+        let result = executor
+            .execute("refuse", input.clone(), &test_session(), CancellationToken::new())
+            .await;
+        assert!(matches!(result, Err(ToolError::PolicyDenied { .. })));
+        let entries = audit.entries.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].verdict, "Deny");
+        assert_eq!(entries[0].rule_matched.as_deref(), Some("unsupported_boundary"));
+        assert_eq!(entries[0].input_hash, crate::policy::compute_input_hash(&input));
+        assert!(entries[0].resolved_executable.is_none());
+        assert!(entries[0].exit_code.is_none());
+    }
+
+    // verifies: the read-only fast path runs prepare_input before the security
+    // ceiling, so a refusing tool is refused and audited instead of executed.
+    #[tokio::test]
+    async fn read_only_preparation_refusal_is_refused_and_audited() {
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(RefusingPreparationTool));
+        let audit = Arc::new(RecordingAudit::default());
+        // `RecordingPolicy` keeps the security ceiling at Allow, so any
+        // refusal observed here can only come from `prepare_input`.
+        let policy = Arc::new(RecordingPolicy { audit: audit.clone() });
+        let executor = ToolExecutor::new(Arc::new(registry), policy);
+        let input = serde_json::json!({"command":"unresolved"});
+        let result = executor
+            .execute_read_only("refuse", input.clone(), &test_session(), CancellationToken::new())
+            .await;
+        // The tool's `execute` panics, so reaching this line also proves it
+        // never ran.
+        assert!(matches!(result, Err(ToolError::PolicyDenied { .. })));
+        let entries = audit.entries.lock().unwrap();
+        assert_eq!(entries.len(), 1, "the refusal must leave exactly one audit row");
+        assert_eq!(entries[0].tool_name, "refuse");
+        assert_eq!(entries[0].verdict, "Deny");
+        assert_eq!(entries[0].rule_matched.as_deref(), Some("unsupported_boundary"));
+        assert_eq!(entries[0].input_hash, crate::policy::compute_input_hash(&input));
+        assert!(entries[0].resolved_executable.is_none());
+        assert!(entries[0].exit_code.is_none());
     }
 
     #[tokio::test]

@@ -16,6 +16,7 @@ pub mod error;
 pub mod filesystem;
 pub mod git;
 pub mod git_init;
+pub mod native_process;
 pub mod process;
 pub mod shell;
 pub mod shell_backend;

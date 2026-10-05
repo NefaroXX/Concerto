@@ -71,9 +71,18 @@ rules before catch-alls and test them on a disposable project.
 
 ## Shell process boundary
 
-The shell tool launches the selected profile with the project working directory
-unless configured otherwise. It applies command validation, timeout clamping,
-stdout/stderr caps, cancellation, and child-process termination behavior.
+The default shell tool executes a program and an argument vector directly,
+without launching a system shell. User-global security settings add deny/ask
+ceilings, an environment allowlist, output and argument caps, and a wall-clock
+deadline. Native filesystem operations use the policy-gated filesystem tool.
+Offline networking and kernel resource limits require the container backend;
+host execution refuses unsupported restrictions. See
+[Native shell security](docs/native-shell-security.md) for exact controls and
+platform limits.
+
+The profile-based `ShellTool` remains a library compatibility path. The
+following quoting guarantees describe that implementation, rather than the
+default native tool (which rejects `bypass_shell` and shell-wrapping fields).
 
 - **Structured parsing**: When `bypass_shell: true`, commands are spawned
   directly with `args` as a vector — no shell interpretation. This is the

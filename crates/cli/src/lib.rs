@@ -8,6 +8,7 @@ pub mod extensions;
 pub mod health;
 pub mod plugin_approval;
 pub mod settings;
+mod shell;
 pub mod theme;
 pub mod ui;
 pub mod update;
@@ -66,6 +67,9 @@ pub const CLI_COMMAND_HELP: &str =
     extensions <list|skills ACTION|mcp ACTION>
     plugin <list|installed|install|remove|revoke>
     shell <list|test|select|managed ACTION>
+    shell [exec COMMAND ARG ...]   shell security <show|validate FILE|apply FILE>
+    Note: protected_paths constrains only the built-in filesystem tool; native
+    run commands and container project mounts are not covered.
     projects <list|current|use>
     sessions <list|show|events|resume|prune>
     memory <graph|explain>   health [--json]   audit   logs <path|show>
@@ -108,7 +112,8 @@ fn run_cli_inner(
     let mut explicit_theme: Option<String> = None;
     let mut filtered: Vec<String> = Vec::with_capacity(remaining.len());
     let mut index = 0;
-    while index < remaining.len() {
+    let startup_count = startup_arguments(remaining).len();
+    while index < startup_count {
         let arg = remaining[index].as_str();
         if arg == "--no-terminal-title" {
             no_terminal_title = Some(true);
@@ -124,6 +129,7 @@ fn run_cli_inner(
         }
         index += 1;
     }
+    filtered.extend_from_slice(&remaining[startup_count..]);
     let (remaining, explicit_project) = invocation_args(&filtered)?;
     if remaining.first().map(String::as_str) == Some("logs") {
         return run_logs_subcommand(&remaining[1..]);
@@ -136,6 +142,19 @@ fn run_cli_inner(
     // ── Subcommand dispatch ────────────────────────────────────────────
     if !remaining.is_empty() {
         match remaining[0].as_str() {
+            // `shell` carries two coexisting surfaces: profile management
+            // (`list|test|select|managed`, ADR-80) and the native console with
+            // its user-owned security editor (ADR-81). The verb sets are
+            // disjoint, so route on the first sub-argument; anything else falls
+            // through to the native console, which owns bare `shell`.
+            "shell" => {
+                return match remaining.get(1).map(String::as_str) {
+                    Some("list" | "test" | "select" | "managed") => {
+                        extensions::run_shell(&remaining[1..], &project_root)
+                    }
+                    _ => shell::run(&remaining[1..], &project_root),
+                };
+            }
             "config" => return run_config_subcommand(&remaining[1..], &project_root),
             "providers" => return run_providers_subcommand(&remaining[1..], &project_root),
             "sessions" => return run_sessions_subcommand(&remaining[1..], &project_root),
@@ -148,7 +167,6 @@ fn run_cli_inner(
             "agents" => return settings::run_agents(&remaining[1..], &project_root),
             "blueprint" => return settings::run_blueprint(&remaining[1..], &project_root),
             "credentials" => return settings::run_credentials(&remaining[1..]),
-            "shell" => return extensions::run_shell(&remaining[1..], &project_root),
             "preferences" => return settings::run_preferences(&remaining[1..]),
             other => {
                 eprintln!("error: unknown subcommand '{other}'");
@@ -1556,12 +1574,33 @@ fn parse_session_id(value: &str) -> anyhow::Result<concerto_core::ids::Ulid> {
         .map_err(|error| anyhow::anyhow!("invalid session id '{value}': {error}"))
 }
 
+/// Concerto flags end before native command operands, which may contain any flag.
+/// Project/theme option values are skipped so a directory named shell stays a value.
+pub fn startup_arguments(args: &[String]) -> &[String] {
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--project" | "-p" | "--theme" => index += 2,
+            "shell" => return &args[..index],
+            value if value.starts_with('-') => index += 1,
+            _ => break,
+        }
+    }
+    args
+}
+
 fn invocation_args(args: &[String]) -> anyhow::Result<(Vec<String>, Option<PathBuf>)> {
     let mut remaining = Vec::new();
     let mut project = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
+            // Native program operands may contain -p/--project and startup
+            // flags. Only parse Concerto flags before the shell subcommand.
+            "shell" if remaining.is_empty() => {
+                remaining.extend_from_slice(&args[index..]);
+                break;
+            }
             // Startup flags the caller already parsed (see `parse_cli_args`)
             // are stripped here so they never reach subcommand dispatch.
             "--cli" | "-c" | "--multi-agent" | "-m" | "--fast" | "-f" | "--reconfigure" | "-r"
@@ -1733,6 +1772,30 @@ mod tests {
         let (remaining, project) = invocation_args(&[]).unwrap();
         assert!(remaining.is_empty());
         assert!(project.is_none());
+    }
+
+    // verifies: native operands survive all startup parsing, including program-specific project/theme flags.
+    #[test]
+    fn native_shell_preserves_program_flags() {
+        let args = [
+            "--cli",
+            "--project",
+            "shell",
+            "shell",
+            "exec",
+            "run",
+            "cargo",
+            "-p",
+            "core",
+            "--help",
+            "--theme",
+            "literal",
+        ]
+        .map(str::to_owned);
+        assert_eq!(startup_arguments(&args), &args[..3]);
+        let (remaining, project) = invocation_args(&args).expect("parse");
+        assert_eq!(project, Some(PathBuf::from("shell")));
+        assert_eq!(remaining, args[3..]);
     }
 
     #[test]

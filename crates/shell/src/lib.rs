@@ -8,11 +8,13 @@
 //! both interactive and automated frontends can use.
 
 mod builtins;
+pub mod client;
 mod command;
 mod context;
 mod execution;
 mod history;
 mod model;
+mod native;
 mod parser;
 mod path;
 mod profile;

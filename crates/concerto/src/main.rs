@@ -1,14 +1,19 @@
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
+    #[cfg(feature = "cli")]
+    let startup_args = concerto_cli::startup_arguments(&args);
+    #[cfg(not(feature = "cli"))]
+    let startup_args = args.as_slice();
+
     // ── --help / -h  (must work without provider config) ──────────────
-    if args.iter().any(|a| a == "--help" || a == "-h") {
+    if startup_args.iter().any(|a| a == "--help" || a == "-h") {
         print_help();
         return;
     }
 
     // ── --version / -V ────────────────────────────────────────────────
-    if args.iter().any(|a| a == "--version" || a == "-V") {
+    if startup_args.iter().any(|a| a == "--version" || a == "-V") {
         println!("concerto {}", env!("CARGO_PKG_VERSION"));
         return;
     }
@@ -17,8 +22,8 @@ fn main() {
     //  • --cli / -c        → force CLI
     //  • --desktop / -d    → force desktop (error if desktop feature off)
     //  • (no flag)         → desktop if available, else CLI
-    let force_cli = args.iter().any(|a| a == "--cli" || a == "-c");
-    let force_desktop = args.iter().any(|a| a == "--desktop" || a == "-d");
+    let force_cli = startup_args.iter().any(|a| a == "--cli" || a == "-c");
+    let force_desktop = startup_args.iter().any(|a| a == "--desktop" || a == "-d");
     #[cfg(feature = "cli")]
     let cli_command = concerto_cli::has_cli_subcommand(&args);
 
@@ -49,15 +54,16 @@ fn main() {
         };
 
         if run_cli {
-            let multi_agent = args.iter().any(|a| a == "--multi-agent" || a == "-m");
-            let fast = args.iter().any(|a| a == "--fast" || a == "-f");
-            let reconfigure = args.iter().any(|a| a == "--reconfigure" || a == "-r");
+            let multi_agent = startup_args.iter().any(|a| a == "--multi-agent" || a == "-m");
+            let fast = startup_args.iter().any(|a| a == "--fast" || a == "-f");
+            let reconfigure = startup_args.iter().any(|a| a == "--reconfigure" || a == "-r");
             // `--reduced-motion` is parsed here exactly like the flags above:
             // `Some(true)` only when the flag is passed (there is no
             // `--no-reduced-motion`), `None` defers to CONCERTO_REDUCED_MOTION
             // env → `[display] reduced_motion` config → default (false) — the
             // same contract as `concerto_cli::parse_cli_args`.
-            let reduced_motion = args.iter().any(|a| a == "--reduced-motion").then_some(true);
+            let reduced_motion =
+                startup_args.iter().any(|a| a == "--reduced-motion").then_some(true);
             if let Err(e) = concerto_cli::run_cli(multi_agent, fast, reconfigure, reduced_motion) {
                 eprintln!("error: {e}");
                 std::process::exit(1);
@@ -129,6 +135,8 @@ CLI SUBCOMMANDS:
     concerto --cli extensions <list|skills ACTION|mcp ACTION>
     concerto --cli plugin <list|installed|install|remove|revoke>
     concerto --cli shell <list|test|select|managed ACTION>
+    concerto --cli shell [exec COMMAND ARG ...]
+    concerto --cli shell security <show|validate FILE|apply FILE>
 
 CLI commands automatically select CLI mode when the 'cli' feature is enabled.
 Run `concerto config help` for settings scopes, typed values, and dry runs.",

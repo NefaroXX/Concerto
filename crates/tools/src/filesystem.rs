@@ -792,7 +792,14 @@ mod tests {
     #[tokio::test]
     async fn rejecting_write_to_existing_file_restores_original_disk_content() {
         let (tool, dir) = tool_and_dir();
-        let path = dir.path().join("existing.txt");
+        // Canonical temp root, so both sides of the VFS lookup are canonical:
+        // `resolve_path` keys entries by the canonical path it returns, while
+        // `TMPDIR` on macOS is a symlinked `/var/folders` → `/private/var/folders`.
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
+            .expect("utf8 temp path")
+            .canonicalize_utf8()
+            .expect("canonical temp root");
+        let path = root.join("existing.txt");
         std::fs::write(&path, "original").unwrap();
 
         tool.execute(
@@ -802,14 +809,14 @@ mod tests {
                 "content": "changed"
             }),
             &test_policy(),
-            &session_for(dir.path()),
+            &session_for(root.as_std_path()),
             CancellationToken::new(),
         )
         .await
         .unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "changed");
 
-        let utf8_path = camino::Utf8PathBuf::from_path_buf(path.clone()).unwrap();
+        let utf8_path = path.clone();
         let mut vfs = tool.vfs().lock().unwrap();
         assert!(matches!(
             vfs.get(&utf8_path),
@@ -1840,7 +1847,11 @@ mod tests {
             assert_eq!(facts.attempted_path.as_deref(), Some("sub/file.txt"));
             let resolved = facts.resolved_path.expect("the path resolves inside the workspace");
             assert!(
-                resolved.ends_with("sub/file.txt"),
+                // Compare as paths, not as strings: the confined path is
+                // canonical (Windows returns the verbatim `\\?\C:\...` form),
+                // so its separator is `\` while the input's is `/`. `Path`
+                // parses both, `str::ends_with` does not.
+                std::path::Path::new(&resolved).ends_with("sub/file.txt"),
                 "resolved path {resolved} must be the confined target"
             );
         }
