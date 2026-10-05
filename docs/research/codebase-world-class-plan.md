@@ -218,8 +218,9 @@ coordinate external coding agents. They do not change Concerto's runtime roles.
 
 OpenCode's Miro access/ACK remains OC00 and is unverified at this reconciliation.
 Q01 is proposed, not an accepted interface. Feature/fix work continues through
-PRs to dev under repository instructions. This documentation restoration is
-direct to dev under the owner's explicit instruction.
+PRs to dev under repository instructions. The owner explicitly requested
+restoration onto dev. GitHub branch protection requires a PR for delivery;
+that transport requirement does not change the retention instruction.
 
 ## Follow-on: coordinator decomposition in small slices
 
