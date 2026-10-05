@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+#
+# [simulated] Artifact-edge shim: reports the pinned version, then exits 0
+# after writing an UNPARSEABLE mutants.json alongside a valid outcomes.json.
+# The runner must report inconclusive / artifact_parse_failed (exit 3) with
+# null counts instead of mistaking malformed artifacts for coverage.
+set -euo pipefail
+
+case " $* " in
+    *" --version "*)
+        printf 'cargo-mutants 27.1.0\n'
+        exit 0
+        ;;
+esac
+
+out=""
+prev=""
+for arg in "$@"; do
+    if [ "$prev" = "--output" ]; then
+        out="$arg"
+    fi
+    prev="$arg"
+done
+if [ -z "$out" ]; then
+    printf '[simulated] malformed-mutants-json shim: missing --output argument\n' >&2
+    exit 70
+fi
+mkdir -p "$out/mutants.out"
+printf '{ this is not valid json\n' >"$out/mutants.out/mutants.json"
+cat >"$out/mutants.out/outcomes.json" <<'EOF'
+{"caught": 1, "missed": 0, "timeout": 0, "unviable": 0, "outcomes": []}
+EOF
+printf '[simulated] malformed-mutants-json shim: wrote invalid mutants.json + valid outcomes.json\n'
+exit 0
