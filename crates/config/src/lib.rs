@@ -85,11 +85,9 @@ use std::sync::Arc;
 /// [`std::env::split_paths`] separator (e.g. `:` on Unix, `;` on Windows).
 const PROJECT_ROOTS_ENV_VAR: &str = "CONCERTO_PROJECT_ROOTS";
 
-/// Default config file location with legacy fallback.
+/// Default config file location.
 ///
-/// Returns the new path (`~/.config/concerto/config.toml`) if it exists,
-/// falling back to the old path (`~/.config/opencode-rs/config.toml`).
-/// When neither exists, returns the new path (callers will create it on write).
+/// Returns `~/.config/concerto/config.toml`.
 /// Returns `None` if the OS has no resolvable config-dir (e.g. some minimal
 /// containers); callers should fall back to defaults + env only in that case.
 pub fn default_config_path() -> Option<PathBuf> {
@@ -100,7 +98,7 @@ pub fn default_config_path() -> Option<PathBuf> {
 /// Env vars are prefixed `CONCERTO_` (e.g. `CONCERTO_PROVIDER`), so env always wins.
 ///
 /// `global_path` is the user-level config file. If `None`, falls back to
-/// [`default_config_path()`] (which includes legacy fallback to `opencode-rs`).
+/// [`default_config_path()`].
 /// `project_root` is the project directory; if a `.concerto.toml` exists there, it is merged
 /// between the global file and env so per-project overrides (policy rules, model pins, spend cap)
 /// can be committed to the project repo or gitignored as desired.
@@ -145,8 +143,8 @@ fn load_config_documents(
 
     let mut figment = Figment::new().merge(Serialized::defaults(&defaults));
 
-    // 1) Global user-level config (with legacy fallback)
-    // If no explicit path, try default_config_path() which handles new→old fallback.
+    // 1) Global user-level config.
+    // If no explicit path, use default_config_path().
     let global_config = global_path.cloned().or_else(default_config_path);
     if let Some(document) = global_document {
         figment = figment.merge(Toml::string(document));
@@ -658,18 +656,19 @@ mod tests {
         assert_eq!(global.session_spend_cap_usd, Some(1.0));
     }
 
-    /// The old project-scoped filename is no longer read: a stale
-    /// `.opencode-rs.toml` in the project root must be ignored entirely
-    /// (nothing ever generated it — the rename predates first use).
+    /// Only the canonical project-scoped filename is read: a stale
+    /// project file under any other name must be ignored entirely (nothing
+    /// else ever generates one, and a stale file in a project repo must not
+    /// resurrect config values).
     #[test]
-    fn stale_opencode_rs_project_file_is_ignored() {
+    fn stale_alternate_project_file_is_ignored() {
         let dir = tempfile::tempdir().unwrap();
         let global_path = dir.path().join("config.toml");
         let project = dir.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(&global_path, format!("schema_version = {SCHEMA_VERSION}\n")).unwrap();
         std::fs::write(
-            project.join(".opencode-rs.toml"),
+            project.join(".stale-project.toml"),
             format!("schema_version = {SCHEMA_VERSION}\nsession_spend_cap_usd = 3.0\n"),
         )
         .unwrap();
@@ -677,24 +676,8 @@ mod tests {
         let cfg = load_config(Some(&global_path), Some(&project)).unwrap();
         assert_eq!(
             cfg.session_spend_cap_usd, None,
-            "stale .opencode-rs.toml must provide no overrides"
+            "a project file under a non-canonical name must provide no overrides"
         );
-    }
-
-    /// The old `OPENCODE_RS_*` env prefix is no longer merged by the config
-    /// loader — only `CONCERTO_*` applies.
-    #[test]
-    fn opencode_rs_env_prefix_is_not_merged() {
-        let dir = tempfile::tempdir().unwrap();
-        let fake_global = dir.path().join("nonexistent-config.toml");
-        std::env::set_var("OPENCODE_RS_SESSION_SPEND_CAP_USD", "9.0");
-        let cfg = load_config(Some(&fake_global), Some(dir.path())).unwrap();
-        assert_ne!(
-            cfg.session_spend_cap_usd,
-            Some(9.0),
-            "OPENCODE_RS_* env vars must not reach the config"
-        );
-        std::env::remove_var("OPENCODE_RS_SESSION_SPEND_CAP_USD");
     }
 
     #[test]

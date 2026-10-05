@@ -19,13 +19,12 @@ use concerto_core::CancellationToken;
 use notify::{RecommendedWatcher, RecursiveMode};
 use tokio::sync::mpsc;
 
-/// File names whose changes are forwarded. `config.toml` covers both the new
-/// and legacy global dirs (they share the file name); the project file is
-/// always the `.concerto.toml` era — the old `.opencode-rs.toml` project name
-/// is no longer read anywhere, so watching it would only produce dead
-/// signals. The ADR-58 blueprint include file is tracked too, so edits
-/// to `orchestration.blueprint.toml` propagate to the next run exactly like
-/// `config.toml` edits do (the reload path re-reads it at load time).
+/// File names whose changes are forwarded. `config.toml` covers the global
+/// config dir; the project file is always the `.concerto.toml` name, which
+/// is the only project file the loader reads. The ADR-58 blueprint include
+/// file is tracked too, so edits to `orchestration.blueprint.toml` propagate
+/// to the next run exactly like `config.toml` edits do (the reload path
+/// re-reads it at load time).
 const TRACKED_NAMES: [&str; 3] = [
     "config.toml",
     concerto_config::legacy::NEW_PROJECT_CONFIG_FILE,
@@ -40,10 +39,9 @@ fn is_tracked(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Compute the directory paths the watcher observes: the new global config
-/// dir (created on demand so file creation for a fresh install is observed),
-/// the legacy global config dir (watched only while it actually exists — all
-/// writes use the new path), and the active project dir.
+/// Compute the directory paths the watcher observes: the global config dir
+/// (created on demand so file creation for a fresh install is observed) and
+/// the active project dir.
 fn watched_dirs(project_dir: PathBuf) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(config_dir) = dirs::config_dir() {
@@ -55,10 +53,6 @@ fn watched_dirs(project_dir: PathBuf) -> Vec<PathBuf> {
                 dir = %new_dir.display(),
                 "failed to create config directory; it will not be watched"
             );
-        }
-        let legacy_dir = config_dir.join(concerto_config::legacy::OLD_CONFIG_DIR);
-        if legacy_dir.exists() {
-            paths.push(legacy_dir);
         }
     }
     paths.push(project_dir);
@@ -143,11 +137,10 @@ mod tests {
     #[test]
     fn tracked_names_cover_every_config_filename() {
         // The ADR-58 blueprint include file is tracked alongside config.toml:
-        // an edit must also propagate to the next run. The old
-        // `.opencode-rs.toml` project name is no longer read anywhere, so it
-        // must NOT be watched.
+        // an edit must also propagate to the next run. Only the canonical
+        // project file is tracked — anything else the loader ignores would
+        // only produce dead signals.
         assert_eq!(TRACKED_NAMES[2], concerto_config::blueprint::BLUEPRINT_INCLUDE_FILE);
-        assert!(!TRACKED_NAMES.contains(&".opencode-rs.toml"));
         for name in TRACKED_NAMES {
             assert!(is_tracked(&PathBuf::from(format!("/some/dir/{name}"))), "{name}");
         }

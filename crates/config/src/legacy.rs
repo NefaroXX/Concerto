@@ -1,151 +1,82 @@
-//! Legacy fallback support for the rename from `opencode-rs` → `concerto`.
+//! Canonical location names and path helpers.
 //!
-//! These helpers check the new `concerto` paths/names first and fall back
-//! to the old `opencode-rs` equivalents so existing installations continue
-//! working without manual migration.
+//! Every current name (config dir, data dir, env prefix, keyring service,
+//! project config file) is declared here so the rest of the workspace
+//! resolves those paths through one seam. Only these names are read: there
+//! are no alternate directories, env prefixes, or keyring services.
 //!
 //! # Design
-//! - **Read**: try new path → try old path → return what exists (or new path
-//!   as default when neither exists).
-//! - **Write**: always use the new path. Old data is never automatically
-//!   migrated — callers can optionally migrate on first write.
-//! - **Env vars**: `CONCERTO_*` is checked first. If a key is not found,
-//!   `OPENCODE_RS_*` is tried as a fallback in `CredentialStore` (the config
-//!   loader itself no longer reads `OPENCODE_RS_*` — only `CredentialStore`
-//!   keeps the legacy read).
-//! - **Keyring**: service name `concerto` is tried first; if an account is
-//!   not found, `opencode-rs` is tried as a fallback.
+//! - **Read/Write**: always the canonical path below.
+//! - **Env vars**: `CONCERTO_*` is the only merged prefix.
+//! - **Keyring**: service name `concerto`.
 
 use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
-// Old names (read-only reference — do not write to these)
+// Canonical names (use these for all reads and writes)
 // ---------------------------------------------------------------------------
 
-/// Old config directory name (e.g. `~/.config/opencode-rs/`).
-pub const OLD_CONFIG_DIR: &str = "opencode-rs";
-
-/// Old data directory name (e.g. `~/.local/share/opencode-rs/`).
-pub const OLD_DATA_DIR: &str = "opencode-rs";
-
-/// Old environment variable prefix. Retained only for the
-/// `CredentialStore` legacy read (the config loader no longer merges
-/// `OPENCODE_RS_*` env vars).
-pub const OLD_ENV_PREFIX: &str = "OPENCODE_RS_";
-
-/// Old keyring service name.
-pub const OLD_KEYRING_SERVICE: &str = "opencode-rs";
-
-// ---------------------------------------------------------------------------
-// New names (canonical — use these for all writes)
-// ---------------------------------------------------------------------------
-
-/// New config directory name (e.g. `~/.config/concerto/`).
+/// Config directory name (e.g. `~/.config/concerto/`).
 pub const NEW_CONFIG_DIR: &str = "concerto";
 
-/// New data directory name (e.g. `~/.local/share/concerto/`).
+/// Data directory name (e.g. `~/.local/share/concerto/`).
 pub const NEW_DATA_DIR: &str = "concerto";
 
-/// New environment variable prefix.
+/// Environment variable prefix.
 pub const NEW_ENV_PREFIX: &str = "CONCERTO_";
 
-/// New keyring service name.
+/// Keyring service name.
 pub const NEW_KEYRING_SERVICE: &str = "concerto";
 
-/// New project-scoped config filename.
+/// Project-scoped config filename.
 pub const NEW_PROJECT_CONFIG_FILE: &str = ".concerto.toml";
 
 // ---------------------------------------------------------------------------
-// Path helpers with fallback
+// Path helpers
 // ---------------------------------------------------------------------------
 
-/// Resolve the config directory path.
+/// Resolve the config file path (`~/.config/concerto/config.toml`).
 ///
-/// Returns the new path (`~/.config/concerto/config.toml`) if it exists,
-/// falling back to the old path (`~/.config/opencode-rs/config.toml`).
-/// When neither exists, returns the new path (callers will create it).
+/// Returns `None` when the platform has no resolvable config dir (e.g. some
+/// minimal containers); callers then fall back to defaults + env only.
 pub fn config_path() -> Option<PathBuf> {
-    let dir = dirs::config_dir()?;
-
-    let new_path = dir.join(NEW_CONFIG_DIR).join("config.toml");
-    if new_path.exists() {
-        return Some(new_path);
-    }
-
-    let old_path = dir.join(OLD_CONFIG_DIR).join("config.toml");
-    if old_path.exists() {
-        return Some(old_path);
-    }
-
-    Some(new_path)
+    Some(dirs::config_dir()?.join(NEW_CONFIG_DIR).join("config.toml"))
 }
 
-/// Resolve the project-scoped config file path.
+/// Resolve the project-scoped config file path (always `.concerto.toml`).
 ///
-/// Always returns the new name (`.concerto.toml`). The project file is
-/// typically gitignored and regenerated. The old `.opencode-rs.toml` name is
-/// no longer read — nothing ever generated it under the old name (the rename
-/// predates first use), and a stale file in a project repo must not
-/// resurrect config values.
+/// The project file is typically gitignored and regenerated; only this name
+/// is ever read, so a stale file under any other name in a project repo
+/// cannot resurrect config values.
 pub fn project_config_path(root: &std::path::Path) -> PathBuf {
     root.join(NEW_PROJECT_CONFIG_FILE)
 }
 
-/// Resolve the data directory path.
+/// Resolve the data directory path (`~/.local/share/concerto/`).
 ///
-/// Returns the new path (`~/.local/share/concerto/`) if it exists,
-/// falling back to the old path (`~/.local/share/opencode-rs/`).
-/// When neither exists, returns the new path.
+/// Returns `None` when the platform has no resolvable data dir.
 pub fn data_dir() -> Option<PathBuf> {
-    let dir = dirs::data_dir()?;
-
-    let new_dir = dir.join(NEW_DATA_DIR);
-    if new_dir.exists() {
-        return Some(new_dir);
-    }
-
-    let old_dir = dir.join(OLD_DATA_DIR);
-    if old_dir.exists() {
-        return Some(old_dir);
-    }
-
-    Some(new_dir)
+    Some(dirs::data_dir()?.join(NEW_DATA_DIR))
 }
 
-/// Resolve the data directory path, preferring the legacy path.
-///
-/// Use this for **read-only** operations where you specifically want the
-/// old location (e.g. plugin discovery that may have installed plugins
-/// under the old name).
-pub fn legacy_data_dir() -> Option<PathBuf> {
-    let dir = dirs::data_dir()?;
-    Some(dir.join(OLD_DATA_DIR))
-}
-
-/// Return the keyring service name to use, preferring the new name.
-///
-/// This does NOT check at runtime — it always returns the new name.
-/// The actual fallback logic lives in `CredentialStore` which tries
-/// the new service first and falls back to the old one on miss.
+/// Return the keyring service name used for credential reads and writes.
 pub fn keyring_service_name() -> &'static str {
     NEW_KEYRING_SERVICE
-}
-
-/// Return the old keyring service name (for fallback lookups).
-pub fn old_keyring_service_name() -> &'static str {
-    OLD_KEYRING_SERVICE
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The names are load-bearing: they must match what already exists on
+    /// disk and in the OS keychain, so a typo in any of them fails loudly.
     #[test]
-    fn constants_are_distinct() {
-        assert_ne!(NEW_CONFIG_DIR, OLD_CONFIG_DIR);
-        assert_ne!(NEW_DATA_DIR, OLD_DATA_DIR);
-        assert_ne!(NEW_ENV_PREFIX, OLD_ENV_PREFIX);
-        assert_ne!(NEW_KEYRING_SERVICE, OLD_KEYRING_SERVICE);
+    fn canonical_names_are_stable() {
+        assert_eq!(NEW_CONFIG_DIR, "concerto");
+        assert_eq!(NEW_DATA_DIR, "concerto");
+        assert_eq!(NEW_ENV_PREFIX, "CONCERTO_");
+        assert_eq!(NEW_KEYRING_SERVICE, "concerto");
+        assert_eq!(NEW_PROJECT_CONFIG_FILE, ".concerto.toml");
     }
 
     #[test]

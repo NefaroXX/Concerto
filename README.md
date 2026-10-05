@@ -29,7 +29,7 @@ describes what is actually implemented. For what is still open, see
 
 ## Origins
 
-Concerto was renamed from `opencode-rs` — a Rust reimplementation inspired by
+Concerto is a Rust reimplementation inspired by
 [OpenCode](https://github.com/sst/opencode), whose fingerprints are still on
 the architecture. The core idea this project is built around — one unified agent
 loop where the model picks its own tools and acts on tool feedback, governed by
@@ -37,10 +37,7 @@ per-tool permission rules instead of pre-classifying the request — comes from
 OpenCode's single-loop design together with Anthropic's *"Building Effective
 Agents"* augmented-LLM pattern; ADR-55
 ([docs/adrs/ADR-55-intent-routing-and-authorization.md](docs/adrs/ADR-55-intent-routing-and-authorization.md))
-credits both. Legacy `opencode-rs` paths and config names still survive in the
-tree as migration shims (`~/.config/opencode-rs/`,
-`~/.local/share/opencode-rs/`, `.opencode-rs.toml`, the `opencode-rs` keyring
-service).
+credits both.
 
 What diverged is everything around the loop: a first-match policy engine whose
 unmatched verdict is *deny*, not ask; a `VirtualFs` overlay that preserves
@@ -315,14 +312,11 @@ concerto --cli audit <session-id>   # one session's policy/tool audit trail
 Configuration is layered in this order:
 
 1. built-in defaults;
-2. the platform configuration file — `~/.config/concerto/config.toml` on Linux
-   (legacy `~/.config/opencode-rs/config.toml` locations are still recognized
-   for migration);
+2. the platform configuration file — `~/.config/concerto/config.toml` on Linux;
 3. a project-root `.concerto.toml` file;
 4. `CONCERTO_*` environment overrides (env always wins).
 
-The `CONCERTO_` prefix is the only recognized environment override prefix; the
-legacy `OPENCODE_RS_*` forms are no longer read.
+The `CONCERTO_` prefix is the only recognized environment override prefix.
 
 The optional `project_roots` list restricts which project directories can be
 opened. Set it as an array in the config file
@@ -379,8 +373,7 @@ credential store. At runtime, when no entry is stored, the provider factory
 falls back to `<PROVIDER>_API_KEY` (provider type uppercased):
 `OPENAI_API_KEY`, `OPENCODE_API_KEY`, `NIM_API_KEY`, `OPENROUTER_API_KEY`.
 Separately, with `CONCERTO_TEST_MODE=1`, lookups derive env vars from
-`keyring_key` (uppercased, `/`/`-` → `_`): `keyring_key = "openai/api_key"` →
-`CONCERTO_OPENAI_API_KEY`, legacy alias `OPENCODE_RS_OPENAI_API_KEY`.
+`keyring_key` (uppercased, `/`/`-` → `_`): `keyring_key = "openai/api_key"` → `CONCERTO_OPENAI_API_KEY`.
 
 **Verify the setup:**
 
