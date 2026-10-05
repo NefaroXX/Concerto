@@ -43,6 +43,9 @@ code changes.
 Accepted designs or referenced design docs, each carrying its own status line.
 These are **not** registers — for what is outstanding, use `DEFERRED.md`.
 
+- [codebase-world-class-plan.md](research/codebase-world-class-plan.md) — active
+  engineering plan restored at the project owner's request (2026-10-05);
+  implementation order and Codex/OpenCode coordination, not a deferred register
 - [custom-ai-shell-plan.md](custom-ai-shell-plan.md) — AI-native shell phases
   A–F; status: A and B implemented, C–F planned (deferred item: `DEFERRED.md`
   row 24)
@@ -63,6 +66,9 @@ These are **not** registers — for what is outstanding, use `DEFERRED.md`.
    and is not a plan either gets summarized into `DEFERRED.md` (if it is future
    work) or dropped. Rationale that a live doc or ADR still depends on is
    **moved into that doc**, not left in a research file (see rule 3).
+   Explicit retained-plan exception: `research/codebase-world-class-plan.md`
+   is an active engineering plan at the owner's request. Preserve that file;
+   its historical directory name does not make it disposable research.
 2. Deferred work is registered in [DEFERRED.md](DEFERRED.md) with a source, a
    re-entry condition, and a size. It does not live in a plan, an ADR, or
    `TODO.md`. A row must be readable on its own: quote the substance of any
