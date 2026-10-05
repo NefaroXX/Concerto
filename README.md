@@ -43,10 +43,9 @@ What diverged is everything around the loop: a first-match policy engine whose
 unmatched verdict is *deny*, not ask; a `VirtualFs` overlay that preserves
 originals for review or rejection; a supervised multi-agent coordinator with a
 delegation doctrine instead of a flat agent list; WASM plugins; an append-only
-audit trail; and SQLite-backed project memory. Concerto is not a fork — it
-shares no code with OpenCode — but it would not exist in this shape without it.
+audit trail; and SQLite-backed project memory.
 
-Concerto is not a fork of OpenCode and depends on no OpenCode code; the
+Concerto is not a fork of OpenCode and depends on no OpenCode code — the
 workspace has no `opencode` dependency and all of it is original. It would,
 though, not have this shape without OpenCode.
 
@@ -73,10 +72,11 @@ state, and authorization on your machine:
 ## Features
 
 **Two native frontends.** The `concerto-desktop` Iced 0.14 GUI provides chat,
-a diff viewer, an integrated terminal panel, memory explorer, settings, an
-orchestration studio, a tool activity log, and a spend log. The
-`concerto-cli` ratatui TUI provides an independent chat, approvals, diff
-review, provider setup, and single/multi-agent execution.
+a diff viewer, an in-app code editor, an integrated terminal panel, a memory
+explorer and graph, an agent graph, settings, an orchestration studio, a tool
+activity log, and a spend log. The `concerto-cli` ratatui 0.29 TUI provides an
+independent chat, approvals, diff review, provider setup, and single/multi-agent
+execution.
 
 **Single- and multi-agent execution.** A streaming plan/act/observe loop with
 bounded continuation, cancellation, cycle detection, and recoverable-error
@@ -115,13 +115,16 @@ command, or a recorded coordinator declaration. No evidence still reports
 Partial rather than Success. (The remaining C-06 work is the *manual*
 build-then-accept/reject cycle on disk, tracked in `docs/DEFERRED.md` row 34.)
 
-**Provider support.** OpenAI, Anthropic, Google Gemini, OpenRouter, Ollama,
-NVIDIA NIM, OpenCode-compatible endpoints, and a config-first catalog of
-OpenAI-compatible providers — Anthropic, OpenAI, OpenCode, Google, OpenRouter,
-NIM, Ollama, DeepSeek, Groq, Together, Mistral, xAI, Fireworks, Cerebras,
-Cohere, DeepInfra, Perplexity, SambaNova, DashScope, Moonshot, Zhipu, and
-Novita — through a shared streaming interface with retry/backoff and token
-metering.
+**Provider support.** **23 provider ids** are registered in `PROVIDER_TYPE_IDS`
+(`crates/providers/src/provider_defs.rs`): Anthropic, OpenAI, Google,
+OpenRouter, NIM, Ollama, OpenCode Zen, OpenCode Zen (free), DeepSeek, Groq,
+Together, Mistral, xAI, Fireworks, Cerebras, Cohere, DeepInfra, Perplexity,
+SambaNova, DashScope, Moonshot, Zhipu, and Novita — all reachable from one
+config-first catalog through a shared streaming interface with retry/backoff
+and token metering. What is *not* here is the Tier-3 tier: GitHub Copilot,
+Amazon Bedrock, Azure OpenAI, Google Vertex, and IBM watsonx are full agent
+SDKs rather than API endpoints, and none has a wrapper (DEFERRED row 6;
+[missing-providers.md](docs/missing-providers.md)).
 
 **Policy governance.** Every file write, shell command, and git operation
 passes through `SimplePolicyEngine` and the `VirtualFs` overlay — there is no
@@ -231,19 +234,25 @@ details.
 Linux is the primary development platform; macOS and Windows are not yet part
 of the verified test matrix.
 
-- Rust 1.88 or newer (the workspace MSRV). CI formats and lints with Rust
-  1.96.0.
+- Rust 1.88 or newer (the workspace MSRV). CI, and `rust-toolchain.toml`,
+  pin formatting, linting, and testing to Rust 1.96.0.
 - The `wasm32-wasip2` Rust target — required to build the
   `test-*-plugin-wasm` crates in the workspace.
 - A C toolchain and the platform development libraries used by SQLite, TLS,
   keyring, protobuf, and Iced/wgpu (X11/Wayland/GL/Vulkan on Linux).
-- Node.js on `PATH` — CI verifies it at the start of every job.
-- `cargo-nextest` and `cargo-deny` to reproduce all CI checks.
+- `cargo-deny` to reproduce the supply-chain job, and `cargo-nextest` only if
+  you want the faster local test runner [TESTING.md](TESTING.md) uses.
 
-On Debian/Ubuntu, typical development packages include `build-essential`,
-`pkg-config`, `libssl-dev`, `libsqlite3-dev`, `clang`, `protobuf-compiler`,
-and the X11/Wayland/Vulkan development packages required by wgpu. Package
-names vary by distribution.
+CI installs exactly this system set on `ubuntu-latest`:
+
+```bash
+sudo apt-get install -y --no-install-recommends \
+  libdbus-1-dev pkg-config libssl-dev libsqlite3-dev
+```
+
+A local full-GUI build additionally needs the X11/Wayland/Vulkan development
+packages wgpu links against, plus a protobuf compiler. Package names vary by
+distribution.
 
 ## Installation
 
@@ -278,11 +287,15 @@ cargo run -p concerto -- config keys
 cargo run -p concerto -- config set retry.max_attempts 5
 ```
 
-Every subcommand (`audit`, `health`, `sessions`, `providers`, `projects`,
-`config`, `logs`, `memory`, `plugin`, `extensions`) is dispatched by
-`concerto-cli`, so a default build runs it without `--cli`; `--cli` forces the
-terminal UI. On a build compiled with only the desktop feature, a subcommand
-such as `concerto audit <id>` launches the GUI and ignores the arguments.
+Fifteen subcommands are dispatched by `concerto-cli` — `audit`, `agents`,
+`blueprint`, `config`, `credentials`, `extensions`, `health`, `logs`, `memory`,
+`plugin`, `preferences`, `projects`, `providers`, `sessions`, and `shell` — so a
+default build runs any of them without `--cli`; `--cli` forces the terminal UI.
+On a build compiled with only the desktop feature, a subcommand such as
+`concerto audit <id>` launches the GUI and ignores the arguments. Run
+`concerto --help` for the per-subcommand action lists, or
+[CLI settings and management commands](docs/cli-settings.md) for the full
+reference.
 
 For a terminal-only build, use `--no-default-features --features cli`.
 
@@ -302,10 +315,14 @@ Useful read-only checks (a default build selects the CLI for them; `--cli`
 forces it):
 
 ```bash
-concerto --cli health        # resolved provider stack, tier-1 default
-concerto --cli config doctor # config file, key presence
-concerto --cli audit <session-id>   # one session's policy/tool audit trail
+concerto --cli health              # resolved provider stack, tier-1 default
+concerto --cli config doctor       # config file, key presence
+concerto --cli audit <session-id>  # one session's policy/tool audit trail
+concerto --cli extensions list     # skills and MCP servers actually present
+concerto --cli memory graph        # the project memory graph
 ```
+
+`concerto --help` lists all fifteen subcommands and their actions.
 
 ## Configuration
 
@@ -370,10 +387,13 @@ reasoning_echo = "always"              # "always" | "if-present"
 
 **Key without the keychain.** `keyring_key` names an entry in the OS
 credential store. At runtime, when no entry is stored, the provider factory
-falls back to `<PROVIDER>_API_KEY` (provider type uppercased):
-`OPENAI_API_KEY`, `OPENCODE_API_KEY`, `NIM_API_KEY`, `OPENROUTER_API_KEY`.
-Separately, with `CONCERTO_TEST_MODE=1`, lookups derive env vars from
-`keyring_key` (uppercased, `/`/`-` → `_`): `keyring_key = "openai/api_key"` → `CONCERTO_OPENAI_API_KEY`.
+falls back to `<PROVIDER>_API_KEY`, with the provider type uppercased verbatim
+(`crates/providers/src/factory.rs`): `OPENAI_API_KEY`, `OPENCODE_API_KEY`,
+`NIM_API_KEY`, `OPENROUTER_API_KEY`. Note the one hyphenated id —
+`provider = "opencode-free"` becomes `OPENCODE-FREE_API_KEY`, not
+`OPENCODE_FREE_API_KEY`. Separately, with `CONCERTO_TEST_MODE=1`, lookups
+derive env vars from `keyring_key` (uppercased, `/`/`-` → `_`):
+`keyring_key = "openai/api_key"` → `CONCERTO_OPENAI_API_KEY`.
 
 **Verify the setup:**
 
@@ -398,28 +418,46 @@ In multi-agent mode the fallback ladder re-dispatches a failed role on
 
 ## Testing and verification
 
-The GitHub Actions workflow at `.github/workflows/ci.yml` is authoritative;
-it pins formatting, linting, and testing to Rust 1.96.0 via
-`rust-toolchain.toml` and sets `RUSTFLAGS="-D warnings"`.
+The GitHub Actions workflow at `.github/workflows/ci.yml` is authoritative. It
+runs on pushes and pull requests to `main` and `dev`, pins the toolchain to
+1.96.0 via `rust-toolchain.toml`, and splits the checks into eight independent
+jobs that deliberately declare no `needs:`, so one failure never masks another:
+
+| Job | What it runs |
+|---|---|
+| `fmt` | `cargo fmt --all -- --check` |
+| `clippy` | `cargo clippy --workspace --all-targets -- -D warnings` |
+| `test` | `cargo test --workspace` (unit, integration, **and** doc tests) |
+| `build` | `cargo build --workspace`, plus CLI smoke-runs and both single-frontend feature combinations |
+| `bench` | compiles and smoke-runs every `[[bench]]` target with `--test` (no timing assertion) |
+| `wasm-plugins` | builds the four `test-*-plugin-wasm` crates for `wasm32-wasip2` |
+| `deny` | `cargo deny check` (licenses, bans, advisories — policy in `deny.toml`) |
+| `ui-colors` | `scripts/check-hardcoded-colors.sh` — desktop `views/` and `ui/` must use `theme.palette.*`, never `Color::from_rgb`, `Color::{BLACK,WHITE,TRANSPARENT}`, or hex literals |
+
+To reproduce them locally:
 
 ```bash
+rustup target add wasm32-wasip2     # required before building the workspace
 cargo build --workspace
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-CONCERTO_TEST_MODE=1 cargo test --workspace        # or: cargo nextest run --workspace
-cargo test --workspace --doc
+CONCERTO_TEST_MODE=1 cargo test --workspace
 cargo deny check
 ```
 
-- `CONCERTO_TEST_MODE=1` is the documented (but currently unused) switch for
-  credential tests. Test-mode behavior is actually selected per-call via
-  `CredentialStore::from_env()`; the one test asserting the production store
-  is intentionally backend-agnostic so the suite stays green without a
-  keychain. It is safe to omit it, but passing it costs nothing and matches
-  CI.
-- `rustup target add wasm32-wasip2` is required before building the workspace.
-- Treat rustc warnings as errors locally too: the workspace lints deny
-  `clippy::all` and `unsafe_code`.
+- `CONCERTO_TEST_MODE=1` matches the `test` job. It is safe to omit: the only
+  test that reaches the real keychain
+  (`config::credentials::default_store_is_not_test_mode`) asserts constructor
+  semantics without touching the backend, and test-mode credential access is
+  otherwise selected per call via `CredentialStore::from_env()`. `TESTING.md`
+  additionally uses `cargo nextest run --workspace` plus
+  `cargo test --workspace --doc` as its faster local equivalent.
+- Warnings are errors, but not via `RUSTFLAGS`: the `clippy` job passes
+  `-D warnings` on the command line, and `[workspace.lints]` in `Cargo.toml`
+  denies `clippy::all` and `unsafe_code` for every crate. Match that locally.
+- Other workflows, not part of the PR gate: `bench-baseline.yml` (scheduled
+  timing regression against a stored baseline), `dev-build.yml`,
+  `native-shell.yml`, and the tag-triggered `release.yml`.
 
 ## Project layout
 
@@ -442,13 +480,23 @@ details.
 
 ## Documentation map
 
+[docs/README.md](docs/README.md) is the index for everything under `docs/`.
+Start with these:
+
 - [Current Status](docs/STATUS.md) — implemented, maturing, and deferred scope
+- [Deferred Work Register](docs/DEFERRED.md) — the single source of truth for
+  "not done", with a re-entry condition per row
 - [Testing](TESTING.md) — automated checks and tester report sheet
 - [Roadmap](ROADMAP.md) — active priorities, not an assertion of completion
 - [Architecture](docs/architecture.md) — runtime data flow and crate ownership
+- [Crate graph](docs/crate-graph.md) — who depends on whom
 - [Architecture Decision Records](docs/adrs/README.md) — numbered, append-only design history
 - [Security Boundaries](SECURITY_BOUNDARIES.md) — enforced boundaries and gaps
+- [Security threat model](docs/security-threat-model.md) — the analysis behind them
+- [HTTP API schema](docs/api/openapi.json) — the api-server surface
 - [Changelog](CHANGELOG.md) — released and unreleased changes
+- [AGENTS.md](AGENTS.md) — the map AI coding agents are pointed at in this repo
+- [TODO.md](docs/TODO.md) — unstarted work that has no deferral decision yet
 
 ## Contributing
 
@@ -466,9 +514,10 @@ details. Do not include API keys or private source code.
 
 ## Acknowledgements
 
-Concerto stands on the Rust ecosystem — notably Tokio, Iced, ratatui, SQLx,
-figment, wasmtime, tree-sitter, fastembed, and Axum — and follows the
-[Contributor Covenant](CODE_OF_CONDUCT.md) for community conduct.
+Concerto stands on the Rust ecosystem — notably Tokio, SQLx, Axum, Iced,
+ratatui, figment, wasmtime, tree-sitter, fastembed, gix, imara-diff, and
+syntect — and follows the [Contributor Covenant](CODE_OF_CONDUCT.md) for
+community conduct.
 
 ## Citation
 
