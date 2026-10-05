@@ -1847,7 +1847,11 @@ mod tests {
             assert_eq!(facts.attempted_path.as_deref(), Some("sub/file.txt"));
             let resolved = facts.resolved_path.expect("the path resolves inside the workspace");
             assert!(
-                resolved.ends_with("sub/file.txt"),
+                // Compare as paths, not as strings: the confined path is
+                // canonical (Windows returns the verbatim `\\?\C:\...` form),
+                // so its separator is `\` while the input's is `/`. `Path`
+                // parses both, `str::ends_with` does not.
+                std::path::Path::new(&resolved).ends_with("sub/file.txt"),
                 "resolved path {resolved} must be the confined target"
             );
         }
