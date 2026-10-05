@@ -7,7 +7,7 @@
 **Supersedes:** nothing new — codifies the provider-execution layer that
 [ADR-31](./ADR-31.md) (model-first selection) and [ADR-49](./ADR-49-config-first-catalog.md)
 (config-first catalog) sit on top of; supersedes-in-part the archived
-[ADR-24](./archive/ADR-24.md) framing of provider/model pairing.
+[ADR-24](./ADR-24.md) framing of provider/model pairing.
 
 ## Context
 
@@ -154,7 +154,7 @@ does not exist on this path.
 - **Per-crate provider traits (orchestrator defines its own interface):**
   rejected — it would invert the dependency direction and force
   `concerto-providers` to know about orchestration concerns.
-- **Capability-tier model ranking (archived ADR-24 lineage):** rejected —
+- **Capability-tier model ranking (superseded ADR-24 lineage):** rejected —
   subjective numeric tiers made valid selections fail and decoupled model
   choice from the serving provider; objective compatibility metadata
   (tool-call support, context window) does the same job honestly.

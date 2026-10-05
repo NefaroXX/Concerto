@@ -16,7 +16,7 @@ use concerto_core::types::Message;
 use concerto_orchestrator::session_manager::{ProjectSessionManager, SessionManagerConfig};
 use concerto_sessions::SessionError;
 
-/// Build the session-manager config from the app config. A missing `[tools]`
+/// Build the session-manager config from the app config. A missing `[tool_settings]`
 /// section (or a missing config at all — e.g. `AppConfig::default()`) keeps
 /// `git_auto_init` at its default ON behavior.
 fn session_manager_config(config: &AppConfig) -> SessionManagerConfig {
@@ -38,7 +38,7 @@ impl DesktopSessionHandler {
     }
 
     /// Open the default on-disk session store, honoring the app config's
-    /// `[tools] git_auto_init` flag for automatic repository initialization.
+    /// `[tool_settings] git_auto_init` flag for automatic repository initialization.
     pub async fn connect_with_config(config: &AppConfig) -> Result<Self, SessionError> {
         let manager =
             ProjectSessionManager::connect_with_config(session_manager_config(config)).await?;

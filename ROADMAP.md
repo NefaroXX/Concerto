@@ -3,8 +3,9 @@
 This document describes active priorities. It is not a completion claim. The
 original phase plan is preserved by Git history and the architectural decisions
 in `docs/adrs/`; current behavior is documented in
-[Current Status](docs/STATUS.md), and the fine-grained pending-work list lives
-in [docs/TODO.md](docs/TODO.md).
+[Current Status](docs/STATUS.md), the outstanding-work register is
+[docs/DEFERRED.md](docs/DEFERRED.md), and the short list of unstarted work with
+no deferral decision is [docs/TODO.md](docs/TODO.md).
 
 ## Product direction
 
@@ -148,13 +149,13 @@ section keeps only the items that shape the roadmap.
 - **Hybrid UI full scope** (post-1.0): split Settings into tabbed sub-views,
   Studio split pane, drag-and-drop agent assignment, focus-trap system —
   `docs/hybrid-ui-plan.md`.
-- **Codebase-world-class Phases 1–5** (from
-  `docs/research/codebase-world-class-plan.md`, an aspirational estimate rather
-  than a schedule): Phase 3 shipped (`10357cd` — two-tier criterion gate in CI).
-  The rest of the real work is registered per-item, not per-phase: hotspot and
-  module decomposition, duplicate error types, and the cancellation audit are
-  `docs/DEFERRED.md` row 34; coverage breadth and the eval live leg are row 17;
-  the security/polish theme is `docs/security-threat-model.md` §6.
+- **Codebase-world-class Phases 1–5** (from a 2026-08 aspirational estimate,
+  since removed — it was never a schedule): Phase 3 shipped (`10357cd` — two-tier
+  criterion gate in CI). The rest of the real work is registered per-item, not
+  per-phase: hotspot and module decomposition, duplicate error types, and the
+  cancellation audit are `docs/DEFERRED.md` row 34; coverage breadth and the eval
+  live leg are row 17; the security/polish theme is
+  `docs/security-threat-model.md` §6.
 - **Coordinator restart/resume:** checkpoint persistence to the session
   database exists (`coordinator.rs::persist_checkpoint`); ADR-65 Phase 7
   (evidence-driven resume at the whiteboard cursor, checkpoint schema v4) is
@@ -166,8 +167,8 @@ section keeps only the items that shape the roadmap.
   rank-ordered (`crates/memory/src/fts.rs:148,160-163`;
   `crates/memory/src/rag.rs:412-459`); the stored `score: 1.0` is inert by
   construction (`crates/memory/src/sync.rs:61,130`), proven by
-  `crates/memory/src/fts.rs:404-450,458-498`. (archive/STUB-FINDINGS.md #6,
-  DEFERRED closed row 12.)
+  `crates/memory/src/fts.rs:404-450,458-498`. (2026-08 stub audit #6, removed
+  2026-09-28; `DEFERRED.md` closed row 12.)
 - **Provider reach follow-ups:** the named OpenAI-compatible wrappers are
   implemented (22 provider ids); remaining work is the *flat*/content-embedded
   tool-call parsing for proxies documented in `docs/proxy-tool-call-fix.md`
@@ -283,12 +284,12 @@ historical numbers. Files are uniformly named `docs/adrs/ADR-NN.md`.
 | [06](docs/adrs/ADR-06.md) | File watching | Accepted |
 | [07](docs/adrs/ADR-07.md) | Terminal UI — `ratatui` | Accepted |
 | [08](docs/adrs/ADR-08.md) | Desktop UI — `iced` | Accepted |
-| [10](docs/adrs/ADR-10.md) | Vector store — superseded | Superseded in implementation by SQLite vector/FTS store |
+| [10](docs/adrs/ADR-10.md) | Vector store — LanceDB (superseded) | Superseded in implementation by SQLite vector/FTS store |
 | [11](docs/adrs/ADR-11.md) | Multi-instance file locking | Accepted |
 | [12](docs/adrs/ADR-12.md) | Embedding versioning | Accepted |
 | [14](docs/adrs/ADR-14.md) | Plugin architecture — WASM | Accepted |
 | [16](docs/adrs/ADR-16.md) | Context overflow strategy | Accepted (updated for Phase 4) |
-| [19](docs/adrs/ADR-19.md) | Multi-agent orchestration | Accepted; routing superseded by ADR-24 |
+| [19](docs/adrs/ADR-19.md) | Multi-agent orchestration | Accepted; routing superseded by ADR-31 |
 | [20](docs/adrs/ADR-20.md) | Desktop UI architecture | Accepted |
 | [21](docs/adrs/ADR-21.md) | WASM plugin implementation | Partially superseded by implementation |
 | [22](docs/adrs/ADR-22.md) | Hybrid retrieval ranking — RRF | Accepted |
@@ -340,6 +341,9 @@ historical numbers. Files are uniformly named `docs/adrs/ADR-NN.md`.
 | [69](docs/adrs/ADR-69-symbolic-cascade.md) | Symbolic cascade — link store, scoring, and observability in slices | Accepted |
 | [70](docs/adrs/ADR-70-project-agents-md-context-injection.md) | Project AGENTS.md context injection | Accepted |
 | [71](docs/adrs/ADR-71-coordinator-supremacy.md) | Coordinator Supremacy — the coordinator is the sole master of a run | Accepted |
+| [72](docs/adrs/ADR-72-containerized-sandbox-profile.md) | Containerized sandbox profile — OS-level isolation via a container runtime | Accepted — implemented on Linux/macOS; Windows unsupported, fails closed |
+| [73](docs/adrs/ADR-73-audit-encryption-and-retention.md) | Audit-Log Encryption at Rest and Bounded Retention | Accepted — implemented; supersedes ADR-40 §Decision item 3 only |
+| [74](docs/adrs/ADR-74-delegation-doctrine-and-ladder-hold.md) | Delegation Doctrine — delegate by default, hold a rung before demoting it | Accepted — implemented; refines ADR-71, amends ADR-35 §8 |
 
 When current behavior supersedes an ADR decision, update that ADR's status or
 add a superseding ADR; do not silently rewrite its historical context.

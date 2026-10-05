@@ -4,7 +4,9 @@
 **Date:** 2026-08-04
 **Deciders:** Concerto architecture
 **Extends:** ADR-14 (plugin architecture — WASM), ADR-37 (plugin capability grant lifecycle), ADR-26 (fault containment and recovery)
-**Plan:** `docs/research/skills-mcp-extensions-plan.md` (plan; shipped reality is `docs/skills.md` + `docs/mcp.md`)
+**Plan:** the 2026-08 skills/MCP/extensions plan (removed 2026-09-28 with the rest
+of `docs/research/`); the shipped reality is `docs/skills.md` + `docs/mcp.md`, which
+is where anything still load-bearing from that plan now lives.
 
 ## Context
 

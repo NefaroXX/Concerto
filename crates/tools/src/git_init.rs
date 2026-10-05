@@ -5,7 +5,7 @@
 //! writing files. This is deliberately conservative: it only runs a bare
 //! `git init` — no initial commit, no `.gitignore`, no identity, no remotes.
 //! Creating the first commit remains the agent's job. The behavior is
-//! opt-out-able via the `[tools] git_auto_init` config key (default true).
+//! opt-out-able via the `[tool_settings] git_auto_init` config key (default true).
 
 use camino::Utf8Path;
 use std::process::Command;

@@ -1,13 +1,8 @@
-# ADR-27: Integrated desktop terminal lifecycle
+# ADR-27: Integrated Desktop Terminal Lifecycle — superseded
 
-> **Archived — superseded by ADR-30 (unified agent shell selection) and
-> ADR-20 (terminal lifecycle consolidated into the desktop-UI ADR;
-> consolidated 2026-08-22).** See [docs/adrs/README.md](./README.md) for the
-> current index.
+> **Superseded.** The decision this number carried is no longer in force; it is
+> consolidated in [ADR-30](./ADR-30.md). This entry exists only so
+> historical references to ADR-27 resolve, and records no current design. No
+> full text of the superseded decision is retained.
 >
-> The full historical text lives at [archive/ADR-27.md](./archive/ADR-27.md).
-> This stub is not active guidance.
-
----
-
-*Last updated: 2026-08-22 (retrospective consolidation — see [README](./README.md)).*
+> See [docs/adrs/README.md](./README.md) for the current index.

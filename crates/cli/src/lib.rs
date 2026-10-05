@@ -2536,11 +2536,31 @@ keyring_key = "providers/openai-1/api_key"
         // No config present: `extensions list` falls back to defaults and
         // must still print both sections (skills discovery is skipped while
         // skills are disabled by default, and there are no MCP servers).
+        //
+        // The config path is process-global (`dirs::config_dir()` honours
+        // `XDG_CONFIG_HOME`), so without ENV_LOCK + an isolated config dir
+        // this test can resolve `default_config_path()` into a sibling test's
+        // temp dir while that test still holds `concerto/config.toml`, then
+        // read it after the sibling's TempDir was dropped — the CI failure
+        // (`ENOENT on <other test>/xdg-config/concerto/config.toml`). Point
+        // XDG_CONFIG_HOME at this test's own temp dir for the whole call so
+        // "no config present" is a stable state, not a race.
+        let _guard = ENV_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
+        let xdg_config = temp.path().join("xdg-config");
+        std::fs::create_dir_all(&xdg_config).unwrap();
+        let old_config = std::env::var("XDG_CONFIG_HOME").ok();
+        std::env::set_var("XDG_CONFIG_HOME", &xdg_config);
+
         let proj = temp.path().join("project");
         std::fs::create_dir_all(&proj).unwrap();
 
         let result = run_extensions_subcommand(&["list".to_string()], &proj);
+
+        match &old_config {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
 
         assert!(result.is_ok(), "extensions list should succeed: {:?}", result.err());
     }

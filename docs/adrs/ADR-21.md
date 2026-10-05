@@ -1,12 +1,8 @@
-# ADR-21: WASM Plugin Implementation — Runtime, Host ABI, Capability Model
+# ADR-21: WASM Plugin Implementation — superseded
 
-> **Archived — superseded by ADR-14 (consolidated 2026-08-22), which carries
-> the full living plugin-system design; async host functions are specified in
-> ADR-38.** See [docs/adrs/README.md](./README.md) for the current index.
+> **Superseded.** The decision this number carried is no longer in force; it is
+> consolidated in [ADR-14](./ADR-14.md) and [ADR-38](./ADR-38.md). This entry
+> exists only so historical references to ADR-21 resolve, and records no current
+> design. No full text of the superseded decision is retained.
 >
-> The full implementation-phase record lives at
-> [archive/ADR-21.md](./archive/ADR-21.md). This stub is not active guidance.
-
----
-
-*Last updated: 2026-08-22 (retrospective consolidation — see [README](./README.md)).*
+> See [docs/adrs/README.md](./README.md) for the current index.

@@ -21,8 +21,9 @@ Relationship to prior ADRs). Every other settled ADR remains in force.
 
 ## Context
 
-The governing principle is "everything is config data"
-(`docs/research/ARCHITECTURE-V2.md`). The product directive: a pipeline with a fixed,
+The governing principle is "everything is config data" (the 2026-08
+provider-first redesign plan, removed 2026-09-28 with the rest of
+`docs/research/`). The product directive: a pipeline with a fixed,
 source-baked stage vocabulary is a pipeline of **hardcoded agents** — even
 though ADR-35 replaced hardcoded role IDs with stage tags, it data-fied only
 the vocabulary; the semantics behind those tags stayed in source. Users edit

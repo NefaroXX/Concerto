@@ -5,8 +5,8 @@
     is the flat text/content model on `concerto_core::types::Message` today.
 **Date:** 2026-08-08
 **Deciders:** Concerto architecture
-**Supersedes:** Phase 2 of the provider-first redesign plan
-    (`docs/research/ARCHITECTURE-V2.md`) — the canonical-IR "message parts" item that
+**Supersedes:** Phase 2 of the provider-first redesign plan (removed 2026-09-28
+    with the rest of `docs/research/`) — the canonical-IR "message parts" item that
     this decision ratifies, then defers.
 **Composes with:** ADR-46 (reasoning-as-data) — `reasoning_content` stays a
     flat `Option<String>` and only becomes a full `Part` during the dialect
@@ -14,8 +14,7 @@
 
 ## Context
 
-The V2 redesign defines a canonical IR with structured message content
-(`docs/research/ARCHITECTURE-V2.md` §2.1):
+The 2026-08 V2 redesign defined a canonical IR with structured message content:
 
 - `Part` sealed enum: `Text { text }`, `Reasoning { text }`,
   `ToolCall { id, name, args }`, `ToolResult { id, name, content }`,
@@ -101,7 +100,7 @@ with the persistence migration in one scoped change and update ADR-46's
   thinking-with-signature) is unavailable until shipped. Every dialect still
   lowers flat content to its wire form.
 - **Risks.** The planned parts migration is one of the largest serialization
-  surface changes in the codebase — `docs/research/ARCHITECTURE-V2.md` §10 risks:
+  surface changes in the codebase — the V2 design's own risk note was:
   "Message/Parts rollout touches persistence format — keep `serde(default)` +
   legacy column fallback so old DBs replay." Because it is deferred, the flat
   shape must stay byte-identical so nothing silently starts depending on a
