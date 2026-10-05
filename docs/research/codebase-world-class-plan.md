@@ -1,324 +1,273 @@
 # Codebase Improvement Plan: World-Class Engineering
 
-> **Moved to `docs/research/` 2026-09-28.** An aspirational estimate
-> (2026-08-06), not a schedule. Since then: Phase 0 merged (PR #63); Phase 3
-> criterion benchmarks + a two-tier CI gate landed (`10357cd`,
-> `.github/workflows/bench-baseline.yml`); the secret sanitizer, hardened WASM
-> capability sandbox, and threat-model work in Phases 4–5 landed (threat
-> gaps #1–#9 are tracked in
-> [`docs/security-threat-model.md`](../security-threat-model.md) §6). The
-> outstanding real items are in
-> [`docs/DEFERRED.md`](../DEFERRED.md) (module decomposition, duplicate error
-> names, cancellation audit).
+> **Reconciled: 2026-10-04 (Africa/Johannesburg).** Source baseline:
+> [`dev` at `345c429d20af5bd2840475f022a935829e483a77`](https://github.com/NefaroXX/Concerto/commit/345c429d20af5bd2840475f022a935829e483a77),
+> committed 2026-10-03 UTC.
+> This replaces the 2026-08-06 assessment and its 8–12 week estimate.
+> Status means present in that snapshot; an open PR is not shipped.
+> [DEFERRED.md](../DEFERRED.md) remains the deferred-work register.
+> This document reconciles the engineering programme and specifies the next
+> task; it does not create a second authority for deferred product features.
 
-**Verdict on Feasibility: Highly Feasible — 8–12 weeks of disciplined work**
+## Assessment and evidence limits
 
-The codebase is already above average for a Rust project of this size (25 crates, 78k lines). Several pieces — SimplePolicyEngine, EventBus, Plugin SDK, VirtualFs, Error Taxonomy — are already world-class. The gap is concentrated in specific areas: cognitive complexity hotspots, test coverage in peripheral crates, and the desktop/CLI UI layers.
+Concerto has a substantial policy, event, persistence, provider, and testing
+foundation. Several original refactoring targets are already implemented.
+The remaining engineering burden is concentrated in orchestration module
+size, enforceable test-quality gates, cancellation contracts, frontend
+configuration parity, and verification of security boundaries.
 
-The foundation is solid. You're not lifting a rusty ship — you're polishing a near-complete one.
+The old "already world-class", zero-vulnerability, zero-warning, complexity,
+LOC, and test-count assertions were not current measurements. They are
+retired, along with the blanket 1,500-test target and hour/week estimates.
+Passing configured checks is evidence for those checks, not a security or
+coverage certification.
 
----
+This reconciliation inspected the repository tree, the affected source
+modules, manifests, tests, fuzz targets, CI workflows, and open PRs through
+GitHub. It did not execute Rust builds, fuzzing, mutation testing, profiling,
+or desktop UI checks. Existing
+[CI](https://github.com/NefaroXX/Concerto/actions/runs/37155188939) and
+[Windows build](https://github.com/NefaroXX/Concerto/actions/runs/37155188918)
+runs for the baseline commit completed successfully; those are upstream
+results, not checks run for this document.
 
-## 📊 Current State Assessment
+## What changed since the original plan
 
-### Already World-Class (Tier 1, ❄️ Minimal Work)
+| Original item | Current status | Evidence / remaining work |
+|---|---|---|
+| Phase 0 groundwork | Landed, with documentation-lint drift | Shell-parser and tree-sitter property suites exist; runtime/coordinator phases have named helpers. Reviewed library roots now use `#![allow(missing_docs)]`, rather than the proposed warning. See [Cargo.toml](../../Cargo.toml), [parser](../../crates/shell/src/parser.rs), [tree-sitter](../../crates/memory/src/treesitter.rs). |
+| Markdown `render()` state machine | Implemented | [markdown.rs](../../crates/desktop/src/widgets/markdown.rs) has `MarkdownRenderer`, tag/event handlers, cached `MarkdownDoc`, and truncated-render tests. Preserve these; do not schedule the original rewrite again. Visual fidelity still needs UI evidence when rendering changes. |
+| Settings / former Studio editor modularization | Implemented or superseded; size reduction incomplete | [settings/](../../crates/desktop/src/views/settings/) and [code_editor/](../../crates/desktop/src/views/code_editor/) are the current modules; the old `studio_editor.rs` and `views/studio/` paths are absent. Large settings state/view modules and `orchestration_studio.rs` remain. |
+| Rust entity extraction helpers | Implemented | [entities.rs](../../crates/memory/src/entities.rs) delegates to `try_extract_fn/struct/enum/trait/impl`. Other parsers should be assessed independently, without reusing the old complexity scores. |
+| OpenAI `build_chat_body()` refactor | Original target superseded | [openai.rs](../../crates/providers/src/openai.rs) uses `Dialect` / `OpenAiChatDialect` and `render_body`; body ownership is in [adapters/](../../crates/providers/src/adapters/). Review current stream/dialect contracts rather than refactoring a retired function. |
+| Plugin host-function registration | Handlers extracted | [host_fns.rs](../../crates/plugins/src/host_fns.rs) has separate async `host_*` functions and explicit ABI registration. A heterogeneous function-pointer table is not a required improvement. Security of the handlers is a separate concern below. |
+| `run_shared_agent`, coordinator, agent-loop phases | Helpers landed; structural debt remains | Named setup, execution, retry, restore, and reconciliation helpers exist. Their containing modules have grown substantially; this is partial completion, not a renewed claim that all complexity disappeared. |
+| Duplicate `MemoryError` | Closed | [memory/src/lib.rs](../../crates/memory/src/lib.rs) re-exports core's error. Remaining same-name public errors are `SessionError` and `EvalError`, deliberately deferred as API changes in [TODO audit cleanups](../TODO.md#audit-cleanups-deferredmd-row-34). |
+| LSP test infrastructure | Present | [LSP integration tests](../../crates/lsp/tests/) cover client, manager, and tools; source modules also contain tests. The old "7 tests / most urgent empty crate" assessment is obsolete. Pending-I/O cancellation still needs contract coverage. |
+| Criterion benchmarks | Implemented | Seven targets: policy, serialization, FTS search, vector retrieval, task graph, provider streaming, and VirtualFs. See [benchmark inventory](#performance-and-fuzzing). |
+| Fuzz targets | Implemented | [fuzz/Cargo.toml](../../fuzz/Cargo.toml) registers `shell_parser` and `guest_abi`. Normal CI does not run them. Target presence is not fuzz-run evidence. |
+| Threat model and event secret sanitization | Implemented | [Threat model](../security-threat-model.md), [SecretSanitizer](../../crates/core/src/sanitizer.rs), and its [EventBus wiring](../../crates/core/src/event.rs) exist. Accepted residuals remain. |
+| WASM sandbox | Partial; important fixes pending | [host.rs](../../crates/plugins/src/host.rs) supplies per-plugin stores, fuel, epochs, and disables memory64. It configures static-memory reservation but does not install an allocation-time `StoreLimits` limiter in this snapshot. PR #172 addresses this and other boundary defects; do not mark complete before merge and verification. |
+| Test-quality / mutation gate | Not enforced | [mutation-gate.sh](../../scripts/mutation-gate.sh) echoes "Would run" and executes no `cargo mutants` command. Neither it nor the panic sweep is invoked by current CI. This is the recommended next task. |
+| Desktop ↔ CLI parity | Historical scope too narrow | [Parity plan](../desktop-cli-parity.md) calls Studio GUI-only. Portable orchestration/security settings require their own inventory and CLI surfaces; a visual layout exemption is not a configuration exemption. |
 
-| Piece | Why | Remaining |
-|-------|-----|-----------|
-| SimplePolicyEngine | Pre-compiled patterns, multi-level sandbox, spend tracking, rate limiting, time-window auto-approval, structured audit | Property tests for condition combinator edge cases |
-| EventBus + EventKind | Broadcast-based, typed event taxonomy by roadmap phase, session/correlation tracing, iced integration | Property test for lag handling under backpressure |
-| Plugin SDK (`plugin_entry!` macros) | `no_std`, 3 macro variants sharing one ABI, bounds-checked scratch buffer, documented ABI v1 | Zero tests (expected for guest SDK) |
-| VirtualFs | 4-entry state machine, snapshot/restore, hunk rejection, partial-commit error collection | Property tests for state transitions |
-| Error Taxonomy | 12 domain `thiserror` enums, structured fields, `describe_error_chain` | Verify all `From` impls in use |
+## Measured structural hotspots
 
-### Already Excellent (Tier 2, 🔧 Moderate Work)
+These are physical line counts, including comments, blank lines and tests,
+from the pinned UTF-8 blobs (`len(content.splitlines())`). The last column
+locates the main inline test module; it is not a production-LOC measurement,
+because some files have other inline tests or helpers. No fresh cognitive or
+cyclomatic analysis was run.
 
-| Piece | Needs |
-|-------|-------|
-| ProviderFactory | Property tests for credential resolution fallback chain |
-| RoutingEngine | Property tests for budget + pin combination matrix |
-| TaskGraph | More boundary tests (empty graph, duplicate edges, serialization round-trips) |
-| SpendTracker | Stress test with concurrent access |
-| RpmLimiter | Fuzz test for window boundary conditions |
-| UndoManager | Test concurrent undo/commit ordering |
-| ShellParser | Property-based fuzz testing — classic proptest candidate |
-| CoordinatorAgent | Split `run()` into named phases (currently ~900 lines) |
+| File | Total lines | Main test module starts |
+|---|---:|---:|
+| [orchestrator/coordinator.rs](../../crates/orchestrator/src/coordinator.rs) | 40,185 | 17,533 |
+| [orchestrator/runtime_runner.rs](../../crates/orchestrator/src/runtime_runner.rs) | 9,532 | 5,469 |
+| [desktop/app.rs](../../crates/desktop/src/app.rs) | 9,196 | 5,109 |
+| [orchestrator/agent_loop.rs](../../crates/orchestrator/src/agent_loop.rs) | 8,244 | 3,314 |
+| [desktop/views/orchestration_studio.rs](../../crates/desktop/src/views/orchestration_studio.rs) | 7,207 | 4,631 |
+| [cli/app.rs](../../crates/cli/src/app.rs) | 3,836 | 2,465 |
+| [desktop/views/settings/state.rs](../../crates/desktop/src/views/settings/state.rs) | 3,529 | 2,615 |
+| [cli/lib.rs](../../crates/cli/src/lib.rs) | 2,772 | 1,575 |
+| [desktop/views/settings/mod.rs](../../crates/desktop/src/views/settings/mod.rs) | 2,721 | 2,539 |
+| [plugins/capability.rs](../../crates/plugins/src/capability.rs) | 2,079 | 1,280 |
 
-### Needs Significant Work (⚠️ High Priority)
+Moving tests helps navigation but does not, alone, resolve oversized production
+modules. Extract by ownership and behavior, preserve public paths and private
+invariants, and avoid a single replacement file containing all the complexity.
+Line thresholds are review prompts, not universal pass/fail targets.
 
-| Crate | File | Issue | Impact |
-|-------|------|-------|--------|
-| Desktop | `widgets/markdown.rs` | `render()` — cognitive 312, cyclomatic 62. Event-driven pulldown-cmark parser with 10+ mutable state variables | **Highest priority** — most complex function in codebase |
-| Desktop | `runtime.rs` | `translate_event()` — cognitive 75. Translates 70+ EventKind variants | Moderate — natural to be long but could use a macro |
-| Desktop | `app.rs` | 3075 lines — large Iced Application impl | Needs splitting by concern |
-| Desktop | `views/studio_editor.rs` | 3131 lines, largest file in codebase | Modularization needed |
-| Desktop | `views/settings.rs` | 2836 lines | Modularization needed |
-| CLI | `lib.rs` | `run_sessions_subcommand()` cognitive 102, `run_cli_inner()` cognitive 63 | Subcommand dispatch needs modularization |
-| CLI | `app.rs` | 1286 lines, `event_line()` cognitive 50 | Needs splitting |
-| Orchestrator | `runtime_runner.rs` | `run_shared_agent()` — cognitive 340, cyclomatic 82 | Major refactor target |
-| Orchestrator | `agent_loop.rs` | 2772 lines, `run_once()` is ~500 lines | Extract verification, tool execution, state management |
-| Plugins | `host_fns.rs` | `register_host_functions()` — complexity 39 | Needs systematic breakdown |
-| Plugins | `capability.rs` | `glob_match_bytes()` — cognitive 63 | Simplify matching logic |
-| Memory | `entities.rs` | `extract_rust_entities()` cognitive 57, `parse_fact_extraction_response()` cognitive 44 | Needs decomposition |
-| Providers | `openai.rs` | `build_chat_body()` cognitive 57 | Needs extraction of per-role logic |
+## Current gates and their limits
 
-### Critical Gaps (🚨 Test Coverage)
+[ci.yml](../../.github/workflows/ci.yml) runs formatting, workspace/all-targets
+Clippy with warnings denied, workspace unit/integration/doc tests via
+`cargo test`, builds, CLI feature combinations and startup smoke commands,
+benchmark smoke runs, four WASM guest builds, cargo-deny, and palette checks.
+It pins Rust 1.96.0; the workspace declares MSRV 1.88. The old claim that CI
+uses nextest and independently runs cargo-audit is incorrect. An MSRV build,
+mutation enforcement, fuzz execution and measured coverage are not present
+in that workflow.
 
-| Crate | Tests | Target | Action |
-|-------|-------|--------|--------|
-| LSP | 7 *(was 0)* | 30+ | Most urgent — LSP client, manager, tools need tests |
-| Orchestrator | 11 | 80+ | Cycle detection, state machine, agent runner |
-| CLI | 21 | 50+ | Subcommand dispatch, approval flows |
-| Config | 21 | 50+ | Schema migration, credential resolution fallback |
-| Memory | 93 | 130+ | Phase 4 modules (FTS, vector, indexer, watcher, RAG) |
-| Desktop | 89 | 120+ | Widget rendering, view state transitions |
-| Observability | 13 | 30+ | Exporter integration edge cases |
+`unsafe_code = "deny"` remains a workspace rule. Dependency hygiene is
+exception-managed: [deny.toml](../../deny.toml) contains documented advisory
+exceptions, including Wasmtime 24.0.13, with several review dates of
+2026-10-01. Re-review reachability/version assumptions before a dependency
+change; do not describe a passing exception-aware check as "zero
+vulnerabilities", or remove exceptions without understanding them.
 
----
+The [contribution test-quality rules](../../CONTRIBUTING.md)
+require behavioral justification, adversarial cases, regression-before-fix,
+and independent review for hardening/quality work. The separately named
+`docs/concerto-test-quality-gates.md` is absent from this snapshot; use the
+actual contribution rules rather than an unresolvable reference.
+[panic-path-sweep.sh](../../scripts/panic-path-sweep.sh) is a manual report
+with a historical checklist, not an automated proof of panic freedom.
 
-## 🎯 Target Bar for World-Class
+## Revised work order
 
-| Metric | Current | Target |
-|--------|---------|--------|
-| Clippy warnings | 0 ✅ (already `-D warnings`) | Maintain |
-| `unsafe_code` | 0 ✅ (workspace deny) | Maintain |
-| Test count | ~850 total | ~1,500+ |
-| Property-based tests | ~11 | proptest in shell parser, policy engine, VirtualFs, graph |
-| Fuzz targets | 0 | `cargo-fuzz` for shell parser, plugin ABI parsing |
-| Benchmark suites | 0 | criterion for provider streaming, policy eval, memory retrieval |
-| Functions with cognitive > 50 | 16 | 0 |
-| Functions with complexity > 20 | 16 | 0 |
-| Files > 2000 lines | 11 | 0 |
-| Files > 1000 lines | 21 | 0 (or justified with module doc) |
-| `pub` items without doc | unknown | 0 (`#[deny(missing_docs)]` on library crates) |
-| Dependency vulnerabilities | 0 ✅ | Maintain (cargo deny + cargo audit in CI) |
-| Test time | unknown | < 5 min CI (cargo nextest) |
+| Priority | Work | Completion condition |
+|---|---|---|
+| P0 — existing safety work | Resolve and validate pending extension-security work in PR #172 | Approved plugin effects reach shared policy/VirtualFs; allocation/output limits and MCP full-lifecycle deadlines/teardown are tested; native checks and independent adversarial review complete. Reconcile after merge. |
+| P1 — next new engineering task | Make the mutation gate executable and enforce a bounded pilot in CI | Real mutations run, useful failures propagate, reports persist, and a deliberate behavioral mutation is caught. Detailed scope below. |
+| P2 — structural debt | Decompose coordinator, then runtime runner / agent loop | Characterization evidence protects dispatch, approvals, cancellation, resume, completion, and accounting; production responsibilities have named module owners. Separate mechanical movement from behavioral fixes. |
+| P2 — contract defects | Complete cancellation audit / compaction contracts | Test already-cancelled and mid-flight cancellation while blocked on locks/I/O; cleanup, durable-state preservation, and bounded exit are observed. Follow [DEFERRED row 34](../DEFERRED.md#outstanding) / [TODO audit cleanups](../TODO.md#audit-cleanups-deferredmd-row-34). |
+| P2 — product parity | Inventory portable Desktop settings and implement CLI access | Each setting has canonical config ownership, scope/default/validation, CLI read/write path, and round-trip/restart evidence. Include orchestration, policies, shell, plugins/MCP, memory, and display controls where applicable. Recheck any existing parity branch before starting. |
+| P3 — remaining frontend decomposition | Extract app, CLI dispatch, Studio and settings responsibilities | State transitions and stale async replies have contract tests; changed desktop views pass palette checks and representative dark/light, narrow/wide UI checks. Avoid bundling a new redesign. |
+| P3 — measured performance / maintenance | Profile before optimizing; improve docs and compatibility checks | A measured bottleneck justifies each optimization; public API docs and MSRV checks are enabled in scoped increments; error renames require an explicit compatibility decision. |
 
----
+Security work already in review should not be duplicated. The next *new*
+task is P1; its work can proceed while PR #172 completes review.
 
-## 🗺️ Phased Improvement Roadmap
+## Next task: replace the mutation dry run with an executable gate
 
-### Phase 0: Foundations + Quick Wins ✅ *(committed on `feat/codebase-world-class`)*
+**Suggested branch:** `fix/mutation-quality-gate`, freshly based on `dev`.
+**Purpose:** establish a trustworthy signal before large orchestration
+extractions. A script that exits successfully after printing commands provides
+no evidence that tests detect wrong behavior.
 
-Low-hanging fruit with high signal-to-noise ratio.
+**Scope:** [scripts/mutation-gate.sh](../../scripts/mutation-gate.sh) and
+[ci.yml](../../.github/workflows/ci.yml), plus focused gate fixtures and
+contribution/testing instructions.
 
-- [x] Add `#[warn(missing_docs)]` to all library crates + workspace lint config
-  - Effort: 4–8 hours. Many pub items already documented. Warn-level to keep CI green.
-- [x] Add proptest to `shell/src/parser.rs` (6 property tests)
-  - Effort: 4 hours. Classic 20-minute property test catches 90% of edge cases.
-- [x] Refactor `runtime_runner::run_shared_agent` (cognitive 340 → 7 phases)
-  - Effort: 8–12 hours. Split into `build_providers`, `build_policy_engine`, `build_memory_system`, `run_session`.
-- [x] Split `coordinator.rs::run()` (~900 lines → 3 named phases)
-  - Effort: 4 hours. `decompose_task`, `execute_graph`, `reconcile_results`.
-- [x] Add integration tests for LSP crate (7 tests)
-  - Effort: 8 hours. Most urgent test gap.
-- [x] Add tree-sitter chunk parsing property tests (5 tests + fix inter-def whitespace bug)
-  - Effort: 4 hours. Property tests revealed a real bug.
-- Deliverable: ~200 new tests, 3 high-complexity functions decomposed, warning-level missing_docs lint enabled on all library crates.
-- Risk: **Very low**. All changes are additive (tests) or mechanical (splitting functions).
+1. Parse `--base <ref>` explicitly, validate the ref, and determine changed
+   eligible Rust source safely. Support file names without word-splitting;
+   preserve runner exit codes. Do not hide an invalid base with the current
+   `git diff ... || git diff HEAD` fallback.
+2. Run `cargo mutants` for the selected supported package/files. Start with a
+   bounded core/shell pilot and record its eligible paths; expanding the pilot
+   is a later measured decision. A documentation-only diff must skip clearly.
+   Changed production files outside the pilot must be reported as uncovered,
+   not described as mutation-verified.
+3. Pin the tool/version used by CI, bound runtime, and retain mutation outcomes
+   and logs as artifacts. Use checkout history sufficient to resolve the
+   PR's actual base. Define CI event/ref handling explicitly.
+4. Make missed mutants fail. Distinguish baseline-test failure, setup/tool
+   failure, timeout/inconclusive results, and successful mutation detection.
+   Document any exclusions with an owner and rationale; no blanket silent
+   suppression of failures or "would run" path.
+5. Prove the gate against an isolated fixture or controlled mutation:
+   the unchanged contract passes; a surviving behavioral mutation fails;
+   killing that mutation passes. Also exercise invalid base, missing tool,
+   unsupported/out-of-pilot source, no eligible changes, and timeout reporting.
+6. Update contribution instructions to describe what is now enforced versus
+   advisory. Keep the rest of the established CI jobs intact.
 
-### Phase 1: Hotspot Refactoring (Weeks 3–5)
+**Acceptance criteria**
 
-Target: Eliminate all cognitive complexity > 50 hotspots (16 functions).
+- A CI report demonstrates actual mutation execution in the pilot and names
+  the behavior/branch tested; test totals are not the success metric.
+- The controlled surviving mutation makes the gate nonzero, and its report
+  explains the failure.
+- Source changes outside the pilot and inconclusive work cannot masquerade
+  as full coverage. Normal builds/tests remain independently visible.
+- Runtime/cost is measured before widening the pilot.
+- Independent adversarial review is completed before this quality branch
+  merges, as required by CONTRIBUTING.md.
 
-- `desktop::widgets::markdown::render` (cognitive 312) — **Biggest single improvement**
-  - Strategy: Extract a `MarkdownRenderer` struct with methods per tag type. The current implementation has 10 mutable variables and a 500+ line event loop — textbook case for a state machine refactor. Pull in `iced::widget::rich_text` where possible.
-  - Effort: 16–24 hours. Must preserve rendering behavior pixel-for-pixel.
-- `desktop::runtime::translate_event` (cognitive 75)
-  - Strategy: Use a macro to generate the 70+ variant match, or separate into per-event-category translation functions.
-  - Effort: 4 hours.
-- `providers::openai::build_chat_body` (cognitive 57)
-  - Strategy: Extract message role formatting into dedicated functions.
-  - Effort: 2 hours.
-- `memory::entities::extract_rust_entities` (cognitive 57)
-  - Strategy: Split into `extract_functions`, `extract_structs`, `extract_enums` passes.
-  - Effort: 4 hours.
-- `plugins::host_fns::register_host_functions` (complexity 39)
-  - Strategy: Table-driven registration using a slice of `(name, fn_ptr)` structs.
-  - Effort: 2 hours.
-- `plugins::capability::glob_match_bytes` (cognitive 63)
-  - Strategy: Replace hand-rolled glob matching with `glob` crate or regex. The comment says "ported from an older version" — there's likely a library that does this correctly.
-  - Effort: 2–4 hours.
-- `desktop::views::settings.rs` and `desktop::views::studio_editor.rs`
-  - Strategy: Extract per-section widgets into separate files under `views/settings/` and `views/studio/`.
-  - Effort: 12–16 hours.
-- `orchestrator::agent_loop::run_once` (~500 lines)
-  - Strategy: Extract: `build_working_memory`, `call_provider_with_retry`, `persist_tool_results`, `run_verification`, `decide_exit`.
-  - Effort: 8 hours.
-- Deliverable: 0 functions with cognitive > 50, 0 files > 2000 lines, all high-complexity functions refactored.
-- Risk: **Medium**. Desktop markdown renderer is high-touch. Needs careful regression testing (screenshot comparison, or manual QA on real chat outputs).
+This task does not rename errors, rewrite the coordinator, change policy
+semantics, or add a workspace-wide test-count requirement.
 
-### Phase 2: Test Coverage (Weeks 4–7, overlapping with Phase 1)
+## Follow-on: coordinator decomposition in small slices
 
-Target: 1,500+ total tests, property tests in 5 crates, fuzz targets in 2 crates.
+The first refactor should preserve `CoordinatorAgent`'s public surface and
+existing checkpoints/events. A practical sequence, to verify against the
+fresh source before implementation:
 
-- **Orchestrator tests** (11 → 80+):
-  - Cycle detection (`cycle.rs`)
-  - State machine transitions (`state.rs`)
-  - Agent runner lifecycle
-  - Checkpoint serialization round-trips
-  - Capability-gated executor policy enforcement
-  - Effort: 16 hours.
-- **Desktop widget tests** (89 → 120+):
-  - Refactored markdown renderer
-  - Diff viewer rendering
-  - File tree widget
-  - Code block widget
-  - Agent graph widget
-  - Effort: 20 hours.
-- **Memory crate tests** (93 → 130+):
-  - FTS5 implementation (index, search, delete)
-  - Embedder integration
-  - RAG query assembly
-  - Indexer with watcher
-  - Entity extraction round-trips
-  - Context budget allocator
-  - Effort: 24 hours.
-- **Config crate tests** (21 → 50+):
-  - Schema migration
-  - Credential resolution fallback chain
-  - Shell profile loading
-  - Setup wizard flows
-  - Effort: 12 hours.
-- **Proptest additions**:
-  - `shell/src/parser.rs` (fuzz command lines)
-  - `core/src/policy.rs` (fuzz rule combinations)
-  - `plugins/src/guest_abi.rs` (fuzz ABI packing/unpacking)
-  - `memory/src/ttl.rs` (fuzz TTL expiration ordering)
-  - `tools/src/diff.rs` (fuzz hunk computation)
-  - Effort: 16 hours.
-- **Fuzz targets**:
-  - `cargo-fuzz` for `shell/src/parser.rs`
-  - `cargo-fuzz` for `plugins/src/guest_abi.rs` (malformed packed i64 values)
-  - Effort: 8 hours.
-- Deliverable: ~500 new tests across all crates, 5 property-test suites, 2 fuzz targets.
-- Risk: **Low-medium**. Mostly additive; slowest part is test infrastructure setup (temp databases, mock providers).
+1. Move the main test module into private test files grouped by dispatch,
+   planning/recovery, approvals, resume, and completion. Preserve test names
+   and meaningful assertions. This is preparation, not the entire refactor.
+2. Extract pure run-shape / argument / decision parsing helpers with narrow
+   visibility and failure-case contracts.
+3. Extract resume/checkpoint and planning-recovery responsibilities, then
+   dispatch/fallback/settlement responsibilities, one slice per review.
+   Keep coordinator orchestration and shared ownership explicit.
+4. Protect known seams: fail-closed write/approval gates, cancellation without
+   terminal-failure reclassification, bounded retries, checkpoint continuity,
+   evidence identifiers, and exactly-once usage/settlement accounting.
+5. Run focused orchestrator tests and meaningful mutation probes per slice;
+   complete required workspace checks before merge. Do not judge success
+   only by a shorter parent file.
 
-### Phase 3: Performance + Benchmarks (Weeks 6–8)
+Cross-crate ownership, persistent formats or security-boundary changes require
+an ADR before implementation. Mechanical private-module extraction should
+preserve existing decisions rather than invent a new architecture.
 
-Target: Benchmark suite, identified hot paths, zero regression on critical paths.
+## Performance and fuzzing
 
-- **Add criterion benchmarks**:
-  - Provider streaming throughput
-  - Policy evaluation (100+ rules)
-  - FTS5 search latency
-  - VirtualFs commit to disk (1000+ files)
-  - Message serialization/deserialization
-  - Effort: 12 hours.
-- **Profile identified hot paths**:
-  - Memory retrieval + reranking pipeline
-  - Tool execution dispatch (policy evaluate → execute → audit)
-  - Desktop UI widget rendering (diff viewer, markdown)
-  - Effort: 8 hours.
-- **Optimize slowest hot path** (likely VirtualFs commit or memory retrieval):
-  - Parallel FTS + vector search
-  - Batch audit log writes
-  - Memoize policy pattern compilation
-  - Effort: 16 hours.
-- Deliverable: CI benchmark gate, identified bottlenecks, 1–2 optimization PRs.
-- Risk: **Low**. Benchmarks are additive; optimization is optional based on findings.
+The current Criterion inventory is:
 
-### Phase 4: Architecture Consistency (Weeks 8–10)
+| Package | Target |
+|---|---|
+| core | [policy](../../crates/core/benches/policy.rs), [serde](../../crates/core/benches/serde.rs) |
+| memory | [fts_search](../../crates/memory/benches/fts_search.rs), [vector_retrieval](../../crates/memory/benches/vector_retrieval.rs) |
+| orchestrator | [task_graph](../../crates/orchestrator/benches/task_graph.rs) |
+| providers | [provider_streaming](../../crates/providers/benches/provider_streaming.rs) |
+| tools | [virtual_fs](../../crates/tools/benches/virtual_fs.rs) |
 
-Target: Unified patterns across all crate boundaries, no conceptual drift.
+PR CI compiles and smoke-runs benchmarks with `--test`; it makes no timing
+assertion. [bench-baseline.yml](../../.github/workflows/bench-baseline.yml)
+runs weekly/manually, compares cached Criterion baselines with a 25% mean
+regression tolerance, and captures a baseline on a cache miss. It is an
+investigation signal, not a per-PR timing blocker. Fresh profiling and
+optimization evidence remain unverified by this reconciliation.
 
-- **Standardize builder pattern for complex constructors**
-  - Currently: `AgentLoop::with_project_root` + `with_usage_model` + `with_retry_policy` + `with_initial_messages` + `with_session_store` (5 builder methods). This is good — but not all crates use it. Unify.
-  - Effort: 8 hours.
-- **Resolve `memory/src/lib.rs` duplicate `MemoryError`**
-  - The Phase 3 crate defines its own `MemoryError` that partially duplicates `core::error::MemoryError`. Remove the local one and use core's.
-  - Effort: 4 hours.
-- **Audit `CancellationToken` threading**
-  - Is every async function covered? Check for missing cancellations in: LSP client, watcher, background exporters.
-  - Effort: 8 hours.
-- **Event consistency audit**
-  - Every event variant should be published somewhere. Check for `EventKind` variants that are defined but never emitted.
-  - Effort: 4 hours.
-- **Add `#[non_exhaustive]` to all public enums**
-  - Future-proofing. Phase-completed enums should not break downstream on new variants.
-  - Effort: 2 hours.
-- Deliverable: Consistent builder pattern, no duplicate error types, complete cancellation coverage, no dead events.
-- Risk: **Low**. Mostly mechanical, well-scoped per commit.
+Retain [shell-parser](../../fuzz/fuzz_targets/shell_parser.rs) and
+[guest-ABI](../../fuzz/fuzz_targets/guest_abi.rs) fuzz targets. A later bounded
+scheduled/manual job should store corpus/crash artifacts and promote every
+reproduced crash into a deterministic regression test. Parser/tree-sitter
+property suites already exist; policy combinations, VirtualFs transitions,
+TTL ordering and diff properties should be added only where a named invariant
+and adversarial input justify them.
 
-### Phase 5: Security + Polish (Weeks 10–12)
+## Security and architecture residuals
 
-Target: Security audit completed, threat model documented, harden attack surface.
+- **Pending extension boundary work:** in this `dev` snapshot,
+  `load_discovered_plugins` / `load_and_configure_plugins` in
+  [runtime_runner.rs](../../crates/orchestrator/src/runtime_runner.rs) and
+  [host_fns.rs](../../crates/plugins/src/host_fns.rs) still need the approved
+  authority/shared-executor enforcement described by PR #172.
+  [MCP request deadlines](../../crates/mcp/src/client.rs) begin after stdin
+  locking/writing; full-lifecycle deadlines and teardown are pending there.
+- **Cancellation remains partial:** accepting a token is not sufficient.
+  [LSP client](../../crates/lsp/src/client.rs) checks cancellation around its
+  reader loop, but pending reads are not raced against cancellation.
+  [ContextOverflowStrategy](../../crates/core/src/traits/context_overflow.rs)
+  includes implementations accepting `_cancel`; this contract and the
+  [executor](../../crates/core/src/executor.rs) need scoped review.
+- **Threat-model closure has residuals:** audit encryption/rate limiting are
+  opt-in; Windows/container and shell CPU-enforcement limitations remain.
+  `cpu_budget_secs` is absent from the inspected
+  [configuration schema](../../crates/config/src/schema.rs).
+  Consult [DEFERRED rows 36 and 45](../DEFERRED.md#outstanding), not an
+  "all security complete" label.
+- **API consistency:** `MemoryError` unification is done. Do not mechanically
+  unify `SessionError` / `EvalError`, standardize all constructors, or add
+  `non_exhaustive` to every enum without reviewing callers and compatibility.
+- **Event coverage:** audit live publishers, consumers and replay semantics
+  per event family. Do not reintroduce removed review/escalation variants just
+  to satisfy an "every variant must emit" rule.
+- **Documentation:** restore warnings/docs in selected stable modules after
+  measuring their missing-doc surface. Avoid switching every crate directly
+  to denial and breaking CI without a remediation slice.
 
-- **Threat model document** (`docs/security-threat-model.md`) — ✅ DONE (v1.0,
-  2026-07-28; v1.1 2026-09-19: gap #2 closed):
-  - Credential exposure (keyring, env vars)
-  - WASM plugin sandboxing
-  - SQL injection (sqlx is parameterized, but audit)
-  - Command injection in shell tool
-  - File path traversal in VirtualFs
-  - Provider API key leak in audit/events
-  - Effort: 8 hours.
-- **Secret scanning in event data** — ✅ DONE (2026-09-19):
-  - `SecretSanitizer` at `core/sanitizer.rs:250`, wired into `EventBus`
-    (`event.rs:583/767/930`). Threat model gap #2 closed.
-  - Effort: ~~8 hours~~ Resolved.
-- **Dependency audit**:
-  - Review `deny.toml` exceptions — are the 6 ignored advisories still acceptable? Pin upgrades for unmaintained transitive deps where possible.
-  - Effort: 4 hours.
-- **Hardened WASM sandbox**:
-  - WASM plugins currently have full access to wasmtime Store data. Implement compartmentalized store-per-plugin with resource limits (fuel, memory ceiling).
-  - Effort: 16 hours.
-- **Final documentation pass**:
-  - Ensure every `pub fn` has a doc comment
-  - Add module-level examples for key entrypoints
-  - Verify ADRs match current implementation
-  - Update `crate-graph.md` if architecture changed
-  - Effort: 16 hours.
-- Deliverable: Threat model doc ✅, secrets sanitizer ✅, hardened plugin sandbox (open), full doc coverage.
-- Risk: **Low-medium**. Security work is methodical; the codebase is already well-audited.
+## In-flight work and maintenance
 
----
+Open at reconciliation; these are dependencies/context, not completed items:
 
-## 📈 Effort Summary
+| PR | Scope | Implication |
+|---|---|---|
+| [#172](https://github.com/NefaroXX/Concerto/pull/172) | Extension security and UI, `fix/extensions-security-ui` | Recheck resource limits, approved authority, MCP lifecycle and UI after merge. Its validation/native-review residuals remain recorded in the PR. |
+| [#169](https://github.com/NefaroXX/Concerto/pull/169) | Tabbed editor workspace, `feat/editor-workspace` | Do not duplicate its editor redesign or characterize its new layout as present on this baseline. |
+| [#174](https://github.com/NefaroXX/Concerto/pull/174) | World-model OpenProblem decision-scoped question keys | Preserve this behavior when future coordinator/world-model work rebases; it is not yet baseline behavior. |
 
-| Phase | Hours | Calendar | Tests Added | Risk |
-|-------|-------|----------|-------------|------|
-| 0: Quick Wins | ~60 | 2 weeks | ~200 | Very Low |
-| 1: Hotspot Refactoring | ~80 | 3 weeks | ~50 (regression) | Medium |
-| 2: Test Coverage | ~100 | 3 weeks | ~500 | Low-Medium |
-| 3: Performance | ~40 | 2 weeks | ~0 | Low |
-| 4: Architecture Consistency | ~30 | 2 weeks | ~0 | Low |
-| 5: Security + Polish | ~50 | 2 weeks | ~10 | Low-Medium |
-| **Total** | **~360 hours** | **8–12 weeks** | **~760** | |
+ADRs #78 are claimed independently by both #169 and #172; reconcile their
+numbers/index before both land, following the repository's no-reuse rule.
 
-Phases can overlap (Phase 2 and Phase 1 can run concurrently with different pairings of developers/agents).
-
----
-
-## 🚧 Risk Assessment
-
-| Risk | Likelihood | Impact | Mitigation |
-|------|------------|--------|------------|
-| Desktop markdown refactor breaks rendering | Medium | High (user-facing) | Screenshot comparison tests, manual QA on real chat outputs |
-| LSP tests flaky due to server startup/shutdown | Medium | Medium | Use `tokio::timeout`, separate test infrastructure from real LSP |
-| Memory crate integration tests slow without real embeddings | Medium | Medium | Use fastembed mock in test mode, skip actual model loading |
-| Property tests too slow for CI | Low | Low | Use proptest with `max_shrink_iters=0` for CI, full config nightly |
-| Missing doc enforcement finds undocumented API in stable crates | High | Low | Takes time but no behavioral change |
-| Test-count targets (Phase 2) incentivize padding over defect coverage | Confirmed | Medium | Audit found `handle_agent_assignments_key` panic reachable despite +1500 tests. See `concerto-test-quality-gates` plan: adopt mutation testing, ban count-only justifications, require regression tests before fixes. |
-
----
-
-## 🏆 Verdict
-
-**Feasibility: 9/10.** This is not a greenfield rewrite or a ship-righting exercise. The codebase already has:
-
-- ✅ Clean architectural layering (core → everything)
-- ✅ Zero compiler warnings
-- ✅ No unsafe code
-- ✅ Consistent error handling taxonomy
-- ✅ Event-driven audit trail
-- ✅ ADR-documented decisions
-- ✅ Excellent test infrastructure (tempfile, MockProvider, TestAuditLog)
-
-The core enablers of world-class engineering are already in place. The remaining work is filling gaps, refactoring hot spots, and adding systematic testing — not fixing fundamental design mistakes.
-
-**The biggest lever** is the desktop markdown renderer and the `run_shared_agent` function (already split). Fixing those alone removes more than half of the cognitive complexity burden on the codebase.
-
-**The biggest risk** is scope creep on UI refactoring. The desktop crate's largest files (3k+ lines in `studio_editor.rs` and `settings.rs`) could tempt a "while-we're-in-here" full redesign. The plan above scopes it to mechanical extraction, not UX redesign.
-
-**Recommendation:** Start with Phase 0 (quick wins + LSP test gap), then tackle the two biggest functions (markdown renderer + agent_loop decomposition) before anything else. The confidence gain from those successes will de-risk the rest of the plan.
+Before the next implementation, fetch fresh `dev`, inspect pending/merged work,
+and recheck the relevant DEFERRED/TODO entries against source. In particular,
+those registers were last reconciled on 2026-09-28 and are pointers, not proof
+that a claim remains true. Update this document's snapshot/status when an item
+lands; preserve deferred-work ownership in DEFERRED.md. Re-measure hotspots
+after refactors and report verified contracts and remaining limits, not a
+"world-class" score.
