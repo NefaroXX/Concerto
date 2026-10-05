@@ -1,0 +1,353 @@
+# Q06 — dedicated mutation-gate CI pilot (Linux only, no matrix, advisory).
+#
+# Contract: CX/20261005-q01-v1/001 (accepted Q01 v1, part 6)
+# Task:     Q06 — writer OpenCode (solo)
+# Claim:    OpenCode/sol-20261005-01/Q06/001
+#
+# Read-only inputs this workflow drives, never edits:
+#   * scripts/mutation-gate.sh  — Q02 runner, head d004eb7
+#   * tests/mutation_gate/**    — Q03 harness, head 579e475
+# It also must not interfere with .github/workflows/ci.yml or native-shell.yml:
+# those keep their own triggers, and this file adds no required status check.
+#
+# Advisory by design: a red run here is visible but never blocks a merge. See
+# docs/mutation-quality-gate.md for enforced-vs-advisory, how to read
+# gate-report.json, the failure-class table, and what Q07 must measure before
+# anyone considers enforcing this gate.
+#
+# Checkout layout: the repository is checked out to $GITHUB_WORKSPACE/repo so
+# report/scratch directories can stay workspace-relative (disk-backed, never
+# /tmp) while remaining OUTSIDE the git checkout — both the Q02 runner and the
+# Q03 harness reject directories inside the checkout they are driving.
+
+name: Mutation gate (pilot)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main, dev]
+    paths:
+      # Q01 pilot target set: the gate only has an opinion when one of these
+      # files changes.
+      - "crates/core/src/policy.rs"
+      - "crates/core/src/shell_security.rs"
+      - "crates/shell/src/parser.rs"
+      # The gate's own inputs, so a change to the runner, the harness or this
+      # workflow is exercised by the run that reads it.
+      - "scripts/mutation-gate.sh"
+      - "tests/mutation_gate/**"
+      - ".github/workflows/mutation-gate.yml"
+
+# One run per ref: a newer push supersedes an in-flight gate. Cancellation
+# reaches the runner as SIGINT/SIGTERM, which it reports as exit 130/143
+# (inconclusive) — never as a pass.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental artifacts are machine-local and must not poison shared state;
+  # keeps builds reproducible across runners (same as ci.yml).
+  CARGO_INCREMENTAL: "0"
+  # One mutation worker. cargo-mutants 27.1.0 reads -j/--jobs from this
+  # variable, which is the "equivalent" of --jobs 1: the Q02 runner builds the
+  # tool command itself and does not pass --jobs, so the environment is the
+  # only hook CI has. Deterministic mutant order needs no hook here: at 27.1.0
+  # `--no-shuffle` (fixed source order) is the tool default, and the runner
+  # passes --no-config so no config file can switch shuffling on.
+  CARGO_MUTANTS_JOBS: "1"
+  # Kept for parity with ci.yml's test job. AGENTS.md records that the value is
+  # documented for CI parity (credential access is selected per call), so this
+  # is environment parity with CI rather than a safety barrier.
+  CONCERTO_TEST_MODE: "1"
+
+jobs:
+  # --------------------------------------------------------------- fixtures
+  # Q03 contract harness vs the Q02 runner: controlled Rust fixtures prove
+  # caught/missed and exercise every failure class before the pilot job
+  # spends 45 minutes on the real workspace.
+  fixtures:
+    name: Fixtures (Q03 contract harness)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+        # Relative working directories resolve against GITHUB_WORKSPACE, so
+        # this is $GITHUB_WORKSPACE/repo (the checkout path below).
+        working-directory: repo
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: Install Rust toolchain (1.96.0)
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Install cargo-mutants (pinned, locked)
+        run: cargo install --locked --version 27.1.0 cargo-mutants
+
+      - name: Verify the pinned tool
+        run: |
+          set -euo pipefail
+          got="$(cargo-mutants mutants --version 2>&1 | tail -n 1)"
+          if [ "$got" != "cargo-mutants 27.1.0" ]; then
+            echo "::error::expected 'cargo-mutants 27.1.0', got: $got"
+            exit 1
+          fi
+          echo "pinned tool: $got"
+
+      - name: Preflight required inputs (Q02 runner + Q03 harness)
+        run: |
+          set -euo pipefail
+          err() { echo "::error::$*"; }
+          if [ ! -f tests/mutation_gate/run-contract-tests.sh ]; then
+            err "tests/mutation_gate/ is missing — this workflow needs Q03 head 579e475 on the ref under test."
+            exit 1
+          fi
+          # The base branch carries a pre-Q02 stub of scripts/mutation-gate.sh;
+          # presence of the path alone does not mean the Q02 runner is there.
+          if [ ! -f scripts/mutation-gate.sh ]; then
+            err "scripts/mutation-gate.sh is missing — this workflow needs Q02 head d004eb7 on the ref under test."
+            exit 1
+          fi
+          if ! grep -qF 'readonly CONTRACT_ID="CX/20261005-q01-v1/001"' scripts/mutation-gate.sh; then
+            err "scripts/mutation-gate.sh is not the Q02 runner — this workflow needs Q02 head d004eb7 on the ref under test."
+            exit 1
+          fi
+          echo "inputs present: Q02 runner + Q03 harness"
+
+      - name: Run Q03 contract harness against the Q02 runner
+        run: |
+          set -euo pipefail
+          work_dir="$GITHUB_WORKSPACE/mutation-gate/fixtures"
+          # Fresh work dir: the harness rejects a non-empty one, and nothing
+          # may live inside the checkout it is about to inspect.
+          rm -rf "$work_dir"
+          bash tests/mutation_gate/run-contract-tests.sh \
+            --runner "$PWD/scripts/mutation-gate.sh" \
+            --work-dir "$work_dir"
+
+      - name: Upload harness session (case logs and per-case reports)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-gate-fixtures-session
+          if-no-files-found: warn
+          path: |
+            mutation-gate/fixtures/q03-contract-session-*/cases/*/*.log
+            mutation-gate/fixtures/q03-contract-session-*/cases/*/*.out
+            mutation-gate/fixtures/q03-contract-session-*/cases/*/report/**
+
+  # ----------------------------------------------------------------- pilot
+  # Q02 runner on the pilot files this change touches, diff-scoped against the
+  # PR base and hard-capped by --budget-seconds 1800.
+  pilot:
+    name: Pilot gate (diff-scoped, advisory)
+    runs-on: ubuntu-latest
+    # 45 minutes > setup (~5 min) + 1800 s runner budget + 30 s kill grace, so
+    # an exhausted budget is reported as inconclusive by the runner instead of
+    # being hard-killed by the job timeout. With the 15-minute fixtures job
+    # this workflow never spends more than 60 runner-minutes.
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: repo
+    steps:
+      - name: Checkout repository (full history, merge ref)
+        uses: actions/checkout@v4
+        with:
+          path: repo
+          # The runner diffs merge-base(<base>, HEAD): the PR base commit must
+          # exist locally, so fetch everything instead of a shallow tip.
+          fetch-depth: 0
+
+      - name: Install Rust toolchain (1.96.0)
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Install cargo-mutants (pinned, locked)
+        run: cargo install --locked --version 27.1.0 cargo-mutants
+
+      - name: Verify the pinned tool
+        run: |
+          set -euo pipefail
+          got="$(cargo-mutants mutants --version 2>&1 | tail -n 1)"
+          if [ "$got" != "cargo-mutants 27.1.0" ]; then
+            echo "::error::expected 'cargo-mutants 27.1.0', got: $got"
+            exit 1
+          fi
+          echo "pinned tool: $got"
+
+      # Same package set ci.yml builds and tests; the pilot mutates
+      # concerto-core and concerto-shell, whose tests link these libraries.
+      - name: Install system dependencies (dbus, ssl, sqlite, pkg-config)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config libssl-dev libsqlite3-dev
+
+      # Contract lock: fail fast when the runner under test is not the Q02
+      # head, or when a pilot target or budget moved. Either case needs a new
+      # contract version plus an explicit ACK before CI may follow it.
+      - name: Preflight inputs and locked contract caps (Q01 v1 part 6)
+        run: |
+          set -euo pipefail
+          err() { echo "::error::$*"; }
+          runner=scripts/mutation-gate.sh
+          if [ ! -f "$runner" ]; then
+            err "$runner is missing — this workflow needs Q02 head d004eb7 on the ref under test."
+            exit 1
+          fi
+          # The base branch carries a pre-Q02 stub of this path; the stub has
+          # no contract id, so this single check tells stub from real runner.
+          if ! grep -qF 'readonly CONTRACT_ID="CX/20261005-q01-v1/001"' "$runner"; then
+            err "$runner is not the Q02 runner (expected head d004eb7); see docs/mutation-quality-gate.md."
+            exit 1
+          fi
+          locked=0
+          require() {
+            if ! grep -qF -- "$1" "$runner"; then
+              err "locked cap missing from $runner: $1"
+              locked=1
+            fi
+          }
+          forbid() {
+            if grep -qF -- "$1" "$runner"; then
+              err "forbidden in $runner (candidate checkout must never be mutated): $1"
+              locked=1
+            fi
+          }
+          require 'MUTANTS_PIN="27.1.0"'
+          require 'DEFAULT_BUDGET=1800'
+          require 'MAX_BUDGET=1800'
+          require 'MUTANTS_BUILD_TIMEOUT=600'
+          require 'MUTANTS_TEST_TIMEOUT=300'
+          require 'KILL_GRACE_SECONDS=30'
+          require '--baseline run'
+          require '"crates/core/src/policy.rs"'
+          require '"crates/core/src/shell_security.rs"'
+          require '"crates/shell/src/parser.rs"'
+          forbid '--in-place'
+          if [ "$locked" -ne 0 ]; then
+            err "contract caps drifted from CX/20261005-q01-v1/001 (Q02 d004eb7): a target or budget change needs a new contract version and an explicit ACK — see docs/mutation-quality-gate.md."
+            exit 1
+          fi
+          echo "contract caps locked: pin 27.1.0, budget 1800 s, build 600 s, test 300 s, baseline run, no --in-place, pilot trio unchanged"
+
+      - name: Resolve base ref for the diff
+        id: base
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ] && [ -n "$PR_BASE_SHA" ]; then
+            base="$PR_BASE_SHA"
+          else
+            # Manual runs diff against the default branch (dev).
+            base="origin/$DEFAULT_BRANCH"
+          fi
+          if ! git rev-parse --verify --quiet "${base}^{commit}" >/dev/null; then
+            echo "::error::base ref '$base' does not resolve to a commit even with full history"
+            exit 1
+          fi
+          echo "base=$base" >>"$GITHUB_OUTPUT"
+          echo "gate base: $base -> $(git rev-parse "${base}^{commit}")"
+
+      - name: Run the mutation gate (budgeted, diff-scoped)
+        env:
+          BASE_REF: ${{ steps.base.outputs.base }}
+        run: |
+          set -euo pipefail
+          report_dir="$GITHUB_WORKSPACE/mutation-gate/report"
+          scratch_dir="$GITHUB_WORKSPACE/mutation-gate/scratch"
+          # Both dirs must be fresh, distinct, disk-backed, outside the
+          # checkout and outside /tmp — the runner enforces every one of those
+          # and exits 1 (setup_error) if any is violated.
+          rm -rf "$report_dir" "$scratch_dir"
+          bash scripts/mutation-gate.sh \
+            --base "$BASE_REF" \
+            --report-dir "$report_dir" \
+            --scratch-dir "$scratch_dir" \
+            --budget-seconds 1800
+
+      # Best effort: this step only narrates the verdict the gate step already
+      # produced, so it must never turn a passing run into a failing one.
+      - name: Summarize gate-report.json
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          heading = "### Mutation gate (pilot)\n\n"
+
+          def publish(text):
+              print(text)
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with Path(summary).open("a", encoding="utf-8") as handle:
+                      handle.write(text + "\n")
+
+          report = Path(os.environ.get("GITHUB_WORKSPACE", ".")) / "mutation-gate/report/gate-report.json"
+          if not report.is_file():
+              publish(heading + "gate-report.json was not produced (the runner failed before the report directory was ready).")
+              raise SystemExit(0)
+          try:
+              doc = json.loads(report.read_text(encoding="utf-8"))
+          except ValueError as exc:
+              publish(heading + f"gate-report.json could not be parsed: {exc}")
+              raise SystemExit(0)
+          counts = doc.get("counts") or {}
+          lines = [
+              heading.rstrip("\n"),
+              "",
+              f"- status: `{doc.get('status')}`  reason: `{doc.get('reason')}`",
+              f"- exit_code: `{doc.get('exit_code')}`  complete: `{doc.get('complete')}`",
+              f"- counts: `{json.dumps(counts, sort_keys=True)}`",
+              f"- coverage_scope: `{doc.get('coverage_scope')}`",
+              f"- selected: `{', '.join(doc.get('selected_files') or []) or 'none'}`",
+              f"- uncovered: `{', '.join(doc.get('uncovered_files') or []) or 'none'}`",
+              f"- skipped: `{', '.join(doc.get('skipped_files') or []) or 'none'}`",
+              f"- duration: `{doc.get('duration_seconds')}s` of `{doc.get('budget_seconds')}s` budget",
+              "",
+              "Full report: artifact `mutation-gate-pilot-report`.",
+          ]
+          publish("\n".join(lines))
+          PY
+
+      - name: Verify the candidate checkout was not modified
+        if: always()
+        run: |
+          set -euo pipefail
+          if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            echo "::notice::checkout unavailable; skipping the no-in-place check"
+            exit 0
+          fi
+          dirty="$(git status --porcelain --untracked-files=all)"
+          if [ -n "$dirty" ]; then
+            echo "::error::the mutation run modified the candidate checkout (no --in-place is allowed):"
+            printf '%s\n' "$dirty"
+            exit 1
+          fi
+          echo "candidate checkout unchanged"
+
+      # Reports, tool logs and raw cargo-mutants outcomes are published on
+      # success and on failure alike; scratch/tmp (copied mutation trees) is
+      # deliberately excluded because it can be gigabytes of build output.
+      - name: Upload gate report, logs and raw outcomes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-gate-pilot-report
+          if-no-files-found: warn
+          path: |
+            mutation-gate/report/**
+            mutation-gate/scratch/tool-run-*.log
