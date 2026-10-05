@@ -31,10 +31,7 @@ impl Default for DiscoveryConfig {
 ///
 /// The installer writes here and the capability store lives here too
 /// ([`crate::capability::CapabilityManager::data_dir`]), so one canonical
-/// path keeps install, discovery, and the grant store in sync. The XDG
-/// `dirs_data_dir` legacy fallback is intentionally NOT applied: installs
-/// always target the current name; migration-time discovery of the old
-/// `opencode-rs` directory is handled by [`DiscoveryConfig::default`].
+/// path keeps install, discovery, and the grant store in sync.
 pub fn plugins_dir() -> std::path::PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -103,27 +100,11 @@ pub fn find_sidecar_manifest(wasm_path: &Path) -> Option<std::path::PathBuf> {
     }
 }
 
-/// Get the XDG data directory with legacy fallback.
+/// Get the XDG data directory for the current install
+/// (`~/.local/share/concerto/`).
 ///
-/// Returns the new path (`~/.local/share/concerto/`) if it exists,
-/// falling back to the old path (`~/.local/share/opencode-rs/`) for
-/// installations that haven't migrated yet. This ensures plugins installed
-/// under the old name are still discovered.
+/// Returns `None` when the platform has no resolvable data dir.
 fn dirs_data_dir() -> Option<std::path::PathBuf> {
     const NEW_DATA_DIR: &str = "concerto";
-    const OLD_DATA_DIR: &str = "opencode-rs";
-
-    let dir = dirs::data_dir()?;
-
-    let new_dir = dir.join(NEW_DATA_DIR);
-    if new_dir.exists() {
-        return Some(new_dir);
-    }
-
-    let old_dir = dir.join(OLD_DATA_DIR);
-    if old_dir.exists() {
-        return Some(old_dir);
-    }
-
-    Some(new_dir)
+    dirs::data_dir().map(|dir| dir.join(NEW_DATA_DIR))
 }

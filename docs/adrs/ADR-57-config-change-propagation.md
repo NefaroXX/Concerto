@@ -41,10 +41,9 @@ startup and then run against a frozen snapshot:
 An external edit of `config.toml` or `.concerto.toml` therefore does nothing
 until restart — and the next settings save overwrites it. Layer facts
 (`crates/config/src/lib.rs`, at time of writing):
-`AppConfig::default` → global file `~/.config/concerto/config.toml` (legacy
-fallback `~/.config/opencode-rs/config.toml`; `config_path()` returns
-existing-new else existing-old else new) → `{project}/.concerto.toml`
-(legacy `.opencode-rs.toml`) → `CONCERTO_*` env. `load_config(global_path,
+`AppConfig::default` → global file `~/.config/concerto/config.toml`
+(`config_path()`) → `{project}/.concerto.toml` → `CONCERTO_*` env.
+`load_config(global_path,
 project_root)`; `load_global_config` excludes project+env (the settings
 editor uses it); `save_config` is an in-place truncate-write
 (`lib.rs:222–232`). The config crate is deliberately **sync-only** (no
@@ -81,10 +80,10 @@ it reloads at the top of `dispatch_message` on every dispatch.
 
 ### 2. Watch targets — config + project dirs, exact-name filtered
 
-`create_dir_all` the config dir at watcher setup. Watch **both** parent
-dirs non-recursively (new + legacy global config dirs) **plus** the current
-project dir. Filter events by exact file name (`config.toml`, the legacy
-global name, `.concerto.toml`, the legacy project name). This covers
+`create_dir_all` the config dir at watcher setup. Watch the global config
+dir and the current project dir non-recursively. Filter events by exact file
+name (`config.toml`, `.concerto.toml`, the ADR-58 blueprint include file).
+This covers
 in-place write, atomic rename, and file creation. One debouncer, multiple
 `watch()` calls. Event noise from unrelated files sharing the config dir is
 neutralized by the name filter.

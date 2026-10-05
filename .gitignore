@@ -44,7 +44,6 @@ crates/sessions/sqlite::memory*
 /.codebase-memory/
 
 # Local-only artifacts, not to be published:
-OpenCode-rs.zip
 .fastembed_cache/
 __pycache__/
 build/

@@ -288,10 +288,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   completion `files` keeps only regular files written by tools;
   orchestration (blueprint + agent roster) persists to the global config
   only — project `.concerto.toml` files are never created by Studio and
-  existing ones keep loading unchanged; legacy `.opencode-rs.toml` /
-  `OPENCODE_RS_*` fallback merges deleted (live keyring/data-dir compat
-  reads kept); pipes/`tee`/`<` modeled in read-only classification and
-  containment (`cat f | grep x` stays free, exfiltrating shapes don't).
+  existing ones keep loading unchanged; stale project-file and env-prefix
+  fallback merges deleted; pipes/`tee`/`<` modeled in read-only classification
+  and containment (`cat f | grep x` stays free, exfiltrating shapes don't).
 - **Coordinator delegation grant:** `call_specialist` is covered under Acting
   grants (`intent_authorized_delegation` audit row) — the coordinator can
   delegate unattended; ReadOnly still denies, ungranted still prompts, and
@@ -593,6 +592,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   implementation notes archived; `STATUS.md`, `architecture.md`, `README.md`,
   `desktop-cli-parity.md`, `STUB-FINDINGS.md`, and `hybrid-ui-plan.md`
   reconciled with the source tree.
+
+### Removed
+
+- **Legacy install fallbacks are gone.** Config and data directory lookups,
+  the environment prefix, and keyring service reads no longer fall back to
+  any older name: only `~/.config/concerto/`, `~/.local/share/concerto/`,
+  `CONCERTO_*`, and the `concerto` keyring service are read, and only
+  `.concerto.toml` is a project file. Configs, plugins, or credentials still
+  sitting under an older name are no longer picked up automatically and must
+  be moved by hand.
 
 ## [0.1.0-alpha] - 2026-07-04
 
