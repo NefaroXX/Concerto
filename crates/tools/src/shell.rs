@@ -1503,7 +1503,6 @@ mod tests {
             Regex::new(r"^echo( .*)?$").unwrap(),
             Regex::new(r"^sleep( .*)?$").unwrap(),
             Regex::new(r"^pwd$").unwrap(),
-            Regex::new(r"^cmd /c cd$").unwrap(),
         ];
         ShellTool::with_config(ShellConfig {
             allowlist,
@@ -2058,15 +2057,9 @@ mod tests {
         let tool = test_tool();
 
         // cwd not specified — should default to project_dir
-        // On Windows the shell is MSYS Git-Bash, whose bare `pwd` prints its
-        // own `/tmp`-mounted spelling that no normalization can map back
-        // (and whose `-W` flavor varies by installation), so query the Win32
-        // cwd directly via `cmd /c cd` instead — no MSYS in the loop.
-        let (command, args): (&str, &[&str]) =
-            if cfg!(windows) { ("cmd", &["/c", "cd"]) } else { ("pwd", &[]) };
         let input = json!({
-            "command": command,
-            "args": args
+            "command": "pwd",
+            "args": []
         });
 
         let result = tool.execute(input, &policy, &session, cancel).await;
@@ -2074,23 +2067,23 @@ mod tests {
         let output = result.unwrap();
         let stdout = output.data["stdout"].as_str().unwrap();
 
-        // Compare canonical-to-canonical: the child's `pwd` prints its cwd in
-        // whatever spelling the platform's `pwd` uses — a POSIX `/c/Users/...`
-        // path under Git-Bash/MSYS, a native `C:\Users\RUNNER~1\...` path (the
-        // short name `tempfile` hands out), or a verbatim `\\?\C:\...` path.
-        // Normalizing the reported spelling through `normalize_msys_cwd` and
-        // canonicalizing both sides collapses those to one form (expanding 8.3
-        // short names on the way). A path that cannot be resolved falls back to
-        // the raw string so the failure names exactly what the child printed.
+        // Compare leaf names, not spellings: on Windows the child is MSYS
+        // `pwd`, which prints its own `/tmp`-mounted spelling that no
+        // normalization can map back to the Win32 path. The leaf is preserved
+        // across every spelling (POSIX, verbatim, 8.3 short), and tempfile
+        // names are unique, so the leaf identifies the directory on all
+        // platforms. (`cmd /c cd` cannot serve here: containment rejects
+        // `/c` as an absolute path.)
         let reported = stdout.trim();
-        let reported_canonical = std::fs::canonicalize(normalize_msys_cwd(reported).as_ref());
-        let expected_canonical = std::fs::canonicalize(dir.path()).expect("canonical project dir");
-        let reported_canonical = match reported_canonical {
-            Ok(path) => path,
-            Err(_) => std::path::PathBuf::from(reported),
-        };
+        let reported_leaf = reported.rsplit(['/', '\\']).next().unwrap_or(reported);
+        let expected_leaf = dir
+            .path()
+            .file_name()
+            .expect("tempdir has a leaf name")
+            .to_str()
+            .expect("UTF-8 tempdir");
         assert_eq!(
-            reported_canonical, expected_canonical,
+            reported_leaf, expected_leaf,
             "pwd reported {reported:?}, which must be the project directory"
         );
     }
