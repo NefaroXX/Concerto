@@ -1502,7 +1502,8 @@ mod tests {
         let allowlist = vec![
             Regex::new(r"^echo( .*)?$").unwrap(),
             Regex::new(r"^sleep( .*)?$").unwrap(),
-            Regex::new(r"^pwd( -W)?$").unwrap(),
+            Regex::new(r"^pwd$").unwrap(),
+            Regex::new(r"^cmd /c cd$").unwrap(),
         ];
         ShellTool::with_config(ShellConfig {
             allowlist,
@@ -2058,10 +2059,11 @@ mod tests {
 
         // cwd not specified — should default to project_dir
         // On Windows the shell is MSYS Git-Bash, whose bare `pwd` prints its
-        // own `/tmp`-mounted spelling that no normalization can map back;
-        // `pwd -W` reports the Win32 form instead.
+        // own `/tmp`-mounted spelling that no normalization can map back
+        // (and whose `-W` flavor varies by installation), so query the Win32
+        // cwd directly via `cmd /c cd` instead — no MSYS in the loop.
         let (command, args): (&str, &[&str]) =
-            if cfg!(windows) { ("pwd", &["-W"]) } else { ("pwd", &[]) };
+            if cfg!(windows) { ("cmd", &["/c", "cd"]) } else { ("pwd", &[]) };
         let input = json!({
             "command": command,
             "args": args
