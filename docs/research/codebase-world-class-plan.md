@@ -1,8 +1,12 @@
 # Codebase Improvement Plan: World-Class Engineering
 
 > **Status: active engineering plan, retained at the project owner's request.**
-> **Reconciled: 2026-10-05 (Africa/Johannesburg).** Source baseline:
-> [`dev` at `c340a5107b874caf3bb517dd06c51f6692736ad4`](https://github.com/NefaroXX/Concerto/commit/c340a5107b874caf3bb517dd06c51f6692736ad4).
+> **Reconciled: 2026-10-06 (Africa/Johannesburg).** Source baseline:
+> `dev` at `0d07038` (merge of [#199](https://github.com/NefaroXX/Concerto/pull/199));
+> the previous baseline was
+> [`c340a5107b874caf3bb517dd06c51f6692736ad4`](https://github.com/NefaroXX/Concerto/commit/c340a5107b874caf3bb517dd06c51f6692736ad4)
+> (2026-10-05). The 2026-10-06 pass only corrected status statements (mutation
+> gate, parity/console delivery, line counts); it ran no builds.
 > The revised plan merged in [#192](https://github.com/NefaroXX/Concerto/pull/192)
 > and was removed by [#193](https://github.com/NefaroXX/Concerto/pull/193).
 > That removal was not intended; this revision restores the same path with
@@ -56,7 +60,7 @@ Interactive release evidence remains separate from automated CI.
 | Fuzz targets | Implemented | [fuzz/Cargo.toml](../../fuzz/Cargo.toml) registers `shell_parser` and `guest_abi`. Normal CI does not run them. Target presence is not fuzz-run evidence. |
 | Threat model and event secret sanitization | Implemented | [Threat model](../security-threat-model.md), [SecretSanitizer](../../crates/core/src/sanitizer.rs), and its [EventBus wiring](../../crates/core/src/event.rs) exist. Accepted residuals remain. |
 | WASM sandbox / extension authorization | Security implementation merged; release evidence still scoped | [host.rs](../../crates/plugins/src/host.rs) now installs allocation-time `StoreLimits`, with fuel/epoch and bounded-output controls. [#172](https://github.com/NefaroXX/Concerto/pull/172) merged; [#191](https://github.com/NefaroXX/Concerto/pull/191) restored reviewed W7/platform fixes dropped by the stale-head merge. Host effects use the shared executor/VirtualFs; MCP deadlines include transport waits. Preserve regressions and collect native UI/keychain evidence separately. |
-| Test-quality / mutation gate | Not enforced | [mutation-gate.sh](../../scripts/mutation-gate.sh) echoes "Would run" and executes no `cargo mutants` command. Neither it nor the panic sweep is invoked by current CI. This is the recommended next task. |
+| Test-quality / mutation gate | Runner landed (PR #199); still advisory, not an enforced check | [mutation-gate.sh](../../scripts/mutation-gate.sh) is a real diff-scoped `cargo mutants` runner pinned to 27.1.0 under contract `CX/20261005-q01-v1/001`, with the Q03 fixture harness in [tests/mutation_gate/](../../tests/mutation_gate/). [mutation-gate.yml](../../.github/workflows/mutation-gate.yml) runs it on `pull_request` for pilot-path changes as an **advisory** check; `ci.yml` does not call it and it is not a required check. The panic sweep remains manual. Remaining work: promote pilot to enforced, then widen coverage. |
 | Desktop ↔ CLI parity | Settings and management shipped; interaction parity remains | [#189](https://github.com/NefaroXX/Concerto/pull/189) implements validated config, agent/provider/extension/credential/profile/preference commands. [Parity matrix](../desktop-cli-parity.md) identifies remaining staged review, live Coordinator control and Studio projections. Audit that matrix rather than creating another settings inventory. |
 | Native shell and human-owned security | Merged in [#190](https://github.com/NefaroXX/Concerto/pull/190) | Native program/argv requests, user-global revision-checked security, central preparation/policy/approval and fail-closed container requirements are implemented. [Security guide](../native-shell-security.md) states protected-path, resource and platform limits. Profiles are compatibility settings; no implicit interpreter is required. |
 | Editor workspace | Merged in [#169](https://github.com/NefaroXX/Concerto/pull/169), with [#185](https://github.com/NefaroXX/Concerto/pull/185) exit guard | [workspace.rs](../../crates/desktop/src/views/code_editor/workspace.rs) and [workspace_view.rs](../../crates/desktop/src/views/code_editor/workspace_view.rs) supply tabs and selected-file review. Do not duplicate the redesign; retain dirty-tab save-failure behavior and collect live UI evidence. |
@@ -121,10 +125,10 @@ with a historical checklist, not an automated proof of panic freedom.
 
 | Priority | Work | Completion condition |
 |---|---|---|
-| P1 — next engineering task | Make the mutation gate executable and enforce a bounded pilot in CI (Q01–Q08) | Actual mutations run; missed mutants fail; setup/baseline/timeout outcomes are distinct; retained reports and independent adversarial review prove the signal. |
+| P1 — next engineering task | **Q01–Q08 landed (PR #199, merged 2026-10-05).** Remaining: promote the mutation gate from advisory to enforced, then widen coverage | Actual mutations run; missed mutants fail; setup/baseline/timeout outcomes are distinct; retained reports and independent adversarial review prove the signal. Enforcement — making the gate required — is the open half. |
 | P1 — release evidence | Verify shipped extension/editor/native-shell behavior in real clients (V01) | Exact source/OS/client and observed UI/keychain/process results recorded; do not reopen merged implementation solely because a live check is outstanding. |
-| P2 — structural debt | Map coordinator seams (R01), then extract/review one test slice (R02/R03) after Q08 | Tests preserve outcome, dismissal, obligation, resume, approval, cancellation and accounting contracts; mechanical movement remains separate from behavior changes. |
-| P2 — contract defects | Audit blocked-I/O cancellation and compaction contracts (A01) | Already-cancelled and mid-flight waits have bounded exit/cleanup and durable-state evidence. Follow [DEFERRED row 34](../DEFERRED.md#outstanding) and [TODO audit cleanups](../TODO.md#audit-cleanups-deferredmd-row-34). |
+| P2 — structural debt | Map coordinator seams (R01), then extract/review one test slice (R02/R03) — Q08 precondition met | Q08 merged (`0d07038`); R01/R02 work is open as [PR #200](https://github.com/NefaroXX/Concerto/pull/200), not yet merged. Tests preserve outcome, dismissal, obligation, resume, approval, cancellation and accounting contracts; mechanical movement remains separate from behavior changes. |
+| P2 — contract defects | Audit blocked-I/O cancellation and compaction contracts (A01) — **not started on this base** | No A01 branch or PR exists; `crates/lsp/src/client.rs` checks the token only between messages (`:126`, `:158`) while the blocked `read_line` (`:132`) / `read_exact` (`:155`) awaits stay unbounded. Already-cancelled and mid-flight waits need bounded exit/cleanup and durable-state evidence. Follow [DEFERRED row 34](../DEFERRED.md#outstanding) and [TODO audit cleanups](../TODO.md#audit-cleanups-deferredmd-row-34). |
 | P2 — interaction parity | Audit remaining portable interactions (P01), then agree one implementation slice (P02) | Existing settings/management remain closed. First candidate: staged unified-diff review through the shared overlay service, including accept/reject and narrow-terminal evidence. |
 | P2 — documentation | Reconcile targeted STATUS/TODO/DEFERRED statements (D01) | Correct native CPU-setting, module/cancellation and delivered parity/console claims without closing Windows/aggregate-resource or live-testing residuals. |
 | P3 — frontend decomposition | Extract app, CLI dispatch, Studio and settings responsibilities | State/stale-reply contracts, palette checks and representative UI verification protect each changed view. Avoid bundling another redesign. |
@@ -134,15 +138,22 @@ Extension security, the editor workspace, ADR allocation, settings parity and
 native shell security have merged. New work starts from fresh dev; existing
 source and current PRs are checked before assigning overlapping changes.
 
-## Next task: replace the mutation dry run with an executable gate
+## Next task: enforce the mutation gate (executable runner already landed)
 
-**Purpose:** establish a trustworthy signal before large orchestration extractions.
-[mutation-gate.sh](../../scripts/mutation-gate.sh) still prints "Would run" and
-executes no cargo-mutants command. The task remains unstarted.
+**Status: implementation complete, enforcement open.** The dry run was replaced:
+[mutation-gate.sh](../../scripts/mutation-gate.sh) is the Q02 runner (head
+`d004eb7`) and really invokes `cargo mutants` 27.1.0 under contract
+`CX/20261005-q01-v1/001`, [tests/mutation_gate/](../../tests/mutation_gate/) is
+the Q03 fixture harness (head `579e475`), and
+[mutation-gate.yml](../../.github/workflows/mutation-gate.yml) runs it as an
+**advisory** PR check. All of Q01–Q08 merged in
+[#199](https://github.com/NefaroXX/Concerto/pull/199) (2026-10-05). What remains
+is promotion from advisory to a required check and any measured widening of the
+pilot set. The task rows below are retained as the contract record of how that
+work was scoped.
 
-**Implementation branches:** fresh dev with the Miro task ID, for example
-`fix/Q02-mutation-runner`, `test/Q03-mutation-fixtures` and
-`ci/Q06-mutation-pilot`. One isolated branch/worktree per writer.
+**Implementation branches (historical, now merged):** `fix/Q02-mutation-runner`,
+`test/Q03-mutation-fixtures`, `ci/Q06-mutation-pilot`.
 
 **Proposed pilot:** [core/policy.rs](../../crates/core/src/policy.rs),
 [core/shell_security.rs](../../crates/core/src/shell_security.rs) and
@@ -217,7 +228,9 @@ coordinate external coding agents. They do not change Concerto's runtime roles.
   are implied by a board task.
 
 OpenCode's Miro access/ACK remains OC00 and is unverified at this reconciliation.
-Q01 is proposed, not an accepted interface. Feature/fix work continues through
+Q01 is **accepted** as contract `CX/20261005-q01-v1/001` (referenced by the
+runner, the workflow preflight and `docs/mutation-quality-gate.md`). Feature/fix
+work continues through
 PRs to dev under repository instructions. The owner explicitly requested
 restoration onto dev. GitHub branch protection requires a PR for delivery;
 that transport requirement does not change the retention instruction.
@@ -296,8 +309,9 @@ and adversarial input justify them.
   allowance or Windows/cgroup-v2 completion. Native Windows cancellation
   reaches only the direct child; do not infer MCP tree-cleanup guarantees for
   that path. See [native security limits](../native-shell-security.md) and
-  [DEFERRED rows 36/45](../DEFERRED.md#outstanding); D01 must reconcile stale
-  claims that no operator-facing CPU key exists.
+  [DEFERRED rows 36/45](../DEFERRED.md#outstanding); D01 (2026-10-06) reconciled
+  the stale claims that no operator-facing CPU key exists — `shell_security.cpu_seconds`
+  is that key, and it is the key-less `cpu_budget_secs` that row 45 still waits on.
 - **Cancellation remains partial:** [LSP client](../../crates/lsp/src/client.rs)
   checks tokens around reader loops while blocked reads remain an audit lead;
   [ContextOverflowStrategy](../../crates/core/src/traits/context_overflow.rs)

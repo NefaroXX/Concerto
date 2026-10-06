@@ -1,6 +1,7 @@
 # Concerto current status
 
-**Last reconciled with the source tree: 2026-09-28**
+**Last reconciled with the source tree: 2026-10-06** (base: `dev` at `0d07038`,
+the merge of PR #199)
 
 This is the public status source of truth. “Implemented” means the code path
 exists and has automated coverage; it does not mean every provider, model,
@@ -103,11 +104,23 @@ installer packages.
   cap, danger at ≥100%), and a Spend Log modal lists persisted per-call spend
   records.
 - **CLI:** independent `ratatui` frontend with chat, approvals, diffs, provider
-  setup, and optional multi-agent execution.
+  setup, and optional multi-agent execution. Settings and management parity
+  shipped in PR #189 (`config`, `agents`, `blueprint`, `providers`,
+  `credentials`, `preferences`, `extensions skills|mcp`, `plugin`, `shell`,
+  `shell security <show|validate|apply>`, `projects`, `sessions`) per ADR-80;
+  what remains open is *interaction* parity — staged change review, live
+  Coordinator control and runtime Studio inspection
+  (`docs/desktop-cli-parity.md`, "Remaining portable interaction work").
 - **Shells:** installed host shells are detected; users may add custom profiles;
   one authoritative agent shell selection is shared with validation and the
   desktop terminal. The `concerto-shell` crate also contains a typed AI-native
-  command runtime foundation.
+  command runtime foundation. Native program/argv execution and user-owned,
+  revision-checked `[shell_security]` controls shipped in PR #190
+  (`docs/native-shell-security.md`): `cpu_seconds`, `memory_bytes` and
+  `max_processes` are refused in host mode and are only applied under container
+  isolation, where `cpu_seconds` maps to a per-process inherited `ulimit` — not
+  an aggregate CPU-time allowance. Aggregate (cgroup v2) accounting and Windows
+  enforcement are still open (`docs/DEFERRED.md` row 45, row 36).
 - **Evaluation:** 10 standard tasks, categorized `bug_fix`,
   `library_with_tests`, `simple_cli_tool`, and `small_web_api` tasks, plus
   multi-agent/reviewer scenarios. Coverage tracking support for `cargo llvm-cov`
@@ -132,7 +145,9 @@ installer packages.
   `EventKind::McpServerStateChanged`. `[mcp]` config is disabled by default.
 - **Skills/MCP surfaces (v1):** desktop Settings has config-driven Skills and
   MCP collapsible sections (enable + probe; edits take effect next run); the
-  CLI adds read-only `concerto extensions list`.
+  CLI has `concerto extensions <list|skills ACTION|mcp ACTION>` — pack
+  lifecycle (list/show/create/edit/remove/enable/disable) and MCP CRUD plus
+  `probe` (PR #189), not the former read-only `extensions list`.
 - **API and observability:** authenticated Axum API/SSE routes, OpenAPI support,
   Prometheus, OpenTelemetry OTLP HTTP, Langfuse export, and structured tracing.
 
@@ -287,7 +302,9 @@ The expected manual release checks are maintained in [Testing](../TESTING.md).
   default for unmatched `mcp:*`, and cleared (with a state-change event) when a
   server crashes. Config schema v5 adds `[skills]` and `[mcp]`. Desktop
   Settings gains config-driven v1 Skills/MCP sections (next-run semantics); the
-  CLI adds `concerto extensions list`.
+  CLI adds `concerto extensions list` (later expanded by PR #189 into
+  `extensions <skills|mcp> <list|show|create|edit|remove|enable|disable|probe>`
+  and `config` management).
 - **Vector-store dependency removed.** The optional feature-gated store was
   deleted in pre-release cleanup; `SqliteVectorStore` (SQLite + cosine
   similarity) is the only vector store. Cold compile time dropped from ~8
