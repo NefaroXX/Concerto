@@ -20,7 +20,11 @@ use crate::views::studio_runtime::{
 use camino::Utf8PathBuf;
 use concerto_config::AppConfig;
 use concerto_config::CredentialStore;
-use concerto_core::event::{EventBus, ThinkingKind};
+use concerto_core::event::EventBus;
+// Only `mod tests` needs `ThinkingKind` directly now: the transcript mapping
+// that used it moved to `views::chat::entries_from_transcript`.
+#[cfg(test)]
+use concerto_core::event::ThinkingKind;
 use concerto_core::failures::{ClassifiedFailure, FailureAudience};
 use concerto_core::helpers::project_id_hash;
 use concerto_core::ids::Ulid;
@@ -543,144 +547,20 @@ fn agent_graph_path(project_dir: &std::path::Path, session_id: &str) -> PathBuf 
 }
 
 /// Convert a persisted session history (`Vec<core::Message>`) into chat
-/// entries for display. Tool/system roles are skipped; assistant turns with
-/// empty text (pure tool-execution turns) are omitted so the resumed chat
-/// reads as a coherent conversation.
+/// entries for display.
+///
+/// Thin delegate: the mapping (and its skip rules) live in
+/// [`views::chat::entries_from_messages`], next to `ChatEntry`.
 fn messages_to_entries(history: Vec<concerto_core::types::Message>) -> Vec<views::chat::ChatEntry> {
-    use concerto_core::types::Role;
-    let mut entries = Vec::new();
-    for m in history {
-        match m.role {
-            Role::User => {
-                let id = entries.len() + 1;
-                // Historical reconstruction: original timestamps are not
-                // recorded in the run transcript.
-                entries.push(views::chat::ChatEntry::User {
-                    id,
-                    content: m.content,
-                    created_at: None,
-                });
-            }
-            Role::Assistant if !m.content.trim().is_empty() => {
-                let id = entries.len() + 1;
-                entries.push(views::chat::ChatEntry::Assistant {
-                    id,
-                    content: m.content,
-                    streaming: false,
-                    created_at: None,
-                });
-            }
-            _ => {}
-        }
-    }
-    entries
+    views::chat::entries_from(views::chat::ChatSource::Messages(history))
 }
 
 /// Map the durable typed transcript (ADR-36) onto chat entries for restore.
 ///
-/// This mirrors the live rendering in `crates/desktop/src/runtime.rs`:
-/// `Thinking`/`Activity`/`Summary` become dimmed `Thinking` lines (typed
-/// per-agent buckets, summaries as collapsed `Context` lines), tool
-/// calls carry their final status 1:1, and the completion marker becomes a
-/// `RunCompletionSummary` card. Entry ids are assigned sequentially (the
-/// existing convention); `State::from_entries` derives the next id.
+/// Thin delegate: the mapping lives in
+/// [`views::chat::entries_from_transcript`], next to `ChatEntry`.
 pub(crate) fn transcript_to_entries(entries: Vec<TranscriptEntry>) -> Vec<views::chat::ChatEntry> {
-    use concerto_core::transcript::TranscriptToolStatus;
-    use views::chat::{ChatEntry, ToolCallStatus};
-
-    let to_chat_status = |status: &TranscriptToolStatus| match status {
-        TranscriptToolStatus::Running => ToolCallStatus::Running,
-        TranscriptToolStatus::Completed => ToolCallStatus::Completed,
-        TranscriptToolStatus::Failed => ToolCallStatus::Failed,
-        TranscriptToolStatus::Allowed => ToolCallStatus::Allowed,
-        TranscriptToolStatus::Denied => ToolCallStatus::Denied,
-        TranscriptToolStatus::Cancelled => ToolCallStatus::Cancelled,
-    };
-
-    let mut chat_entries = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let id = chat_entries.len() + 1;
-        match entry {
-            TranscriptEntry::User { content } => {
-                // Historical reconstruction: original timestamps are not
-                // recorded in the run transcript.
-                chat_entries.push(ChatEntry::User { id, content, created_at: None });
-            }
-            TranscriptEntry::Assistant { content } => {
-                chat_entries.push(ChatEntry::Assistant {
-                    id,
-                    content,
-                    streaming: false,
-                    created_at: None,
-                });
-            }
-            // Live AgentThought lines render bucketed per agent
-            // (runtime.rs route_event); restore the typed fields directly.
-            // The tier flows through so the bucket digest matches live;
-            // pre-tier rows default to Detail via serde.
-            TranscriptEntry::Thinking { agent, content, kind } => {
-                chat_entries.push(ChatEntry::Thinking {
-                    id,
-                    agent: concerto_core::types::normalize_agent_id(&agent),
-                    content: content.clone(),
-                    kind,
-                    collapsed: false,
-                    created_at: None,
-                    finished_at: None,
-                });
-            }
-            TranscriptEntry::ToolCall { tool_name, detail, status } => {
-                chat_entries.push(ChatEntry::ToolCall {
-                    id,
-                    tool_name,
-                    detail,
-                    status: to_chat_status(&status),
-                    created_at: None,
-                });
-            }
-            // Activity lines restore as thinking lines (ADR-36); the agent
-            // field mirrors the live subtask/activity attribution.
-            TranscriptEntry::Activity { agent, content } => {
-                chat_entries.push(ChatEntry::Thinking {
-                    id,
-                    agent: concerto_core::types::normalize_agent_id(&agent),
-                    content: content.clone(),
-                    kind: ThinkingKind::Detail,
-                    collapsed: false,
-                    created_at: None,
-                    finished_at: None,
-                });
-            }
-            TranscriptEntry::Error { content } => {
-                chat_entries.push(ChatEntry::Error { id, content, created_at: None });
-            }
-            // Context summaries restore as collapsed thinking lines.
-            TranscriptEntry::Summary { content } => {
-                chat_entries.push(ChatEntry::Thinking {
-                    id,
-                    agent: concerto_core::types::normalize_agent_id("Context"),
-                    content: content.clone(),
-                    kind: ThinkingKind::Detail,
-                    collapsed: true,
-                    created_at: None,
-                    finished_at: None,
-                });
-            }
-            TranscriptEntry::Completion { multi_agent, completed, files, project_root } => {
-                chat_entries.push(ChatEntry::Completion {
-                    id,
-                    summary: views::chat::RunCompletionSummary {
-                        multi_agent,
-                        completed,
-                        files,
-                        project_root,
-                    },
-                    created_at: None,
-                });
-            }
-        }
-    }
-    chat_entries
+    views::chat::entries_from(views::chat::ChatSource::Transcript(entries))
 }
 
 fn configured_default_route(config: &AppConfig) -> (String, String) {
