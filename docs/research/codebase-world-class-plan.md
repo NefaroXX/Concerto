@@ -338,3 +338,71 @@ verified contracts and remaining limits. The owner explicitly requested
 retention of this file; directory cleanup must preserve it unless the owner
 changes that instruction.
 
+## Normalization track (NORM) - owner-requested
+
+Appended 2026-10-06 from `dev` at `0d07038` as a pure, add-only section at the
+end of this file, deliberately isolated from the open
+[D01 reconciliation (#202)](https://github.com/NefaroXX/Concerto/pull/202),
+which edits this plan's header and status lines; appending here avoids a merge
+conflict with that PR. This section sets conventions, order and gates for
+normalization work. It claims no completed normalization, no merged slices and
+no new measurements.
+
+**Exemplar and five conventions.**
+[shell/parser.rs](../../crates/shell/src/parser.rs) (320 lines) is the
+reference module. Slices in this track apply: (1) verb-first function names;
+(2) `thiserror` error enums with every failure mode a named variant, plus
+`# Errors` sections on fallible APIs; (3) `//!` module/crate docs with doctest
+examples; (4) in-file failure-case tests, including proptest properties where
+a property is named; (5) size bars — modules <= 500 lines, functions <= ~100
+lines, zero `unwrap`/`expect` in library (non-test) code. Convention (3) is a
+target, not a status claim: the exemplar carries no doctest and doctests are
+near-absent tree-wide today.
+
+**Monolith order — smallest first; each slice moves < 500 lines:**
+(1) tools staged helpers; (2) desktop
+[code_editor/](../../crates/desktop/src/views/code_editor/); (3) chat
+transcript merge; (4) sessions splits; (5) orchestrator giants last
+(`coordinator.rs`, `runtime_runner.rs`, `agent_loop.rs` — sizes in the
+hotspot table above). Never replace one monolith with one new giant file.
+Named slices so far: slice 2 is the desktop staged-helper move (~120 moved
+lines); slice 3 is the chat transcript merge (~80 moved lines).
+
+**Spaghetti singles — one relocation target each:**
+
+- S1: `StagedReview` finds its home in
+  [tools/diff.rs](../../crates/tools/src/diff.rs), post-#203;
+- S2: chat entries find their home in
+  [views/chat.rs](../../crates/desktop/src/views/chat.rs);
+- S3: plan-approval truth in
+  [plan_approval.rs](../../crates/orchestrator/src/plan_approval.rs);
+- S4: `parse_tool_blocks` finds its home under
+  [agents/](../../crates/orchestrator/src/agents/) — inventory label; confirm
+  the exact symbol before moving it.
+
+The inventory references an S5 with no target named in this request; it stays
+unassigned and nothing moves under that label until it is.
+
+**Remnants rule.** Each `allow(dead_code)` (8 files at this base) is justified
+or removed individually — no blanket sweeps. The
+`unimplemented!("not expected in this test")` wall inside
+[runtime_runner.rs](../../crates/orchestrator/src/runtime_runner.rs)'s test
+module is kept; it is a test sentinel, not dead product code. `TODO`
+pointers are kept — registers own the work. `dbg!` is already zero in
+`crates/`; keep it zero. The `unwrap`/`expect` ban stays scoped to library
+(non-test, non-`main`) code per [AGENTS.md](../../AGENTS.md).
+
+**Slice gates.** Every slice is behavior-preserving and lands as exactly one
+PR: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --
+-D warnings` and the focused crate tests run green, with independent review of
+the exact head before merge. Dependencies: coordinator slices are blocked by
+[#200](https://github.com/NefaroXX/Concerto/pull/200) (R02 resume-test
+extraction) and staged-review normalization by
+[#203](https://github.com/NefaroXX/Concerto/pull/203) (the CLI twin of P02) —
+which is why S1 is explicitly post-#203.
+
+**V01 stays deferred.** Live release evidence for shipped
+extension/editor/native-shell behavior remains open exactly as stated in the
+work-order table above. Nothing in this normalization track claims live UI,
+keychain or process proof for any slice.
+
