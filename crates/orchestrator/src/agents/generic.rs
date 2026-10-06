@@ -34,6 +34,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::agents::tool_blocks::{parse_tool_blocks, BlockDecision};
 use crate::tool_facts::{tool_outcome_for_error, ToolExecutedFact, ToolFactContext};
 use crate::tool_guard;
 use concerto_config::{AgentCapabilities, PromptSections};
@@ -1206,7 +1207,9 @@ impl GenericSpecialistAgent {
     /// ADR-66 §4: resolve one Freeform provider turn through the
     /// text-fallback driver.
     ///
-    /// Parses the turn's text for structured tool-call blocks. A malformed
+    /// Parses the turn's text for structured tool-call blocks — the
+    /// parse-plus-bound decision is shared with the single-agent loop in
+    /// [`crate::agents::tool_blocks::parse_tool_blocks`]. A malformed
     /// block is repaired by re-prompting (bounded by
     /// [`crate::tool_driver::MAX_REPAIR_ATTEMPTS`], each attempt audited and
     /// labeled); bound exhaustion fails the run loudly — never a silent
@@ -1227,8 +1230,8 @@ impl GenericSpecialistAgent {
     {
         let mut attempts = 0u32;
         loop {
-            match driver.parse_turn(&text) {
-                crate::tool_driver::DriverTurn::ToolCalls(calls) => {
+            match parse_tool_blocks(driver, &text, attempts) {
+                BlockDecision::Ready(calls) => {
                     let _ = self.bus.publish_for_session(
                         task.session_id,
                         task.id.0,
@@ -1252,28 +1255,26 @@ impl GenericSpecialistAgent {
                     .await;
                     return Ok((text, reasoning, calls, usage));
                 }
-                crate::tool_driver::DriverTurn::FinalAnswer(final_text) => {
+                BlockDecision::FinalAnswer(final_text) => {
                     return Ok((final_text, reasoning, Vec::new(), usage));
                 }
-                crate::tool_driver::DriverTurn::Malformed { reason } => {
-                    if attempts >= crate::tool_driver::MAX_REPAIR_ATTEMPTS {
-                        self.record_tool_driver_event(
-                            task,
-                            model,
-                            "exhausted",
-                            "exhausted",
-                            &format!(
-                                "bounded repair exhausted after {attempts} attempts: {reason}"
-                            ),
-                            cancel,
-                        )
-                        .await;
-                        return Err(OrchestratorError::AgentLoopError(format!(
-                            "tool_driver: text-fallback repair exhausted after {attempts} attempts \
-                             (provider '{}', model '{model}'): {reason}",
-                            self.provider.provider_name()
-                        )));
-                    }
+                BlockDecision::Exhausted { reason } => {
+                    self.record_tool_driver_event(
+                        task,
+                        model,
+                        "exhausted",
+                        "exhausted",
+                        &format!("bounded repair exhausted after {attempts} attempts: {reason}"),
+                        cancel,
+                    )
+                    .await;
+                    return Err(OrchestratorError::AgentLoopError(format!(
+                        "tool_driver: text-fallback repair exhausted after {attempts} attempts \
+                         (provider '{}', model '{model}'): {reason}",
+                        self.provider.provider_name()
+                    )));
+                }
+                BlockDecision::Repair { reason } => {
                     attempts += 1;
                     let _ = self.bus.publish_for_session(
                         task.session_id,
