@@ -9,6 +9,7 @@ use concerto_tools::diff::compute_diffs_from_virtual_fs;
 use concerto_tools::virtual_fs::VirtualFs;
 use iced::widget::text_editor;
 
+use super::staged::{collect_staged_review, count_staged_hunks};
 use super::{
     clamp_cursor, expand_all_in_text, lsp_did_save, trim_trailing_whitespace, ActiveFold,
     Diagnostic, EditKind, HistoryEntry, Message, State, TabMode,
@@ -320,30 +321,17 @@ impl State {
         }
     }
 
+    /// Replace the staged review set with `results` as assembled from `vfs`.
+    /// Thin wiring: sorting, entry building and the baseline map live in
+    /// `super::staged`.
     pub(crate) fn set_staged_results(
         &mut self,
         vfs: &VirtualFs,
-        mut results: Vec<concerto_api_types::diff::DiffResult>,
+        results: Vec<concerto_api_types::diff::DiffResult>,
     ) {
-        use concerto_tools::virtual_fs::VirtualFsEntry;
-        self.staged_entries.clear();
-        for path in vfs.changed_paths() {
-            let Some(entry) = vfs.get(path) else { continue };
-            let has_diff = results.iter().any(|result| result.path == path);
-            let file_operation =
-                matches!(entry, VirtualFsEntry::Created { .. } | VirtualFsEntry::Deleted { .. });
-            if !has_diff && file_operation {
-                results.push(concerto_api_types::diff::DiffResult {
-                    path: path.to_path_buf(),
-                    hunks: Vec::new(),
-                });
-            }
-            if has_diff || file_operation {
-                self.staged_entries.insert(path.to_path_buf(), entry.clone());
-            }
-        }
-        results.sort_by(|a, b| a.path.cmp(&b.path));
-        self.staged = results;
+        let (staged, staged_entries) = collect_staged_review(vfs, results);
+        self.staged = staged;
+        self.staged_entries = staged_entries;
     }
 
     pub(crate) fn staged_file(&self) -> Option<&concerto_api_types::diff::DiffResult> {
@@ -351,22 +339,10 @@ impl State {
         self.staged.iter().find(|result| &result.path == path)
     }
 
+    /// Reviewable hunks staged for `path`; the counting contract is documented
+    /// on `super::staged::count_staged_hunks`.
     pub(crate) fn staged_hunks(&self, path: &Utf8Path) -> usize {
-        use concerto_api_types::diff::DiffLine;
-        self.staged
-            .iter()
-            .find(|result| result.path == path)
-            .map(|result| {
-                result
-                    .hunks
-                    .iter()
-                    .filter(|hunk| {
-                        hunk.lines.iter().any(|line| !matches!(line, DiffLine::Context { .. }))
-                    })
-                    .count()
-                    .max(1)
-            })
-            .unwrap_or(0)
+        count_staged_hunks(&self.staged, path)
     }
 
     /// Explicit user decision, scoped to a single entry; failures retain the overlay.

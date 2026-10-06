@@ -26,6 +26,7 @@ mod editor_core;
 mod editor_view;
 mod helpers;
 mod message;
+mod staged;
 mod text_helpers;
 mod workspace;
 mod workspace_view;
