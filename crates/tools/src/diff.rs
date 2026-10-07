@@ -1,7 +1,10 @@
 use camino::Utf8PathBuf;
 use concerto_api_types::diff::{DiffLine, DiffResult, Hunk};
+use concerto_core::types::{Condition, PolicyRule};
+use concerto_core::PolicyPresets;
 use std::collections::HashSet;
 use std::ops::Range;
+use std::sync::OnceLock;
 
 fn change_ranges(old: &str, new: &str) -> Vec<(Range<u32>, Range<u32>)> {
     use imara_diff::intern::InternedInput;
@@ -67,9 +70,85 @@ pub fn reject_change_hunks(
     Ok(content)
 }
 
+/// Replacement marker for diff line content that matches the `no_secrets`
+/// secret pattern.
+const REDACTED: &str = "[REDACTED]";
+
+/// The core `no_secrets` `Condition::SecretPattern` regex, compiled once per
+/// process (SEC-001: reuse the policy's pattern instead of a local copy).
+///
+/// Returns `None` only if the preset's fixed pattern fails to compile or the
+/// preset stops carrying a `SecretPattern` rule; redaction is then skipped
+/// with a warning instead of panicking, mirroring how
+/// [`concerto_core::sanitizer`] degrades on an invalid pattern.
+fn no_secrets_pattern() -> Option<&'static regex::Regex> {
+    static PATTERN: OnceLock<Option<regex::Regex>> = OnceLock::new();
+    PATTERN
+        .get_or_init(|| {
+            let Some(pattern) =
+                PolicyPresets::no_secrets().into_iter().find_map(|rule| match rule {
+                    PolicyRule::AutoDeny(Condition::SecretPattern(pattern)) => Some(pattern),
+                    _ => None,
+                })
+            else {
+                tracing::warn!(
+                    "core no_secrets preset carries no SecretPattern; diff redaction disabled"
+                );
+                return None;
+            };
+            match regex::Regex::new(&pattern) {
+                Ok(regex) => Some(regex),
+                Err(error) => {
+                    tracing::warn!(%error, "invalid no_secrets pattern; diff redaction disabled");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// Replace the content of every diff line matching the core `no_secrets`
+/// secret pattern with [`REDACTED`], preserving hunk structure, line counts,
+/// and line numbers (SEC-001 compute-time redaction, shared by the CLI and
+/// desktop diff views because both consume [`compute_diff`] output).
+///
+/// The reused pattern matches secret *keywords* (`api_key`, `password`,
+/// `token`, ...) rather than the credential value, so redacting only the
+/// matched substring would leave the value on screen; a matching line is
+/// therefore replaced wholesale. This is display-only: reject/apply paths
+/// (`reject_change_hunks`, `VirtualFs::reject_hunks`) keep operating on the
+/// raw file content.
+fn redact_secret_lines(hunks: &mut [Hunk]) {
+    let Some(pattern) = no_secrets_pattern() else {
+        return;
+    };
+    for hunk in hunks {
+        for line in &mut hunk.lines {
+            match line {
+                DiffLine::Addition { content, .. }
+                | DiffLine::Deletion { content, .. }
+                | DiffLine::Context { content, .. }
+                    if pattern.is_match(content) =>
+                {
+                    content.clear();
+                    content.push_str(REDACTED);
+                }
+                // Either a non-content variant or a line without a secret
+                // keyword — `DiffLine` is `#[non_exhaustive]` outside
+                // `api-types`, so the wildcard arm stays.
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Compute a unified diff between two strings.
 /// Uses `imara-diff`'s Histogram algorithm for line-level diffs.
 /// Returns a `DiffResult` containing all hunks.
+///
+/// Line content matching the core `no_secrets` secret pattern is replaced
+/// with `[REDACTED]` before the result is built (see `redact_secret_lines`);
+/// hunk structure and line numbers are preserved.
 pub fn compute_diff(path: Utf8PathBuf, old: &str, new: &str) -> DiffResult {
     if old == new {
         return DiffResult { path, hunks: Vec::new() };
@@ -175,7 +254,9 @@ pub fn compute_diff(path: Utf8PathBuf, old: &str, new: &str) -> DiffResult {
         }
     }
 
-    DiffResult { path, hunks }
+    let mut result = DiffResult { path, hunks };
+    redact_secret_lines(&mut result.hunks);
+    result
 }
 
 fn get_line_at(content: &str, index: usize) -> Option<&str> {
@@ -233,6 +314,10 @@ pub fn compute_all_virtual_diffs(
 /// Iterates over every non-Original entry, converts it to a
 /// [`VirtualFsEntryRef`], and delegates to [`compute_all_virtual_diffs`].
 /// Entries whose content has not actually changed produce no diff.
+///
+/// Secret-pattern line content is redacted at compute time by
+/// [`compute_diff`], so every consumer of these results (CLI and desktop
+/// diff review alike) sees `[REDACTED]` lines instead of raw credentials.
 pub fn compute_diffs_from_virtual_fs(vfs: &crate::virtual_fs::VirtualFs) -> Vec<DiffResult> {
     use crate::virtual_fs::VirtualFsEntry;
 
@@ -443,5 +528,201 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results.iter().any(|r| r.path.as_str() == "new.txt"));
         assert!(results.iter().any(|r| r.path.as_str() == "gone.txt"));
+    }
+
+    // ---- SEC-001: compute-time secret redaction --------------------------
+
+    /// Every `DiffLine` content string in `result`, in hunk order.
+    fn line_contents(result: &DiffResult) -> Vec<&str> {
+        result
+            .hunks
+            .iter()
+            .flat_map(|h| &h.lines)
+            .filter_map(|line| match line {
+                DiffLine::Addition { content, .. }
+                | DiffLine::Deletion { content, .. }
+                | DiffLine::Context { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn compute_diff_redacts_secret_key_addition() {
+        let old = "fn main() {}\n";
+        let new = "fn main() {}\nlet api_key = \"sk-proj-abcd1234efgh5678\";\n";
+        let result = compute_diff(Utf8PathBuf::from("cfg.rs"), old, new);
+
+        let additions: Vec<&str> = result
+            .hunks
+            .iter()
+            .flat_map(|h| &h.lines)
+            .filter_map(|line| match line {
+                DiffLine::Addition { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(additions, vec![REDACTED], "secret key line must be redacted");
+
+        let serialized = serde_json::to_string(&result).expect("DiffResult serializes");
+        assert!(
+            !serialized.contains("sk-proj-abcd1234efgh5678"),
+            "raw key material must not survive redaction: {serialized}"
+        );
+        assert!(serialized.contains(REDACTED));
+    }
+
+    #[test]
+    fn compute_diff_redacts_password_deletion() {
+        let old = "let a = 1;\npassword = \"hunter2secret99\";\nlet b = 2;\n";
+        let new = "let a = 1;\nlet b = 2;\n";
+        let result = compute_diff(Utf8PathBuf::from("app.env"), old, new);
+
+        let deletions: Vec<&str> = result
+            .hunks
+            .iter()
+            .flat_map(|h| &h.lines)
+            .filter_map(|line| match line {
+                DiffLine::Deletion { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deletions, vec![REDACTED], "password line must be redacted");
+
+        let serialized = serde_json::to_string(&result).expect("DiffResult serializes");
+        assert!(
+            !serialized.contains("hunter2secret99"),
+            "raw password must not survive redaction: {serialized}"
+        );
+    }
+
+    #[test]
+    fn compute_diff_redacts_token_context_line() {
+        let old = "auth_token = load_token();\nlet x = 1;\n";
+        let new = "auth_token = load_token();\nlet x = 2;\n";
+        let result = compute_diff(Utf8PathBuf::from("auth.rs"), old, new);
+
+        let context: Vec<(&str, u64)> = result
+            .hunks
+            .iter()
+            .flat_map(|h| &h.lines)
+            .filter_map(|line| match line {
+                DiffLine::Context { content, line_num } => Some((content.as_str(), *line_num)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            context,
+            vec![(REDACTED, 1)],
+            "token-bearing context line must be redacted with its line number preserved"
+        );
+
+        let serialized = serde_json::to_string(&result).expect("DiffResult serializes");
+        assert!(
+            !serialized.contains("load_token"),
+            "raw token reference must not survive redaction: {serialized}"
+        );
+    }
+
+    #[test]
+    fn compute_diff_keeps_clean_lines_unchanged() {
+        let old = "fn add(a: u32, b: u32) -> u32 {\n    a + b\n}\n";
+        let new = "fn add(a: u32, b: u32) -> u32 {\n    a + b + 1\n}\n";
+        let result = compute_diff(Utf8PathBuf::from("math.rs"), old, new);
+
+        assert!(!result.hunks.is_empty(), "a change must still produce hunks");
+        let contents = line_contents(&result);
+        assert!(
+            contents.iter().all(|c| !c.contains(REDACTED)),
+            "clean lines must not be redacted: {contents:?}"
+        );
+        assert!(
+            contents.contains(&"fn add(a: u32, b: u32) -> u32 {"),
+            "clean context must pass through verbatim: {contents:?}"
+        );
+        assert!(contents.contains(&"    a + b + 1"), "clean addition verbatim: {contents:?}");
+    }
+
+    #[test]
+    fn redaction_preserves_hunk_structure_and_line_numbers() {
+        let old = "let a = 1;\npassword = \"hunter2secret99\";\nlet b = 2;\n";
+        let new = "let a = 1;\nlet b = 2;\n";
+        let result = compute_diff(Utf8PathBuf::from("app.env"), old, new);
+
+        // Structure identical to an unredacted diff: context, change, context.
+        assert_eq!(result.hunks.len(), 3);
+
+        let leading = &result.hunks[0];
+        assert_eq!(
+            (leading.old_start, leading.old_len, leading.new_start, leading.new_len),
+            (1, 1, 1, 1)
+        );
+        assert_eq!(
+            leading.lines,
+            vec![DiffLine::Context { content: "let a = 1;".into(), line_num: 1 }]
+        );
+
+        let change = &result.hunks[1];
+        assert_eq!(
+            (change.old_start, change.old_len, change.new_start, change.new_len),
+            (2, 1, 2, 0),
+            "hunk ranges must not shift under redaction"
+        );
+        assert_eq!(
+            change.lines,
+            vec![DiffLine::Deletion { content: REDACTED.into(), line_num: 2 }],
+            "line count and line_num preserved while content is redacted"
+        );
+
+        let trailing = &result.hunks[2];
+        assert_eq!(
+            (trailing.old_start, trailing.old_len, trailing.new_start, trailing.new_len),
+            (3, 1, 2, 1)
+        );
+        assert_eq!(
+            trailing.lines,
+            vec![DiffLine::Context { content: "let b = 2;".into(), line_num: 3 }]
+        );
+    }
+
+    #[test]
+    fn binary_placeholder_is_not_redacted() {
+        // Same shape git.rs substitutes for non-UTF-8 blobs; none of the
+        // no_secrets keywords appear, so it must pass through verbatim.
+        let placeholder = "[binary file: 128 bytes — contents not decoded]";
+        let result = compute_diff(Utf8PathBuf::from("blob.bin"), "", &format!("{placeholder}\n"));
+
+        let additions: Vec<&str> = result
+            .hunks
+            .iter()
+            .flat_map(|h| &h.lines)
+            .filter_map(|line| match line {
+                DiffLine::Addition { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(additions, vec![placeholder], "binary placeholder must stay unchanged");
+    }
+
+    #[test]
+    fn compute_diffs_from_virtual_fs_redacts_secret_lines() {
+        use crate::virtual_fs::{VirtualFs, VirtualFsEntry};
+        let mut vfs = VirtualFs::new();
+        vfs.insert(VirtualFsEntry::Modified {
+            path: Utf8PathBuf::from(".env"),
+            original: "debug=true\n".to_string(),
+            current: "debug=true\npassword = \"hunter2secret99\"\n".to_string(),
+        });
+
+        let results = compute_diffs_from_virtual_fs(&vfs);
+        assert_eq!(results.len(), 1);
+
+        let serialized = serde_json::to_string(&results).expect("results serialize");
+        assert!(serialized.contains(REDACTED), "marker missing: {serialized}");
+        assert!(
+            !serialized.contains("hunter2secret99"),
+            "raw secret must not reach diff consumers: {serialized}"
+        );
+        assert!(serialized.contains("debug=true"), "clean lines must stay readable: {serialized}");
     }
 }

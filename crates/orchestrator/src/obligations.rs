@@ -45,10 +45,13 @@
 
 use std::collections::HashMap;
 
-use concerto_core::types::{AgentId, SubTaskStatus};
+use concerto_core::types::AgentId;
 use serde::{Deserialize, Serialize};
 
 use crate::graph::TaskGraph;
+
+mod transitions;
+pub use self::transitions::{dispatch_guard_arms, obligation_state_for_status, try_transition};
 
 /// What kind of work an obligation tracks. Chained in the canonical
 /// investigate → implement → verify → explain order via
@@ -121,27 +124,6 @@ impl ObligationState {
     /// terminal states keeps the execution policy armed.
     pub fn is_open(self) -> bool {
         matches!(self, Self::Outstanding | Self::Blocked | Self::Failed)
-    }
-}
-
-/// Map a graph subtask status onto the obligation lifecycle. `Completed` is
-/// settled; `Failed` is terminal-but-retryable; `Declared` (obligation
-/// declared via `declare_obligations`, not yet dispatched) is Outstanding —
-/// enforceable before any dispatch, never auto-executed; every other status
-/// is work the run has not settled yet. There is no graph-native "superseded"
-/// — that transition lives on the ledger (reconsider/split/merge), never in
-/// a status column.
-pub fn obligation_state_for_status(status: SubTaskStatus) -> ObligationState {
-    match status {
-        SubTaskStatus::Completed => ObligationState::Completed,
-        SubTaskStatus::Blocked => ObligationState::Blocked,
-        SubTaskStatus::Failed => ObligationState::Failed,
-        SubTaskStatus::Declared
-        | SubTaskStatus::Pending
-        | SubTaskStatus::Running
-        | SubTaskStatus::AwaitingReview
-        | SubTaskStatus::NeedsRevision => ObligationState::Outstanding,
-        _ => ObligationState::Outstanding,
     }
 }
 
@@ -222,61 +204,6 @@ impl std::fmt::Display for ObligationTransitionError {
 }
 
 impl std::error::Error for ObligationTransitionError {}
-
-/// Validate one transition without mutating anything. Pure: unit-testable
-/// without a graph, a checkpoint, or a provider.
-pub fn try_transition(
-    current: ObligationState,
-    event: &ObligationEvent,
-    kind: ObligationKind,
-    obligation_id: &str,
-) -> Result<ObligationState, ObligationTransitionError> {
-    let reject = |reason: &str| {
-        Err(ObligationTransitionError {
-            obligation_id: obligation_id.to_owned(),
-            from: current,
-            reason: reason.to_owned(),
-        })
-    };
-    match (current, event) {
-        (ObligationState::Completed, _) | (ObligationState::Superseded, _) => {
-            reject("terminal obligations accept no further transitions")
-        }
-        (ObligationState::Outstanding, ObligationEvent::Complete { evidence }) => {
-            if !kind.is_prose_satisfiable() && evidence.is_empty() {
-                return reject(
-                    "execution obligations require evidence; prose never marks them complete",
-                );
-            }
-            Ok(ObligationState::Completed)
-        }
-        (ObligationState::Outstanding, ObligationEvent::Block { .. }) => {
-            Ok(ObligationState::Blocked)
-        }
-        (ObligationState::Outstanding, ObligationEvent::Fail { .. }) => Ok(ObligationState::Failed),
-        (ObligationState::Outstanding, ObligationEvent::Supersede { .. }) => {
-            Ok(ObligationState::Superseded)
-        }
-        (ObligationState::Outstanding, ObligationEvent::Retry) => {
-            reject("nothing to retry: the obligation is already outstanding")
-        }
-        (ObligationState::Blocked, ObligationEvent::Retry) => Ok(ObligationState::Outstanding),
-        (ObligationState::Blocked, ObligationEvent::Fail { .. }) => Ok(ObligationState::Failed),
-        (ObligationState::Blocked, ObligationEvent::Supersede { .. }) => {
-            Ok(ObligationState::Superseded)
-        }
-        (ObligationState::Blocked, _) => {
-            reject("blocked obligations must be retried before they can complete")
-        }
-        (ObligationState::Failed, ObligationEvent::Retry) => Ok(ObligationState::Outstanding),
-        (ObligationState::Failed, ObligationEvent::Supersede { .. }) => {
-            Ok(ObligationState::Superseded)
-        }
-        (ObligationState::Failed, _) => {
-            reject("failed obligations must be retried before they can complete")
-        }
-    }
-}
 
 /// Owned, transition-validated collection of a run's obligations.
 ///
@@ -425,20 +352,11 @@ impl ObligationLedger {
     }
 }
 
-/// Whether the dispatch guards must arm for this run state: the legacy mode
-/// predicate *or* an open execution obligation. Either source arms; neither
-/// disarms the other's. Module-level form of the combined predicate — the
-/// coordinator's `dispatch_guard_arms` arms on these two terms plus a
-/// promised plan that produced no code artifact.
-pub fn dispatch_guard_arms(mode_requires_dispatch: bool, ledger: &ObligationLedger) -> bool {
-    mode_requires_dispatch || ledger.has_open_execution_work()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use concerto_core::ids::Ulid;
-    use concerto_core::types::{SubTask, TaskId};
+    use concerto_core::types::{SubTask, SubTaskStatus, TaskId};
 
     use crate::graph::Dependency;
 
