@@ -1,6 +1,6 @@
 # Concerto pending work (TODO)
 
-**Last reconciled with the source tree: 2026-09-28**
+**Last reconciled with the source tree: 2026-10-06** (base: `dev` at `0d07038`)
 
 **This file is no longer the outstanding-work register.**
 [`DEFERRED.md`](DEFERRED.md) is. Every deferral lands there with a source, a
@@ -18,7 +18,7 @@ session scoping, recall budget caps, proxy tool-call parsing, fault-injection
 tests, prompt-prefix stability), cited a file that has never existed in the
 tree (`AUDIT_FINDINGS_CURRENT.md`), cited an ADR at line numbers that do not
 exist, and carried a `coordinator.rs` line count off by an order of magnitude
-(3 295 vs ~36 000 today). One maintained register with a stated maintenance
+(3 295 vs 41 667 as of 2026-10-06). One maintained register with a stated maintenance
 rule is auditable; two "authoritative" lists are not.
 
 ## Not in the register
@@ -58,12 +58,17 @@ unstarted.
   interactive HTTP client to serve. Source: `docs/adrs/ADR-44.md:37`.
 - **Config for a shell CPU budget (gap #6 residual).** *Registered — see
   `DEFERRED.md` row 45, whose title is "Shell CPU limiting — Windows, cgroup v2,
-  config key" and whose body states the missing TOML key explicitly.* The
-  portable CPU-budget layer shipped (`13cba1c`) but `cpu_budget_secs` is `None`
-  in every production constructor (`crates/tools/src/shell.rs:220-231`) and
-  there is no TOML key for it — the env var is the only operator knob. This
-  item was listed here on the belief that the config key was unregistered; that
-  belief was wrong, and this bullet is kept only as a pointer.
+  config key" and whose body states the missing TOML key explicitly.* Two
+  distinct CPU controls exist; only one has a config key:
+  `[shell_security] cpu_seconds` (operator TOML, human-owned and
+  revision-checked) is **shipped** (PR #190) but container-only — it maps to a
+  per-process inherited `ulimit` and is refused in host mode
+  (`crates/core/src/shell_security.rs`, `crates/tools/src/native_process.rs`,
+  `docs/native-shell-security.md:82`). The *portable* tool-level budget
+  `ShellConfig::cpu_budget_secs` (`crates/tools/src/shell.rs:220`, default
+  `None` at `:231`) still has **no TOML key** — only
+  `CONCERTO_SHELL_CPU_BUDGET_SECS` (`shell.rs:58`) — and that is what row 45 is
+  waiting on. This bullet is kept only as a pointer.
 
 ## Audit cleanups (`DEFERRED.md` row 34)
 
@@ -94,15 +99,36 @@ lost. All six read Not started or Partial.
   are deliberate; note `MemoryError` exists only in core (the original audit
   over-stated this one).
 - **M-05 — oversized module decomposition.** Partial — and worse than recorded.
-  `settings.rs` and `studio_editor.rs` split into `views/settings/` and
-  `views/studio/`; what remains is large: `coordinator.rs` ~36 000,
-  `runtime_runner.rs` ~9 400, `agent_loop.rs` ~8 200 lines (measured
-  2026-09-28). Each needs a dedicated refactor with coverage.
+  `settings.rs` split into `views/settings/` (state/helpers/message/shell) and
+  the Studio editor split into the flat `views/studio_*.rs` files +
+  `orchestration_studio.rs` (there is **no** `views/studio/` directory); what
+  remains is large: `coordinator.rs` 41 667, `runtime_runner.rs` 9 534,
+  `agent_loop.rs` 8 253, `desktop/src/app.rs` 9 244 lines (measured 2026-10-06).
+  Each needs a dedicated refactor with coverage.
 - **M-02 — decorative cancellation.** Partial. Hot paths (tools, shell, plugins,
-  memory sync/watcher, sessions) honour tokens; remaining ignores include
-  `core/src/executor.rs:216..362`, core traits, shell builtins,
-  `memory/src/system.rs:174-457`, `plugins/src/host_fns.rs:511` (fresh token),
-  and `ContextOverflowStrategy`. Closing requires trait-contract changes.
+  memory sync/watcher, sessions) honour tokens; the remaining ignores are:
+  core trait defaults that accept `_cancel` and never consult it
+  (`traits/context_overflow.rs:93,142` (`ContextOverflowStrategy`), plus the
+  `policy`/`tool`/`provider`/`vector_store`/`memory`/`approval` defaults);
+  the audit write itself — `executor.rs:229,313` forwards the token to
+  `AuditLog::record`, but `SqliteAuditLog::record`
+  (`crates/sessions/src/audit.rs:23-27`) takes `_cancel` and never checks it, so
+  a cancelled run still writes its audit row; the shell paths that take
+  `_cancel` and never consult it (`crates/shell/src/builtins.rs:59,311`,
+  `execution.rs:275,553,566,603`, `client.rs:101` — other builtins do check,
+  e.g. `builtins.rs:138,215,246`); and the plugin
+  completion fallback at `plugins/src/host_fns.rs:663`, which only has a caller
+  token when one was threaded via `ActivePlugin::set_cancel` and otherwise uses
+  `unwrap_or_default()`. (Two previously-listed ranges are no longer ignores:
+  `memory/src/system.rs` L1 extraction/dedup check the token at `:352,373,407`,
+  and `executor.rs:216..362` now passes the token down rather than dropping it.)
+  Closing requires trait-contract changes.
+- **A01 — LSP blocked-read cancellation (not landed).** No A01 branch or PR
+  exists on this base. `crates/lsp/src/client.rs` checks the token between
+  messages (`:126`, `:158`), but the blocked `read_line` (`:132`) and
+  `read_exact` (`:155`) awaits are unbounded, so cancellation cannot interrupt a
+  server that stops writing. Treat any claim that this is bounded as false until
+  the fix lands.
 
 ## Resolved — where each record now lives
 
@@ -126,7 +152,7 @@ its authority instead of re-opening the item.
 | Hybrid UI medium / full scope | Medium merged (PR #97); full scope is `DEFERRED.md` row 37 |
 | Codebase-world-class Phases 1–5 | The 2026-08 plan behind these phases was an aspirational estimate and was removed on 2026-09-28; Phase 3 shipped (`10357cd`) and the real residue is registered per-item in `DEFERRED.md` row 34 |
 | Editor integration ("open in editor") | `DEFERRED.md` closed row 26 — **cut**, not deferred. The in-app editor and diff viewer shipped; external-editor launch is a scope cut |
-| Stale parity document | Resolved in place: `docs/desktop-cli-parity.md` is marked complete as of 2026-08-03 |
+| Stale parity document | Resolved in place: `docs/desktop-cli-parity.md` now records settings/management parity as shipped (expanded 2026-10-03, PR #189) and states in its header that **interaction parity remains in progress** — the "complete as of 2026-08-03" reading is stale; the remaining staged-review / live-Coordinator / Studio gaps are enumerated there |
 | Flat tool-call parsing for OpenAI-compatible proxies | Fixes 1–3 shipped (`docs/proxy-tool-call-fix.md`, 2026-09-20) plus long-tail hardening `3bc11db` (`DEFERRED.md` closed row 21) |
 | Additional OpenAI-compatible providers | Tier 1 + Tier 2 shipped — 22 provider ids (`DEFERRED.md` closed row 9). Tier 3 is row 6; Doubao/StepFun/Replicate is row 7 |
 | Model metadata / price freshness | `DEFERRED.md` row 27 — the SpendLog UI exists but nothing feeds it fresh prices. Explicit non-goal: no cost-based routing |
