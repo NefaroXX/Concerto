@@ -12,6 +12,7 @@ use crate::views::spend::{
 use crate::widgets::agent_graph::NodeState;
 use crate::widgets::markdown;
 use concerto_core::event::ThinkingKind;
+use concerto_core::transcript::TranscriptEntry;
 use concerto_core::types::normalize_agent_id;
 use concerto_sessions::spend::SpendRecord;
 
@@ -195,6 +196,170 @@ pub struct RunCompletionSummary {
     pub completed: bool,
     pub files: Vec<String>,
     pub project_root: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Restore-time mapping (single home for the transcript mappers)
+// ---------------------------------------------------------------------------
+
+/// Inputs that map onto a display [`ChatEntry`] sequence.
+///
+/// A resumed session comes from one of two persisted surfaces — the legacy
+/// run history (`core::types::Message` rows) or the durable typed transcript
+/// (ADR-36) — and both must produce the same view model, so both mappers
+/// live here next to [`ChatEntry`] instead of in `app.rs`.
+#[derive(Debug, Clone)]
+pub enum ChatSource {
+    /// Persisted session history rows (`core::types::Message`).
+    Messages(Vec<concerto_core::types::Message>),
+    /// Durable typed transcript entries (ADR-36).
+    Transcript(Vec<TranscriptEntry>),
+}
+
+/// Map a [`ChatSource`] onto its display [`ChatEntry`] sequence.
+///
+/// Verb-first single entry point for restore-time conversion: whichever
+/// surface a session was persisted as, the chat renders the same
+/// [`ChatEntry`] list with sequential 1-based ids (the existing convention;
+/// [`State::from_entries`] derives the next id).
+pub fn entries_from(source: ChatSource) -> Vec<ChatEntry> {
+    match source {
+        ChatSource::Messages(history) => entries_from_messages(history),
+        ChatSource::Transcript(transcript) => entries_from_transcript(transcript),
+    }
+}
+
+/// Convert a persisted session history (`Vec<core::types::Message>`) into chat
+/// entries for display. Tool/system roles are skipped; assistant turns with
+/// empty text (pure tool-execution turns) are omitted so the resumed chat
+/// reads as a coherent conversation.
+///
+/// The degraded messages-only view: legacy sessions predate the typed
+/// transcript, so this is the last fallback under ADR-36 §5 restore priority.
+pub fn entries_from_messages(history: Vec<concerto_core::types::Message>) -> Vec<ChatEntry> {
+    use concerto_core::types::Role;
+    entries_via(history, |id, m| match m.role {
+        Role::User => {
+            // Historical reconstruction: original timestamps are not
+            // recorded in the run transcript.
+            Some(ChatEntry::User { id, content: m.content, created_at: None })
+        }
+        // Assistant turns that only executed tools carry no text, so they
+        // are skipped rather than rendered as blank bubbles.
+        Role::Assistant if !m.content.trim().is_empty() => Some(ChatEntry::Assistant {
+            id,
+            content: m.content,
+            streaming: false,
+            created_at: None,
+        }),
+        _ => None,
+    })
+}
+
+/// Map the durable typed transcript (ADR-36) onto chat entries for restore.
+///
+/// This mirrors the live rendering in `crates/desktop/src/runtime.rs`:
+/// `Thinking`/`Activity`/`Summary` become dimmed `Thinking` lines (typed
+/// per-agent buckets, summaries as collapsed `Context` lines), tool
+/// calls carry their final status 1:1, and the completion marker becomes a
+/// [`ChatEntry::Completion`] card.
+pub fn entries_from_transcript(transcript: Vec<TranscriptEntry>) -> Vec<ChatEntry> {
+    use concerto_core::transcript::TranscriptToolStatus;
+
+    let to_chat_status = |status: &TranscriptToolStatus| match status {
+        TranscriptToolStatus::Running => ToolCallStatus::Running,
+        TranscriptToolStatus::Completed => ToolCallStatus::Completed,
+        TranscriptToolStatus::Failed => ToolCallStatus::Failed,
+        TranscriptToolStatus::Allowed => ToolCallStatus::Allowed,
+        TranscriptToolStatus::Denied => ToolCallStatus::Denied,
+        TranscriptToolStatus::Cancelled => ToolCallStatus::Cancelled,
+    };
+
+    entries_via(transcript, |id, entry| {
+        let mapped = match entry {
+            TranscriptEntry::User { content } => {
+                // Historical reconstruction: original timestamps are not
+                // recorded in the run transcript.
+                ChatEntry::User { id, content, created_at: None }
+            }
+            TranscriptEntry::Assistant { content } => {
+                ChatEntry::Assistant { id, content, streaming: false, created_at: None }
+            }
+            // Live AgentThought lines render bucketed per agent
+            // (runtime.rs route_event); restore the typed fields directly.
+            // The tier flows through so the bucket digest matches live;
+            // pre-tier rows default to Detail via serde.
+            TranscriptEntry::Thinking { agent, content, kind } => ChatEntry::Thinking {
+                id,
+                agent: normalize_agent_id(&agent),
+                content,
+                kind,
+                collapsed: false,
+                created_at: None,
+                finished_at: None,
+            },
+            TranscriptEntry::ToolCall { tool_name, detail, status } => ChatEntry::ToolCall {
+                id,
+                tool_name,
+                detail,
+                status: to_chat_status(&status),
+                created_at: None,
+            },
+            // Activity lines restore as thinking lines (ADR-36); the agent
+            // field mirrors the live subtask/activity attribution.
+            TranscriptEntry::Activity { agent, content } => ChatEntry::Thinking {
+                id,
+                agent: normalize_agent_id(&agent),
+                content,
+                kind: ThinkingKind::Detail,
+                collapsed: false,
+                created_at: None,
+                finished_at: None,
+            },
+            TranscriptEntry::Error { content } => {
+                ChatEntry::Error { id, content, created_at: None }
+            }
+            // Context summaries restore as collapsed thinking lines.
+            TranscriptEntry::Summary { content } => ChatEntry::Thinking {
+                id,
+                agent: normalize_agent_id("Context"),
+                content,
+                kind: ThinkingKind::Detail,
+                collapsed: true,
+                created_at: None,
+                finished_at: None,
+            },
+            TranscriptEntry::Completion { multi_agent, completed, files, project_root } => {
+                ChatEntry::Completion {
+                    id,
+                    summary: RunCompletionSummary { multi_agent, completed, files, project_root },
+                    created_at: None,
+                }
+            }
+        };
+        Some(mapped)
+    })
+}
+
+/// Shared mapping core for [`entries_from_messages`] and
+/// [`entries_from_transcript`]: fold `items` into entries, handing the mapper
+/// the next sequential 1-based id.
+///
+/// The id is derived from the entries already accepted, so a source row the
+/// mapper declines (`None`) consumes no id and the sequence stays gap-free —
+/// exactly the numbering both original per-source loops produced.
+fn entries_via<T>(
+    items: impl IntoIterator<Item = T>,
+    mut map: impl FnMut(EntryId, T) -> Option<ChatEntry>,
+) -> Vec<ChatEntry> {
+    let mut entries = Vec::new();
+    for item in items {
+        let id = entries.len() + 1;
+        if let Some(entry) = map(id, item) {
+            entries.push(entry);
+        }
+    }
+    entries
 }
 
 /// On-disk transcript wrapper. Version 2 added `created_at` timestamps.
@@ -2916,6 +3081,51 @@ mod tests {
                 assert_eq!(content, "First\nSecond");
             }
             _ => panic!("Expected a Thinking entry"),
+        }
+    }
+
+    /// The messages-only restore fallback (ADR-36 §5 last resort) skips
+    /// tool/system roles and blank assistant turns, and keeps entry ids
+    /// gap-free across the skipped rows.
+    #[test]
+    fn entries_from_messages_skips_roles_and_blank_assistant() {
+        use concerto_core::types::{Message as SessionMessage, Role};
+
+        let row = |role: Role, content: &str| SessionMessage {
+            role,
+            content: content.to_string(),
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: None,
+            tokens_in: None,
+            tokens_out: None,
+        };
+
+        let entries = entries_from(ChatSource::Messages(vec![
+            row(Role::System, "sys prompt"),
+            row(Role::User, "hello"),
+            row(Role::Tool, "tool output"),
+            row(Role::Assistant, "   "),
+            row(Role::Assistant, "hi there"),
+        ]));
+
+        assert_eq!(entries.len(), 2, "system/tool rows and blank assistant turns are skipped");
+        match &entries[0] {
+            ChatEntry::User { id, content, created_at } => {
+                assert_eq!(*id, 1);
+                assert_eq!(content, "hello");
+                assert!(created_at.is_none(), "historical rows carry no timestamp");
+            }
+            other => panic!("expected a User entry, got {other:?}"),
+        }
+        match &entries[1] {
+            ChatEntry::Assistant { id, content, streaming, created_at } => {
+                assert_eq!(*id, 2, "ids stay gap-free after skipped rows");
+                assert_eq!(content, "hi there");
+                assert!(!streaming);
+                assert!(created_at.is_none());
+            }
+            other => panic!("expected an Assistant entry, got {other:?}"),
         }
     }
 
