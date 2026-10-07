@@ -16,6 +16,15 @@
 //! escalates to `kill().await` + `wait().await`. The `Drop` impl reaps any
 //! child that was never stopped via `start_kill()` + a bounded `try_wait()`
 //! poll, so a server is never orphaned.
+//!
+//! The stdout reader loop (message dispatch, EOF/failure recording, exit
+//! polling) lives in the `reader` submodule; this module keeps the lifecycle,
+//! request deadlines, and the pending-map spine.
+
+// NORM S12: the reader-loop cluster (dispatch, failure record, exit poll,
+// ping reply) lives in `reader`; lifecycle, request deadlines and the
+// pending-map guard stay here.
+mod reader;
 
 use crate::error::McpError;
 use crate::transport;
@@ -27,12 +36,12 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, BufReader};
+use tokio::io::AsyncReadExt;
 #[cfg(not(windows))]
 use tokio::process::Child;
-use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::process::{ChildStderr, ChildStdin, Command};
 #[cfg(windows)]
 type Child = Box<dyn process_wrap::tokio::ChildWrapper>;
 use tokio::sync::{oneshot, watch, Mutex};
@@ -47,12 +56,6 @@ const MAX_TOOL_LIST_PAGES: usize = 1000;
 /// How long `stop` waits for the server to exit after stdin EOF before
 /// escalating to `kill`.
 const GRACE_PERIOD: Duration = Duration::from_secs(2);
-
-/// Bounded poll for the crashed server's exit status: EOF is observed the
-/// moment the child's stdout pipe closes, which can precede the process
-/// becoming a zombie, so `try_wait()` is retried briefly before giving up.
-const CHILD_STATUS_POLLS: usize = 20;
-const CHILD_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Structured server identity reported by a successful `initialize`.
 #[derive(Debug, Clone, PartialEq)]
@@ -262,7 +265,8 @@ impl McpClient {
 
         let stdin_shared = Arc::new(Mutex::new(stdin));
         let child_shared = Arc::new(Mutex::new(Some(child)));
-        tokio::spawn(reader_task(
+        // Thin delegate: the reader loop and its helpers live in `reader`.
+        tokio::spawn(reader::reader_task(
             stdout,
             self.pending.clone(),
             self.server_died.clone(),
@@ -746,169 +750,6 @@ fn pipe_error(what: &str) -> McpError {
             format!("{what} pipe missing after spawn"),
         ),
     }
-}
-
-/// Reader task: consumes server stdout until EOF, dispatching server
-/// requests and resolving pending requests by id. On EOF/error the server's
-/// lifecycle state is flipped to `Failed` (with the exit detail) so the
-/// `McpManager` watcher can publish the crash event.
-#[allow(clippy::too_many_arguments)]
-async fn reader_task(
-    mut stdout: ChildStdout,
-    pending: Arc<std::sync::Mutex<PendingMap>>,
-    server_died: Arc<AtomicBool>,
-    stopping: Arc<AtomicBool>,
-    child_weak: Weak<Mutex<Option<Child>>>,
-    stdin_weak: Weak<Mutex<ChildStdin>>,
-    server_id: String,
-    state_tx: watch::Sender<McpServerState>,
-    last_failure: Arc<std::sync::Mutex<Option<String>>>,
-    process_id: Option<u32>,
-) {
-    let mut reader = BufReader::new(&mut stdout);
-    let mut buf: Vec<u8> = Vec::new();
-    loop {
-        match transport::read_message(&mut reader, &mut buf).await {
-            Ok(Some(message)) => {
-                if transport::is_server_request(&message) {
-                    if !handle_server_request(&stdin_weak, &message, &server_id).await {
-                        server_died.store(true, Ordering::SeqCst);
-                        terminate_process_id(process_id);
-                        terminate_shared_tree(&child_weak.upgrade());
-                        record_reader_failure(
-                            &last_failure,
-                            &state_tx,
-                            &server_id,
-                            &None,
-                            "server request reply timed out or failed",
-                        );
-                        fail_all_pending(&pending, || McpError::NotConnected).await;
-                        break;
-                    }
-                } else if transport::is_response(&message) {
-                    if let Some(id) = transport::response_id(&message) {
-                        if let Some(tx) =
-                            pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&id)
-                        {
-                            let _ = tx.send(transport::extract_result(&message));
-                        } else {
-                            tracing::warn!(server = %server_id, id, "response for unknown request id; ignoring");
-                        }
-                    }
-                } else if transport::is_notification(&message) {
-                    // id-less notifications (initialized, cancelled, ...) are
-                    // acknowledged implicitly; nothing to do.
-                }
-                // Notifications (method, no id) are ignored silently.
-            }
-            Ok(None) => {
-                server_died.store(true, Ordering::SeqCst);
-                let status = child_exit_code(&child_weak).await;
-                terminate_process_id(process_id);
-                terminate_shared_tree(&child_weak.upgrade());
-                if !stopping.load(Ordering::SeqCst) {
-                    record_reader_failure(
-                        &last_failure,
-                        &state_tx,
-                        &server_id,
-                        &status,
-                        "server closed its output (EOF)",
-                    );
-                }
-                fail_all_pending(&pending, || McpError::ServerExited {
-                    status,
-                    detail: "server closed its output (EOF)".into(),
-                })
-                .await;
-                tracing::info!(server = %server_id, "server closed stdout; connection ended");
-                break;
-            }
-            Err(e) => {
-                server_died.store(true, Ordering::SeqCst);
-                tracing::error!(server = %server_id, error = %e, "reader failure; disconnecting");
-                let status = child_exit_code(&child_weak).await;
-                terminate_process_id(process_id);
-                terminate_shared_tree(&child_weak.upgrade());
-                if !stopping.load(Ordering::SeqCst) {
-                    record_reader_failure(
-                        &last_failure,
-                        &state_tx,
-                        &server_id,
-                        &status,
-                        &e.to_string(),
-                    );
-                }
-                fail_all_pending(&pending, || McpError::ServerExited {
-                    status,
-                    detail: e.to_string(),
-                })
-                .await;
-                break;
-            }
-        }
-    }
-}
-
-/// Record the reader-observed failure detail and flip the server state to
-/// `Failed` so the manager watcher publishes the crash event. The state send
-/// is a no-op if it is already `Failed` (e.g. the manager recorded a
-/// registration failure first), but the detail is always refreshed.
-fn record_reader_failure(
-    last_failure: &Arc<std::sync::Mutex<Option<String>>>,
-    state_tx: &watch::Sender<McpServerState>,
-    server_id: &str,
-    status: &Option<i32>,
-    detail: &str,
-) {
-    let detail = match status {
-        Some(code) => format!("mcp server '{server_id}' exited with status {code}: {detail}"),
-        None => format!("mcp server '{server_id}' exited: {detail}"),
-    };
-    *last_failure.lock().unwrap_or_else(|error| error.into_inner()) = Some(detail);
-    let _ = state_tx.send(McpServerState::Failed);
-}
-
-/// Best-effort exit code of the server child once the reader observed
-/// EOF/error. `try_wait()` reaps a zombie without blocking; the process may
-/// still be transitioning to a zombie when EOF is first observed, so the
-/// status is polled briefly. Returns `None` if the process is still alive
-/// (e.g. it closed stdout deliberately) or the shared handle is gone (`stop`
-/// took it).
-async fn child_exit_code(child_weak: &Weak<Mutex<Option<Child>>>) -> Option<i32> {
-    let child = child_weak.upgrade()?;
-    for _ in 0..CHILD_STATUS_POLLS {
-        let status = child.lock().await.as_mut().and_then(|c| c.try_wait().ok()).flatten();
-        if let Some(status) = status {
-            return status.code();
-        }
-        tokio::time::sleep(CHILD_STATUS_POLL_INTERVAL).await;
-    }
-    None
-}
-
-/// Handle a server→client request: reply to `ping` with an empty result and
-/// log-and-ignore other methods. Replies are written through a `Weak` handle
-/// so they never keep the stdin pipe open past `stop`.
-async fn handle_server_request(
-    stdin_weak: &Weak<Mutex<ChildStdin>>,
-    message: &Value,
-    server_id: &str,
-) -> bool {
-    let method = message.get("method").and_then(Value::as_str).unwrap_or_default();
-    let Some(reply) = transport::ping_reply(message) else { return true };
-    if method != "ping" {
-        tracing::warn!(server = %server_id, method, "ignoring unsupported server request");
-        return true;
-    }
-    let Some(stdin) = stdin_weak.upgrade() else { return false };
-    matches!(
-        timeout(Duration::from_millis(100), async {
-            let mut stdin = stdin.lock().await;
-            transport::write_message(&mut *stdin, &reply).await
-        })
-        .await,
-        Ok(Ok(()))
-    )
 }
 
 /// Stderr pump: stream the server's stderr into the log at warn level so
