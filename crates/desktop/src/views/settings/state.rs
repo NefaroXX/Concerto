@@ -17,6 +17,7 @@ use crate::theme::AppTheme;
 
 use super::helpers::default_managed_source;
 use super::message::SectionId;
+use super::state_mcp_validate::{self, parse_mcp_args};
 use super::{
     readable_provider_label, CreateParentOption, ExtensionTab, Message, PolicyActionChoice,
     PolicyConditionChoice, CUSTOM_MODEL_SENTINEL, EMPTY_DISCOVERY_KEPT, EMPTY_DISCOVERY_NO_CACHE,
@@ -835,37 +836,24 @@ impl State {
         }
     }
 
-    /// Validate the timeout field of the MCP edit draft. Blank is valid (the
-    /// crate default is 60s); otherwise the value must be a whole number in
-    /// `1..=300` — the hard cap the MCP bridge enforces.
+    /// Validate the timeout field of the MCP edit draft — thin delegate; the
+    /// rule lives in [`state_mcp_validate`] (blank = the 60s default, else a
+    /// whole number in `1..=300`).
     fn validate_mcp_timeout(s: &str) -> Option<String> {
-        let trimmed = s.trim();
-        if trimmed.is_empty() {
-            return None; // blank is valid (means "use the 60s default")
-        }
-        match trimmed.parse::<u64>() {
-            Ok(0) => Some("Must be a positive number".into()),
-            Ok(v) if v > 300 => Some("Hard cap is 300 seconds".into()),
-            Ok(_) => None,
-            Err(_) => Some("Must be a whole number".into()),
-        }
+        state_mcp_validate::validate_mcp_timeout(s)
     }
 
-    /// Validate the id of an MCP add draft against the configured servers.
-    /// Mirrors `McpConfig::validate` (ADR-43 §4): non-empty, no `:` — tools
-    /// are namespaced `mcp:<server_id>:<tool_name>` — and unique.
-    fn mcp_add_id_error(mcp_servers: &[McpServerConfig], id: &str) -> Option<String> {
-        let trimmed = id.trim();
-        if trimmed.is_empty() {
-            return Some("Id is required".into());
-        }
-        if trimmed.contains(':') {
-            return Some("Id must not contain ':'".into());
-        }
-        if mcp_servers.iter().any(|server| server.id == trimmed) {
-            return Some("An MCP server with this id already exists".into());
-        }
-        None
+    /// Validate the id of an MCP add draft against the configured servers —
+    /// thin delegate; the rule lives in [`state_mcp_validate`] (non-empty,
+    /// no `:`, unique).
+    fn validate_mcp_add_id(mcp_servers: &[McpServerConfig], id: &str) -> Option<String> {
+        state_mcp_validate::validate_mcp_add_id(mcp_servers, id)
+    }
+
+    /// Validate the command field of an MCP add/edit draft — thin delegate;
+    /// the rule lives in [`state_mcp_validate`] (blank is rejected).
+    fn validate_mcp_command(command: &str) -> Option<String> {
+        state_mcp_validate::validate_mcp_command(command)
     }
 
     pub(super) fn rule_display(rule: &PolicyRuleDef) -> String {
@@ -2342,7 +2330,7 @@ impl State {
                     let Some(draft) = self.mcp_add_draft.as_mut() else {
                         return iced::Task::none();
                     };
-                    if Self::mcp_add_id_error(&self.mcp_servers, draft.id.trim()).is_some() {
+                    if Self::validate_mcp_add_id(&self.mcp_servers, draft.id.trim()).is_some() {
                         draft.id_error = Some(
                             "Enter a valid unique server id before storing credentials".into(),
                         );
@@ -2406,11 +2394,7 @@ impl State {
                 };
                 // Inline validation: keep the user in edit mode with the
                 // errors visible; only a valid draft is applied.
-                draft.command_error = if draft.command.trim().is_empty() {
-                    Some("Command is required".into())
-                } else {
-                    None
-                };
+                draft.command_error = Self::validate_mcp_command(&draft.command);
                 draft.env_error =
                     McpServerConfig::validate_env(&draft.env).err().map(|e| e.to_string());
                 draft.args_error = parse_mcp_args(&draft.args).err();
@@ -2507,7 +2491,7 @@ impl State {
             Message::McpAddIdChanged(value) => {
                 if let Some(draft) = &mut self.mcp_add_draft {
                     draft.id = value;
-                    draft.id_error = Self::mcp_add_id_error(&self.mcp_servers, draft.id.trim());
+                    draft.id_error = Self::validate_mcp_add_id(&self.mcp_servers, draft.id.trim());
                 }
             }
             Message::McpAddCommandChanged(value) => {
@@ -2580,12 +2564,8 @@ impl State {
                 // Inline validation mirrors `McpConfig::validate` plus the
                 // edit draft's command/env/timeout rules. Keep the form open
                 // with the errors visible; only a valid draft is applied.
-                draft.id_error = Self::mcp_add_id_error(&self.mcp_servers, draft.id.trim());
-                draft.command_error = if draft.command.trim().is_empty() {
-                    Some("Command is required".into())
-                } else {
-                    None
-                };
+                draft.id_error = Self::validate_mcp_add_id(&self.mcp_servers, draft.id.trim());
+                draft.command_error = Self::validate_mcp_command(&draft.command);
                 draft.env_error =
                     McpServerConfig::validate_env(&draft.env).err().map(|e| e.to_string());
                 draft.args_error = parse_mcp_args(&draft.args).err();
@@ -2681,16 +2661,6 @@ impl State {
         }
         iced::Task::none()
     }
-}
-
-fn parse_mcp_args(input: &str) -> Result<Vec<String>, String> {
-    if input.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    serde_json::from_str::<Vec<String>>(input).map_err(|_| {
-        "Arguments must be a JSON array of strings, for example [\"-y\", \"path with spaces\"]"
-            .into()
-    })
 }
 
 /// Collapse duplicates while preserving first-occurrence order.
