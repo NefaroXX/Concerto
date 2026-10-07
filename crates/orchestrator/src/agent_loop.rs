@@ -39,6 +39,11 @@ use crate::tool_driver::{self, TextToolDriver};
 use crate::tool_facts::{tool_outcome_for_error, ToolExecutedFact, ToolFactContext};
 use crate::tool_guard;
 
+mod output_progress;
+use output_progress::{
+    audited_file_changes, continuation_instruction, merge_run_progress, ProgressFingerprint,
+};
+
 /// The single-agent loop driving plan → act → observe → plan cycles.
 pub struct AgentLoop {
     fast: bool,
@@ -216,119 +221,6 @@ fn remember_ack(session_id: Ulid, project_root: &std::path::Path, condition: &'s
 /// Character cap for the loop's persisted end-reason note (completion fix:
 /// the terminal reason/surfaces bounded into the session event log).
 const END_REASON_CHARS: usize = 2000;
-
-/// Snapshot of progress used to detect non-convergence across continuation
-/// rounds (two identical fingerprints in a row ⇒ no real forward motion).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct ProgressFingerprint {
-    files_modified: usize,
-    tool_call_count: u32,
-    passed_verifications: usize,
-    failed_verifications: usize,
-    final_message_len: usize,
-}
-
-impl ProgressFingerprint {
-    fn from_output(output: &AgentOutput) -> Self {
-        Self {
-            files_modified: output.files_modified.len(),
-            tool_call_count: output.tool_call_count,
-            passed_verifications: output.verification.iter().filter(|v| v.passed).count(),
-            failed_verifications: output.verification.iter().filter(|v| !v.passed).count(),
-            final_message_len: output.final_message.len(),
-        }
-    }
-}
-
-fn merge_run_progress(accumulated: &mut AgentOutput, latest: &AgentOutput) {
-    for path in &latest.files_modified {
-        if !accumulated.files_modified.contains(path) {
-            accumulated.files_modified.push(path.clone());
-        }
-    }
-    accumulated.tool_call_count =
-        accumulated.tool_call_count.saturating_add(latest.tool_call_count);
-    accumulated.tool_events.extend(latest.tool_events.clone());
-    for check in &latest.verification {
-        if let Some(existing) = accumulated
-            .verification
-            .iter_mut()
-            .find(|existing| existing.path == check.path && existing.command == check.command)
-        {
-            *existing = check.clone();
-        } else {
-            accumulated.verification.push(check.clone());
-        }
-    }
-    accumulated.final_message = latest.final_message.clone();
-    accumulated.eval_result = latest.eval_result.clone();
-    accumulated.completion_status = latest.completion_status;
-    accumulated.provider_metrics = latest.provider_metrics.clone();
-    accumulated.checkpoint_json = latest.checkpoint_json.clone();
-    if latest.project_root.is_some() {
-        accumulated.project_root = latest.project_root.clone();
-    }
-}
-
-/// Number of successful, audited file-changing tool calls recorded in
-/// `output.tool_events` (completion-fix counter reconciliation, 2026-09-09).
-///
-/// The ActionRequired completion check consults the in-loop counter
-/// (`file_changing_tool_count`), which is SCOPED to one continuation round
-/// and keys off the raw arguments' tool name / `operation` field — while the
-/// audited write path (tool summaries, tool-fact rows) accumulates across
-/// rounds and records what the tool normalized. A run that wrote a file in
-/// an earlier round then ended Blocked on "no file-changing tool call
-/// succeeded" reported a disagreement between the two views (live smoke
-/// evidence). This reconciles the check with the audited write path: the
-/// cross-round audit counts as file-changing evidence too.
-fn audited_file_changes(output: &AgentOutput) -> u32 {
-    output
-        .tool_events
-        .iter()
-        .filter(|event| event.success && is_audited_mutation_event(event))
-        .count()
-        .try_into()
-        .unwrap_or(u32::MAX)
-}
-
-/// True when a tool-execution summary names a mutating tool or operation —
-/// the same grammar [`crate::tool_facts::is_file_affecting_tool`] uses on the
-/// RAW arguments, applied to the summary the executor produced, with the
-/// filesystem tool's own write/delete success marker ("Wrote …"/"Deleted …")
-/// as the fallback for normalized (alias/inferred) calls whose raw
-/// `operation` field was absent.
-fn is_audited_mutation_event(event: &ToolExecutionSummary) -> bool {
-    if event
-        .operation
-        .as_deref()
-        .is_some_and(|op| matches!(op, "write" | "delete" | "move" | "copy"))
-    {
-        return true;
-    }
-    if matches!(
-        event.tool_name.as_str(),
-        "write" | "write_file" | "delete_file" | "edit_file" | "create_file" | "modify_file"
-    ) {
-        return true;
-    }
-    // Normalized writes whose raw arguments carried no `operation` field:
-    // classify from the tool's own success summary vocabulary.
-    ["Wrote ", "Deleted "].iter().any(|marker| event.summary.starts_with(marker))
-}
-
-/// Hard completion condition: verification must actually pass when the task
-/// requires it. Without this, a capped or partially-failed run could be
-/// reported as `Done`.
-/// Instruction appended to the conversation when a run is auto-continued,
-/// so the model resumes the same task instead of re-summarizing.
-fn continuation_instruction(reason: &str) -> String {
-    format!(
-        "Continue the same task. Previous run stopped because: {reason}. \
-             Do not summarize. Continue using tools until the job is done, \
-             verification passes, user input is required, or a real blocker is found."
-    )
-}
 
 /// Signal from `process_provider_response` back to the iteration loop body,
 /// indicating how to continue after processing the provider's response.
