@@ -10,5 +10,6 @@
 //! runs in eval mode (no LLM call).
 
 mod generic;
+pub(crate) mod tool_blocks;
 
 pub use generic::GenericSpecialistAgent;
