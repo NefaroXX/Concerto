@@ -40,6 +40,7 @@ use concerto_core::CancellationToken;
 use serde::{Deserialize, Serialize};
 
 use crate::check_cancel;
+use crate::query::write_applied_paths;
 use crate::whiteboard::WhiteboardKind;
 use crate::SessionError;
 
@@ -382,28 +383,6 @@ async fn reconcile_snapshot(
         }
     }
     Ok(())
-}
-
-/// Extract the file paths touched by a `WriteApplied` event's payload, using
-/// the same defensive grammar as `fold_ledger` in the orchestrator: the
-/// `pre_images` map keys when present, else the `path`/`target`/`input.path`
-/// string fields. An empty result means the event carried no path information.
-fn write_applied_paths(payload: &serde_json::Value) -> Vec<String> {
-    let mut paths = Vec::new();
-    if let Some(pre_images) = payload.get("pre_images").and_then(|v| v.as_object()) {
-        paths.extend(pre_images.keys().cloned());
-        return paths;
-    }
-    if let Some(path) = payload.get("path").and_then(|v| v.as_str()) {
-        paths.push(path.to_owned());
-    } else if let Some(target) = payload.get("target").and_then(|v| v.as_str()) {
-        paths.push(target.to_owned());
-    } else if let Some(input) = payload.get("input").and_then(|v| v.as_object()) {
-        if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
-            paths.push(path.to_owned());
-        }
-    }
-    paths
 }
 
 impl ResourceFacts {
@@ -1030,21 +1009,6 @@ mod tests {
         assert!(b.dirty, "vanished row is kept but marked dirty");
         assert_eq!(b.generation, "1", "observation preserved");
         assert_eq!(b.last_event_id.as_deref(), Some("ev-b"), "observation preserved");
-    }
-
-    #[tokio::test]
-    async fn write_applied_paths_handles_every_payload_shape() {
-        assert_eq!(
-            write_applied_paths(&json!({ "pre_images": { "a.md": "pre-a", "b.rs": "pre-b" } })),
-            vec!["a.md", "b.rs"]
-        );
-        assert_eq!(write_applied_paths(&json!({ "path": "x.txt" })), vec!["x.txt"]);
-        assert_eq!(write_applied_paths(&json!({ "target": "y.txt" })), vec!["y.txt"]);
-        assert_eq!(write_applied_paths(&json!({ "input": { "path": "z.txt" } })), vec!["z.txt"]);
-        assert!(
-            write_applied_paths(&json!({ "something": "else" })).is_empty(),
-            "a payload without path info names no files"
-        );
     }
 
     #[tokio::test]

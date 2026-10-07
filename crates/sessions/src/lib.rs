@@ -10,6 +10,7 @@ pub mod audit;
 pub mod audit_retention;
 pub mod plan_bindings;
 pub mod plans;
+pub mod query;
 pub mod replay;
 pub mod resource_facts;
 pub mod spend;
