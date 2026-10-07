@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -12,6 +12,7 @@ use crate::approval::{
 };
 use crate::theme::CliTheme;
 use crate::ui::{self, chat_line_with_theme, ChatRole};
+use concerto_api_types::diff::DiffResult;
 use concerto_config::{
     AgentModelAssignment, AppConfig, ConditionDef, ModelSettings, MultiAgentConfig, PolicyConfig,
     PolicyRuleDef,
@@ -33,6 +34,8 @@ use concerto_orchestrator::session_manager::ProjectSessionManager;
 use concerto_providers::factory::ProviderFactory;
 use concerto_providers::provider_defs::{model_options_for, provider_definition};
 use concerto_sessions::SessionSummary;
+use concerto_tools::diff::compute_diffs_from_virtual_fs;
+use concerto_tools::virtual_fs::{VirtualFs, VirtualFsEntry};
 
 /// CLI flags supplied at startup and remembered for the life of the TUI
 /// (ADR-57 D5). `Some` marks an explicit flag that must survive a config
@@ -136,6 +139,65 @@ pub enum Screen {
     Sessions,
     ToolLog,
     AgentAssignments,
+    /// Staged unified-diff review (P02): accept/reject each staged file.
+    DiffReview,
+}
+
+/// Outcome of a per-file review decision on the staged-diff screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReviewStatus {
+    /// The decision was applied to the shared overlay: `path` was accepted
+    /// (materialized to disk) or rejected (unstaged).
+    Decided { path: String, accept: bool },
+    /// A guard blocked the decision; `String` is the desktop's message.
+    Blocked(String),
+}
+
+/// State of the staged unified-diff review screen (P02 CLI/parity slice).
+///
+/// The diff is never computed here: `results` come from
+/// [`compute_diffs_from_virtual_fs`] over the shared overlay, exactly like
+/// the Desktop review. `entries` freezes the overlay entries as presented so
+/// a later decision fails closed when the overlay moved on — the TUI twin of
+/// Desktop `decide_staged`'s stale-review guard.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DiffReviewState {
+    /// Reviewable staged files, sorted by path.
+    pub(crate) results: Vec<DiffResult>,
+    /// The reviewed overlay entry per path (the stale-review baseline).
+    pub(crate) entries: HashMap<camino::Utf8PathBuf, VirtualFsEntry>,
+    /// Index of the selected file.
+    pub(crate) index: usize,
+    /// Scroll offset into the selected file's unified diff.
+    pub(crate) scroll: u16,
+    /// Last decision outcome (or guard message) shown in the status row.
+    pub(crate) status: Option<ReviewStatus>,
+}
+
+/// Collect the reviewable staged files from the shared overlay: the unified
+/// diffs from [`compute_diffs_from_virtual_fs`], plus created/deleted file
+/// operations that carry no text hunks (so an empty create/delete still
+/// shows up for review). Mirrors Desktop `set_staged_results`: results and
+/// the reviewed-entry baseline are keyed by path, sorted by path.
+fn staged_review(
+    vfs: &VirtualFs,
+) -> (Vec<DiffResult>, HashMap<camino::Utf8PathBuf, VirtualFsEntry>) {
+    let mut results = compute_diffs_from_virtual_fs(vfs);
+    let mut entries = HashMap::new();
+    for path in vfs.changed_paths() {
+        let Some(entry) = vfs.get(path) else { continue };
+        let has_diff = results.iter().any(|result| result.path == path);
+        let file_operation =
+            matches!(entry, VirtualFsEntry::Created { .. } | VirtualFsEntry::Deleted { .. });
+        if !has_diff && file_operation {
+            results.push(DiffResult { path: path.to_path_buf(), hunks: Vec::new() });
+        }
+        if has_diff || file_operation {
+            entries.insert(path.to_path_buf(), entry.clone());
+        }
+    }
+    results.sort_by(|a, b| a.path.cmp(&b.path));
+    (results, entries)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -428,6 +490,13 @@ pub struct App {
     /// `Midnight`). The single color source for gutters and status chrome;
     /// `NO_COLOR`/off-TTY still renders plain via the `styling` gate.
     pub cli_theme: CliTheme,
+    /// Shared overlay filesystem for this TUI process (ADR-62): file tools
+    /// stage changes here so they can be reviewed as a unified diff before
+    /// the review record is dropped. Wired into `ServicesBuilder::with_vfs`
+    /// on every dispatch; project-scoped (reset by `switch_project`).
+    pub(crate) vfs: Arc<Mutex<VirtualFs>>,
+    /// Staged unified-diff review screen state (P02).
+    pub(crate) diff_review: DiffReviewState,
 }
 
 impl Default for App {
@@ -447,7 +516,7 @@ impl App {
                 let mut initial = startup_signature_lines(styling_enabled());
                 initial.push(Line::from("Concerto CLI — type a message and press Enter"));
                 initial.push(Line::from(
-                    "Esc: commands/settings  [l] sessions  [t] log  [n] new  [p] project  Ctrl+C: cancel or quit",
+                    "Esc: commands/settings  [l] sessions  [t] log  [d] diff  [n] new  [p] project  Ctrl+C: cancel or quit",
                 ));
                 initial
             },
@@ -492,6 +561,8 @@ impl App {
             reduced_motion: false,
             terminal_title_enabled: true,
             cli_theme: CliTheme::by_name("Midnight"),
+            vfs: Arc::new(Mutex::new(VirtualFs::new())),
+            diff_review: DiffReviewState::default(),
         }
     }
 
@@ -616,6 +687,12 @@ impl App {
         self.session_id = None;
         self.messages.clear();
         self.push_line(Line::from(format!("Switched to project: {}", canonical.display())));
+
+        // Staged overlay entries are project-scoped: a fresh project starts
+        // with an empty overlay (Desktop resets its `vfs` the same way), so a
+        // review can never show another project's staged files.
+        self.vfs = Arc::new(Mutex::new(VirtualFs::new()));
+        self.diff_review = DiffReviewState::default();
 
         // Update project registry.
         if let Ok(mut registry) = concerto_config::ProjectRegistry::load() {
@@ -1080,6 +1157,7 @@ impl App {
                 .build();
 
         let services = ServicesBuilder::new(self.bus.clone(), config, self.approval_sink.clone())
+            .with_vfs(self.vfs.clone())
             .with_session_manager(session_manager)
             .with_memory(self.memory.clone())
             .build();
@@ -1457,6 +1535,7 @@ impl App {
             Screen::Sessions => self.handle_sessions_key(key.code),
             Screen::ToolLog => self.handle_tool_log_key(key.code),
             Screen::AgentAssignments => self.handle_agent_assignments_key(key.code),
+            Screen::DiffReview => self.handle_diff_review_key(key.code),
         }
     }
 
@@ -1527,6 +1606,10 @@ impl App {
             }
             KeyCode::Char('t') if !self.input_mode => {
                 self.screen = Screen::ToolLog;
+            }
+            KeyCode::Char('d') if !self.input_mode => {
+                self.refresh_diff_review();
+                self.screen = Screen::DiffReview;
             }
             KeyCode::Char('n') if !self.input_mode => return Action::NewSession,
             KeyCode::Char('p') if !self.input_mode => {
@@ -1662,6 +1745,118 @@ impl App {
             _ => {}
         }
         Action::None
+    }
+
+    // ------------------------------------------------------------------
+    // Staged unified-diff review (P02)
+    // ------------------------------------------------------------------
+
+    /// Reload the review from the shared overlay: the unified diffs come from
+    /// [`staged_review`], the reviewed-entry baseline is re-captured, the
+    /// selection stays on the file it was showing (falling back to the first),
+    /// and the scroll restarts at the top. The previous status is dropped — a
+    /// reload is a fresh view; a decision re-sets its own feedback afterwards.
+    fn refresh_diff_review(&mut self) {
+        let selected =
+            self.diff_review.results.get(self.diff_review.index).map(|result| result.path.clone());
+        self.diff_review = match self.vfs.lock() {
+            Ok(guard) => {
+                let (results, entries) = staged_review(&guard);
+                let index = selected
+                    .and_then(|path| results.iter().position(|result| result.path == path))
+                    .unwrap_or(0);
+                DiffReviewState { results, entries, index, scroll: 0, status: None }
+            }
+            // Fail closed: a poisoned overlay must not leave a reviewable
+            // list behind that could no longer be acted on safely.
+            Err(_) => DiffReviewState {
+                status: Some(ReviewStatus::Blocked("Staged changes are unavailable".into())),
+                ..DiffReviewState::default()
+            },
+        };
+    }
+
+    fn handle_diff_review_key(&mut self, key: KeyCode) -> Action {
+        match key {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('d') => self.screen = Screen::Chat,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.diff_review.scroll = self.diff_review.scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.diff_review.scroll = self.diff_review.scroll.saturating_add(1);
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.diff_review.index = self.diff_review.index.saturating_sub(1);
+                self.diff_review.scroll = 0;
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                let last = self.diff_review.results.len().saturating_sub(1);
+                self.diff_review.index = (self.diff_review.index + 1).min(last);
+                self.diff_review.scroll = 0;
+            }
+            KeyCode::Char('a') => self.decide_diff_review(true),
+            KeyCode::Char('r') => self.decide_diff_review(false),
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// Apply the selected file's accept/reject decision through the shared
+    /// overlay, then reload the review (Desktop refreshes the staged list the
+    /// same way after a decision).
+    fn decide_diff_review(&mut self, accept: bool) {
+        let Some(path) =
+            self.diff_review.results.get(self.diff_review.index).map(|result| result.path.clone())
+        else {
+            return;
+        };
+        // The TUI review has no editor buffer, so the desktop dirty-buffer
+        // guard never trips here; the branch stays in `decide_staged` (and is
+        // tested) so the guard contract is identical once a buffer arrives.
+        match self.decide_staged(accept, path.as_path(), false) {
+            Ok(()) => {
+                self.refresh_diff_review();
+                self.diff_review.status =
+                    Some(ReviewStatus::Decided { path: path.to_string(), accept });
+            }
+            Err(error) => self.diff_review.status = Some(ReviewStatus::Blocked(error)),
+        }
+    }
+
+    /// Per-file staged-review decision — the TUI twin of Desktop's
+    /// `views/code_editor/workspace.rs::decide_staged`.
+    ///
+    /// Same guard chain, same messages, same `materialize_paths`/`unstage`
+    /// calls:
+    /// 1. dirty editor buffer → blocked (see `decide_diff_review`),
+    /// 2. nothing staged for `path` → `This file has no staged changes`,
+    /// 3. the presented entry no longer matches the overlay → fail closed
+    ///    with the stale-review message,
+    /// 4. accept materializes then unstages; reject only unstages — the
+    ///    on-disk state is authoritative, exactly as on Desktop.
+    pub(crate) fn decide_staged(
+        &self,
+        accept: bool,
+        path: &camino::Utf8Path,
+        dirty_buffer: bool,
+    ) -> Result<(), String> {
+        if dirty_buffer {
+            return Err("Save your edits before accepting or discarding staged changes.".into());
+        }
+        let reviewed = self.diff_review.entries.get(path).cloned();
+        let mut guard =
+            self.vfs.lock().map_err(|_| "Staged changes are unavailable".to_string())?;
+        if !guard.changed_paths().contains(&path) {
+            return Err("This file has no staged changes".to_string());
+        }
+        if reviewed.is_none() || guard.get(path) != reviewed.as_ref() {
+            return Err("Staged changes changed. Review the latest diff before deciding.".into());
+        }
+        if accept {
+            guard.materialize_paths(&[path.to_path_buf()]).map_err(|error| error.to_string())?;
+        }
+        guard.unstage(path);
+        Ok(())
     }
 
     fn handle_agent_assignments_key(&mut self, key: KeyCode) -> Action {
@@ -3994,5 +4189,212 @@ mod tests {
         assert_eq!(app.messages.len(), before + 1);
         assert!(app.reveal.is_none(), "reduced-motion never opens a reveal");
         assert_eq!(line_text(app.messages.last().unwrap()), format!("♪ {full}"));
+    }
+
+    // ------------------------------------------------------------------
+    // Staged unified-diff review (P02)
+    // ------------------------------------------------------------------
+
+    /// Stage one file in the overlay — `read_disk` registers the on-disk
+    /// baseline, then `write` stages the proposal (the same overlay sequence
+    /// the file tools use, minus their disk write-through) — and reload the
+    /// review screen over it.
+    fn staged_review_app() -> (tempfile::TempDir, camino::Utf8PathBuf, App) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = camino::Utf8PathBuf::from_path_buf(dir.path().join("reviewed.txt"))
+            .expect("utf-8 test path");
+        std::fs::write(&path, "original\n").expect("seed file");
+        let mut app = App::new();
+        {
+            let mut vfs = app.vfs.lock().expect("vfs lock");
+            vfs.read_disk(&path).expect("stage the on-disk baseline");
+            vfs.write(&path, "proposal\n".to_string()).expect("stage the proposal");
+        }
+        app.refresh_diff_review();
+        (dir, path, app)
+    }
+
+    #[test]
+    fn command_mode_d_opens_and_refreshes_the_diff_review() {
+        let (_dir, path, mut app) = staged_review_app();
+        app.handle_key(key_event(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(!app.input_mode, "Esc enters command mode");
+        app.handle_key(key_event(KeyCode::Char('d'), KeyModifiers::empty()));
+        assert_eq!(app.screen, Screen::DiffReview);
+        assert_eq!(app.diff_review.results.len(), 1, "the staged file is reviewable");
+        assert_eq!(app.diff_review.results[0].path, path);
+        assert_eq!(app.diff_review.entries.len(), 1, "the baseline is captured");
+
+        // Re-opening is a fresh view: stale feedback does not carry over.
+        app.diff_review.status = Some(ReviewStatus::Blocked("stale".into()));
+        app.handle_key(key_event(KeyCode::Char('d'), KeyModifiers::empty()));
+        assert_eq!(app.screen, Screen::Chat);
+        app.handle_key(key_event(KeyCode::Char('d'), KeyModifiers::empty()));
+        assert_eq!(app.screen, Screen::DiffReview);
+        assert!(app.diff_review.status.is_none(), "a reload drops stale feedback");
+    }
+
+    #[test]
+    fn diff_review_close_keys_return_to_chat() {
+        for code in [KeyCode::Esc, KeyCode::Char('q'), KeyCode::Char('d')] {
+            let mut app = App::new();
+            app.screen = Screen::DiffReview;
+            app.handle_key(key_event(code, KeyModifiers::empty()));
+            assert_eq!(app.screen, Screen::Chat, "{code:?} closes the review");
+        }
+    }
+
+    #[test]
+    fn diff_review_navigates_files_and_scrolls_the_diff() {
+        let mut app = App::new();
+        app.screen = Screen::DiffReview;
+        app.diff_review.results = vec![
+            DiffResult { path: "a.rs".into(), hunks: Vec::new() },
+            DiffResult { path: "b.rs".into(), hunks: Vec::new() },
+        ];
+
+        // Right/l advances and clamps at the last file (no wrap).
+        app.handle_key(key_event(KeyCode::Right, KeyModifiers::empty()));
+        assert_eq!(app.diff_review.index, 1);
+        app.handle_key(key_event(KeyCode::Char('l'), KeyModifiers::empty()));
+        assert_eq!(app.diff_review.index, 1, "selection clamps at the last file");
+
+        // Left/h steps back and clamps at the first file.
+        app.handle_key(key_event(KeyCode::Char('h'), KeyModifiers::empty()));
+        assert_eq!(app.diff_review.index, 0);
+        app.handle_key(key_event(KeyCode::Left, KeyModifiers::empty()));
+        assert_eq!(app.diff_review.index, 0);
+
+        // j/k page the body with a saturating floor at the top.
+        app.handle_key(key_event(KeyCode::Char('k'), KeyModifiers::empty()));
+        assert_eq!(app.diff_review.scroll, 0, "scroll never goes below the top");
+        app.handle_key(key_event(KeyCode::Char('j'), KeyModifiers::empty()));
+        app.handle_key(key_event(KeyCode::Down, KeyModifiers::empty()));
+        assert_eq!(app.diff_review.scroll, 2);
+        app.handle_key(key_event(KeyCode::Char('k'), KeyModifiers::empty()));
+        assert_eq!(app.diff_review.scroll, 1);
+
+        // Switching files restarts the body at the top.
+        app.handle_key(key_event(KeyCode::Char('l'), KeyModifiers::empty()));
+        assert_eq!(app.diff_review.scroll, 0);
+    }
+
+    #[test]
+    fn review_accept_materializes_to_disk_and_leaves_the_list() {
+        let (_dir, path, mut app) = staged_review_app();
+        app.screen = Screen::DiffReview;
+        app.handle_key(key_event(KeyCode::Char('a'), KeyModifiers::empty()));
+
+        assert_eq!(
+            app.diff_review.status,
+            Some(ReviewStatus::Decided { path: path.to_string(), accept: true })
+        );
+        assert_eq!(app.screen, Screen::DiffReview, "the review stays open");
+        assert!(app.diff_review.results.is_empty(), "an accepted file leaves the review");
+        assert!(app.vfs.lock().expect("vfs lock").get(&path).is_none(), "the entry is dropped");
+        assert_eq!(std::fs::read_to_string(&path).expect("disk"), "proposal\n");
+    }
+
+    #[test]
+    fn review_reject_unstages_and_keeps_the_disk_baseline() {
+        let (_dir, path, mut app) = staged_review_app();
+        app.screen = Screen::DiffReview;
+        app.handle_key(key_event(KeyCode::Char('r'), KeyModifiers::empty()));
+
+        assert_eq!(
+            app.diff_review.status,
+            Some(ReviewStatus::Decided { path: path.to_string(), accept: false })
+        );
+        assert!(app.diff_review.results.is_empty(), "a rejected file leaves the review");
+        assert!(app.vfs.lock().expect("vfs lock").get(&path).is_none(), "the entry is dropped");
+        // Reject only drops the staged record: the on-disk baseline stands,
+        // exactly as on Desktop (`decide_staged` without materialize).
+        assert_eq!(std::fs::read_to_string(&path).expect("disk"), "original\n");
+    }
+
+    #[test]
+    fn review_fails_closed_when_the_overlay_changed_after_presentation() {
+        let (_dir, path, mut app) = staged_review_app();
+        app.screen = Screen::DiffReview;
+        // A newer proposal lands after the diff was presented.
+        app.vfs.lock().expect("vfs lock").write(&path, "newer\n".to_string()).expect("stage");
+
+        app.handle_key(key_event(KeyCode::Char('a'), KeyModifiers::empty()));
+        assert_eq!(
+            app.diff_review.status,
+            Some(ReviewStatus::Blocked(
+                "Staged changes changed. Review the latest diff before deciding.".into()
+            ))
+        );
+        // Fail closed: nothing materialized, nothing unstaged, review kept.
+        assert_eq!(std::fs::read_to_string(&path).expect("disk"), "original\n");
+        assert!(app.vfs.lock().expect("vfs lock").get(&path).is_some());
+        assert_eq!(app.diff_review.results.len(), 1, "the stale review is retained");
+    }
+
+    #[test]
+    fn review_reports_a_file_with_no_staged_change() {
+        let (_dir, path, mut app) = staged_review_app();
+        app.screen = Screen::DiffReview;
+        // The presented file is unstaged behind the review's back.
+        app.vfs.lock().expect("vfs lock").unstage(&path);
+
+        app.handle_key(key_event(KeyCode::Char('a'), KeyModifiers::empty()));
+        assert_eq!(
+            app.diff_review.status,
+            Some(ReviewStatus::Blocked("This file has no staged changes".into()))
+        );
+    }
+
+    #[test]
+    fn decide_staged_blocks_a_dirty_buffer_with_the_desktop_message() {
+        let (_dir, path, app) = staged_review_app();
+        let error = app
+            .decide_staged(true, path.as_path(), true)
+            .expect_err("a dirty buffer blocks the decision");
+        assert_eq!(error, "Save your edits before accepting or discarding staged changes.");
+        // Nothing moved: the guard runs before any overlay mutation.
+        assert_eq!(std::fs::read_to_string(&path).expect("disk"), "original\n");
+        assert!(app.vfs.lock().expect("vfs lock").get(&path).is_some());
+    }
+
+    #[test]
+    fn refresh_diff_review_sorts_files_and_keeps_the_selection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root =
+            camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf-8 test path");
+        let a = root.join("a.txt");
+        let b = root.join("b.txt");
+        std::fs::write(&a, "a\n").expect("seed a");
+        std::fs::write(&b, "b\n").expect("seed b");
+
+        let mut app = App::new();
+        {
+            // Staged in reverse order: the review still lists them sorted.
+            let mut vfs = app.vfs.lock().expect("vfs lock");
+            for (path, content) in [(&b, "b2\n"), (&a, "a2\n")] {
+                vfs.read_disk(path).expect("stage the baseline");
+                vfs.write(path, content.to_string()).expect("stage the change");
+            }
+        }
+        app.refresh_diff_review();
+        let paths: Vec<_> =
+            app.diff_review.results.iter().map(|result| result.path.clone()).collect();
+        assert_eq!(paths, vec![a.clone(), b.clone()], "staged files are sorted by path");
+        assert_eq!(app.diff_review.entries.len(), 2);
+
+        // The selection follows the file it was showing across a reload.
+        app.diff_review.index = 1;
+        app.diff_review.scroll = 5;
+        app.refresh_diff_review();
+        assert_eq!(app.diff_review.results[app.diff_review.index].path, b);
+        assert_eq!(app.diff_review.scroll, 0, "a reload restarts at the top");
+
+        // A file that left the overlay drops out; the index falls back.
+        app.vfs.lock().expect("vfs lock").unstage(&b);
+        app.refresh_diff_review();
+        assert_eq!(app.diff_review.results.len(), 1);
+        assert_eq!(app.diff_review.index, 0);
+        assert_eq!(app.diff_review.results[0].path, a);
     }
 }

@@ -8,8 +8,9 @@ use ratatui::text::Span;
 use ratatui::widgets::List;
 use ratatui::widgets::ListItem;
 
-use crate::app::{App, Screen, SettingsField};
+use crate::app::{App, ReviewStatus, Screen, SettingsField};
 use crate::theme::CliTheme;
+use concerto_api_types::diff::{DiffLine, DiffResult};
 use concerto_core::intent::RunStage;
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -19,6 +20,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Screen::Sessions => draw_sessions_screen(frame, app),
         Screen::ToolLog => draw_tool_log_screen(frame, app),
         Screen::AgentAssignments => draw_agent_assignments_screen(frame, app),
+        Screen::DiffReview => draw_diff_review_screen(frame, app),
     }
     if let Some(prompt) = app.approval_prompt() {
         draw_approval_modal(frame, frame.area(), &prompt, &app.cli_theme);
@@ -74,7 +76,7 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
         app.input.clone()
     } else {
         String::from(
-            "[Esc] edit | [s] settings | [l] sessions | [t] log | [n] new | [p] project | [q] quit",
+            "[Esc] edit | [s] settings | [l] sessions | [t] log | [d] diff | [n] new | [p] project | [q] quit",
         )
     };
     let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
@@ -206,6 +208,156 @@ pub(crate) fn tool_log_line_with_theme(
         Span::styled(base, style),
         Span::styled(rail.to_string(), Style::default().fg(entry.status.rail_color(theme))),
     ])
+}
+
+// ---------------------------------------------------------------------------
+// Staged unified-diff review screen (P02)
+// ---------------------------------------------------------------------------
+
+/// Review modal for the staged unified diffs (CLI/parity slice of the
+/// Desktop staged review). Geometry follows `draw_approval_modal` — centered,
+/// half the terminal wide (min 40) — but grown to the full frame height so a
+/// real diff is visible without paging.
+///
+/// The body never wraps: every row is pre-truncated to the viewport width
+/// with an ellipsis, so a long source line is cut rather than re-wrapped
+/// into a misleading second row, and the `@@`/`+`/`-` prefix at column 0
+/// stays the non-color cue for every diff row.
+fn draw_diff_review_screen(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    let state = &app.diff_review;
+    let theme = &app.cli_theme;
+
+    // Same backdrop idiom as the other modals, but full-frame: this screen
+    // replaces the chat instead of floating over it.
+    let backdrop = Block::default().style(Style::default().bg(Color::Black));
+    frame.render_widget(backdrop, area);
+
+    let modal_width = (area.width.saturating_div(2)).max(40).min(area.width.saturating_sub(4));
+    let modal_height = area.height.saturating_sub(2).max(3).min(area.height);
+    let modal_x = area.x + (area.width.saturating_sub(modal_width)) / 2;
+    let modal_y = area.y + (area.height.saturating_sub(modal_height)) / 2;
+    let modal_area = Rect { x: modal_x, y: modal_y, width: modal_width, height: modal_height };
+
+    let title = if state.results.is_empty() {
+        " Diff review ".to_string()
+    } else {
+        format!(" Diff review — {}/{} ", state.index + 1, state.results.len())
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(theme.border));
+    let inner = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    // Selected file: the title carries the position, this row the path
+    // (truncated like every other single-row field).
+    let header = state
+        .results
+        .get(state.index)
+        .map(|result| truncate_to(result.path.to_string(), chunks[0].width))
+        .unwrap_or_default();
+    frame.render_widget(
+        Paragraph::new(header)
+            .style(Style::default().fg(theme.warning).add_modifier(Modifier::BOLD)),
+        chunks[0],
+    );
+
+    let body_lines = match state.results.get(state.index) {
+        Some(result) => diff_review_lines(result, chunks[1].width, theme),
+        None => vec![Line::from(Span::styled(
+            truncate_to("No staged changes.".to_string(), chunks[1].width),
+            Style::default().fg(theme.muted),
+        ))],
+    };
+    // Clamp the scroll so a stale offset (e.g. after the list shrank)
+    // cannot show past the end of the body — same rule as the plan modal.
+    let rows = body_lines.len();
+    let viewport = usize::from(chunks[1].height);
+    let clamped = usize::from(state.scroll).min(rows.saturating_sub(viewport));
+    let scroll = u16::try_from(clamped).unwrap_or(u16::MAX);
+    frame.render_widget(Paragraph::new(body_lines).scroll((scroll, 0)), chunks[1]);
+
+    let (status, status_style) = match &state.status {
+        None => (String::new(), Style::default().fg(theme.muted)),
+        Some(ReviewStatus::Decided { path, accept }) => (
+            truncate_to(
+                format!("{} {path}", if *accept { "Accepted" } else { "Rejected" }),
+                chunks[2].width,
+            ),
+            Style::default().fg(theme.success),
+        ),
+        Some(ReviewStatus::Blocked(message)) => (
+            truncate_to(format!("Blocked: {message}"), chunks[2].width),
+            Style::default().fg(theme.danger),
+        ),
+    };
+    frame.render_widget(Paragraph::new(status).style(status_style), chunks[2]);
+
+    let hint = truncate_to(
+        "[a] accept  [r] reject  Esc close  h/l: file  j/k: scroll".to_string(),
+        chunks[3].width,
+    );
+    frame.render_widget(Paragraph::new(hint).style(Style::default().fg(theme.muted)), chunks[3]);
+}
+
+/// Unified-diff rows for one file, pre-truncated to `width` columns.
+///
+/// The `@@`/`+`/`-`/space prefix and the colors (green additions, red
+/// deletions, dim hunk headers) are derived purely from the shared
+/// [`DiffResult`] — no diff is computed here. A file staged as a pure
+/// create/delete (no text hunks) gets an explanatory row instead of an
+/// empty viewport.
+fn diff_review_lines(result: &DiffResult, width: u16, theme: &CliTheme) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for hunk in &result.hunks {
+        lines.push(Line::from(Span::styled(
+            truncate_to(
+                format!(
+                    "@@ -{},{} +{},{} @@",
+                    hunk.old_start, hunk.old_len, hunk.new_start, hunk.new_len
+                ),
+                width,
+            ),
+            Style::default().fg(theme.muted),
+        )));
+        for line in &hunk.lines {
+            let (prefix, content, style) = match line {
+                DiffLine::Addition { content, .. } => {
+                    ("+", content.as_str(), Style::default().fg(theme.success))
+                }
+                DiffLine::Deletion { content, .. } => {
+                    ("-", content.as_str(), Style::default().fg(theme.danger))
+                }
+                DiffLine::Context { content, .. } => (" ", content.as_str(), Style::default()),
+                // `DiffLine` is `#[non_exhaustive]`: a future variant must
+                // never blank the review, so it renders as context.
+                _ => (" ", "", Style::default()),
+            };
+            lines.push(Line::from(Span::styled(
+                truncate_to(format!("{prefix}{content}"), width),
+                style,
+            )));
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            truncate_to("No textual change (empty file operation).".to_string(), width),
+            Style::default().fg(theme.muted),
+        )));
+    }
+    lines
 }
 
 // ---------------------------------------------------------------------------
@@ -861,7 +1013,6 @@ mod tests {
     #[test]
     fn settings_selection_stays_visible_at_narrow_and_short_terminal_sizes() {
         use crate::app::{App, Screen, SettingsField};
-        use ratatui::{backend::TestBackend, Terminal};
         for (width, height) in [(24, 8), (40, 12), (80, 24), (120, 40)] {
             let mut app = App::new();
             app.screen = Screen::Settings;
@@ -879,6 +1030,7 @@ mod tests {
 
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use ratatui::{backend::TestBackend, Terminal};
 
     // ------------------------------------------------------------------
     // Plan modal helpers (ADR-55 §4)
@@ -1281,5 +1433,162 @@ mod tests {
         let text: String = full.iter().map(|span| span.content.to_string()).collect();
         assert!(text.contains("  │ let x = 1;"));
         assert!(text.contains("done"));
+    }
+
+    // ------------------------------------------------------------------
+    // Staged unified-diff review screen (P02)
+    // ------------------------------------------------------------------
+
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect()
+    }
+
+    /// Review screen showing one staged file with a two-line change.
+    fn populated_diff_review_app() -> App {
+        use concerto_api_types::diff::Hunk;
+        let mut app = App::new();
+        app.screen = Screen::DiffReview;
+        app.diff_review.results = vec![DiffResult {
+            path: "src/lib.rs".into(),
+            hunks: vec![Hunk {
+                old_start: 10,
+                old_len: 2,
+                new_start: 10,
+                new_len: 3,
+                lines: vec![
+                    DiffLine::Context { content: "fn kept() {}".into(), line_num: 10 },
+                    DiffLine::Deletion { content: "fn old() {}".into(), line_num: 11 },
+                    DiffLine::Addition { content: "fn new() {}".into(), line_num: 11 },
+                ],
+            }],
+        }];
+        app.diff_review.index = 0;
+        app
+    }
+
+    #[test]
+    fn diff_review_renders_at_all_supported_terminal_sizes() {
+        for (width, height) in [(24, 8), (40, 12), (80, 24), (120, 40)] {
+            let app = populated_diff_review_app();
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| super::draw(frame, &app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(
+                text.contains("Diff review"),
+                "review title missing at {width}x{height}: {text}"
+            );
+            assert!(text.contains("1/1"), "file position missing at {width}x{height}: {text}");
+            assert!(
+                text.contains("src/lib.rs"),
+                "selected file missing at {width}x{height}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn diff_review_renders_unified_diff_rows() {
+        let app = populated_diff_review_app();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| super::draw(frame, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("@@ -10,2 +10,3 @@"), "hunk header missing: {text}");
+        assert!(text.contains(" fn kept() {}"), "context row missing: {text}");
+        assert!(text.contains("-fn old() {}"), "deletion row missing: {text}");
+        assert!(text.contains("+fn new() {}"), "addition row missing: {text}");
+    }
+
+    #[test]
+    fn diff_review_shows_the_decision_hints() {
+        let app = populated_diff_review_app();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| super::draw(frame, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("[a] accept"), "accept stake missing: {text}");
+        assert!(text.contains("[r] reject"), "reject stake missing: {text}");
+        assert!(text.contains("Esc close"), "close key missing: {text}");
+    }
+
+    #[test]
+    fn diff_review_empty_state_renders() {
+        let mut app = App::new();
+        app.screen = Screen::DiffReview;
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal.draw(|frame| super::draw(frame, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Diff review"), "title missing on the empty screen: {text}");
+        assert!(text.contains("No staged changes."), "empty state missing: {text}");
+    }
+
+    #[test]
+    fn diff_review_status_row_reports_feedback() {
+        let mut app = populated_diff_review_app();
+        app.diff_review.status =
+            Some(ReviewStatus::Decided { path: "src/lib.rs".into(), accept: true });
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| super::draw(frame, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Accepted src/lib.rs"), "decision feedback missing: {text}");
+
+        app.diff_review.status = Some(ReviewStatus::Blocked(
+            "Staged changes changed. Review the latest diff before deciding.".into(),
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| super::draw(frame, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("Blocked: Staged changes changed."),
+            "blocked message missing (stakes head must survive truncation): {text}"
+        );
+    }
+
+    #[test]
+    fn diff_review_render_is_stable_with_a_stale_scroll_offset() {
+        let mut app = populated_diff_review_app();
+        app.diff_review.scroll = u16::MAX;
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal.draw(|frame| super::draw(frame, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Diff review"), "a stale offset must not blank the review: {text}");
+        assert!(text.contains("src/lib.rs"), "the header stays visible: {text}");
+    }
+
+    #[test]
+    fn diff_review_lines_truncate_to_width_without_wrapping() {
+        use concerto_api_types::diff::Hunk;
+        let theme = CliTheme::by_name("Midnight");
+        let result = DiffResult {
+            path: "src/lib.rs".into(),
+            hunks: vec![Hunk {
+                old_start: 1,
+                old_len: 1,
+                new_start: 1,
+                new_len: 1,
+                lines: vec![DiffLine::Addition {
+                    content: format!("{}TAIL_MARKER", "x".repeat(300)),
+                    line_num: 1,
+                }],
+            }],
+        };
+        let lines = diff_review_lines(&result, 20, &theme);
+        // Hunk header + the single row: a long line is cut, never re-wrapped
+        // into extra rows.
+        assert_eq!(lines.len(), 2, "rows must not wrap");
+        for line in &lines {
+            let text = line_text(line);
+            assert!(text.chars().count() <= 20, "row exceeds the viewport: {text:?}");
+        }
+        let addition = line_text(&lines[1]);
+        assert!(addition.starts_with('+'), "the prefix is the non-color cue: {addition:?}");
+        assert!(addition.ends_with('…'), "a cut row ends with an ellipsis: {addition:?}");
+        assert!(!addition.contains("TAIL_MARKER"), "the cut tail stays hidden: {addition:?}");
+    }
+
+    #[test]
+    fn diff_review_lines_explain_files_without_text_hunks() {
+        let theme = CliTheme::by_name("Midnight");
+        let result = DiffResult { path: "new.txt".into(), hunks: Vec::new() };
+        let lines = diff_review_lines(&result, 40, &theme);
+        assert_eq!(lines.len(), 1, "an empty create/delete still gets a row");
+        assert!(line_text(&lines[0]).contains("No textual change"));
     }
 }
