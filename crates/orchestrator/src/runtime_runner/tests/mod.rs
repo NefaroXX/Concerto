@@ -713,3 +713,12 @@ mod memory_cache;
 // an explicit `#[path]` too.
 #[path = "provider_pinning.rs"]
 mod provider_pinning;
+
+// NORM S24F: the spend-log persistence + dispatch-switch + approved-plan
+// task-phrase cluster (the three section banners and the four tests from
+// `persist_spend_records_writes_one_record_per_metrics_entry` through
+// `apply_run_uses_approved_plan_not_approval_phrase`) lives in
+// `spend_dispatch.rs`. This file is loaded via `#[path]` as
+// `runtime_runner::tests`, so the submodule needs an explicit `#[path]` too.
+#[path = "spend_dispatch.rs"]
+mod spend_dispatch;
