@@ -753,3 +753,13 @@ pub(super) mod stage_harness;
 // `runtime_runner::tests`, so the submodule needs an explicit `#[path]` too.
 #[path = "auto_apply.rs"]
 mod auto_apply;
+
+// NORM S24I: the per-stage feed-binding + transcript gate-label cluster (the
+// ADR-58 P2+P3 (Batch 3b)/(Batch 4b) banners and the four tests from
+// `stage_feed_bindings_resolve_standard_and_legacy_advances` through
+// `gate_labels_follow_renamed_gate_tags`) lives in `stage_feed.rs`. This file
+// is loaded via `#[path]` as `runtime_runner::tests`, so the submodule needs
+// an explicit `#[path]` too; it imports `TestAudit` from `stage_harness`
+// rather than duplicating the harness.
+#[path = "stage_feed.rs"]
+mod stage_feed;
