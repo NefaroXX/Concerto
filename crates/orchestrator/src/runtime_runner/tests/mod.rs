@@ -18,6 +18,17 @@ use concerto_core::transcript::{GateLabels, TranscriptToolStatus};
 #[path = "memory_init.rs"]
 mod memory_init;
 
+// NORM S24D: the ADR-60 D7 approved-plan continuity cluster (the `d7_pool`,
+// `supervised_config`, `d7_design_doc`, `d7_binding`, `d7_binding_named`
+// fixtures and the four `approved_plan_*` / `injected_plan_*` /
+// `d7_write_gated_*` tests) lives in `approved_plan_d7.rs`. This file is loaded
+// via `#[path]` as `runtime_runner::tests`, so the submodule needs an explicit
+// `#[path]` too. `pub(super)` (unlike the sibling `mod`s): the three shared D7
+// fixtures are re-exported from `runtime_runner_tests` for the continuity
+// tests, so the module must be nameable across `runtime_runner_impl`.
+#[path = "approved_plan_d7.rs"]
+pub(super) mod approved_plan_d7;
+
 // ------------------------------------------------------------------
 // Mock SessionStore for event-recorder testing
 // ------------------------------------------------------------------
