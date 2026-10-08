@@ -732,3 +732,15 @@ mod agency_topology;
 // `runtime_runner::tests`, so the submodule needs an explicit `#[path]` too.
 #[path = "spend_dispatch.rs"]
 mod spend_dispatch;
+
+// NORM S24G: the local approval/policy/provider test harness (the
+// `ApprovalTestHarness` / `TestAudit` / `WriteFileTool` / `ScriptedProvider`
+// / `FailingProvider` fixtures and the `make_tool_call` / `make_services` /
+// `make_executor` / `drain_stage_events` helpers) plus the first six
+// stage-tracker / auto-Apply tests live in `stage_harness.rs`. This file is
+// loaded via `#[path]` as `runtime_runner::tests`, so the submodule needs an
+// explicit `#[path]` too. `pub(super)` (like the sibling S24D module): the
+// harness items the donor's not-yet-moved tests consume must be nameable
+// across `runtime_runner_impl`.
+#[path = "stage_harness.rs"]
+pub(super) mod stage_harness;
