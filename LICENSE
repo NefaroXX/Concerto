@@ -10,3 +10,18 @@ conditions.
 
 The workspace manifests declare this as `license = "MIT OR Apache-2.0"`
 (SPDX expression) in the root `Cargo.toml`.
+
+## Maintainer identity and copyright
+
+NefaroXX (https://github.com/NefaroXX) is the public pseudonym of Concerto's
+individual maintainer and identifies the copyright holder for that
+individual's own copyrightable contributions.
+
+Earlier notices used "NefaroXX / MIT Services". MIT Services was the same
+individual's unregistered trading name, not a separate company or additional
+copyright holder. Using "NefaroXX" alone clarifies that identity; it does not
+transfer copyright or change the permissions granted for earlier versions.
+
+Other contributors and third-party authors retain their respective rights.
+Contributing under the licenses above does not, by itself, assign copyright
+to the maintainer. This identity clarification adds no license conditions.
