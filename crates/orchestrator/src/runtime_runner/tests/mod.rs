@@ -713,3 +713,13 @@ mod memory_cache;
 // an explicit `#[path]` too.
 #[path = "provider_pinning.rs"]
 mod provider_pinning;
+
+// NORM S24E: the agency/envelope + tool-config + resume-scope +
+// multi-agent-history + topology/roster cluster (the ADR-55 envelope banner,
+// the "Full local agency" banner, and the eleven tests from
+// `full_agency_envelope_is_the_only_mode` through
+// `topology_roles_excludes_disabled`) lives in `agency_topology.rs`. This file
+// is loaded via `#[path]` as `runtime_runner::tests`, so the submodule needs
+// an explicit `#[path]` too.
+#[path = "agency_topology.rs"]
+mod agency_topology;
