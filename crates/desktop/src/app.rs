@@ -85,6 +85,16 @@ mod orchestration_persist;
 mod view_dialogs;
 mod view_panels;
 
+/// Trivial arm groups extracted from the root `update` match (NORM S30):
+/// run-cancel + animation ticks, the `AgentGraph`/`Terminal`
+/// passthroughs, the prefs-theme/help flip, and the screenshot/toast/
+/// quick/memory/terminal/git tail. Bodies moved verbatim; each group is
+/// one `pub(super)` method taking the full [`Message`] so every arm keeps
+/// its exact early-return `Task` semantics (same pattern as
+/// `views::settings::update_mcp`). The parent `update` keeps one thin
+/// delegating arm per group; the tests in `mod tests` stay put untouched.
+mod simple_updates;
+
 /// Shared text-focus state read by the keyboard-subscription fn pointer.
 /// `keyboard::on_key_press` requires a bare fn (no captures), so we route
 /// through a static rather than App's field.
@@ -1152,51 +1162,14 @@ impl App {
                     self.load_git_summary(),
                 ])
             }
-            Message::CancelAgentRun => {
-                if self.run_status == RunStatus::Running {
-                    self.cancel_token.cancel();
-                    self.run_status = RunStatus::Cancelling;
-                }
-                iced::Task::none()
-            }
-            Message::CircuitTick => {
-                self.circuit_progress =
-                    (self.circuit_progress + circuit_background::PROGRESS_STEP) % 1.0;
-                iced::Task::none()
-            }
-            Message::ScanlineTick => {
-                self.scanline_progress =
-                    (self.scanline_progress + scanline_overlay::PROGRESS_STEP) % 1.0;
-                iced::Task::none()
-            }
-            Message::AnimTick => {
-                // Overlay backdrop fade: advance toward the target in fixed
-                // 0.08 steps, snapping on the final step (~15 ticks ≈ 240 ms
-                // for a full fade). Clears the flag when settled, which also
-                // stops the shared animation subscription.
-                if self.overlay_fading {
-                    let target = self.overlay_fade_target;
-                    if (target - self.overlay_fade).abs() <= 0.08 {
-                        self.overlay_fade = target;
-                        self.overlay_fading = false;
-                    } else {
-                        self.overlay_fade += (target - self.overlay_fade).signum() * 0.08;
-                    }
-                }
-                // Terminal panel slide: animate toward open (1.0) / closed
-                // (0.0) from the `terminal_panel_open` flag.
-                if self.terminal_panel_animating {
-                    let target = if self.terminal_panel_open { 1.0 } else { 0.0 };
-                    if (target - self.terminal_panel_anim).abs() <= 0.08 {
-                        self.terminal_panel_anim = target;
-                        self.terminal_panel_animating = false;
-                    } else {
-                        self.terminal_panel_anim +=
-                            (target - self.terminal_panel_anim).signum() * 0.08;
-                    }
-                }
-                iced::Task::none()
-            }
+            // NORM S30 — run cancel + the three shared animation ticks moved
+            // verbatim to the sibling `simple_updates` submodule. The full
+            // `Message` is forwarded so the helper preserves each arm's exact
+            // early-return `Task` semantics.
+            message @ (Message::CancelAgentRun
+            | Message::CircuitTick
+            | Message::ScanlineTick
+            | Message::AnimTick) => self.update_cancel_and_ticks(message),
             Message::Chat(msg) => {
                 if let views::chat::Message::CopyCode(code) = &msg {
                     return iced::clipboard::write(code.clone());
@@ -1618,9 +1591,10 @@ impl App {
                 }
                 _ => self.settings.update(msg).map(Message::Settings),
             },
-            Message::AgentGraph(msg) => self.agent_graph.update(msg).map(Message::AgentGraph),
-            Message::Terminal(msg) => {
-                self.terminal.update(msg, &self.current_theme).map(Message::Terminal)
+            // NORM S30 — the `AgentGraph`/`Terminal` passthrough one-liners
+            // live in the sibling `simple_updates` submodule.
+            message @ (Message::AgentGraph(_) | Message::Terminal(_)) => {
+                self.update_passthrough_views(message)
             }
             Message::ImportProjectOrchestration => {
                 self.run_project_orchestration_import();
@@ -1703,18 +1677,10 @@ impl App {
                     task
                 }
             },
-            Message::ThemeChanged => {
-                // Re-read the single source (prefs) and re-apply it to every
-                // surface, including the Settings picker — a prefs reload that
-                // only replaced `current_theme` would leave the picker showing
-                // a theme the shell is not rendering.
-                let theme = load_prefs_theme();
-                self.apply_prefs_theme(theme);
-                iced::Task::none()
-            }
-            Message::HelpToggled => {
-                self.show_help = !self.show_help;
-                iced::Task::none()
+            // NORM S30 — prefs-theme reload + help-overlay flip moved to the
+            // sibling `simple_updates` submodule.
+            message @ (Message::ThemeChanged | Message::HelpToggled) => {
+                self.update_theme_and_help(message)
             }
             Message::OpenProjectDirPicker => {
                 self.show_dir_picker = true;
@@ -1969,153 +1935,30 @@ impl App {
             }
 
             // (sync_chat_model_options is invoked inside persist_active_model_selection)
-            Message::TakeScreenshot => {
-                self.screenshot_status = Some("Capturing...".to_string());
-                iced::window::latest().and_then(|id| {
-                    iced::window::screenshot(id).map(|screenshot| {
-                        let rgba: &[u8] = screenshot.as_ref();
-                        let w = screenshot.size.width;
-                        let h = screenshot.size.height;
-                        match crate::services::screenshot::save_png(rgba, w, h, true) {
-                            Ok(res) => Message::ScreenshotCompleted(Ok(res)),
-                            Err(e) => Message::ScreenshotCompleted(Err(e.to_string())),
-                        }
-                    })
-                })
-            }
-            Message::ScreenshotCompleted(result) => {
-                match result {
-                    Ok(res) => {
-                        let path_str = res.file_path.display().to_string();
-                        tracing::info!(path = %path_str, "Screenshot saved");
-                        self.screenshot_status = Some(format!("Saved: {}", path_str));
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "Screenshot failed");
-                        self.screenshot_status = Some(format!("Failed: {}", e));
-                    }
-                }
-                // Clear status after 5 seconds
-                let status = self.screenshot_status.clone();
-                iced::Task::perform(
-                    async move {
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        status
-                    },
-                    |_| Message::ClearScreenshotStatus,
-                )
-            }
-            Message::ClearScreenshotStatus => {
-                self.screenshot_status = None;
-                iced::Task::none()
-            }
-            Message::ClearSaveFeedback(generation) => {
-                // Ignore stale timers from a previous save: only the current
-                // generation may clear the notice.
-                if generation == self.save_feedback_generation {
-                    self.save_feedback = None;
-                }
-                iced::Task::none()
-            }
-            Message::ToastDismissed(id) => {
-                self.toasts.dismiss(id);
-                iced::Task::none()
-            }
-            Message::ToastExpiryTick => {
-                let cutoff =
-                    std::time::Instant::now() - std::time::Duration::from_secs(TOAST_LIFETIME_SECS);
-                self.toasts.prune_older_than(cutoff);
-                iced::Task::none()
-            }
-            Message::ToggleQuickPanel => {
-                self.quick_panel_open = !self.quick_panel_open;
-                if self.quick_panel_open {
-                    // Opening the panel also (re)loads memory entries so the
-                    // Memory section is fresh; the git summary is loaded
-                    // alongside it.
-                    if self.config.as_ref().is_some_and(|c| c.memory.enabled) {
-                        iced::Task::batch(vec![self.load_memory_entries(), self.load_git_summary()])
-                    } else {
-                        self.load_git_summary()
-                    }
-                } else {
-                    iced::Task::none()
-                }
-            }
-            Message::OpenMemoryModal => {
-                self.memory_view_open = true;
-                self.load_memory_entries()
-            }
-            Message::CloseMemoryModal => {
-                self.memory_view_open = false;
-                iced::Task::none()
-            }
-            Message::OpenMemoryGraph => {
-                self.memory_graph_open = true;
-                self.memory_graph = views::memory_graph::State::Loading;
-                self.load_memory_graph()
-            }
-            Message::CloseMemoryGraph => {
-                self.memory_graph_open = false;
-                iced::Task::none()
-            }
-            Message::MemoryGraph(msg) => match msg {
-                views::memory_graph::Message::Refresh => {
-                    self.memory_graph = views::memory_graph::State::Loading;
-                    self.load_memory_graph()
-                }
-            },
-            Message::MemoryGraphLoaded(result) => {
-                match result {
-                    Ok(graph) => self.memory_graph = views::memory_graph::State::Loaded(graph),
-                    Err(error) => self.memory_graph = views::memory_graph::State::Error(error),
-                }
-                iced::Task::none()
-            }
-            Message::ToggleTerminalPanel => {
-                self.terminal_panel_open = !self.terminal_panel_open;
-                // Kick off the slide animation; `AnimTick` eases the panel
-                // height toward the new `terminal_panel_open` target.
-                self.terminal_panel_animating = true;
-                if self.terminal_panel_open {
-                    // Opening the panel lazily starts the shell (and re-focuses
-                    // it when the panel is already running).
-                    self.terminal.ensure_started(&self.current_theme).map(Message::Terminal)
-                } else {
-                    iced::Task::none()
-                }
-            }
-            Message::TerminalPanelResizeStart => {
-                if self.terminal_resizing {
-                    return iced::Task::none();
-                }
-                self.terminal_resizing = true;
-                self.terminal_start_height = self.terminal_panel_height;
-                self.terminal_drag_origin = None;
-                iced::Task::none()
-            }
-            Message::TerminalPanelResizeMoved(y) => {
-                if !self.terminal_resizing {
-                    return iced::Task::none();
-                }
-                if self.terminal_drag_origin.is_none() {
-                    self.terminal_drag_origin = Some(y);
-                    return iced::Task::none();
-                }
-                let origin = self.terminal_drag_origin.unwrap_or(y);
-                self.terminal_panel_height =
-                    (self.terminal_start_height + (origin - y)).clamp(120.0, 600.0);
-                iced::Task::none()
-            }
-            Message::TerminalPanelResizeEnd => {
-                self.terminal_resizing = false;
-                self.terminal_drag_origin = None;
-                iced::Task::none()
-            }
-            Message::GitSummaryLoaded(summary) => {
-                self.git_summary = summary;
-                iced::Task::none()
-            }
+            // NORM S30 — the trivial tail cluster (screenshot status, save
+            // feedback, toasts, quick panel, memory modal/graph, terminal
+            // panel + drag resize, git summary) moved verbatim to the
+            // sibling `simple_updates` submodule. The full `Message` is
+            // forwarded so the helper preserves each arm's exact early-return
+            // `Task` semantics.
+            message @ (Message::TakeScreenshot
+            | Message::ScreenshotCompleted(_)
+            | Message::ClearScreenshotStatus
+            | Message::ClearSaveFeedback(_)
+            | Message::ToastDismissed(_)
+            | Message::ToastExpiryTick
+            | Message::ToggleQuickPanel
+            | Message::OpenMemoryModal
+            | Message::CloseMemoryModal
+            | Message::OpenMemoryGraph
+            | Message::CloseMemoryGraph
+            | Message::MemoryGraph(_)
+            | Message::MemoryGraphLoaded(_)
+            | Message::ToggleTerminalPanel
+            | Message::TerminalPanelResizeStart
+            | Message::TerminalPanelResizeMoved(_)
+            | Message::TerminalPanelResizeEnd
+            | Message::GitSummaryLoaded(_)) => self.update_trivial_ui_state(message),
         }
     }
 
