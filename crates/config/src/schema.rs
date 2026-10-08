@@ -2978,6 +2978,16 @@ mod tests {
         }
     }
 
+    /// Serializes the two WarnSink-capturing tests (H1 flake experiment): both
+    /// install a scoped `tracing::subscriber::with_default` dispatcher, and the
+    /// intermittent Windows `left: 0` failure (warn! executed, event lost before
+    /// reaching the sink) is hypothesized to be cross-test dispatcher overlap.
+    /// Holding this guard for a whole test body makes overlap impossible; if the
+    /// flake persists, H1 is weakened. Poison is recovered rather than
+    /// propagated so one failing test cannot cascade a second, misleading
+    /// failure.
+    static SERIALIZE_WARN_CAPTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Minimal `tracing::Subscriber` collecting WARN events while a closure
     /// runs under `tracing::subscriber::with_default`, so the no-clobber
     /// warning can be asserted without pulling `tracing-subscriber` into
@@ -3089,6 +3099,7 @@ mod tests {
     /// It must also say so, loudly, naming the provider and the retained count.
     #[test]
     fn record_discovered_models_empty_result_keeps_cache_and_warns() {
+        let _guard = SERIALIZE_WARN_CAPTURE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut pc = provider_with_cached_models(&["gpt-4o", "gpt-4o-mini"]);
         let subscriber = WarnSink::default();
         let sink = subscriber.clone();
@@ -3141,6 +3152,7 @@ mod tests {
     /// cache with `[]`.
     #[test]
     fn record_discovered_models_whitespace_only_result_is_treated_as_empty() {
+        let _guard = SERIALIZE_WARN_CAPTURE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut pc = provider_with_cached_models(&["gpt-4o"]);
         let subscriber = WarnSink::default();
         let sink = subscriber.clone();
