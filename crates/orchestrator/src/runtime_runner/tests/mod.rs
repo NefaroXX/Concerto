@@ -8,6 +8,8 @@
 //! stage-tracker tests still in `runtime_runner_tests` construct it.
 
 use super::*;
+use concerto_core::event::Event;
+use concerto_core::transcript::{GateLabels, TranscriptToolStatus};
 
 // ------------------------------------------------------------------
 // Mock SessionStore for event-recorder testing
