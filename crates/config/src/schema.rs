@@ -3078,7 +3078,18 @@ mod tests {
         let mut pc = provider_with_cached_models(&["gpt-4o"]);
         pc.cached_model_tool_support.insert("gpt-4o".to_string(), true);
 
-        let outcome = pc.record_discovered_models(Vec::new());
+        // This empty-input + non-empty-cache path evaluates the same `warn!`
+        // callsite the capturing tests assert on. tracing's callsite-interest
+        // cache is process-global: an unsubscribed emit here can land between
+        // a capturing test's scope-enter rebuild and its own emit, caching
+        // `Never` and silently dropping that event. Draining this emit
+        // through a WarnSink keeps the callsite evaluated under a subscriber;
+        // the warn itself is not asserted, only tolerated.
+        let subscriber = WarnSink::default();
+        let outcome = tracing::subscriber::with_default(subscriber, || {
+            pc.record_discovered_models(Vec::new())
+        });
+
         assert_eq!(outcome, DiscoveryOutcome::EmptyIgnored);
         assert_eq!(pc.cached_models, vec!["gpt-4o"]);
         assert_eq!(pc.advertised_tool_support_for("gpt-4o"), Some(true));
