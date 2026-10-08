@@ -744,3 +744,12 @@ mod spend_dispatch;
 // across `runtime_runner_impl`.
 #[path = "stage_harness.rs"]
 pub(super) mod stage_harness;
+
+// NORM S24H: the A5 auto-Apply tail + StageTracker sequence + apply-path
+// checkpoint cluster (the ADR-55 §4 (M2) banner and the seven tests from
+// `a5_unverifiable_session_newest_binding_falls_through_fail_soft` through
+// `apply_path_suppresses_stale_orchestration_checkpoint`) lives in
+// `auto_apply.rs`. This file is loaded via `#[path]` as
+// `runtime_runner::tests`, so the submodule needs an explicit `#[path]` too.
+#[path = "auto_apply.rs"]
+mod auto_apply;
