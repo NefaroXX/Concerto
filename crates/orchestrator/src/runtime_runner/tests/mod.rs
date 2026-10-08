@@ -11,6 +11,13 @@ use super::*;
 use concerto_core::event::Event;
 use concerto_core::transcript::{GateLabels, TranscriptToolStatus};
 
+// NORM S24A: the memory-init production-path cluster (the two `MEMORY_INIT_*`
+// serial locks, `XdgDataHomeGuard`, and the two `init_path_*` tests) lives in
+// `memory_init.rs`. This file is loaded via `#[path]` as
+// `runtime_runner::tests`, so the submodule needs an explicit `#[path]` too.
+#[path = "memory_init.rs"]
+mod memory_init;
+
 // ------------------------------------------------------------------
 // Mock SessionStore for event-recorder testing
 // ------------------------------------------------------------------
