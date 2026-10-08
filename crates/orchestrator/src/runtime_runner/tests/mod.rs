@@ -694,3 +694,11 @@ async fn transcript_recorder_filters_cross_session_events() {
 // `#[path]` too.
 #[path = "memory_cache.rs"]
 mod memory_cache;
+
+// NORM S24C: the model/provider pinning cluster (the three
+// `legacy_pins_from_config` model-override tests, `EnvVarGuard`, and the five
+// custom-agent `provider_id` tests) lives in `provider_pinning.rs`. This file
+// is loaded via `#[path]` as `runtime_runner::tests`, so the submodule needs
+// an explicit `#[path]` too.
+#[path = "provider_pinning.rs"]
+mod provider_pinning;
