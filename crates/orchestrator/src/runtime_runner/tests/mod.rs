@@ -679,3 +679,11 @@ async fn transcript_recorder_filters_cross_session_events() {
         }
     );
 }
+
+// NORM S24B: the project-switch memory-isolation / memory-optional test
+// cluster (the three `Dummy*` stand-ins, `active_memory_for`, and the six
+// tests they drive) lives in `memory_cache.rs`. This file is loaded via
+// `#[path]` as `runtime_runner::tests`, so the submodule needs an explicit
+// `#[path]` too.
+#[path = "memory_cache.rs"]
+mod memory_cache;
