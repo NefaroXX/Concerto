@@ -24,6 +24,7 @@ pub mod message;
 pub mod shell;
 pub mod state;
 mod state_mcp_validate;
+mod state_sync;
 
 pub use message::ExtensionTab;
 pub use message::Message;
