@@ -16,8 +16,7 @@ use super::message::SectionId;
 use super::state_mcp_validate;
 use super::{
     CreateParentOption, ExtensionTab, Message, PolicyActionChoice, PolicyConditionChoice,
-    FILESYSTEM_OPERATIONS, MAIN_SCROLL_ID, POLICY_ACTIONS, POLICY_CONDITION_KINDS,
-    POLICY_OPERATION_TOOLS, POLICY_TOOLS,
+    FILESYSTEM_OPERATIONS, MAIN_SCROLL_ID, POLICY_ACTIONS, POLICY_CONDITION_KINDS, POLICY_TOOLS,
 };
 
 /// A plugin installed in the canonical plugins directory, as listed by the
@@ -625,7 +624,10 @@ impl State {
     /// Validate an optional positive-integer field. Blank is valid (it means
     /// "use the default / retry indefinitely"); any other input must be a
     /// whole number greater than zero. Returns `Some(message)` when invalid.
-    fn validate_optional_positive_int(s: &str) -> Option<String> {
+    ///
+    /// `pub(super)` (NORM S35): the memory/retry arms moved to the sibling
+    /// `update_policy` submodule still call this validator.
+    pub(super) fn validate_optional_positive_int(s: &str) -> Option<String> {
         let trimmed = s.trim();
         if trimmed.is_empty() {
             return None; // blank is valid (means "use default/unlimited")
@@ -1085,129 +1087,32 @@ impl State {
                 }
             }
 
-            // Policy (kept)
-            Message::NewPolicyActionSelected(a) => {
-                self.settings_dirty = true;
-                self.new_policy_action = a;
-            }
-            Message::NewPolicyConditionKindSelected(k) => {
-                self.settings_dirty = true;
-                self.new_policy_condition_kind = k;
-                if k == PolicyConditionChoice::ToolOperation
-                    && !POLICY_OPERATION_TOOLS.contains(&self.new_policy_tool)
-                {
-                    self.new_policy_tool = POLICY_OPERATION_TOOLS[0];
-                    self.new_policy_operation = FILESYSTEM_OPERATIONS[0];
-                }
-            }
-            Message::NewPolicyToolSelected(tool) => {
-                self.settings_dirty = true;
-                self.new_policy_tool = tool;
-                self.new_policy_operation = Self::operation_options(tool)[0];
-            }
-            Message::NewPolicyOperationSelected(operation) => {
-                self.settings_dirty = true;
-                self.new_policy_operation = operation;
-            }
-            Message::NewPolicyConditionValueChanged(v) => {
-                self.settings_dirty = true;
-                self.new_policy_condition_value = v;
-            }
-            Message::PolicyRuleAdded => {
-                self.settings_dirty = true;
-                let condition = match self.new_policy_condition_kind {
-                    PolicyConditionChoice::Tool => {
-                        ConditionDef::ToolName { tool_name: self.new_policy_tool.to_string() }
-                    }
-                    PolicyConditionChoice::ToolOperation => ConditionDef::ToolOperation {
-                        tool_name: self.new_policy_tool.to_string(),
-                        operation: self.new_policy_operation.to_string(),
-                    },
-                    PolicyConditionChoice::ProjectPath => ConditionDef::PathGlob {
-                        path_glob: self.new_policy_condition_value.clone(),
-                    },
-                    PolicyConditionChoice::ShellCommand => ConditionDef::CommandPattern {
-                        command_pattern: self.new_policy_condition_value.clone(),
-                    },
-                    PolicyConditionChoice::Always => ConditionDef::Always { always: true },
-                };
-                if matches!(
-                    self.new_policy_condition_kind,
-                    PolicyConditionChoice::Tool
-                        | PolicyConditionChoice::ToolOperation
-                        | PolicyConditionChoice::Always
-                ) || !self.new_policy_condition_value.trim().is_empty()
-                {
-                    self.policy_rules.push(PolicyRuleDef {
-                        action: self.new_policy_action.config_value().to_string(),
-                        condition,
-                    });
-                    self.new_policy_condition_value.clear();
-                }
-            }
-            Message::PolicyRuleRemoved(idx) => {
-                self.settings_dirty = true;
-                if idx < self.policy_rules.len() {
-                    self.policy_rules.remove(idx);
-                }
-            }
-            Message::PolicyRuleMovedUp(idx) => {
-                self.settings_dirty = true;
-                if idx > 0 && idx < self.policy_rules.len() {
-                    self.policy_rules.swap(idx, idx - 1);
-                }
-            }
-            Message::PolicyRuleMovedDown(idx) => {
-                self.settings_dirty = true;
-                if idx + 1 < self.policy_rules.len() {
-                    self.policy_rules.swap(idx, idx + 1);
-                }
-            }
+            // Policy rule-builder edits and memory/retry tuning: pure
+            // relocation (NORM S35). The 9 `NewPolicy*` / `PolicyRule*` arms
+            // now live in `update_policy` and the 10 `Memory*` / `Retry*` arms
+            // in `update_memory`, both in the sibling `update_policy`
+            // submodule. The full `Message` is forwarded so each helper keeps
+            // the arm's exact early-return semantics.
+            message @ (Message::NewPolicyActionSelected(_)
+            | Message::NewPolicyConditionKindSelected(_)
+            | Message::NewPolicyToolSelected(_)
+            | Message::NewPolicyOperationSelected(_)
+            | Message::NewPolicyConditionValueChanged(_)
+            | Message::PolicyRuleAdded
+            | Message::PolicyRuleRemoved(_)
+            | Message::PolicyRuleMovedUp(_)
+            | Message::PolicyRuleMovedDown(_)) => return self.update_policy(message),
 
-            Message::MemoryEnabledToggled(v) => {
-                self.settings_dirty = true;
-                self.memory_enabled = v;
-            }
-            Message::MemoryTtlChanged(v) => {
-                self.settings_dirty = true;
-                self.memory_ttl_days = v.clamp(1.0, 365.0);
-            }
-            Message::RetryEnabledToggled(value) => {
-                self.settings_dirty = true;
-                self.retry_enabled = value;
-            }
-            Message::RetryInitialDelayChanged(value) => {
-                self.settings_dirty = true;
-                self.retry_initial_delay_ms = value;
-            }
-            Message::RetryMaxDelayChanged(value) => {
-                self.settings_dirty = true;
-                self.retry_max_delay_ms = value;
-            }
-            Message::RetryMultiplierChanged(value) => {
-                self.settings_dirty = true;
-                self.retry_multiplier = value;
-            }
-            Message::RetryFixedDelayChanged(value) => {
-                self.settings_dirty = true;
-                self.retry_fixed_delay_ms = value;
-                self.retry_fixed_delay_error =
-                    Self::validate_optional_positive_int(&self.retry_fixed_delay_ms);
-            }
-            Message::RetryRespectAfterToggled(value) => {
-                self.settings_dirty = true;
-                self.retry_respect_after = value;
-            }
-            Message::RetryJitterToggled(value) => {
-                self.settings_dirty = true;
-                self.retry_jitter = value;
-            }
-            Message::RetryMaxElapsedChanged(value) => {
-                self.settings_dirty = true;
-                self.retry_max_elapsed_seconds = value;
-                self.retry_max_elapsed_error =
-                    Self::validate_optional_positive_int(&self.retry_max_elapsed_seconds);
-            }
+            message @ (Message::MemoryEnabledToggled(_)
+            | Message::MemoryTtlChanged(_)
+            | Message::RetryEnabledToggled(_)
+            | Message::RetryInitialDelayChanged(_)
+            | Message::RetryMaxDelayChanged(_)
+            | Message::RetryMultiplierChanged(_)
+            | Message::RetryFixedDelayChanged(_)
+            | Message::RetryRespectAfterToggled(_)
+            | Message::RetryJitterToggled(_)
+            | Message::RetryMaxElapsedChanged(_)) => return self.update_memory(message),
             Message::SaveSettings => {
                 self.settings_saved_notice = true;
                 self.settings_dirty = false;

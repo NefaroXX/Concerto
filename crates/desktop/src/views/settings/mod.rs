@@ -28,6 +28,7 @@ mod state_mcp_validate;
 mod state_sync;
 mod update_mcp;
 mod update_plugins;
+mod update_policy;
 mod update_providers;
 mod update_skills;
 
