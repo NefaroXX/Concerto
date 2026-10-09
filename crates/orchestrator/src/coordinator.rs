@@ -3803,6 +3803,17 @@ struct CompletionGuards {
     has_declared_verification: bool,
 }
 
+/// W3a: the outcome of the dispatch policy gate + Decision journal step
+/// ([`CoordinatorAgent::gate_and_journal_dispatch`]). `decision_id` is the
+/// validator-minted id the rest of the dispatch cites (threaded through the
+/// helper so that step returns the journaled decision's handle); `description`
+/// is the human-facing task description the caller materializes into the graph
+/// node immediately after journaling.
+struct JournaledDispatch {
+    decision_id: String,
+    description: String,
+}
+
 impl CoordinatorAgent {
     /// Create a new coordinator with all required subsystems.
     pub fn new(
@@ -12491,62 +12502,12 @@ impl CoordinatorAgent {
                 }
             }
 
-            let request = CompletionRequest {
-                model: model.clone(),
-                messages: messages.clone(),
-                tools: (!tool_defs.is_empty()).then_some(tool_defs.clone()),
-                tool_choice: None,
-                temperature: Some(0.7),
-                max_tokens: Some(8192),
-                stream: false,
-            };
-            // ADR-48 §4: the planning provider's reported usage is the source
-            // of truth when present; the byte/4 heuristic is the fallback for
-            // providers that report none (`0` is measured, only `None` falls
-            // back). Mirrors the single-agent loop's per-turn accounting.
-            let request_tokens_in = request
-                .messages
-                .iter()
-                .map(|message| message.content.len() as u64)
-                .sum::<u64>()
-                .div_ceil(4);
-            let request_started = std::time::Instant::now();
-            let (text, reasoning, tool_calls, usage) = crate::prompts::complete_provider_request(
-                &self.planning_provider,
-                &request,
-                &self.retry_policy,
-                &self.bus,
-                task.session_id,
-                task.id,
-                cancel,
-            )
-            .await?; // provider-class errors classify at the decompose level
-                     // The decision loop's own model turns are real spend: record each
-                     // turn on the ledger (and the settled mirror) so a zero-dispatch
-                     // conversational close still carries provider metrics instead of
-                     // reporting tokens 0/0 with an empty metric list.
-            {
-                let measured_in = usage.as_ref().and_then(|u| u.prompt_tokens);
-                let measured_out = usage.as_ref().and_then(|u| u.completion_tokens);
-                let tool_chars = serde_json::to_string(&tool_calls)
-                    .map(|value| value.len() as u64)
-                    .unwrap_or_default();
-                let estimated_out = (text.len() as u64).saturating_add(tool_chars).div_ceil(4);
-                let tokens_in = measured_in.unwrap_or(request_tokens_in);
-                let tokens_out = measured_out.unwrap_or(estimated_out);
-                let cost = self.planning_provider.approximate_cost(tokens_in, tokens_out);
-                let settled = ProviderMetrics {
-                    provider: self.planning_provider.provider_name().to_owned(),
-                    model: model.clone(),
-                    tokens_in,
-                    tokens_out,
-                    cost_usd: cost,
-                    latency_ms: request_started.elapsed().as_millis() as u64,
-                };
-                ledger.provider_metrics.push(settled.clone());
-                self.settled_metrics.push(settled);
-                ledger.total_cost += cost;
-            }
+            // W3c: issue the per-turn provider request and record its provider
+            // metrics on the ledger in one ordered unit
+            // ([`Self::request_dispatch_turn`]).
+            let (text, reasoning, tool_calls) = self
+                .request_dispatch_turn(model.as_str(), &messages, &tool_defs, task, cancel, ledger)
+                .await?; // provider-class errors classify at the decompose level
 
             messages.push(Message {
                 role: Role::Assistant,
@@ -13075,6 +13036,83 @@ impl CoordinatorAgent {
         Ok((summary, advisory_plan))
     }
 
+    /// W3c (run_dispatch_session per-turn request): issue one dispatch-loop
+    /// provider completion and account its provider metrics on the ledger in
+    /// ONE ordered unit. The `complete_provider_request` await is immediately
+    /// followed by the settled-metric writes (ledger + settled mirror) with no
+    /// other ledger mutation interleaved, so extracting the unit preserves the
+    /// loop's ledger mutation order. Returns the model's text/reasoning/tool
+    /// calls; the caller keeps pushing the assistant message.
+    #[allow(clippy::too_many_arguments)]
+    async fn request_dispatch_turn(
+        &mut self,
+        model: &str,
+        messages: &[Message],
+        tool_defs: &[ToolDefinition],
+        task: &AgentTask,
+        cancel: &CancellationToken,
+        ledger: &mut DispatchLedger,
+    ) -> Result<(String, Option<String>, Vec<concerto_core::types::ToolCall>), OrchestratorError>
+    {
+        let request = CompletionRequest {
+            model: model.to_owned(),
+            messages: messages.to_vec(),
+            tools: (!tool_defs.is_empty()).then_some(tool_defs.to_vec()),
+            tool_choice: None,
+            temperature: Some(0.7),
+            max_tokens: Some(8192),
+            stream: false,
+        };
+        // ADR-48 §4: the planning provider's reported usage is the source
+        // of truth when present; the byte/4 heuristic is the fallback for
+        // providers that report none (`0` is measured, only `None` falls
+        // back). Mirrors the single-agent loop's per-turn accounting.
+        let request_tokens_in = request
+            .messages
+            .iter()
+            .map(|message| message.content.len() as u64)
+            .sum::<u64>()
+            .div_ceil(4);
+        let request_started = std::time::Instant::now();
+        let (text, reasoning, tool_calls, usage) = crate::prompts::complete_provider_request(
+            &self.planning_provider,
+            &request,
+            &self.retry_policy,
+            &self.bus,
+            task.session_id,
+            task.id,
+            cancel,
+        )
+        .await?; // provider-class errors classify at the decompose level
+                 // The decision loop's own model turns are real spend: record each
+                 // turn on the ledger (and the settled mirror) so a zero-dispatch
+                 // conversational close still carries provider metrics instead of
+                 // reporting tokens 0/0 with an empty metric list.
+        {
+            let measured_in = usage.as_ref().and_then(|u| u.prompt_tokens);
+            let measured_out = usage.as_ref().and_then(|u| u.completion_tokens);
+            let tool_chars = serde_json::to_string(&tool_calls)
+                .map(|value| value.len() as u64)
+                .unwrap_or_default();
+            let estimated_out = (text.len() as u64).saturating_add(tool_chars).div_ceil(4);
+            let tokens_in = measured_in.unwrap_or(request_tokens_in);
+            let tokens_out = measured_out.unwrap_or(estimated_out);
+            let cost = self.planning_provider.approximate_cost(tokens_in, tokens_out);
+            let settled = ProviderMetrics {
+                provider: self.planning_provider.provider_name().to_owned(),
+                model: model.to_owned(),
+                tokens_in,
+                tokens_out,
+                cost_usd: cost,
+                latency_ms: request_started.elapsed().as_millis() as u64,
+            };
+            ledger.provider_metrics.push(settled.clone());
+            self.settled_metrics.push(settled);
+            ledger.total_cost += cost;
+        }
+        Ok((text, reasoning, tool_calls))
+    }
+
     /// Same-role dispatch cap — the bound on the repeat-dispatch path beside
     /// the vacuous-completion and zero-work guards.
     ///
@@ -13506,13 +13544,6 @@ impl CoordinatorAgent {
             });
         };
 
-        // ── Policy gate (the SAME engine the shared executor enforces) ────
-        let Some(policy) = self.policy.clone() else {
-            return serde_json::json!({
-                "error": "policy_unavailable",
-                "message": "no policy engine is wired for this run; dispatch is denied",
-            });
-        };
         let action = PolicyAction {
             tool_name: CALL_SPECIALIST_TOOL,
             input: arguments,
@@ -13525,91 +13556,29 @@ impl CoordinatorAgent {
             orchestrator_authority: true,
             path_facts: None,
         };
-        match policy.evaluate(&action, cancel.clone()).await {
-            Ok(PolicyVerdict::Allow) => {}
-            // The coordinator loop carries no approval sink: a
-            // RequireApproval verdict is a denial here, mirroring the
-            // executor's requires-approval-no-sink semantics. Any non-`Allow`
-            // verdict (current or future) is likewise a denial.
-            Ok(_) => {
-                // Issue #60: a denied dispatch is a tool/permission
-                // compatibility miss for the requested specialist —
-                // recorded (derive-only history; spend is never scored).
-                self.suitability.record(
-                    agent_id.as_str(),
-                    suitability_class,
-                    crate::suitability::OutcomeKind::Denied,
-                    None,
-                    suitability_now,
-                    0,
-                );
-                // Run-history audit: never reached a specialist.
-                self.publish_dispatch_outcome(
-                    scope,
-                    subtask_id,
-                    &agent_id,
-                    false,
-                    "policy-denied",
-                    None,
-                );
-                return serde_json::json!({
-                    "error": "policy_denied",
-                    "message": "the run's policy denied this specialist dispatch",
-                });
-            }
-            Err(error) => {
-                if matches!(error, concerto_core::error::PolicyError::Cancelled)
-                    || cancel.is_cancelled()
-                {
-                    // Run-history audit: the stop landed before any
-                    // specialist call — an interrupt, not a failure.
-                    self.publish_dispatch_outcome(
-                        scope,
-                        subtask_id,
-                        &agent_id,
-                        false,
-                        "cancelled",
-                        Some(Self::cancelled_dispatch_reason(cancel, &error)),
-                    );
-                    return serde_json::json!({ "error": "cancelled" });
-                }
-                self.suitability.record(
-                    agent_id.as_str(),
-                    suitability_class,
-                    crate::suitability::OutcomeKind::Denied,
-                    None,
-                    suitability_now,
-                    0,
-                );
-                // Run-history audit: never reached a specialist; the reason
-                // carries the policy error text (sanitized on publish).
-                self.publish_dispatch_outcome(
-                    scope,
-                    subtask_id,
-                    &agent_id,
-                    false,
-                    "policy-denied",
-                    Some(error.to_string()),
-                );
-                return serde_json::json!({
-                    "error": "policy_denied",
-                    "message": format!("policy evaluation failed: {error}"),
-                });
-            }
-        }
-
-        // ── Evidence-backed Decision event (ADR-65 §6/§7) ──────────────────
-        let reason = args.notes.clone().unwrap_or_else(|| "coordinator_choice".to_owned());
-        let description = specialist_task_description(&args.task, args.notes.as_deref());
-        self.append_dispatch_decision(
-            task.session_id,
-            &agent_id,
-            &reason,
-            &args.task,
-            &args.supporting_evidence_ids,
-            Some(subtask_id),
-        )
-        .await;
+        // ── Policy gate + Decision journal (W3a): the single policy eval and
+        // the single whiteboard Decision append run as ONE ordered async unit
+        // ([`Self::gate_and_journal_dispatch`]), so the eval→append order is
+        // frozen in one body. A non-`Allow` verdict is a denial (the
+        // coordinator loop carries no approval sink).
+        let JournaledDispatch { decision_id, description } = match self
+            .gate_and_journal_dispatch(
+                &action,
+                cancel,
+                scope,
+                subtask_id,
+                &agent_id,
+                suitability_class,
+                suitability_now,
+                task.session_id,
+                &args,
+                decision_id,
+            )
+            .await
+        {
+            Ok(journaled) => journaled,
+            Err(error) => return error,
+        };
 
         // ── Materialize the SubTask node — the graph RECORDS the decision ──
         // An adopted declaration keeps its declared chain position (parent,
@@ -14184,6 +14153,126 @@ impl CoordinatorAgent {
             });
         }
         tool_result
+    }
+
+    /// W3a (handle_call_specialist P7+P8): run the dispatch policy gate and
+    /// journal the evidence-backed Decision in one ordered async unit. The
+    /// single `policy.evaluate` await precedes the single
+    /// `append_dispatch_decision` await — the eval→append order is frozen
+    /// here. The coordinator decision loop carries no approval sink, so a
+    /// non-`Allow` verdict (or an evaluation error) records the suitability
+    /// miss / run-history outcome and returns the structured tool error; on
+    /// `Allow` the appended Decision's `decision_id` is handed back so the
+    /// rest of the dispatch keeps citing the same decision. `args` supplies
+    /// the reason/description derived at the journal step, keeping that
+    /// derivation in place after the gate.
+    #[allow(clippy::too_many_arguments)]
+    async fn gate_and_journal_dispatch(
+        &mut self,
+        action: &PolicyAction<'_>,
+        cancel: &CancellationToken,
+        scope: &checkpoint::CheckpointScope,
+        subtask_id: TaskId,
+        agent_id: &AgentId,
+        suitability_class: crate::suitability::TaskClass,
+        suitability_now: time::OffsetDateTime,
+        session_id: Ulid,
+        args: &CallSpecialistArgs,
+        decision_id: String,
+    ) -> Result<JournaledDispatch, serde_json::Value> {
+        // ── Policy gate (the SAME engine the shared executor enforces) ────
+        let Some(policy) = self.policy.clone() else {
+            return Err(serde_json::json!({
+                "error": "policy_unavailable",
+                "message": "no policy engine is wired for this run; dispatch is denied",
+            }));
+        };
+        match policy.evaluate(action, cancel.clone()).await {
+            Ok(PolicyVerdict::Allow) => {}
+            // The coordinator loop carries no approval sink: a
+            // RequireApproval verdict is a denial here, mirroring the
+            // executor's requires-approval-no-sink semantics. Any non-`Allow`
+            // verdict (current or future) is likewise a denial.
+            Ok(_) => {
+                // Issue #60: a denied dispatch is a tool/permission
+                // compatibility miss for the requested specialist —
+                // recorded (derive-only history; spend is never scored).
+                self.suitability.record(
+                    agent_id.as_str(),
+                    suitability_class,
+                    crate::suitability::OutcomeKind::Denied,
+                    None,
+                    suitability_now,
+                    0,
+                );
+                // Run-history audit: never reached a specialist.
+                self.publish_dispatch_outcome(
+                    scope,
+                    subtask_id,
+                    agent_id,
+                    false,
+                    "policy-denied",
+                    None,
+                );
+                return Err(serde_json::json!({
+                    "error": "policy_denied",
+                    "message": "the run's policy denied this specialist dispatch",
+                }));
+            }
+            Err(error) => {
+                if matches!(error, concerto_core::error::PolicyError::Cancelled)
+                    || cancel.is_cancelled()
+                {
+                    // Run-history audit: the stop landed before any
+                    // specialist call — an interrupt, not a failure.
+                    self.publish_dispatch_outcome(
+                        scope,
+                        subtask_id,
+                        agent_id,
+                        false,
+                        "cancelled",
+                        Some(Self::cancelled_dispatch_reason(cancel, &error)),
+                    );
+                    return Err(serde_json::json!({ "error": "cancelled" }));
+                }
+                self.suitability.record(
+                    agent_id.as_str(),
+                    suitability_class,
+                    crate::suitability::OutcomeKind::Denied,
+                    None,
+                    suitability_now,
+                    0,
+                );
+                // Run-history audit: never reached a specialist; the reason
+                // carries the policy error text (sanitized on publish).
+                self.publish_dispatch_outcome(
+                    scope,
+                    subtask_id,
+                    agent_id,
+                    false,
+                    "policy-denied",
+                    Some(error.to_string()),
+                );
+                return Err(serde_json::json!({
+                    "error": "policy_denied",
+                    "message": format!("policy evaluation failed: {error}"),
+                }));
+            }
+        }
+
+        // ── Evidence-backed Decision event (ADR-65 §6/§7) ──────────────────
+        let reason = args.notes.clone().unwrap_or_else(|| "coordinator_choice".to_owned());
+        let description = specialist_task_description(&args.task, args.notes.as_deref());
+        self.append_dispatch_decision(
+            session_id,
+            agent_id,
+            &reason,
+            &args.task,
+            &args.supporting_evidence_ids,
+            Some(subtask_id),
+        )
+        .await;
+        Ok(JournaledDispatch { decision_id, description })
     }
 
     /// Issue #61: the whiteboard `Decision` record for a mediated ownership
