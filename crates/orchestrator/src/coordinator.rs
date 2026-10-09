@@ -3814,6 +3814,20 @@ struct JournaledDispatch {
     description: String,
 }
 
+/// W3i: the per-hypothesis record built during
+/// [`CoordinatorAgent::handle_investigate_hypotheses`] validation and consumed
+/// by the batch gate+journal step and the concurrent execution futures.
+/// Carries all owned data needed for both.
+struct PerHypothesisRecord {
+    hypothesis_id: String,
+    agent_id: AgentId,
+    question: String,
+    notes: Option<String>,
+    cited_ids: Vec<String>,
+    effort_cap: u32,
+    decision_id: String,
+}
+
 impl CoordinatorAgent {
     /// Create a new coordinator with all required subsystems.
     pub fn new(
@@ -14952,20 +14966,7 @@ impl CoordinatorAgent {
         ledger: &mut DispatchLedger,
         arguments: &serde_json::Value,
     ) -> serde_json::Value {
-        // ── Local types ──────────────────────────────────────────────────
-        // Per-hypothesis record built during validation and consumed during
-        // future construction. Carries all owned data needed for the
-        // concurrent execution future and the sequential settle phase.
-        struct PerHypothesisRecord {
-            hypothesis_id: String,
-            agent_id: AgentId,
-            question: String,
-            notes: Option<String>,
-            cited_ids: Vec<String>,
-            effort_cap: u32,
-            decision_id: String,
-        }
-
+        // ── Local type ───────────────────────────────────────────────────
         /// Result of one hypothesis execution future, consumed during settle.
         struct PerHypothesisResult {
             hypothesis_id: String,
@@ -15042,123 +15043,26 @@ impl CoordinatorAgent {
             });
         }
 
-        // ── 3b. Batch-level Investigate decision (journal) ────────────────
-        // One Investigate-kind decision covers the whole batch; the
-        // per-hypothesis Consult decisions carry the detail. Validated like
-        // any decision against the same roster + evidence sets used above
-        // (every cited id was already proven real — a missing id rejects the
-        // whole batch before this point).
-        let batch_evidence: Vec<String> = per_hyp
-            .iter()
-            .flat_map(|h| h.cited_ids.iter().cloned())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-        let known_ids: std::collections::HashSet<String> =
-            per_hyp.iter().flat_map(|h| h.cited_ids.iter().cloned()).collect();
-        let batch_task_text = {
-            let ids: Vec<&str> = per_hyp.iter().map(|h| h.hypothesis_id.as_str()).collect();
-            format!(
-                "speculative investigation across hypotheses [{}]; each runs \
-                 bounded read-only consultation under a distinct question",
-                ids.join(", "),
+        // ── 3b–5. Batch gate + journal (W3i) ─────────────────────────────
+        // Ordered batch `Investigate` decision journal (3b), single batch
+        // policy gate (4), and batch/per-hypothesis `Dispatched` journal
+        // transitions + consultative Decision events (5). The
+        // eval → journal → event order is frozen inside the helper.
+        let (batch_decision_id, policy) = match self
+            .gate_and_journal_investigate_hypotheses(
+                task,
+                base_ctx,
+                cancel,
+                arguments,
+                &roster_ids,
+                &per_hyp,
+                total_effort,
             )
+            .await
+        {
+            Ok(pair) => pair,
+            Err(value) => return value,
         };
-        let batch_reason = "coordinator_speculative_investigation".to_owned();
-        let validator = crate::decisions::DecisionValidator {
-            roster_ids: &roster_ids,
-            known_event_ids: &known_ids,
-            project_root: Some(base_ctx.session.project_dir.as_path()),
-        };
-        let mut batch_decision = match validator.validate(
-            crate::decisions::DecisionKind::Investigate,
-            None,
-            &batch_task_text,
-            Some(&batch_reason),
-            &batch_evidence,
-            &[],
-        ) {
-            Ok(decision) => decision,
-            Err(rejection) => return rejection.tool_value(),
-        };
-        // The summed effort ceiling rides the journaled batch decision
-        // (additive field), mirroring how each hypothesis' own cap rides its
-        // consult decision.
-        batch_decision.max_tool_calls = Some(total_effort);
-        let batch_decision_id = batch_decision.id.clone();
-        self.decision_journal.record(batch_decision);
-
-        // ── 4. Policy gate (SINGLE evaluation for the batch) ─────────────
-        let Some(policy) = self.policy.clone() else {
-            return serde_json::json!({
-                "error": "policy_unavailable",
-                "message": "no policy engine is wired for this run; speculative investigation is denied",
-            });
-        };
-        let action = PolicyAction {
-            tool_name: INVESTIGATE_HYPOTHESES_TOOL,
-            input: arguments,
-            session_id: task.session_id,
-            correlation_id: concerto_core::ids::new_id(),
-            capability_requirements: concerto_core::types::CapabilitySet::default(),
-            sandbox_profile: None,
-            estimated_cost_usd: None,
-            command_facts: None,
-            orchestrator_authority: false,
-            path_facts: None,
-        };
-        match policy.evaluate(&action, cancel.clone()).await {
-            Ok(PolicyVerdict::Allow) => {}
-            Ok(_) => {
-                return serde_json::json!({
-                    "error": "policy_denied",
-                    "message": "the run's policy denied this speculative investigation",
-                });
-            }
-            Err(error) => {
-                if matches!(error, concerto_core::error::PolicyError::Cancelled)
-                    || cancel.is_cancelled()
-                {
-                    return serde_json::json!({ "error": "cancelled" });
-                }
-                return serde_json::json!({
-                    "error": "policy_denied",
-                    "message": format!("policy evaluation failed: {error}"),
-                });
-            }
-        }
-
-        // ── 5. Batch Investigate decision → Dispatched + event ──────────
-        //    The batch decision was journaled (Validated) at step 3b; the
-        //    whiteboard event names the batch; per-hypothesis consultative
-        //    Decision events carry the attribution detail.
-        self.decision_journal
-            .transition(&batch_decision_id, crate::decisions::DecisionStatus::Dispatched);
-        self.append_consult_decision(
-            task.session_id,
-            &AgentId::new("coordinator"),
-            &batch_task_text,
-            &batch_reason,
-            &batch_evidence,
-            None,
-        )
-        .await;
-        // Per-hypothesis consultative Decision events (attribution via
-        // hypothesis_id in the payload).
-        for h in &per_hyp {
-            let reason = h.notes.clone().unwrap_or_else(|| "coordinator_consultation".to_owned());
-            self.append_consult_decision(
-                task.session_id,
-                &h.agent_id,
-                &h.question,
-                &reason,
-                &h.cited_ids,
-                Some(&h.hypothesis_id),
-            )
-            .await;
-            self.decision_journal
-                .transition(&h.decision_id, crate::decisions::DecisionStatus::Dispatched);
-        }
 
         // ── 6. Pre-spawn cancellation check ──────────────────────────────
         if cancel.is_cancelled() {
@@ -15366,6 +15270,148 @@ impl CoordinatorAgent {
             result["cancelled"] = serde_json::json!(true);
         }
         result
+    }
+
+    /// W3i: the ordered `gate + journal` step of
+    /// [`Self::handle_investigate_hypotheses`] — the batch `Investigate`
+    /// decision journal (3b), the single batch policy gate (4), and the
+    /// batch/per-hypothesis `Dispatched` journal transitions + consultative
+    /// Decision events (5). The eval → journal → event order is frozen here.
+    ///
+    /// Returns the batch decision id and the resolved policy engine on
+    /// success (the caller reuses the same `Arc` for the concurrent
+    /// hypothesis futures), or the structured tool value to return early
+    /// (validation rejection / policy denial / cancellation).
+    #[allow(clippy::too_many_arguments)]
+    async fn gate_and_journal_investigate_hypotheses(
+        &mut self,
+        task: &AgentTask,
+        base_ctx: &AgentContext,
+        cancel: &CancellationToken,
+        arguments: &serde_json::Value,
+        roster_ids: &HashSet<String>,
+        per_hyp: &[PerHypothesisRecord],
+        total_effort: u32,
+    ) -> Result<(String, Arc<dyn PolicyEngine>), serde_json::Value> {
+        // ── 3b. Batch-level Investigate decision (journal) ────────────────
+        // One Investigate-kind decision covers the whole batch; the
+        // per-hypothesis Consult decisions carry the detail. Validated like
+        // any decision against the same roster + evidence sets used above
+        // (every cited id was already proven real — a missing id rejects the
+        // whole batch before this point).
+        let batch_evidence: Vec<String> = per_hyp
+            .iter()
+            .flat_map(|h| h.cited_ids.iter().cloned())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        let known_ids: std::collections::HashSet<String> =
+            per_hyp.iter().flat_map(|h| h.cited_ids.iter().cloned()).collect();
+        let batch_task_text = {
+            let ids: Vec<&str> = per_hyp.iter().map(|h| h.hypothesis_id.as_str()).collect();
+            format!(
+                "speculative investigation across hypotheses [{}]; each runs \
+                 bounded read-only consultation under a distinct question",
+                ids.join(", "),
+            )
+        };
+        let batch_reason = "coordinator_speculative_investigation".to_owned();
+        let validator = crate::decisions::DecisionValidator {
+            roster_ids,
+            known_event_ids: &known_ids,
+            project_root: Some(base_ctx.session.project_dir.as_path()),
+        };
+        let mut batch_decision = match validator.validate(
+            crate::decisions::DecisionKind::Investigate,
+            None,
+            &batch_task_text,
+            Some(&batch_reason),
+            &batch_evidence,
+            &[],
+        ) {
+            Ok(decision) => decision,
+            Err(rejection) => return Err(rejection.tool_value()),
+        };
+        // The summed effort ceiling rides the journaled batch decision
+        // (additive field), mirroring how each hypothesis' own cap rides its
+        // consult decision.
+        batch_decision.max_tool_calls = Some(total_effort);
+        let batch_decision_id = batch_decision.id.clone();
+        self.decision_journal.record(batch_decision);
+
+        // ── 4. Policy gate (SINGLE evaluation for the batch) ─────────────
+        let Some(policy) = self.policy.clone() else {
+            return Err(serde_json::json!({
+                "error": "policy_unavailable",
+                "message": "no policy engine is wired for this run; speculative investigation is denied",
+            }));
+        };
+        let action = PolicyAction {
+            tool_name: INVESTIGATE_HYPOTHESES_TOOL,
+            input: arguments,
+            session_id: task.session_id,
+            correlation_id: concerto_core::ids::new_id(),
+            capability_requirements: concerto_core::types::CapabilitySet::default(),
+            sandbox_profile: None,
+            estimated_cost_usd: None,
+            command_facts: None,
+            orchestrator_authority: false,
+            path_facts: None,
+        };
+        match policy.evaluate(&action, cancel.clone()).await {
+            Ok(PolicyVerdict::Allow) => {}
+            Ok(_) => {
+                return Err(serde_json::json!({
+                    "error": "policy_denied",
+                    "message": "the run's policy denied this speculative investigation",
+                }));
+            }
+            Err(error) => {
+                if matches!(error, concerto_core::error::PolicyError::Cancelled)
+                    || cancel.is_cancelled()
+                {
+                    return Err(serde_json::json!({ "error": "cancelled" }));
+                }
+                return Err(serde_json::json!({
+                    "error": "policy_denied",
+                    "message": format!("policy evaluation failed: {error}"),
+                }));
+            }
+        }
+
+        // ── 5. Batch Investigate decision → Dispatched + event ──────────
+        //    The batch decision was journaled (Validated) at step 3b; the
+        //    whiteboard event names the batch; per-hypothesis consultative
+        //    Decision events carry the attribution detail.
+        self.decision_journal
+            .transition(&batch_decision_id, crate::decisions::DecisionStatus::Dispatched);
+        self.append_consult_decision(
+            task.session_id,
+            &AgentId::new("coordinator"),
+            &batch_task_text,
+            &batch_reason,
+            &batch_evidence,
+            None,
+        )
+        .await;
+        // Per-hypothesis consultative Decision events (attribution via
+        // hypothesis_id in the payload).
+        for h in per_hyp {
+            let reason = h.notes.clone().unwrap_or_else(|| "coordinator_consultation".to_owned());
+            self.append_consult_decision(
+                task.session_id,
+                &h.agent_id,
+                &h.question,
+                &reason,
+                &h.cited_ids,
+                Some(&h.hypothesis_id),
+            )
+            .await;
+            self.decision_journal
+                .transition(&h.decision_id, crate::decisions::DecisionStatus::Dispatched);
+        }
+
+        Ok((batch_decision_id, policy))
     }
 
     /// Issue #57: the decision-validation preamble shared by the split/merge

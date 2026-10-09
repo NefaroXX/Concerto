@@ -317,6 +317,59 @@ fn resolve_role_provider_config<'a>(
     custom_agent_provider(settings, agent_configs, role, model).unwrap_or(default_provider_config)
 }
 
+/// Resolve the run's default provider configuration and model using the
+/// model-first strategy:
+///
+/// 1. Explicit provider ID → find that config.
+/// 2. Explicit model name → find the provider that offers it.
+/// 3. `global_default_model` → find the matching provider.
+/// 4. First configured provider.
+///
+/// Pure config lookup (no IO, no awaits). The caller owns the empty-model
+/// recorder-stop/early-return, so the resolved model is returned verbatim
+/// even when empty.
+fn resolve_default_provider<'a>(
+    req: &'a AgentRunRequest,
+    settings: &'a concerto_config::ModelSettings,
+) -> Result<(&'a concerto_config::ProviderConfig, &'a str), OrchestratorError> {
+    let requested_provider_id = non_empty(req.selected_provider_id.as_deref());
+    let default_provider_config = if let Some(id) = requested_provider_id {
+        settings
+            .providers
+            .iter()
+            .find(|config| ProviderFactory::config_id(config) == id)
+            .ok_or_else(|| {
+                OrchestratorError::AgentLoopError(format!(
+                    "selected provider configuration '{id}' no longer exists"
+                ))
+            })?
+    } else if let Some(model) =
+        non_empty(req.selected_model.as_deref()).filter(|m| !m.trim().is_empty())
+    {
+        ProviderFactory::config_for_model(settings, model, None).ok_or_else(|| {
+            OrchestratorError::AgentLoopError(format!(
+                "no configured provider offers model '{model}'"
+            ))
+        })?
+    } else if let Some(model) =
+        non_empty(settings.global_default_model.as_deref()).filter(|m| !m.trim().is_empty())
+    {
+        ProviderFactory::config_for_model(settings, model, None).ok_or_else(|| {
+            OrchestratorError::AgentLoopError(format!(
+                "no configured provider offers global default model '{model}'"
+            ))
+        })?
+    } else {
+        settings.providers.first().ok_or_else(|| {
+            OrchestratorError::AgentLoopError("no providers configured in model_settings".into())
+        })?
+    };
+    let default_model = non_empty(req.selected_model.as_deref())
+        .or_else(|| non_empty(settings.global_default_model.as_deref()))
+        .unwrap_or(default_provider_config.model.trim());
+    Ok((default_provider_config, default_model))
+}
+
 /// The coordinator's model.
 ///
 /// The coordinator is hardcoded (maintainer decision 2026-09) and always
@@ -364,6 +417,80 @@ fn topology_roles(multi_agent: &Option<concerto_config::MultiAgentConfig>) -> Ve
 }
 
 const COORDINATOR_ONLY_ROLES: [&str; 1] = ["coordinator"];
+
+/// ADR-35 phase 4 / ADR-58 P2+P3 (Batch 1): assemble the run's role topology,
+/// per-agent config map, and resolved blueprint facade.
+///
+/// Pure data assembly — no IO, no awaits. Returns the roles needing
+/// provider/model resolution, the optional blueprint facade, the
+/// (facade-staffed) agent-config map, and the tool-calling role set derived
+/// from it.
+fn build_role_topology(
+    multi_agent: &Option<concerto_config::MultiAgentConfig>,
+    resolved_blueprint: Option<&concerto_config::ResolvedBlueprint>,
+    action_capable: bool,
+) -> (
+    Vec<AgentId>,
+    Option<BlueprintFacade>,
+    HashMap<AgentId, concerto_config::CustomAgentConfig>,
+    std::collections::HashSet<AgentId>,
+) {
+    // ADR-35 phase 4: the roles needing provider/model resolution mirror the
+    // runtime topology (coordinator + built-ins not disabled + enabled custom
+    // agents) instead of a hardcoded role list. The shape follows the intent
+    // gate's effective outcome (ADR-55 §7): Execute runs use the full
+    // topology, everything else resolves only the coordinator.
+    let roles_to_resolve: Vec<AgentId> = if action_capable {
+        topology_roles(multi_agent)
+    } else {
+        COORDINATOR_ONLY_ROLES.iter().map(|name| AgentId::new(*name)).collect()
+    };
+    // ADR-58 P2+P3 (Batch 1): the resolved blueprint attached at load is the
+    // lifecycle-stage authority (design doc §1.2/§2). Derive the per-agent
+    // stage and the tool-calling role set from it at the same construction
+    // seam the registry consumes the agent configs. On the default `standard`
+    // blueprint the derived stages equal the built-in seed stages and the
+    // tool-calling set equals the legacy classification (Batch 1 pinned it;
+    // R5/F1 deleted the standalone `tool_calling_roles_for` — the facade
+    // method is the single implementation, preserving the full legacy
+    // disjunction, design doc §4 Q5). Roles the blueprint does not staff
+    // keep their config stage (Freeform/run_once semantics, ADR-58 D2).
+    let facade = resolved_blueprint.map(BlueprintFacade::new);
+
+    // The tool-calling role set handed to the routing engine mirrors the same
+    // topology. Derived before `roles_to_resolve` is consumed by the
+    // resolution loop below.
+    let mut agent_configs: HashMap<AgentId, concerto_config::CustomAgentConfig> =
+        build_agent_config_map(multi_agent);
+    if let Some(facade) = facade.as_ref() {
+        for (id, cfg) in agent_configs.iter_mut() {
+            // Blueprint staffing fills in the stage of roles whose config
+            // leaves it unset (the same gap the registry's seed merge covers
+            // today): the resolved blueprint's `def.agents` is the
+            // post-ADR-58 authority for which stage a role participates in.
+            // Explicit config stages — including deliberate Freeform/run_once
+            // retags of staffed built-ins — keep winning, so the default
+            // path is byte-identical (every seed's declared stage already
+            // equals the standard blueprint's staffing).
+            if cfg.stage.is_none() {
+                if let Some(stage) = facade.stage_for_agent(id) {
+                    cfg.stage = Some(AgentStage::new(&stage.def.tag));
+                }
+            }
+        }
+    }
+    let tool_calling_roles = match &facade {
+        Some(facade) => facade.tool_calling_roles(&roles_to_resolve, &agent_configs),
+        // ADR-58 P2+P3 (R5/F1): the legacy `tool_calling_roles_for` route is
+        // deleted. `resolved_blueprint` is attached on every load path
+        // (config/lib.rs `validate_config`), so this branch is unreachable
+        // for runtime-built configs; an artificially facade-less config would
+        // route with no tool-calling roles rather than regress to the deleted
+        // classification.
+        None => Default::default(),
+    };
+    (roles_to_resolve, facade, agent_configs, tool_calling_roles)
+}
 
 fn non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
@@ -2621,47 +2748,8 @@ async fn run_multi_agent(
         ));
     }
 
-    let requested_provider_id = non_empty(req.selected_provider_id.as_deref());
-
-    // Resolve the default provider using model-first strategy:
-    //   1. Explicit provider ID → find that config.
-    //   2. Explicit model name → find the provider that offers it.
-    //   3. `global_default_model` → find the matching provider.
-    //   4. First configured provider.
-    let default_provider_config = if let Some(id) = requested_provider_id {
-        settings
-            .providers
-            .iter()
-            .find(|config| ProviderFactory::config_id(config) == id)
-            .ok_or_else(|| {
-                OrchestratorError::AgentLoopError(format!(
-                    "selected provider configuration '{id}' no longer exists"
-                ))
-            })?
-    } else if let Some(model) =
-        non_empty(req.selected_model.as_deref()).filter(|m| !m.trim().is_empty())
-    {
-        ProviderFactory::config_for_model(settings, model, None).ok_or_else(|| {
-            OrchestratorError::AgentLoopError(format!(
-                "no configured provider offers model '{model}'"
-            ))
-        })?
-    } else if let Some(model) =
-        non_empty(settings.global_default_model.as_deref()).filter(|m| !m.trim().is_empty())
-    {
-        ProviderFactory::config_for_model(settings, model, None).ok_or_else(|| {
-            OrchestratorError::AgentLoopError(format!(
-                "no configured provider offers global default model '{model}'"
-            ))
-        })?
-    } else {
-        settings.providers.first().ok_or_else(|| {
-            OrchestratorError::AgentLoopError("no providers configured in model_settings".into())
-        })?
-    };
-    let default_model = non_empty(req.selected_model.as_deref())
-        .or_else(|| non_empty(settings.global_default_model.as_deref()))
-        .unwrap_or(default_provider_config.model.trim());
+    // Resolve the default provider using model-first strategy (W3f).
+    let (default_provider_config, default_model) = resolve_default_provider(req, settings)?;
     if default_model.is_empty() {
         event_recorder.stop().await;
         transcript_recorder.stop().await;
@@ -2705,60 +2793,12 @@ async fn run_multi_agent(
     let mut provider_pins = std::collections::HashMap::new();
     let mut profiles = Vec::new();
 
-    // ADR-35 phase 4: the roles needing provider/model resolution mirror the
-    // runtime topology (coordinator + built-ins not disabled + enabled custom
-    // agents) instead of a hardcoded role list. The shape follows the intent
-    // gate's effective outcome (ADR-55 §7): Execute runs use the full
-    // topology, everything else resolves only the coordinator.
-    let roles_to_resolve: Vec<AgentId> = if action_capable {
-        topology_roles(&services.config.multi_agent)
-    } else {
-        COORDINATOR_ONLY_ROLES.iter().map(|name| AgentId::new(*name)).collect()
-    };
-    // ADR-58 P2+P3 (Batch 1): the resolved blueprint attached at load is the
-    // lifecycle-stage authority (design doc §1.2/§2). Derive the per-agent
-    // stage and the tool-calling role set from it at the same construction
-    // seam the registry consumes the agent configs. On the default `standard`
-    // blueprint the derived stages equal the built-in seed stages and the
-    // tool-calling set equals the legacy classification (Batch 1 pinned it;
-    // R5/F1 deleted the standalone `tool_calling_roles_for` — the facade
-    // method is the single implementation, preserving the full legacy
-    // disjunction, design doc §4 Q5). Roles the blueprint does not staff
-    // keep their config stage (Freeform/run_once semantics, ADR-58 D2).
-    let facade = services.config.resolved_blueprint.as_deref().map(BlueprintFacade::new);
-
-    // The tool-calling role set handed to the routing engine mirrors the same
-    // topology. Derived before `roles_to_resolve` is consumed by the
-    // resolution loop below.
-    let mut agent_configs: HashMap<AgentId, concerto_config::CustomAgentConfig> =
-        build_agent_config_map(&services.config.multi_agent);
-    if let Some(facade) = facade.as_ref() {
-        for (id, cfg) in agent_configs.iter_mut() {
-            // Blueprint staffing fills in the stage of roles whose config
-            // leaves it unset (the same gap the registry's seed merge covers
-            // today): the resolved blueprint's `def.agents` is the
-            // post-ADR-58 authority for which stage a role participates in.
-            // Explicit config stages — including deliberate Freeform/run_once
-            // retags of staffed built-ins — keep winning, so the default
-            // path is byte-identical (every seed's declared stage already
-            // equals the standard blueprint's staffing).
-            if cfg.stage.is_none() {
-                if let Some(stage) = facade.stage_for_agent(id) {
-                    cfg.stage = Some(AgentStage::new(&stage.def.tag));
-                }
-            }
-        }
-    }
-    let tool_calling_roles = match &facade {
-        Some(facade) => facade.tool_calling_roles(&roles_to_resolve, &agent_configs),
-        // ADR-58 P2+P3 (R5/F1): the legacy `tool_calling_roles_for` route is
-        // deleted. `resolved_blueprint` is attached on every load path
-        // (config/lib.rs `validate_config`), so this branch is unreachable
-        // for runtime-built configs; an artificially facade-less config would
-        // route with no tool-calling roles rather than regress to the deleted
-        // classification.
-        None => Default::default(),
-    };
+    // Role topology, per-agent config map, and blueprint facade (W3g).
+    let (roles_to_resolve, facade, agent_configs, tool_calling_roles) = build_role_topology(
+        &services.config.multi_agent,
+        services.config.resolved_blueprint.as_deref(),
+        action_capable,
+    );
     for role in roles_to_resolve {
         // When an agent assignment references a provider that no longer
         // exists, silently fall back to the global default instead of
