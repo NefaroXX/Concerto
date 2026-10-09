@@ -13,7 +13,6 @@
 //! | `MAX_TIMELINE_ENTRIES` | 30 | Matches `MAX_TASKS` (24) + planning overhead |
 //! | `MAX_ACTIVE_FILES` | 12 | Matches `MAX_PREVIOUS_RESULTS` (8) × 1.5 |
 //! | `MAX_ENTRY_CHARS` | 400 | Half of `MAX_DETAIL_CHARS` (800) for balance |
-//! | `MAX_OBSERVATION_SEQ` | 200 | Cap on served observation sequence length |
 
 use concerto_core::types::{
     CapsuleFileEntry, CapsulePendingTask, SubTaskStatus, TaskId, WorkspaceCapsule,
@@ -34,11 +33,6 @@ pub(crate) const MAX_ACTIVE_FILES: usize = 12;
 
 /// Maximum characters per entry description.
 pub(crate) const MAX_ENTRY_CHARS: usize = 400;
-
-/// Maximum observation sequence length served in the capsule.
-/// Reserved for Phase 7 observation sequences; currently unused.
-#[allow(dead_code)]
-pub(crate) const MAX_OBSERVATION_SEQ: usize = 200;
 
 /// Total character budget for the formatted capsule block.
 pub(crate) const MAX_CAPSULE_CHARS: usize = 4_000;

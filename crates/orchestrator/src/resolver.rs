@@ -232,16 +232,13 @@ fn find_matching_record<'a>(
                 semantic_key_hex,
                 summary,
                 files_modified,
-                content_hash,
                 recorded_inputs,
                 gate_seq,
                 ..
             } if !semantic_key_hex.is_empty() && semantic_key_hex == target_hex => {
                 Some(CompletedRecord {
-                    semantic_key_hex,
                     summary,
                     files_modified,
-                    content_hash,
                     recorded_inputs,
                     gate_seq: *gate_seq,
                 })
@@ -254,17 +251,11 @@ fn find_matching_record<'a>(
 /// Borrowed view of a matched completion record.  Extracted from the
 /// timeline event so the comparison logic does not repeat the match.
 struct CompletedRecord<'a> {
-    /// Retained for Phase 5 capsules (context enrichment).
-    #[allow(dead_code)]
-    semantic_key_hex: &'a str,
     summary: &'a str,
     /// The files the completing run reported writing. Artifact evidence for
     /// the completeness judgement — a contract naming files must be backed
     /// by this list or by `WroteFile` events.
     files_modified: &'a [camino::Utf8PathBuf],
-    /// Retained for Phase 5 capsules (deliverable hashing).
-    #[allow(dead_code)]
-    content_hash: &'a str,
     recorded_inputs: &'a [ArtifactFingerprint],
     /// The `gate_seq` of the completion — scopes `WroteFile` evidence to
     /// writes that happened AT OR BEFORE this completion (a file written by

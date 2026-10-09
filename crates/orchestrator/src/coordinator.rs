@@ -11334,18 +11334,6 @@ impl CoordinatorAgent {
         }
     }
 
-    // ── relationship summary ────────────────────────────────────────────
-
-    /// Build a human-readable summary of the current collaboration rules.
-    pub fn relationship_summary(&self) -> String {
-        self.relationships
-            .rules()
-            .iter()
-            .map(|r| format!("{:?} {:?} {:?}", r.from, r.relationship, r.to))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
     // ── task decomposition — the Coordinator decides (ADR-35 amendment
     //    2026-09-05) ──────────────────────────────────────────────────────
 
