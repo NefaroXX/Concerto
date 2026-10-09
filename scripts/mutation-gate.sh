@@ -909,6 +909,49 @@ def as_int(value, default=0):
         return default
 
 
+# Individual mutant evidence lives in outcomes.json's `outcomes` entries, each
+# carrying its own `summary`; cargo-mutants 27.1.0 writes these variant names
+# (verified against real artifacts: mutants.json lists the discovered mutants
+# and holds no summary field of its own).
+SUMMARY_TO_KEY = {
+    "CaughtMutant": "caught",
+    "MissedMutant": "missed",
+    "Timeout": "timeout",
+    "Unviable": "unviable",
+}
+KNOWN_SUMMARIES = frozenset(SUMMARY_TO_KEY) | {"Success", "Failure"}
+
+
+def recount_individuals(outcomes):
+    """Recount one run from outcomes.json's individual summaries.
+
+    Returns {"counts": {...}, "mutants": <n mutant entries>} or None when the
+    individuals are unreadable, so callers fail closed on a torn artifact pair
+    instead of trusting aggregate counters that contradict the evidence.
+    """
+    entries = outcomes.get("outcomes")
+    if not isinstance(entries, list):
+        return None
+    counts = {"caught": 0, "missed": 0, "timeout": 0, "unviable": 0}
+    mutants = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return None
+        scenario = entry.get("scenario")
+        if scenario == "Baseline":
+            continue
+        if not isinstance(scenario, dict) or "Mutant" not in scenario:
+            return None
+        summary = entry.get("summary")
+        if not isinstance(summary, str) or summary not in KNOWN_SUMMARIES:
+            return None
+        mutants += 1
+        key = SUMMARY_TO_KEY.get(summary)
+        if key is not None:
+            counts[key] += 1
+    return {"counts": counts, "mutants": mutants}
+
+
 def field(directory, name, default=""):
     try:
         return (directory / name).read_text(encoding="utf-8", errors="replace").strip()
@@ -956,8 +999,20 @@ for directory in sorted(gate.glob("run-*")):
             isinstance(outcomes.get(key), int)
             for key in ("caught", "missed", "timeout", "unviable")
         ):
-            counts = {key: int(outcomes[key]) for key in ("caught", "missed", "timeout", "unviable")}
-            ok = isinstance(mutants, list)
+            aggregate = {key: int(outcomes[key]) for key in ("caught", "missed", "timeout", "unviable")}
+            # Fail closed unless the aggregate counters, the individual
+            # summaries and the mutants.json mutant list all agree — a torn
+            # artifact pair must never be read as a pass.
+            individual = recount_individuals(outcomes)
+            reconciled = (
+                individual is not None
+                and individual["counts"] == aggregate
+                and isinstance(mutants, list)
+                and individual["mutants"] == len(mutants)
+            )
+            if reconciled:
+                counts = aggregate
+                ok = True
         elif isinstance(mutants, list) and len(mutants) == 0 and not outcomes_present:
             counts = {"caught": 0, "missed": 0, "timeout": 0, "unviable": 0}
             ok = True
