@@ -946,7 +946,7 @@ impl State {
     /// accounts for the trailing save footer and biases the jump slightly high,
     /// so the target section's expanded body (which grows downward) stays
     /// visible.
-    fn scroll_to_section(section: SectionId) -> iced::Task<Message> {
+    pub(super) fn scroll_to_section(section: SectionId) -> iced::Task<Message> {
         let Some(index) = SectionId::ALL.iter().position(|candidate| *candidate == section) else {
             return iced::Task::none();
         };
@@ -971,16 +971,14 @@ impl State {
 
     pub fn update(&mut self, message: Message) -> iced::Task<Message> {
         match message {
-            Message::ThemeSelected(name) => self.selected_theme = name,
-            Message::FontSizeChanged(size) => self.font_size = size.clamp(12.0, 20.0),
-            Message::ReducedMotionToggled(reduced) => {
-                self.settings_dirty = true;
-                self.reduced_motion = reduced;
-            }
-            Message::ScanlineOverlayToggled(enabled) => {
-                self.settings_dirty = true;
-                self.scanline_overlay_enabled = enabled;
-            }
+            // Theme / display. Pure relocation (NORM S36): the four
+            // `ThemeSelected`, `FontSizeChanged`, `ReducedMotionToggled`, and
+            // `ScanlineOverlayToggled` arms now live in the sibling
+            // `update_misc` submodule as `update_theme`.
+            message @ (Message::ThemeSelected(_)
+            | Message::FontSizeChanged(_)
+            | Message::ReducedMotionToggled(_)
+            | Message::ScanlineOverlayToggled(_)) => self.update_theme(message),
 
             // Providers. Pure relocation (NORM S33): the 25 legacy provider,
             // multi-provider, `Form*`, model-discovery, and global-default-model
@@ -1012,80 +1010,18 @@ impl State {
             | Message::FormCancel
             | Message::ProviderModelsRefreshRequested(_)
             | Message::ProviderModelsRefreshed { .. }
-            | Message::GlobalDefaultModelChanged(_)) => return self.update_providers(message),
+            | Message::GlobalDefaultModelChanged(_)) => self.update_providers(message),
 
-            // Policy / relationships / memory are persisted on explicit Save Settings.
-            Message::RelationshipFromChanged(role) => {
-                self.settings_dirty = true;
-                self.new_relationship_from = role;
-                self.relationship_warning = None;
-            }
-            Message::RelationshipToChanged(role) => {
-                self.settings_dirty = true;
-                self.new_relationship_to = role;
-                self.relationship_warning = None;
-            }
-            Message::RelationshipTypeChanged(relationship) => {
-                self.settings_dirty = true;
-                self.new_relationship_type = relationship;
-                self.relationship_warning = None;
-            }
-            Message::RelationshipCyclesChanged(value) => {
-                self.settings_dirty = true;
-                self.new_relationship_cycles = value;
-                self.relationship_warning = None;
-            }
-            Message::RelationshipAdded => {
-                self.settings_dirty = true;
-                self.relationship_dirty = true;
-                // Inline validation: surface problems instead of silently
-                // dropping or overwriting rules.
-                if self.new_relationship_from == self.new_relationship_to {
-                    self.relationship_warning =
-                        Some("An agent cannot have a relationship with itself.".into());
-                    return iced::Task::none();
-                }
-                let max_cycles = self
-                    .new_relationship_cycles
-                    .trim()
-                    .parse::<u32>()
-                    .ok()
-                    .filter(|cycles| *cycles > 0);
-                let rule = AgentRelationshipConfig {
-                    from: self.new_relationship_from.into(),
-                    to: self.new_relationship_to.into(),
-                    relationship: self.new_relationship_type.into(),
-                    max_cycles,
-                };
-                let duplicate = self
-                    .relationship_rules
-                    .iter()
-                    .any(|existing| existing.from == rule.from && existing.to == rule.to);
-                if duplicate {
-                    self.relationship_warning = Some(format!(
-                        "A relationship from '{}' to '{}' already exists; the new rule replaces it.",
-                        rule.from, rule.to
-                    ));
-                } else {
-                    self.relationship_warning = None;
-                }
-                if let Some(existing) = self
-                    .relationship_rules
-                    .iter_mut()
-                    .find(|existing| existing.from == rule.from && existing.to == rule.to)
-                {
-                    *existing = rule;
-                } else {
-                    self.relationship_rules.push(rule);
-                }
-            }
-            Message::RelationshipRemoved(index) => {
-                self.settings_dirty = true;
-                self.relationship_dirty = true;
-                if index < self.relationship_rules.len() {
-                    self.relationship_rules.remove(index);
-                }
-            }
+            // Relationship builder. Pure relocation (NORM S36): the six
+            // `Relationship*` arms now live in the sibling `update_misc`
+            // submodule as `update_relationships`. Relationships are persisted
+            // on explicit Save Settings.
+            message @ (Message::RelationshipFromChanged(_)
+            | Message::RelationshipToChanged(_)
+            | Message::RelationshipTypeChanged(_)
+            | Message::RelationshipCyclesChanged(_)
+            | Message::RelationshipAdded
+            | Message::RelationshipRemoved(_)) => self.update_relationships(message),
 
             // Policy rule-builder edits and memory/retry tuning: pure
             // relocation (NORM S35). The 9 `NewPolicy*` / `PolicyRule*` arms
@@ -1101,7 +1037,7 @@ impl State {
             | Message::PolicyRuleAdded
             | Message::PolicyRuleRemoved(_)
             | Message::PolicyRuleMovedUp(_)
-            | Message::PolicyRuleMovedDown(_)) => return self.update_policy(message),
+            | Message::PolicyRuleMovedDown(_)) => self.update_policy(message),
 
             message @ (Message::MemoryEnabledToggled(_)
             | Message::MemoryTtlChanged(_)
@@ -1112,23 +1048,14 @@ impl State {
             | Message::RetryFixedDelayChanged(_)
             | Message::RetryRespectAfterToggled(_)
             | Message::RetryJitterToggled(_)
-            | Message::RetryMaxElapsedChanged(_)) => return self.update_memory(message),
-            Message::SaveSettings => {
-                self.settings_saved_notice = true;
-                self.settings_dirty = false;
-                self.relationship_dirty = false;
-            }
-            Message::ToggleSection(id) => {
-                if !self.collapsed_sections.remove(&id) {
-                    self.collapsed_sections.insert(id);
-                }
-            }
-            // Sidebar navigation: always expand the target (never fold it) and
-            // scroll the main column to its header.
-            Message::JumpToSection(id) => {
-                self.collapsed_sections.remove(&id);
-                return Self::scroll_to_section(id);
-            }
+            | Message::RetryMaxElapsedChanged(_)) => self.update_memory(message),
+
+            // Save / section navigation. Pure relocation (NORM S36): the
+            // `SaveSettings`, `ToggleSection`, and `JumpToSection` arms now live
+            // in the sibling `update_misc` submodule as `update_navigation`.
+            message @ (Message::SaveSettings
+            | Message::ToggleSection(_)
+            | Message::JumpToSection(_)) => self.update_navigation(message),
 
             // ADR-37 — Plugins. Pure relocation (NORM S34): the 15
             // `Message::Plugin*` arms now live in the sibling `update_plugins`
@@ -1149,7 +1076,7 @@ impl State {
             | Message::PluginDeleteConfirmed(_)
             | Message::PluginDeleteResult(_)
             | Message::PluginListRefreshRequested
-            | Message::PluginListRefreshResult(_)) => return self.update_plugins(message),
+            | Message::PluginListRefreshResult(_)) => self.update_plugins(message),
 
             // ADR-43 — Skills. Pure relocation (NORM S32): the 26
             // `Message::Skill*` / `Message::Skills*` arms now live in the
@@ -1181,7 +1108,7 @@ impl State {
             | Message::SkillDeletePressed(_)
             | Message::SkillDeleteCancelled(_)
             | Message::SkillDeleteConfirmed(_)
-            | Message::SkillDeleteResult(_)) => return self.update_skills(message),
+            | Message::SkillDeleteResult(_)) => self.update_skills(message),
 
             // ADR-43 — MCP server management. Pure relocation (NORM S28):
             // the 30 `Mcp*` arms now live in the sibling `update_mcp`
@@ -1216,73 +1143,33 @@ impl State {
             | Message::McpAddEnvAdd
             | Message::McpAddEnvRemove(_)
             | Message::McpAddTimeoutChanged(_)
-            | Message::McpAddSaved) => return self.update_mcp(message),
+            | Message::McpAddSaved) => self.update_mcp(message),
 
-            // Unified Extensions manager (ADR-37/43/70). Tab switching and
-            // master-list selection are transient view state: they never arm
-            // the dirty flag and are never persisted.
-            Message::ExtensionTabSelected(tab) => {
-                self.active_extension_tab = tab;
-                if tab == ExtensionTab::Plugins {
-                    // The installed-plugin list is scanned once, lazily, the
-                    // first time the tab is opened (mirrors skill discovery).
-                    if !self.plugins_loaded && !self.plugins_loading {
-                        return self.start_plugin_list_refresh();
-                    }
-                }
-            }
-            Message::ExtensionItemSelected(tab, id) => {
-                match tab {
-                    ExtensionTab::Skills => {
-                        // A CRUD outcome belongs to the previously selected
-                        // skill; drop it so the next selection never shows a
-                        // stale result line.
-                        self.skill_crud_result = None;
-                        self.ext_selected_skill = Some(id);
-                    }
-                    ExtensionTab::Mcp => self.ext_selected_mcp = Some(id),
-                    ExtensionTab::Plugins => {
-                        // A revoke or delete outcome belongs to the previously
-                        // selected plugin; drop it so the next selection never
-                        // shows a stale result line.
-                        self.plugin_revoke_result = None;
-                        self.plugin_install_result = None;
-                        self.plugin_delete_confirm = None;
-                        self.ext_selected_plugin = Some(id);
-                    }
-                    // The project-context tab has no item list.
-                    ExtensionTab::ProjectContext => {}
-                }
+            // Unified Extensions manager (ADR-37/43/70). Pure relocation
+            // (NORM S36): tab switching and master-list selection now live in
+            // the sibling `update_misc` submodule as `update_extension_tab`.
+            // Both are transient view state: they never arm the dirty flag and
+            // are never persisted.
+            message @ (Message::ExtensionTabSelected(_) | Message::ExtensionItemSelected(..)) => {
+                self.update_extension_tab(message)
             }
 
-            // ADR-70 — project AGENTS.md context injection. Persisted on Save
-            // Settings; each edit explicitly arms `project_context_dirty` so a
-            // plain save never publishes the startup snapshot.
-            Message::ProjectContextEnabledToggled(enabled) => {
-                self.settings_dirty = true;
-                self.project_context_dirty = true;
-                self.project_context_enabled = enabled;
-                // Disabling the feature also quiets the nudge: ADR-70 gates the
-                // advisory on the whole feature being active, so leaving the
-                // nudge on after a disable would be dead config.
-                if !enabled {
-                    self.project_context_auto_update_agents_md = false;
-                }
-            }
-            Message::ProjectContextNudgeToggled(enabled) => {
-                self.settings_dirty = true;
-                self.project_context_dirty = true;
-                self.project_context_auto_update_agents_md = enabled;
-            }
+            // ADR-70 — project AGENTS.md context injection. Pure relocation
+            // (NORM S36): both `ProjectContext*Toggled` arms now live in the
+            // sibling `update_misc` submodule as `update_project_context`.
+            // Persisted on Save Settings; each edit explicitly arms
+            // `project_context_dirty` so a plain save never publishes the
+            // startup snapshot.
+            message @ (Message::ProjectContextEnabledToggled(_)
+            | Message::ProjectContextNudgeToggled(_)) => self.update_project_context(message),
 
             // Shell messages are delegated to handle_shell_message in shell.rs.
             // They modify settings state and only persist on Save Settings.
             other => {
                 self.settings_dirty = true;
-                return self.handle_shell_message(other);
+                self.handle_shell_message(other)
             }
         }
-        iced::Task::none()
     }
 }
 
