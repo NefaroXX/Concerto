@@ -731,6 +731,150 @@ case_malformed_outcomes_keys() {
 }
 
 ##############################################################################
+# Torn-evidence cases ([simulated] shims; counter-reconciliation edge)
+##############################################################################
+
+# outcomes.json aggregates (caught: 1, missed: 0) contradict the individual
+# summary recorded for the very same mutant (MissedMutant). The runner must
+# recount the counters from the individual summaries and fail closed — never
+# report a pass off a contradictory aggregate.
+case_inconsistent_artifacts() {
+    local repo="$CASE_DIR/repo"
+    fixture_standard_candidate "$repo" || return 1
+    SOURCE_SNAPSHOT="$(snapshot_source_state "$repo")"
+    printf '[simulated] inconsistent-artifacts case: cargo-mutants shim with torn counters\n'
+    invoke_runner "$repo" "$STANDARD_BASE" 300 120 \
+        "PATH=$HARNESS_DIR/shims/inconsistent-artifacts:$PATH"
+
+    expect_eq "$RUN_RC" "3" "runner exit code (inconsistent artifacts)"
+    expect_report_eq status "inconclusive"
+    expect_report_eq reason "artifact_parse_failed"
+    expect_report_eq exit_code "3"
+    expect_report_eq complete "false"
+    expect_report_eq counts.caught "null"
+    expect_report_eq counts.missed "null"
+    expect_file_contains "$CASE_DIR/report/console.log" "[simulated]"
+    assert_source_unchanged "$repo"
+    return 0
+}
+
+# Cross-file tear: mutants.json lists two discovered mutants while
+# outcomes.json (aggregates AND individuals, mutually consistent) accounts for
+# only one. The unaccounted mutant must not vanish into a pass: the runner
+# reconciles the individuals against mutants.json and fails closed.
+case_inconsistent_mutant_count() {
+    local repo="$CASE_DIR/repo"
+    fixture_standard_candidate "$repo" || return 1
+    SOURCE_SNAPSHOT="$(snapshot_source_state "$repo")"
+    printf '[simulated] inconsistent-mutant-count case: cargo-mutants shim with a cross-file tear\n'
+    invoke_runner "$repo" "$STANDARD_BASE" 300 120 \
+        "PATH=$HARNESS_DIR/shims/inconsistent-mutant-count:$PATH"
+
+    expect_eq "$RUN_RC" "3" "runner exit code (inconsistent mutant count)"
+    expect_report_eq status "inconclusive"
+    expect_report_eq reason "artifact_parse_failed"
+    expect_report_eq exit_code "3"
+    expect_report_eq complete "false"
+    expect_report_eq counts.caught "null"
+    expect_report_eq counts.missed "null"
+    expect_file_contains "$CASE_DIR/report/console.log" "[simulated]"
+    assert_source_unchanged "$repo"
+    return 0
+}
+
+##############################################################################
+# terminate_child process-group probe (unit; no runner invocation)
+##############################################################################
+
+# Extracts terminate_child from the runner under test and drives it with a
+# fake setsid session whose leader exits immediately, leaving a descendant
+# that ignores SIGTERM (trap '' TERM). Parent-PID-only liveness — the
+# pre-fix defect — sees the dead leader, skips the SIGKILL escalation and
+# leaks the orphan; PGID-gated liveness must kill the whole group within the
+# grace window (shortened here: the probe tests the gating, not the 30s
+# configuration constant).
+case_terminate_pgid_escalation() {
+    local extracted="$CASE_DIR/terminate_child.sh"
+    awk '/^terminate_child\(\) \{/,/^\}$/' "$RUNNER" >"$extracted" || return 1
+    if ! grep -q '^terminate_child()' "$extracted"; then
+        case_fail "terminate_child not extractable from $RUNNER (probe setup broken)"
+        return 0
+    fi
+
+    KILL_GRACE_SECONDS=2
+    CHILD_PID=""
+    CHILD_PGID=""
+    # shellcheck source=/dev/null
+    . "$extracted"
+
+    cat >"$CASE_DIR/leader.sh" <<'EOF'
+#!/usr/bin/env bash
+# Leave a descendant that ignores SIGTERM, record it, then let the leader die.
+bash -c 'trap "" TERM; printf ready > "$GATE_PROBE_DIR/orphan-ready"; exec sleep 300' &
+printf '%s' "$!" >"$GATE_PROBE_DIR/orphan-pid"
+exit 0
+EOF
+
+    # Same launch shape as run_child: backgrounded subshell + exec setsid, so
+    # PGID == PID of $! exactly as in the runner under test.
+    (
+        export GATE_PROBE_DIR="$CASE_DIR"
+        exec setsid bash "$CASE_DIR/leader.sh"
+    ) >"$CASE_DIR/leader.log" 2>&1 &
+    local leader=$!
+
+    # Wait (bounded) until the orphan reports ready and the leader is dead:
+    # terminate_child must only be entered once the group outlives its leader.
+    local i=0
+    while [ "$i" -lt 50 ]; do
+        if [ -f "$CASE_DIR/orphan-ready" ] && ! kill -0 "$leader" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+    if [ ! -f "$CASE_DIR/orphan-ready" ]; then
+        case_fail "orphan never reported ready (leader log: $(tr '\n' ' ' <"$CASE_DIR/leader.log" 2>/dev/null || true))"
+        kill -s KILL -- "-$leader" 2>/dev/null || true
+        return 0
+    fi
+    if kill -0 "$leader" 2>/dev/null; then
+        case_fail "leader pid $leader still alive; probe needs it dead before terminate_child"
+        kill -s KILL -- "-$leader" 2>/dev/null || true
+        return 0
+    fi
+    if ! kill -0 -- "-$leader" 2>/dev/null; then
+        case_fail "process group -$leader vanished with its leader (probe setup broken)"
+        return 0
+    fi
+
+    printf 'probe: leader %s exited, group still alive; calling terminate_child TERM\n' "$leader"
+    CHILD_PID="$leader"
+    CHILD_PGID="$leader"
+    terminate_child TERM
+
+    # The orphan ignores TERM, so only the SIGKILL escalation can clear the
+    # group. Allow a bounded window for the kernel to reap it first.
+    i=0
+    while kill -0 -- "-$leader" 2>/dev/null && [ "$i" -lt 20 ]; do
+        sleep 0.1
+        i=$((i + 1))
+    done
+    if kill -0 -- "-$leader" 2>/dev/null; then
+        case_fail "terminate_child left group -$leader alive (SIGKILL escalation never landed)"
+        kill -s KILL -- "-$leader" 2>/dev/null || true
+    fi
+    local orphan=""
+    orphan="$(cat "$CASE_DIR/orphan-pid" 2>/dev/null || true)"
+    if [ -n "$orphan" ] && kill -0 "$orphan" 2>/dev/null; then
+        case_fail "orphan pid $orphan survived terminate_child"
+        kill -s KILL "$orphan" 2>/dev/null || true
+    fi
+    printf 'probe: group -%s is gone after terminate_child\n' "$leader"
+    return 0
+}
+
+##############################################################################
 # Summary
 ##############################################################################
 
@@ -811,6 +955,12 @@ main() {
     run_case malformed-mutants-json malformed case_malformed_mutants_json
     run_case malformed-outcomes-json malformed case_malformed_outcomes_json
     run_case malformed-outcomes-keys malformed case_malformed_outcomes_keys
+
+    # Cases 19-20: torn artifacts must fail closed, never pass (Bug B).
+    run_case inconsistent-artifacts inconsistent case_inconsistent_artifacts
+    run_case inconsistent-mutant-count inconsistent case_inconsistent_mutant_count
+    # Case 21: terminate_child must escalate on PGID liveness (Bug A).
+    run_case terminate-pgid-escalation terminate case_terminate_pgid_escalation
 
     if print_summary; then
         exit 0

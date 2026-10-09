@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+#
+# [simulated] Torn-evidence shim (cross-file variant): reports the pinned
+# version, then exits 0 after writing outcomes.json whose aggregates and
+# individual summaries agree with each other (caught: 1, missed: 0) while
+# mutants.json lists TWO discovered mutants — the second mutant has no
+# outcome entry anywhere, exactly the cross-file tear where a missing mutant
+# would otherwise be reported as caught=1/missed=0 and pass.
+#
+# The runner must reconcile the individuals against mutants.json and fail
+# closed (inconclusive / artifact_parse_failed, null counts) instead of
+# reporting a pass on the self-consistent but incomplete outcomes.json.
+set -euo pipefail
+
+case " $* " in
+    *" --version "*)
+        printf 'cargo-mutants 27.1.0\n'
+        exit 0
+        ;;
+esac
+
+out=""
+prev=""
+for arg in "$@"; do
+    if [ "$prev" = "--output" ]; then
+        out="$arg"
+    fi
+    prev="$arg"
+done
+if [ -z "$out" ]; then
+    printf '[simulated] inconsistent-mutant-count shim: missing --output argument\n' >&2
+    exit 70
+fi
+mkdir -p "$out/mutants.out"
+cat >"$out/mutants.out/mutants.json" <<'EOF'
+[
+  {
+    "name": "crates/core/src/policy.rs: classify: replace if-expression with true",
+    "package": "concerto-core",
+    "file": "crates/core/src/policy.rs",
+    "function": "classify",
+    "span": {
+      "file": "crates/core/src/policy.rs",
+      "line": 2,
+      "column": 5,
+      "end_line": 4,
+      "end_column": 6
+    },
+    "replacement": "true",
+    "genre": "FnValue",
+    "diff": "--- a/crates/core/src/policy.rs\n+++ b/crates/core/src/policy.rs\n@@ -1,6 +1,6 @@\n"
+  },
+  {
+    "name": "crates/core/src/policy.rs: classify: replace < with <=",
+    "package": "concerto-core",
+    "file": "crates/core/src/policy.rs",
+    "function": "classify",
+    "span": {
+      "file": "crates/core/src/policy.rs",
+      "line": 2,
+      "column": 8,
+      "end_line": 2,
+      "end_column": 10
+    },
+    "replacement": "<=",
+    "genre": "BinaryOp",
+    "diff": "--- a/crates/core/src/policy.rs\n+++ b/crates/core/src/policy.rs\n@@ -1,5 +1,5 @@\n"
+  }
+]
+EOF
+cat >"$out/mutants.out/outcomes.json" <<'EOF'
+{
+  "caught": 1,
+  "missed": 0,
+  "timeout": 0,
+  "unviable": 0,
+  "total_mutants": 1,
+  "success": 0,
+  "start_time": "2026-10-09T00:00:00Z",
+  "end_time": "2026-10-09T00:00:01Z",
+  "cargo_mutants_version": "27.1.0",
+  "outcomes": [
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/core/src/policy.rs: classify: replace if-expression with true",
+          "package": "concerto-core",
+          "file": "crates/core/src/policy.rs",
+          "function": "classify",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/classify.log",
+      "diff_path": "diff/classify.diff",
+      "phase_results": []
+    }
+  ]
+}
+EOF
+printf '[simulated] inconsistent-mutant-count shim: mutants.json lists 2 mutants but outcomes.json accounts for only 1\n'
+exit 0

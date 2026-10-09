@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+#
+# [simulated] Torn-evidence shim: reports the pinned version, then exits 0
+# after writing artifacts whose outcomes.json AGGREGATES (caught: 1,
+# missed: 0) contradict the individual summary recorded in outcomes.json
+# `outcomes` (a single MissedMutant), with mutants.json holding exactly the
+# one discovered mutant.
+#
+# The runner must recount the per-run counters from the individual summaries
+# and fail closed (inconclusive / artifact_parse_failed, null counts) instead
+# of trusting the contradictory aggregate and reporting a pass.
+set -euo pipefail
+
+case " $* " in
+    *" --version "*)
+        printf 'cargo-mutants 27.1.0\n'
+        exit 0
+        ;;
+esac
+
+out=""
+prev=""
+for arg in "$@"; do
+    if [ "$prev" = "--output" ]; then
+        out="$arg"
+    fi
+    prev="$arg"
+done
+if [ -z "$out" ]; then
+    printf '[simulated] inconsistent-artifacts shim: missing --output argument\n' >&2
+    exit 70
+fi
+mkdir -p "$out/mutants.out"
+cat >"$out/mutants.out/mutants.json" <<'EOF'
+[
+  {
+    "name": "crates/core/src/policy.rs: classify: replace if-expression with true",
+    "package": "concerto-core",
+    "file": "crates/core/src/policy.rs",
+    "function": "classify",
+    "span": {
+      "file": "crates/core/src/policy.rs",
+      "line": 2,
+      "column": 5,
+      "end_line": 4,
+      "end_column": 6
+    },
+    "replacement": "true",
+    "genre": "FnValue",
+    "diff": "--- a/crates/core/src/policy.rs\n+++ b/crates/core/src/policy.rs\n@@ -1,6 +1,6 @@\n"
+  }
+]
+EOF
+cat >"$out/mutants.out/outcomes.json" <<'EOF'
+{
+  "caught": 1,
+  "missed": 0,
+  "timeout": 0,
+  "unviable": 0,
+  "total_mutants": 1,
+  "success": 0,
+  "start_time": "2026-10-09T00:00:00Z",
+  "end_time": "2026-10-09T00:00:01Z",
+  "cargo_mutants_version": "27.1.0",
+  "outcomes": [
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/core/src/policy.rs: classify: replace if-expression with true",
+          "package": "concerto-core",
+          "file": "crates/core/src/policy.rs",
+          "function": "classify",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/classify.log",
+      "diff_path": "diff/classify.diff",
+      "phase_results": []
+    }
+  ]
+}
+EOF
+printf '[simulated] inconsistent-artifacts shim: aggregates claim caught=1/missed=0 but the individual summary is MissedMutant\n'
+exit 0

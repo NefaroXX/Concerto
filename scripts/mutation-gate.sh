@@ -75,6 +75,7 @@ CANCEL_EXIT=0
 BUDGET_EXCEEDED=0
 DEADLINE=0
 CHILD_PID=""
+CHILD_PGID=""
 CHILD_KILLED=0
 RUN_RC=0
 FINALIZED=0
@@ -662,16 +663,19 @@ build_runs() {
 
 # Send $1 to the tool's whole process group, then escalate to KILL after
 # KILL_GRACE_SECONDS. Never signals this script's own process group.
+# Liveness is judged on the process GROUP, not on the leader's PID: the
+# setsid'd leader can exit while a descendant still ignores TERM, and a
+# parent-only check would skip the SIGKILL escalation and leak the orphan.
 terminate_child() {
-    local sig="$1" pid="$CHILD_PID" waited=0
-    [ -n "$pid" ] || return 0
-    kill -s "$sig" -- "-$pid" 2>/dev/null || kill -s "$sig" "$pid" 2>/dev/null || true
-    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$KILL_GRACE_SECONDS" ]; do
+    local sig="$1" pgid="$CHILD_PGID" waited=0
+    [ -n "$pgid" ] || return 0
+    kill -s "$sig" -- "-$pgid" 2>/dev/null || kill -s "$sig" "$pgid" 2>/dev/null || true
+    while kill -0 -- "-$pgid" 2>/dev/null && [ "$waited" -lt "$KILL_GRACE_SECONDS" ]; do
         sleep 1
         waited=$((waited + 1))
     done
-    if kill -0 "$pid" 2>/dev/null; then
-        kill -s KILL -- "-$pid" 2>/dev/null || kill -s KILL "$pid" 2>/dev/null || true
+    if kill -0 -- "-$pgid" 2>/dev/null; then
+        kill -s KILL -- "-$pgid" 2>/dev/null || kill -s KILL "$pgid" 2>/dev/null || true
     fi
 }
 
@@ -685,14 +689,19 @@ run_child() {
 
     CHILD_KILLED=0
     CHILD_PID=""
+    CHILD_PGID=""
     (
         cd "$ROOT" || exit 111
         exec setsid "$@"
     ) >"$logfile" 2>&1 &
     pid=$!
     CHILD_PID=$pid
+    # setsid makes the child a session and process-group leader: PGID == PID.
+    CHILD_PGID=$pid
 
-    while kill -0 "$pid" 2>/dev/null; do
+    # Wait while either the leader or its process group is alive: a leader
+    # that exits must not end budget monitoring while descendants remain.
+    while kill -0 "$pid" 2>/dev/null || kill -0 -- "-$CHILD_PGID" 2>/dev/null; do
         if [ "$BUDGET_EXCEEDED" -eq 0 ] && [ "$SECONDS" -ge "$DEADLINE" ]; then
             BUDGET_EXCEEDED=1
             CHILD_KILLED=1
@@ -705,6 +714,7 @@ run_child() {
     done
     wait "$pid" || rc=$?
     CHILD_PID=""
+    CHILD_PGID=""
     RUN_RC=$rc
 }
 
@@ -899,6 +909,49 @@ def as_int(value, default=0):
         return default
 
 
+# Individual mutant evidence lives in outcomes.json's `outcomes` entries, each
+# carrying its own `summary`; cargo-mutants 27.1.0 writes these variant names
+# (verified against real artifacts: mutants.json lists the discovered mutants
+# and holds no summary field of its own).
+SUMMARY_TO_KEY = {
+    "CaughtMutant": "caught",
+    "MissedMutant": "missed",
+    "Timeout": "timeout",
+    "Unviable": "unviable",
+}
+KNOWN_SUMMARIES = frozenset(SUMMARY_TO_KEY) | {"Success", "Failure"}
+
+
+def recount_individuals(outcomes):
+    """Recount one run from outcomes.json's individual summaries.
+
+    Returns {"counts": {...}, "mutants": <n mutant entries>} or None when the
+    individuals are unreadable, so callers fail closed on a torn artifact pair
+    instead of trusting aggregate counters that contradict the evidence.
+    """
+    entries = outcomes.get("outcomes")
+    if not isinstance(entries, list):
+        return None
+    counts = {"caught": 0, "missed": 0, "timeout": 0, "unviable": 0}
+    mutants = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return None
+        scenario = entry.get("scenario")
+        if scenario == "Baseline":
+            continue
+        if not isinstance(scenario, dict) or "Mutant" not in scenario:
+            return None
+        summary = entry.get("summary")
+        if not isinstance(summary, str) or summary not in KNOWN_SUMMARIES:
+            return None
+        mutants += 1
+        key = SUMMARY_TO_KEY.get(summary)
+        if key is not None:
+            counts[key] += 1
+    return {"counts": counts, "mutants": mutants}
+
+
 def field(directory, name, default=""):
     try:
         return (directory / name).read_text(encoding="utf-8", errors="replace").strip()
@@ -946,8 +999,20 @@ for directory in sorted(gate.glob("run-*")):
             isinstance(outcomes.get(key), int)
             for key in ("caught", "missed", "timeout", "unviable")
         ):
-            counts = {key: int(outcomes[key]) for key in ("caught", "missed", "timeout", "unviable")}
-            ok = isinstance(mutants, list)
+            aggregate = {key: int(outcomes[key]) for key in ("caught", "missed", "timeout", "unviable")}
+            # Fail closed unless the aggregate counters, the individual
+            # summaries and the mutants.json mutant list all agree — a torn
+            # artifact pair must never be read as a pass.
+            individual = recount_individuals(outcomes)
+            reconciled = (
+                individual is not None
+                and individual["counts"] == aggregate
+                and isinstance(mutants, list)
+                and individual["mutants"] == len(mutants)
+            )
+            if reconciled:
+                counts = aggregate
+                ok = True
         elif isinstance(mutants, list) and len(mutants) == 0 and not outcomes_present:
             counts = {"caught": 0, "missed": 0, "timeout": 0, "unviable": 0}
             ok = True
