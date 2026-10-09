@@ -91,99 +91,10 @@ pub(crate) async fn init_memory_system_with_handles(
     // Re‑use the same implementation as CLI/Desktop apps – copy/paste the
     // `init_memory_system` logic from those modules (project ID hashing, DB
     // path, vector & FTS stores, optional embedder, background indexing).
-    let project_id = ProjectId(concerto_core::helpers::project_id_hash(project_dir));
-    let lifecycle = CancellationToken::new();
-    let previous =
-        memory_cancel.lock().unwrap_or_else(|error| error.into_inner()).replace(lifecycle.clone());
-    if let Some(previous) = previous {
-        previous.cancel();
-    }
-
-    // ADR-11: one `.concerto.lock` at the data root governs the memory
-    // database. Acquired here and parked into `data_dir_lock` so it is held
-    // for the memory subsystem's lifetime, not just during init.
-    let root_data_dir = concerto_sessions::app_data_dir()
-        .map_err(|e| OrchestratorError::AgentLoopError(format!("data directory error: {e}")))?;
-    let lock = concerto_core::lock::acquire_data_dir_lock(
-        &root_data_dir,
-        Some(MEMORY_LOCK_TIMEOUT),
-        Some(&lifecycle),
-    )
-    .map_err(|e| OrchestratorError::AgentLoopError(format!("data directory error: lock {e}")))?;
-    *data_dir_lock.lock().unwrap_or_else(|e| e.into_inner()) = Some(lock);
-
-    let data_dir = root_data_dir.join("memory");
-    let db_path = data_dir.join("memory.db");
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| OrchestratorError::AgentLoopError(format!("IO error: {}", e)))?;
-    }
-    let db = Arc::new(
-        MemoryDb::connect(
-            &camino::Utf8PathBuf::from_path_buf(db_path)
-                .map_err(|e| OrchestratorError::AgentLoopError(format!("Path error: {:?}", e)))?,
-        )
-        .await
-        .map_err(|e| OrchestratorError::AgentLoopError(format!("MemoryDb connect error: {}", e)))?,
-    );
-    let pool = db.pool().clone();
-    // ADR-69 slice 1 link store: built here (over the same pool the vector
-    // store uses) so the init retention prunes below can also run the
-    // slice-2 orphan-evidence prune against it. Fail-open: an unopenable
-    // store leaves links off and memory behaves exactly as before.
-    let link_store = build_link_store(&pool, config.memory.max_out_degree).await;
-    let vector_store: Arc<dyn VectorStore> = Arc::new(
-        SqliteVectorStore::new(pool.clone())
-            .await
-            .map_err(|e| OrchestratorError::AgentLoopError(format!("VectorStore error: {}", e)))?,
-    );
-    let fts_store: Arc<dyn FullTextStore> =
-        Arc::new(SqliteFullTextStore::new(pool.clone()).await.map_err(|e| {
-            OrchestratorError::AgentLoopError(format!("FullTextStore error: {}", e))
-        })?);
-    let ttl = concerto_memory::ttl::TtlManager::with_default_ttl_days(
-        vector_store.clone(),
-        fts_store.clone(),
-        pool.clone(),
-        config.memory.ttl_days,
-    );
-    if let Err(error) = ttl.purge_expired(&project_id, CancellationToken::new()).await {
-        tracing::warn!(%error, "failed to purge expired project memory");
-    }
-    // ADR-65 §8: prune derived summary chunks (Fact/SessionSummary) past the
-    // configured retention — NEVER source chunks. Fail-soft: a failed prune
-    // only logs; the pass itself logs what it removed.
-    if let Err(error) = ttl
-        .prune_derived_summaries(
-            &project_id,
-            config.memory.summary_keep_per_session,
-            config.memory.summary_retention_days,
-            CancellationToken::new(),
-        )
-        .await
-    {
-        tracing::warn!(%error, "failed to prune derived summaries past retention");
-    }
-    // ADR-69 slice 2: prune DERIVED rows whose incoming link evidence has
-    // decayed cold — NEVER source chunks and NEVER unlinked rows. Same policy
-    // knob as the retrieval cascade (`cascade_decay_days`; `None` → the
-    // 90-day ADR A5 floor, `Some(0)` disables decay). Fail-open: a failed
-    // prune only logs.
-    if let Some(store) = &link_store {
-        if let Err(error) = ttl
-            .prune_orphaned_derived(
-                &project_id,
-                store,
-                config.memory.cascade_decay_days.or(Some(DECAY_FLOOR_DAYS as u16)),
-                CancellationToken::new(),
-            )
-            .await
-        {
-            tracing::warn!(%error, "failed to prune orphaned derived memory");
-        }
-    } else {
-        tracing::debug!("link store unavailable — orphan-evidence prune skipped (fail-open)");
-    }
+    let (project_id, lifecycle, db, pool, data_dir) =
+        open_memory_db(project_dir, memory_cancel, data_dir_lock).await?;
+    let (link_store, vector_store, fts_store) = build_memory_stores(&pool, config).await?;
+    run_memory_retention(&vector_store, &fts_store, &pool, &link_store, &project_id, config).await;
     let decision_store = Arc::new(DecisionStore::load(db.clone()).await.map_err(|error| {
         OrchestratorError::AgentLoopError(format!("DecisionStore load error: {error}"))
     })?);
@@ -386,6 +297,144 @@ pub(crate) async fn init_memory_system_with_handles(
     });
 
     Ok(MemorySystemHandles { store: system as Arc<dyn MemoryStore>, decision_store, task_tree })
+}
+
+/// H1: open (and lock) the project memory database. Derives the project id,
+/// mints a fresh lifecycle token (cancelling any previous one), acquires the
+/// ADR-11 data-dir lock, ensures the memory directory exists, and connects the
+/// pool.
+///
+/// Returns `(project_id, lifecycle, db, pool, memory_data_dir)`. The lock is
+/// parked in `data_dir_lock` so it is held for the memory subsystem's
+/// lifetime, not just during init.
+async fn open_memory_db(
+    project_dir: &std::path::Path,
+    memory_cancel: &Arc<Mutex<Option<CancellationToken>>>,
+    data_dir_lock: &Arc<Mutex<Option<Arc<DataDirLock>>>>,
+) -> Result<
+    (ProjectId, CancellationToken, Arc<MemoryDb>, sqlx::SqlitePool, std::path::PathBuf),
+    OrchestratorError,
+> {
+    let project_id = ProjectId(concerto_core::helpers::project_id_hash(project_dir));
+    let lifecycle = CancellationToken::new();
+    let previous =
+        memory_cancel.lock().unwrap_or_else(|error| error.into_inner()).replace(lifecycle.clone());
+    if let Some(previous) = previous {
+        previous.cancel();
+    }
+
+    // ADR-11: one `.concerto.lock` at the data root governs the memory
+    // database. Acquired here and parked into `data_dir_lock` so it is held
+    // for the memory subsystem's lifetime, not just during init.
+    let root_data_dir = concerto_sessions::app_data_dir()
+        .map_err(|e| OrchestratorError::AgentLoopError(format!("data directory error: {e}")))?;
+    let lock = concerto_core::lock::acquire_data_dir_lock(
+        &root_data_dir,
+        Some(MEMORY_LOCK_TIMEOUT),
+        Some(&lifecycle),
+    )
+    .map_err(|e| OrchestratorError::AgentLoopError(format!("data directory error: lock {e}")))?;
+    *data_dir_lock.lock().unwrap_or_else(|e| e.into_inner()) = Some(lock);
+
+    let data_dir = root_data_dir.join("memory");
+    let db_path = data_dir.join("memory.db");
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| OrchestratorError::AgentLoopError(format!("IO error: {}", e)))?;
+    }
+    let db = Arc::new(
+        MemoryDb::connect(
+            &camino::Utf8PathBuf::from_path_buf(db_path)
+                .map_err(|e| OrchestratorError::AgentLoopError(format!("Path error: {:?}", e)))?,
+        )
+        .await
+        .map_err(|e| OrchestratorError::AgentLoopError(format!("MemoryDb connect error: {}", e)))?,
+    );
+    let pool = db.pool().clone();
+    Ok((project_id, lifecycle, db, pool, data_dir))
+}
+
+/// H2: build the project memory stores over `pool` — the ADR-69 slice-1 link
+/// store (fail-open), the vector store, and the FTS store. Vector/FTS
+/// construction errors abort memory init; an unopenable link store degrades to
+/// `None`.
+async fn build_memory_stores(
+    pool: &sqlx::SqlitePool,
+    config: &AppConfig,
+) -> Result<(Option<Arc<LinkStore>>, Arc<dyn VectorStore>, Arc<dyn FullTextStore>), OrchestratorError>
+{
+    // ADR-69 slice 1 link store: built here (over the same pool the vector
+    // store uses) so the init retention prunes below can also run the
+    // slice-2 orphan-evidence prune against it. Fail-open: an unopenable
+    // store leaves links off and memory behaves exactly as before.
+    let link_store = build_link_store(pool, config.memory.max_out_degree).await;
+    let vector_store: Arc<dyn VectorStore> = Arc::new(
+        SqliteVectorStore::new(pool.clone())
+            .await
+            .map_err(|e| OrchestratorError::AgentLoopError(format!("VectorStore error: {}", e)))?,
+    );
+    let fts_store: Arc<dyn FullTextStore> =
+        Arc::new(SqliteFullTextStore::new(pool.clone()).await.map_err(|e| {
+            OrchestratorError::AgentLoopError(format!("FullTextStore error: {}", e))
+        })?);
+    Ok((link_store, vector_store, fts_store))
+}
+
+/// H3: run the memory retention passes at init — TTL expiry purge, derived
+/// summary prune, and (when the link store attached) the ADR-69 slice-2
+/// orphaned derived-evidence prune. All three are fail-soft: a failed pass
+/// logs and the run continues. Never returns a value and never fails init.
+async fn run_memory_retention(
+    vector_store: &Arc<dyn VectorStore>,
+    fts_store: &Arc<dyn FullTextStore>,
+    pool: &sqlx::SqlitePool,
+    link_store: &Option<Arc<LinkStore>>,
+    project_id: &ProjectId,
+    config: &AppConfig,
+) {
+    let ttl = concerto_memory::ttl::TtlManager::with_default_ttl_days(
+        vector_store.clone(),
+        fts_store.clone(),
+        pool.clone(),
+        config.memory.ttl_days,
+    );
+    if let Err(error) = ttl.purge_expired(project_id, CancellationToken::new()).await {
+        tracing::warn!(%error, "failed to purge expired project memory");
+    }
+    // ADR-65 §8: prune derived summary chunks (Fact/SessionSummary) past the
+    // configured retention — NEVER source chunks. Fail-soft: a failed prune
+    // only logs; the pass itself logs what it removed.
+    if let Err(error) = ttl
+        .prune_derived_summaries(
+            project_id,
+            config.memory.summary_keep_per_session,
+            config.memory.summary_retention_days,
+            CancellationToken::new(),
+        )
+        .await
+    {
+        tracing::warn!(%error, "failed to prune derived summaries past retention");
+    }
+    // ADR-69 slice 2: prune DERIVED rows whose incoming link evidence has
+    // decayed cold — NEVER source chunks and NEVER unlinked rows. Same policy
+    // knob as the retrieval cascade (`cascade_decay_days`; `None` → the
+    // 90-day ADR A5 floor, `Some(0)` disables decay). Fail-open: a failed
+    // prune only logs.
+    if let Some(store) = link_store {
+        if let Err(error) = ttl
+            .prune_orphaned_derived(
+                project_id,
+                store,
+                config.memory.cascade_decay_days.or(Some(DECAY_FLOOR_DAYS as u16)),
+                CancellationToken::new(),
+            )
+            .await
+        {
+            tracing::warn!(%error, "failed to prune orphaned derived memory");
+        }
+    } else {
+        tracing::debug!("link store unavailable — orphan-evidence prune skipped (fail-open)");
+    }
 }
 
 /// Build the shared summarizer behind the ADR-46 L1 symbolic pass, or `None`.
