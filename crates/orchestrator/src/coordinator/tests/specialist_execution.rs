@@ -279,7 +279,8 @@ async fn closing_prose_cannot_complete_a_run_with_unfinished_specialist_executio
         .into_iter()
         .find(|node| node.status == SubTaskStatus::NeedsRevision)
         .unwrap();
-    let resume_call = call_specialist_for("coder", "Continue the fixture repair", &held.id.to_string());
+    let resume_call =
+        call_specialist_for("coder", "Continue the fixture repair", &held.id.to_string());
     coordinator.planning_provider = Arc::new(TurnProvider::new(vec![
         CoordinatorTurn::Calls(vec![resume_call]),
         CoordinatorTurn::Text("The remaining work is finished.".into()),

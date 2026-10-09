@@ -6949,7 +6949,7 @@ impl CoordinatorAgent {
                         })
                 })
                 .collect::<Vec<_>>();
-            held.sort_by_key(|node| node.id);
+            held.sort_by_key(|node| node.id.to_string());
             let tasks = held
                 .iter()
                 .take(8)
@@ -19270,7 +19270,9 @@ mod tests {
             AgentId::new("docs-writer"),
             "Docs Writer".into(),
             Some(concerto_core::AgentStage::new("documentation")),
-            Arc::new(TurnProvider::new(vec![CoordinatorTurn::Text("Release notes written.".into())])),
+            Arc::new(TurnProvider::new(vec![CoordinatorTurn::Text(
+                "Release notes written.".into(),
+            )])),
             None,
             bus.clone(),
             RetryPolicy::default(),
