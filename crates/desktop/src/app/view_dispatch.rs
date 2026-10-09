@@ -9,9 +9,9 @@
 //!   intercept falls through to: `chat.update` mapped back into
 //!   `Message::Chat`). The pre-routing itself (clipboard, navigation
 //!   re-dispatches, session select / spend refresh, the New Session
-//!   intercept, focus tracking, and the submit/toggle intercepts) stays in
-//!   the parent: those branches mutate App-level fields or re-dispatch
-//!   rather than only forwarding to the child view state.
+//!   intercept, focus tracking, and the submit/toggle intercepts) moved to
+//!   the sibling `update_routing` submodule in S42, which still calls this
+//!   tail for the messages it does not intercept.
 //! * [`App::update_diff`] — the `Diff` arm: `diff.update` plus the
 //!   conditional VFS commit that applies an accept/reject/undo decision to
 //!   the shared `VirtualFs`.
@@ -19,10 +19,11 @@
 //!   plus the reindex / refresh / search / delete dispatches (each a loader
 //!   task, or a passthrough batched with a loader task).
 //!
-//! The `Shortcut` arm is deliberately NOT extracted: its handler
-//! (`App::handle_shortcut`) flips App-level fields (`show_help`, the memory
-//! modals, page navigation) instead of only re-dispatching, so it is state
-//! surgery rather than view-state dispatch.
+//! The `Shortcut` handler (`App::handle_shortcut`) is not here: in S42 it
+//! moved to the sibling `update_routing` submodule. On review it only
+//! re-dispatches into other `update` arms and flips a handful of small
+//! App-level routing flags (`show_help`, the memory modals, `page`), so it is
+//! a routing group rather than deep view-state dispatch.
 //!
 //! Bodies moved verbatim at the same 12-space arm indent, so each arm is
 //! line-for-line with its origin; the only structural edit is each group
