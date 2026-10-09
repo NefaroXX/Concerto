@@ -9308,1044 +9308,36 @@ impl CoordinatorAgent {
             let batch_results: Vec<(TaskId, AgentId, String, Result<AgentRunResult, _>)> =
                 join_all(futures).await;
 
-            // ── 2d. Process results sequentially ─────────────────────
-            let mut cancelled_during_batch = false;
-            for (task_id, role, model, result_or_err) in batch_results {
-                let attempt = subtask_attempts.get(&task_id).copied().unwrap_or(1);
-                // Record which model actually ran this task (reproducibility).
-                if !model.is_empty() {
-                    model_assignments.insert(task_id, model);
-                }
-
-                let result = match result_or_err {
-                    Ok(result) => result,
-                    Err(e) => {
-                        let _ = self.bus.publish_for_session(
-                            task.session_id,
-                            task_id.0,
-                            EventKind::SubTaskFailed {
-                                task_id,
-                                role: role.clone(),
-                                error: e.to_string(),
-                            },
-                        );
-                        if is_cancellation_error(&e) {
-                            graph.mark_pending(&task_id);
-                            cancelled_during_batch = true;
-                            continue;
-                        }
-                        // Issue #54: normalize the error into ONE structured
-                        // diagnosis at the point the failure surfaces; the
-                        // recovery below is deterministic from it (the class
-                        // mapping preserves ADR-42 §1 behavior), and the
-                        // diagnosis rides the audit trail (events + whiteboard
-                        // + the checkpointed history).
-                        let diagnosis = crate::failure_diagnosis::diagnose(&e);
-                        self.record_failure_diagnosis(
-                            task.session_id,
-                            Some(task_id),
-                            &role,
-                            &diagnosis,
-                        )
-                        .await;
-                        match SubtaskFailureClass::from(&diagnosis) {
-                            // Transient errors retry the same agent/model
-                            // while attempts remain (ADR-42 §1 Recoverable).
-                            SubtaskFailureClass::Recoverable
-                                if attempt < self.max_subtask_attempts =>
-                            {
-                                retry_feedback.entry(task_id).or_default().push(
-                                    failed_attempt_result(task_id, role.clone(), e.to_string()),
-                                );
-                                graph.mark_pending(&task_id);
-                                let _ = self.bus.publish_for_session(task.session_id, task_id.0, EventKind::AgentThought {
-                                    agent_id: "coordinator".into(),
-                                    content: format!(
-                                        "Retrying {role} subtask {task_id} after recoverable failure (attempt {attempt}/{}): {e}", self.max_subtask_attempts
-                                    ),
-                                    kind: ThinkingKind::Detail,
-                                });
-                                continue;
-                            }
-                            // Retries exhausted (Recoverable) or a
-                            // provider/model-specific hard failure
-                            // (LimitReached): walk the ADR-42 fallback ladder
-                            // before any Partial exit. Recoverable errors keep
-                            // the one-shot escalation retry first. Note the
-                            // asymmetry with the outcome arm: this block
-                            // escalates ONLY Recoverable errors — LimitReached
-                            // (auth, context overflow, no-affordable-model)
-                            // skips escalation and enters the ladder directly,
-                            // while the outcome arm escalates any non-implement
-                            // failure regardless of class.
-                            SubtaskFailureClass::Recoverable
-                            | SubtaskFailureClass::LimitReached => {
-                                // ── Escalation retry ─────────────────────
-                                // On the final retry attempt of a recoverable
-                                // error, do one escalation retry before the
-                                // ladder. Escalation is limited to once per
-                                // task per run by the escalation_attempted set.
-                                //
-                                // Attempt-math confirmation (see the outcome
-                                // arm for the same shape): the counter is
-                                // incremented at dispatch time (batch build,
-                                // `subtask_attempts.entry(t).or_insert(0) += 1`)
-                                // and read here as `attempt`. Retries fire for
-                                // attempts 1..=2 (`attempt < MAX`); attempt 3
-                                // falls through to this block. The reset to
-                                // `MAX - 1` makes the NEXT dispatch read
-                                // exactly `MAX` again, so the retry arm does
-                                // NOT re-fire on the escalated dispatch — the
-                                // extra dispatch comes from `mark_pending` +
-                                // `continue` (the re-pended task re-enters the
-                                // ready queue). Net effect: exactly ONE
-                                // additional dispatch per task per run, with
-                                // the escalated failure appended to
-                                // `retry_feedback` (surfaced to the agent as
-                                // previous results). Without the reset the
-                                // counter would drift to MAX + 1, skewing the
-                                // `attempt {attempt}/{MAX}` reporting.
-                                let is_recoverable = matches!(
-                                    SubtaskFailureClass::from(&diagnosis),
-                                    SubtaskFailureClass::Recoverable
-                                );
-                                if is_recoverable && !self.escalation_attempted.contains(&task_id) {
-                                    self.escalation_attempted.insert(task_id);
-                                    subtask_attempts.insert(
-                                        task_id,
-                                        self.max_subtask_attempts.saturating_sub(1),
-                                    );
-                                    retry_feedback.entry(task_id).or_default().push(
-                                        failed_attempt_result(
-                                            task_id,
-                                            role.clone(),
-                                            format!("{e} (escalation retry)"),
-                                        ),
-                                    );
-                                    graph.mark_pending(&task_id);
-                                    let _ = self.bus.publish_for_session(
-                                        task.session_id,
-                                        task_id.0,
-                                        EventKind::AgentThought {
-                                            agent_id: "coordinator".into(),
-                                            content: format!(
-                                                "Escalating {role} subtask {task_id} — escalation retry \
-                                             (attempt {attempt}/{} exhausted)", self.max_subtask_attempts
-                                            ),
-                                            kind: ThinkingKind::Detail,
-                                        },
-                                    );
-                                    continue;
-                                }
-
-                                // ── ADR-42 fallback ladder ───────────────
-                                // Rebuild the per-task dispatch context for
-                                // the ladder (the original was consumed inside
-                                // the async dispatch closure above).
-                                let Some(ladder_entry) =
-                                    batch.iter().find(|entry| entry.id == task_id)
-                                else {
-                                    graph.mark_blocked(&task_id);
-                                    terminal_subtask_failure =
-                                        Some(OrchestratorError::SubTaskRetriesExhausted {
-                                            task_id,
-                                            role,
-                                            attempts: attempt,
-                                            last_error: e.to_string(),
-                                        });
-                                    continue;
-                                };
-                                let ladder_artifacts = self
-                                    .expected_artifacts
-                                    .lock()
-                                    .unwrap_or_else(|error| error.into_inner())
-                                    .get(&task_id)
-                                    .cloned()
-                                    .unwrap_or_default();
-                                let ladder_ctx = AgentContext {
-                                    session: session.clone(),
-                                    parent_task: Some(parent_task.clone()),
-                                    working_memory: working_memory.clone(),
-                                    retrieved_chunks: retrieved_chunks.clone(),
-                                    previous_results: ladder_entry.previous_results.clone(),
-                                    budget_remaining_usd: None,
-                                    expected_artifacts: ladder_artifacts,
-                                    workspace_capsule: None,
-                                    workspace_snapshot_digest: self.snapshot_digest(&cancel).await,
-                                    run_id: self.run_id.clone(),
-                                    workspace_generation: self.snapshot_generation(),
-                                };
-                                match self
-                                    .attempt_fallback_ladder(
-                                        &ladder_entry.subtask,
-                                        &role,
-                                        &e,
-                                        &ladder_ctx,
-                                        &cancel,
-                                    )
-                                    .await
-                                {
-                                    // Ladder Success always carries a genuine
-                                    // Success outcome (see the outcome arm):
-                                    // yielding it here completes the subtask.
-                                    FallbackOutcome::Success(result) => *result,
-                                    FallbackOutcome::Cancelled => {
-                                        graph.mark_pending(&task_id);
-                                        cancelled_during_batch = true;
-                                        continue;
-                                    }
-                                    FallbackOutcome::Exhausted => {
-                                        graph.mark_blocked(&task_id);
-                                        terminal_subtask_failure =
-                                            Some(OrchestratorError::SubTaskRetriesExhausted {
-                                                task_id,
-                                                role,
-                                                attempts: attempt,
-                                                last_error: e.to_string(),
-                                            });
-                                        continue;
-                                    }
-                                }
-                            }
-                            // Structural errors (cancellation, invalid task
-                            // graph, cycle detection, planning failure) exit
-                            // immediately via the graceful non-recoverable
-                            // path. ADR-42 reclassifies the former
-                            // non-recoverable provider/model-specific family
-                            // (auth, context overflow, no-affordable-model) as
-                            // LimitReached, so it now walks the ladder above
-                            // instead of reaching this arm. Audit §3.4: the
-                            // previous code did `return Err(e)` here, which:
-                            //   (a) discarded `all_files`, `provider_metrics`,
-                            //       and any successful siblings already
-                            //       processed earlier in this same
-                            //       `batch_results` loop,
-                            //   (b) dropped subsequent siblings still queued
-                            //       in `batch_results` without processing
-                            //       their success/failure,
-                            //   (c) bypassed every graceful-completion path
-                            //       the rest of `run` builds (the empty-queue
-                            //       terminal-failure exit below does the same
-                            //       thing for *recoverable* errors after
-                            //       retries are exhausted).
-                            // Instead, stash the error so we can finish the
-                            // current batch, then surface a Partial AgentOutput
-                            // through the same graceful-degradation
-                            // construction used at the empty-queue exit.
-                            SubtaskFailureClass::NonRecoverable => {
-                                tracing::warn!(
-                                    target: "orchestrator::coordinator",
-                                    task_id = ?task_id,
-                                    role = ?role,
-                                    error = %e,
-                                    "non-recoverable subtask error; draining batch then surfacing partial AgentOutput",
-                                );
-                                non_recoverable_exit = Some((task_id, role, e));
-                                // Skip the success-path processing for this
-                                // errored task; the outer loop tail will detect
-                                // `non_recoverable_exit` and return the graceful
-                                // Partial AgentOutput after the rest of `batch_results`
-                                // has been processed.
-                                continue;
-                            }
-                        }
-                    }
-                };
-
-                // Record the outcome in the checkpoint action ledger.
-                // ADR-65 §7: the dispatched step settled — the pending
-                // decision it recorded no longer awaits completion.
-                if self.last_dispatch_decision.as_ref().and_then(|pending| pending.task_id)
-                    == Some(task_id)
-                {
-                    self.last_dispatch_decision = None;
-                }
-                action_ledger.push(checkpoint::CheckpointAction {
-                    kind: if matches!(result.outcome, AgentOutcome::Success) {
-                        "completed".into()
-                    } else {
-                        "failed".into()
-                    },
-                    task_id: Some(task_id),
-                    timestamp: time::OffsetDateTime::now_utc(),
-                    evidence: None,
-                });
-
-                total_cost += result.cost_usd;
-                total_tool_calls += result.tool_call_count;
-                all_files.extend(result.files_modified.clone());
-                let settled = metrics_from_result(&result);
-                provider_metrics.push(settled.clone());
-                self.settled_metrics.push(settled);
-                let stop_followups = cancel.is_cancelled();
-                cancelled_during_batch |= stop_followups;
-                let (desc, deps, sid) = {
-                    let entry =
-                        batch.iter().find(|entry| entry.id == task_id).ok_or_else(|| {
-                            OrchestratorError::InvalidTaskGraph {
-                                reason: format!(
-                                    "completed task {task_id} was not in dispatched batch"
-                                ),
-                            }
-                        })?;
-                    (
-                        entry.description.clone(),
-                        entry.dependencies.clone(),
-                        entry.subtask.session_id,
-                    )
-                };
-                match result.outcome.clone() {
-                    AgentOutcome::Success => {
-                        if let Some(subtask) = graph.get_mut(&task_id) {
-                            subtask.deliverable = Some(result.summary.clone());
-                        }
-                        completed_results.insert(task_id, result.clone());
-                        retry_feedback.remove(&task_id);
-                        // A success ends any identical-failure run.
-                        self.identical_failures.record_success(task_id);
-                        graph.mark_done(&task_id);
-                        // Issue #61: the subtask settled completed — the role's
-                        // ownerships release (evented via the attached gate).
-                        self.settle_release_task_ownership(&role, "subtask settled: completed")
-                            .await;
-                        // Phase 6 M3b: persist the settled outcome into the
-                        // shared decision/task stores so the next Phase-0
-                        // retrieval (M3a) is grounded in what this run already
-                        // decided. Best-effort — settlement never fails
-                        // because memory did.
-                        self.write_back_memory_outcome(&task_id, &role, &result, sid, &desc, &deps);
-
-                        // ── Replan fallback: design-stage redesign complete ──
-                        // When a design-stage replan subtask finishes
-                        // successfully, parse its DesignDoc and spawn a new
-                        // implement-stage subtask (same role as the original)
-                        // with the revised expected artifacts. The design
-                        // classification is facade-resolved by kind, so a
-                        // renamed Planning stage keeps replanning (issue
-                        // #150).
-                        if self.role_in_kind_stage(
-                            &role,
-                            StageKind::Planning,
-                            AgentStage::is_design,
-                        ) && !stop_followups
-                        {
-                            let parent_id = graph.get(&task_id).and_then(|st| st.parent_id);
-                            if let Some(orig_impl_id) = parent_id {
-                                if self.replan_attempts.contains_key(&orig_impl_id) {
-                                    let design_doc: Option<DesignDoc> =
-                                        crate::prompts::parse_json_substring(&result.summary);
-                                    // A replan supersedes the original plan;
-                                    // keep the newest DesignDoc for checkpoints.
-                                    if let Some(ref doc) = design_doc {
-                                        *self
-                                            .design_doc
-                                            .lock()
-                                            .unwrap_or_else(|error| error.into_inner()) =
-                                            Some(doc.clone());
-                                    }
-                                    // The follow-up implement task keeps the
-                                    // original role (which may be a custom
-                                    // implement-stage agent, ADR-35 §5).
-                                    let implement_role = graph
-                                        .get(&orig_impl_id)
-                                        .map(|t| t.role.clone())
-                                        .or_else(|| implement_ids.first().cloned());
-
-                                    let (new_expected, new_desc) = if let Some(ref doc) = design_doc
-                                    {
-                                        let files = if doc.proposed_files.is_empty() {
-                                            self.expected_artifacts
-                                                .lock()
-                                                .unwrap_or_else(|error| error.into_inner())
-                                                .get(&orig_impl_id)
-                                                .cloned()
-                                                .unwrap_or_default()
-                                        } else {
-                                            // Declaration boundary (see the
-                                            // DesignDoc dispatch insert): keep
-                                            // the path, drop `": <description>"`.
-                                            crate::declared_artifacts::declared_paths(
-                                                &doc.proposed_files,
-                                            )
-                                        };
-                                        let orig_desc = graph
-                                            .get(&orig_impl_id)
-                                            .map(|t| t.description.clone())
-                                            .unwrap_or_default();
-                                        let desc = if doc.goals.is_empty() {
-                                            format!(
-                                                "Re-implement based on revised design: {orig_desc}"
-                                            )
-                                        } else {
-                                            format!(
-                                                "Re-implement based on revised design: {}",
-                                                doc.goals.join("; ")
-                                            )
-                                        };
-                                        (files, desc)
-                                    } else {
-                                        let fallback_expected = self
-                                            .expected_artifacts
-                                            .lock()
-                                            .unwrap_or_else(|error| error.into_inner())
-                                            .get(&orig_impl_id)
-                                            .cloned()
-                                            .unwrap_or_default();
-                                        let orig_desc = graph
-                                            .get(&orig_impl_id)
-                                            .map(|t| t.description.clone())
-                                            .unwrap_or_default();
-                                        (
-                                            fallback_expected,
-                                            format!(
-                                                "Re-implement based on revised design: {orig_desc}"
-                                            ),
-                                        )
-                                    };
-
-                                    if let Some(implement_role) = implement_role {
-                                        let new_coder_desc = new_desc;
-                                        let new_coder = SubTask {
-                                            id: TaskId::new(),
-                                            parent_id: Some(task_id),
-                                            session_id: sid,
-                                            role: implement_role.clone(),
-                                            description: new_coder_desc.clone(),
-                                            status: SubTaskStatus::Pending,
-                                            dependencies: vec![task_id],
-                                            deliverable: None,
-                                            created_at: time::OffsetDateTime::now_utc(),
-                                            completed_at: None,
-                                        };
-                                        let new_coder_id = new_coder.id;
-
-                                        // Record this new implement task in
-                                        // replan_attempts so that if it also
-                                        // fails with an artifact error we do
-                                        // not attempt a second cascading
-                                        // replan.
-                                        self.replan_attempts.insert(new_coder_id, 1);
-
-                                        self.expected_artifacts
-                                            .lock()
-                                            .unwrap_or_else(|error| error.into_inner())
-                                            .insert(new_coder_id, new_expected);
-
-                                        graph.add_child(
-                                            new_coder,
-                                            task_id,
-                                            Dependency::MustFinishBefore,
-                                        );
-
-                                        let _ = self.bus.publish_for_session(
-                                            sid,
-                                            task_id.0,
-                                            EventKind::SubTaskCreated {
-                                                task_id: new_coder_id,
-                                                role: implement_role,
-                                                description: new_coder_desc,
-                                            },
-                                        );
-                                        let _ = self.bus.publish_for_session(
-                                            sid,
-                                            task_id.0,
-                                            EventKind::AgentThought {
-                                                agent_id: "coordinator".into(),
-                                                content: format!(
-                                                    "Design redesign complete. Spawning new implementation subtask {new_coder_id} for re-implementation."
-                                                ),
-                                                kind: ThinkingKind::Detail,
-                                            },
-                                        );
-                                    }
-                                }
-                            }
-                        }
-
-                        // ── Zero-file implement success short-circuit ─────
-                        // An implement-stage agent that "succeeds" without
-                        // writing any file has no deliverable for the review
-                        // cycle to inspect. Skip the reviewer model call and
-                        // directly queue the correction task the review
-                        // outcome would have produced (the Revision subtask
-                        // pattern below) instead of spending a reviewer call
-                        // to rediscover that no deliverable exists.
-                        //
-                        // Bounded once per lineage, in two steps:
-                        // 1. The FIRST zero-file success in a lineage skips
-                        //    the reviewer and queues a revision — the
-                        //    deliverable may simply be missing because the
-                        //    model under-performed, and a revision is a cheap
-                        //    second chance.
-                        // 2. A SUBSEQUENT zero-file implement success in the
-                        //    SAME lineage (the revision/revise pass itself —
-                        //    same role, fresh task id, same lineage root) had
-                        //    its chance to produce the deliverables and
-                        //    produced none. Running the reviewer would only
-                        //    re-discover the missing artifacts and queue yet
-                        //    another revision, spinning forever on an empty
-                        //    `files_modified` — the observed quota-burning
-                        //    loop. That completion FAILS the subtask instead:
-                        //    no further revision is queued and no review
-                        //    cycle starts for that lineage.
-                        //
-                        // Pipelines with no review-stage agent never
-                        // short-circuit: there is no reviewer call to save.
-                        let implement_phase = self.role_in_kind_stage(
-                            &role,
-                            StageKind::Execution,
-                            AgentStage::is_implement,
-                        ) && !stop_followups;
-                        // The short-circuit exists to save a *reviewer* model
-                        // call. Without a review-stage agent in the pipeline
-                        // there is no call to save (`run_review_cycle` is a
-                        // cheap skip), so zero-file successes take the normal
-                        // path instead of injecting a needless revision. The
-                        // review stage is resolved by kind, so a renamed
-                        // review tag keeps the short-circuit (issue #150).
-                        let review_tag = kind_stage_tag(
-                            self.blueprint_facade.as_ref(),
-                            StageKind::Review,
-                            AgentStage::REVIEW,
-                        );
-                        let has_review_stage_agent =
-                            self.first_agent_for_stage(&AgentStage::new(review_tag)).is_some();
-                        let lineage_root = {
-                            let mut root = task_id;
-                            while let Some(parent) =
-                                graph.get(&root).and_then(|node| node.parent_id)
-                            {
-                                root = parent;
-                            }
-                            root
-                        };
-                        let zero_file_success = result.files_modified.is_empty();
-                        if implement_phase
-                            && zero_file_success
-                            && has_review_stage_agent
-                            && !zero_file_revision_queued_roots.contains(&lineage_root)
-                        {
-                            // Step 1: first zero-file success in this lineage.
-                            zero_file_revision_queued_roots.insert(lineage_root);
-                            let _ = self.bus.publish_for_session(
-                                sid,
-                                task_id.0,
-                                EventKind::AgentThought {
-                                    agent_id: "coordinator".into(),
-                                    content: format!(
-                                        "Coder subtask {task_id} completed with no file changes; queuing revision without running the review cycle."
-                                    ),
-                                    kind: ThinkingKind::Detail,
-                                },
-                            );
-                            recoverable_notes.push(format!(
-                                "Coder subtask {task_id} completed with no file changes; revision queued without running the review cycle."
-                            ));
-                            self.queue_revision_subtask(
-                                &mut graph,
-                                task_id,
-                                sid,
-                                role.clone(),
-                                "completed with no file changes".into(),
-                            );
-                        } else if implement_phase && zero_file_success && has_review_stage_agent {
-                            // Step 2: a zero-file implement success after the
-                            // short-circuit already fired for this lineage is
-                            // the revision/revise pass itself, and it produced
-                            // no deliverable. Fail the subtask terminally so
-                            // the run surfaces the missing deliverables
-                            // instead of burning the quota on a
-                            // revision → zero-file → revision loop.
-                            let zero_file_error = format!(
-                                "subtask {task_id} ({role:?}) completed with no file \
-                                 changes after revision; required deliverables were \
-                                 not produced"
-                            );
-                            let _ = self.bus.publish_for_session(
-                                sid,
-                                task_id.0,
-                                EventKind::SubTaskFailed {
-                                    task_id,
-                                    role: role.clone(),
-                                    error: zero_file_error.clone(),
-                                },
-                            );
-                            graph.mark_blocked(&task_id);
-                            terminal_subtask_failure =
-                                Some(OrchestratorError::SubTaskRetriesExhausted {
-                                    task_id,
-                                    role,
-                                    attempts: attempt,
-                                    last_error: zero_file_error,
-                                });
-                            continue;
-                        }
-                    }
-                    AgentOutcome::NeedsRevision { reason } => {
-                        if let Some(subtask) = graph.get_mut(&task_id) {
-                            subtask.deliverable = Some(result.summary.clone());
-                        }
-                        completed_results.insert(task_id, result.clone());
-                        retry_feedback.remove(&task_id);
-                        graph.mark_done(&task_id);
-                        if stop_followups {
-                            continue;
-                        }
-                        // The revision subtask reuses the original
-                        // implement-stage role (custom or built-in).
-                        self.queue_revision_subtask(&mut graph, task_id, sid, role.clone(), reason);
-                    }
-                    AgentOutcome::Failed { error } => {
-                        // Issue #61: failure is a settle — release the role's
-                        // leases; a retrying generation re-acquires on its
-                        // first write.
-                        self.settle_release_task_ownership(&role, "subtask settled: failed").await;
-                        let _ = self.bus.publish_for_session(
-                            task.session_id,
-                            task_id.0,
-                            EventKind::SubTaskFailed {
-                                task_id,
-                                role: role.clone(),
-                                error: error.clone(),
-                            },
-                        );
-                        // Issue #54: normalize the settled failure into the
-                        // structured diagnosis (artifact-contract misses,
-                        // malformed output, generic agent failures) and put
-                        // it on the audit trail; the retry/escalation/replan/
-                        // ladder flow below is the recovery the diagnosis's
-                        // flags map onto.
-                        let diagnosis = crate::failure_diagnosis::diagnose_outcome_failure(&error);
-                        self.record_failure_diagnosis(
-                            task.session_id,
-                            Some(task_id),
-                            &role,
-                            &diagnosis,
-                        )
-                        .await;
-                        // Smoke fix (clap-derive 101): identical failures
-                        // repeated consecutively are deterministic — another
-                        // same-agent retry is unlikely to make progress. The
-                        // repeat diagnosis is injected as tool-result context
-                        // (an advisory recommendation) so the Coordinator can
-                        // weigh retry vs escalation; the retry/escalate choice
-                        // is never forced here.
-                        let identical_repeat =
-                            self.identical_failures.record_failure(task_id, &error);
-                        if identical_repeat {
-                            let repeated = self.identical_failures.consecutive(task_id);
-                            let repeat_diag = crate::failure_diagnosis::diagnose_identical_repeat(
-                                &error, repeated,
-                            );
-                            self.record_failure_diagnosis(
-                                task.session_id,
-                                Some(task_id),
-                                &role,
-                                &repeat_diag,
-                            )
-                            .await;
-                            let _ = self.bus.publish_for_session(
-                                task.session_id,
-                                task_id.0,
-                                EventKind::AgentThought {
-                                    agent_id: "coordinator".into(),
-                                    content: format!(
-                                        "Recommendation for {role} subtask {task_id}: identical \
-                                         failure repeated {repeated}× consecutively (threshold {}); \
-                                         escalating (rather than retrying the same agent) is \
-                                         recommended — the Coordinator decides.",
-                                        crate::failure_diagnosis::IDENTICAL_FAILURE_ESCALATION_THRESHOLD,
-                                    ),
-                                    kind: ThinkingKind::Detail,
-                                },
-                            );
-                        }
-                        if attempt < self.max_subtask_attempts {
-                            retry_feedback.entry(task_id).or_default().push(result.clone());
-                            graph.mark_pending(&task_id);
-                            let _ = self.bus.publish_for_session(task.session_id, task_id.0, EventKind::AgentThought {
-                                agent_id: "coordinator".into(),
-                                content: format!(
-                                    "Retrying {role} subtask {task_id} with failure feedback (attempt {attempt}/{}): {error}", self.max_subtask_attempts
-                                ),
-                                kind: ThinkingKind::Detail,
-                            });
-                            continue;
-                        }
-
-                        // ── Escalation retry (non-implement) ─────────────────────
-                        // For non-implement failures that have exhausted normal
-                        // retries, try one escalation retry before giving up. This
-                        // gives the agent one more attempt with accumulated failure
-                        // feedback, which can help with design/research roles where
-                        // the model may produce a better result with more context.
-                        // Implement-stage failures instead funnel into the replan
-                        // fallback below.
-                        //
-                        // Attempt-math confirmation (identical to the
-                        // dispatch-error arm): the counter is incremented at
-                        // dispatch time and read here as `attempt`. Retries
-                        // fire for attempts 1..=2; the reset to `MAX - 1`
-                        // makes the next dispatch read exactly `MAX`, so the
-                        // retry arm does NOT re-fire on the escalated dispatch
-                        // — the extra dispatch comes from `mark_pending` +
-                        // `continue`. Net effect: exactly ONE additional
-                        // dispatch per task per run with the failed result
-                        // appended to `retry_feedback`.
-                        if !self.role_in_kind_stage(
-                            &role,
-                            StageKind::Execution,
-                            AgentStage::is_implement,
-                        ) && !self.escalation_attempted.contains(&task_id)
-                        {
-                            self.escalation_attempted.insert(task_id);
-                            subtask_attempts
-                                .insert(task_id, self.max_subtask_attempts.saturating_sub(1));
-                            retry_feedback.entry(task_id).or_default().push(result.clone());
-                            graph.mark_pending(&task_id);
-                            let _ = self.bus.publish_for_session(
-                                task.session_id,
-                                task_id.0,
-                                EventKind::AgentThought {
-                                    agent_id: "coordinator".into(),
-                                    content: format!(
-                                        "Escalating {role} subtask {task_id} — escalation retry \
-                                     (attempt {attempt}/{} exhausted, role-based)",
-                                        self.max_subtask_attempts
-                                    ),
-                                    kind: ThinkingKind::Detail,
-                                },
-                            );
-                            continue;
-                        }
-
-                        // ── Replan fallback (implement-stage only) ─────────────
-                        // If an implement-stage subtask exhausts its retries
-                        // because expected artifacts were not produced, escalate
-                        // to the design-stage agent for a design revision instead
-                        // of giving up immediately. Pipelines without a
-                        // design-stage agent have no redesign path and fall
-                        // through to blocked.
-                        if let Some(design_role) = design_role.as_ref() {
-                            if self.role_in_kind_stage(
-                                &role,
-                                StageKind::Execution,
-                                AgentStage::is_implement,
-                            ) && is_artifact_failure(&error)
-                                && !self.replan_attempts.contains_key(&task_id)
-                            {
-                                self.replan_attempts.insert(task_id, 1);
-
-                                // Complete the original implement task so the
-                                // replan design task (which depends on it) becomes
-                                // ready.
-                                graph.mark_done(&task_id);
-                                completed_results.insert(task_id, result.clone());
-                                retry_feedback.remove(&task_id);
-
-                                // Copy the original task's expected artifacts so
-                                // the design agent knows what files were expected.
-                                let orig_expected = self
-                                    .expected_artifacts
-                                    .lock()
-                                    .unwrap_or_else(|error| error.into_inner())
-                                    .get(&task_id)
-                                    .cloned()
-                                    .unwrap_or_default();
-
-                                let arch_replan = SubTask {
-                                    id: TaskId::new(),
-                                    parent_id: Some(task_id),
-                                    session_id: sid,
-                                    role: design_role.clone(),
-                                    description: format!("Replan: {desc}"),
-                                    status: SubTaskStatus::Pending,
-                                    dependencies: vec![task_id],
-                                    deliverable: None,
-                                    created_at: time::OffsetDateTime::now_utc(),
-                                    completed_at: None,
-                                };
-                                let arch_replan_id = arch_replan.id;
-
-                                self.expected_artifacts
-                                    .lock()
-                                    .unwrap_or_else(|error| error.into_inner())
-                                    .insert(arch_replan_id, orig_expected);
-
-                                graph.add_child(arch_replan, task_id, Dependency::MustFinishBefore);
-
-                                // Publish a handoff event: implement → design
-                                let handoff = AgentHandoff::new(
-                                    role.clone(),
-                                    design_role.clone(),
-                                    task_id,
-                                    "Implementing agent could not produce expected artifacts; replanning design"
-                                        .into(),
-                                    HandoffDeliverable::Design(error.clone()),
-                                );
-                                let _ = self.bus.publish_for_session(
-                                    sid,
-                                    task_id.0,
-                                    EventKind::AgentHandoff {
-                                        from: handoff.from,
-                                        to: handoff.to,
-                                        task_id: handoff.task_id,
-                                        rationale: handoff.rationale.clone(),
-                                    },
-                                );
-                                let _ = self.bus.publish_for_session(
-                                    sid,
-                                    task_id.0,
-                                    EventKind::AgentThought {
-                                        agent_id: "coordinator".into(),
-                                        content: format!(
-                                            "Implement subtask {task_id} exhausted attempts producing expected artifacts. Escalating to {design_role} for redesign (replan #1)."
-                                        ),
-                                        kind: ThinkingKind::Detail,
-                                    },
-                                );
-                                continue;
-                            }
-                        }
-
-                        // ── ADR-42 fallback ladder ─────────────────────
-                        // Retries (and escalation/replan, where applicable)
-                        // are exhausted: walk the fallback ladder before
-                        // surfacing a partial outcome. The agent-produced
-                        // error string is wrapped for classification purposes
-                        // only — exhaustion already implies LimitReached
-                        // (ADR-42 §1).
-                        let Some(ladder_entry) = batch.iter().find(|entry| entry.id == task_id)
-                        else {
-                            graph.mark_blocked(&task_id);
-                            terminal_subtask_failure =
-                                Some(OrchestratorError::SubTaskRetriesExhausted {
-                                    task_id,
-                                    role,
-                                    attempts: attempt,
-                                    last_error: error,
-                                });
-                            continue;
-                        };
-                        let ladder_artifacts = self
-                            .expected_artifacts
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .get(&task_id)
-                            .cloned()
-                            .unwrap_or_default();
-                        let ladder_ctx = AgentContext {
-                            session: session.clone(),
-                            parent_task: Some(parent_task.clone()),
-                            working_memory: working_memory.clone(),
-                            retrieved_chunks: retrieved_chunks.clone(),
-                            previous_results: ladder_entry.previous_results.clone(),
-                            budget_remaining_usd: None,
-                            expected_artifacts: ladder_artifacts,
-                            workspace_capsule: None,
-                            workspace_snapshot_digest: self.snapshot_digest(&cancel).await,
-                            run_id: self.run_id.clone(),
-                            workspace_generation: self.snapshot_generation(),
-                        };
-                        let classify_err = OrchestratorError::AgentLoopError(error.clone());
-                        match self
-                            .attempt_fallback_ladder(
-                                &ladder_entry.subtask,
-                                &role,
-                                &classify_err,
-                                &ladder_ctx,
-                                &cancel,
-                            )
-                            .await
-                        {
-                            FallbackOutcome::Success(fb_result) => {
-                                let fb_result = *fb_result;
-                                if !matches!(fb_result.outcome, AgentOutcome::Success) {
-                                    // Defense-in-depth: the ladder only reports
-                                    // Success for a genuine Success outcome —
-                                    // attempt_fallback_ladder sends tier-1
-                                    // Ok(Failed) results into tier 2, and tier
-                                    // 2 only yields Success on substantive
-                                    // output. A non-Success result here is
-                                    // terminal: retries are exhausted and the
-                                    // per-task guards bound the ladder.
-                                    graph.mark_blocked(&task_id);
-                                    terminal_subtask_failure =
-                                        Some(OrchestratorError::SubTaskRetriesExhausted {
-                                            task_id,
-                                            role,
-                                            attempts: attempt,
-                                            last_error: error,
-                                        });
-                                    continue;
-                                }
-                                // The ladder completed the subtask: record it
-                                // like a successful dispatch. The fallback is
-                                // a single last-resort attempt, so review /
-                                // follow-up cycles (wired to primary dispatch
-                                // results above) are not re-run here.
-                                action_ledger.push(checkpoint::CheckpointAction {
-                                    kind: "completed".into(),
-                                    task_id: Some(task_id),
-                                    timestamp: time::OffsetDateTime::now_utc(),
-                                    evidence: None,
-                                });
-                                total_cost += fb_result.cost_usd;
-                                total_tool_calls += fb_result.tool_call_count;
-                                all_files.extend(fb_result.files_modified.clone());
-                                let settled = metrics_from_result(&fb_result);
-                                provider_metrics.push(settled.clone());
-                                self.settled_metrics.push(settled);
-                                if let Some(subtask) = graph.get_mut(&task_id) {
-                                    subtask.deliverable = Some(fb_result.summary.clone());
-                                }
-                                completed_results.insert(task_id, fb_result.clone());
-                                retry_feedback.remove(&task_id);
-                                graph.mark_done(&task_id);
-                                // Phase 6 M3b: the ladder settled this subtask
-                                // completed — persist the outcome like any
-                                // successful dispatch so the next Phase-0
-                                // retrieval (M3a) is grounded in what this run
-                                // ended up deciding. Best-effort (fail-soft),
-                                // mirroring the primary Success arm above.
-                                self.write_back_memory_outcome(
-                                    &task_id, &role, &fb_result, sid, &desc, &deps,
-                                );
-                                continue;
-                            }
-                            FallbackOutcome::Cancelled => {
-                                // The run is being cancelled (handled at the
-                                // loop top); re-pend the subtask rather than
-                                // failing it.
-                                graph.mark_pending(&task_id);
-                                cancelled_during_batch = true;
-                                continue;
-                            }
-                            FallbackOutcome::Exhausted => {
-                                graph.mark_blocked(&task_id);
-                                terminal_subtask_failure =
-                                    Some(OrchestratorError::SubTaskRetriesExhausted {
-                                        task_id,
-                                        role,
-                                        attempts: attempt,
-                                        last_error: error,
-                                    });
-                                continue;
-                            }
-                        }
-                    }
-                    AgentOutcome::Blocked { on } => {
-                        // Issue #61: a blocked settle also frees the leases
-                        // (recoverable later — a retried task re-acquires).
-                        self.settle_release_task_ownership(&role, "subtask settled: blocked").await;
-                        // Issue #54: a blocked outcome is the Dependency
-                        // dimension — diagnosed and audited before the
-                        // existing dependency-attach/retry handling.
-                        let diagnosis = crate::failure_diagnosis::diagnose_blocked(&on);
-                        self.record_failure_diagnosis(
-                            task.session_id,
-                            Some(task_id),
-                            &role,
-                            &diagnosis,
-                        )
-                        .await;
-                        if attempt < self.max_subtask_attempts {
-                            let mut attached = 0usize;
-                            let mut failures = Vec::new();
-                            for blocker in &on {
-                                match graph.add_dependency(
-                                    task_id,
-                                    *blocker,
-                                    Dependency::MustFinishBefore,
-                                ) {
-                                    Ok(()) => attached += 1,
-                                    Err(e) => {
-                                        warn!(
-                                            target: "orchestrator::coordinator",
-                                            task_id = ?task_id,
-                                            blocker = ?blocker,
-                                            error = %e,
-                                            "Blocked handler: could not attach dependency, blocker id unknown",
-                                        );
-                                        failures.push(e);
-                                    }
-                                }
-                            }
-                            if attached == 0 && !on.is_empty() {
-                                // Every reported blocker is invalid — don't busy-retry.
-                                warn!(
-                                    target: "orchestrator::coordinator",
-                                    task_id = ?task_id,
-                                    blockers = ?on,
-                                    "all reported blockers are unknown; marking task blocked",
-                                );
-                                graph.mark_blocked(&task_id);
-                                terminal_subtask_failure =
-                                    Some(OrchestratorError::TaskGraphError(format!(
-                                    "task {task_id} reported blocked on {} unknown task(s): {:?}",
-                                    on.len(), on
-                                )));
-                                continue;
-                            }
-                            retry_feedback.entry(task_id).or_default().push(result.clone());
-                            graph.mark_pending(&task_id);
-                        } else {
-                            graph.mark_blocked(&task_id);
-                            terminal_subtask_failure =
-                                Some(OrchestratorError::SubTaskRetriesExhausted {
-                                    task_id,
-                                    role: role.clone(),
-                                    attempts: attempt,
-                                    last_error: format!("agent remained blocked on {on:?}"),
-                                });
-                        }
-                    }
-                    _ => {
-                        graph.mark_blocked(&task_id);
-                        terminal_subtask_failure =
-                            Some(OrchestratorError::SubTaskRetriesExhausted {
-                                task_id,
-                                role: role.clone(),
-                                attempts: attempt,
-                                last_error: "unexpected agent outcome".into(),
-                            });
-                        continue;
-                    }
-                }
-
-                // Cycle detection — content-aware via FileDeltaTracker so
-                // that editing the same file across iterations counts as
-                // progress (the old `!files_modified.is_empty()` would reset
-                // on every write, but could not distinguish an actual edit
-                // from a repeated write of identical content).
-                let has_progress =
-                    self.file_delta.has_progress_since(&task_id, &result.files_modified);
-                // ADR-58 P2+P3 (R11): Rule B keys on the gate being executed —
-                // the tag of the gate stage in which the role is staffed,
-                // resolved through the blueprint facade (which also classifies
-                // custom gate tags), falling back to the role's registered
-                // stage and then the legacy `AgentStage::is_review`
-                // classification when no facade is attached. The coordinator
-                // sentinel is never registered, so for self-execution this
-                // stays `None` and Rule B never fires on it.
-                let stage = match &self.blueprint_facade {
-                    Some(facade) => facade
-                        .stage_for_agent(&role)
-                        .filter(|stage| stage.def.is_gate())
-                        .map(|stage| AgentStage::new(&stage.def.tag))
-                        .or_else(|| self.stage_of(&role)),
-                    None => self.stage_of(&role),
-                };
-                self.cycle_state.record(
-                    task.session_id,
-                    task_id,
-                    role,
-                    stage,
-                    &desc,
-                    &deps,
-                    has_progress,
-                )?;
-            }
+            // ── 2d. Process results sequentially (W3e): settle the dispatched
+            // batch in ONE ordered unit ([`Self::process_batch_results`]) ─────────
+            let cancelled_during_batch = self
+                .process_batch_results(
+                    batch_results,
+                    &batch,
+                    &session,
+                    &parent_task,
+                    &working_memory,
+                    &retrieved_chunks,
+                    &cancel,
+                    &task,
+                    &mut graph,
+                    &mut completed_results,
+                    &mut total_cost,
+                    &mut total_tool_calls,
+                    &mut all_files,
+                    &mut provider_metrics,
+                    &mut subtask_attempts,
+                    &mut retry_feedback,
+                    &mut model_assignments,
+                    &mut action_ledger,
+                    &mut terminal_subtask_failure,
+                    &mut non_recoverable_exit,
+                    &mut zero_file_revision_queued_roots,
+                    &mut recoverable_notes,
+                    design_role.as_ref(),
+                    &implement_ids,
+                )
+                .await?;
 
             refresh_working_memory(
                 &mut context,
@@ -11102,6 +10094,1057 @@ impl CoordinatorAgent {
                 Err(e)
             }
         }
+    }
+
+    /// W3e (execute_graph 2d): settle one dispatched batch sequentially in ONE
+    /// ordered async unit. The per-result escalation / ADR-42 fallback ladder /
+    /// replan / zero-file handling and the ledger + action-ledger + metrics
+    /// mutations stay in this one body in their original order — the ladder and
+    /// replan side effects are never split apart. Mutated run state is threaded
+    /// as `&mut` pass-through (no snapshot-write-back); the caller resumes at
+    /// `refresh_working_memory`. Returns the batch's `cancelled_during_batch`.
+    #[allow(clippy::too_many_arguments)]
+    async fn process_batch_results(
+        &mut self,
+        batch_results: Vec<(TaskId, AgentId, String, Result<AgentRunResult, OrchestratorError>)>,
+        batch: &[ReadyTask],
+        session: &concerto_core::types::SessionContext,
+        parent_task: &AgentTask,
+        working_memory: &concerto_core::memory::WorkingMemorySnapshot,
+        retrieved_chunks: &[MemoryChunk],
+        cancel: &CancellationToken,
+        task: &AgentTask,
+        graph: &mut TaskGraph,
+        completed_results: &mut HashMap<TaskId, AgentRunResult>,
+        total_cost: &mut f64,
+        total_tool_calls: &mut u32,
+        all_files: &mut Vec<camino::Utf8PathBuf>,
+        provider_metrics: &mut Vec<ProviderMetrics>,
+        subtask_attempts: &mut HashMap<TaskId, u32>,
+        retry_feedback: &mut HashMap<TaskId, Vec<AgentRunResult>>,
+        model_assignments: &mut HashMap<TaskId, String>,
+        action_ledger: &mut Vec<checkpoint::CheckpointAction>,
+        terminal_subtask_failure: &mut Option<OrchestratorError>,
+        non_recoverable_exit: &mut Option<(TaskId, AgentId, OrchestratorError)>,
+        zero_file_revision_queued_roots: &mut HashSet<TaskId>,
+        recoverable_notes: &mut Vec<String>,
+        design_role: Option<&AgentId>,
+        implement_ids: &[AgentId],
+    ) -> Result<bool, OrchestratorError> {
+        let mut cancelled_during_batch = false;
+        for (task_id, role, model, result_or_err) in batch_results {
+            let attempt = subtask_attempts.get(&task_id).copied().unwrap_or(1);
+            // Record which model actually ran this task (reproducibility).
+            if !model.is_empty() {
+                model_assignments.insert(task_id, model);
+            }
+
+            let result = match result_or_err {
+                Ok(result) => result,
+                Err(e) => {
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        task_id.0,
+                        EventKind::SubTaskFailed {
+                            task_id,
+                            role: role.clone(),
+                            error: e.to_string(),
+                        },
+                    );
+                    if is_cancellation_error(&e) {
+                        graph.mark_pending(&task_id);
+                        cancelled_during_batch = true;
+                        continue;
+                    }
+                    // Issue #54: normalize the error into ONE structured
+                    // diagnosis at the point the failure surfaces; the
+                    // recovery below is deterministic from it (the class
+                    // mapping preserves ADR-42 §1 behavior), and the
+                    // diagnosis rides the audit trail (events + whiteboard
+                    // + the checkpointed history).
+                    let diagnosis = crate::failure_diagnosis::diagnose(&e);
+                    self.record_failure_diagnosis(
+                        task.session_id,
+                        Some(task_id),
+                        &role,
+                        &diagnosis,
+                    )
+                    .await;
+                    match SubtaskFailureClass::from(&diagnosis) {
+                        // Transient errors retry the same agent/model
+                        // while attempts remain (ADR-42 §1 Recoverable).
+                        SubtaskFailureClass::Recoverable if attempt < self.max_subtask_attempts => {
+                            retry_feedback.entry(task_id).or_default().push(failed_attempt_result(
+                                task_id,
+                                role.clone(),
+                                e.to_string(),
+                            ));
+                            graph.mark_pending(&task_id);
+                            let _ = self.bus.publish_for_session(task.session_id, task_id.0, EventKind::AgentThought {
+                                agent_id: "coordinator".into(),
+                                content: format!(
+                                    "Retrying {role} subtask {task_id} after recoverable failure (attempt {attempt}/{}): {e}", self.max_subtask_attempts
+                                ),
+                                kind: ThinkingKind::Detail,
+                            });
+                            continue;
+                        }
+                        // Retries exhausted (Recoverable) or a
+                        // provider/model-specific hard failure
+                        // (LimitReached): walk the ADR-42 fallback ladder
+                        // before any Partial exit. Recoverable errors keep
+                        // the one-shot escalation retry first. Note the
+                        // asymmetry with the outcome arm: this block
+                        // escalates ONLY Recoverable errors — LimitReached
+                        // (auth, context overflow, no-affordable-model)
+                        // skips escalation and enters the ladder directly,
+                        // while the outcome arm escalates any non-implement
+                        // failure regardless of class.
+                        SubtaskFailureClass::Recoverable | SubtaskFailureClass::LimitReached => {
+                            // ── Escalation retry ─────────────────────
+                            // On the final retry attempt of a recoverable
+                            // error, do one escalation retry before the
+                            // ladder. Escalation is limited to once per
+                            // task per run by the escalation_attempted set.
+                            //
+                            // Attempt-math confirmation (see the outcome
+                            // arm for the same shape): the counter is
+                            // incremented at dispatch time (batch build,
+                            // `subtask_attempts.entry(t).or_insert(0) += 1`)
+                            // and read here as `attempt`. Retries fire for
+                            // attempts 1..=2 (`attempt < MAX`); attempt 3
+                            // falls through to this block. The reset to
+                            // `MAX - 1` makes the NEXT dispatch read
+                            // exactly `MAX` again, so the retry arm does
+                            // NOT re-fire on the escalated dispatch — the
+                            // extra dispatch comes from `mark_pending` +
+                            // `continue` (the re-pended task re-enters the
+                            // ready queue). Net effect: exactly ONE
+                            // additional dispatch per task per run, with
+                            // the escalated failure appended to
+                            // `retry_feedback` (surfaced to the agent as
+                            // previous results). Without the reset the
+                            // counter would drift to MAX + 1, skewing the
+                            // `attempt {attempt}/{MAX}` reporting.
+                            let is_recoverable = matches!(
+                                SubtaskFailureClass::from(&diagnosis),
+                                SubtaskFailureClass::Recoverable
+                            );
+                            if is_recoverable && !self.escalation_attempted.contains(&task_id) {
+                                self.escalation_attempted.insert(task_id);
+                                subtask_attempts
+                                    .insert(task_id, self.max_subtask_attempts.saturating_sub(1));
+                                retry_feedback.entry(task_id).or_default().push(
+                                    failed_attempt_result(
+                                        task_id,
+                                        role.clone(),
+                                        format!("{e} (escalation retry)"),
+                                    ),
+                                );
+                                graph.mark_pending(&task_id);
+                                let _ = self.bus.publish_for_session(
+                                    task.session_id,
+                                    task_id.0,
+                                    EventKind::AgentThought {
+                                        agent_id: "coordinator".into(),
+                                        content: format!(
+                                            "Escalating {role} subtask {task_id} — escalation retry \
+                                         (attempt {attempt}/{} exhausted)", self.max_subtask_attempts
+                                        ),
+                                        kind: ThinkingKind::Detail,
+                                    },
+                                );
+                                continue;
+                            }
+
+                            // ── ADR-42 fallback ladder ───────────────
+                            // Rebuild the per-task dispatch context for
+                            // the ladder (the original was consumed inside
+                            // the async dispatch closure above).
+                            let Some(ladder_entry) = batch.iter().find(|entry| entry.id == task_id)
+                            else {
+                                graph.mark_blocked(&task_id);
+                                *terminal_subtask_failure =
+                                    Some(OrchestratorError::SubTaskRetriesExhausted {
+                                        task_id,
+                                        role,
+                                        attempts: attempt,
+                                        last_error: e.to_string(),
+                                    });
+                                continue;
+                            };
+                            let ladder_artifacts = self
+                                .expected_artifacts
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .get(&task_id)
+                                .cloned()
+                                .unwrap_or_default();
+                            let ladder_ctx = AgentContext {
+                                session: session.clone(),
+                                parent_task: Some(parent_task.clone()),
+                                working_memory: working_memory.clone(),
+                                retrieved_chunks: retrieved_chunks.to_vec(),
+                                previous_results: ladder_entry.previous_results.clone(),
+                                budget_remaining_usd: None,
+                                expected_artifacts: ladder_artifacts,
+                                workspace_capsule: None,
+                                workspace_snapshot_digest: self.snapshot_digest(cancel).await,
+                                run_id: self.run_id.clone(),
+                                workspace_generation: self.snapshot_generation(),
+                            };
+                            match self
+                                .attempt_fallback_ladder(
+                                    &ladder_entry.subtask,
+                                    &role,
+                                    &e,
+                                    &ladder_ctx,
+                                    cancel,
+                                )
+                                .await
+                            {
+                                // Ladder Success always carries a genuine
+                                // Success outcome (see the outcome arm):
+                                // yielding it here completes the subtask.
+                                FallbackOutcome::Success(result) => *result,
+                                FallbackOutcome::Cancelled => {
+                                    graph.mark_pending(&task_id);
+                                    cancelled_during_batch = true;
+                                    continue;
+                                }
+                                FallbackOutcome::Exhausted => {
+                                    graph.mark_blocked(&task_id);
+                                    *terminal_subtask_failure =
+                                        Some(OrchestratorError::SubTaskRetriesExhausted {
+                                            task_id,
+                                            role,
+                                            attempts: attempt,
+                                            last_error: e.to_string(),
+                                        });
+                                    continue;
+                                }
+                            }
+                        }
+                        // Structural errors (cancellation, invalid task
+                        // graph, cycle detection, planning failure) exit
+                        // immediately via the graceful non-recoverable
+                        // path. ADR-42 reclassifies the former
+                        // non-recoverable provider/model-specific family
+                        // (auth, context overflow, no-affordable-model) as
+                        // LimitReached, so it now walks the ladder above
+                        // instead of reaching this arm. Audit §3.4: the
+                        // previous code did `return Err(e)` here, which:
+                        //   (a) discarded `all_files`, `provider_metrics`,
+                        //       and any successful siblings already
+                        //       processed earlier in this same
+                        //       `batch_results` loop,
+                        //   (b) dropped subsequent siblings still queued
+                        //       in `batch_results` without processing
+                        //       their success/failure,
+                        //   (c) bypassed every graceful-completion path
+                        //       the rest of `run` builds (the empty-queue
+                        //       terminal-failure exit below does the same
+                        //       thing for *recoverable* errors after
+                        //       retries are exhausted).
+                        // Instead, stash the error so we can finish the
+                        // current batch, then surface a Partial AgentOutput
+                        // through the same graceful-degradation
+                        // construction used at the empty-queue exit.
+                        SubtaskFailureClass::NonRecoverable => {
+                            tracing::warn!(
+                                target: "orchestrator::coordinator",
+                                task_id = ?task_id,
+                                role = ?role,
+                                error = %e,
+                                "non-recoverable subtask error; draining batch then surfacing partial AgentOutput",
+                            );
+                            *non_recoverable_exit = Some((task_id, role, e));
+                            // Skip the success-path processing for this
+                            // errored task; the outer loop tail will detect
+                            // `non_recoverable_exit` and return the graceful
+                            // Partial AgentOutput after the rest of `batch_results`
+                            // has been processed.
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            // Record the outcome in the checkpoint action ledger.
+            // ADR-65 §7: the dispatched step settled — the pending
+            // decision it recorded no longer awaits completion.
+            if self.last_dispatch_decision.as_ref().and_then(|pending| pending.task_id)
+                == Some(task_id)
+            {
+                self.last_dispatch_decision = None;
+            }
+            action_ledger.push(checkpoint::CheckpointAction {
+                kind: if matches!(result.outcome, AgentOutcome::Success) {
+                    "completed".into()
+                } else {
+                    "failed".into()
+                },
+                task_id: Some(task_id),
+                timestamp: time::OffsetDateTime::now_utc(),
+                evidence: None,
+            });
+
+            *total_cost += result.cost_usd;
+            *total_tool_calls += result.tool_call_count;
+            all_files.extend(result.files_modified.clone());
+            let settled = metrics_from_result(&result);
+            provider_metrics.push(settled.clone());
+            self.settled_metrics.push(settled);
+            let stop_followups = cancel.is_cancelled();
+            cancelled_during_batch |= stop_followups;
+            let (desc, deps, sid) = {
+                let entry = batch.iter().find(|entry| entry.id == task_id).ok_or_else(|| {
+                    OrchestratorError::InvalidTaskGraph {
+                        reason: format!("completed task {task_id} was not in dispatched batch"),
+                    }
+                })?;
+                (entry.description.clone(), entry.dependencies.clone(), entry.subtask.session_id)
+            };
+            match result.outcome.clone() {
+                AgentOutcome::Success => {
+                    if let Some(subtask) = graph.get_mut(&task_id) {
+                        subtask.deliverable = Some(result.summary.clone());
+                    }
+                    completed_results.insert(task_id, result.clone());
+                    retry_feedback.remove(&task_id);
+                    // A success ends any identical-failure run.
+                    self.identical_failures.record_success(task_id);
+                    graph.mark_done(&task_id);
+                    // Issue #61: the subtask settled completed — the role's
+                    // ownerships release (evented via the attached gate).
+                    self.settle_release_task_ownership(&role, "subtask settled: completed").await;
+                    // Phase 6 M3b: persist the settled outcome into the
+                    // shared decision/task stores so the next Phase-0
+                    // retrieval (M3a) is grounded in what this run already
+                    // decided. Best-effort — settlement never fails
+                    // because memory did.
+                    self.write_back_memory_outcome(&task_id, &role, &result, sid, &desc, &deps);
+
+                    // ── Replan fallback: design-stage redesign complete ──
+                    // When a design-stage replan subtask finishes
+                    // successfully, parse its DesignDoc and spawn a new
+                    // implement-stage subtask (same role as the original)
+                    // with the revised expected artifacts. The design
+                    // classification is facade-resolved by kind, so a
+                    // renamed Planning stage keeps replanning (issue
+                    // #150).
+                    if self.role_in_kind_stage(&role, StageKind::Planning, AgentStage::is_design)
+                        && !stop_followups
+                    {
+                        let parent_id = graph.get(&task_id).and_then(|st| st.parent_id);
+                        if let Some(orig_impl_id) = parent_id {
+                            if self.replan_attempts.contains_key(&orig_impl_id) {
+                                let design_doc: Option<DesignDoc> =
+                                    crate::prompts::parse_json_substring(&result.summary);
+                                // A replan supersedes the original plan;
+                                // keep the newest DesignDoc for checkpoints.
+                                if let Some(ref doc) = design_doc {
+                                    *self
+                                        .design_doc
+                                        .lock()
+                                        .unwrap_or_else(|error| error.into_inner()) =
+                                        Some(doc.clone());
+                                }
+                                // The follow-up implement task keeps the
+                                // original role (which may be a custom
+                                // implement-stage agent, ADR-35 §5).
+                                let implement_role = graph
+                                    .get(&orig_impl_id)
+                                    .map(|t| t.role.clone())
+                                    .or_else(|| implement_ids.first().cloned());
+
+                                let (new_expected, new_desc) = if let Some(ref doc) = design_doc {
+                                    let files = if doc.proposed_files.is_empty() {
+                                        self.expected_artifacts
+                                            .lock()
+                                            .unwrap_or_else(|error| error.into_inner())
+                                            .get(&orig_impl_id)
+                                            .cloned()
+                                            .unwrap_or_default()
+                                    } else {
+                                        // Declaration boundary (see the
+                                        // DesignDoc dispatch insert): keep
+                                        // the path, drop `": <description>"`.
+                                        crate::declared_artifacts::declared_paths(
+                                            &doc.proposed_files,
+                                        )
+                                    };
+                                    let orig_desc = graph
+                                        .get(&orig_impl_id)
+                                        .map(|t| t.description.clone())
+                                        .unwrap_or_default();
+                                    let desc = if doc.goals.is_empty() {
+                                        format!("Re-implement based on revised design: {orig_desc}")
+                                    } else {
+                                        format!(
+                                            "Re-implement based on revised design: {}",
+                                            doc.goals.join("; ")
+                                        )
+                                    };
+                                    (files, desc)
+                                } else {
+                                    let fallback_expected = self
+                                        .expected_artifacts
+                                        .lock()
+                                        .unwrap_or_else(|error| error.into_inner())
+                                        .get(&orig_impl_id)
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    let orig_desc = graph
+                                        .get(&orig_impl_id)
+                                        .map(|t| t.description.clone())
+                                        .unwrap_or_default();
+                                    (
+                                        fallback_expected,
+                                        format!(
+                                            "Re-implement based on revised design: {orig_desc}"
+                                        ),
+                                    )
+                                };
+
+                                if let Some(implement_role) = implement_role {
+                                    let new_coder_desc = new_desc;
+                                    let new_coder = SubTask {
+                                        id: TaskId::new(),
+                                        parent_id: Some(task_id),
+                                        session_id: sid,
+                                        role: implement_role.clone(),
+                                        description: new_coder_desc.clone(),
+                                        status: SubTaskStatus::Pending,
+                                        dependencies: vec![task_id],
+                                        deliverable: None,
+                                        created_at: time::OffsetDateTime::now_utc(),
+                                        completed_at: None,
+                                    };
+                                    let new_coder_id = new_coder.id;
+
+                                    // Record this new implement task in
+                                    // replan_attempts so that if it also
+                                    // fails with an artifact error we do
+                                    // not attempt a second cascading
+                                    // replan.
+                                    self.replan_attempts.insert(new_coder_id, 1);
+
+                                    self.expected_artifacts
+                                        .lock()
+                                        .unwrap_or_else(|error| error.into_inner())
+                                        .insert(new_coder_id, new_expected);
+
+                                    graph.add_child(
+                                        new_coder,
+                                        task_id,
+                                        Dependency::MustFinishBefore,
+                                    );
+
+                                    let _ = self.bus.publish_for_session(
+                                        sid,
+                                        task_id.0,
+                                        EventKind::SubTaskCreated {
+                                            task_id: new_coder_id,
+                                            role: implement_role,
+                                            description: new_coder_desc,
+                                        },
+                                    );
+                                    let _ = self.bus.publish_for_session(
+                                        sid,
+                                        task_id.0,
+                                        EventKind::AgentThought {
+                                            agent_id: "coordinator".into(),
+                                            content: format!(
+                                                "Design redesign complete. Spawning new implementation subtask {new_coder_id} for re-implementation."
+                                            ),
+                                            kind: ThinkingKind::Detail,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // ── Zero-file implement success short-circuit ─────
+                    // An implement-stage agent that "succeeds" without
+                    // writing any file has no deliverable for the review
+                    // cycle to inspect. Skip the reviewer model call and
+                    // directly queue the correction task the review
+                    // outcome would have produced (the Revision subtask
+                    // pattern below) instead of spending a reviewer call
+                    // to rediscover that no deliverable exists.
+                    //
+                    // Bounded once per lineage, in two steps:
+                    // 1. The FIRST zero-file success in a lineage skips
+                    //    the reviewer and queues a revision — the
+                    //    deliverable may simply be missing because the
+                    //    model under-performed, and a revision is a cheap
+                    //    second chance.
+                    // 2. A SUBSEQUENT zero-file implement success in the
+                    //    SAME lineage (the revision/revise pass itself —
+                    //    same role, fresh task id, same lineage root) had
+                    //    its chance to produce the deliverables and
+                    //    produced none. Running the reviewer would only
+                    //    re-discover the missing artifacts and queue yet
+                    //    another revision, spinning forever on an empty
+                    //    `files_modified` — the observed quota-burning
+                    //    loop. That completion FAILS the subtask instead:
+                    //    no further revision is queued and no review
+                    //    cycle starts for that lineage.
+                    //
+                    // Pipelines with no review-stage agent never
+                    // short-circuit: there is no reviewer call to save.
+                    let implement_phase = self.role_in_kind_stage(
+                        &role,
+                        StageKind::Execution,
+                        AgentStage::is_implement,
+                    ) && !stop_followups;
+                    // The short-circuit exists to save a *reviewer* model
+                    // call. Without a review-stage agent in the pipeline
+                    // there is no call to save (`run_review_cycle` is a
+                    // cheap skip), so zero-file successes take the normal
+                    // path instead of injecting a needless revision. The
+                    // review stage is resolved by kind, so a renamed
+                    // review tag keeps the short-circuit (issue #150).
+                    let review_tag = kind_stage_tag(
+                        self.blueprint_facade.as_ref(),
+                        StageKind::Review,
+                        AgentStage::REVIEW,
+                    );
+                    let has_review_stage_agent =
+                        self.first_agent_for_stage(&AgentStage::new(review_tag)).is_some();
+                    let lineage_root = {
+                        let mut root = task_id;
+                        while let Some(parent) = graph.get(&root).and_then(|node| node.parent_id) {
+                            root = parent;
+                        }
+                        root
+                    };
+                    let zero_file_success = result.files_modified.is_empty();
+                    if implement_phase
+                        && zero_file_success
+                        && has_review_stage_agent
+                        && !zero_file_revision_queued_roots.contains(&lineage_root)
+                    {
+                        // Step 1: first zero-file success in this lineage.
+                        zero_file_revision_queued_roots.insert(lineage_root);
+                        let _ = self.bus.publish_for_session(
+                            sid,
+                            task_id.0,
+                            EventKind::AgentThought {
+                                agent_id: "coordinator".into(),
+                                content: format!(
+                                    "Coder subtask {task_id} completed with no file changes; queuing revision without running the review cycle."
+                                ),
+                                kind: ThinkingKind::Detail,
+                            },
+                        );
+                        recoverable_notes.push(format!(
+                            "Coder subtask {task_id} completed with no file changes; revision queued without running the review cycle."
+                        ));
+                        self.queue_revision_subtask(
+                            &mut *graph,
+                            task_id,
+                            sid,
+                            role.clone(),
+                            "completed with no file changes".into(),
+                        );
+                    } else if implement_phase && zero_file_success && has_review_stage_agent {
+                        // Step 2: a zero-file implement success after the
+                        // short-circuit already fired for this lineage is
+                        // the revision/revise pass itself, and it produced
+                        // no deliverable. Fail the subtask terminally so
+                        // the run surfaces the missing deliverables
+                        // instead of burning the quota on a
+                        // revision → zero-file → revision loop.
+                        let zero_file_error = format!(
+                            "subtask {task_id} ({role:?}) completed with no file \
+                             changes after revision; required deliverables were \
+                             not produced"
+                        );
+                        let _ = self.bus.publish_for_session(
+                            sid,
+                            task_id.0,
+                            EventKind::SubTaskFailed {
+                                task_id,
+                                role: role.clone(),
+                                error: zero_file_error.clone(),
+                            },
+                        );
+                        graph.mark_blocked(&task_id);
+                        *terminal_subtask_failure =
+                            Some(OrchestratorError::SubTaskRetriesExhausted {
+                                task_id,
+                                role,
+                                attempts: attempt,
+                                last_error: zero_file_error,
+                            });
+                        continue;
+                    }
+                }
+                AgentOutcome::NeedsRevision { reason } => {
+                    if let Some(subtask) = graph.get_mut(&task_id) {
+                        subtask.deliverable = Some(result.summary.clone());
+                    }
+                    completed_results.insert(task_id, result.clone());
+                    retry_feedback.remove(&task_id);
+                    graph.mark_done(&task_id);
+                    if stop_followups {
+                        continue;
+                    }
+                    // The revision subtask reuses the original
+                    // implement-stage role (custom or built-in).
+                    self.queue_revision_subtask(&mut *graph, task_id, sid, role.clone(), reason);
+                }
+                AgentOutcome::Failed { error } => {
+                    // Issue #61: failure is a settle — release the role's
+                    // leases; a retrying generation re-acquires on its
+                    // first write.
+                    self.settle_release_task_ownership(&role, "subtask settled: failed").await;
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        task_id.0,
+                        EventKind::SubTaskFailed {
+                            task_id,
+                            role: role.clone(),
+                            error: error.clone(),
+                        },
+                    );
+                    // Issue #54: normalize the settled failure into the
+                    // structured diagnosis (artifact-contract misses,
+                    // malformed output, generic agent failures) and put
+                    // it on the audit trail; the retry/escalation/replan/
+                    // ladder flow below is the recovery the diagnosis's
+                    // flags map onto.
+                    let diagnosis = crate::failure_diagnosis::diagnose_outcome_failure(&error);
+                    self.record_failure_diagnosis(
+                        task.session_id,
+                        Some(task_id),
+                        &role,
+                        &diagnosis,
+                    )
+                    .await;
+                    // Smoke fix (clap-derive 101): identical failures
+                    // repeated consecutively are deterministic — another
+                    // same-agent retry is unlikely to make progress. The
+                    // repeat diagnosis is injected as tool-result context
+                    // (an advisory recommendation) so the Coordinator can
+                    // weigh retry vs escalation; the retry/escalate choice
+                    // is never forced here.
+                    let identical_repeat = self.identical_failures.record_failure(task_id, &error);
+                    if identical_repeat {
+                        let repeated = self.identical_failures.consecutive(task_id);
+                        let repeat_diag =
+                            crate::failure_diagnosis::diagnose_identical_repeat(&error, repeated);
+                        self.record_failure_diagnosis(
+                            task.session_id,
+                            Some(task_id),
+                            &role,
+                            &repeat_diag,
+                        )
+                        .await;
+                        let _ = self.bus.publish_for_session(
+                            task.session_id,
+                            task_id.0,
+                            EventKind::AgentThought {
+                                agent_id: "coordinator".into(),
+                                content: format!(
+                                    "Recommendation for {role} subtask {task_id}: identical \
+                                     failure repeated {repeated}× consecutively (threshold {}); \
+                                     escalating (rather than retrying the same agent) is \
+                                     recommended — the Coordinator decides.",
+                                    crate::failure_diagnosis::IDENTICAL_FAILURE_ESCALATION_THRESHOLD,
+                                ),
+                                kind: ThinkingKind::Detail,
+                            },
+                        );
+                    }
+                    if attempt < self.max_subtask_attempts {
+                        retry_feedback.entry(task_id).or_default().push(result.clone());
+                        graph.mark_pending(&task_id);
+                        let _ = self.bus.publish_for_session(task.session_id, task_id.0, EventKind::AgentThought {
+                            agent_id: "coordinator".into(),
+                            content: format!(
+                                "Retrying {role} subtask {task_id} with failure feedback (attempt {attempt}/{}): {error}", self.max_subtask_attempts
+                            ),
+                            kind: ThinkingKind::Detail,
+                        });
+                        continue;
+                    }
+
+                    // ── Escalation retry (non-implement) ─────────────────────
+                    // For non-implement failures that have exhausted normal
+                    // retries, try one escalation retry before giving up. This
+                    // gives the agent one more attempt with accumulated failure
+                    // feedback, which can help with design/research roles where
+                    // the model may produce a better result with more context.
+                    // Implement-stage failures instead funnel into the replan
+                    // fallback below.
+                    //
+                    // Attempt-math confirmation (identical to the
+                    // dispatch-error arm): the counter is incremented at
+                    // dispatch time and read here as `attempt`. Retries
+                    // fire for attempts 1..=2; the reset to `MAX - 1`
+                    // makes the next dispatch read exactly `MAX`, so the
+                    // retry arm does NOT re-fire on the escalated dispatch
+                    // — the extra dispatch comes from `mark_pending` +
+                    // `continue`. Net effect: exactly ONE additional
+                    // dispatch per task per run with the failed result
+                    // appended to `retry_feedback`.
+                    if !self.role_in_kind_stage(
+                        &role,
+                        StageKind::Execution,
+                        AgentStage::is_implement,
+                    ) && !self.escalation_attempted.contains(&task_id)
+                    {
+                        self.escalation_attempted.insert(task_id);
+                        subtask_attempts
+                            .insert(task_id, self.max_subtask_attempts.saturating_sub(1));
+                        retry_feedback.entry(task_id).or_default().push(result.clone());
+                        graph.mark_pending(&task_id);
+                        let _ = self.bus.publish_for_session(
+                            task.session_id,
+                            task_id.0,
+                            EventKind::AgentThought {
+                                agent_id: "coordinator".into(),
+                                content: format!(
+                                    "Escalating {role} subtask {task_id} — escalation retry \
+                                 (attempt {attempt}/{} exhausted, role-based)",
+                                    self.max_subtask_attempts
+                                ),
+                                kind: ThinkingKind::Detail,
+                            },
+                        );
+                        continue;
+                    }
+
+                    // ── Replan fallback (implement-stage only) ─────────────
+                    // If an implement-stage subtask exhausts its retries
+                    // because expected artifacts were not produced, escalate
+                    // to the design-stage agent for a design revision instead
+                    // of giving up immediately. Pipelines without a
+                    // design-stage agent have no redesign path and fall
+                    // through to blocked.
+                    if let Some(design_role) = design_role {
+                        if self.role_in_kind_stage(
+                            &role,
+                            StageKind::Execution,
+                            AgentStage::is_implement,
+                        ) && is_artifact_failure(&error)
+                            && !self.replan_attempts.contains_key(&task_id)
+                        {
+                            self.replan_attempts.insert(task_id, 1);
+
+                            // Complete the original implement task so the
+                            // replan design task (which depends on it) becomes
+                            // ready.
+                            graph.mark_done(&task_id);
+                            completed_results.insert(task_id, result.clone());
+                            retry_feedback.remove(&task_id);
+
+                            // Copy the original task's expected artifacts so
+                            // the design agent knows what files were expected.
+                            let orig_expected = self
+                                .expected_artifacts
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .get(&task_id)
+                                .cloned()
+                                .unwrap_or_default();
+
+                            let arch_replan = SubTask {
+                                id: TaskId::new(),
+                                parent_id: Some(task_id),
+                                session_id: sid,
+                                role: design_role.clone(),
+                                description: format!("Replan: {desc}"),
+                                status: SubTaskStatus::Pending,
+                                dependencies: vec![task_id],
+                                deliverable: None,
+                                created_at: time::OffsetDateTime::now_utc(),
+                                completed_at: None,
+                            };
+                            let arch_replan_id = arch_replan.id;
+
+                            self.expected_artifacts
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .insert(arch_replan_id, orig_expected);
+
+                            graph.add_child(arch_replan, task_id, Dependency::MustFinishBefore);
+
+                            // Publish a handoff event: implement → design
+                            let handoff = AgentHandoff::new(
+                                role.clone(),
+                                design_role.clone(),
+                                task_id,
+                                "Implementing agent could not produce expected artifacts; replanning design"
+                                    .into(),
+                                HandoffDeliverable::Design(error.clone()),
+                            );
+                            let _ = self.bus.publish_for_session(
+                                sid,
+                                task_id.0,
+                                EventKind::AgentHandoff {
+                                    from: handoff.from,
+                                    to: handoff.to,
+                                    task_id: handoff.task_id,
+                                    rationale: handoff.rationale.clone(),
+                                },
+                            );
+                            let _ = self.bus.publish_for_session(
+                                sid,
+                                task_id.0,
+                                EventKind::AgentThought {
+                                    agent_id: "coordinator".into(),
+                                    content: format!(
+                                        "Implement subtask {task_id} exhausted attempts producing expected artifacts. Escalating to {design_role} for redesign (replan #1)."
+                                    ),
+                                    kind: ThinkingKind::Detail,
+                                },
+                            );
+                            continue;
+                        }
+                    }
+
+                    // ── ADR-42 fallback ladder ─────────────────────
+                    // Retries (and escalation/replan, where applicable)
+                    // are exhausted: walk the fallback ladder before
+                    // surfacing a partial outcome. The agent-produced
+                    // error string is wrapped for classification purposes
+                    // only — exhaustion already implies LimitReached
+                    // (ADR-42 §1).
+                    let Some(ladder_entry) = batch.iter().find(|entry| entry.id == task_id) else {
+                        graph.mark_blocked(&task_id);
+                        *terminal_subtask_failure =
+                            Some(OrchestratorError::SubTaskRetriesExhausted {
+                                task_id,
+                                role,
+                                attempts: attempt,
+                                last_error: error,
+                            });
+                        continue;
+                    };
+                    let ladder_artifacts = self
+                        .expected_artifacts
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .get(&task_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let ladder_ctx = AgentContext {
+                        session: session.clone(),
+                        parent_task: Some(parent_task.clone()),
+                        working_memory: working_memory.clone(),
+                        retrieved_chunks: retrieved_chunks.to_vec(),
+                        previous_results: ladder_entry.previous_results.clone(),
+                        budget_remaining_usd: None,
+                        expected_artifacts: ladder_artifacts,
+                        workspace_capsule: None,
+                        workspace_snapshot_digest: self.snapshot_digest(cancel).await,
+                        run_id: self.run_id.clone(),
+                        workspace_generation: self.snapshot_generation(),
+                    };
+                    let classify_err = OrchestratorError::AgentLoopError(error.clone());
+                    match self
+                        .attempt_fallback_ladder(
+                            &ladder_entry.subtask,
+                            &role,
+                            &classify_err,
+                            &ladder_ctx,
+                            cancel,
+                        )
+                        .await
+                    {
+                        FallbackOutcome::Success(fb_result) => {
+                            let fb_result = *fb_result;
+                            if !matches!(fb_result.outcome, AgentOutcome::Success) {
+                                // Defense-in-depth: the ladder only reports
+                                // Success for a genuine Success outcome —
+                                // attempt_fallback_ladder sends tier-1
+                                // Ok(Failed) results into tier 2, and tier
+                                // 2 only yields Success on substantive
+                                // output. A non-Success result here is
+                                // terminal: retries are exhausted and the
+                                // per-task guards bound the ladder.
+                                graph.mark_blocked(&task_id);
+                                *terminal_subtask_failure =
+                                    Some(OrchestratorError::SubTaskRetriesExhausted {
+                                        task_id,
+                                        role,
+                                        attempts: attempt,
+                                        last_error: error,
+                                    });
+                                continue;
+                            }
+                            // The ladder completed the subtask: record it
+                            // like a successful dispatch. The fallback is
+                            // a single last-resort attempt, so review /
+                            // follow-up cycles (wired to primary dispatch
+                            // results above) are not re-run here.
+                            action_ledger.push(checkpoint::CheckpointAction {
+                                kind: "completed".into(),
+                                task_id: Some(task_id),
+                                timestamp: time::OffsetDateTime::now_utc(),
+                                evidence: None,
+                            });
+                            *total_cost += fb_result.cost_usd;
+                            *total_tool_calls += fb_result.tool_call_count;
+                            all_files.extend(fb_result.files_modified.clone());
+                            let settled = metrics_from_result(&fb_result);
+                            provider_metrics.push(settled.clone());
+                            self.settled_metrics.push(settled);
+                            if let Some(subtask) = graph.get_mut(&task_id) {
+                                subtask.deliverable = Some(fb_result.summary.clone());
+                            }
+                            completed_results.insert(task_id, fb_result.clone());
+                            retry_feedback.remove(&task_id);
+                            graph.mark_done(&task_id);
+                            // Phase 6 M3b: the ladder settled this subtask
+                            // completed — persist the outcome like any
+                            // successful dispatch so the next Phase-0
+                            // retrieval (M3a) is grounded in what this run
+                            // ended up deciding. Best-effort (fail-soft),
+                            // mirroring the primary Success arm above.
+                            self.write_back_memory_outcome(
+                                &task_id, &role, &fb_result, sid, &desc, &deps,
+                            );
+                            continue;
+                        }
+                        FallbackOutcome::Cancelled => {
+                            // The run is being cancelled (handled at the
+                            // loop top); re-pend the subtask rather than
+                            // failing it.
+                            graph.mark_pending(&task_id);
+                            cancelled_during_batch = true;
+                            continue;
+                        }
+                        FallbackOutcome::Exhausted => {
+                            graph.mark_blocked(&task_id);
+                            *terminal_subtask_failure =
+                                Some(OrchestratorError::SubTaskRetriesExhausted {
+                                    task_id,
+                                    role,
+                                    attempts: attempt,
+                                    last_error: error,
+                                });
+                            continue;
+                        }
+                    }
+                }
+                AgentOutcome::Blocked { on } => {
+                    // Issue #61: a blocked settle also frees the leases
+                    // (recoverable later — a retried task re-acquires).
+                    self.settle_release_task_ownership(&role, "subtask settled: blocked").await;
+                    // Issue #54: a blocked outcome is the Dependency
+                    // dimension — diagnosed and audited before the
+                    // existing dependency-attach/retry handling.
+                    let diagnosis = crate::failure_diagnosis::diagnose_blocked(&on);
+                    self.record_failure_diagnosis(
+                        task.session_id,
+                        Some(task_id),
+                        &role,
+                        &diagnosis,
+                    )
+                    .await;
+                    if attempt < self.max_subtask_attempts {
+                        let mut attached = 0usize;
+                        let mut failures = Vec::new();
+                        for blocker in &on {
+                            match graph.add_dependency(
+                                task_id,
+                                *blocker,
+                                Dependency::MustFinishBefore,
+                            ) {
+                                Ok(()) => attached += 1,
+                                Err(e) => {
+                                    warn!(
+                                        target: "orchestrator::coordinator",
+                                        task_id = ?task_id,
+                                        blocker = ?blocker,
+                                        error = %e,
+                                        "Blocked handler: could not attach dependency, blocker id unknown",
+                                    );
+                                    failures.push(e);
+                                }
+                            }
+                        }
+                        if attached == 0 && !on.is_empty() {
+                            // Every reported blocker is invalid — don't busy-retry.
+                            warn!(
+                                target: "orchestrator::coordinator",
+                                task_id = ?task_id,
+                                blockers = ?on,
+                                "all reported blockers are unknown; marking task blocked",
+                            );
+                            graph.mark_blocked(&task_id);
+                            *terminal_subtask_failure =
+                                Some(OrchestratorError::TaskGraphError(format!(
+                                    "task {task_id} reported blocked on {} unknown task(s): {:?}",
+                                    on.len(),
+                                    on
+                                )));
+                            continue;
+                        }
+                        retry_feedback.entry(task_id).or_default().push(result.clone());
+                        graph.mark_pending(&task_id);
+                    } else {
+                        graph.mark_blocked(&task_id);
+                        *terminal_subtask_failure =
+                            Some(OrchestratorError::SubTaskRetriesExhausted {
+                                task_id,
+                                role: role.clone(),
+                                attempts: attempt,
+                                last_error: format!("agent remained blocked on {on:?}"),
+                            });
+                    }
+                }
+                _ => {
+                    graph.mark_blocked(&task_id);
+                    *terminal_subtask_failure = Some(OrchestratorError::SubTaskRetriesExhausted {
+                        task_id,
+                        role: role.clone(),
+                        attempts: attempt,
+                        last_error: "unexpected agent outcome".into(),
+                    });
+                    continue;
+                }
+            }
+
+            // Cycle detection — content-aware via FileDeltaTracker so
+            // that editing the same file across iterations counts as
+            // progress (the old `!files_modified.is_empty()` would reset
+            // on every write, but could not distinguish an actual edit
+            // from a repeated write of identical content).
+            let has_progress = self.file_delta.has_progress_since(&task_id, &result.files_modified);
+            // ADR-58 P2+P3 (R11): Rule B keys on the gate being executed —
+            // the tag of the gate stage in which the role is staffed,
+            // resolved through the blueprint facade (which also classifies
+            // custom gate tags), falling back to the role's registered
+            // stage and then the legacy `AgentStage::is_review`
+            // classification when no facade is attached. The coordinator
+            // sentinel is never registered, so for self-execution this
+            // stays `None` and Rule B never fires on it.
+            let stage = match &self.blueprint_facade {
+                Some(facade) => facade
+                    .stage_for_agent(&role)
+                    .filter(|stage| stage.def.is_gate())
+                    .map(|stage| AgentStage::new(&stage.def.tag))
+                    .or_else(|| self.stage_of(&role)),
+                None => self.stage_of(&role),
+            };
+            self.cycle_state.record(
+                task.session_id,
+                task_id,
+                role,
+                stage,
+                &desc,
+                &deps,
+                has_progress,
+            )?;
+        }
+        Ok(cancelled_during_batch)
     }
 
     // ── review cycle (§3.8) ─────────────────────────────────────────────
@@ -13580,6 +13623,59 @@ impl CoordinatorAgent {
             Err(error) => return error,
         };
 
+        // ── W3d: materialize the SubTask, dispatch the specialist and settle
+        // it as ONE ordered async unit ([`Self::run_specialist`]) ──────────
+        self.run_specialist(
+            graph,
+            task,
+            base_ctx,
+            cancel,
+            scope,
+            ledger,
+            state,
+            design_role,
+            agent,
+            agent_id,
+            subtask_id,
+            decision_id,
+            description,
+            dispatch_artifacts,
+            world_model_advisory,
+            suitability_class,
+            suitability_now,
+        )
+        .await
+    }
+
+    /// W3d (handle_call_specialist P9-P15): materialize the dispatched SubTask
+    /// node, attach the binding-doc artifact contract, issue the specialist run
+    /// and settle its outcome — the DesignDoc verifier chain, the outcome +
+    /// ledger/metrics record, the same-role cap update and the checkpoint — as
+    /// ONE ordered async unit. The whole await-ordered mutation chain is frozen
+    /// here and `graph`/`ledger`/`state`/`scope` are `&mut` pass-through (no
+    /// snapshot-write-back), so the caller's later reads are unchanged. Returns
+    /// the `call_specialist` tool result.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_specialist(
+        &mut self,
+        graph: &mut TaskGraph,
+        task: &AgentTask,
+        base_ctx: &AgentContext,
+        cancel: &CancellationToken,
+        scope: &mut checkpoint::CheckpointScope,
+        ledger: &mut DispatchLedger,
+        state: &mut DispatchSessionState,
+        design_role: Option<&AgentId>,
+        agent: Arc<dyn ExpertAgent>,
+        agent_id: AgentId,
+        subtask_id: TaskId,
+        decision_id: String,
+        description: String,
+        dispatch_artifacts: Vec<String>,
+        world_model_advisory: Option<serde_json::Value>,
+        suitability_class: crate::suitability::TaskClass,
+        suitability_now: time::OffsetDateTime,
+    ) -> serde_json::Value {
         // ── Materialize the SubTask node — the graph RECORDS the decision ──
         // An adopted declaration keeps its declared chain position (parent,
         // dependencies); only its description is refined to this dispatch's
