@@ -1437,6 +1437,81 @@ async fn resolve_auto_apply_binding(
     Ok(None)
 }
 
+/// W3b (run_shared_agent P6c): perform the ADR-55 §4 auto-Apply intercept for
+/// a hash-verified stored plan binding in ONE ordered unit. The revision
+/// snapshot (`current_source_revision`) precedes the `record_plan_decision`
+/// audit write, which precedes the two-store consume (in-memory registry
+/// removal, then the durable `delete_plan_binding`), and the run-scoped grant
+/// decision lands last — the same order the interception always ran in.
+/// `plan_decision` / `applied_plan` / `approval_time_revision` are mutated in
+/// place so the caller's later reads are unchanged. The durable delete is
+/// fail-soft (a missing row is a warn, never an abort).
+#[allow(clippy::too_many_arguments)]
+async fn apply_bound_plan(
+    binding: PlanBinding,
+    executor: &ToolExecutor,
+    session_id: Ulid,
+    session_store: Option<&Arc<dyn SessionStore>>,
+    project_dir: &std::path::Path,
+    cancel: &CancellationToken,
+    intent_store: &Arc<IntentGrantStore>,
+    plan_decision: &mut Option<PlanDecision>,
+    applied_plan: &mut Option<PlanBinding>,
+    approval_time_revision: &mut Option<String>,
+) {
+    // ADR-55 §4: auto-Apply — no dialog. The binding was
+    // hash-verified at interception ([`resolve_auto_apply_binding`]);
+    // consume it in both stores so a later run cannot re-apply an
+    // already-executed plan.
+    let objective_hash = binding.objective_hash();
+    let current_revision = current_source_revision(project_dir).await;
+    *approval_time_revision = current_revision.clone();
+    let binding_revision = binding.source_revision().unwrap_or("unknown");
+    // The auto decision is audited under the synthetic `intent:plan`
+    // identity with plan_id + source revision in the user response
+    // (`auto_apply`, ADR-55 §6).
+    executor
+        .record_plan_decision(
+            session_id,
+            Ulid::new(),
+            binding.plan_id(),
+            objective_hash,
+            current_revision.as_deref(),
+            // ADR-55 §6: the plan-decision seam gains the
+            // `auto_apply` variant.
+            "auto_apply",
+            cancel.clone(),
+        )
+        .await;
+    tracing::info!(
+        %session_id,
+        plan_id = %binding.plan_id(),
+        plan_revision = %binding_revision,
+        current_revision = %current_revision.as_deref().unwrap_or("unknown"),
+        "auto-Applying the hash-verified stored plan (ADR-55 §4, no dialog)"
+    );
+    // The decision rides along for ADR-55 §4 (M2) checkpoint
+    // suppression below.
+    *plan_decision = Some(PlanDecision::Apply);
+    // The auto-Apply CONSUMES the stored plan: drop the session's
+    // binding in the in-memory registry and in durable storage so a
+    // later run cannot re-apply an already-executed plan. A missing
+    // durable row is a no-op (fail-soft).
+    // ADR-55 §4 (M3, live-fix): capture the binding BEFORE
+    // consuming it so the Execute run below can describe the
+    // approved plan.
+    *applied_plan = Some(binding.clone());
+    plan_registry().remove(session_id, objective_hash);
+    if let Some(store) = session_store {
+        if let Err(error) =
+            store.delete_plan_binding(session_id, objective_hash, cancel.clone()).await
+        {
+            tracing::warn!(%error, "failed to clear durable plan binding after apply");
+        }
+    }
+    let _ = apply_auto_plan_decision(intent_store);
+}
+
 /// The authoritative acting-run vehicle.
 ///
 /// Routing is no longer consulted: with full local agency every non-forced run
@@ -1897,58 +1972,19 @@ pub async fn run_shared_agent(
     // divergence, never something a user saw.
     let mut approval_time_revision: Option<String> = None;
     if let Some(binding) = bound {
-        // ADR-55 §4: auto-Apply — no dialog. The binding was
-        // hash-verified at interception ([`resolve_auto_apply_binding`]);
-        // consume it in both stores so a later run cannot re-apply an
-        // already-executed plan.
-        let objective_hash = binding.objective_hash();
-        let current_revision = current_source_revision(&req.project_dir).await;
-        approval_time_revision = current_revision.clone();
-        let binding_revision = binding.source_revision().unwrap_or("unknown");
-        // The auto decision is audited under the synthetic `intent:plan`
-        // identity with plan_id + source revision in the user response
-        // (`auto_apply`, ADR-55 §6).
-        executor
-            .record_plan_decision(
-                session_id,
-                Ulid::new(),
-                binding.plan_id(),
-                objective_hash,
-                current_revision.as_deref(),
-                // ADR-55 §6: the plan-decision seam gains the
-                // `auto_apply` variant.
-                "auto_apply",
-                req.cancel_token.clone(),
-            )
-            .await;
-        tracing::info!(
-            %session_id,
-            plan_id = %binding.plan_id(),
-            plan_revision = %binding_revision,
-            current_revision = %current_revision.as_deref().unwrap_or("unknown"),
-            "auto-Applying the hash-verified stored plan (ADR-55 §4, no dialog)"
-        );
-        // The decision rides along for ADR-55 §4 (M2) checkpoint
-        // suppression below.
-        plan_decision = Some(PlanDecision::Apply);
-        // The auto-Apply CONSUMES the stored plan: drop the session's
-        // binding in the in-memory registry and in durable storage so a
-        // later run cannot re-apply an already-executed plan. A missing
-        // durable row is a no-op (fail-soft).
-        // ADR-55 §4 (M3, live-fix): capture the binding BEFORE
-        // consuming it so the Execute run below can describe the
-        // approved plan.
-        applied_plan = Some(binding.clone());
-        plan_registry().remove(session_id, objective_hash);
-        if let Some(store) = &session_store {
-            if let Err(error) = store
-                .delete_plan_binding(session_id, objective_hash, req.cancel_token.clone())
-                .await
-            {
-                tracing::warn!(%error, "failed to clear durable plan binding after apply");
-            }
-        }
-        let _ = apply_auto_plan_decision(&store);
+        apply_bound_plan(
+            binding,
+            executor.as_ref(),
+            session_id,
+            session_store.as_ref(),
+            &req.project_dir,
+            &req.cancel_token,
+            &store,
+            &mut plan_decision,
+            &mut applied_plan,
+            &mut approval_time_revision,
+        )
+        .await;
     }
 
     // ADR-55 §4 (M2): an Apply decision authorizes the STORED plan for
