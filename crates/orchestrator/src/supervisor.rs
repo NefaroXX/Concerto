@@ -1208,12 +1208,7 @@ impl Supervisor {
                 // Async dispatch replies arrive via the reply channel; drain
                 // before processing fresh events so acknowledgements stay in
                 // order.
-                for _ in 0..MAX_EVENTS_PER_TICK {
-                    match process.reply_rx.try_recv() {
-                        Ok(reply) => write_reply(&mut process.stdin, &reply),
-                        Err(_) => break,
-                    }
-                }
+                drain_agent_replies(process);
                 for _ in 0..MAX_EVENTS_PER_TICK {
                     match process.reader.rx.try_recv() {
                         Ok(LineEvent::Message(text)) => {
@@ -2251,6 +2246,20 @@ fn write_reply(stdin: &mut std::process::ChildStdin, reply: &IpcResponse) {
     };
     if let Err(error) = IoWrite::write_all(stdin, &frame).and_then(|()| IoWrite::flush(stdin)) {
         tracing::warn!(%error, "supervisor: reply write failed (agent gone?)");
+    }
+}
+
+/// Drain replies from detached async dispatch handlers back to the child's
+/// stdin, bounded per tick. Async dispatch replies arrive via the reply
+/// channel; draining them before processing fresh events keeps
+/// acknowledgements in order. Sync and side-effect-ordered: it only moves
+/// already-queued replies, and a quiet channel ends the drain immediately.
+fn drain_agent_replies(process: &mut AgentProcess) {
+    for _ in 0..MAX_EVENTS_PER_TICK {
+        match process.reply_rx.try_recv() {
+            Ok(reply) => write_reply(&mut process.stdin, &reply),
+            Err(_) => break,
+        }
     }
 }
 
