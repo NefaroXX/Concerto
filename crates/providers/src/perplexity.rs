@@ -48,74 +48,26 @@ impl PerplexityProvider {
         }
     }
 
-    /// Override the API base URL (self-hosted gateways, proxies, or tests).
-    pub fn with_api_base(mut self, api_base: String) -> Self {
-        self.inner = self.inner.with_api_base(api_base);
-        self
-    }
-
-    /// Set the reasoning-content echo policy (ADR-46), forwarded to the inner
-    /// OpenAI-compatible connector. Defaults to [`ReasoningEcho::IfPresent`].
-    pub fn with_reasoning_echo(mut self, echo: ReasoningEcho) -> Self {
-        self.inner = self.inner.with_reasoning_echo(echo);
-        self
-    }
-
-    /// Set the tool-schema presentation mode (adaptive tool schemas),
-    /// forwarded to the inner OpenAI-compatible connector. Defaults to
-    /// [`concerto_config::ToolSchemaMode::Auto`].
-    pub fn with_tool_schema_mode(mut self, mode: concerto_config::ToolSchemaMode) -> Self {
-        self.inner = self.inner.with_tool_schema_mode(mode);
-        self
-    }
-
-    /// Forward the provider-advertised per-model tool-calling capability
-    /// (ADR-66 §3 precedence level 2) to the inner OpenAI-compatible
-    /// provider, so an advertised flag beats the last-resort name heuristic.
-    pub fn with_advertised_tool_support(mut self, advertised: Option<bool>) -> Self {
-        self.inner = self.inner.with_advertised_tool_support(advertised);
-        self
-    }
+    openai_wrapper_forwarders!(inner, [
+        with_api_base,
+        with_reasoning_echo,
+        with_tool_schema_mode,
+        with_advertised_tool_support => [
+            /// Forward the provider-advertised per-model tool-calling capability
+            /// (ADR-66 §3 precedence level 2) to the inner OpenAI-compatible
+            /// provider, so an advertised flag beats the last-resort name heuristic.
+        ],
+    ]);
 }
 
-#[async_trait]
-impl LlmProvider for PerplexityProvider {
-    async fn stream_completion(
-        &self,
-        request: CompletionRequest,
-        cancel: CancellationToken,
-    ) -> Result<CompletionStream, ProviderError> {
-        self.inner.stream_completion(request, cancel).await
-    }
-
-    fn context_capacity(&self, model: &str) -> TokenBudget {
-        self.inner.context_capacity(model)
-    }
-
-    fn approximate_cost(&self, tokens_in: u64, tokens_out: u64) -> f64 {
-        // Perplexity representative pricing: `sonar-pro` at $3.00 input /
-        // $15.00 output per MTok (the default model; the higher-priced tier
-        // of the sonar family).
-        let input_cost = (tokens_in as f64 / 1_000_000.0) * 3.00;
-        let output_cost = (tokens_out as f64 / 1_000_000.0) * 15.00;
-        input_cost + output_cost
-    }
-
-    fn provider_name(&self) -> &'static str {
-        "perplexity"
-    }
-
-    async fn test_connection(&self, _cancel: CancellationToken) -> Result<(), ProviderError> {
-        self.inner.test_connection(_cancel.clone()).await
-    }
-
-    async fn list_models(
-        &self,
-        _cancel: CancellationToken,
-    ) -> Result<Vec<ModelInfo>, ProviderError> {
-        self.inner.list_models(_cancel.clone()).await
-    }
-}
+openai_wrapper_forwarders!(llm PerplexityProvider, inner,
+    name: "perplexity",
+    capacity: forward,
+    // Perplexity representative pricing: `sonar-pro` at $3.00 input /
+    // $15.00 output per MTok (the default model; the higher-priced tier
+    // of the sonar family).
+    cost: per_mtok(3.00, 15.00),
+);
 
 #[cfg(test)]
 mod tests {

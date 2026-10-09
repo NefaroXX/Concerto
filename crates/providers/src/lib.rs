@@ -8,6 +8,11 @@
 
 use concerto_core::error::{describe_error_chain, ProviderError};
 
+// `openai_wrapper_forwarders!` — must precede the wrapper modules below so
+// textual macro scoping reaches them.
+#[macro_use]
+mod forward;
+
 pub mod budget;
 pub mod context_guard;
 pub mod factory;

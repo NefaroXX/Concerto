@@ -21,63 +21,26 @@ impl NimProvider {
         }
     }
 
-    /// Set the reasoning-content echo policy (ADR-46), forwarded to the inner
-    /// OpenAI-compatible connector. Defaults to [`ReasoningEcho::IfPresent`].
-    pub fn with_reasoning_echo(mut self, echo: ReasoningEcho) -> Self {
-        self.inner = self.inner.with_reasoning_echo(echo);
-        self
-    }
-
-    /// Set the tool-schema presentation mode (adaptive tool schemas),
-    /// forwarded to the inner OpenAI-compatible connector. Defaults to
-    /// [`concerto_config::ToolSchemaMode::Auto`]. See
-    /// `crate::adapters::schema_loose`.
-    pub fn with_tool_schema_mode(mut self, mode: concerto_config::ToolSchemaMode) -> Self {
-        self.inner = self.inner.with_tool_schema_mode(mode);
-        self
-    }
-
-    /// Forward the provider-advertised per-model tool-calling capability
-    /// (ADR-66 §3 precedence level 2) to the inner OpenAI-compatible
-    /// provider, so an advertised flag beats the last-resort name heuristic.
-    pub fn with_advertised_tool_support(mut self, advertised: Option<bool>) -> Self {
-        self.inner = self.inner.with_advertised_tool_support(advertised);
-        self
-    }
+    openai_wrapper_forwarders!(inner, [
+        with_reasoning_echo,
+        with_tool_schema_mode => [
+            /// Set the tool-schema presentation mode (adaptive tool schemas),
+            /// forwarded to the inner OpenAI-compatible connector. Defaults to
+            /// [`concerto_config::ToolSchemaMode::Auto`]. See
+            /// `crate::adapters::schema_loose`.
+        ],
+        with_advertised_tool_support => [
+            /// Forward the provider-advertised per-model tool-calling capability
+            /// (ADR-66 §3 precedence level 2) to the inner OpenAI-compatible
+            /// provider, so an advertised flag beats the last-resort name heuristic.
+        ],
+    ]);
 }
 
-#[async_trait]
-impl LlmProvider for NimProvider {
-    async fn test_connection(&self, _cancel: CancellationToken) -> Result<(), ProviderError> {
-        self.inner.test_connection(_cancel.clone()).await
-    }
-
-    async fn list_models(
-        &self,
-        _cancel: CancellationToken,
-    ) -> Result<Vec<ModelInfo>, ProviderError> {
-        self.inner.list_models(_cancel.clone()).await
-    }
-
-    async fn stream_completion(
-        &self,
-        request: CompletionRequest,
-        cancel: CancellationToken,
-    ) -> Result<CompletionStream, ProviderError> {
-        self.inner.stream_completion(request, cancel).await
-    }
-
-    fn context_capacity(&self, model: &str) -> TokenBudget {
-        crate::budget::budget_for_model(model, 4_000)
-    }
-
-    fn approximate_cost(&self, tokens_in: u64, tokens_out: u64) -> f64 {
-        // Representative 70B pricing: ~$0.00099/1K tokens (in+out combined).
-        // Actual cost varies by model; callers should consult NIM pricing for precision.
-        ((tokens_in + tokens_out) as f64 / 1_000.0) * 0.00099
-    }
-
-    fn provider_name(&self) -> &'static str {
-        "nim"
-    }
-}
+openai_wrapper_forwarders!(llm NimProvider, inner,
+    name: "nim",
+    capacity: budget(4_000),
+    // Representative 70B pricing: ~$0.00099/1K tokens (in+out combined).
+    // Actual cost varies by model; callers should consult NIM pricing for precision.
+    cost: per_1k(0.00099),
+);

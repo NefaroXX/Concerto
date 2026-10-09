@@ -46,74 +46,17 @@ impl DeepInfraProvider {
         }
     }
 
-    /// Override the API base URL (self-hosted gateways, proxies, or tests).
-    pub fn with_api_base(mut self, api_base: String) -> Self {
-        self.inner = self.inner.with_api_base(api_base);
-        self
-    }
-
-    /// Set the reasoning-content echo policy (ADR-46), forwarded to the inner
-    /// OpenAI-compatible connector. Defaults to [`ReasoningEcho::IfPresent`].
-    pub fn with_reasoning_echo(mut self, echo: ReasoningEcho) -> Self {
-        self.inner = self.inner.with_reasoning_echo(echo);
-        self
-    }
-
-    /// Set the tool-schema presentation mode (adaptive tool schemas),
-    /// forwarded to the inner OpenAI-compatible connector. Defaults to
-    /// [`concerto_config::ToolSchemaMode::Auto`].
-    pub fn with_tool_schema_mode(mut self, mode: concerto_config::ToolSchemaMode) -> Self {
-        self.inner = self.inner.with_tool_schema_mode(mode);
-        self
-    }
-
-    /// Forward the provider-advertised per-model tool-calling capability
-    /// (ADR-66 §3 precedence level 2) to the inner OpenAI-compatible
-    /// provider.
-    pub fn with_advertised_tool_support(mut self, advertised: Option<bool>) -> Self {
-        self.inner = self.inner.with_advertised_tool_support(advertised);
-        self
-    }
+    openai_wrapper_forwarders!(inner);
 }
 
-#[async_trait]
-impl LlmProvider for DeepInfraProvider {
-    async fn stream_completion(
-        &self,
-        request: CompletionRequest,
-        cancel: CancellationToken,
-    ) -> Result<CompletionStream, ProviderError> {
-        self.inner.stream_completion(request, cancel).await
-    }
-
-    fn context_capacity(&self, model: &str) -> TokenBudget {
-        self.inner.context_capacity(model)
-    }
-
-    fn approximate_cost(&self, tokens_in: u64, tokens_out: u64) -> f64 {
-        // DeepInfra representative pricing:
-        // `meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo` at $0.28 input /
-        // $0.10 output per MTok (the catalog's default entry).
-        let input_cost = (tokens_in as f64 / 1_000_000.0) * 0.28;
-        let output_cost = (tokens_out as f64 / 1_000_000.0) * 0.10;
-        input_cost + output_cost
-    }
-
-    fn provider_name(&self) -> &'static str {
-        "deepinfra"
-    }
-
-    async fn test_connection(&self, _cancel: CancellationToken) -> Result<(), ProviderError> {
-        self.inner.test_connection(_cancel.clone()).await
-    }
-
-    async fn list_models(
-        &self,
-        _cancel: CancellationToken,
-    ) -> Result<Vec<ModelInfo>, ProviderError> {
-        self.inner.list_models(_cancel.clone()).await
-    }
-}
+openai_wrapper_forwarders!(llm DeepInfraProvider, inner,
+    name: "deepinfra",
+    capacity: forward,
+    // DeepInfra representative pricing:
+    // `meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo` at $0.28 input /
+    // $0.10 output per MTok (the catalog's default entry).
+    cost: per_mtok(0.28, 0.10),
+);
 
 #[cfg(test)]
 mod tests {

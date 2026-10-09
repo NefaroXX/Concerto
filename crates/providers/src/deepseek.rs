@@ -62,72 +62,36 @@ impl DeepSeekProvider {
         }
     }
 
-    /// Override the reasoning-content echo policy (ADR-46).
-    ///
-    /// The connector defaults to [`ReasoningEcho::Always`] for the DeepSeek
-    /// reasoning contract; `with_reasoning_echo` lets a caller or config dial
-    /// opt back in to [`ReasoningEcho::IfPresent`].
-    pub fn with_reasoning_echo(mut self, echo: ReasoningEcho) -> Self {
-        self.inner = self.inner.with_reasoning_echo(echo);
-        self
-    }
-
-    /// Set the tool-schema presentation mode (adaptive tool schemas).
-    ///
-    /// Defaults to [`concerto_config::ToolSchemaMode::Auto`] — see
-    /// [`OpenAiProvider::with_tool_schema_mode`] for the loose-schema
-    /// semantics.
-    pub fn with_tool_schema_mode(mut self, mode: concerto_config::ToolSchemaMode) -> Self {
-        self.inner = self.inner.with_tool_schema_mode(mode);
-        self
-    }
-
-    /// Forward the provider-advertised per-model tool-calling capability
-    /// (ADR-66 §3 precedence level 2) to the inner OpenAI-compatible
-    /// provider, so an advertised flag beats the last-resort name heuristic.
-    pub fn with_advertised_tool_support(mut self, advertised: Option<bool>) -> Self {
-        self.inner = self.inner.with_advertised_tool_support(advertised);
-        self
-    }
+    openai_wrapper_forwarders!(inner, [
+        with_reasoning_echo => [
+            /// Override the reasoning-content echo policy (ADR-46).
+            ///
+            /// The connector defaults to [`ReasoningEcho::Always`] for the DeepSeek
+            /// reasoning contract; `with_reasoning_echo` lets a caller or config dial
+            /// opt back in to [`ReasoningEcho::IfPresent`].
+        ],
+        with_tool_schema_mode => [
+            /// Set the tool-schema presentation mode (adaptive tool schemas).
+            ///
+            /// Defaults to [`concerto_config::ToolSchemaMode::Auto`] — see
+            /// [`OpenAiProvider::with_tool_schema_mode`] for the loose-schema
+            /// semantics.
+        ],
+        with_advertised_tool_support => [
+            /// Forward the provider-advertised per-model tool-calling capability
+            /// (ADR-66 §3 precedence level 2) to the inner OpenAI-compatible
+            /// provider, so an advertised flag beats the last-resort name heuristic.
+        ],
+    ]);
 }
 
-#[async_trait]
-impl LlmProvider for DeepSeekProvider {
-    async fn stream_completion(
-        &self,
-        request: CompletionRequest,
-        cancel: CancellationToken,
-    ) -> Result<CompletionStream, ProviderError> {
-        self.inner.stream_completion(request, cancel).await
-    }
-
-    fn context_capacity(&self, model: &str) -> TokenBudget {
-        self.inner.context_capacity(model)
-    }
-
-    fn approximate_cost(&self, tokens_in: u64, tokens_out: u64) -> f64 {
-        // DeepSeek V4 Flash pricing (docs/missing-providers.md): $0.14 input /
-        // $0.28 output per MTok — the cheapest frontier tier.
-        let input_cost = (tokens_in as f64 / 1_000_000.0) * 0.14;
-        let output_cost = (tokens_out as f64 / 1_000_000.0) * 0.28;
-        input_cost + output_cost
-    }
-
-    fn provider_name(&self) -> &'static str {
-        "deepseek"
-    }
-
-    async fn test_connection(&self, _cancel: CancellationToken) -> Result<(), ProviderError> {
-        self.inner.test_connection(_cancel.clone()).await
-    }
-
-    async fn list_models(
-        &self,
-        _cancel: CancellationToken,
-    ) -> Result<Vec<ModelInfo>, ProviderError> {
-        self.inner.list_models(_cancel.clone()).await
-    }
-}
+openai_wrapper_forwarders!(llm DeepSeekProvider, inner,
+    name: "deepseek",
+    capacity: forward,
+    // DeepSeek V4 Flash pricing (docs/missing-providers.md): $0.14 input /
+    // $0.28 output per MTok — the cheapest frontier tier.
+    cost: per_mtok(0.14, 0.28),
+);
 
 // ---------------------------------------------------------------------------
 // Tests
