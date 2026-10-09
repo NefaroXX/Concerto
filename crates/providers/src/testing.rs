@@ -210,6 +210,35 @@ pub mod mock_server {
         (base, req_rx)
     }
 
+    /// Serve one caller-canned HTTP response for the next single request and
+    /// return `(base_url, captured_request_receiver)`.
+    ///
+    /// Unlike [`spawn`], the status line (`"401 Unauthorized"`, `"200 OK"`, …)
+    /// and body are supplied by the caller, so a test can pin the shared
+    /// status/error mapping of connection probes and model listings without a
+    /// streaming payload. The body is served as `application/json`, which is
+    /// what both consumers parse.
+    pub fn spawn_response(status_line: &str, body: &str) -> (String, mpsc::Receiver<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local mock server");
+        let port = listener.local_addr().expect("local address").port();
+        let base = format!("http://127.0.0.1:{port}");
+        let (req_tx, req_rx) = mpsc::channel();
+        let status_line = status_line.to_string();
+        let body = body.to_string();
+        let _ = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept one request");
+            let request = read_request(&mut stream);
+            let _ = req_tx.send(request);
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+        (base, req_rx)
+    }
+
     /// Parse the captured request's JSON body out of its raw HTTP bytes.
     pub fn request_body(raw: Vec<u8>) -> serde_json::Value {
         let header_end = find_subsequence(&raw, b"\r\n\r\n").expect("captured request has headers");

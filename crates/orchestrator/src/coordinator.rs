@@ -8099,6 +8099,85 @@ impl CoordinatorAgent {
         }
     }
 
+    /// Single source for the three Partial terminal exits inside
+    /// [`Self::execute_graph`] (terminal subtask failure, run-wide dispatch
+    /// cap exhaustion, non-recoverable subtask error): publish
+    /// [`EventKind::MultiAgentModeCompleted`], advance the checkpoint
+    /// sequence, build + persist the `Executing` checkpoint, serialize it,
+    /// and shape the `Partial` [`AgentOutput`].
+    ///
+    /// DEDUP D3: the three former call sites were exact clones of this body
+    /// (byte-identical after de-indentation) and now call it instead. The
+    /// body is infallible by construction — `persist_checkpoint` reports its
+    /// own failures through `tracing::warn` — so the callers keep wrapping
+    /// the returned pair in `Ok(..)`.
+    // `too_many_arguments` is the narrowest signature that covers all three
+    // clone sites without cloning the run state.
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_completion_and_checkpoint(
+        &mut self,
+        task: &AgentTask,
+        final_message: String,
+        checkpoint_scope: &mut checkpoint::CheckpointScope,
+        context: &AgentContext,
+        graph: &TaskGraph,
+        completed_results: &HashMap<TaskId, AgentRunResult>,
+        total_cost: f64,
+        total_tool_calls: u32,
+        provider_metrics: Vec<ProviderMetrics>,
+        all_files: &[camino::Utf8PathBuf],
+        subtask_attempts: &HashMap<TaskId, u32>,
+        retry_feedback: &HashMap<TaskId, Vec<AgentRunResult>>,
+        model_assignments: &HashMap<TaskId, String>,
+        action_ledger: &[checkpoint::CheckpointAction],
+        recoverable_notes: Vec<String>,
+    ) -> (AgentOutput, Vec<String>) {
+        let _ = self.bus.publish_for_session(
+            task.session_id,
+            task.id.0,
+            EventKind::MultiAgentModeCompleted { task_id: task.id, cost_usd: total_cost },
+        );
+        checkpoint_scope.sequence_num = checkpoint_scope.sequence_num.saturating_add(1);
+        let mut cp = checkpoint::build_checkpoint(
+            checkpoint_scope,
+            checkpoint::CheckpointStage::Executing,
+            None,
+            &context.working_memory,
+            graph,
+            completed_results,
+            total_cost,
+            total_tool_calls,
+            &provider_metrics,
+            all_files,
+            &self.expected_artifacts_snapshot(),
+            subtask_attempts,
+            retry_feedback,
+            &self.checkpoint_context(model_assignments, action_ledger),
+        );
+        self.persist_checkpoint(&mut cp, model_assignments).await;
+        let checkpoint_json = serde_json::to_string(&cp).ok();
+        (
+            AgentOutput {
+                task_id: task.id,
+                session_id: task.session_id,
+                final_message,
+                files_modified: crate::tool_facts::sanitize_files_modified(
+                    &context.session.project_dir,
+                    all_files,
+                ),
+                tool_call_count: total_tool_calls,
+                eval_result: None,
+                tool_events: Vec::new(),
+                verification: Vec::new(),
+                project_root: None,
+                completion_status: concerto_core::types::AgentCompletionStatus::Partial,
+                provider_metrics,
+                checkpoint_json,
+            },
+            recoverable_notes,
+        )
+    }
+
     /// Execute the task graph until all tasks complete. Returns the final
     /// `AgentOutput` for a fully-completed run.
     #[allow(clippy::too_many_arguments)]
@@ -8643,53 +8722,25 @@ impl CoordinatorAgent {
                     let final_message = format!(
                         "Automation paused after exhausting recovery attempts for a non-fatal subtask. Existing workspace changes and session context were preserved. {error}"
                     );
-                    let _ = self.bus.publish_for_session(
-                        task.session_id,
-                        task.id.0,
-                        EventKind::MultiAgentModeCompleted {
-                            task_id: task.id,
-                            cost_usd: total_cost,
-                        },
-                    );
-                    checkpoint_scope.sequence_num = checkpoint_scope.sequence_num.saturating_add(1);
-                    let mut cp = checkpoint::build_checkpoint(
-                        &checkpoint_scope,
-                        checkpoint::CheckpointStage::Executing,
-                        None,
-                        &context.working_memory,
-                        &graph,
-                        &completed_results,
-                        total_cost,
-                        total_tool_calls,
-                        &provider_metrics,
-                        &all_files,
-                        &self.expected_artifacts_snapshot(),
-                        &subtask_attempts,
-                        &retry_feedback,
-                        &self.checkpoint_context(&model_assignments, &action_ledger),
-                    );
-                    self.persist_checkpoint(&mut cp, &model_assignments).await;
-                    let checkpoint_json = serde_json::to_string(&cp).ok();
-                    return Ok((
-                        AgentOutput {
-                            task_id: task.id,
-                            session_id: task.session_id,
+                    return Ok(self
+                        .publish_completion_and_checkpoint(
+                            &task,
                             final_message,
-                            files_modified: crate::tool_facts::sanitize_files_modified(
-                                &context.session.project_dir,
-                                &all_files,
-                            ),
-                            tool_call_count: total_tool_calls,
-                            eval_result: None,
-                            tool_events: Vec::new(),
-                            verification: Vec::new(),
-                            project_root: None,
-                            completion_status: concerto_core::types::AgentCompletionStatus::Partial,
+                            &mut checkpoint_scope,
+                            &context,
+                            &graph,
+                            &completed_results,
+                            total_cost,
+                            total_tool_calls,
                             provider_metrics,
-                            checkpoint_json,
-                        },
-                        recoverable_notes,
-                    ));
+                            &all_files,
+                            &subtask_attempts,
+                            &retry_feedback,
+                            &model_assignments,
+                            &action_ledger,
+                            recoverable_notes,
+                        )
+                        .await);
                 }
                 // Unfinished-work routing: ready queue empty but the graph is
                 // not all-completed because non-terminal subtask(s) remain
@@ -8726,50 +8777,25 @@ impl CoordinatorAgent {
                      total model dispatches). Existing workspace changes and session \
                      context were preserved."
                 );
-                let _ = self.bus.publish_for_session(
-                    task.session_id,
-                    task.id.0,
-                    EventKind::MultiAgentModeCompleted { task_id: task.id, cost_usd: total_cost },
-                );
-                checkpoint_scope.sequence_num = checkpoint_scope.sequence_num.saturating_add(1);
-                let mut cp = checkpoint::build_checkpoint(
-                    &checkpoint_scope,
-                    checkpoint::CheckpointStage::Executing,
-                    None,
-                    &context.working_memory,
-                    &graph,
-                    &completed_results,
-                    total_cost,
-                    total_tool_calls,
-                    &provider_metrics,
-                    &all_files,
-                    &self.expected_artifacts_snapshot(),
-                    &subtask_attempts,
-                    &retry_feedback,
-                    &self.checkpoint_context(&model_assignments, &action_ledger),
-                );
-                self.persist_checkpoint(&mut cp, &model_assignments).await;
-                let checkpoint_json = serde_json::to_string(&cp).ok();
-                return Ok((
-                    AgentOutput {
-                        task_id: task.id,
-                        session_id: task.session_id,
+                return Ok(self
+                    .publish_completion_and_checkpoint(
+                        &task,
                         final_message,
-                        files_modified: crate::tool_facts::sanitize_files_modified(
-                            &context.session.project_dir,
-                            &all_files,
-                        ),
-                        tool_call_count: total_tool_calls,
-                        eval_result: None,
-                        tool_events: Vec::new(),
-                        verification: Vec::new(),
-                        project_root: None,
-                        completion_status: concerto_core::types::AgentCompletionStatus::Partial,
+                        &mut checkpoint_scope,
+                        &context,
+                        &graph,
+                        &completed_results,
+                        total_cost,
+                        total_tool_calls,
                         provider_metrics,
-                        checkpoint_json,
-                    },
-                    recoverable_notes,
-                ));
+                        &all_files,
+                        &subtask_attempts,
+                        &retry_feedback,
+                        &model_assignments,
+                        &action_ledger,
+                        recoverable_notes,
+                    )
+                    .await);
             }
 
             checkpoint_scope.sequence_num = checkpoint_scope.sequence_num.saturating_add(1);
@@ -10069,50 +10095,25 @@ impl CoordinatorAgent {
                      ({failed_role:?} subtask {failed_task_id}). Existing \
                      workspace changes and session context were preserved. {error}"
                 );
-                let _ = self.bus.publish_for_session(
-                    task.session_id,
-                    task.id.0,
-                    EventKind::MultiAgentModeCompleted { task_id: task.id, cost_usd: total_cost },
-                );
-                checkpoint_scope.sequence_num = checkpoint_scope.sequence_num.saturating_add(1);
-                let mut cp = checkpoint::build_checkpoint(
-                    &checkpoint_scope,
-                    checkpoint::CheckpointStage::Executing,
-                    None,
-                    &context.working_memory,
-                    &graph,
-                    &completed_results,
-                    total_cost,
-                    total_tool_calls,
-                    &provider_metrics,
-                    &all_files,
-                    &self.expected_artifacts_snapshot(),
-                    &subtask_attempts,
-                    &retry_feedback,
-                    &self.checkpoint_context(&model_assignments, &action_ledger),
-                );
-                self.persist_checkpoint(&mut cp, &model_assignments).await;
-                let checkpoint_json = serde_json::to_string(&cp).ok();
-                return Ok((
-                    AgentOutput {
-                        task_id: task.id,
-                        session_id: task.session_id,
+                return Ok(self
+                    .publish_completion_and_checkpoint(
+                        &task,
                         final_message,
-                        files_modified: crate::tool_facts::sanitize_files_modified(
-                            &context.session.project_dir,
-                            &all_files,
-                        ),
-                        tool_call_count: total_tool_calls,
-                        eval_result: None,
-                        tool_events: Vec::new(),
-                        verification: Vec::new(),
-                        project_root: None,
-                        completion_status: concerto_core::types::AgentCompletionStatus::Partial,
+                        &mut checkpoint_scope,
+                        &context,
+                        &graph,
+                        &completed_results,
+                        total_cost,
+                        total_tool_calls,
                         provider_metrics,
-                        checkpoint_json,
-                    },
-                    recoverable_notes,
-                ));
+                        &all_files,
+                        &subtask_attempts,
+                        &retry_feedback,
+                        &model_assignments,
+                        &action_ledger,
+                        recoverable_notes,
+                    )
+                    .await);
             }
         }
 
