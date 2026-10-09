@@ -12502,62 +12502,12 @@ impl CoordinatorAgent {
                 }
             }
 
-            let request = CompletionRequest {
-                model: model.clone(),
-                messages: messages.clone(),
-                tools: (!tool_defs.is_empty()).then_some(tool_defs.clone()),
-                tool_choice: None,
-                temperature: Some(0.7),
-                max_tokens: Some(8192),
-                stream: false,
-            };
-            // ADR-48 §4: the planning provider's reported usage is the source
-            // of truth when present; the byte/4 heuristic is the fallback for
-            // providers that report none (`0` is measured, only `None` falls
-            // back). Mirrors the single-agent loop's per-turn accounting.
-            let request_tokens_in = request
-                .messages
-                .iter()
-                .map(|message| message.content.len() as u64)
-                .sum::<u64>()
-                .div_ceil(4);
-            let request_started = std::time::Instant::now();
-            let (text, reasoning, tool_calls, usage) = crate::prompts::complete_provider_request(
-                &self.planning_provider,
-                &request,
-                &self.retry_policy,
-                &self.bus,
-                task.session_id,
-                task.id,
-                cancel,
-            )
-            .await?; // provider-class errors classify at the decompose level
-                     // The decision loop's own model turns are real spend: record each
-                     // turn on the ledger (and the settled mirror) so a zero-dispatch
-                     // conversational close still carries provider metrics instead of
-                     // reporting tokens 0/0 with an empty metric list.
-            {
-                let measured_in = usage.as_ref().and_then(|u| u.prompt_tokens);
-                let measured_out = usage.as_ref().and_then(|u| u.completion_tokens);
-                let tool_chars = serde_json::to_string(&tool_calls)
-                    .map(|value| value.len() as u64)
-                    .unwrap_or_default();
-                let estimated_out = (text.len() as u64).saturating_add(tool_chars).div_ceil(4);
-                let tokens_in = measured_in.unwrap_or(request_tokens_in);
-                let tokens_out = measured_out.unwrap_or(estimated_out);
-                let cost = self.planning_provider.approximate_cost(tokens_in, tokens_out);
-                let settled = ProviderMetrics {
-                    provider: self.planning_provider.provider_name().to_owned(),
-                    model: model.clone(),
-                    tokens_in,
-                    tokens_out,
-                    cost_usd: cost,
-                    latency_ms: request_started.elapsed().as_millis() as u64,
-                };
-                ledger.provider_metrics.push(settled.clone());
-                self.settled_metrics.push(settled);
-                ledger.total_cost += cost;
-            }
+            // W3c: issue the per-turn provider request and record its provider
+            // metrics on the ledger in one ordered unit
+            // ([`Self::request_dispatch_turn`]).
+            let (text, reasoning, tool_calls) = self
+                .request_dispatch_turn(model.as_str(), &messages, &tool_defs, task, cancel, ledger)
+                .await?; // provider-class errors classify at the decompose level
 
             messages.push(Message {
                 role: Role::Assistant,
@@ -13084,6 +13034,83 @@ impl CoordinatorAgent {
         }
 
         Ok((summary, advisory_plan))
+    }
+
+    /// W3c (run_dispatch_session per-turn request): issue one dispatch-loop
+    /// provider completion and account its provider metrics on the ledger in
+    /// ONE ordered unit. The `complete_provider_request` await is immediately
+    /// followed by the settled-metric writes (ledger + settled mirror) with no
+    /// other ledger mutation interleaved, so extracting the unit preserves the
+    /// loop's ledger mutation order. Returns the model's text/reasoning/tool
+    /// calls; the caller keeps pushing the assistant message.
+    #[allow(clippy::too_many_arguments)]
+    async fn request_dispatch_turn(
+        &mut self,
+        model: &str,
+        messages: &[Message],
+        tool_defs: &[ToolDefinition],
+        task: &AgentTask,
+        cancel: &CancellationToken,
+        ledger: &mut DispatchLedger,
+    ) -> Result<(String, Option<String>, Vec<concerto_core::types::ToolCall>), OrchestratorError>
+    {
+        let request = CompletionRequest {
+            model: model.to_owned(),
+            messages: messages.to_vec(),
+            tools: (!tool_defs.is_empty()).then_some(tool_defs.to_vec()),
+            tool_choice: None,
+            temperature: Some(0.7),
+            max_tokens: Some(8192),
+            stream: false,
+        };
+        // ADR-48 §4: the planning provider's reported usage is the source
+        // of truth when present; the byte/4 heuristic is the fallback for
+        // providers that report none (`0` is measured, only `None` falls
+        // back). Mirrors the single-agent loop's per-turn accounting.
+        let request_tokens_in = request
+            .messages
+            .iter()
+            .map(|message| message.content.len() as u64)
+            .sum::<u64>()
+            .div_ceil(4);
+        let request_started = std::time::Instant::now();
+        let (text, reasoning, tool_calls, usage) = crate::prompts::complete_provider_request(
+            &self.planning_provider,
+            &request,
+            &self.retry_policy,
+            &self.bus,
+            task.session_id,
+            task.id,
+            cancel,
+        )
+        .await?; // provider-class errors classify at the decompose level
+                 // The decision loop's own model turns are real spend: record each
+                 // turn on the ledger (and the settled mirror) so a zero-dispatch
+                 // conversational close still carries provider metrics instead of
+                 // reporting tokens 0/0 with an empty metric list.
+        {
+            let measured_in = usage.as_ref().and_then(|u| u.prompt_tokens);
+            let measured_out = usage.as_ref().and_then(|u| u.completion_tokens);
+            let tool_chars = serde_json::to_string(&tool_calls)
+                .map(|value| value.len() as u64)
+                .unwrap_or_default();
+            let estimated_out = (text.len() as u64).saturating_add(tool_chars).div_ceil(4);
+            let tokens_in = measured_in.unwrap_or(request_tokens_in);
+            let tokens_out = measured_out.unwrap_or(estimated_out);
+            let cost = self.planning_provider.approximate_cost(tokens_in, tokens_out);
+            let settled = ProviderMetrics {
+                provider: self.planning_provider.provider_name().to_owned(),
+                model: model.to_owned(),
+                tokens_in,
+                tokens_out,
+                cost_usd: cost,
+                latency_ms: request_started.elapsed().as_millis() as u64,
+            };
+            ledger.provider_metrics.push(settled.clone());
+            self.settled_metrics.push(settled);
+            ledger.total_cost += cost;
+        }
+        Ok((text, reasoning, tool_calls))
     }
 
     /// Same-role dispatch cap — the bound on the repeat-dispatch path beside
