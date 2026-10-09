@@ -3032,6 +3032,174 @@ pub(crate) fn parse_string_array(arguments: &serde_json::Value, key: &str) -> Ve
         .unwrap_or_default()
 }
 
+/// Phases 1–2 of `handle_investigate_hypotheses`: parse the batch arguments
+/// and run the pure batch-level validation — read-only contract, hypothesis
+/// count bounds, per-hypothesis question/notes length, effort caps, duplicate
+/// ids, and the summed-effort ceiling. Returns the parsed batch, or the
+/// structured tool error the handler returns verbatim.
+///
+/// Returns the parsed batch plus the summed per-hypothesis effort cap (which
+/// the handler later stamps onto the journaled batch decision). Pure: no
+/// `&self`, no I/O, no state mutation. Phase 3 (per-hypothesis Consult
+/// validation) stays in the handler because it awaits evidence resolution and
+/// journals decisions.
+fn validate_investigate_batch(
+    arguments: &serde_json::Value,
+) -> Result<(InvestigateHypothesesArgs, u32), serde_json::Value> {
+    let Some(args) = InvestigateHypothesesArgs::parse(arguments) else {
+        return Err(serde_json::json!({
+            "error": "invalid_arguments",
+            "message": "investigate_hypotheses requires a hypotheses array of \
+                        {hypothesis_id, agent_id, question} specs",
+        }));
+    };
+    // Investigations are read-only: declaring expected artifacts would
+    // imply a work contract — a conflicting decision, rejected.
+    if !parse_string_array(arguments, "expected_artifacts").is_empty() {
+        return Err(serde_json::json!({
+            "error": "conflicting_decision",
+            "message": "speculative investigations are read-only and never declare \
+                        expected artifacts; drop the field and re-decide",
+        }));
+    }
+    if args.hypotheses.len() < MIN_SPECULATIVE_HYPOTHESES {
+        return Err(serde_json::json!({
+            "error": "too_few_hypotheses",
+            "message": format!(
+                "investigate_hypotheses requires at least {} competing hypotheses \
+                 (got {}); for a single question use consult_specialist",
+                MIN_SPECULATIVE_HYPOTHESES,
+                args.hypotheses.len(),
+            ),
+        }));
+    }
+    if args.hypotheses.len() > MAX_SPECULATIVE_HYPOTHESES {
+        return Err(serde_json::json!({
+            "error": "too_many_hypotheses",
+            "message": format!(
+                "investigate_hypotheses accepts at most {} hypotheses (got {})",
+                MAX_SPECULATIVE_HYPOTHESES,
+                args.hypotheses.len(),
+            ),
+        }));
+    }
+
+    // ── Per-hypothesis batch-level validation (pre-state-mutation) ─
+    let mut total_effort: u32 = 0;
+    let mut seen_ids = std::collections::HashSet::new();
+    for h in &args.hypotheses {
+        let q = h.question.trim();
+        if q.chars().count() > crate::consultation::MAX_CONSULT_QUESTION_CHARS {
+            return Err(serde_json::json!({
+                "error": "question_too_long",
+                "message": format!(
+                    "hypothesis {} question exceeds {} characters ({}); \
+                     shorten and re-decide",
+                    h.hypothesis_id,
+                    crate::consultation::MAX_CONSULT_QUESTION_CHARS,
+                    q.chars().count(),
+                ),
+            }));
+        }
+        if let Some(notes) = h.notes.as_deref() {
+            if notes.chars().count() > crate::decisions::MAX_DECISION_NOTES_CHARS {
+                return Err(serde_json::json!({
+                    "error": "notes_too_long",
+                    "message": format!(
+                        "hypothesis {} notes exceeds {} characters ({}); \
+                         shorten and re-decide",
+                        h.hypothesis_id,
+                        crate::decisions::MAX_DECISION_NOTES_CHARS,
+                        notes.chars().count(),
+                    ),
+                }));
+            }
+        }
+        let cap = h.max_tool_calls.unwrap_or(crate::consultation::DEFAULT_CONSULT_MAX_TOOL_CALLS);
+        if cap == 0 || cap > crate::consultation::MAX_CONSULT_MAX_TOOL_CALLS {
+            return Err(serde_json::json!({
+                "error": "invalid_effort_cap",
+                "message": format!(
+                    "hypothesis {} max_tool_calls must be 1..={} (got {})",
+                    h.hypothesis_id,
+                    crate::consultation::MAX_CONSULT_MAX_TOOL_CALLS,
+                    cap,
+                ),
+            }));
+        }
+        total_effort = total_effort.saturating_add(cap);
+        if !seen_ids.insert(&h.hypothesis_id) {
+            return Err(serde_json::json!({
+                "error": "duplicate_hypothesis_id",
+                "message": format!(
+                    "each hypothesis_id in the batch must be unique; \
+                     duplicate: {}",
+                    h.hypothesis_id,
+                ),
+            }));
+        }
+    }
+    if total_effort > MAX_SPECULATION_TOTAL_TOOL_CALLS {
+        return Err(serde_json::json!({
+            "error": "total_effort_exceeded",
+            "message": format!(
+                "the summed per-hypothesis max_tool_calls {} exceeds the batch \
+                 ceiling {}; lower per-hypothesis caps and re-decide",
+                total_effort,
+                MAX_SPECULATION_TOTAL_TOOL_CALLS,
+            ),
+        }));
+    }
+    Ok((args, total_effort))
+}
+
+#[cfg(test)]
+mod validate_investigate_batch_tests {
+    use super::validate_investigate_batch;
+    use serde_json::json;
+
+    fn spec(id: &str) -> serde_json::Value {
+        json!({
+            "hypothesis_id": id,
+            "agent_id": "agent-a",
+            "question": "why?",
+        })
+    }
+
+    #[test]
+    fn accepts_a_well_formed_batch() {
+        let args = json!({ "hypotheses": [spec("h1"), spec("h2")] });
+        let (parsed, total_effort) = validate_investigate_batch(&args).expect("valid batch");
+        assert_eq!(parsed.hypotheses.len(), 2);
+        // Two hypotheses at the default cap of 8 each.
+        assert_eq!(total_effort, 16);
+    }
+
+    #[test]
+    fn rejects_too_few_hypotheses() {
+        let args = json!({ "hypotheses": [spec("h1")] });
+        let error = validate_investigate_batch(&args).err().expect("too few");
+        assert_eq!(error["error"], "too_few_hypotheses");
+    }
+
+    #[test]
+    fn rejects_duplicate_ids() {
+        let args = json!({ "hypotheses": [spec("h1"), spec("h1")] });
+        let error = validate_investigate_batch(&args).err().expect("duplicate");
+        assert_eq!(error["error"], "duplicate_hypothesis_id");
+    }
+
+    #[test]
+    fn rejects_declared_expected_artifacts() {
+        let args = json!({
+            "hypotheses": [spec("h1"), spec("h2")],
+            "expected_artifacts": ["src/lib.rs"],
+        });
+        let error = validate_investigate_batch(&args).err().expect("read-only");
+        assert_eq!(error["error"], "conflicting_decision");
+    }
+}
+
 /// Mutable working state of one Coordinator decision session: the current
 /// DesignDoc claim, its verifier verdict (ADR-65 §5), and the last
 /// dispatched node (the chain parent of the next `call_specialist`).
@@ -14472,112 +14640,11 @@ impl CoordinatorAgent {
             outcome: Result<AgentRunResult, OrchestratorError>,
         }
 
-        // ── 1. Parse + batch-level arg validation ────────────────────────
-        let Some(args) = InvestigateHypothesesArgs::parse(arguments) else {
-            return serde_json::json!({
-                "error": "invalid_arguments",
-                "message": "investigate_hypotheses requires a hypotheses array of \
-                            {hypothesis_id, agent_id, question} specs",
-            });
+        // ── 1–2. Parse + batch-level arg validation (pure) ───────────────
+        let (args, total_effort) = match validate_investigate_batch(arguments) {
+            Ok(validated) => validated,
+            Err(error) => return error,
         };
-        // Investigations are read-only: declaring expected artifacts would
-        // imply a work contract — a conflicting decision, rejected.
-        if !parse_string_array(arguments, "expected_artifacts").is_empty() {
-            return serde_json::json!({
-                "error": "conflicting_decision",
-                "message": "speculative investigations are read-only and never declare \
-                            expected artifacts; drop the field and re-decide",
-            });
-        }
-        if args.hypotheses.len() < MIN_SPECULATIVE_HYPOTHESES {
-            return serde_json::json!({
-                "error": "too_few_hypotheses",
-                "message": format!(
-                    "investigate_hypotheses requires at least {} competing hypotheses \
-                     (got {}); for a single question use consult_specialist",
-                    MIN_SPECULATIVE_HYPOTHESES,
-                    args.hypotheses.len(),
-                ),
-            });
-        }
-        if args.hypotheses.len() > MAX_SPECULATIVE_HYPOTHESES {
-            return serde_json::json!({
-                "error": "too_many_hypotheses",
-                "message": format!(
-                    "investigate_hypotheses accepts at most {} hypotheses (got {})",
-                    MAX_SPECULATIVE_HYPOTHESES,
-                    args.hypotheses.len(),
-                ),
-            });
-        }
-
-        // ── 2. Per-hypothesis batch-level validation (pre-state-mutation) ─
-        let mut total_effort: u32 = 0;
-        let mut seen_ids = std::collections::HashSet::new();
-        for h in &args.hypotheses {
-            let q = h.question.trim();
-            if q.chars().count() > crate::consultation::MAX_CONSULT_QUESTION_CHARS {
-                return serde_json::json!({
-                    "error": "question_too_long",
-                    "message": format!(
-                        "hypothesis {} question exceeds {} characters ({}); \
-                         shorten and re-decide",
-                        h.hypothesis_id,
-                        crate::consultation::MAX_CONSULT_QUESTION_CHARS,
-                        q.chars().count(),
-                    ),
-                });
-            }
-            if let Some(notes) = h.notes.as_deref() {
-                if notes.chars().count() > crate::decisions::MAX_DECISION_NOTES_CHARS {
-                    return serde_json::json!({
-                        "error": "notes_too_long",
-                        "message": format!(
-                            "hypothesis {} notes exceeds {} characters ({}); \
-                             shorten and re-decide",
-                            h.hypothesis_id,
-                            crate::decisions::MAX_DECISION_NOTES_CHARS,
-                            notes.chars().count(),
-                        ),
-                    });
-                }
-            }
-            let cap =
-                h.max_tool_calls.unwrap_or(crate::consultation::DEFAULT_CONSULT_MAX_TOOL_CALLS);
-            if cap == 0 || cap > crate::consultation::MAX_CONSULT_MAX_TOOL_CALLS {
-                return serde_json::json!({
-                    "error": "invalid_effort_cap",
-                    "message": format!(
-                        "hypothesis {} max_tool_calls must be 1..={} (got {})",
-                        h.hypothesis_id,
-                        crate::consultation::MAX_CONSULT_MAX_TOOL_CALLS,
-                        cap,
-                    ),
-                });
-            }
-            total_effort = total_effort.saturating_add(cap);
-            if !seen_ids.insert(&h.hypothesis_id) {
-                return serde_json::json!({
-                    "error": "duplicate_hypothesis_id",
-                    "message": format!(
-                        "each hypothesis_id in the batch must be unique; \
-                         duplicate: {}",
-                        h.hypothesis_id,
-                    ),
-                });
-            }
-        }
-        if total_effort > MAX_SPECULATION_TOTAL_TOOL_CALLS {
-            return serde_json::json!({
-                "error": "total_effort_exceeded",
-                "message": format!(
-                    "the summed per-hypothesis max_tool_calls {} exceeds the batch \
-                     ceiling {}; lower per-hypothesis caps and re-decide",
-                    total_effort,
-                    MAX_SPECULATION_TOTAL_TOOL_CALLS,
-                ),
-            });
-        }
 
         // ── 3. Per-hypothesis Consult validation (DecisionValidator) ──────
         //    ANY invalid hypothesis rejects the whole batch (fail fast,
