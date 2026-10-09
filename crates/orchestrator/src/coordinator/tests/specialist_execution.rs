@@ -89,17 +89,27 @@ async fn unfinished_execution_continues_same_node_and_retains_dependency_positio
             {"agent_id": "coder", "task": "repair"},
             {"agent_id": "coder", "task": "dependent", "after": [0]}
         ]}),
-    ).await;
+    )
+    .await;
     let raw = declared["obligations"][0]["task_id"].as_str().unwrap();
     let id = Ulid::from_string(raw).map(TaskId).unwrap();
     let dependent_raw = declared["obligations"][1]["task_id"].as_str().unwrap();
     let dependent_id = Ulid::from_string(dependent_raw).map(TaskId).unwrap();
     let args = serde_json::json!({"agent_id": "coder", "task": "repair", "task_id": raw});
     let mut state = DispatchSessionState::default();
-    let held = coordinator.handle_call_specialist(
-        &mut graph, &task, &context, &CancellationToken::new(), &mut scope,
-        &mut ledger, &mut state, None, &args,
-    ).await;
+    let held = coordinator
+        .handle_call_specialist(
+            &mut graph,
+            &task,
+            &context,
+            &CancellationToken::new(),
+            &mut scope,
+            &mut ledger,
+            &mut state,
+            None,
+            &args,
+        )
+        .await;
     assert_eq!(held["outcome"], "needs_revision", "{held:?}");
     assert_eq!(held["continuation"]["task_id"], raw);
     assert_eq!(graph.get(&id).unwrap().status, SubTaskStatus::NeedsRevision);
@@ -116,10 +126,20 @@ async fn unfinished_execution_continues_same_node_and_retains_dependency_positio
 
     // Existing checkpoint rows preserve the held status and structured result.
     let checkpoint = checkpoint::build_checkpoint(
-        &scope, checkpoint::CheckpointStage::Executing, None, &context.working_memory,
-        &graph, &ledger.completed_results, ledger.total_cost, ledger.total_tool_calls,
-        &ledger.provider_metrics, &ledger.all_files, &HashMap::new(), &ledger.subtask_attempts,
-        &ledger.retry_feedback, &checkpoint::CheckpointContext::default(),
+        &scope,
+        checkpoint::CheckpointStage::Executing,
+        None,
+        &context.working_memory,
+        &graph,
+        &ledger.completed_results,
+        ledger.total_cost,
+        ledger.total_tool_calls,
+        &ledger.provider_metrics,
+        &ledger.all_files,
+        &HashMap::new(),
+        &ledger.subtask_attempts,
+        &HashMap::new(),
+        &checkpoint::CheckpointContext::default(),
     );
     let json = serde_json::to_string(&checkpoint).unwrap();
     let loaded = checkpoint::GraphCheckpoint::from_json(&json).unwrap();
@@ -131,10 +151,19 @@ async fn unfinished_execution_continues_same_node_and_retains_dependency_positio
     };
     assert_eq!(continuation(reason).unwrap().successful_calls[0].call_id, "write-a");
 
-    let finished = coordinator.handle_call_specialist(
-        &mut graph, &task, &context, &CancellationToken::new(), &mut scope,
-        &mut ledger, &mut state, None, &args,
-    ).await;
+    let finished = coordinator
+        .handle_call_specialist(
+            &mut graph,
+            &task,
+            &context,
+            &CancellationToken::new(),
+            &mut scope,
+            &mut ledger,
+            &mut state,
+            None,
+            &args,
+        )
+        .await;
     assert_eq!(finished["outcome"], "success", "{finished:?}");
     assert_eq!(graph.len(), 2, "continuation creates no duplicate node");
     assert_eq!(graph.get(&id).unwrap().status, SubTaskStatus::Completed);
@@ -147,7 +176,10 @@ async fn unfinished_execution_continues_same_node_and_retains_dependency_positio
     assert!(continued_task.dependencies.is_empty(), "no synthetic self-dependency");
     assert_eq!(continued_context.previous_results.len(), 1);
     assert_eq!(continued_context.previous_results[0].task_id, id);
-    assert!(matches!(continued_context.previous_results[0].outcome, AgentOutcome::NeedsRevision { .. }));
+    assert!(matches!(
+        continued_context.previous_results[0].outcome,
+        AgentOutcome::NeedsRevision { .. }
+    ));
 }
 
 #[tokio::test]
@@ -158,9 +190,15 @@ async fn unfinished_owner_can_be_retargeted_without_releasing_or_duplicating_wor
             MockExpertAgent::always_succeed(AgentId::new("validator"), "verified"),
         ]);
     let declared = declare_for_test(
-        &mut coordinator, &task, &context, &mut graph, &mut ledger, &mut scope,
+        &mut coordinator,
+        &task,
+        &context,
+        &mut graph,
+        &mut ledger,
+        &mut scope,
         &serde_json::json!({"obligations": [{"agent_id": "coder", "task": "repair"}]}),
-    ).await;
+    )
+    .await;
     let raw = declared["obligations"][0]["task_id"].as_str().unwrap();
     let id = Ulid::from_string(raw).map(TaskId).unwrap();
     graph.get_mut(&id).unwrap().status = SubTaskStatus::NeedsRevision;
@@ -177,12 +215,23 @@ async fn unfinished_owner_can_be_retargeted_without_releasing_or_duplicating_wor
 #[tokio::test]
 async fn completed_review_recommendation_still_settles_the_review_node() {
     let (mut coordinator, task, context, mut graph, mut ledger, mut scope, _workspace) =
-        obligation_harness(vec![MockExpertAgent::always_revise(AgentId::new("reviewer"), "fix tests")]);
-    let result = coordinator.handle_call_specialist(
-        &mut graph, &task, &context, &CancellationToken::new(), &mut scope,
-        &mut ledger, &mut DispatchSessionState::default(), None,
-        &serde_json::json!({"agent_id": "reviewer", "task": "Review the changes"}),
-    ).await;
+        obligation_harness(vec![MockExpertAgent::always_revise(
+            AgentId::new("reviewer"),
+            "fix tests",
+        )]);
+    let result = coordinator
+        .handle_call_specialist(
+            &mut graph,
+            &task,
+            &context,
+            &CancellationToken::new(),
+            &mut scope,
+            &mut ledger,
+            &mut DispatchSessionState::default(),
+            None,
+            &serde_json::json!({"agent_id": "reviewer", "task": "Review the changes"}),
+        )
+        .await;
     assert_eq!(result["outcome"], "needs_revision", "{result:?}");
     assert!(result.get("continuation").is_none());
     assert!(graph.all_completed(), "a completed review recommendation is not unfinished execution");

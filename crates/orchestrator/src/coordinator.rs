@@ -14107,7 +14107,9 @@ impl CoordinatorAgent {
             );
         }
         let execution_continuation = match &result.outcome {
-            AgentOutcome::NeedsRevision { reason } => crate::agents::execution_state::continuation(reason),
+            AgentOutcome::NeedsRevision { reason } => {
+                crate::agents::execution_state::continuation(reason)
+            }
             _ => None,
         };
         match result.outcome {

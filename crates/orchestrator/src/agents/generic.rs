@@ -314,7 +314,6 @@ impl GenericSpecialistAgent {
             )
             .await;
     }
-
 }
 
 impl GenericSpecialistAgent {
@@ -2626,8 +2625,10 @@ mod tests {
         assert_eq!(result.tool_call_count, 1);
         assert!(result.summary.starts_with("Needs continuation:"));
         assert!(result.summary.contains("Recovered from tool failure."));
-        assert!(matches!(result.outcome, AgentOutcome::NeedsRevision { .. }),
-            "completion prose must not erase the unresolved disk-full failure");
+        assert!(
+            matches!(result.outcome, AgentOutcome::NeedsRevision { .. }),
+            "completion prose must not erase the unresolved disk-full failure"
+        );
         assert!(provider.second_request_contained_error_result());
     }
 

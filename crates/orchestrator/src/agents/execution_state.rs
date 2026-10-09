@@ -62,7 +62,11 @@ impl ExecutionState {
     /// gets a fresh turn budget, but unresolved operations do not disappear
     /// merely because the Coordinator continued the same task.
     pub fn for_task(task: &SubTask, context: &AgentContext) -> Self {
-        let note = context.previous_results.iter().rev().find(|result| result.task_id == task.id)
+        let note = context
+            .previous_results
+            .iter()
+            .rev()
+            .find(|result| result.task_id == task.id)
             .and_then(|result| match &result.outcome {
                 AgentOutcome::NeedsRevision { reason } => continuation(reason),
                 _ => None,
@@ -133,7 +137,8 @@ impl ExecutionState {
         // execution itself failed. Its actual failure replaces that rejection.
         self.rejected_arguments.remove(tool);
         self.rejected_arguments.remove(&operation_hash);
-        if self.failures.len() >= MAX_RECORDED_CALLS && !self.failures.contains_key(&operation_hash) {
+        if self.failures.len() >= MAX_RECORDED_CALLS && !self.failures.contains_key(&operation_hash)
+        {
             self.omitted_outstanding_calls = self.omitted_outstanding_calls.saturating_add(1);
             return;
         }
@@ -198,9 +203,7 @@ impl ExecutionState {
             omitted_outstanding_calls: self.omitted_outstanding_calls,
         };
         let detail = serde_json::to_string(&continuation).unwrap_or_default();
-        AgentOutcome::NeedsRevision {
-            reason: format!("{reason}. {CONTINUATION_MARKER}{detail}"),
-        }
+        AgentOutcome::NeedsRevision { reason: format!("{reason}. {CONTINUATION_MARKER}{detail}") }
     }
 }
 
@@ -231,17 +234,21 @@ pub(crate) fn tool_failure_payload(error: &ToolError) -> Value {
 fn operation_hash(tool: &str, args: &Value) -> String {
     let operation = match tool {
         "filesystem" | "write_file" | "edit_file" | "delete_file" | "create_file"
-        | "modify_file" | "write" if has_resource(args) => serde_json::json!({
-            "tool": tool,
-            "operation": args.get("operation"),
-            "path": args.get("path"),
-            "file_path": args.get("file_path"),
-            "file": args.get("file"),
-            "source": args.get("source"),
-            "target": args.get("target"),
-            "paths": args.get("paths"),
-            "destination": args.get("destination"),
-        }),
+        | "modify_file" | "write"
+            if has_resource(args) =>
+        {
+            serde_json::json!({
+                "tool": tool,
+                "operation": args.get("operation"),
+                "path": args.get("path"),
+                "file_path": args.get("file_path"),
+                "file": args.get("file"),
+                "source": args.get("source"),
+                "target": args.get("target"),
+                "paths": args.get("paths"),
+                "destination": args.get("destination"),
+            })
+        }
         _ => serde_json::json!({ "tool": tool, "args": args }),
     };
     blake3::hash(operation.to_string().as_bytes()).to_hex().to_string()
@@ -287,9 +294,13 @@ mod tests {
     fn exhausted_execution_preserves_successes_without_claiming_completion() {
         let mut state = ExecutionState::default();
         state.begin_turn();
-        state.succeeded("write-1", "filesystem", &serde_json::json!({
-            "operation": "write", "path": "a.rs", "content": "changed"
-        }));
+        state.succeeded(
+            "write-1",
+            "filesystem",
+            &serde_json::json!({
+                "operation": "write", "path": "a.rs", "content": "changed"
+            }),
+        );
         let AgentOutcome::NeedsRevision { reason } = state.outcome(&task(), "working") else {
             panic!("execution without a final answer must remain unfinished");
         };
@@ -302,17 +313,30 @@ mod tests {
     #[test]
     fn successful_sibling_cannot_resolve_another_resources_failure() {
         let mut state = ExecutionState::default();
-        state.failed("bad", "filesystem", &serde_json::json!({
-            "operation": "write", "path": "a.rs"
-        }), "tool-failed");
-        state.succeeded("other", "filesystem", &serde_json::json!({
-            "operation": "write", "path": "b.rs"
-        }));
+        state.failed(
+            "bad",
+            "filesystem",
+            &serde_json::json!({
+                "operation": "write", "path": "a.rs"
+            }),
+            "tool-failed",
+        );
+        state.succeeded(
+            "other",
+            "filesystem",
+            &serde_json::json!({
+                "operation": "write", "path": "b.rs"
+            }),
+        );
         state.final_answer();
         assert!(matches!(state.outcome(&task(), "done"), AgentOutcome::NeedsRevision { .. }));
-        state.succeeded("fixed", "filesystem", &serde_json::json!({
-            "operation": "write", "path": "a.rs", "content": "repaired"
-        }));
+        state.succeeded(
+            "fixed",
+            "filesystem",
+            &serde_json::json!({
+                "operation": "write", "path": "a.rs", "content": "repaired"
+            }),
+        );
         assert_eq!(state.outcome(&task(), "done"), AgentOutcome::Success);
     }
 
@@ -323,9 +347,13 @@ mod tests {
         state.succeeded("other", "shell", &serde_json::json!({"command": "true"}));
         state.final_answer();
         assert!(matches!(state.outcome(&task(), "done"), AgentOutcome::NeedsRevision { .. }));
-        state.succeeded("fixed", "filesystem", &serde_json::json!({
-            "operation": "write", "path": "a.rs"
-        }));
+        state.succeeded(
+            "fixed",
+            "filesystem",
+            &serde_json::json!({
+                "operation": "write", "path": "a.rs"
+            }),
+        );
         assert_eq!(state.outcome(&task(), "done"), AgentOutcome::Success);
     }
 
@@ -364,7 +392,11 @@ mod tests {
         assert_eq!(note.omitted_successful_calls, 1);
         assert_eq!(note.omitted_outstanding_calls, 1);
         for index in 0..(MAX_RECORDED_CALLS + 1) {
-            state.succeeded("fixed", "filesystem", &serde_json::json!({"path": format!("{index}.rs")}));
+            state.succeeded(
+                "fixed",
+                "filesystem",
+                &serde_json::json!({"path": format!("{index}.rs")}),
+            );
         }
         assert!(matches!(state.outcome(&task(), "done"), AgentOutcome::NeedsRevision { .. }));
     }
@@ -376,7 +408,11 @@ mod tests {
         state.succeeded("sibling", "write_file", &serde_json::json!({"path": "b.rs"}));
         state.final_answer();
         assert!(matches!(state.outcome(&task(), "done"), AgentOutcome::NeedsRevision { .. }));
-        state.succeeded("fixed", "write_file", &serde_json::json!({"path": "a.rs", "content": "fixed"}));
+        state.succeeded(
+            "fixed",
+            "write_file",
+            &serde_json::json!({"path": "a.rs", "content": "fixed"}),
+        );
         assert_eq!(state.outcome(&task(), "done"), AgentOutcome::Success);
     }
 }

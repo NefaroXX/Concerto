@@ -61,6 +61,11 @@ modules. Its evaluator and typed submission paths stay in the parent file.
 OpenCode H05 should start from this extraction rather than copying the old
 freeform loop or building a second validator path.
 
+The obsolete previous-result formatter is removed from `memory_prompt.rs`;
+its replacement is `agents/task_contract.rs`. Retrieved memory serialization
+and run-memory formatting are unchanged. H11 can edit those memory functions
+after rebasing this small removal.
+
 OpenCode H02 should replace the existing diagnosis-to-tool-result adapter when
 its canonical `ToolFailure` is available. Do not add a second error taxonomy.
 When H01 provides a canonical rich result schema, migrate this private

@@ -39,25 +39,21 @@ impl concerto_core::traits::tool::Tool for FixtureWriteTool {
         session: &concerto_core::types::SessionContext,
         _cancel: CancellationToken,
     ) -> Result<ToolOutput, concerto_core::ToolError> {
-        if self.failures.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-            count.checked_sub(1)
-        }).is_ok() {
+        if self
+            .failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| count.checked_sub(1))
+            .is_ok()
+        {
             return Err(concerto_core::ToolError::ExecutionFailed { message: "disk full".into() });
         }
         let path = input["path"].as_str().expect("fixture path validated by the guard");
         let content = input["content"].as_str().expect("fixture content validated by the guard");
         std::fs::write(session.project_dir.join(path), content)?;
-        Ok(ToolOutput {
-            summary: format!("Wrote {path}"),
-            data: serde_json::json!({"path": path}),
-        })
+        Ok(ToolOutput { summary: format!("Wrote {path}"), data: serde_json::json!({"path": path}) })
     }
 }
 
-fn fixture_agent(
-    failures: usize,
-    chunks: Vec<CompletionChunk>,
-) -> GenericSpecialistAgent {
+fn fixture_agent(failures: usize, chunks: Vec<CompletionChunk>) -> GenericSpecialistAgent {
     let mut registry = concerto_core::types::ToolRegistry::default();
     registry.register(Box::new(FixtureWriteTool { failures: AtomicUsize::new(failures) }));
     let executor = ToolExecutor::new(
@@ -140,11 +136,14 @@ async fn iteration_limit_returns_revision_with_files_and_serializable_progress()
 #[tokio::test]
 async fn corrected_operation_can_finish_after_observed_success() {
     let dir = tempfile::tempdir().unwrap();
-    let agent = fixture_agent(1, vec![
-        write_turn("failed", "a.rs", "initial"),
-        write_turn("corrected", "a.rs", "repaired"),
-        final_turn(),
-    ]);
+    let agent = fixture_agent(
+        1,
+        vec![
+            write_turn("failed", "a.rs", "initial"),
+            write_turn("corrected", "a.rs", "repaired"),
+            final_turn(),
+        ],
+    );
     let (task, context) = fixture_context(dir.path());
     let result = agent.run(&task, context, "mock", CancellationToken::new()).await.unwrap();
     assert_eq!(result.outcome, AgentOutcome::Success);
@@ -155,11 +154,14 @@ async fn corrected_operation_can_finish_after_observed_success() {
 #[tokio::test]
 async fn successful_sibling_edit_does_not_hide_unresolved_failure() {
     let dir = tempfile::tempdir().unwrap();
-    let agent = fixture_agent(1, vec![
-        write_turn("failed", "a.rs", "missing"),
-        write_turn("sibling", "b.rs", "retained"),
-        final_turn(),
-    ]);
+    let agent = fixture_agent(
+        1,
+        vec![
+            write_turn("failed", "a.rs", "missing"),
+            write_turn("sibling", "b.rs", "retained"),
+            final_turn(),
+        ],
+    );
     let (task, context) = fixture_context(dir.path());
     let result = agent.run(&task, context, "mock", CancellationToken::new()).await.unwrap();
     assert!(!dir.path().join("a.rs").exists());
@@ -178,11 +180,13 @@ async fn continuing_a_task_cannot_forget_its_unresolved_operations() {
     let dir = tempfile::tempdir().unwrap();
     let (task, mut context) = fixture_context(dir.path());
     let first = fixture_agent(1, vec![write_turn("failed", "a.rs", "initial"), final_turn()]);
-    let unfinished = first.run(&task, context.clone(), "mock", CancellationToken::new()).await.unwrap();
+    let unfinished =
+        first.run(&task, context.clone(), "mock", CancellationToken::new()).await.unwrap();
     assert!(matches!(unfinished.outcome, AgentOutcome::NeedsRevision { .. }));
     context.previous_results.push(unfinished);
     let idle = fixture_agent(0, vec![final_turn()]);
-    let still_open = idle.run(&task, context.clone(), "mock", CancellationToken::new()).await.unwrap();
+    let still_open =
+        idle.run(&task, context.clone(), "mock", CancellationToken::new()).await.unwrap();
     assert!(matches!(still_open.outcome, AgentOutcome::NeedsRevision { .. }));
     context.previous_results.push(still_open);
     let repaired = fixture_agent(0, vec![write_turn("repaired", "a.rs", "fixed"), final_turn()]);

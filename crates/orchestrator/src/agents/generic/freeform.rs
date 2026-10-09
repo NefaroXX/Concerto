@@ -436,14 +436,19 @@ impl GenericSpecialistAgent {
                             &cancel,
                         )
                         .await;
-                        if cancel.is_cancelled() || matches!(error, concerto_core::ToolError::Cancelled) {
+                        if cancel.is_cancelled()
+                            || matches!(error, concerto_core::ToolError::Cancelled)
+                        {
                             return Err(OrchestratorError::Cancelled);
                         }
-                        if matches!(error, concerto_core::ToolError::PausedAwaitingApproval { .. }) {
+                        if matches!(error, concerto_core::ToolError::PausedAwaitingApproval { .. })
+                        {
                             return Err(OrchestratorError::Tool(error));
                         }
                         let payload = tool_failure_payload(&error);
-                        let code = payload.get("code").and_then(serde_json::Value::as_str)
+                        let code = payload
+                            .get("code")
+                            .and_then(serde_json::Value::as_str)
                             .unwrap_or("tool-failed");
                         progress.failed(&tool_call.id, &tool_call.name, &arguments, code);
                         let _ = self.bus.publish_for_session(
@@ -527,4 +532,3 @@ impl GenericSpecialistAgent {
         })
     }
 }
-
