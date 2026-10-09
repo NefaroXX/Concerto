@@ -3786,6 +3786,23 @@ fn default_agent_kinds(
         .collect()
 }
 
+/// W2c: the completion-tail guard predicates evaluated by
+/// [`CoordinatorAgent::evaluate_completion_guards`]. Each flag names a guard
+/// that arms at the success tail; the caller owns every resulting note,
+/// decision row, and acceptance check so side-effect ordering is unchanged.
+struct CompletionGuards {
+    /// P5: an action-required run reached the success tail with an empty graph
+    /// (a vacuous completion).
+    vacuous_execute_dispatch: bool,
+    /// P5: a dispatched ledger exists but zero tool calls executed.
+    zero_work: bool,
+    /// P6: the graph holds implement-stage work — C-06 acceptance applies.
+    build_task: bool,
+    /// P6: a completed validation-stage dispatch provides declared
+    /// verification evidence.
+    has_declared_verification: bool,
+}
+
 impl CoordinatorAgent {
     /// Create a new coordinator with all required subsystems.
     pub fn new(
@@ -8346,6 +8363,155 @@ impl CoordinatorAgent {
         )
     }
 
+    /// W2a (execute_graph P1): seed `terminal_subtask_failure` from a resumed
+    /// checkpoint. A blocked task whose retry attempts are already exhausted
+    /// (resumed from a checkpoint) publishes one `SubTaskFailed` event and
+    /// yields the terminal error, so the empty-ready-queue exit returns
+    /// Partial (ADR-26) instead of INTERNAL_ERROR (C-05). Pure apart from the
+    /// single best-effort publish; a fresh run has no blocked tasks and gets
+    /// `None`.
+    fn seed_terminal_failure_from_checkpoint(
+        &self,
+        graph: &TaskGraph,
+        subtask_attempts: &HashMap<TaskId, u32>,
+    ) -> Option<OrchestratorError> {
+        let mut terminal_subtask_failure = None;
+        for task in graph.all_tasks() {
+            if task.status == SubTaskStatus::Blocked {
+                let attempts = subtask_attempts.get(&task.id).copied().unwrap_or(0);
+                if attempts >= self.max_subtask_attempts {
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        task.id.0,
+                        EventKind::SubTaskFailed {
+                            task_id: task.id,
+                            role: task.role.clone(),
+                            error: format!(
+                                "subtask exhausted after {} attempt(s) (resumed from checkpoint)",
+                                attempts,
+                            ),
+                        },
+                    );
+                    terminal_subtask_failure = Some(OrchestratorError::SubTaskRetriesExhausted {
+                        task_id: task.id,
+                        role: task.role.clone(),
+                        attempts,
+                        last_error: "subtask exhausted retry attempts before checkpoint".into(),
+                    });
+                    break;
+                }
+            }
+        }
+        terminal_subtask_failure
+    }
+
+    /// W2b (execute_graph P2): build the initial execution checkpoint from the
+    /// run's current snapshots. Bumps the scope sequence number, captures the
+    /// working memory / graph / ledger state through the self snapshot
+    /// accessors ([`Self::expected_artifacts_snapshot`],
+    /// [`Self::checkpoint_context`]), and stamps the pending interactive /
+    /// approval request so a resume re-attaches to the same question. Pure
+    /// snapshot assembly: no I/O, and no state mutation beyond the scope's
+    /// sequence counter.
+    #[allow(clippy::too_many_arguments)]
+    fn build_initial_execution_checkpoint(
+        &self,
+        checkpoint_scope: &mut checkpoint::CheckpointScope,
+        context: &AgentContext,
+        graph: &TaskGraph,
+        completed_results: &HashMap<TaskId, AgentRunResult>,
+        total_cost: f64,
+        total_tool_calls: u32,
+        provider_metrics: &[ProviderMetrics],
+        all_files: &[camino::Utf8PathBuf],
+        subtask_attempts: &HashMap<TaskId, u32>,
+        retry_feedback: &HashMap<TaskId, Vec<AgentRunResult>>,
+        model_assignments: &HashMap<TaskId, String>,
+        action_ledger: &[checkpoint::CheckpointAction],
+        requested_user_input: Option<String>,
+        pending_approval: Option<concerto_core::types::PendingApprovalInfo>,
+    ) -> checkpoint::GraphCheckpoint {
+        checkpoint_scope.sequence_num = checkpoint_scope.sequence_num.saturating_add(1);
+        let mut checkpoint = checkpoint::build_checkpoint(
+            checkpoint_scope,
+            checkpoint::CheckpointStage::Executing,
+            None,
+            &context.working_memory,
+            graph,
+            completed_results,
+            total_cost,
+            total_tool_calls,
+            provider_metrics,
+            all_files,
+            &self.expected_artifacts_snapshot(),
+            subtask_attempts,
+            retry_feedback,
+            &self.checkpoint_context(model_assignments, action_ledger),
+        );
+        // TODO #22 (tracking half): persist the pending interactive
+        // answer-request ON the checkpoint so an AwaitingUser pause survives
+        // a resume with the SAME question — the short-circuit is the only
+        // reader on the fresh path, and `restore_and_evaluate` feeds it back
+        // into this parameter on the resume path. `None` except when the run
+        // is waiting on the operator (fresh or restored).
+        checkpoint.pending_user_input = requested_user_input;
+        // Approval-timeout pause: persist the preserved request on the
+        // checkpoint so a resume re-attaches to the SAME approval (the sink
+        // reuses the pending entry) instead of re-asking the model.
+        checkpoint.pending_approval = pending_approval;
+        checkpoint
+    }
+
+    /// W2c (execute_graph P5-P7): the completion-tail guard predicates,
+    /// evaluated over [`Self::dispatch_guard_arms`]. Pure — classifies which
+    /// guards arm without pushing notes, recording decisions, fetching
+    /// verification evidence, or probing the filesystem; every note, decision
+    /// row, acceptance check, and on-disk deliverable probe stays at the call
+    /// site so ordering and side effects are unchanged.
+    fn evaluate_completion_guards(
+        &self,
+        task: &AgentTask,
+        graph: &TaskGraph,
+        all_files: &[camino::Utf8PathBuf],
+        action_ledger: &[checkpoint::CheckpointAction],
+        total_tool_calls: u32,
+        requested_user_input: Option<&str>,
+    ) -> CompletionGuards {
+        // P5 vacuous-completion predicate: an action-required run that reaches
+        // the success tail with an EMPTY graph and no pending user input would
+        // otherwise exit `Completed` on a vacuous truth. Prose-only roots and
+        // non-full depths are exempt by construction.
+        let roster_has_specialists = !self.registry.ids().is_empty();
+        let vacuous_execute_dispatch = graph.is_empty()
+            && self.dispatch_guard_arms(task, graph, all_files)
+            && requested_user_input.is_none()
+            && self.orchestration_depth == OrchestrationDepth::Full
+            && (all_files.is_empty() || roster_has_specialists);
+        // P5 zero-work predicate: the same guard arms and a dispatched ledger
+        // is present, yet no tool ever ran.
+        let dispatched_subtasks = action_ledger.iter().any(|action| action.kind == "dispatched");
+        let zero_work = self.dispatch_guard_arms(task, graph, all_files)
+            && dispatched_subtasks
+            && total_tool_calls == 0;
+        // P6 C-06 predicates: implement-stage work is present, and a completed
+        // validation-stage dispatch provides declared verification evidence.
+        let build_task = graph.all_tasks().iter().any(|subtask| {
+            self.stage_of(&subtask.role).as_ref().is_some_and(AgentStage::is_implement)
+        });
+        let has_declared_verification = graph.all_tasks().iter().any(|subtask| {
+            self.role_in_kind_stage(&subtask.role, StageKind::Acceptance, AgentStage::is_validate)
+                && action_ledger
+                    .iter()
+                    .any(|action| action.task_id == Some(subtask.id) && action.kind == "completed")
+        });
+        CompletionGuards {
+            vacuous_execute_dispatch,
+            zero_work,
+            build_task,
+            has_declared_verification,
+        }
+    }
+
     /// Execute the task graph until all tasks complete. Returns the final
     /// `AgentOutput` for a fully-completed run.
     #[allow(clippy::too_many_arguments)]
@@ -8374,38 +8540,12 @@ impl CoordinatorAgent {
         // ADR-52: the run-wide dispatch cap is counted across the whole `run`
         // invocation (the Coordinator decision loop + this graph loop share
         // one ceiling); the counter is reset in `run`, never here.
-        let mut terminal_subtask_failure = None;
         // When resuming from a checkpoint, blocked tasks with exhausted retry
-        // attempts may already be present in the graph.  Populate
+        // attempts may already be present in the graph. Seed
         // `terminal_subtask_failure` so the empty-ready-queue exit below
         // returns Partial (ADR-26) instead of INTERNAL_ERROR (C-05).
-        // On a fresh run there are no blocked tasks, so this is a no-op.
-        for task in graph.all_tasks() {
-            if task.status == SubTaskStatus::Blocked {
-                let attempts = subtask_attempts.get(&task.id).copied().unwrap_or(0);
-                if attempts >= self.max_subtask_attempts {
-                    let _ = self.bus.publish_for_session(
-                        task.session_id,
-                        task.id.0,
-                        EventKind::SubTaskFailed {
-                            task_id: task.id,
-                            role: task.role.clone(),
-                            error: format!(
-                                "subtask exhausted after {} attempt(s) (resumed from checkpoint)",
-                                attempts,
-                            ),
-                        },
-                    );
-                    terminal_subtask_failure = Some(OrchestratorError::SubTaskRetriesExhausted {
-                        task_id: task.id,
-                        role: task.role.clone(),
-                        attempts,
-                        last_error: "subtask exhausted retry attempts before checkpoint".into(),
-                    });
-                    break;
-                }
-            }
-        }
+        let mut terminal_subtask_failure =
+            self.seed_terminal_failure_from_checkpoint(&graph, &subtask_attempts);
         let mut non_recoverable_exit: Option<(TaskId, AgentId, OrchestratorError)> = None;
         // Notes carried over from the Coordinator's decision loop (ADR-35
         // amendment 2026-09-05): per-call zero-work flags, an empty dispatch
@@ -8447,34 +8587,22 @@ impl CoordinatorAgent {
             &|role| self.stage_of(role),
             self.blueprint_facade.as_ref(),
         );
-        checkpoint_scope.sequence_num = checkpoint_scope.sequence_num.saturating_add(1);
-        let mut initial_execution_checkpoint = checkpoint::build_checkpoint(
-            &checkpoint_scope,
-            checkpoint::CheckpointStage::Executing,
-            None,
-            &context.working_memory,
+        let mut initial_execution_checkpoint = self.build_initial_execution_checkpoint(
+            &mut checkpoint_scope,
+            &context,
             &graph,
             &completed_results,
             total_cost,
             total_tool_calls,
             &provider_metrics,
             &all_files,
-            &self.expected_artifacts_snapshot(),
             &subtask_attempts,
             &retry_feedback,
-            &self.checkpoint_context(&model_assignments, &action_ledger),
+            &model_assignments,
+            &action_ledger,
+            requested_user_input.clone(),
+            pending_approval.clone(),
         );
-        // TODO #22 (tracking half): persist the pending interactive
-        // answer-request ON the checkpoint so an AwaitingUser pause survives
-        // a resume with the SAME question — the short-circuit below is the
-        // only reader on the fresh path, and `restore_and_evaluate` feeds it
-        // back into this parameter on the resume path. `None` except when
-        // the run is waiting on the operator (fresh or restored).
-        initial_execution_checkpoint.pending_user_input = requested_user_input.clone();
-        // Approval-timeout pause: persist the preserved request on the
-        // checkpoint so a resume re-attaches to the SAME approval (the sink
-        // reuses the pending entry) instead of re-asking the model.
-        initial_execution_checkpoint.pending_approval = pending_approval.clone();
         // Lazy machinery: a text-only run (an empty graph that will dispatch
         // nothing) must leave no orchestration checkpoint behind. Persist the
         // initial execution checkpoint only when there is dispatchable work or
@@ -10347,19 +10475,22 @@ impl CoordinatorAgent {
         // the lawful delegation-failure recovery path, and attributing which
         // bytes each party produced is beyond this name-based gate. Only the
         // zero-dispatch (empty graph) case is gated here.
-        let roster_has_specialists = !self.registry.ids().is_empty();
-        // Obligation correction: the mode predicate below is the combined
+        // W2c: classify the completion-tail guards (P5-P7) in one pure pass.
+        // Obligation correction: the mode predicate is the combined
         // [`Self::dispatch_guard_arms`] — a `CoordinatorDecides` run holding a
         // promised-but-unattempted plan (or open execution work, which cannot
         // occur with an empty graph) is vacuous in exactly the same way as an
         // `ActionRequired` one. Conversational turns stay exempt: no plan, no
         // open work, no guard.
-        let vacuous_execute_dispatch = graph.is_empty()
-            && self.dispatch_guard_arms(&task, &graph, &all_files)
-            && requested_user_input.is_none()
-            && self.orchestration_depth == OrchestrationDepth::Full
-            && (all_files.is_empty() || roster_has_specialists);
-        if vacuous_execute_dispatch {
+        let guards = self.evaluate_completion_guards(
+            &task,
+            &graph,
+            &all_files,
+            &action_ledger,
+            total_tool_calls,
+            requested_user_input.as_deref(),
+        );
+        if guards.vacuous_execute_dispatch {
             recoverable_notes.push(
                 "Vacuous-completion guard: this action-required run dispatched zero tasks — an \
                  empty dispatch session cannot claim completion, even when the coordinator's own \
@@ -10391,11 +10522,7 @@ impl CoordinatorAgent {
         //   turns arm neither source (no mode, no open work, no plan).
         // The note downgrades the exit to Partial, and the stall gate below
         // keeps the checkpoint resumable for a later resume.
-        let dispatched_subtasks = action_ledger.iter().any(|action| action.kind == "dispatched");
-        if self.dispatch_guard_arms(&task, &graph, &all_files)
-            && dispatched_subtasks
-            && total_tool_calls == 0
-        {
+        if guards.zero_work {
             recoverable_notes.push(
                 "Zero-work guard: the task required tool work but zero tool calls executed \
                  across the run; the completion claim was not backed by any executed tool."
@@ -10428,16 +10555,8 @@ impl CoordinatorAgent {
         // with a note naming the missing evidence. FAIL-CLOSED: absence of
         // evidence is never Complete; failed or refused tool calls are never
         // evidence.
-        let build_task = graph.all_tasks().iter().any(|subtask| {
-            self.stage_of(&subtask.role).as_ref().is_some_and(AgentStage::is_implement)
-        });
-        let has_declared_verification = graph.all_tasks().iter().any(|subtask| {
-            self.role_in_kind_stage(&subtask.role, StageKind::Acceptance, AgentStage::is_validate)
-                && action_ledger
-                    .iter()
-                    .any(|action| action.task_id == Some(subtask.id) && action.kind == "completed")
-        });
-        if build_task && completion_status == concerto_core::types::AgentCompletionStatus::Completed
+        if guards.build_task
+            && completion_status == concerto_core::types::AgentCompletionStatus::Completed
         {
             let declared_artifacts = expected_artifact_list(&self.expected_artifacts_snapshot());
             let run_id = checkpoint_scope.run_id.to_string();
@@ -10446,7 +10565,7 @@ impl CoordinatorAgent {
                     task.session_id,
                     Some(run_id.as_str()),
                     &declared_artifacts,
-                    has_declared_verification,
+                    guards.has_declared_verification,
                 )
                 .await;
             match evidence {
@@ -10461,7 +10580,7 @@ impl CoordinatorAgent {
                     );
                     if let Some(rejected) = self.acceptance_rejection(
                         &task,
-                        build_task,
+                        guards.build_task,
                         &project_root,
                         &mut action_ledger,
                     ) {
