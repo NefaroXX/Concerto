@@ -43,6 +43,10 @@ pub mod openrouter;
 pub mod perplexity;
 pub mod sambanova;
 pub mod sse;
+// Shared Anthropic-dialect SSE stream state machine (crate-internal: the
+// anthropic and opencode connectors share one copy; not part of the public
+// API surface).
+mod sse_state;
 pub mod together;
 pub mod tool_args;
 pub mod xai;
