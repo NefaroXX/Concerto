@@ -4930,6 +4930,10 @@ custom_agents = []
 
     #[test]
     fn dispatch_allowed_when_active_provider_ready() {
+        // CONFIG_ENV_LOCK: `dispatch_validation_error` reads `runtime_providers`,
+        // which prefers a config loaded by `App::new` — a concurrent XDG
+        // redirect seeding a foreign provider list must not interleave.
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let (mut app, _) = App::new();
         app.settings.providers.clear();
         // Ollama needs no credential, so it is ready regardless of a stored model
@@ -5352,6 +5356,15 @@ custom_agents = []
 
     #[test]
     fn chat_model_options_match_shared_resolver() {
+        // Hold CONFIG_ENV_LOCK and redirect XDG like the other config-sensitive
+        // tests: `App::new` loads the user config, and a concurrent
+        // XDG_CONFIG_HOME redirect (e.g. the agent-override test) would make
+        // `runtime_providers` resolve a foreign provider list instead of the
+        // `settings.providers` rows pushed below.
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
         let (mut app, _) = App::new();
         app.settings.providers.clear();
         push_provider(&mut app, "prov1", "openai", "gpt-4");
@@ -5359,6 +5372,10 @@ custom_agents = []
         app.active_provider_id = "prov1".into();
         app.active_model = "gpt-4".into();
         app.sync_chat_model_options();
+        match previous {
+            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
         assert!(
             app.chat_model_options.contains(&"gpt-4".to_string()),
             "the active/selected model must be present in the chat picker"
