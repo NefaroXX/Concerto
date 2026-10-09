@@ -1129,10 +1129,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coder_seed_is_generic_backed_freeform() {
-        // The retired CoderAgent failed when no file was modified; the
-        // generic Freeform backing reports Success for any terminal text.
-        // This is the accepted interim until the C-06 acceptance work lands.
+    async fn coder_seed_is_generic_backed_and_rejects_empty_completion() {
+        // Freeform backing retains the seed's identity/stage, but an empty
+        // provider response cannot settle the assigned work successfully.
         let registry = build_test_registry(&HashMap::new());
         let coder = registry.get(&AgentId::new("coder")).expect("coder seed registered");
         assert_eq!(coder.stage().map(|s| s.to_string()), Some("implement".to_string()));
@@ -1161,8 +1160,8 @@ mod tests {
             .expect("run should succeed");
 
         assert!(
-            matches!(result.outcome, AgentOutcome::Success),
-            "generic Freeform coder reports Success for any terminal text (interim until C-06)"
+            matches!(result.outcome, AgentOutcome::NeedsRevision { .. }),
+            "an empty terminal chunk must retain unfinished work"
         );
         assert!(result.files_modified.is_empty());
         assert_eq!(result.role, AgentId::new("coder"));

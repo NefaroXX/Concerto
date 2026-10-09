@@ -236,3 +236,71 @@ async fn completed_review_recommendation_still_settles_the_review_node() {
     assert!(result.get("continuation").is_none());
     assert!(graph.all_completed(), "a completed review recommendation is not unfinished execution");
 }
+
+#[tokio::test]
+async fn closing_prose_cannot_complete_a_run_with_unfinished_specialist_execution() {
+    let bus = EventBus::new(256);
+    let mut coordinator = coordinator_with_turns(
+        bus,
+        Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("coder"),
+            "done",
+        )])),
+        vec![
+            CoordinatorTurn::Calls(vec![call_specialist("coder", "Repair the fixture")]),
+            CoordinatorTurn::Text("The change is done.".into()),
+        ],
+    );
+    let agent = install_continuing_agent(&mut coordinator);
+    let session_id = Ulid::new();
+    let workspace = tempfile::tempdir().unwrap();
+    let context = AgentContext::new(concerto_core::types::SessionContext::new(
+        session_id,
+        workspace.path().to_path_buf(),
+    ));
+    let output = coordinator
+        .run(
+            AgentTask::new_coordinator_decides(session_id, "Repair the fixture"),
+            context,
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(output.completion_status, concerto_core::types::AgentCompletionStatus::Partial);
+    let checkpoint_json = output.checkpoint_json.as_deref().unwrap();
+    let saved = checkpoint::GraphCheckpoint::from_json(checkpoint_json).unwrap();
+    let restored = checkpoint::restore_graph(&saved).unwrap();
+    assert!(!restored.all_completed());
+    assert!(restored.all_tasks().iter().any(|node| node.status == SubTaskStatus::NeedsRevision));
+
+    let held = restored
+        .all_tasks()
+        .into_iter()
+        .find(|node| node.status == SubTaskStatus::NeedsRevision)
+        .unwrap();
+    let resume_call = call_specialist_for("coder", "Continue the fixture repair", &held.id.to_string());
+    coordinator.planning_provider = Arc::new(TurnProvider::new(vec![
+        CoordinatorTurn::Calls(vec![resume_call]),
+        CoordinatorTurn::Text("The remaining work is finished.".into()),
+    ]));
+    let resumed_context = AgentContext::new(concerto_core::types::SessionContext::new(
+        session_id,
+        workspace.path().to_path_buf(),
+    ));
+    let resumed = coordinator
+        .run(
+            AgentTask::new_coordinator_decides(session_id, "continue"),
+            resumed_context,
+            CancellationToken::new(),
+            output.checkpoint_json,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resumed.tool_call_count, 2, "resume adds one dispatch to retained metrics");
+    let dispatches = agent.dispatches.lock().unwrap();
+    assert_eq!(dispatches.len(), 2, "Continue returns to the Coordinator's decision loop");
+    assert_eq!(dispatches[1].0.id, held.id, "resume continues the same task");
+    assert_eq!(dispatches[1].1.previous_results[0].task_id, held.id);
+    assert!(dispatches[1].0.dependencies.is_empty());
+}

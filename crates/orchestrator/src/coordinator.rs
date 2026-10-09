@@ -6890,6 +6890,22 @@ impl CoordinatorAgent {
                 .all(|subtask| subtask.status == SubTaskStatus::Completed)
     }
 
+    /// Held specialist execution must return to the Coordinator's decision
+    /// loop on Continue. Replaying the graph alone has no ready nodes and
+    /// would report the same Partial forever. Approval/input/wait pauses
+    /// retain their dedicated resume paths.
+    fn resume_needs_continuation_drive(&self, result: &DecomposeResult) -> bool {
+        result.requested_user_input.is_none()
+            && result.pending_approval.is_none()
+            && self.active_wait.is_none()
+            && result.graph.all_tasks().iter().any(|node| {
+                node.status == SubTaskStatus::NeedsRevision
+                    && result.completed_results.get(&node.id).is_some_and(|result| {
+                        crate::agents::execution_state::unfinished(&result.outcome)
+                    })
+            })
+    }
+
     /// Resume-drive: re-enter the Coordinator's decision loop over the
     /// RESTORED graph so a settled-but-unattempted implement stage gets its
     /// dispatch, instead of returning the restore verbatim and letting the
@@ -6920,7 +6936,49 @@ impl CoordinatorAgent {
         // still decides who gets dispatched (ADR-35).
         let design_role = self.first_agent_for_stage(&AgentStage::new(AgentStage::DESIGN));
         let mut intro = self.dispatch_context_intro(doc.as_ref(), None, cancel).await;
-        intro.push_str(&resume_drive_instruction());
+        let continuing = self.resume_needs_continuation_drive(&result);
+        if continuing {
+            let mut held = result
+                .graph
+                .all_tasks()
+                .into_iter()
+                .filter(|node| {
+                    node.status == SubTaskStatus::NeedsRevision
+                        && result.completed_results.get(&node.id).is_some_and(|result| {
+                            crate::agents::execution_state::unfinished(&result.outcome)
+                        })
+                })
+                .collect::<Vec<_>>();
+            held.sort_by_key(|node| node.id);
+            let tasks = held
+                .iter()
+                .take(8)
+                .map(|node| {
+                    serde_json::json!({
+                        "task_id": node.id.to_string(),
+                        "agent_id": node.role.to_string(),
+                        "task": bounded_text(&node.description, 2_000),
+                        "blocked_on": result.graph.blocked_on(&node.id).iter()
+                            .map(ToString::to_string).collect::<Vec<_>>(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let packet = serde_json::json!({
+                "objective": bounded_text(&result.objective, 3_000),
+                "tasks": tasks,
+                "omitted_tasks": held.len().saturating_sub(8),
+            });
+            intro.push_str(&format!(
+                "\n<specialist_continuations>\n{packet}\n\
+                 These restored tasks are unfinished execution, with prior progress preserved. \
+                 Inspect the current workspace and decide how to continue. Use call_specialist \
+                 with the SAME task_id; update_obligations can retarget the held task. Do not \
+                 replay successful calls blindly or declare a duplicate task. Prose alone does \
+                 not finish this work.\n</specialist_continuations>\n"
+            ));
+        } else {
+            intro.push_str(&resume_drive_instruction());
+        }
         let mut state = DispatchSessionState {
             doc,
             doc_verdict: None,
@@ -6994,8 +7052,13 @@ impl CoordinatorAgent {
                 if is_cancellation_error(&error) {
                     return Err(error);
                 }
+                let action = if continuing {
+                    "continue restored specialist work"
+                } else {
+                    "dispatch the pending implement stage"
+                };
                 return Err(OrchestratorError::AgentLoopError(format!(
-                    "resume could not dispatch the pending implement stage: {error}"
+                    "resume could not {action}: {error}"
                 )));
             }
         };
@@ -7037,7 +7100,9 @@ impl CoordinatorAgent {
         // Truthful pause when the session closed without the dispatch the
         // run promised: the guard would fire at the exit anyway, so name the
         // real cause instead of leaving only the guard's verdict to explain it.
-        if !self.implement_stage_dispatch_occurred(&result.graph, &result.action_ledger) {
+        if !continuing
+            && !self.implement_stage_dispatch_occurred(&result.graph, &result.action_ledger)
+        {
             result.loop_notes.push(
                 "Resume-drive: the restored plan's implement stage is still unattempted — the \
                  resumed decision session closed without an implement dispatch, so the run \
@@ -7071,7 +7136,9 @@ impl CoordinatorAgent {
                     // dead end that re-persists on every resume. Hand it back
                     // to the decision loop instead, so the Coordinator
                     // dispatches the promised work.
-                    if self.resume_needs_implement_drive(task, &result) {
+                    if self.resume_needs_implement_drive(task, &result)
+                        || self.resume_needs_continuation_drive(&result)
+                    {
                         return self
                             .drive_resumed_implement(task, context, cancel, &cp_json, result)
                             .await;
@@ -19203,7 +19270,7 @@ mod tests {
             AgentId::new("docs-writer"),
             "Docs Writer".into(),
             Some(concerto_core::AgentStage::new("documentation")),
-            Arc::new(MockProvider::default()),
+            Arc::new(TurnProvider::new(vec![CoordinatorTurn::Text("Release notes written.".into())])),
             None,
             bus.clone(),
             RetryPolicy::default(),

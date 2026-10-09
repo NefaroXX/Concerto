@@ -18,8 +18,11 @@ pub(crate) fn format_contract(task: &SubTask, context: &AgentContext) -> String 
     let contract = serde_json::json!({
         "schema_version": 1,
         "task_id": task.id.to_string(),
+        "session_id": task.session_id.to_string(),
         "agent_id": task.role.to_string(),
         "parent_task_id": task.parent_id.map(|id| id.to_string()),
+        "root_task_id": context.parent_task.as_ref().map(|parent| parent.id.to_string()),
+        "root_objective": context.parent_task.as_ref().map(|parent| clip(&parent.description)),
         "run_id": context.run_id,
         "workspace_generation": context.workspace_generation,
         "workspace_root": context.session.project_dir,

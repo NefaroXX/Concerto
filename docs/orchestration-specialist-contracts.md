@@ -20,6 +20,8 @@ The Coordinator continues to choose the specialist and any continuation.
 - Unfinished execution stays `NeedsRevision` in the graph and blocks dependent
   work. The Coordinator explicitly continues it with `call_specialist.task_id`,
   retaining the node, its original dependencies and its prior settlement.
+  A restored held task returns to the Coordinator's decision loop on Continue;
+  restoring an empty ready queue alone would repeat the same Partial forever.
   `update_obligations` may retarget or revise this held node. This grants no
   artifact ownership; any ownership transfer still uses the existing gate.
 - A completed review's ordinary `NeedsRevision` recommendation still settles
@@ -53,8 +55,8 @@ failure/verification evidence remain responsibilities of the harness upgrade.
 | Owner | Files and responsibilities |
 | --- | --- |
 | Codex orchestration branch | `agents/generic/freeform.rs`, `agents/generic/prompt.rs`, `agents/execution_state.rs`, `agents/task_contract.rs`, task dispatch/settlement in `coordinator.rs`, human result events in `agent_runner.rs`, corresponding regression tests |
-| OpenCode harness upgrade | Environment/tool-failure/verification/checkpoint/memory-evidence schemas and services; executor/IPC error transport; verification adapters; durable undo/restore; experiment/database/container harnesses; memory evidence |
-| Handoff before editing | Shared core types, config schema, session migrations, runtime construction, CLI resume, and harness integrations in the orchestration files above |
+| OpenCode harness upgrade | Additive harness schemas, config and session migrations; environment/tool-failure/verification/checkpoint/memory-evidence services; executor/IPC error transport; verification adapters; durable undo/restore; experiment/database/container harnesses; memory evidence |
+| Coordinate integration | Changes to existing AgentOutcome/AgentRunResult contracts; runtime construction; CLI resume; harness integrations in the orchestration files above |
 
 `generic.rs` delegates freeform execution and prompt construction to the new
 modules. Its evaluator and typed submission paths stay in the parent file.
@@ -65,6 +67,9 @@ The obsolete previous-result formatter is removed from `memory_prompt.rs`;
 its replacement is `agents/task_contract.rs`. Retrieved memory serialization
 and run-memory formatting are unchanged. H11 can edit those memory functions
 after rebasing this small removal.
+The coder seed's empty-completion regression in `registry.rs` is updated; its
+production registry and evaluator construction are unchanged. The resume-drive
+change is inside `coordinator.rs`; CLI/runtime resume wiring is unchanged.
 
 OpenCode H02 should replace the existing diagnosis-to-tool-result adapter when
 its canonical `ToolFailure` is available. Do not add a second error taxonomy.
@@ -83,6 +88,7 @@ Regression fixtures cover actual retained writes, turn exhaustion, corrected
 operations, unresolved sibling failures, schema rejection, missing executors,
 unresolved failures across continuation attempts, bounded progress, dependency
 blocking, checkpoint round trips, same-node continuation, owner retargeting and
-completed review recommendations. Formatting, compilation and tests must be
+completed review recommendations, plus a run-level Partial regression.
+Formatting, compilation and tests must be
 confirmed by the repository's Rust CI; the editing environment has no Rust
 toolchain.

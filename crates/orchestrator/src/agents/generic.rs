@@ -2114,7 +2114,7 @@ mod tests {
 
     #[tokio::test]
     async fn freeform_run_returns_result_with_id_and_stage() {
-        let provider = Arc::new(MockProvider::default());
+        let provider = Arc::new(TextSequencedProvider::new(vec!["README drafted.".into()]));
         let bus = EventBus::new(1024);
         let agent = GenericSpecialistAgent::new(
             AgentId::new("docs-writer"),
@@ -4597,7 +4597,7 @@ mod tests {
             .await
             .expect("run should succeed");
 
-        assert!(matches!(result.outcome, AgentOutcome::Success));
+        assert!(matches!(result.outcome, AgentOutcome::NeedsRevision { .. }));
         assert_eq!(result.tool_call_count, 1, "the rejected call still counts as a tool call");
         assert!(executed.lock().unwrap().is_empty(), "rejected calls must never execute");
         let payload = provider
