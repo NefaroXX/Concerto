@@ -77,6 +77,72 @@ pub(crate) fn build_plugin_manager() -> Option<(Arc<PluginHost>, PluginManager)>
     Some((host.clone(), PluginManager::new(host, cap_mgr, None, None)))
 }
 
+/// Load and initialise ONE discovered plugin candidate, registering its tools
+/// into `registry`. Fail-soft per candidate: a read/load/initialise failure
+/// logs a warning and returns, leaving the rest of the batch to run. The
+/// `continue` arms of the pre-extraction loop body become `return`s here.
+async fn load_single_plugin(
+    manager: &mut PluginManager,
+    candidate: &concerto_plugins::discovery::PluginCandidate,
+    project_dir: &std::path::Path,
+    registry: &mut ToolRegistry,
+) {
+    use concerto_plugins::capability::{DenyUnapproved, GrantedCapabilities};
+
+    let read = concerto_plugins::loader::PluginLoader::read_wasm_bytes(&candidate.wasm_path);
+    let wasm_bytes = match read {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                path = %candidate.wasm_path.display(),
+                error = %e,
+                "failed to read plugin WASM"
+            );
+            return;
+        }
+    };
+    let loaded = match manager.load_plugin(&wasm_bytes, &candidate.wasm_path, &DenyUnapproved).await
+    {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(
+                path = %candidate.wasm_path.display(),
+                error = %e,
+                "failed to load plugin module"
+            );
+            return;
+        }
+    };
+
+    let mut granted = GrantedCapabilities::new();
+    granted.set_root(project_dir.to_path_buf());
+
+    let plugin_id = loaded.manifest.id.clone();
+    match manager.initialise_plugin(&loaded, granted).await {
+        Ok(()) => {
+            if let Err(e) = manager.register_tools(&plugin_id, registry) {
+                tracing::warn!(
+                    plugin_id = %plugin_id,
+                    error = %e,
+                    "failed to register plugin tools"
+                );
+            } else {
+                tracing::info!(
+                    plugin_id = %plugin_id,
+                    "plugin loaded with approved grants"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                plugin_id = %plugin_id,
+                error = %e,
+                "failed to initialise plugin"
+            );
+        }
+    }
+}
+
 /// Load every discovered `.wasm` into `manager` with approved, hash-pinned
 /// grants rooted at `project_dir`, register their tools into `registry`, and
 /// collect the plugin-backed providers for this run. Never fails a run:
@@ -88,8 +154,6 @@ pub(crate) async fn load_discovered_plugins(
     project_dir: &std::path::Path,
     registry: &mut ToolRegistry,
 ) -> HashMap<String, Arc<dyn LlmProvider>> {
-    use concerto_plugins::capability::{DenyUnapproved, GrantedCapabilities};
-
     let mut plugin_providers = HashMap::new();
     let Ok(candidates) = manager.discover(disc_cfg) else {
         tracing::warn!("plugin discovery failed — continuing without plugins");
@@ -97,58 +161,7 @@ pub(crate) async fn load_discovered_plugins(
     };
 
     for candidate in &candidates {
-        let read = concerto_plugins::loader::PluginLoader::read_wasm_bytes(&candidate.wasm_path);
-        let wasm_bytes = match read {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(
-                    path = %candidate.wasm_path.display(),
-                    error = %e,
-                    "failed to read plugin WASM"
-                );
-                continue;
-            }
-        };
-        let loaded =
-            match manager.load_plugin(&wasm_bytes, &candidate.wasm_path, &DenyUnapproved).await {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::warn!(
-                        path = %candidate.wasm_path.display(),
-                        error = %e,
-                        "failed to load plugin module"
-                    );
-                    continue;
-                }
-            };
-
-        let mut granted = GrantedCapabilities::new();
-        granted.set_root(project_dir.to_path_buf());
-
-        let plugin_id = loaded.manifest.id.clone();
-        match manager.initialise_plugin(&loaded, granted).await {
-            Ok(()) => {
-                if let Err(e) = manager.register_tools(&plugin_id, registry) {
-                    tracing::warn!(
-                        plugin_id = %plugin_id,
-                        error = %e,
-                        "failed to register plugin tools"
-                    );
-                } else {
-                    tracing::info!(
-                        plugin_id = %plugin_id,
-                        "plugin loaded with approved grants"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    plugin_id = %plugin_id,
-                    error = %e,
-                    "failed to initialise plugin"
-                );
-            }
-        }
+        load_single_plugin(manager, candidate, project_dir, registry).await;
     }
     match manager.collect_providers().await {
         Ok(providers) => plugin_providers = providers,
@@ -348,4 +361,32 @@ pub(crate) fn advertised_tool_support(
         .iter()
         .find(|provider| ProviderFactory::config_id(provider) == id)
         .and_then(|provider| provider.advertised_tool_support_for(model))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The per-candidate loader is fail-soft: a candidate whose WASM file is
+    /// missing logs and returns without touching the manager or registry, so
+    /// the rest of the discovery batch still runs.
+    #[tokio::test]
+    async fn load_single_plugin_missing_wasm_is_fail_soft() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cap_mgr = CapabilityManager::open(dir.path()).expect("capability manager");
+        let host = Arc::new(PluginHost::new().expect("plugin host"));
+        let mut manager = PluginManager::new(host, cap_mgr, None, None);
+        let candidate = concerto_plugins::discovery::PluginCandidate {
+            wasm_path: dir.path().join("absent.wasm"),
+            sidecar_manifest_path: None,
+        };
+        let mut registry = ToolRegistry::default();
+
+        load_single_plugin(&mut manager, &candidate, dir.path(), &mut registry).await;
+
+        assert!(
+            registry.all_tool_definitions().is_empty(),
+            "fail-soft path must not register tools"
+        );
+    }
 }
