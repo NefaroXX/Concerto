@@ -317,6 +317,59 @@ fn resolve_role_provider_config<'a>(
     custom_agent_provider(settings, agent_configs, role, model).unwrap_or(default_provider_config)
 }
 
+/// Resolve the run's default provider configuration and model using the
+/// model-first strategy:
+///
+/// 1. Explicit provider ID → find that config.
+/// 2. Explicit model name → find the provider that offers it.
+/// 3. `global_default_model` → find the matching provider.
+/// 4. First configured provider.
+///
+/// Pure config lookup (no IO, no awaits). The caller owns the empty-model
+/// recorder-stop/early-return, so the resolved model is returned verbatim
+/// even when empty.
+fn resolve_default_provider<'a>(
+    req: &'a AgentRunRequest,
+    settings: &'a concerto_config::ModelSettings,
+) -> Result<(&'a concerto_config::ProviderConfig, &'a str), OrchestratorError> {
+    let requested_provider_id = non_empty(req.selected_provider_id.as_deref());
+    let default_provider_config = if let Some(id) = requested_provider_id {
+        settings
+            .providers
+            .iter()
+            .find(|config| ProviderFactory::config_id(config) == id)
+            .ok_or_else(|| {
+                OrchestratorError::AgentLoopError(format!(
+                    "selected provider configuration '{id}' no longer exists"
+                ))
+            })?
+    } else if let Some(model) =
+        non_empty(req.selected_model.as_deref()).filter(|m| !m.trim().is_empty())
+    {
+        ProviderFactory::config_for_model(settings, model, None).ok_or_else(|| {
+            OrchestratorError::AgentLoopError(format!(
+                "no configured provider offers model '{model}'"
+            ))
+        })?
+    } else if let Some(model) =
+        non_empty(settings.global_default_model.as_deref()).filter(|m| !m.trim().is_empty())
+    {
+        ProviderFactory::config_for_model(settings, model, None).ok_or_else(|| {
+            OrchestratorError::AgentLoopError(format!(
+                "no configured provider offers global default model '{model}'"
+            ))
+        })?
+    } else {
+        settings.providers.first().ok_or_else(|| {
+            OrchestratorError::AgentLoopError("no providers configured in model_settings".into())
+        })?
+    };
+    let default_model = non_empty(req.selected_model.as_deref())
+        .or_else(|| non_empty(settings.global_default_model.as_deref()))
+        .unwrap_or(default_provider_config.model.trim());
+    Ok((default_provider_config, default_model))
+}
+
 /// The coordinator's model.
 ///
 /// The coordinator is hardcoded (maintainer decision 2026-09) and always
@@ -2621,47 +2674,8 @@ async fn run_multi_agent(
         ));
     }
 
-    let requested_provider_id = non_empty(req.selected_provider_id.as_deref());
-
-    // Resolve the default provider using model-first strategy:
-    //   1. Explicit provider ID → find that config.
-    //   2. Explicit model name → find the provider that offers it.
-    //   3. `global_default_model` → find the matching provider.
-    //   4. First configured provider.
-    let default_provider_config = if let Some(id) = requested_provider_id {
-        settings
-            .providers
-            .iter()
-            .find(|config| ProviderFactory::config_id(config) == id)
-            .ok_or_else(|| {
-                OrchestratorError::AgentLoopError(format!(
-                    "selected provider configuration '{id}' no longer exists"
-                ))
-            })?
-    } else if let Some(model) =
-        non_empty(req.selected_model.as_deref()).filter(|m| !m.trim().is_empty())
-    {
-        ProviderFactory::config_for_model(settings, model, None).ok_or_else(|| {
-            OrchestratorError::AgentLoopError(format!(
-                "no configured provider offers model '{model}'"
-            ))
-        })?
-    } else if let Some(model) =
-        non_empty(settings.global_default_model.as_deref()).filter(|m| !m.trim().is_empty())
-    {
-        ProviderFactory::config_for_model(settings, model, None).ok_or_else(|| {
-            OrchestratorError::AgentLoopError(format!(
-                "no configured provider offers global default model '{model}'"
-            ))
-        })?
-    } else {
-        settings.providers.first().ok_or_else(|| {
-            OrchestratorError::AgentLoopError("no providers configured in model_settings".into())
-        })?
-    };
-    let default_model = non_empty(req.selected_model.as_deref())
-        .or_else(|| non_empty(settings.global_default_model.as_deref()))
-        .unwrap_or(default_provider_config.model.trim());
+    // Resolve the default provider using model-first strategy (W3f).
+    let (default_provider_config, default_model) = resolve_default_provider(req, settings)?;
     if default_model.is_empty() {
         event_recorder.stop().await;
         transcript_recorder.stop().await;
