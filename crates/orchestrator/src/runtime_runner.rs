@@ -1655,24 +1655,31 @@ async fn append_plan_binding_event(
     }
 }
 
-/// Run a single‑agent task using shared components.
-///
-/// Orchestrates the full agent lifecycle by delegating to specialised helpers:
-///
-/// 1. `build_tool_registry`   — filesystem, shell, git, and LSP tools
-/// 2. `load_and_configure_plugins` — WASM plugins + provider collection
-/// 3. `register_tools` (MCP)  — namespaced `mcp:<server>:<tool>` bridge (ADR-43)
-/// 4. `resolve_provider_and_model` — provider/model resolution from config
-/// 5. `setup_policy_and_audit`     — policy engine, audit log, spend tracker
-/// 6. `create_session_and_recorder` — session creation + event recording
-/// 7. `execute_agent_loop`         — single-agent AgentLoop execution
-///
-/// For multi-agent runs the function delegates to `run_multi_agent` after the
-/// shared setup phases are complete.
-pub async fn run_shared_agent(
-    mut req: AgentRunRequest,
-    services: SharedServices,
-) -> Result<AgentOutput, OrchestratorError> {
+/// W2d: the startup tooling/provider stack for a shared run (P1-P3b of
+/// [`run_shared_agent`]): the tool registry plus audit sink, plugin and MCP
+/// tool loading, and provider/model resolution. Each field feeds the
+/// policy/audit executor the caller builds next (P4) or a later phase. Every
+/// step is a linear await, so building the whole stack in one call preserves
+/// their original order.
+struct SharedTooling {
+    registry: Arc<ToolRegistry>,
+    audit: Arc<dyn AuditLog>,
+    gate_pool: Option<sqlx::SqlitePool>,
+    plugin_context: Option<concerto_plugins::host::PluginHostContext>,
+    provider: Arc<dyn LlmProvider>,
+    model: String,
+    provider_config_id: Option<String>,
+}
+
+/// W2d (P1-P3b): build the tool registry, audit sink, plugin/MCP tools, and
+/// the resolved provider/model in their original order. Returns the same
+/// values the inlined phases produced, so the caller's subsequent
+/// `setup_policy_and_audit` (P4) and session creation are unchanged. The
+/// plugin-backed provider map is consumed by resolution here and not returned.
+async fn setup_shared_tooling(
+    req: &AgentRunRequest,
+    services: &SharedServices,
+) -> Result<SharedTooling, OrchestratorError> {
     // 1. Build tool registry (filesystem, shell, git, LSP tools)
     let mut registry = build_tool_registry(&req.project_dir, &services.vfs, &services.config);
 
@@ -1723,6 +1730,62 @@ pub async fn run_shared_agent(
         &plugin_providers,
     )?;
 
+    Ok(SharedTooling {
+        registry,
+        audit,
+        gate_pool,
+        plugin_context,
+        provider,
+        model,
+        provider_config_id,
+    })
+}
+
+/// W2d (P5): resolve the run's memory store — the cached project store, a
+/// freshly initialised one, or the null store when memory is disabled or
+/// initialisation fails (ADR-65 acceptance 9: memory is optional for a run's
+/// correctness). Single await, preserved verbatim.
+async fn resolve_run_memory(
+    services: &SharedServices,
+    project_dir: &Path,
+    memory_enabled: bool,
+) -> Arc<dyn MemoryStore> {
+    memory_store_or_disabled(
+        select_or_init_memory_services(services, project_dir, memory_enabled).await,
+    )
+}
+
+/// Run a single‑agent task using shared components.
+///
+/// Orchestrates the full agent lifecycle by delegating to specialised helpers:
+///
+/// 1. `build_tool_registry`   — filesystem, shell, git, and LSP tools
+/// 2. `load_and_configure_plugins` — WASM plugins + provider collection
+/// 3. `register_tools` (MCP)  — namespaced `mcp:<server>:<tool>` bridge (ADR-43)
+/// 4. `resolve_provider_and_model` — provider/model resolution from config
+/// 5. `setup_policy_and_audit`     — policy engine, audit log, spend tracker
+/// 6. `create_session_and_recorder` — session creation + event recording
+/// 7. `execute_agent_loop`         — single-agent AgentLoop execution
+///
+/// For multi-agent runs the function delegates to `run_multi_agent` after the
+/// shared setup phases are complete.
+pub async fn run_shared_agent(
+    mut req: AgentRunRequest,
+    services: SharedServices,
+) -> Result<AgentOutput, OrchestratorError> {
+    // W2d: P1-P3b (registry + audit sink, plugin/MCP tool loading, and
+    // provider/model resolution) in one ordered call. The returned stack feeds
+    // the policy/audit executor built next.
+    let SharedTooling {
+        registry,
+        audit,
+        gate_pool,
+        plugin_context,
+        provider,
+        model,
+        provider_config_id,
+    } = setup_shared_tooling(&req, &services).await?;
+
     // 4. Policy engine, audit log, spend tracker, tool executor.
     //
     // Full local agency: the run-scoped grant store is created fresh per call
@@ -1753,9 +1816,8 @@ pub async fn run_shared_agent(
     // ADR-65 acceptance 9: memory is OPTIONAL for a run's correctness — an
     // init failure (missing/unopenable DB, failed migration) degrades to the
     // null store with a warn instead of aborting the run.
-    let memory: Arc<dyn MemoryStore> = memory_store_or_disabled(
-        select_or_init_memory_services(&services, &req.project_dir, req.memory_enabled).await,
-    );
+    let memory: Arc<dyn MemoryStore> =
+        resolve_run_memory(&services, &req.project_dir, req.memory_enabled).await;
 
     // 6. Session creation and event recording
     let (session_id, session_store, event_recorder, transcript_recorder) =
@@ -3724,6 +3786,47 @@ fn supervised_agent_tasks(
         .collect()
 }
 
+/// W2e: build the child commands for a supervised run — one per task, in
+/// topology order, each carrying the agent identity, project root, task
+/// description, the run's serialized config/skills environment, and (for a
+/// plan-driven run) the approved plan id. Pure: constructs the commands and
+/// performs no spawning or I/O; the caller owns `Supervisor::spawn_agent`.
+/// Takes the disjoint fields so it can be called after `run.config` has moved
+/// into the supervisor.
+fn build_supervised_commands(
+    binary: &Path,
+    project_root: &Path,
+    tasks: &[(String, String)],
+    spawn_env: &[(String, String)],
+    plan_id: Option<&str>,
+) -> Vec<(String, std::process::Command)> {
+    tasks
+        .iter()
+        .map(|(agent_id, description)| {
+            let mut command = std::process::Command::new(binary);
+            command
+                .env("CONCERTO_AGENT_ID", agent_id)
+                .env("CONCERTO_PROJECT_ROOT", project_root)
+                .env("CONCERTO_TASK_DESCRIPTION", description);
+            // ADR-60 S5 (DEFERRED #49): the effective config (no secrets) and
+            // the parent-rendered skills section are stamped once per run so
+            // each child rebuilds the real provider and injects the same
+            // skills. `mock` is an explicit opt-in only — the child never
+            // falls back to it implicitly.
+            for (name, value) in spawn_env {
+                command.env(name, value);
+            }
+            // ADR-60 D7 ledger enrichment: a plan-driven run stamps every
+            // child write with the approved plan id (the child mirrors it onto
+            // `GateRequest.plan_id` and its terminal whiteboard events).
+            if let Some(plan_id) = plan_id {
+                command.env("CONCERTO_PLAN_ID", plan_id);
+            }
+            (agent_id.clone(), command)
+        })
+        .collect()
+}
+
 /// Drive one prepared supervised multi-agent run to completion and synthesize
 /// the run output from the supervisor's summary.
 ///
@@ -3762,26 +3865,14 @@ async fn drive_supervised_run(
     // a start failure has no in-flight process to restart, so it is decided
     // directly as a failed subtask.)
     let mut failed_to_start: Vec<String> = Vec::new();
-    for (agent_id, description) in &run.tasks {
-        let mut command = std::process::Command::new(&run.binary);
-        command
-            .env("CONCERTO_AGENT_ID", agent_id)
-            .env("CONCERTO_PROJECT_ROOT", &run.project_root)
-            .env("CONCERTO_TASK_DESCRIPTION", description);
-        // ADR-60 S5 (DEFERRED #49): the effective config (no secrets) and the
-        // parent-rendered skills section are stamped once per run so each child
-        // rebuilds the real provider and injects the same skills. `mock` is an
-        // explicit opt-in only — the child never falls back to it implicitly.
-        for (name, value) in &run.spawn_env {
-            command.env(name, value);
-        }
-        // ADR-60 D7 ledger enrichment: a plan-driven run stamps every child
-        // write with the approved plan id (the child mirrors it onto
-        // `GateRequest.plan_id` and its terminal whiteboard events).
-        if let Some(plan_id) = &run.plan_id {
-            command.env("CONCERTO_PLAN_ID", plan_id);
-        }
-        if let Err(error) = supervisor.spawn_agent(&mut command, agent_id) {
+    for (agent_id, mut command) in build_supervised_commands(
+        &run.binary,
+        &run.project_root,
+        &run.tasks,
+        &run.spawn_env,
+        run.plan_id.as_deref(),
+    ) {
+        if let Err(error) = supervisor.spawn_agent(&mut command, &agent_id) {
             tracing::warn!(%agent_id, %error, "supervised agent failed to start; recording a decision");
             crate::bypass_decision::record_decision_row(
                 None,
@@ -3791,7 +3882,7 @@ async fn drive_supervised_run(
                 &format!("agent-process '{agent_id}' failed to start: {error}"),
             )
             .await;
-            failed_to_start.push(agent_id.clone());
+            failed_to_start.push(agent_id);
         }
     }
 
