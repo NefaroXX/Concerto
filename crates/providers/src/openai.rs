@@ -707,23 +707,8 @@ impl LlmProvider for OpenAiProvider {
     async fn test_connection(&self, _cancel: CancellationToken) -> Result<(), ProviderError> {
         let client = crate::new_client(self.timeout_secs);
         let url = format!("{}/models", self.api_base);
-        let resp = self
-            .apply_extra_headers(client.get(&url).bearer_auth(self.api_key.expose()))
-            .send()
-            .await
-            .map_err(|e| {
-                ProviderError::Other(format!(
-                    "openai connection failed: {}",
-                    describe_error_chain(&e)
-                ))
-            })?;
-        if resp.status().is_success() {
-            Ok(())
-        } else if resp.status().as_u16() == 401 {
-            Err(ProviderError::AuthFailure)
-        } else {
-            Err(ProviderError::Other(format!("openai returned {}", resp.status())))
-        }
+        let request = self.apply_extra_headers(client.get(&url).bearer_auth(self.api_key.expose()));
+        crate::probe_connection(request, "openai", &[401], crate::unredacted).await
     }
 
     async fn list_models(
@@ -732,51 +717,27 @@ impl LlmProvider for OpenAiProvider {
     ) -> Result<Vec<ModelInfo>, ProviderError> {
         let client = crate::new_client(self.timeout_secs);
         let url = format!("{}/models", self.api_base);
-        let resp = self
-            .apply_extra_headers(client.get(&url).bearer_auth(self.api_key.expose()))
-            .send()
-            .await
-            .map_err(|e| {
-                ProviderError::Other(format!(
-                    "openai list_models failed: {}",
-                    describe_error_chain(&e)
-                ))
-            })?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Other(format!(
-                "openai list_models returned {status}: {text}"
-            )));
-        }
-
-        let json: serde_json::Value = resp.json().await.map_err(|e| {
-            ProviderError::Other(format!(
-                "openai list_models parse failed: {}",
-                describe_error_chain(&e)
-            ))
-        })?;
-
-        let models = json["data"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| {
-                        let id = v["id"].as_str()?.to_string();
-                        let owned_by = v["owned_by"].as_str().map(String::from);
-                        Some(ModelInfo {
-                            id: id.clone(),
-                            name: Some(id),
-                            owned_by,
-                            supports_tool_calling: None,
+        let request = self.apply_extra_headers(client.get(&url).bearer_auth(self.api_key.expose()));
+        crate::list_models_json(request, "openai", crate::unredacted, |json| {
+            json["data"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| {
+                            let id = v["id"].as_str()?.to_string();
+                            let owned_by = v["owned_by"].as_str().map(String::from);
+                            Some(ModelInfo {
+                                id: id.clone(),
+                                name: Some(id),
+                                owned_by,
+                                supports_tool_calling: None,
+                            })
                         })
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
-        Ok(models)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .await
     }
 
     async fn stream_completion(

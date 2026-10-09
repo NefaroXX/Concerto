@@ -6,6 +6,8 @@
 //! tool-call normalization, retry/backoff, fallback chains, and context
 //! window budget management.
 
+use concerto_core::error::{describe_error_chain, ProviderError};
+
 pub mod budget;
 pub mod context_guard;
 pub mod factory;
@@ -94,6 +96,112 @@ pub(crate) fn new_client(timeout_secs: u64) -> reqwest::Client {
         .connect_timeout(std::time::Duration::from_secs(timeout_secs.clamp(5, 60)))
         .build()
         .expect("failed to build HTTP client")
+}
+
+// ---------------------------------------------------------------------------
+// Shared connection-probe / model-listing pipeline
+//
+// `anthropic`, `openai`, and `google` each send a plain GET, map the HTTP
+// status (2xx → Ok, an auth status → AuthFailure, else `"{name} returned
+// {status}"`), and — for `list_models` — surface a non-success body, parse the
+// JSON, and map it to `ModelInfo`s. Only the provider name string differs
+// everywhere; the genuine per-provider disagreements (which statuses mean
+// "auth failed", and whether a message may carry a secret) are explicit
+// parameters instead of copy-pasted control flow.
+// ---------------------------------------------------------------------------
+
+/// Identity message filter: the message is returned unchanged.
+///
+/// The policy for providers whose probe/diagnostic text cannot contain a
+/// secret (Anthropic, OpenAI). `GoogleProvider` passes its own redacting
+/// `scrub` instead, because Gemini puts the API key in the request URL.
+pub(crate) fn unredacted(message: &str) -> String {
+    message.to_string()
+}
+
+/// Shared HTTP status mapping for a connection probe.
+///
+/// 2xx → `Ok(())`, any status listed in `auth_statuses` →
+/// [`ProviderError::AuthFailure`], anything else →
+/// `Other("{provider} returned {status}")`.
+///
+/// `auth_statuses` is a parameter because the connectors genuinely disagree:
+/// Anthropic and OpenAI map only `401`, while Google also maps `403` (Gemini
+/// answers 403 for a missing/invalid key too).
+pub(crate) fn map_connection_status(
+    provider: &str,
+    status: reqwest::StatusCode,
+    auth_statuses: &[u16],
+) -> Result<(), ProviderError> {
+    if status.is_success() {
+        Ok(())
+    } else if auth_statuses.contains(&status.as_u16()) {
+        Err(ProviderError::AuthFailure)
+    } else {
+        Err(ProviderError::Other(format!("{provider} returned {status}")))
+    }
+}
+
+/// Shared `test_connection` pipeline: send the caller-built request, map a
+/// transport failure to `"{provider} connection failed: {chain}"`, then map
+/// the response status with [`map_connection_status`].
+///
+/// `scrub` post-processes every message before it is embedded (Google
+/// redacts its API key; the others pass [`unredacted`]).
+pub(crate) async fn probe_connection(
+    request: reqwest::RequestBuilder,
+    provider: &str,
+    auth_statuses: &[u16],
+    scrub: impl Fn(&str) -> String,
+) -> Result<(), ProviderError> {
+    let resp = request.send().await.map_err(|e| {
+        ProviderError::Other(format!(
+            "{provider} connection failed: {}",
+            scrub(&describe_error_chain(&e))
+        ))
+    })?;
+    map_connection_status(provider, resp.status(), auth_statuses)
+}
+
+/// Shared `list_models` pipeline: send the caller-built request, surface a
+/// non-success body as `"{provider} list_models returned {status}: {text}"`,
+/// parse the JSON body, then hand it to the provider-specific `extract`.
+///
+/// The connectors disagree on the details — message redaction (`scrub`) and
+/// how one JSON entry maps to a [`ModelInfo`] (`extract`, e.g. Anthropic's
+/// `display_name`, OpenAI's `owned_by`, Google's `models/` prefix strip) — so
+/// both stay with the caller. Only the transport/status/parse scaffolding is
+/// shared here, which is what the three copies actually had in common.
+pub(crate) async fn list_models_json(
+    request: reqwest::RequestBuilder,
+    provider: &str,
+    scrub: impl Fn(&str) -> String,
+    extract: impl FnOnce(&serde_json::Value) -> Vec<ModelInfo>,
+) -> Result<Vec<ModelInfo>, ProviderError> {
+    let resp = request.send().await.map_err(|e| {
+        ProviderError::Other(format!(
+            "{provider} list_models failed: {}",
+            scrub(&describe_error_chain(&e))
+        ))
+    })?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(ProviderError::Other(format!(
+            "{provider} list_models returned {status}: {}",
+            scrub(&text)
+        )));
+    }
+
+    let json: serde_json::Value = resp.json().await.map_err(|e| {
+        ProviderError::Other(format!(
+            "{provider} list_models parse failed: {}",
+            scrub(&describe_error_chain(&e))
+        ))
+    })?;
+
+    Ok(extract(&json))
 }
 
 /// Async helper: list available models for a given provider configuration.
@@ -510,6 +618,182 @@ mod discovery_tests {
             warns[0].message.contains("model discovery failed"),
             "the warning must describe the failure: {}",
             warns[0].message
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — shared connection-probe / list_models pipeline
+//
+// The three connectors (`anthropic`, `openai`, `google`) that now call these
+// helpers used to inline the same status/error handling with no coverage at
+// all. These tests pin the shared contract — status mapping, verbatim
+// message wording, redaction, extraction threading — against a one-shot
+// local responder (loopback, OS-assigned port; nothing leaves the machine).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod shared_probe_tests {
+    use super::{list_models_json, map_connection_status, probe_connection, unredacted, ModelInfo};
+    use concerto_core::error::ProviderError;
+    use reqwest::StatusCode;
+
+    /// Start a one-shot responder and return its base URL.
+    fn responder(status_line: &str, body: &str) -> String {
+        crate::testing::mock_server::spawn_response(status_line, body).0
+    }
+
+    /// A GET against a local responder, built the way the connectors build
+    /// theirs: `crate::new_client` + `.get(url)`.
+    fn get(base: &str) -> reqwest::RequestBuilder {
+        crate::new_client(10).get(format!("{base}/models"))
+    }
+
+    fn status(code: u16) -> StatusCode {
+        StatusCode::from_u16(code).expect("status code is valid")
+    }
+
+    /// Unwrap the `Other` variant: its message is the observable contract
+    /// (operators grep these strings when a probe or discovery fails).
+    fn other_message(error: ProviderError) -> String {
+        match error {
+            ProviderError::Other(message) => message,
+            other => panic!("expected ProviderError::Other, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_connection_status_maps_success_to_ok() {
+        assert!(map_connection_status("anthropic", status(200), &[401]).is_ok());
+        assert!(map_connection_status("anthropic", status(204), &[401]).is_ok());
+    }
+
+    /// Anthropic/OpenAI treat only 401 as "auth failed"; Google also maps
+    /// 403 (Gemini answers 403 for a missing/invalid key). Every other
+    /// status becomes an `Other` message carrying the provider name.
+    #[test]
+    fn map_connection_status_maps_auth_statuses_per_provider() {
+        assert!(matches!(
+            map_connection_status("openai", status(401), &[401]),
+            Err(ProviderError::AuthFailure)
+        ));
+        assert_eq!(
+            other_message(map_connection_status("openai", status(403), &[401]).unwrap_err()),
+            "openai returned 403 Forbidden"
+        );
+        assert!(matches!(
+            map_connection_status("google", status(403), &[401, 403]),
+            Err(ProviderError::AuthFailure)
+        ));
+        assert_eq!(
+            other_message(map_connection_status("google", status(500), &[401, 403]).unwrap_err()),
+            "google returned 500 Internal Server Error"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_connection_maps_auth_status_to_auth_failure() {
+        let base = responder("401 Unauthorized", "{}");
+        let error = probe_connection(get(&base), "anthropic", &[401], unredacted)
+            .await
+            .expect_err("401 must fail the probe");
+        assert!(matches!(error, ProviderError::AuthFailure));
+    }
+
+    #[tokio::test]
+    async fn probe_connection_maps_other_status_to_named_other() {
+        let base = responder("500 Internal Server Error", "boom");
+        let error = probe_connection(get(&base), "openai", &[401], unredacted)
+            .await
+            .expect_err("500 must fail the probe");
+        assert_eq!(other_message(error), "openai returned 500 Internal Server Error");
+    }
+
+    /// Loopback port 1: the connection is refused locally and immediately —
+    /// no packet leaves the machine. The failure must still be typed as a
+    /// named `Other` (the wording is shared with the three connectors).
+    #[tokio::test]
+    async fn probe_connection_transport_failure_names_provider() {
+        let error = probe_connection(get("http://127.0.0.1:1"), "google", &[401, 403], unredacted)
+            .await
+            .expect_err("refused connection must fail the probe");
+        let message = other_message(error);
+        assert!(
+            message.starts_with("google connection failed: "),
+            "message must name the provider: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_json_parses_with_the_caller_extractor() {
+        let base = responder("200 OK", r#"{"models":["m1","m2"]}"#);
+        let models = list_models_json(get(&base), "t", unredacted, |json| {
+            json["models"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| {
+                            let id = v.as_str()?.to_string();
+                            Some(ModelInfo {
+                                id: id.clone(),
+                                name: Some(id),
+                                owned_by: None,
+                                supports_tool_calling: None,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .await
+        .expect("200 with a JSON body parses");
+        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+        assert_eq!(ids, ["m1", "m2"]);
+        assert_eq!(models[0].name.as_deref(), Some("m1"));
+    }
+
+    /// A non-success listing embeds the status and the (scrubbed) body —
+    /// Google's redaction runs over exactly this text today.
+    #[tokio::test]
+    async fn list_models_json_non_success_carries_status_and_scrubbed_body() {
+        let base = responder("429 Too Many Requests", "quota exhausted for sk-SECRET");
+        let error = list_models_json(
+            get(&base),
+            "google",
+            |message| message.replace("sk-SECRET", "REDACTED"),
+            |_| Vec::new(),
+        )
+        .await
+        .expect_err("429 must fail the listing");
+        assert_eq!(
+            other_message(error),
+            "google list_models returned 429 Too Many Requests: quota exhausted for REDACTED"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_json_parse_failure_names_provider() {
+        let base = responder("200 OK", "not json");
+        let error = list_models_json(get(&base), "anthropic", unredacted, |_| Vec::new())
+            .await
+            .expect_err("non-JSON body must fail the listing");
+        let message = other_message(error);
+        assert!(
+            message.starts_with("anthropic list_models parse failed: "),
+            "message must name the provider: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_json_transport_failure_names_provider() {
+        let error =
+            list_models_json(get("http://127.0.0.1:1"), "openai", unredacted, |_| Vec::new())
+                .await
+                .expect_err("refused connection must fail the listing");
+        let message = other_message(error);
+        assert!(
+            message.starts_with("openai list_models failed: "),
+            "message must name the provider: {message}"
         );
     }
 }

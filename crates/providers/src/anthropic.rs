@@ -96,25 +96,11 @@ impl AnthropicProvider {
 impl LlmProvider for AnthropicProvider {
     async fn test_connection(&self, _cancel: CancellationToken) -> Result<(), ProviderError> {
         let client = crate::new_client(self.timeout_secs);
-        let resp = client
+        let request = client
             .get("https://api.anthropic.com/v1/models")
             .header("x-api-key", self.api_key.expose())
-            .header("anthropic-version", "2023-06-01")
-            .send()
-            .await
-            .map_err(|e| {
-                ProviderError::Other(format!(
-                    "anthropic connection failed: {}",
-                    describe_error_chain(&e)
-                ))
-            })?;
-        if resp.status().is_success() {
-            Ok(())
-        } else if resp.status().as_u16() == 401 {
-            Err(ProviderError::AuthFailure)
-        } else {
-            Err(ProviderError::Other(format!("anthropic returned {}", resp.status())))
-        }
+            .header("anthropic-version", "2023-06-01");
+        crate::probe_connection(request, "anthropic", &[401], crate::unredacted).await
     }
 
     async fn list_models(
@@ -122,49 +108,31 @@ impl LlmProvider for AnthropicProvider {
         _cancel: CancellationToken,
     ) -> Result<Vec<ModelInfo>, ProviderError> {
         let client = crate::new_client(self.timeout_secs);
-        let resp = client
+        let request = client
             .get("https://api.anthropic.com/v1/models")
             .header("x-api-key", self.api_key.expose())
-            .header("anthropic-version", "2023-06-01")
-            .send()
-            .await
-            .map_err(|e| {
-                ProviderError::Other(format!(
-                    "anthropic list_models failed: {}",
-                    describe_error_chain(&e)
-                ))
-            })?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Other(format!(
-                "anthropic list_models returned {status}: {text}"
-            )));
-        }
-
-        let json: serde_json::Value = resp.json().await.map_err(|e| {
-            ProviderError::Other(format!(
-                "anthropic list_models parse failed: {}",
-                describe_error_chain(&e)
-            ))
-        })?;
-
-        let models = json["data"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| {
-                        let id = v["id"].as_str()?.to_string();
-                        let name =
-                            v["display_name"].as_str().or(v["id"].as_str()).map(String::from);
-                        Some(ModelInfo { id, name, owned_by: None, supports_tool_calling: None })
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
-        Ok(models)
+            .header("anthropic-version", "2023-06-01");
+        crate::list_models_json(request, "anthropic", crate::unredacted, |json| {
+            json["data"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| {
+                            let id = v["id"].as_str()?.to_string();
+                            let name =
+                                v["display_name"].as_str().or(v["id"].as_str()).map(String::from);
+                            Some(ModelInfo {
+                                id,
+                                name,
+                                owned_by: None,
+                                supports_tool_calling: None,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .await
     }
 
     async fn stream_completion(

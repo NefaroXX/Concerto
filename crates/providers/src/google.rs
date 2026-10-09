@@ -453,19 +453,10 @@ impl LlmProvider for GoogleProvider {
             "https://generativelanguage.googleapis.com/v1beta/models?key={}",
             self.api_key.expose()
         );
-        let resp = client.get(&url).send().await.map_err(|e| {
-            ProviderError::Other(format!(
-                "google connection failed: {}",
-                self.scrub(&describe_error_chain(&e))
-            ))
-        })?;
-        if resp.status().is_success() {
-            Ok(())
-        } else if resp.status().as_u16() == 401 || resp.status().as_u16() == 403 {
-            Err(ProviderError::AuthFailure)
-        } else {
-            Err(ProviderError::Other(format!("google returned {}", resp.status())))
-        }
+        crate::probe_connection(client.get(&url), "google", &[401, 403], |message| {
+            self.scrub(message)
+        })
+        .await
     }
 
     async fn list_models(
@@ -477,46 +468,32 @@ impl LlmProvider for GoogleProvider {
             "https://generativelanguage.googleapis.com/v1beta/models?key={}",
             self.api_key.expose()
         );
-        let resp = client.get(&url).send().await.map_err(|e| {
-            ProviderError::Other(format!(
-                "google list_models failed: {}",
-                self.scrub(&describe_error_chain(&e))
-            ))
-        })?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Other(format!(
-                "google list_models returned {status}: {}",
-                self.scrub(&text)
-            )));
-        }
-
-        let json: serde_json::Value = resp.json().await.map_err(|e| {
-            ProviderError::Other(format!(
-                "google list_models parse failed: {}",
-                self.scrub(&describe_error_chain(&e))
-            ))
-        })?;
-
-        let models = json["models"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| {
-                        let full_name = v["name"].as_str()?;
-                        // Strip "models/" prefix for the model ID
-                        let id = full_name.strip_prefix("models/").unwrap_or(full_name).to_string();
-                        let name = v["displayName"].as_str().map(String::from);
-                        let owned_by = Some("google".to_string());
-                        Some(ModelInfo { id, name, owned_by, supports_tool_calling: None })
+        crate::list_models_json(
+            client.get(&url),
+            "google",
+            |message| self.scrub(message),
+            |json| {
+                json["models"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| {
+                                let full_name = v["name"].as_str()?;
+                                // Strip "models/" prefix for the model ID
+                                let id = full_name
+                                    .strip_prefix("models/")
+                                    .unwrap_or(full_name)
+                                    .to_string();
+                                let name = v["displayName"].as_str().map(String::from);
+                                let owned_by = Some("google".to_string());
+                                Some(ModelInfo { id, name, owned_by, supports_tool_calling: None })
+                            })
+                            .collect::<Vec<_>>()
                     })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
-        Ok(models)
+                    .unwrap_or_default()
+            },
+        )
+        .await
     }
 
     async fn stream_completion(
