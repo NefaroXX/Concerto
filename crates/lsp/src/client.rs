@@ -11,22 +11,24 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{oneshot, Mutex};
-use tokio::time::{timeout, Duration};
+use tokio::time::{timeout, timeout_at, Duration, Instant};
 
 type PendingMap = HashMap<u64, oneshot::Sender<Result<serde_json::Value, ToolError>>>;
 type DiagMap = HashMap<String, Vec<serde_json::Value>>;
 
-/// Bound on a single blocking read of the server's stdout (one header line or
-/// the body chunk).
+/// Bound on completing one in-flight frame of the server's stdout: from the
+/// first header byte received through the remaining headers and the body.
 ///
 /// Cancellation is the prompt exit path — it is observed *during* a blocked
-/// read, not only between messages. This timeout is the backstop for a server
-/// that stalls mid-frame, or goes silent, while no cancellation ever comes,
-/// so the reader task and its stdout pipe cannot be pinned open indefinitely.
-/// It is deliberately much longer than the 30s request bound: `LspManager`
-/// caches one client per project for the whole session and an exited reader
-/// is never restarted, so a short bound would sever a healthy-but-quiet
-/// server (rust-analyzer is silent between edits) and strand later requests.
+/// read, not only between messages. This deadline is the backstop for a
+/// server that stalls mid-frame while no cancellation ever comes, so the
+/// reader task and its stdout pipe cannot be pinned open indefinitely.
+/// It deliberately does **not** bound the wait *between* frames: waiting for
+/// the next frame's first byte is unbounded (cancel only), because
+/// `LspManager` caches one client per project for the whole session and an
+/// exited reader is never restarted — an inter-message bound would sever a
+/// healthy-but-quiet server (rust-analyzer is silent between edits) and
+/// strand later requests. The deadline arms only once a frame has started.
 /// Diagnostics already delivered live in the in-memory map; nothing needs to
 /// be persisted when the reader exits.
 const READER_READ_TIMEOUT: Duration = Duration::from_secs(300);
@@ -226,19 +228,23 @@ impl LspClient {
 }
 
 /// Read framed LSP messages from the server's stdout until the stream ends,
-/// `cancel` fires, or a single read exceeds `read_timeout`.
+/// `cancel` fires, or an in-flight frame exceeds `frame_timeout`.
 ///
-/// Cancellation and the read bound are observed *during* a blocked read — not
-/// only between messages — so a stalled server cannot pin this task and its
-/// pipe open forever. Any of the three exits simply returns: diagnostics
-/// already parsed live in the shared in-memory map, and in-flight requests
-/// fail through `send_request`'s own 30s timeout.
+/// The bound is per *frame*, not per read: waiting for the next frame's
+/// first byte is unbounded (cancel only), so a quiet-but-healthy server
+/// never ends the reader; once a frame has started, `frame_timeout` bounds
+/// completing its headers and its body against one absolute deadline.
+/// Cancellation and that frame bound are observed *during* a blocked read —
+/// not only between messages — so a stalled server cannot pin this task and
+/// its pipe open forever. Any exit simply returns: diagnostics already
+/// parsed live in the shared in-memory map, and in-flight requests fail
+/// through `send_request`'s own 30s timeout.
 async fn run_reader<R: AsyncRead + Unpin>(
     stdout: R,
     pending: Arc<Mutex<PendingMap>>,
     diagnostics: Arc<Mutex<DiagMap>>,
     cancel: CancellationToken,
-    read_timeout: Duration,
+    frame_timeout: Duration,
 ) {
     let mut reader = BufReader::new(stdout);
     let mut headers = String::new();
@@ -247,9 +253,23 @@ async fn run_reader<R: AsyncRead + Unpin>(
             return;
         }
         headers.clear();
+        // Inter-message idle: wait for the first byte of the next frame with
+        // no deadline (cancel only) — a silent server is healthy, not
+        // stalled. EOF, an I/O error, and cancellation all end the reader.
+        let started = match read_bounded(&cancel, None, reader.fill_buf()).await {
+            Some(Ok(buf)) => !buf.is_empty(),
+            _ => return,
+        };
+        if !started {
+            return;
+        }
+        // First byte seen: the frame is in flight. Arm one absolute deadline
+        // now covering the rest of the headers and the whole body.
+        let deadline = Instant::now() + frame_timeout;
         loop {
             let mut line = String::new();
-            let Some(read) = read_bounded(&cancel, read_timeout, reader.read_line(&mut line)).await
+            let Some(read) =
+                read_bounded(&cancel, Some(deadline), reader.read_line(&mut line)).await
             else {
                 return;
             };
@@ -276,7 +296,7 @@ async fn run_reader<R: AsyncRead + Unpin>(
             continue;
         }
         let mut body = vec![0u8; content_length];
-        let Some(read) = read_bounded(&cancel, read_timeout, reader.read_exact(&mut body)).await
+        let Some(read) = read_bounded(&cancel, Some(deadline), reader.read_exact(&mut body)).await
         else {
             return;
         };
@@ -323,19 +343,28 @@ async fn run_reader<R: AsyncRead + Unpin>(
     }
 }
 
-/// Await one read bounded by `cancel` and `read_timeout`.
+/// Await one read bounded by `cancel` and, while a frame is in flight, by an
+/// absolute `deadline`.
 ///
-/// Returns `None` when the token fires or the bound elapses — both end the
+/// Returns `None` when the token fires or the deadline elapses — both end the
 /// reader task — and `Some(result)` when the read itself completed (including
-/// EOF and I/O errors, which the caller classifies).
+/// EOF and I/O errors, which the caller classifies). A `None` deadline means
+/// no frame has started yet: the read is then bounded by cancellation only,
+/// so ordinary inter-message silence never ends the reader.
 async fn read_bounded<T>(
     cancel: &CancellationToken,
-    read_timeout: Duration,
+    deadline: Option<Instant>,
     read: impl Future<Output = T>,
 ) -> Option<T> {
+    let bound = async move {
+        match deadline {
+            Some(at) => timeout_at(at, read).await.ok(),
+            None => Some(read.await),
+        }
+    };
     tokio::select! {
         _ = cancel.cancelled() => None,
-        result = timeout(read_timeout, read) => result.ok(),
+        result = bound => result,
     }
 }
 
@@ -545,6 +574,69 @@ mod tests {
             .await
             .expect("reader must exit on cancel")
             .expect("reader task must not panic");
+    }
+
+    /// Regression test for the inter-message-idle bug: the frame bound must
+    /// not be applied to the silence *between* messages. The reader waits out
+    /// an idle stretch four times longer than `frame_timeout`, then delivers
+    /// the message that arrives afterwards. Under a per-read bound the reader
+    /// died during the gap and the message was never delivered. Virtual time
+    /// keeps the test instant while preserving the same ordering as wall time.
+    #[tokio::test(start_paused = true)]
+    async fn reader_survives_an_idle_gap_longer_than_the_frame_bound() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (pending, diagnostics) = reader_inputs();
+        let (tx, rx) = oneshot::channel();
+        pending.lock().await.insert(1, tx);
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(run_reader(
+            reader,
+            pending,
+            diagnostics,
+            cancel.clone(),
+            Duration::from_secs(30),
+        ));
+        // Inter-message idle: 4x the frame bound, with nothing written.
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        assert!(!handle.is_finished(), "an idle gap must not end the reader");
+        let body =
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}).to_string();
+        let framed = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+        writer.write_all(framed.as_bytes()).await.expect("buffered write");
+        let result = timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("response must arrive after the idle gap")
+            .expect("sender must not be dropped")
+            .expect("result must be Ok");
+        assert_eq!(result, serde_json::json!({"ok": true}));
+        cancel.cancel();
+        timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("reader must exit on cancel")
+            .expect("reader task must not panic");
+    }
+
+    /// A frame that starts but never completes must be cut off by the frame
+    /// deadline: headers arrive, then the declared body stalls after a
+    /// prefix. The deadline is armed at the first byte and covers the whole
+    /// body, so the reader ends instead of pinning the pipe. Virtual time
+    /// keeps the test instant, and the writer stays open so only the deadline
+    /// can end the read.
+    #[tokio::test(start_paused = true)]
+    async fn reader_exits_when_an_in_flight_frame_never_completes() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        // Declare 100 body bytes but deliver only a prefix: the frame has
+        // started, so the deadline arms and must end the reader.
+        writer.write_all(b"Content-Length: 100\r\n\r\npartial").await.expect("buffered write");
+        let (pending, diagnostics) = reader_inputs();
+        let cancel = CancellationToken::new();
+        let handle =
+            tokio::spawn(run_reader(reader, pending, diagnostics, cancel, Duration::from_secs(5)));
+        timeout(Duration::from_secs(60), handle)
+            .await
+            .expect("the frame deadline must end the reader task")
+            .expect("reader task must not panic");
+        drop(writer);
     }
 
     /// Hung-server simulation: `tail` reads stdin and never answers, so
