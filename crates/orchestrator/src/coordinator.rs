@@ -3803,6 +3803,17 @@ struct CompletionGuards {
     has_declared_verification: bool,
 }
 
+/// W3a: the outcome of the dispatch policy gate + Decision journal step
+/// ([`CoordinatorAgent::gate_and_journal_dispatch`]). `decision_id` is the
+/// validator-minted id the rest of the dispatch cites (threaded through the
+/// helper so that step returns the journaled decision's handle); `description`
+/// is the human-facing task description the caller materializes into the graph
+/// node immediately after journaling.
+struct JournaledDispatch {
+    decision_id: String,
+    description: String,
+}
+
 impl CoordinatorAgent {
     /// Create a new coordinator with all required subsystems.
     pub fn new(
@@ -13506,13 +13517,6 @@ impl CoordinatorAgent {
             });
         };
 
-        // ── Policy gate (the SAME engine the shared executor enforces) ────
-        let Some(policy) = self.policy.clone() else {
-            return serde_json::json!({
-                "error": "policy_unavailable",
-                "message": "no policy engine is wired for this run; dispatch is denied",
-            });
-        };
         let action = PolicyAction {
             tool_name: CALL_SPECIALIST_TOOL,
             input: arguments,
@@ -13525,91 +13529,29 @@ impl CoordinatorAgent {
             orchestrator_authority: true,
             path_facts: None,
         };
-        match policy.evaluate(&action, cancel.clone()).await {
-            Ok(PolicyVerdict::Allow) => {}
-            // The coordinator loop carries no approval sink: a
-            // RequireApproval verdict is a denial here, mirroring the
-            // executor's requires-approval-no-sink semantics. Any non-`Allow`
-            // verdict (current or future) is likewise a denial.
-            Ok(_) => {
-                // Issue #60: a denied dispatch is a tool/permission
-                // compatibility miss for the requested specialist —
-                // recorded (derive-only history; spend is never scored).
-                self.suitability.record(
-                    agent_id.as_str(),
-                    suitability_class,
-                    crate::suitability::OutcomeKind::Denied,
-                    None,
-                    suitability_now,
-                    0,
-                );
-                // Run-history audit: never reached a specialist.
-                self.publish_dispatch_outcome(
-                    scope,
-                    subtask_id,
-                    &agent_id,
-                    false,
-                    "policy-denied",
-                    None,
-                );
-                return serde_json::json!({
-                    "error": "policy_denied",
-                    "message": "the run's policy denied this specialist dispatch",
-                });
-            }
-            Err(error) => {
-                if matches!(error, concerto_core::error::PolicyError::Cancelled)
-                    || cancel.is_cancelled()
-                {
-                    // Run-history audit: the stop landed before any
-                    // specialist call — an interrupt, not a failure.
-                    self.publish_dispatch_outcome(
-                        scope,
-                        subtask_id,
-                        &agent_id,
-                        false,
-                        "cancelled",
-                        Some(Self::cancelled_dispatch_reason(cancel, &error)),
-                    );
-                    return serde_json::json!({ "error": "cancelled" });
-                }
-                self.suitability.record(
-                    agent_id.as_str(),
-                    suitability_class,
-                    crate::suitability::OutcomeKind::Denied,
-                    None,
-                    suitability_now,
-                    0,
-                );
-                // Run-history audit: never reached a specialist; the reason
-                // carries the policy error text (sanitized on publish).
-                self.publish_dispatch_outcome(
-                    scope,
-                    subtask_id,
-                    &agent_id,
-                    false,
-                    "policy-denied",
-                    Some(error.to_string()),
-                );
-                return serde_json::json!({
-                    "error": "policy_denied",
-                    "message": format!("policy evaluation failed: {error}"),
-                });
-            }
-        }
-
-        // ── Evidence-backed Decision event (ADR-65 §6/§7) ──────────────────
-        let reason = args.notes.clone().unwrap_or_else(|| "coordinator_choice".to_owned());
-        let description = specialist_task_description(&args.task, args.notes.as_deref());
-        self.append_dispatch_decision(
-            task.session_id,
-            &agent_id,
-            &reason,
-            &args.task,
-            &args.supporting_evidence_ids,
-            Some(subtask_id),
-        )
-        .await;
+        // ── Policy gate + Decision journal (W3a): the single policy eval and
+        // the single whiteboard Decision append run as ONE ordered async unit
+        // ([`Self::gate_and_journal_dispatch`]), so the eval→append order is
+        // frozen in one body. A non-`Allow` verdict is a denial (the
+        // coordinator loop carries no approval sink).
+        let JournaledDispatch { decision_id, description } = match self
+            .gate_and_journal_dispatch(
+                &action,
+                cancel,
+                scope,
+                subtask_id,
+                &agent_id,
+                suitability_class,
+                suitability_now,
+                task.session_id,
+                &args,
+                decision_id,
+            )
+            .await
+        {
+            Ok(journaled) => journaled,
+            Err(error) => return error,
+        };
 
         // ── Materialize the SubTask node — the graph RECORDS the decision ──
         // An adopted declaration keeps its declared chain position (parent,
@@ -14184,6 +14126,126 @@ impl CoordinatorAgent {
             });
         }
         tool_result
+    }
+
+    /// W3a (handle_call_specialist P7+P8): run the dispatch policy gate and
+    /// journal the evidence-backed Decision in one ordered async unit. The
+    /// single `policy.evaluate` await precedes the single
+    /// `append_dispatch_decision` await — the eval→append order is frozen
+    /// here. The coordinator decision loop carries no approval sink, so a
+    /// non-`Allow` verdict (or an evaluation error) records the suitability
+    /// miss / run-history outcome and returns the structured tool error; on
+    /// `Allow` the appended Decision's `decision_id` is handed back so the
+    /// rest of the dispatch keeps citing the same decision. `args` supplies
+    /// the reason/description derived at the journal step, keeping that
+    /// derivation in place after the gate.
+    #[allow(clippy::too_many_arguments)]
+    async fn gate_and_journal_dispatch(
+        &mut self,
+        action: &PolicyAction<'_>,
+        cancel: &CancellationToken,
+        scope: &checkpoint::CheckpointScope,
+        subtask_id: TaskId,
+        agent_id: &AgentId,
+        suitability_class: crate::suitability::TaskClass,
+        suitability_now: time::OffsetDateTime,
+        session_id: Ulid,
+        args: &CallSpecialistArgs,
+        decision_id: String,
+    ) -> Result<JournaledDispatch, serde_json::Value> {
+        // ── Policy gate (the SAME engine the shared executor enforces) ────
+        let Some(policy) = self.policy.clone() else {
+            return Err(serde_json::json!({
+                "error": "policy_unavailable",
+                "message": "no policy engine is wired for this run; dispatch is denied",
+            }));
+        };
+        match policy.evaluate(action, cancel.clone()).await {
+            Ok(PolicyVerdict::Allow) => {}
+            // The coordinator loop carries no approval sink: a
+            // RequireApproval verdict is a denial here, mirroring the
+            // executor's requires-approval-no-sink semantics. Any non-`Allow`
+            // verdict (current or future) is likewise a denial.
+            Ok(_) => {
+                // Issue #60: a denied dispatch is a tool/permission
+                // compatibility miss for the requested specialist —
+                // recorded (derive-only history; spend is never scored).
+                self.suitability.record(
+                    agent_id.as_str(),
+                    suitability_class,
+                    crate::suitability::OutcomeKind::Denied,
+                    None,
+                    suitability_now,
+                    0,
+                );
+                // Run-history audit: never reached a specialist.
+                self.publish_dispatch_outcome(
+                    scope,
+                    subtask_id,
+                    agent_id,
+                    false,
+                    "policy-denied",
+                    None,
+                );
+                return Err(serde_json::json!({
+                    "error": "policy_denied",
+                    "message": "the run's policy denied this specialist dispatch",
+                }));
+            }
+            Err(error) => {
+                if matches!(error, concerto_core::error::PolicyError::Cancelled)
+                    || cancel.is_cancelled()
+                {
+                    // Run-history audit: the stop landed before any
+                    // specialist call — an interrupt, not a failure.
+                    self.publish_dispatch_outcome(
+                        scope,
+                        subtask_id,
+                        agent_id,
+                        false,
+                        "cancelled",
+                        Some(Self::cancelled_dispatch_reason(cancel, &error)),
+                    );
+                    return Err(serde_json::json!({ "error": "cancelled" }));
+                }
+                self.suitability.record(
+                    agent_id.as_str(),
+                    suitability_class,
+                    crate::suitability::OutcomeKind::Denied,
+                    None,
+                    suitability_now,
+                    0,
+                );
+                // Run-history audit: never reached a specialist; the reason
+                // carries the policy error text (sanitized on publish).
+                self.publish_dispatch_outcome(
+                    scope,
+                    subtask_id,
+                    agent_id,
+                    false,
+                    "policy-denied",
+                    Some(error.to_string()),
+                );
+                return Err(serde_json::json!({
+                    "error": "policy_denied",
+                    "message": format!("policy evaluation failed: {error}"),
+                }));
+            }
+        }
+
+        // ── Evidence-backed Decision event (ADR-65 §6/§7) ──────────────────
+        let reason = args.notes.clone().unwrap_or_else(|| "coordinator_choice".to_owned());
+        let description = specialist_task_description(&args.task, args.notes.as_deref());
+        self.append_dispatch_decision(
+            session_id,
+            agent_id,
+            &reason,
+            &args.task,
+            &args.supporting_evidence_ids,
+            Some(subtask_id),
+        )
+        .await;
+        Ok(JournaledDispatch { decision_id, description })
     }
 
     /// Issue #61: the whiteboard `Decision` record for a mediated ownership
