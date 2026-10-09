@@ -131,6 +131,22 @@ mod delegated_updates;
 /// delegating arm per group; the tests in `mod tests` stay put untouched.
 mod event_model_updates;
 
+/// The view-state dispatch arms extracted from the root `update` match
+/// (NORM S39): the `Chat` arm's pure-delegation tail (its clipboard /
+/// navigation / New Session / focus / toggle pre-routing stays in the
+/// parent), the `Diff` dispatch arm (`diff.update` + the conditional VFS
+/// commit for accept/reject/undo decisions), and the `Memory` dispatch arm
+/// (the child-view passthrough plus the reindex/refresh/search/delete
+/// loader dispatches). Bodies moved verbatim; each group is one
+/// `pub(super)` method taking the full [`Message`] so every arm keeps its
+/// exact early-return `Task` semantics (same pattern as
+/// `views::settings::update_mcp`). The parent `update` keeps one thin
+/// delegating arm per group; the tests in `mod tests` stay put untouched.
+/// The `Shortcut` arm is deliberately NOT extracted: `handle_shortcut`
+/// flips App-level fields instead of only re-dispatching (see the
+/// submodule docs).
+mod view_dispatch;
+
 /// Shared text-focus state read by the keyboard-subscription fn pointer.
 /// `keyboard::on_key_press` requires a bare fn (no captures), so we route
 /// through a static rather than App's field.
@@ -1327,51 +1343,26 @@ impl App {
                     self.persist_muted_agents();
                     chat_task
                 } else {
-                    self.chat.update(msg).map(Message::Chat)
+                    // NORM S39 — the pure-delegation tail (every chat
+                    // message the pre-routing above did not intercept)
+                    // moved to the sibling `view_dispatch` submodule; the
+                    // full `Message` is re-wrapped so the helper keeps the
+                    // full-Message re-match pattern.
+                    self.update_chat_tail(Message::Chat(msg))
                 }
             }
-            Message::Diff(msg) => {
-                let needs_commit = matches!(
-                    &msg,
-                    views::diff::Message::AcceptHunk(_)
-                        | views::diff::Message::RejectHunk(_)
-                        | views::diff::Message::AcceptAll
-                        | views::diff::Message::RejectAll
-                        | views::diff::Message::Undo
-                );
-                let task = self.diff.update(msg).map(Message::Diff);
-                if needs_commit {
-                    if let Ok(mut vfs) = self.vfs.lock() {
-                        if let Err(e) = self.diff.commit(&mut vfs) {
-                            tracing::error!(error = %e, "failed to apply diff decision to VFS");
-                            self.toasts.push(
-                                ToastLevel::Error,
-                                format!("Failed to apply diff decision: {e}"),
-                            );
-                        }
-                    }
-                }
-                task
-            }
-            Message::Memory(msg) => match msg {
-                views::memory::Message::Reindex => self.trigger_reindex(),
-                views::memory::Message::Refresh => self.load_memory_entries(),
-                views::memory::Message::SearchChanged(_)
-                | views::memory::Message::TypeFilterChanged(_) => {
-                    let update = self.memory.update(msg).map(Message::Memory);
-                    iced::Task::batch(vec![update, self.load_memory_entries()])
-                }
-                views::memory::Message::DeleteConfirmed => {
-                    let id = self.memory.delete_target_id();
-                    let update = self.memory.update(msg).map(Message::Memory);
-                    if let Some(id) = id {
-                        iced::Task::batch(vec![update, self.delete_memory_entry(id)])
-                    } else {
-                        update
-                    }
-                }
-                other => self.memory.update(other).map(Message::Memory),
-            },
+            // NORM S39 — the `Diff` dispatch arm (`diff.update` + the
+            // conditional VFS commit for accept/reject/undo decisions)
+            // moved verbatim to the sibling `view_dispatch` submodule. The
+            // full `Message` is forwarded so the helper preserves the arm's
+            // exact `Task` semantics.
+            message @ Message::Diff(_) => self.update_diff(message),
+            // NORM S39 — the `Memory` dispatch arm (child-view passthrough
+            // + the reindex/refresh/search/delete loader dispatches) moved
+            // verbatim to the sibling `view_dispatch` submodule. The full
+            // `Message` is forwarded so the helper preserves each branch's
+            // exact `Task` semantics.
+            message @ Message::Memory(_) => self.update_memory(message),
             Message::ReindexResult(outcome) => {
                 match outcome {
                     ReindexResult::Done(_) => {
