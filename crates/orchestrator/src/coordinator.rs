@@ -13580,6 +13580,59 @@ impl CoordinatorAgent {
             Err(error) => return error,
         };
 
+        // ── W3d: materialize the SubTask, dispatch the specialist and settle
+        // it as ONE ordered async unit ([`Self::run_specialist`]) ──────────
+        self.run_specialist(
+            graph,
+            task,
+            base_ctx,
+            cancel,
+            scope,
+            ledger,
+            state,
+            design_role,
+            agent,
+            agent_id,
+            subtask_id,
+            decision_id,
+            description,
+            dispatch_artifacts,
+            world_model_advisory,
+            suitability_class,
+            suitability_now,
+        )
+        .await
+    }
+
+    /// W3d (handle_call_specialist P9-P15): materialize the dispatched SubTask
+    /// node, attach the binding-doc artifact contract, issue the specialist run
+    /// and settle its outcome — the DesignDoc verifier chain, the outcome +
+    /// ledger/metrics record, the same-role cap update and the checkpoint — as
+    /// ONE ordered async unit. The whole await-ordered mutation chain is frozen
+    /// here and `graph`/`ledger`/`state`/`scope` are `&mut` pass-through (no
+    /// snapshot-write-back), so the caller's later reads are unchanged. Returns
+    /// the `call_specialist` tool result.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_specialist(
+        &mut self,
+        graph: &mut TaskGraph,
+        task: &AgentTask,
+        base_ctx: &AgentContext,
+        cancel: &CancellationToken,
+        scope: &mut checkpoint::CheckpointScope,
+        ledger: &mut DispatchLedger,
+        state: &mut DispatchSessionState,
+        design_role: Option<&AgentId>,
+        agent: Arc<dyn ExpertAgent>,
+        agent_id: AgentId,
+        subtask_id: TaskId,
+        decision_id: String,
+        description: String,
+        dispatch_artifacts: Vec<String>,
+        world_model_advisory: Option<serde_json::Value>,
+        suitability_class: crate::suitability::TaskClass,
+        suitability_now: time::OffsetDateTime,
+    ) -> serde_json::Value {
         // ── Materialize the SubTask node — the graph RECORDS the decision ──
         // An adopted declaration keeps its declared chain position (parent,
         // dependencies); only its description is refined to this dispatch's
