@@ -198,6 +198,19 @@ mod update_routing;
 /// delegating arm; the tests in `mod tests` stay put untouched.
 mod run_completion;
 
+/// The memory-result arms extracted from the root `update` match (NORM S44):
+/// the `ReindexResult` outcome (memory status/loaded flags + the success-path
+/// entry reload), the `MemoryEntriesLoaded` loader result, the
+/// `PluginProvidersRefreshed` log-only placeholder, and `MemoryEntryDeleted`
+/// (row removal / error state). Bodies moved verbatim; the group is one
+/// `pub(super)` method taking the full [`Message`] so every arm keeps its
+/// exact early-return `Task` semantics (same pattern as
+/// `views::settings::update_mcp`). The parent `update` keeps one thin
+/// delegating arm; the `trigger_reindex` / `load_memory_entries` /
+/// `delete_memory_entry` helpers and the memory setters stay here. The tests
+/// in `mod tests` stay put untouched.
+mod memory_results;
+
 /// Shared text-focus state read by the keyboard-subscription fn pointer.
 /// `keyboard::on_key_press` requires a bare fn (no captures), so we route
 /// through a static rather than App's field.
@@ -1130,46 +1143,16 @@ impl App {
             // `Message` is forwarded so the helper preserves each branch's
             // exact `Task` semantics.
             message @ Message::Memory(_) => self.update_memory(message),
-            Message::ReindexResult(outcome) => {
-                match outcome {
-                    ReindexResult::Done(_) => {
-                        self.memory.status = MemoryStatus::Idle;
-                        self.memory.loaded = true;
-                        return self.load_memory_entries();
-                    }
-                    ReindexResult::Failed(e) => {
-                        self.memory.status = MemoryStatus::Error(e);
-                    }
-                    ReindexResult::Started => {}
-                    ReindexResult::Skipped => {
-                        self.memory.status = MemoryStatus::Idle;
-                    }
-                }
-                iced::Task::none()
-            }
-            Message::MemoryEntriesLoaded(result) => {
-                match result {
-                    Ok(entries) => {
-                        self.memory.set_entries(entries);
-                        self.memory.status = MemoryStatus::Idle;
-                    }
-                    Err(error) => self.memory.status = MemoryStatus::Error(error),
-                }
-                iced::Task::none()
-            }
-            Message::PluginProvidersRefreshed => {
-                // Log-only outcome (the refresh task logs its own results);
-                // kept as a message so future UI feedback needs no wiring
-                // change.
-                iced::Task::none()
-            }
-            Message::MemoryEntryDeleted { id, result } => {
-                match result {
-                    Ok(()) => self.memory.remove_entry(&id),
-                    Err(error) => self.memory.status = MemoryStatus::Error(error),
-                }
-                iced::Task::none()
-            }
+            // NORM S44 — the four memory-result arms (`ReindexResult`,
+            // `MemoryEntriesLoaded`, `PluginProvidersRefreshed`, and
+            // `MemoryEntryDeleted`) moved verbatim to the sibling
+            // `memory_results` submodule. The full `Message` is forwarded so
+            // the helper preserves each arm's exact early-return `Task`
+            // semantics.
+            message @ (Message::ReindexResult(_)
+            | Message::MemoryEntriesLoaded(_)
+            | Message::PluginProvidersRefreshed
+            | Message::MemoryEntryDeleted { .. }) => self.update_memory_results(message),
             // NORM S37 — the `ToolLog` child-view passthrough one-liner
             // lives in the sibling `delegated_updates` submodule.
             message @ Message::ToolLog(_) => self.update_tool_log(message),
