@@ -12074,50 +12074,29 @@ impl CoordinatorAgent {
         .await
     }
 
-    /// The Coordinator's decision loop (ADR-35 amendment 2026-09-05 §1).
+    /// D1: build the coordinator's dispatch system message. Refreshes the
+    /// world model first (Issue #56: rebuild it BEFORE the decision prompt is
+    /// rendered so the injected block reflects the state the decisions run
+    /// against, restored checkpoint state included), renders the dispatch
+    /// template, and threads it through the shared `PromptBuilder` seam.
     ///
-    /// A bounded LLM loop on the planning provider whose toolset is the
-    /// policy-gated [`CALL_SPECIALIST_TOOL`] dispatch (plus the optional
-    /// [`DRAFT_PLAN_TOOL`] advisor and — when the coordinator holds the
-    /// shared executor — the executor's own tools for ADR-35 §8
-    /// self-execution). The loop ends when the model replies without a tool
-    /// call (its final text is the run's dispatch summary), or at the
-    /// structural iteration bound. Every iteration is a model dispatch and
-    /// counts toward the ADR-52 run-wide doom guard.
+    /// The single `refresh_world_model` await stays inside so the refresh and
+    /// the render it feeds remain one ordered unit.
     ///
-    /// `PlanningOnly` depth (ADR-55 archived Phase 2b §1) offers NO tools:
-    /// the single
-    /// planning response IS the plan — advisory prose, nothing is
-    /// dispatched, no tools are touched (M1).
-    ///
-    /// Provider failures propagate so the caller degrades to a graceful
-    /// `Partial` result. Cancellation propagates immediately.
+    /// `too_many_arguments` is allowed for the same reason as its caller
+    /// [`Self::run_dispatch_session`]: the parameters are the session's
+    /// borrowed context, threaded through unchanged rather than re-bundled.
     #[allow(clippy::too_many_arguments)]
-    async fn run_dispatch_session(
+    async fn build_dispatch_prompt(
         &mut self,
-        graph: &mut TaskGraph,
         task: &AgentTask,
         base_ctx: &AgentContext,
         cancel: &CancellationToken,
-        scope: &mut checkpoint::CheckpointScope,
-        ledger: &mut DispatchLedger,
-        state: &mut DispatchSessionState,
-        design_role: Option<&AgentId>,
         intro: &str,
-    ) -> Result<(String, Option<PlanArtifact>), OrchestratorError> {
-        // Run-history audit: the session's scope run id IS the run in scope
-        // from here on. Stamping it at session entry — rather than at each
-        // scope-creation site — gives every decision session (fresh
-        // decompose, evidence re-entry, resume-drive) the id its
-        // mid-session `RunInterruptedByUser` and its in-session dispatch
-        // evidence are reported under: `execute_graph` stamps its own id
-        // only at Phase 2, so without this a fresh run stopped during
-        // planning would have no run to name.
-        self.run_id = Some(scope.run_id.to_string());
-        let dispatching = self.orchestration_depth != OrchestrationDepth::PlanningOnly;
-        // Issue #56: rebuild the world model BEFORE the decision prompt is
-        // rendered so the injected block reflects the state the decisions
-        // run against (restored checkpoint state included).
+        dispatching: bool,
+        state: &DispatchSessionState,
+        ledger: &DispatchLedger,
+    ) -> Message {
         self.refresh_world_model(task, &[], Vec::new(), cancel).await;
         let system_prompt =
             self.render_dispatch_system_prompt(task, intro, dispatching, state, ledger);
@@ -12127,8 +12106,13 @@ impl CoordinatorAgent {
         // discipline as the single-agent loop, and the prompt is emitted as
         // the single `Role::System` message the adapters expect.
         let working_memory_block = self.dispatch_working_memory_block(base_ctx);
-        let system_message =
-            self.build_dispatch_system_message(system_prompt, &working_memory_block);
+        self.build_dispatch_system_message(system_prompt, &working_memory_block)
+    }
+
+    /// D2: the dispatch decision loop's tool-definition surface. Pure — reads
+    /// the run's `write_gate`/`tool_executor` handles and performs no I/O.
+    /// Gated on `dispatching`: a planning-only run exposes no tools.
+    fn build_dispatch_tool_defs(&self, dispatching: bool) -> Vec<ToolDefinition> {
         let mut tool_defs: Vec<ToolDefinition> = Vec::new();
         if dispatching {
             tool_defs.push(call_specialist_tool_definition());
@@ -12188,6 +12172,54 @@ impl CoordinatorAgent {
                 tool_defs.extend(executor.tool_definitions());
             }
         }
+        tool_defs
+    }
+
+    /// The Coordinator's decision loop (ADR-35 amendment 2026-09-05 §1).
+    ///
+    /// A bounded LLM loop on the planning provider whose toolset is the
+    /// policy-gated [`CALL_SPECIALIST_TOOL`] dispatch (plus the optional
+    /// [`DRAFT_PLAN_TOOL`] advisor and — when the coordinator holds the
+    /// shared executor — the executor's own tools for ADR-35 §8
+    /// self-execution). The loop ends when the model replies without a tool
+    /// call (its final text is the run's dispatch summary), or at the
+    /// structural iteration bound. Every iteration is a model dispatch and
+    /// counts toward the ADR-52 run-wide doom guard.
+    ///
+    /// `PlanningOnly` depth (ADR-55 archived Phase 2b §1) offers NO tools:
+    /// the single
+    /// planning response IS the plan — advisory prose, nothing is
+    /// dispatched, no tools are touched (M1).
+    ///
+    /// Provider failures propagate so the caller degrades to a graceful
+    /// `Partial` result. Cancellation propagates immediately.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_dispatch_session(
+        &mut self,
+        graph: &mut TaskGraph,
+        task: &AgentTask,
+        base_ctx: &AgentContext,
+        cancel: &CancellationToken,
+        scope: &mut checkpoint::CheckpointScope,
+        ledger: &mut DispatchLedger,
+        state: &mut DispatchSessionState,
+        design_role: Option<&AgentId>,
+        intro: &str,
+    ) -> Result<(String, Option<PlanArtifact>), OrchestratorError> {
+        // Run-history audit: the session's scope run id IS the run in scope
+        // from here on. Stamping it at session entry — rather than at each
+        // scope-creation site — gives every decision session (fresh
+        // decompose, evidence re-entry, resume-drive) the id its
+        // mid-session `RunInterruptedByUser` and its in-session dispatch
+        // evidence are reported under: `execute_graph` stamps its own id
+        // only at Phase 2, so without this a fresh run stopped during
+        // planning would have no run to name.
+        self.run_id = Some(scope.run_id.to_string());
+        let dispatching = self.orchestration_depth != OrchestrationDepth::PlanningOnly;
+        let system_message = self
+            .build_dispatch_prompt(task, base_ctx, cancel, intro, dispatching, state, ledger)
+            .await;
+        let tool_defs = self.build_dispatch_tool_defs(dispatching);
 
         let profile = match self.planning_profile.clone() {
             Some(profile) => profile,
