@@ -107,6 +107,17 @@ mod simple_updates;
 /// put untouched.
 mod project_switch;
 
+/// The thin-delegation arms extracted from the root `update` match (NORM
+/// S37): the orchestration wrappers (banner import/dismiss, Studio dispatch
+/// + guarded Save, runtime-snapshot load), the `Editor` dispatch arm, the
+/// capability/ack/intent/plan dialog resolvers over the shared pending
+/// queues, and the `ToolLog` child-view passthrough. Bodies moved verbatim;
+/// each group is one `pub(super)` method taking the full [`Message`] so
+/// every arm keeps its exact early-return `Task` semantics (same pattern as
+/// `views::settings::update_mcp`). The parent `update` keeps one thin
+/// delegating arm per group; the tests in `mod tests` stay put untouched.
+mod delegated_updates;
+
 /// Shared text-focus state read by the keyboard-subscription fn pointer.
 /// `keyboard::on_key_press` requires a bare fn (no captures), so we route
 /// through a static rather than App's field.
@@ -1388,7 +1399,9 @@ impl App {
                 }
                 iced::Task::none()
             }
-            Message::ToolLog(msg) => self.tool_log.update(msg).map(Message::ToolLog),
+            // NORM S37 — the `ToolLog` child-view passthrough one-liner
+            // lives in the sibling `delegated_updates` submodule.
+            message @ Message::ToolLog(_) => self.update_tool_log(message),
             Message::SessionSelected { session_id, history, events, transcript } => {
                 // Flush the previously active session before switching.
                 self.persist_active_agent_graph();
@@ -1608,87 +1621,20 @@ impl App {
             message @ (Message::AgentGraph(_) | Message::Terminal(_)) => {
                 self.update_passthrough_views(message)
             }
-            Message::ImportProjectOrchestration => {
-                self.run_project_orchestration_import();
-                iced::Task::none()
-            }
-            Message::DismissOrchestrationBanner => {
-                self.orchestration_banner_dismissed = true;
-                iced::Task::none()
-            }
-            Message::OrchestrationStudio(msg) => {
-                // ADR-58/59 (rewritten) Slice 2 (single-arm Save), AMENDED
-                // (global-only orchestration): `SaveOrchestration` persists
-                // the Studio's editable blueprint via `persist_orchestration`,
-                // which writes to the GLOBAL config (include → guarded include
-                // write, name/inline → materialize inline into the global
-                // config) + the roster to the global config, validates,
-                // writes, and reloads — never navigating, never switching the
-                // surface, and never creating a project `.concerto.toml`
-                // (project-layer orchestration keys are now ignored at load;
-                // a Save is refused while a project file still declares
-                // `[orchestration]` — the banner import owns the relocation).
-                // There is no init path anymore: the
-                // roster auto-seeds globally on Studio open.
-                let persist =
-                    matches!(msg, views::orchestration_studio::StudioMessage::SaveOrchestration);
-                let task = self.orchestration_studio.update(msg);
-                if persist {
-                    match self.persist_orchestration() {
-                        Ok(()) => {
-                            self.orchestration_studio.mark_saved();
-                            self.toasts.push(ToastLevel::Success, "Orchestration saved".into());
-                        }
-                        Err(error) => {
-                            // Every write is atomic and nothing is written on
-                            // failure — surface the reason persistently so the
-                            // draft is kept, not lost.
-                            self.toasts.push(ToastLevel::Error, format!("Save failed: {error}"));
-                            self.orchestration_studio.mark_save_failed(error);
-                        }
-                    }
-                }
-                task
-            }
-            Message::StudioRuntimeLoaded(session_id, snapshot) => {
-                // Discard a stale load: only apply the snapshot whose session
-                // still matches the active one.
-                if session_id == self.active_session_id {
-                    self.orchestration_studio.set_runtime_snapshot(*snapshot);
-                }
-                iced::Task::none()
-            }
-            Message::Editor(msg) => match msg {
-                // The Editor toolbar's screenshot button is an app-level
-                // action (whole-window capture), so it never enters the
-                // editor state — the Editor page is the one page whose
-                // Ctrl+S means Save, and this is its screenshot access.
-                views::code_editor::Message::TakeScreenshot => self.update(Message::TakeScreenshot),
-                msg => {
-                    let refresh_diff = matches!(
-                        msg,
-                        views::code_editor::Message::AcceptStaged
-                            | views::code_editor::Message::DiscardStaged
-                            | views::code_editor::Message::Save
-                            | views::code_editor::Message::DeleteConfirmed
-                    );
-                    let task = self
-                        .editor
-                        .update(
-                            msg,
-                            &self.vfs,
-                            &Utf8PathBuf::from_path_buf(self.project_dir.clone()).unwrap_or_else(
-                                |p| Utf8PathBuf::from(p.to_string_lossy().as_ref()),
-                            ),
-                            &self.cancel_token,
-                        )
-                        .map(Message::Editor);
-                    if refresh_diff {
-                        self.load_diff_from_vfs();
-                    }
-                    task
-                }
-            },
+            // NORM S37 — the thin-delegation orchestration arms (banner
+            // import action, banner dismiss, Studio dispatch + guarded Save
+            // persist, and the stale-checked runtime-snapshot load) moved
+            // verbatim to the sibling `delegated_updates` submodule. The full
+            // `Message` is forwarded so the helper preserves each arm's exact
+            // early-return `Task` semantics.
+            message @ (Message::ImportProjectOrchestration
+            | Message::DismissOrchestrationBanner
+            | Message::OrchestrationStudio(_)
+            | Message::StudioRuntimeLoaded(..)) => self.update_orchestration(message),
+            // NORM S37 — the `Editor` dispatch arm (screenshot re-dispatch,
+            // `editor.update`, and the staged-diff reload) moved verbatim to
+            // the sibling `delegated_updates` submodule.
+            message @ Message::Editor(_) => self.update_editor(message),
             // NORM S30 — prefs-theme reload + help-overlay flip moved to the
             // sibling `simple_updates` submodule.
             message @ (Message::ThemeChanged | Message::HelpToggled) => {
@@ -1708,43 +1654,15 @@ impl App {
             | Message::ToggleProjectExpanded(_)
             | Message::ProjectSessionsLoaded { .. }
             | Message::TreeSessionClicked { .. }) => self.update_project_switch(message),
-            Message::CapabilityDlg(msg) => {
-                capability_dialog::resolve(&self.cap_pending, &msg);
-                iced::Task::none()
-            }
-            Message::AckDialog(msg) => {
-                // Resolve only the ack that is actually displayed: capture the
-                // pending ack's session identity so a stale or cross-session
-                // entry can never answer a different run's prompt (ADR-68,
-                // audit H-04).
-                let session_id = {
-                    let guard = self.pending_ack.lock().unwrap_or_else(|e| e.into_inner());
-                    guard.front().map(|ack| ack.session_id)
-                };
-                if let Some(session_id) = session_id {
-                    let acknowledged =
-                        matches!(msg, capability_dialog::AckDialogMessage::Acknowledge);
-                    capability_dialog::resolve_ack(&self.pending_ack, session_id, acknowledged);
-                }
-                iced::Task::none()
-            }
-            Message::IntentDialog(msg) => {
-                capability_dialog::resolve_intent(&self.pending_intent, msg);
-                iced::Task::none()
-            }
-            Message::PlanDialog(msg) => {
-                // Resolve only the dialog that is actually displayed: capture
-                // the front entry's identity so a stale or cross-session queue
-                // entry can never answer a different prompt.
-                let identity = {
-                    let guard = self.pending_plan.lock().unwrap_or_else(|e| e.into_inner());
-                    guard.front().map(|plan| (plan.session_id, plan.plan_id.clone()))
-                };
-                if let Some((session_id, plan_id)) = identity {
-                    capability_dialog::resolve_plan(&self.pending_plan, session_id, &plan_id, msg);
-                }
-                iced::Task::none()
-            }
+            // NORM S37 — the capability / ack / intent / plan dialog resolver
+            // arms (shared pending queues) moved verbatim to the sibling
+            // `delegated_updates` submodule. The full `Message` is forwarded
+            // so the helper preserves each arm's exact early-return `Task`
+            // semantics.
+            message @ (Message::CapabilityDlg(_)
+            | Message::AckDialog(_)
+            | Message::IntentDialog(_)
+            | Message::PlanDialog(_)) => self.update_capability_dialogs(message),
             Message::DesktopEvent(evt) => {
                 // Spend events update App-level state (status-bar chip + cap
                 // state) before the remaining variants route into per-view
