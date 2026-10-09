@@ -3,10 +3,20 @@
 use concerto_core::helpers::canonical_project_path;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use concerto_core::error::ConfigError;
 
 const MAX_RECENT_PROJECTS: usize = 20;
+
+/// Monotonic sequence making each `save_to` temporary file name unique per
+/// call, not merely per process. Concurrent in-process savers (e.g. parallel
+/// tests sharing the registry path) must never race on the same temp
+/// write/rename pair. Behavior-neutral for production (single writer): the
+/// temp file is always unlinked after the rename — or removed by the Windows
+/// copy fallback below — so only the private temp name changes, never the
+/// final path or the atomic-replace semantics.
+static SAVE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Persisted active project, startup behaviour, and most-recently-used project list.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -60,7 +70,8 @@ impl ProjectRegistry {
         let bytes = serde_json::to_vec_pretty(self).map_err(|error| {
             ConfigError::Load(format!("failed to serialize project registry: {error}"))
         })?;
-        let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        let sequence = SAVE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = path.with_extension(format!("json.{}.{sequence}.tmp", std::process::id()));
         std::fs::write(&temporary, bytes).map_err(|error| {
             ConfigError::Load(format!("failed to write project registry: {error}"))
         })?;
