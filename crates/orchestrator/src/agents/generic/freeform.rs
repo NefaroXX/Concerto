@@ -195,6 +195,14 @@ impl GenericSpecialistAgent {
 
             let Some(executor) = &self.tool_executor else {
                 progress.unavailable_executor();
+                for call in &tool_calls {
+                    progress.failed(
+                        &call.id,
+                        &call.name,
+                        &call.arguments,
+                        "specialist-no-executor",
+                    );
+                }
                 summary = text;
                 break;
             };

@@ -229,11 +229,21 @@ async fn requested_tool_without_executor_is_an_unfinished_task() {
         PromptSections::default(),
         AgentCapabilities::default(),
     );
-    let (task, context) = fixture_context(dir.path());
-    let result = agent.run(&task, context, "mock", CancellationToken::new()).await.unwrap();
-    let AgentOutcome::NeedsRevision { reason } = result.outcome else {
+    let (task, mut context) = fixture_context(dir.path());
+    let result = agent.run(&task, context.clone(), "mock", CancellationToken::new()).await.unwrap();
+    let AgentOutcome::NeedsRevision { reason } = &result.outcome else {
         panic!("unexecuted tool requests are not completed work");
     };
     assert!(reason.contains("specialist-no-executor"));
     assert!(!dir.path().join("a.rs").exists());
+    context.previous_results.push(result);
+    let idle = fixture_agent(0, vec![final_turn()]);
+    let still_open =
+        idle.run(&task, context.clone(), "mock", CancellationToken::new()).await.unwrap();
+    assert!(matches!(still_open.outcome, AgentOutcome::NeedsRevision { .. }));
+    context.previous_results.push(still_open);
+    let repaired = fixture_agent(0, vec![write_turn("executed", "a.rs", "fixed"), final_turn()]);
+    let finished = repaired.run(&task, context, "mock", CancellationToken::new()).await.unwrap();
+    assert_eq!(finished.outcome, AgentOutcome::Success);
+    assert_eq!(std::fs::read_to_string(dir.path().join("a.rs")).unwrap(), "fixed");
 }
