@@ -75,6 +75,7 @@ CANCEL_EXIT=0
 BUDGET_EXCEEDED=0
 DEADLINE=0
 CHILD_PID=""
+CHILD_PGID=""
 CHILD_KILLED=0
 RUN_RC=0
 FINALIZED=0
@@ -662,16 +663,19 @@ build_runs() {
 
 # Send $1 to the tool's whole process group, then escalate to KILL after
 # KILL_GRACE_SECONDS. Never signals this script's own process group.
+# Liveness is judged on the process GROUP, not on the leader's PID: the
+# setsid'd leader can exit while a descendant still ignores TERM, and a
+# parent-only check would skip the SIGKILL escalation and leak the orphan.
 terminate_child() {
-    local sig="$1" pid="$CHILD_PID" waited=0
-    [ -n "$pid" ] || return 0
-    kill -s "$sig" -- "-$pid" 2>/dev/null || kill -s "$sig" "$pid" 2>/dev/null || true
-    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$KILL_GRACE_SECONDS" ]; do
+    local sig="$1" pgid="$CHILD_PGID" waited=0
+    [ -n "$pgid" ] || return 0
+    kill -s "$sig" -- "-$pgid" 2>/dev/null || kill -s "$sig" "$pgid" 2>/dev/null || true
+    while kill -0 -- "-$pgid" 2>/dev/null && [ "$waited" -lt "$KILL_GRACE_SECONDS" ]; do
         sleep 1
         waited=$((waited + 1))
     done
-    if kill -0 "$pid" 2>/dev/null; then
-        kill -s KILL -- "-$pid" 2>/dev/null || kill -s KILL "$pid" 2>/dev/null || true
+    if kill -0 -- "-$pgid" 2>/dev/null; then
+        kill -s KILL -- "-$pgid" 2>/dev/null || kill -s KILL "$pgid" 2>/dev/null || true
     fi
 }
 
@@ -685,14 +689,19 @@ run_child() {
 
     CHILD_KILLED=0
     CHILD_PID=""
+    CHILD_PGID=""
     (
         cd "$ROOT" || exit 111
         exec setsid "$@"
     ) >"$logfile" 2>&1 &
     pid=$!
     CHILD_PID=$pid
+    # setsid makes the child a session and process-group leader: PGID == PID.
+    CHILD_PGID=$pid
 
-    while kill -0 "$pid" 2>/dev/null; do
+    # Wait while either the leader or its process group is alive: a leader
+    # that exits must not end budget monitoring while descendants remain.
+    while kill -0 "$pid" 2>/dev/null || kill -0 -- "-$CHILD_PGID" 2>/dev/null; do
         if [ "$BUDGET_EXCEEDED" -eq 0 ] && [ "$SECONDS" -ge "$DEADLINE" ]; then
             BUDGET_EXCEEDED=1
             CHILD_KILLED=1
@@ -705,6 +714,7 @@ run_child() {
     done
     wait "$pid" || rc=$?
     CHILD_PID=""
+    CHILD_PGID=""
     RUN_RC=$rc
 }
 
