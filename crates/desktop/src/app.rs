@@ -118,6 +118,19 @@ mod project_switch;
 /// delegating arm per group; the tests in `mod tests` stay put untouched.
 mod delegated_updates;
 
+/// The backend-event and model/config arms extracted from the root
+/// `update` match (NORM S38): the `DesktopEvent` arm (App-level spend /
+/// cap / run-stage chip updates, the `ErrorOccurred` toast, and the
+/// `route_event` fan-out into the chat / tool-log / agent-graph / memory
+/// view states) and the active provider/model selection + external
+/// config-reload arms (`SetActiveProvider`, `SetActiveModel`,
+/// `SetAgentModel`, `ConfigReloaded`). Bodies moved verbatim; each group
+/// is one `pub(super)` method taking the full [`Message`] so every arm
+/// keeps its exact early-return `Task` semantics (same pattern as
+/// `views::settings::update_mcp`). The parent `update` keeps one thin
+/// delegating arm per group; the tests in `mod tests` stay put untouched.
+mod event_model_updates;
+
 /// Shared text-focus state read by the keyboard-subscription fn pointer.
 /// `keyboard::on_key_press` requires a bare fn (no captures), so we route
 /// through a static rather than App's field.
@@ -1663,114 +1676,23 @@ impl App {
             | Message::AckDialog(_)
             | Message::IntentDialog(_)
             | Message::PlanDialog(_)) => self.update_capability_dialogs(message),
-            Message::DesktopEvent(evt) => {
-                // Spend events update App-level state (status-bar chip + cap
-                // state) before the remaining variants route into per-view
-                // states. Session-id mismatches are ignored: the chip tracks
-                // the active session, and session switches reset this state.
-                match &evt {
-                    crate::runtime::DesktopEvent::SpendUpdated { total_usd } => {
-                        self.live_session_cost = *total_usd;
-                        self.reconcile_cap_state(*total_usd);
-                    }
-                    crate::runtime::DesktopEvent::SpendCapApproaching {
-                        current_usd,
-                        cap_usd,
-                        pct,
-                    } => {
-                        self.live_session_cost = *current_usd;
-                        self.session_cap = Some(*cap_usd);
-                        self.cap_state = CapUiState::Approaching {
-                            current_usd: *current_usd,
-                            cap_usd: *cap_usd,
-                            pct: *pct,
-                        };
-                    }
-                    crate::runtime::DesktopEvent::SpendCapExceeded { current_usd, cap_usd } => {
-                        self.live_session_cost = *current_usd;
-                        self.session_cap = Some(*cap_usd);
-                        self.cap_state =
-                            CapUiState::Exceeded { current_usd: *current_usd, cap_usd: *cap_usd };
-                    }
-                    crate::runtime::DesktopEvent::RunStageChanged { stage }
-                        if self.run_status == RunStatus::Running =>
-                    {
-                        // The run-stage chip tracks the active run only. A
-                        // stage event outside a run (e.g. a stale bus replay
-                        // caught mid-dispatch) must not re-arm the chip: the
-                        // arm is guarded on the run status, so a non-Running
-                        // run falls through to the `_` catch-all.
-                        self.run_stage = Some(*stage);
-                    }
-                    crate::runtime::DesktopEvent::ErrorOccurred { message } => {
-                        // A backend refusal (e.g. a full ack queue) must be
-                        // visible: surface it as an error toast rather than a
-                        // silent log line.
-                        self.toasts.push(ToastLevel::Error, message.clone());
-                    }
-                    _ => {}
-                }
-                crate::runtime::route_event(
-                    &evt,
-                    &mut self.chat,
-                    &mut self.tool_log,
-                    &mut self.agent_graph,
-                    &mut self.memory,
-                );
-                iced::Task::none()
-            }
-            Message::SetActiveProvider(id) => {
-                let resolved_id = self
-                    .settings
-                    .cached_provider_labels
-                    .iter()
-                    .position(|label| label == &id)
-                    .and_then(|index| self.settings.cached_provider_ids.get(index))
-                    .cloned()
-                    .unwrap_or(id);
-                self.active_provider_id = resolved_id.clone();
-                if self.runtime_providers().iter().any(|provider| provider.id == resolved_id) {
-                    // Models live on role assignments (Option-1), not providers,
-                    // so derive the chat model from the assignment for this
-                    // provider instead of the now-empty `provider.model`.
-                    self.sync_chat_model_options();
-                    self.active_model = self.resolve_default_model();
-                }
-                self.persist_active_model_selection();
-                self.refresh_seq = self.refresh_seq.wrapping_add(1);
-                let req_id = self.refresh_seq;
-                self.pending_refresh.insert(resolved_id.clone(), req_id);
-                self.fetch_models_for_provider(resolved_id, req_id)
-            }
-            Message::SetActiveModel(model) => {
-                if self
-                    .runtime_model_names(&self.active_provider_id)
-                    .iter()
-                    .any(|candidate| candidate == &model)
-                {
-                    self.active_model = model.clone();
-                    self.persist_active_model_selection();
-                } else {
-                    tracing::warn!(
-                        provider_id = %self.active_provider_id,
-                        model = %model,
-                        "ignored model selection that does not belong to the active provider"
-                    );
-                }
-                iced::Task::none()
-            }
-            Message::SetAgentModel { agent_id, model } => {
-                self.set_agent_model(agent_id, model);
-                iced::Task::none()
-            }
-
-            // External config edit (ADR-57): reload from disk and re-derive
-            // every config-derived field through the one shared helper. The
-            // equality short-circuit inside makes our own saves no-ops.
-            Message::ConfigReloaded => {
-                self.reconcile_config_from_reload();
-                iced::Task::none()
-            }
+            // NORM S38 — the `DesktopEvent` arm (App-level spend / cap /
+            // run-stage chip updates, the `ErrorOccurred` toast, and the
+            // `route_event` fan-out into the chat / tool-log / agent-graph /
+            // memory view states) moved verbatim to the sibling
+            // `event_model_updates` submodule. The full `Message` is
+            // forwarded so the helper preserves the arm's exact semantics.
+            message @ Message::DesktopEvent(_) => self.update_desktop_event(message),
+            // NORM S38 — the active provider/model selection + external
+            // config-reload arms (`SetActiveProvider`, `SetActiveModel`,
+            // `SetAgentModel`, `ConfigReloaded`) moved verbatim to the
+            // sibling `event_model_updates` submodule. The full `Message` is
+            // forwarded so the helper preserves each arm's exact
+            // early-return `Task` semantics.
+            message @ (Message::SetActiveProvider(_)
+            | Message::SetActiveModel(_)
+            | Message::SetAgentModel { .. }
+            | Message::ConfigReloaded) => self.update_model_config(message),
 
             // (sync_chat_model_options is invoked inside persist_active_model_selection)
             // NORM S30 — the trivial tail cluster (screenshot status, save
