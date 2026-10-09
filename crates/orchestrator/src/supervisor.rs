@@ -2347,14 +2347,6 @@ fn kill_group(child: &mut std::process::Child, _sig: i32) {
     let _ = child.kill();
 }
 
-#[allow(dead_code)]
-fn kill_group_term(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    kill_group(child, libc::SIGTERM);
-    #[cfg(not(unix))]
-    kill_group(child, 0);
-}
-
 fn kill_group_kill(child: &mut std::process::Child) {
     #[cfg(unix)]
     kill_group(child, libc::SIGKILL);
