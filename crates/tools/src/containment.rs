@@ -74,6 +74,7 @@
 //!   one (may conservatively block) and no delimiter validation occurs.
 
 use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
+use concerto_core::authorization::interpreter_program_executes;
 use concerto_core::ToolError;
 use std::collections::HashSet;
 
@@ -94,18 +95,6 @@ const READ_ONLY_VERBS: &[&str] = &[
 /// marker per the ADR-55 v1 contract.
 const INPLACE_WRITE_FLAGS: &[(&str, &[&str])] =
     &[("sed", &["-i", "--in-place"]), ("grep", &["-w"]), ("awk", &["-i", "--in-place", "-w"])];
-
-/// awk program-text execution primitives (2026-09-15, tight set; mirrored in
-/// core's `AWK_EXEC_PRIMITIVES`, `crates/core/src/authorization.rs`). An
-/// `awk` invocation whose program text carries any of these executes code no
-/// token scan can see into, so the invocation demotes from read-only:
-/// `system("cmd")` (shell-out builtin), `"cmd" | getline` / `|getline` (the
-/// shell runs the left side), `|&` (coprocess), and `print … | "cmd"` /
-/// `print|"cmd"` (the quoted command is executed). Conservative: a program
-/// that merely prints such a literal loses its read-only exemption (a
-/// rejection at most). `awk -f` script-file bodies remain invisible
-/// (documented residual).
-const AWK_EXEC_PRIMITIVES: &[&str] = &["system(", "|&", "|getline", "| getline", "| \"", "|\""];
 
 /// Write-redirect operators whose target is contained regardless of the verb.
 const WRITE_REDIRECT_OPERATORS: &[&str] = &[">", ">>", "2>", "2>>", "&>", "&>>", ">|"];
@@ -194,89 +183,6 @@ fn is_read_only(verb: &str, trailing: &[String]) -> bool {
     // stays a read.
     !trailing.iter().any(|arg| {
         write_flags.iter().any(|flag| arg == *flag || (flag.len() > 1 && arg.starts_with(flag)))
-    })
-}
-
-/// Whether an `awk`/`sed` invocation's trailing tokens (its program text, or
-/// arguments carrying it) contain code-execution primitives. A bounded,
-/// conservative scan — NOT an awk/sed parser; mirror of core's
-/// [`interpreter_program_executes`-analog in `authorization.rs`]
-/// (`interpreter_program_executes`):
-///
-/// - `awk`: any trailing token carrying an [`AWK_EXEC_PRIMITIVES`] member.
-/// - `sed`: the `s///e` execute flag and the standalone `e` command
-///   ([`sed_program_executes`] — bounded delimiter walk).
-///
-/// A false positive costs the read-only exemption (a rejection at most); it
-/// can only ever NARROW the exemption, never widen it.
-fn interpreter_program_executes(verb: &str, trailing: &[String]) -> bool {
-    match verb {
-        "awk" => trailing
-            .iter()
-            .any(|token| AWK_EXEC_PRIMITIVES.iter().any(|primitive| token.contains(primitive))),
-        "sed" => trailing.iter().any(|token| sed_program_executes(token)),
-        _ => false,
-    }
-}
-
-/// Whether a `sed` program text executes shell code (2026-09-15, tight set):
-/// the `s///e` flag (the replacement runs as a shell command) and the
-/// standalone `e` command (`sed 'e'`, `sed 's/x/y/;e ls'`). Bounded walk in
-/// [`sed_substitute_e_flag`]; the standalone command is detected on
-/// `;`/newline chunks whose first character is `e` followed by end/space/tab.
-fn sed_program_executes(script: &str) -> bool {
-    sed_substitute_e_flag(script) || sed_standalone_exec_command(script)
-}
-
-/// Bounded `s<delim>…<delim>…<delim><flags>` walk: returns whether ANY
-/// substitute command's flag run contains the `e` flag. A word containing
-/// `s<delim>` may be misread as a substitute command (over-block only).
-fn sed_substitute_e_flag(script: &str) -> bool {
-    let chars: Vec<char> = script.chars().collect();
-    for (i, &c) in chars.iter().enumerate() {
-        let Some(&delim) = chars.get(i + 1) else {
-            break;
-        };
-        if c != 's' || delim.is_alphanumeric() {
-            continue;
-        }
-        // The delimiter at i+1 is occurrence one; the next two occurrences
-        // bound pattern and replacement.
-        let mut seen = 1usize;
-        for (j, &c2) in chars.iter().enumerate().skip(i + 2) {
-            if c2 != delim {
-                continue;
-            }
-            seen += 1;
-            if seen != 3 {
-                continue;
-            }
-            // Flag run: characters after the third delimiter until a
-            // whitespace/separator boundary; `e` there is the execute flag.
-            if chars.get(j + 1..).is_some_and(|tail| {
-                tail.iter()
-                    .copied()
-                    .take_while(|c2| {
-                        !c2.is_whitespace() && !matches!(c2, ';' | '\n' | '\r' | '&' | '|')
-                    })
-                    .any(|c2| c2 == 'e')
-            }) {
-                return true;
-            }
-            // One flag run per substitute command; keep scanning for the
-            // NEXT `s<delim>` command.
-            break;
-        }
-    }
-    false
-}
-
-/// Bounded standalone-`e`-command walk: `;`/newline-separated chunks whose
-/// first character is `e` followed by end/space/tab execute code.
-fn sed_standalone_exec_command(script: &str) -> bool {
-    script.split([';', '\n', '\r']).any(|chunk| {
-        let chunk = chunk.trim_start();
-        chunk.starts_with('e') && (chunk.len() == 1 || chunk[1..].starts_with([' ', '\t']))
     })
 }
 

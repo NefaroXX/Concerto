@@ -666,7 +666,10 @@ fn is_read_only_verb_invocation(verb: &str, trailing: &[&str]) -> bool {
 /// most an approval prompt; it can only ever move a verdict toward the
 /// approval path, never toward Allow. `awk -f` / `sed -f` script-file bodies
 /// stay invisible (documented residual).
-fn interpreter_program_executes(verb: &str, trailing: &[&str]) -> bool {
+pub fn interpreter_program_executes<T: std::ops::Deref<Target = str>>(
+    verb: &str,
+    trailing: &[T],
+) -> bool {
     match verb {
         "awk" => trailing
             .iter()
