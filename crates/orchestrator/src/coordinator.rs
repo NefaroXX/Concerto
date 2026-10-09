@@ -358,7 +358,7 @@ Restructuring an open task (use sparingly, deterministically):
 Declaring work before dispatching it:
 - When the turn needs work, FIRST declare it with declare_obligations (one structured call naming each obligation's owning specialist and work text, chained in order), THEN dispatch each item with call_specialist passing its task_id. Declaration creates Outstanding, not-yet-dispatched work without running anything.
 - Declared Implement/Verify work blocks completion until it is dispatched with evidence: closing the run in prose while such obligations stand open is re-prompted, then reported Partial — never accepted as completion. Prose answers the explanation half freely and discharges nothing else.
-- Revise still-undispatched work with update_obligations (description, artifacts, owner, or release a declared node to Pending); settled or dispatched work is never re-cut there — reconsider, split, or merge it instead.
+- Revise undispatched or unfinished NeedsRevision work with update_obligations (description, artifacts, owner, or release a declared node to Pending). Continue unfinished specialist execution with call_specialist using the SAME task_id; its progress survives and its dependents stay blocked. Completed or in-flight work cannot be edited there.
 
 Consultation (read-only, use it to resolve open questions):
 - consult_specialist asks a registered specialist for ADVICE. The consultant runs READ-ONLY — it cannot write files or mutate the workspace — and consultation never dispatches task work or changes task state.
@@ -412,7 +412,7 @@ fn call_specialist_tool_definition() -> ToolDefinition {
                 },
                 "task_id": {
                     "type": "string",
-                    "description": "Optional id of a declared (not-yet-dispatched) obligation to dispatch. The node must still be undispatched and name this same specialist; use `update_obligations` first when it names someone else."
+                    "description": "Optional id of a Declared/Pending obligation or unfinished NeedsRevision task to dispatch or continue. Use the same task_id to retain progress and dependency position. The node must name this specialist; use `update_obligations` first when it names someone else."
                 },
                 "notes": {
                     "type": "string",
@@ -775,7 +775,7 @@ fn declare_obligations_tool_definition() -> ToolDefinition {
 }
 
 /// Argument schema for the Coordinator's `update_obligations` tool: revise
-/// still-undispatched (`Declared` or `Pending`) work — its description,
+/// undispatched (`Declared`/`Pending`) or unfinished `NeedsRevision` work — its description,
 /// expected artifacts, or owning specialist — or release a `Declared` node
 /// to `Pending` so the graph loop may dispatch it. Settled or dispatched
 /// work is rejected with a structured error; use reconsider/split/merge for
@@ -785,15 +785,15 @@ fn update_obligations_tool_definition() -> ToolDefinition {
         name: UPDATE_OBLIGATIONS_TOOL.to_string(),
         description: "Revise still-undispatched work (description, expected artifacts, \
                       owning specialist) or release a declared node to Pending for \
-                      graph-loop dispatch. Only Declared/Pending nodes are editable; \
-                      settled or dispatched work is rejected."
+                      graph-loop dispatch. Declared/Pending and unfinished NeedsRevision \
+                      nodes are editable; completed or in-flight work is rejected."
             .to_string(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
                 "task_id": {
                     "type": "string",
-                    "description": "The id of the declared (not-yet-dispatched) obligation to revise."
+                    "description": "The id of the Declared/Pending obligation or unfinished NeedsRevision task to revise."
                 },
                 "task": {
                     "type": "string",
@@ -10703,6 +10703,14 @@ impl CoordinatorAgent {
                     }
                     completed_results.insert(task_id, result.clone());
                     retry_feedback.remove(&task_id);
+                    if crate::agents::execution_state::unfinished(&result.outcome) {
+                        if let Some(subtask) = graph.get_mut(&task_id) {
+                            subtask.status = SubTaskStatus::NeedsRevision;
+                            subtask.completed_at = None;
+                        }
+                        recoverable_notes.push(result.summary.clone());
+                        continue;
+                    }
                     graph.mark_done(&task_id);
                     if stop_followups {
                         continue;
@@ -13255,9 +13263,9 @@ impl CoordinatorAgent {
         Some(serde_json::json!({ "same_role_guard": "cap_reached", "message": note }))
     }
 
-    /// Resolve an optional `call_specialist` `task_id` onto a declared
-    /// (not-yet-dispatched) obligation. The node must exist, still be
-    /// undispatched (`Declared`/`Pending`), and name the same specialist —
+    /// Resolve an optional `call_specialist` `task_id` onto a declared or
+    /// unfinished obligation. The node must exist, be undispatched
+    /// (`Declared`/`Pending`) or `NeedsRevision`, and name the same specialist —
     /// otherwise a structured tool error tells the model the fix
     /// (`update_obligations` retargets a mis-owned node,
     /// `declare_obligations` declares fresh work). `Ok(None)` is the legacy
@@ -13287,12 +13295,15 @@ impl CoordinatorAgent {
                 ),
             }));
         };
-        if !matches!(node.status, SubTaskStatus::Declared | SubTaskStatus::Pending) {
+        if !matches!(
+            node.status,
+            SubTaskStatus::Declared | SubTaskStatus::Pending | SubTaskStatus::NeedsRevision
+        ) {
             return Err(serde_json::json!({
                 "error": "already_dispatched",
                 "message": format!(
                     "call_specialist: obligation {raw} is {} (already dispatched or settled); \
-                     declare fresh work for a new dispatch",
+                     continue unfinished NeedsRevision work by its task_id, or declare fresh work",
                     node.status.as_str()
                 ),
             }));
@@ -13305,6 +13316,14 @@ impl CoordinatorAgent {
                      {agent_id}; retarget it first with update_obligations",
                     node.role
                 ),
+            }));
+        }
+        let blocked_on = graph.blocked_on(&id);
+        if !blocked_on.is_empty() {
+            return Err(serde_json::json!({
+                "error": "decision_not_ready",
+                "message": "this obligation still depends on unfinished work; continue its dependency before dispatching it",
+                "blocked_on": blocked_on.iter().map(ToString::to_string).collect::<Vec<_>>(),
             }));
         }
         Ok(Some(id))
@@ -13545,7 +13564,7 @@ impl CoordinatorAgent {
         // ── The DAG frontier must be settled: the chain parent (when any)
         // is done or definitively blocked — the model cannot back-chain a
         // new dispatch out of order past open work (ready-set gate) ─────
-        if let Some(parent) = state.last_node {
+        if let Some(parent) = state.last_node.filter(|id| *id != subtask_id) {
             let stall = match graph.get(&parent) {
                 None => Some("no longer in the graph"),
                 Some(node)
@@ -13767,14 +13786,16 @@ impl CoordinatorAgent {
         }
 
         // ── Dispatch through the EXISTING specialist-run plumbing ──────────
+        let dispatch_parent = graph.get(&subtask_id).and_then(|node| node.parent_id);
+        let dispatch_dependencies = graph.dependencies_of(&subtask_id);
         let run_subtask = SubTask {
             id: subtask_id,
-            parent_id: state.last_node,
+            parent_id: dispatch_parent,
             session_id: task.session_id,
             role: agent_id.clone(),
             description: description.clone(),
             status: SubTaskStatus::Running,
-            dependencies: state.last_node.iter().copied().collect(),
+            dependencies: dispatch_dependencies,
             deliverable: None,
             created_at: time::OffsetDateTime::now_utc(),
             completed_at: None,
@@ -13788,16 +13809,24 @@ impl CoordinatorAgent {
             .get(&subtask_id)
             .cloned()
             .unwrap_or_default();
+        // An explicit continuation receives its own settled progress as well
+        // as its actual dependencies. The loop frontier may be this same
+        // task, so it must never become a synthetic self-dependency.
+        let mut handoff_ids = vec![subtask_id];
+        handoff_ids.extend(run_subtask.dependencies.iter().copied());
+        handoff_ids.extend(run_subtask.parent_id);
+        let mut seen_handoffs = HashSet::new();
+        let previous_results = handoff_ids
+            .into_iter()
+            .filter(|id| seen_handoffs.insert(*id))
+            .filter_map(|id| ledger.completed_results.get(&id).cloned())
+            .collect();
         let run_ctx = AgentContext {
             session: base_ctx.session.clone(),
             parent_task: Some(task.clone()),
             working_memory: base_ctx.working_memory.clone(),
             retrieved_chunks: base_ctx.retrieved_chunks.clone(),
-            previous_results: state
-                .last_node
-                .and_then(|parent| ledger.completed_results.get(&parent).cloned())
-                .into_iter()
-                .collect(),
+            previous_results,
             budget_remaining_usd: None,
             expected_artifacts: expected_for_dispatch,
             workspace_capsule: None,
@@ -14067,7 +14096,7 @@ impl CoordinatorAgent {
         if matches!(result.outcome, AgentOutcome::Success)
             && (self.memory_decision_store.is_some() || self.memory_task_tree.is_some())
         {
-            let dependencies: Vec<TaskId> = state.last_node.iter().copied().collect();
+            let dependencies = run_subtask.dependencies.clone();
             self.write_back_memory_outcome(
                 &subtask_id,
                 &agent_id,
@@ -14077,6 +14106,10 @@ impl CoordinatorAgent {
                 &dependencies,
             );
         }
+        let execution_continuation = match &result.outcome {
+            AgentOutcome::NeedsRevision { reason } => crate::agents::execution_state::continuation(reason),
+            _ => None,
+        };
         match result.outcome {
             AgentOutcome::Success => {
                 // Issue #60: settled success — recorded with the observed
@@ -14127,13 +14160,22 @@ impl CoordinatorAgent {
                     suitability_now,
                     result_cost_milli,
                 );
-                // The completed task stays done; the Coordinator decides the
-                // correction (it sees `needs_revision` in the tool result).
+                // A completed review may recommend revision. Unfinished
+                // execution instead retains its obligation and dependency
+                // position until the Coordinator explicitly continues it.
                 if let Some(node) = graph.get_mut(&subtask_id) {
                     node.deliverable = Some(summary_text.clone());
-                    node.completed_at = Some(time::OffsetDateTime::now_utc());
+                    if execution_continuation.is_some() {
+                        node.status = SubTaskStatus::NeedsRevision;
+                        node.completed_at = None;
+                    } else {
+                        node.completed_at = Some(time::OffsetDateTime::now_utc());
+                    }
                 }
-                graph.mark_done(&subtask_id);
+                if execution_continuation.is_none() {
+                    graph.mark_done(&subtask_id);
+                }
+                let reason = crate::agents::execution_state::display_reason(reason);
                 ledger.notes.push(format!(
                     "Specialist {agent_id} requested revision: {reason}. The Coordinator \
                      decides whether to re-dispatch a correction."
@@ -14225,6 +14267,15 @@ impl CoordinatorAgent {
             "tool_call_count": result.tool_call_count,
             "cost_usd": result.cost_usd,
         });
+        if let Some(continuation) = execution_continuation {
+            tool_result["continuation"] = serde_json::json!({
+                "task_id": subtask_id.to_string(),
+                "progress": continuation,
+                "hint": "The task is unfinished and still blocks its dependents. Inspect current \
+                         state, then explicitly continue with call_specialist using this task_id. \
+                         Do not replay successful calls blindly or declare duplicate work.",
+            });
+        }
         if let Some(guard) = same_role_guard {
             tool_result["guard"] = guard;
         }
@@ -16664,7 +16715,7 @@ impl CoordinatorAgent {
     }
 
     /// Handle ONE `update_obligations` tool call — revise one
-    /// still-undispatched (`Declared`/`Pending`) node: its description,
+    /// undispatched (`Declared`/`Pending`) or unfinished (`NeedsRevision`) node: its description,
     /// expected artifacts, owning specialist, or its release from `Declared`
     /// to `Pending` so the graph loop may dispatch it. Settled or dispatched
     /// work is rejected (completed work is never re-cut; failed/blocked work
@@ -16704,13 +16755,16 @@ impl CoordinatorAgent {
                 ),
             });
         };
-        if !matches!(node.status, SubTaskStatus::Declared | SubTaskStatus::Pending) {
+        if !matches!(
+            node.status,
+            SubTaskStatus::Declared | SubTaskStatus::Pending | SubTaskStatus::NeedsRevision
+        ) {
             return serde_json::json!({
                 "error": "invalid_transition",
                 "message": format!(
-                    "update_obligations: obligation {} is {} — only Declared/Pending \
-                     (not-yet-dispatched) work is editable; settled or dispatched work is never \
-                     re-cut",
+                    "update_obligations: obligation {} is {} — only Declared/Pending or \
+                     unfinished NeedsRevision work is editable; completed or in-flight work \
+                     is never re-cut",
                     args.task_id,
                     node.status.as_str()
                 ),
@@ -18025,6 +18079,7 @@ impl CoordinatorAgent {
 mod tests {
     // R02: resume/continue coverage lives in `coordinator/tests/resume_tests.rs`.
     mod resume_tests;
+    mod specialist_execution;
 
     use super::*;
     use crate::progress::{MAX_STALL_RECOVERIES, MAX_STALL_ROUNDS};
