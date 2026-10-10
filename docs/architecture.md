@@ -178,7 +178,9 @@ functional. `ShellTool` still applies its own hard denylist before any allow-all
 configuration. See [policy-rules.md](policy-rules.md) and
 [Security Boundaries](../SECURITY_BOUNDARIES.md).
 
-`VirtualFs` stages filesystem changes for review and supplies diffs. Session
+`VirtualFs` stages filesystem changes for review (the human review chains) and
+supplies diffs; agent `filesystem` tool writes are written to disk at `execute`
+time, with the overlay as their post-disk audit/diff record. Session
 undo/snapshot support uses Git infrastructure where configured. These are safety
 layers, not a substitute for an OS sandbox or independent backups.
 
