@@ -86,6 +86,12 @@ pub enum WhiteboardKind {
     /// `write-applied` row (`ownership_acquired` payload), whose event id is
     /// the acquiring-event id of the produced record.
     OwnershipEvent,
+    /// ADR-82 §2: the cached per-run environment manifest
+    /// (`EnvironmentManifest` JSON payload, all-`#[serde(default)]` fields),
+    /// appended once per run by the manifest collector and restored on
+    /// resume instead of re-probing. Additive kebab-case kind per the ADR-65
+    /// §1 precedent: readers that do not know it treat the row as opaque.
+    EnvironmentObserved,
 }
 
 impl WhiteboardKind {
@@ -113,6 +119,7 @@ impl WhiteboardKind {
             Self::WorkspaceSnapshot => "workspace-snapshot",
             Self::DesignDoc => "design-doc",
             Self::OwnershipEvent => "ownership-event",
+            Self::EnvironmentObserved => "environment-observed",
         }
     }
 
@@ -1173,6 +1180,7 @@ mod tests {
             (WhiteboardKind::ToolExecuted, "tool-executed"),
             (WhiteboardKind::WorkspaceSnapshot, "workspace-snapshot"),
             (WhiteboardKind::DesignDoc, "design-doc"),
+            (WhiteboardKind::EnvironmentObserved, "environment-observed"),
         ];
         for (kind, expected) in cases {
             assert_eq!(kind.as_str(), expected, "as_str kebab-case");

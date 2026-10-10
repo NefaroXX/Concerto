@@ -283,6 +283,9 @@ pub(crate) struct ConsultExecutionInputs {
     pub working_memory: concerto_core::memory::WorkingMemorySnapshot,
     pub retrieved_chunks: Vec<concerto_core::memory::MemoryChunk>,
     pub snapshot_digest: Option<String>,
+    /// ADR-82 §2: the cached manifest summary, beside the snapshot digest.
+    /// Pure render — no probes run to produce it.
+    pub environment_manifest_digest: Option<String>,
     pub run_id: Option<String>,
     pub workspace_generation: Option<String>,
     pub cancel: CancellationToken,
@@ -318,6 +321,7 @@ pub(crate) async fn run_consult_execution(
         working_memory,
         retrieved_chunks,
         snapshot_digest,
+        environment_manifest_digest,
         run_id,
         workspace_generation,
         cancel,
@@ -378,6 +382,7 @@ pub(crate) async fn run_consult_execution(
         expected_artifacts: Vec::new(),
         workspace_capsule: None,
         workspace_snapshot_digest: snapshot_digest,
+        environment_manifest_digest,
         run_id,
         workspace_generation,
     };

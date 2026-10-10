@@ -9,6 +9,7 @@
 
 pub mod authorization;
 pub mod checkpoint;
+pub mod environment_manifest;
 pub mod error;
 pub mod event;
 pub mod executor;
@@ -103,6 +104,15 @@ pub use checkpoint::{
     CHECKPOINT_LIMITATION_MAX_BYTES, CHECKPOINT_METADATA_MAX_ENTRIES,
     CHECKPOINT_METADATA_MAX_KEY_BYTES, CHECKPOINT_METADATA_MAX_VALUE_BYTES,
     CHECKPOINT_PATH_MAX_BYTES, CHECKPOINT_RECORD_SCHEMA_VERSION, PARTIAL_SCOPE_LIMITATION,
+};
+
+/// Descriptive per-run environment declaration (ADR-82 §2, slice 6): the
+/// cached manifest vocabulary. Descriptive only — never an authorization
+/// token, never read by the policy engine, convertible into no policy type.
+pub use environment_manifest::{
+    EnvironmentManifest, ExecutableObservation, FreshnessStamp, ManifestExecutionBackend,
+    ManifestToolEntry, PersistenceClass, PolicyScopeDescription, RestoreCapabilities,
+    ENVIRONMENT_MANIFEST_DIGEST_MAX_TOOLS, ENVIRONMENT_MANIFEST_SCHEMA_VERSION,
 };
 
 /// Typed tool-failure envelope (ADR-82 §1, slice 2): the bounded failure

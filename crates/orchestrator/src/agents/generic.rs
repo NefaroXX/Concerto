@@ -2129,6 +2129,7 @@ mod tests {
             expected_artifacts: Vec::new(),
             workspace_capsule: None,
             workspace_snapshot_digest: None,
+            environment_manifest_digest: None,
             run_id: None,
             workspace_generation: None,
         }
@@ -2309,6 +2310,55 @@ mod tests {
         let prompt = agent.build_prompt(&task, &ctx()).await;
         assert!(!prompt.contains("## Environment"), "unexpected identity card: {prompt}");
         assert!(prompt.contains("Implement the feature"));
+    }
+
+    #[tokio::test]
+    async fn build_prompt_injects_environment_manifest_beside_the_snapshot_digest() {
+        let agent = GenericSpecialistAgent::new(
+            AgentId::new("coder"),
+            "Coder".into(),
+            Some(AgentStage::new("implement")),
+            Arc::new(MockProvider::default()),
+            None,
+            EventBus::new(1024),
+            RetryPolicy::default(),
+            PromptSections { system_instructions: "You write code.".into(), ..Default::default() },
+            AgentCapabilities::default(),
+        );
+
+        let task = SubTask {
+            id: TaskId::new(),
+            parent_id: None,
+            session_id: concerto_core::ids::Ulid::new(),
+            role: AgentId::new("coder"),
+            description: "Implement the feature".into(),
+            status: concerto_core::types::SubTaskStatus::Pending,
+            dependencies: Vec::new(),
+            deliverable: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        };
+        // No digests: neither block renders.
+        let bare = agent.build_prompt(&task, &ctx()).await;
+        assert!(!bare.contains("<workspace_snapshot>"), "unexpected snapshot block: {bare}");
+        assert!(!bare.contains("<environment_manifest>"), "unexpected manifest block: {bare}");
+
+        // Both digests: the manifest block renders beside (after) the snapshot
+        // block, before handoffs.
+        let mut grounded = ctx();
+        grounded.workspace_snapshot_digest = Some("workspace-snapshot generation=g1".to_string());
+        grounded.environment_manifest_digest =
+            Some("environment-manifest schema=1 revision=0".to_string());
+        let prompt = agent.build_prompt(&task, &grounded).await;
+        assert!(prompt.contains("<workspace_snapshot>"), "snapshot block missing: {prompt}");
+        assert!(prompt.contains("<environment_manifest>"), "manifest block missing: {prompt}");
+        assert!(
+            prompt.contains("environment-manifest schema=1 revision=0"),
+            "manifest summary missing: {prompt}"
+        );
+        let snapshot = prompt.find("<workspace_snapshot>").unwrap();
+        let manifest = prompt.find("<environment_manifest>").unwrap();
+        assert!(snapshot < manifest, "manifest block must follow the snapshot block: {prompt}");
     }
 
     // ------------------------------------------------------------------
