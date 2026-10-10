@@ -18,7 +18,7 @@ use concerto_core::traits::provider::LlmProvider;
 use concerto_core::types::{
     AgentOutput, AgentRunExit, AgentTask, CapabilitySet, CompletionRequest, CompletionUsage,
     Message, PolicyAction, ProviderMetrics, Role, SessionContext, TaskExecutionMode, ToolCall,
-    ToolExecutionSummary, VerificationSummary,
+    ToolExecutionSummary, VerificationOutcome, VerificationSummary,
 };
 use concerto_core::{CancellationToken, OrchestratorError, TaskId};
 use concerto_eval::EvalEngine;
@@ -1054,10 +1054,12 @@ impl AgentLoop {
 
         // Phase 8: Run evaluation
         self.state = AgentState::Evaluating;
-        let eval_result = self.run_evaluation(&files_modified, cancel.clone()).await;
+        let (eval_result, eval_verification) =
+            self.run_evaluation(&files_modified, cancel.clone()).await;
 
         // Lightweight verification for file changes
         verification = verify_file_changes(&files_modified, &self.project_root).await;
+        verification.extend(eval_verification);
 
         // Phase 9: Build agent output
         let output = self.build_agent_output(
@@ -1629,13 +1631,35 @@ impl AgentLoop {
     /// manifest-bearing ancestor of the modified files under the project
     /// root — so a project built in a subdirectory validates there, with the
     /// session root as the fallback when nothing better exists.
+    ///
+    /// ADR-82 §3: the harness error is mapped into typed verification records
+    /// instead of collapsing to an absent value. `Cancelled` maps to a
+    /// `Cancelled` record and every other [`concerto_eval::EvalError`] to an
+    /// `Error` record carrying the error text; a finished harness run (pass or
+    /// fail) maps to a `Passed`/`Failed` record whose `detail` carries the full
+    /// [`concerto_core::types::EvalResult`] (including Harness|Fallback
+    /// provenance). `AgentOutput.eval_result` semantics are UNCHANGED: `Some`
+    /// only for an actually-finished harness run, so the existing
+    /// `eval_result.is_none()` check and the completion downgrade behave
+    /// identically — no run-outcome change.
     async fn run_evaluation(
         &self,
         files_modified: &[Utf8PathBuf],
         cancel: CancellationToken,
-    ) -> Option<concerto_core::types::EvalResult> {
+    ) -> (Option<concerto_core::types::EvalResult>, Vec<VerificationSummary>) {
         let eval_dir = EvalEngine::resolve_manifest_root(&self.project_root, files_modified);
-        self.eval.run_scoped_in_dir(&eval_dir, files_modified, cancel).await.ok()
+        let eval_path = Utf8PathBuf::from_path_buf(eval_dir.clone())
+            .unwrap_or_else(|_| Utf8PathBuf::from("eval"));
+        match self.eval.run_scoped_in_dir(&eval_dir, files_modified, cancel).await {
+            Ok(result) => {
+                let record = eval_result_record(&eval_path, &result);
+                (Some(result), vec![record])
+            }
+            Err(concerto_eval::EvalError::Cancelled) => {
+                (None, vec![eval_error_record(&eval_path, &concerto_eval::EvalError::Cancelled)])
+            }
+            Err(error) => (None, vec![eval_error_record(&eval_path, &error)]),
+        }
     }
 
     /// Phase 9: Build an `AgentOutput` summarising the current progress
@@ -3114,9 +3138,113 @@ impl AgentLoop {
 // Lightweight file-level verification helpers
 // ---------------------------------------------------------------------------
 
+/// Verifier identity stamped on every sweep record (ADR-82 §3 R2 verifier axis).
+const VERIFY_SWEEP_VERIFIER: &str = "concerto-verify-sweep";
+
+/// Verifier identity stamped on every eval-harness record (ADR-82 §3 R2 verifier axis).
+const EVAL_HARNESS_VERIFIER: &str = "concerto-eval-harness";
+
+/// Build one sweep record with the freshness basis available in this context.
+///
+/// Scope and the blake3 content fingerprint come from the checked file (the
+/// fingerprint is best-effort: empty when the bytes are unreadable);
+/// `checked_at` is stamped by the constructor. `generation` stays empty and
+/// `evidence_ids` stay empty **with reason**: the sweep runs outside the
+/// workspace-snapshot and whiteboard contexts, so it can cite neither a
+/// generation nor event ids — its records are display-grade until slice 4
+/// wires those axes (see [`VerificationSummary::is_passing_evidence`]).
+/// `duration_ms`/`exit_code` are set only when the check measured/spawned them.
+async fn sweep_record(
+    project_root: &std::path::Path,
+    path: &Utf8PathBuf,
+    command: &str,
+    outcome: VerificationOutcome,
+    output: String,
+    duration_ms: Option<u64>,
+    exit_code: Option<i32>,
+) -> VerificationSummary {
+    let full = if path.is_absolute() {
+        std::path::PathBuf::from(path.as_str())
+    } else {
+        project_root.join(path.as_std_path())
+    };
+    let content_fingerprint = match tokio::fs::read(&full).await {
+        Ok(bytes) => blake3::hash(&bytes).to_hex().to_string(),
+        Err(_) => String::new(),
+    };
+    let mut record = VerificationSummary::new(path.clone(), command, outcome, output)
+        .with_verifier(VERIFY_SWEEP_VERIFIER)
+        .with_scope(path.as_str())
+        .with_content_fingerprint(content_fingerprint);
+    if let Some(duration_ms) = duration_ms {
+        record = record.with_duration_ms(duration_ms);
+    }
+    if let Some(exit_code) = exit_code {
+        record = record.with_exit_code(exit_code);
+    }
+    record
+}
+
+/// Elapsed milliseconds since `start`, saturating instead of wrapping.
+fn elapsed_ms(start: std::time::Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Map a finished harness run (pass or fail) into its typed verification
+/// record. The `detail` carries the full [`concerto_core::types::EvalResult`]
+/// including Harness|Fallback provenance.
+fn eval_result_record(
+    eval_path: &Utf8PathBuf,
+    result: &concerto_core::types::EvalResult,
+) -> VerificationSummary {
+    let outcome =
+        if result.passed { VerificationOutcome::Passed } else { VerificationOutcome::Failed };
+    let summary = format!(
+        "eval {} {} in {}ms (exit {})",
+        result.runner,
+        if result.passed { "passed" } else { "failed" },
+        result.duration_ms,
+        result.exit_code,
+    );
+    VerificationSummary::new(eval_path.clone(), "eval", outcome, summary)
+        .with_verifier(EVAL_HARNESS_VERIFIER)
+        .with_scope(eval_path.as_str())
+        .with_duration_ms(result.duration_ms)
+        .with_exit_code(result.exit_code)
+        .with_detail(result.clone())
+}
+
+/// Map a harness error into its typed verification record — the total
+/// [`concerto_eval::EvalError`] mapping that replaces the old `.ok()`
+/// collapse: `Cancelled` maps to `Cancelled`, every other variant to `Error`
+/// carrying the error text. The wildcard arm keeps the mapping total over the
+/// `#[non_exhaustive]` error enum (unknown future variants degrade to `Error`,
+/// never to an absent value).
+fn eval_error_record(
+    eval_path: &Utf8PathBuf,
+    error: &concerto_eval::EvalError,
+) -> VerificationSummary {
+    match error {
+        concerto_eval::EvalError::Cancelled => {
+            VerificationSummary::cancelled(eval_path.clone(), "eval", "eval cancelled")
+        }
+        other => {
+            VerificationSummary::error(eval_path.clone(), "eval", format!("eval error: {other}"))
+        }
+    }
+    .with_verifier(EVAL_HARNESS_VERIFIER)
+    .with_scope(eval_path.as_str())
+}
+
 /// Run after each tool call iteration: perform extension-based verification
 /// (py_compile, cargo check, npm test, HTML/CSS reference checks) on each
 /// modified file and return structured results.
+///
+/// ADR-82 §3: every gap records an honest outcome with the same spawned
+/// commands and the same pass/fail detection as before — only the record
+/// vocabulary changes. A missing npm `test` script records `Skipped` (never
+/// `passed: true`); a missing `Cargo.toml`/`package.json` records
+/// `Unavailable` instead of no record; spawn errors record `Error`.
 async fn verify_file_changes(
     files: &[camino::Utf8PathBuf],
     project_root: &std::path::Path,
@@ -3126,6 +3254,7 @@ async fn verify_file_changes(
         let ext = path.extension().unwrap_or_default();
         match ext {
             "py" => {
+                let start = std::time::Instant::now();
                 let output = tokio::process::Command::new("python")
                     .args(["-m", "py_compile", path.as_str()])
                     .current_dir(project_root)
@@ -3133,35 +3262,54 @@ async fn verify_file_changes(
                     .await;
                 match output {
                     Ok(out) if out.status.success() => {
-                        results.push(VerificationSummary {
-                            path: path.clone(),
-                            command: "py_compile".into(),
-                            passed: true,
-                            output: "py_compile passed".into(),
-                        });
+                        results.push(
+                            sweep_record(
+                                project_root,
+                                path,
+                                "py_compile",
+                                VerificationOutcome::Passed,
+                                "py_compile passed".into(),
+                                Some(elapsed_ms(start)),
+                                out.status.code(),
+                            )
+                            .await,
+                        );
                     }
                     Ok(out) => {
                         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                        results.push(VerificationSummary {
-                            path: path.clone(),
-                            command: "py_compile".into(),
-                            passed: false,
-                            output: stderr,
-                        });
+                        results.push(
+                            sweep_record(
+                                project_root,
+                                path,
+                                "py_compile",
+                                VerificationOutcome::Failed,
+                                stderr,
+                                Some(elapsed_ms(start)),
+                                out.status.code(),
+                            )
+                            .await,
+                        );
                     }
                     Err(e) => {
-                        results.push(VerificationSummary {
-                            path: path.clone(),
-                            command: "py_compile".into(),
-                            passed: false,
-                            output: format!("py_compile error: {e}"),
-                        });
+                        results.push(
+                            sweep_record(
+                                project_root,
+                                path,
+                                "py_compile",
+                                VerificationOutcome::Error,
+                                format!("py_compile error: {e}"),
+                                Some(elapsed_ms(start)),
+                                None,
+                            )
+                            .await,
+                        );
                     }
                 }
             }
             "rs" => {
                 let cargo_toml = project_root.join("Cargo.toml");
                 if cargo_toml.exists() {
+                    let start = std::time::Instant::now();
                     let output = tokio::process::Command::new("cargo")
                         .args(["check"])
                         .current_dir(project_root)
@@ -3169,31 +3317,63 @@ async fn verify_file_changes(
                         .await;
                     match output {
                         Ok(out) if out.status.success() => {
-                            results.push(VerificationSummary {
-                                path: path.clone(),
-                                command: "cargo check".into(),
-                                passed: true,
-                                output: "cargo check passed".into(),
-                            });
+                            results.push(
+                                sweep_record(
+                                    project_root,
+                                    path,
+                                    "cargo check",
+                                    VerificationOutcome::Passed,
+                                    "cargo check passed".into(),
+                                    Some(elapsed_ms(start)),
+                                    out.status.code(),
+                                )
+                                .await,
+                            );
                         }
                         Ok(out) => {
                             let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                            results.push(VerificationSummary {
-                                path: path.clone(),
-                                command: "cargo check".into(),
-                                passed: false,
-                                output: stderr,
-                            });
+                            results.push(
+                                sweep_record(
+                                    project_root,
+                                    path,
+                                    "cargo check",
+                                    VerificationOutcome::Failed,
+                                    stderr,
+                                    Some(elapsed_ms(start)),
+                                    out.status.code(),
+                                )
+                                .await,
+                            );
                         }
                         Err(e) => {
-                            results.push(VerificationSummary {
-                                path: path.clone(),
-                                command: "cargo check".into(),
-                                passed: false,
-                                output: format!("cargo check error: {e}"),
-                            });
+                            results.push(
+                                sweep_record(
+                                    project_root,
+                                    path,
+                                    "cargo check",
+                                    VerificationOutcome::Error,
+                                    format!("cargo check error: {e}"),
+                                    Some(elapsed_ms(start)),
+                                    None,
+                                )
+                                .await,
+                            );
                         }
                     }
+                } else {
+                    results.push(
+                        sweep_record(
+                            project_root,
+                            path,
+                            "cargo check",
+                            VerificationOutcome::Unavailable,
+                            "unavailable: no Cargo.toml under project root; cargo check not run"
+                                .into(),
+                            None,
+                            None,
+                        )
+                        .await,
+                    );
                 }
             }
             "js" | "ts" | "jsx" | "tsx" => {
@@ -3202,6 +3382,7 @@ async fn verify_file_changes(
                     let content =
                         tokio::fs::read_to_string(&package_json).await.unwrap_or_default();
                     if content.contains("\"test\"") {
+                        let start = std::time::Instant::now();
                         let output = tokio::process::Command::new("npm")
                             .args(["test"])
                             .current_dir(project_root)
@@ -3209,39 +3390,77 @@ async fn verify_file_changes(
                             .await;
                         match output {
                             Ok(out) if out.status.success() => {
-                                results.push(VerificationSummary {
-                                    path: path.clone(),
-                                    command: "npm test".into(),
-                                    passed: true,
-                                    output: "npm test passed".into(),
-                                });
+                                results.push(
+                                    sweep_record(
+                                        project_root,
+                                        path,
+                                        "npm test",
+                                        VerificationOutcome::Passed,
+                                        "npm test passed".into(),
+                                        Some(elapsed_ms(start)),
+                                        out.status.code(),
+                                    )
+                                    .await,
+                                );
                             }
                             Ok(out) => {
                                 let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                                results.push(VerificationSummary {
-                                    path: path.clone(),
-                                    command: "npm test".into(),
-                                    passed: false,
-                                    output: stderr,
-                                });
+                                results.push(
+                                    sweep_record(
+                                        project_root,
+                                        path,
+                                        "npm test",
+                                        VerificationOutcome::Failed,
+                                        stderr,
+                                        Some(elapsed_ms(start)),
+                                        out.status.code(),
+                                    )
+                                    .await,
+                                );
                             }
                             Err(e) => {
-                                results.push(VerificationSummary {
-                                    path: path.clone(),
-                                    command: "npm test".into(),
-                                    passed: false,
-                                    output: format!("npm test error: {e}"),
-                                });
+                                results.push(
+                                    sweep_record(
+                                        project_root,
+                                        path,
+                                        "npm test",
+                                        VerificationOutcome::Error,
+                                        format!("npm test error: {e}"),
+                                        Some(elapsed_ms(start)),
+                                        None,
+                                    )
+                                    .await,
+                                );
                             }
                         }
                     } else {
-                        results.push(VerificationSummary {
-                            path: path.clone(),
-                            command: "npm test".into(),
-                            passed: true,
-                            output: "skipped (no test script in package.json)".into(),
-                        });
+                        results.push(
+                            sweep_record(
+                                project_root,
+                                path,
+                                "npm test",
+                                VerificationOutcome::Skipped,
+                                "skipped (no test script in package.json)".into(),
+                                None,
+                                None,
+                            )
+                            .await,
+                        );
                     }
+                } else {
+                    results.push(
+                        sweep_record(
+                            project_root,
+                            path,
+                            "npm test",
+                            VerificationOutcome::Unavailable,
+                            "unavailable: no package.json under project root; npm test not run"
+                                .into(),
+                            None,
+                            None,
+                        )
+                        .await,
+                    );
                 }
             }
             "html" | "css" => {
@@ -3275,19 +3494,31 @@ async fn verify_file_changes(
                     }
                 }
                 if missing.is_empty() {
-                    results.push(VerificationSummary {
-                        path: path.clone(),
-                        command: "reference check".into(),
-                        passed: true,
-                        output: "all referenced local files exist".into(),
-                    });
+                    results.push(
+                        sweep_record(
+                            project_root,
+                            path,
+                            "reference check",
+                            VerificationOutcome::Passed,
+                            "all referenced local files exist".into(),
+                            None,
+                            None,
+                        )
+                        .await,
+                    );
                 } else {
-                    results.push(VerificationSummary {
-                        path: path.clone(),
-                        command: "reference check".into(),
-                        passed: false,
-                        output: format!("missing referenced files: {missing:?}"),
-                    });
+                    results.push(
+                        sweep_record(
+                            project_root,
+                            path,
+                            "reference check",
+                            VerificationOutcome::Failed,
+                            format!("missing referenced files: {missing:?}"),
+                            None,
+                            None,
+                        )
+                        .await,
+                    );
                 }
             }
             _ => {}
@@ -5938,6 +6169,154 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // ADR-82 slice 3: honest verification outcomes (no run-outcome change)
+    // -----------------------------------------------------------------------
+
+    /// Intended behavior fix: a `package.json` without a `test` script records
+    /// `Skipped` with `passed: false` — never `passed: true`.
+    #[tokio::test]
+    async fn sweep_npm_without_test_script_records_skipped_not_passed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("package.json"), "{\"name\": \"demo\"}\n")
+            .expect("package.json");
+        let files = vec![Utf8PathBuf::from("app.js")];
+        let records = verify_file_changes(&files, dir.path()).await;
+        assert_eq!(records.len(), 1, "the gap must record, not vanish: {records:?}");
+        let record = &records[0];
+        assert_eq!(record.command, "npm test");
+        assert_eq!(record.outcome, Some(VerificationOutcome::Skipped), "no test script is a skip");
+        assert!(!record.passed, "a skip is never a pass");
+        assert_eq!(record.verifier, VERIFY_SWEEP_VERIFIER);
+        assert!(record.checked_at.is_some(), "every new record stamps checked_at");
+        assert_eq!(record.effective_outcome(), VerificationOutcome::Skipped);
+    }
+
+    /// Intended behavior fix: a `.rs` file without a `Cargo.toml` records
+    /// `Unavailable` instead of no record at all.
+    #[tokio::test]
+    async fn sweep_rs_without_cargo_toml_records_unavailable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").expect("main.rs");
+        let files = vec![Utf8PathBuf::from("main.rs")];
+        let records = verify_file_changes(&files, dir.path()).await;
+        assert_eq!(records.len(), 1, "the gap must record, not vanish: {records:?}");
+        let record = &records[0];
+        assert_eq!(record.command, "cargo check");
+        assert_eq!(
+            record.outcome,
+            Some(VerificationOutcome::Unavailable),
+            "no manifest means the check could not run"
+        );
+        assert!(!record.passed);
+        assert!(!record.content_fingerprint.is_empty(), "the file was readable");
+        assert!(record.checked_at.is_some());
+    }
+
+    /// Intended behavior fix: a `.js` file without a `package.json` records
+    /// `Unavailable` instead of no record at all.
+    #[tokio::test]
+    async fn sweep_js_without_package_json_records_unavailable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let files = vec![Utf8PathBuf::from("app.js")];
+        let records = verify_file_changes(&files, dir.path()).await;
+        assert_eq!(records.len(), 1, "the gap must record, not vanish: {records:?}");
+        let record = &records[0];
+        assert_eq!(record.command, "npm test");
+        assert_eq!(record.outcome, Some(VerificationOutcome::Unavailable));
+        assert!(!record.passed);
+    }
+
+    /// The typed eval-error mapping is total: `Cancelled` maps to `Cancelled`
+    /// and every other harness error maps to `Error` carrying the error text —
+    /// never to an absent value.
+    #[test]
+    fn eval_error_mapping_is_total_and_typed() {
+        use concerto_eval::EvalError;
+        let path = Utf8PathBuf::from("eval-root");
+
+        let cancelled = eval_error_record(&path, &EvalError::Cancelled);
+        assert_eq!(cancelled.outcome, Some(VerificationOutcome::Cancelled));
+        assert!(!cancelled.passed);
+        assert_eq!(cancelled.command, "eval");
+        assert!(cancelled.checked_at.is_some());
+
+        let cases = [
+            EvalError::Timeout(Duration::from_secs(1)),
+            EvalError::HarnessSetupFailed("cannot run tests: no config file found".into()),
+            EvalError::TestRunnerFailed("framework crashed".into()),
+            EvalError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "gone")),
+        ];
+        for error in &cases {
+            let record = eval_error_record(&path, error);
+            assert_eq!(record.outcome, Some(VerificationOutcome::Error), "{error}");
+            assert!(!record.passed, "an errored check never passes: {error}");
+            assert!(
+                record.output.contains("eval error:"),
+                "the error text travels with the record: {}",
+                record.output
+            );
+        }
+    }
+
+    /// A finished harness run maps to `Passed`/`Failed` with the full
+    /// `EvalResult` (including Harness|Fallback provenance) in `detail`.
+    #[test]
+    fn eval_result_mapping_carries_detail_and_provenance() {
+        use concerto_core::types::{EvalProvenance, EvalResult, TestRunner};
+        let path = Utf8PathBuf::from("eval-root");
+        let result = EvalResult {
+            runner: TestRunner::Cargo,
+            exit_code: 0,
+            passed: true,
+            duration_ms: 12,
+            output_tail: "ok".into(),
+            coverage: None,
+            provenance: EvalProvenance::Fallback,
+        };
+        let record = eval_result_record(&path, &result);
+        assert_eq!(record.outcome, Some(VerificationOutcome::Passed));
+        assert!(record.passed);
+        assert_eq!(record.detail, Some(result));
+        assert_eq!(
+            record.detail.as_ref().map(|detail| detail.provenance),
+            Some(EvalProvenance::Fallback),
+            "Harness|Fallback provenance survives in detail"
+        );
+
+        let failed = concerto_core::types::EvalResult {
+            passed: false,
+            exit_code: 1,
+            ..record.detail.clone().expect("detail was just set")
+        };
+        let failed_record = eval_result_record(&path, &failed);
+        assert_eq!(failed_record.outcome, Some(VerificationOutcome::Failed));
+        assert!(!failed_record.passed);
+    }
+
+    /// End-to-end through `run_evaluation`: a harness setup failure (no
+    /// manifest, no Cargo project reachable) yields `None` for `eval_result`
+    /// — identical to the old `.ok()` collapse, so `decide_exit` and the
+    /// completion downgrade behave exactly as before — while the verification
+    /// vec carries the typed `Error` record instead of silence.
+    #[tokio::test]
+    async fn run_evaluation_maps_harness_failure_to_error_record_with_none_result() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let project_dir = dir.path().to_str().expect("tempdir is utf-8").to_string();
+        let loop_ = make_loop_with_dir(provider, approval, 4, &project_dir);
+        let (eval_result, records) = loop_.run_evaluation(&[], CancellationToken::new()).await;
+        assert!(
+            eval_result.is_none(),
+            "no harness run means no eval payload — exactly the old `.ok()` value"
+        );
+        assert_eq!(records.len(), 1, "the failure maps to one record, never silence");
+        assert_eq!(records[0].outcome, Some(VerificationOutcome::Error));
+        assert!(!records[0].passed);
+        assert!(records[0].checked_at.is_some());
+    }
+
     #[tokio::test]
     async fn retry_produces_agent_thought_not_assistant_message() {
         // Regression: when the provider returns text-only (no tool calls) on
@@ -6339,12 +6718,7 @@ mod tests {
             tool_call_count: 3,
             eval_result: None,
             tool_events: vec![],
-            verification: vec![VerificationSummary {
-                command: "py_compile".into(),
-                path: "hello.py".into(),
-                passed: true,
-                output: "ok".into(),
-            }],
+            verification: vec![VerificationSummary::passed("hello.py", "py_compile", "ok")],
             project_root: None,
             completion_status: concerto_core::types::AgentCompletionStatus::Partial,
             provider_metrics: vec![],
@@ -6484,13 +6858,8 @@ mod tests {
 
     #[test]
     fn merge_run_progress_verification_latest_wins() {
-        let v1 = VerificationSummary {
-            path: "x.rs".into(),
-            command: "cargo test".into(),
-            passed: false,
-            output: "old".into(),
-        };
-        let v2 = VerificationSummary { passed: true, output: "new".into(), ..v1.clone() };
+        let v1 = VerificationSummary::failed("x.rs", "cargo test", "old");
+        let v2 = VerificationSummary::passed("x.rs", "cargo test", "new");
         let mut acc = AgentOutput { verification: vec![v1.clone()], ..agent_output_base() };
         let latest = AgentOutput { verification: vec![v2.clone()], ..agent_output_base() };
         merge_run_progress(&mut acc, &latest);
@@ -6501,18 +6870,8 @@ mod tests {
 
     #[test]
     fn merge_run_progress_preserves_verification_if_no_match() {
-        let v1 = VerificationSummary {
-            path: "a.rs".into(),
-            command: "cargo test".into(),
-            passed: false,
-            output: "".into(),
-        };
-        let v2 = VerificationSummary {
-            path: "b.rs".into(),
-            command: "cargo clippy".into(),
-            passed: true,
-            output: "".into(),
-        };
+        let v1 = VerificationSummary::failed("a.rs", "cargo test", "");
+        let v2 = VerificationSummary::passed("b.rs", "cargo clippy", "");
         let mut acc = AgentOutput { verification: vec![v1.clone()], ..agent_output_base() };
         let latest = AgentOutput { verification: vec![v2.clone()], ..agent_output_base() };
         merge_run_progress(&mut acc, &latest);
@@ -6547,18 +6906,8 @@ mod tests {
             files_modified: vec![Utf8PathBuf::from("a.rs")],
             tool_call_count: 3,
             verification: vec![
-                VerificationSummary {
-                    path: "a.rs".into(),
-                    command: "cargo test".into(),
-                    passed: true,
-                    output: String::new(),
-                },
-                VerificationSummary {
-                    path: "b.rs".into(),
-                    command: "cargo clippy".into(),
-                    passed: false,
-                    output: String::new(),
-                },
+                VerificationSummary::passed("a.rs", "cargo test", ""),
+                VerificationSummary::failed("b.rs", "cargo clippy", ""),
             ],
             final_message: "done".into(),
             ..agent_output_base()

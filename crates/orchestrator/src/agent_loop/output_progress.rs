@@ -8,7 +8,7 @@
 //! No event bus, checkpoint, policy, session store, or async I/O appears in
 //! any body — call sites in `agent_loop.rs` pass all context explicitly.
 
-use concerto_core::types::{AgentOutput, ToolExecutionSummary};
+use concerto_core::types::{AgentOutput, ToolExecutionSummary, VerificationOutcome};
 /// Snapshot of progress used to detect non-convergence across continuation
 /// rounds (two identical fingerprints in a row ⇒ no real forward motion).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -22,11 +22,24 @@ pub(super) struct ProgressFingerprint {
 
 impl ProgressFingerprint {
     pub(super) fn from_output(output: &AgentOutput) -> Self {
+        // ADR-82 slice 3: count by effective outcome (display/stall-detection
+        // only — never an evidence decision). Legacy rows resolve through
+        // their stored `passed` flag, so legacy fingerprints are unchanged;
+        // new non-pass outcomes (Skipped/Unavailable/Error/Cancelled) land in
+        // the failed bucket, where their `passed: false` already put them.
         Self {
             files_modified: output.files_modified.len(),
             tool_call_count: output.tool_call_count,
-            passed_verifications: output.verification.iter().filter(|v| v.passed).count(),
-            failed_verifications: output.verification.iter().filter(|v| !v.passed).count(),
+            passed_verifications: output
+                .verification
+                .iter()
+                .filter(|v| v.effective_outcome() == VerificationOutcome::Passed)
+                .count(),
+            failed_verifications: output
+                .verification
+                .iter()
+                .filter(|v| v.effective_outcome() != VerificationOutcome::Passed)
+                .count(),
             final_message_len: output.final_message.len(),
         }
     }
@@ -310,22 +323,14 @@ mod tests {
     fn progress_fingerprint_splits_passed_and_failed_verifications() {
         let mut output = empty_output();
         output.verification = vec![
-            VerificationSummary {
-                path: "a.py".into(),
-                command: "py_compile".into(),
-                passed: true,
-                output: String::new(),
-            },
-            VerificationSummary {
-                path: "b.py".into(),
-                command: "py_compile".into(),
-                passed: false,
-                output: String::new(),
-            },
+            VerificationSummary::passed("a.py", "py_compile", ""),
+            VerificationSummary::failed("b.py", "py_compile", ""),
+            // Non-pass outcomes land in the failed bucket (display/stall only).
+            VerificationSummary::skipped("c.js", "npm test", "no test script"),
         ];
         let fp = ProgressFingerprint::from_output(&output);
         assert_eq!(fp.passed_verifications, 1);
-        assert_eq!(fp.failed_verifications, 1);
+        assert_eq!(fp.failed_verifications, 2);
     }
 
     /// Boundary: an empty stop reason still yields the full instruction —
