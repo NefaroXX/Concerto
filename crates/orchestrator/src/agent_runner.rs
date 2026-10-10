@@ -14,6 +14,7 @@ use concerto_core::{CancellationToken, OrchestratorError};
 use concerto_providers::model::ModelProfile;
 use concerto_sessions::spend::SpendTracker;
 
+use crate::agents::execution_state::display_reason;
 use crate::cost::AgentCostEstimator;
 use crate::registry::AgentRegistry;
 
@@ -335,6 +336,7 @@ impl AgentRunner {
                 );
             }
             AgentOutcome::NeedsRevision { reason } => {
+                let reason = display_reason(&reason);
                 let _ = self.bus.publish_for_session(
                     session_id,
                     correlation_id,

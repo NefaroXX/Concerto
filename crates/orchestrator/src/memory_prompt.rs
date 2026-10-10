@@ -1,7 +1,6 @@
 //! Safe prompt representation for retrieved project memory.
 
 use concerto_core::memory::MemoryChunk;
-use concerto_core::types::AgentRunResult;
 use concerto_core::WorkingMemorySnapshot;
 
 pub(crate) const RETRIEVED_MEMORY_START: &str = "<retrieved_project_memory>";
@@ -12,8 +11,6 @@ pub(crate) const RUN_MEMORY_END: &str = "</orchestration_run_state>";
 const MAX_DECISIONS: usize = 8;
 const MAX_TASKS: usize = 24;
 const MAX_DETAIL_CHARS: usize = 800;
-const MAX_PREVIOUS_RESULTS: usize = 8;
-const MAX_PREVIOUS_RESULT_CHARS: usize = 3_000;
 
 /// Format the role-relevant live run ledger as a bounded trusted block.
 pub(crate) fn format_run_memory(snapshot: &WorkingMemorySnapshot) -> String {
@@ -60,29 +57,6 @@ pub(crate) fn format_run_memory(snapshot: &WorkingMemorySnapshot) -> String {
 
 fn clip(value: &str) -> String {
     clip_to(value, MAX_DETAIL_CHARS)
-}
-
-/// Format handoff results without copying complete cold agent transcripts into
-/// every downstream prompt.
-pub(crate) fn format_previous_results(results: &[AgentRunResult]) -> String {
-    let values = results
-        .iter()
-        .rev()
-        .take(MAX_PREVIOUS_RESULTS)
-        .map(|result| {
-            serde_json::json!({
-                "task_id": result.task_id.to_string(),
-                "role": format!("{:?}", result.role),
-                "outcome": format!("{:?}", result.outcome),
-                "summary": clip_to(&result.summary, MAX_PREVIOUS_RESULT_CHARS),
-                "files_modified": &result.files_modified,
-            })
-        })
-        .collect::<Vec<_>>();
-    format!(
-        "<previous_agent_results>\nBounded handoff results. Use the workspace and run ledger for cold detail.\n{}\n</previous_agent_results>",
-        serde_json::json!({ "results": values })
-    )
 }
 
 fn clip_to(value: &str, max_chars: usize) -> String {
