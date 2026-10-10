@@ -82,7 +82,7 @@ jobs:
       # in the primary key lets an update_baseline run write a fresh entry that
       # later runs pick up through restore-keys.
       - name: Restore criterion baseline
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: target/criterion
           key: criterion-baseline-${{ env.BENCH_BASELINE }}-${{ github.run_id }}
@@ -192,7 +192,7 @@ jobs:
 
       - name: Save criterion baseline
         if: steps.mode.outputs.mode == 'save'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: target/criterion
           key: criterion-baseline-${{ env.BENCH_BASELINE }}-${{ github.run_id }}
