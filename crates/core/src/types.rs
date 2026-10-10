@@ -1323,14 +1323,329 @@ pub struct ToolExecutionSummary {
 }
 
 /// One structured verification result for a written file.
+///
+/// ADR-82 §3 (slice 3): the additive outcome extension. `outcome` is
+/// authoritative over `passed` wherever it is present; legacy records
+/// deserialized without `outcome` (`None`) are display data only and must
+/// never count as passing evidence — see [`Self::effective_outcome`] and
+/// [`Self::is_passing_evidence`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VerificationSummary {
     pub path: Utf8PathBuf,
     /// Short command label, e.g. "py_compile", "cargo check", "npm test".
     pub command: String,
+    /// Legacy pass flag. Constructors always derive this from `outcome`
+    /// (`passed == (outcome == Passed)`); on deserialized records it is the
+    /// raw stored value, which may disagree with `outcome` (see `inconsistent`).
     pub passed: bool,
     /// Captured command output/error for inspectability.
     pub output: String,
+    /// Typed outcome. `None` only for legacy records written before the field
+    /// existed — never for records built through the constructors below.
+    #[serde(default)]
+    pub outcome: Option<VerificationOutcome>,
+    /// Identity of the checker that produced this record
+    /// (e.g. `"concerto-verify-sweep"`, `"eval-harness"`).
+    #[serde(default)]
+    pub verifier: String,
+    /// What was checked (workspace-relative path under check, or the eval root).
+    #[serde(default)]
+    pub scope: String,
+    /// blake3 hex of the checked file's bytes at check time; empty when the
+    /// bytes were unreadable (the record stays display-grade, never evidence).
+    #[serde(default)]
+    pub content_fingerprint: String,
+    /// Workspace generation the check ran against (`""` when the producer
+    /// runs outside the snapshot context — display-grade until wired).
+    #[serde(default)]
+    pub generation: String,
+    /// Explicit check timestamp (ADR-82 R2 freshness basis). `None` on legacy
+    /// records; always `Some` from the constructors.
+    #[serde(default)]
+    pub checked_at: Option<OffsetDateTime>,
+    /// Wall-clock time the check took, when measured.
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    /// Process exit code, when the check spawned a process.
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    /// Whiteboard event ids backing this record (ADR-65 evidence spine).
+    /// Empty when the producer has no whiteboard context (the sweep and the
+    /// eval path run outside it); emptiness degrades the record to
+    /// display-grade per [`Self::is_passing_evidence`].
+    #[serde(default)]
+    pub evidence_ids: Vec<String>,
+    /// Full harness payload on eval-backed records (incl. Harness|Fallback
+    /// provenance); `None` for sweep records and legacy rows.
+    #[serde(default)]
+    pub detail: Option<EvalResult>,
+    /// Record schema version; current version is
+    /// [`VERIFICATION_SCHEMA_VERSION`].
+    #[serde(default = "default_verification_schema_version")]
+    pub schema_version: u16,
+    /// True when both raw values exist and disagree (`outcome` still wins —
+    /// see [`Self::effective_outcome`]). Set by the constructors; preserved
+    /// verbatim on deserialized rows so an auditor sees the mismatch instead
+    /// of a silent normalization.
+    #[serde(default)]
+    pub inconsistent: bool,
+}
+
+/// Current [`VerificationSummary`] record schema version (ADR-82 §3).
+pub const VERIFICATION_SCHEMA_VERSION: u16 = 1;
+
+fn default_verification_schema_version() -> u16 {
+    VERIFICATION_SCHEMA_VERSION
+}
+
+/// Honest outcome vocabulary for a single verification check (ADR-82 §3).
+///
+/// `#[non_exhaustive]` so future outcomes stay additive: match with a
+/// wildcard arm, never exhaustively outside `concerto-core`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum VerificationOutcome {
+    Passed,
+    Failed,
+    Skipped,
+    Unavailable,
+    Error,
+    Cancelled,
+}
+
+impl VerificationOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+            Self::Unavailable => "unavailable",
+            Self::Error => "error",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// True only for [`Self::Passed`] — the single outcome that can ever
+    /// count as passing evidence (subject to the freshness predicate on
+    /// [`VerificationSummary::is_passing_evidence`]).
+    pub fn is_pass(&self) -> bool {
+        matches!(self, Self::Passed)
+    }
+}
+
+impl fmt::Display for VerificationOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl VerificationSummary {
+    /// Single construction path: every constructor routes through here, so a
+    /// constructed record always carries `Some(outcome)`, derives
+    /// `passed == outcome.is_pass()`, stamps `checked_at`, sets the current
+    /// `schema_version`, and records `inconsistent: false` (constructed raw
+    /// values agree by construction).
+    fn construct(
+        path: Utf8PathBuf,
+        command: String,
+        outcome: VerificationOutcome,
+        output: String,
+    ) -> Self {
+        Self {
+            passed: outcome.is_pass(),
+            path,
+            command,
+            output,
+            outcome: Some(outcome),
+            verifier: String::new(),
+            scope: String::new(),
+            content_fingerprint: String::new(),
+            generation: String::new(),
+            checked_at: Some(OffsetDateTime::now_utc()),
+            duration_ms: None,
+            exit_code: None,
+            evidence_ids: Vec::new(),
+            detail: None,
+            schema_version: VERIFICATION_SCHEMA_VERSION,
+            inconsistent: false,
+        }
+    }
+
+    /// General constructor — prefer the per-outcome constructors below at
+    /// call sites so the outcome reads explicitly.
+    pub fn new(
+        path: impl Into<Utf8PathBuf>,
+        command: impl Into<String>,
+        outcome: VerificationOutcome,
+        output: impl Into<String>,
+    ) -> Self {
+        Self::construct(path.into(), command.into(), outcome, output.into())
+    }
+
+    /// A check that ran and passed.
+    pub fn passed(
+        path: impl Into<Utf8PathBuf>,
+        command: impl Into<String>,
+        output: impl Into<String>,
+    ) -> Self {
+        Self::new(path, command, VerificationOutcome::Passed, output)
+    }
+
+    /// A check that ran and failed.
+    pub fn failed(
+        path: impl Into<Utf8PathBuf>,
+        command: impl Into<String>,
+        output: impl Into<String>,
+    ) -> Self {
+        Self::new(path, command, VerificationOutcome::Failed, output)
+    }
+
+    /// A check that was deliberately not run (e.g. no npm `test` script).
+    /// `passed` is `false`: a skip is never a pass.
+    pub fn skipped(
+        path: impl Into<Utf8PathBuf>,
+        command: impl Into<String>,
+        output: impl Into<String>,
+    ) -> Self {
+        Self::new(path, command, VerificationOutcome::Skipped, output)
+    }
+
+    /// A check that could not run for lack of a harness (e.g. `.rs` without
+    /// `Cargo.toml`). Records the gap instead of recording nothing.
+    pub fn unavailable(
+        path: impl Into<Utf8PathBuf>,
+        command: impl Into<String>,
+        output: impl Into<String>,
+    ) -> Self {
+        Self::new(path, command, VerificationOutcome::Unavailable, output)
+    }
+
+    /// A check that errored (spawn failure, harness setup failure, timeout).
+    pub fn error(
+        path: impl Into<Utf8PathBuf>,
+        command: impl Into<String>,
+        output: impl Into<String>,
+    ) -> Self {
+        Self::new(path, command, VerificationOutcome::Error, output)
+    }
+
+    /// A check cancelled before it could report.
+    pub fn cancelled(
+        path: impl Into<Utf8PathBuf>,
+        command: impl Into<String>,
+        output: impl Into<String>,
+    ) -> Self {
+        Self::new(path, command, VerificationOutcome::Cancelled, output)
+    }
+
+    /// Set the verifier identity (R2 freshness basis).
+    pub fn with_verifier(mut self, verifier: impl Into<String>) -> Self {
+        self.verifier = verifier.into();
+        self
+    }
+
+    /// Set the checked scope (R2 freshness basis).
+    pub fn with_scope(mut self, scope: impl Into<String>) -> Self {
+        self.scope = scope.into();
+        self
+    }
+
+    /// Set the blake3 content fingerprint of the checked bytes (R2 freshness basis).
+    pub fn with_content_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
+        self.content_fingerprint = fingerprint.into();
+        self
+    }
+
+    /// Set the workspace generation the check ran against (R2 freshness basis).
+    pub fn with_generation(mut self, generation: impl Into<String>) -> Self {
+        self.generation = generation.into();
+        self
+    }
+
+    /// Override the check timestamp (defaults to construction time).
+    pub fn with_checked_at(mut self, checked_at: OffsetDateTime) -> Self {
+        self.checked_at = Some(checked_at);
+        self
+    }
+
+    /// Set the measured check duration.
+    pub fn with_duration_ms(mut self, duration_ms: u64) -> Self {
+        self.duration_ms = Some(duration_ms);
+        self
+    }
+
+    /// Set the spawned process exit code.
+    pub fn with_exit_code(mut self, exit_code: i32) -> Self {
+        self.exit_code = Some(exit_code);
+        self
+    }
+
+    /// Set the backing whiteboard event ids (ADR-65 evidence spine).
+    pub fn with_evidence_ids(mut self, evidence_ids: Vec<String>) -> Self {
+        self.evidence_ids = evidence_ids;
+        self
+    }
+
+    /// Attach the full harness payload (eval-backed records).
+    pub fn with_detail(mut self, detail: EvalResult) -> Self {
+        self.detail = Some(detail);
+        self
+    }
+
+    /// Resolve the outcome for **display only** (transcripts, summaries,
+    /// stall-detection counters).
+    ///
+    /// A present `outcome` wins. A legacy record (`outcome: None`) resolves
+    /// through the stored `passed` flag so old rows keep rendering exactly as
+    /// written. **This resolution must never count as verification evidence**:
+    /// historical rows contain `passed: true` for skipped checks, and no
+    /// reclassification can tell them apart — use
+    /// [`Self::is_passing_evidence`] for any evidence decision.
+    pub fn effective_outcome(&self) -> VerificationOutcome {
+        match self.outcome {
+            Some(outcome) => outcome,
+            None if self.passed => VerificationOutcome::Passed,
+            None => VerificationOutcome::Failed,
+        }
+    }
+
+    /// Display label for [`Self::effective_outcome`] (summary rendering).
+    pub fn outcome_label(&self) -> &'static str {
+        self.effective_outcome().as_str()
+    }
+
+    /// Recompute the mismatch predicate from the raw stored values: true when
+    /// both exist and disagree. Constructors set the stored `inconsistent`
+    /// flag consistently with this; deserialized rows carry whatever was
+    /// recorded, and this method re-derives it either way.
+    pub fn computed_inconsistent(&self) -> bool {
+        match self.outcome {
+            Some(outcome) => self.passed != outcome.is_pass(),
+            None => false,
+        }
+    }
+
+    /// Whether this record may count as fresh passing evidence (ADR-82 §3 R2).
+    ///
+    /// Deliberately strict: requires `outcome == Passed`, agreement of the raw
+    /// values, the current schema version, and the complete freshness basis
+    /// (verifier, scope, generation, content fingerprint, explicit
+    /// `checked_at`, evidence ids). Anything missing or stale degrades the
+    /// record to display-grade. No completion logic consults this yet — slice
+    /// 3 ships the data fields only; the opt-in gate (slice 4) is the
+    /// consumer.
+    pub fn is_passing_evidence(&self) -> bool {
+        self.outcome.is_some_and(|outcome| outcome.is_pass())
+            && !self.computed_inconsistent()
+            && self.schema_version == VERIFICATION_SCHEMA_VERSION
+            && !self.verifier.is_empty()
+            && !self.scope.is_empty()
+            && !self.generation.is_empty()
+            && !self.content_fingerprint.is_empty()
+            && self.checked_at.is_some()
+            && !self.evidence_ids.is_empty()
+    }
 }
 
 /// Explicit outcome of a single agent run attempt (`AgentLoop::run_once`).
@@ -1390,8 +1705,7 @@ impl AgentOutput {
         if !self.verification.is_empty() {
             s.push_str("\nVerification:\n");
             for v in &self.verification {
-                let status = if v.passed { "passed" } else { "failed" };
-                s.push_str(&format!("- {}: {} {}\n", v.path, v.command, status));
+                s.push_str(&format!("- {}: {} {}\n", v.path, v.command, v.outcome_label()));
             }
         }
 
@@ -1410,7 +1724,7 @@ impl AgentOutput {
 }
 
 /// Coverage measurement from a coverage tool run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CoverageInfo {
     /// Tool used to collect coverage.
     pub tool: CoverageTool,
@@ -1445,7 +1759,7 @@ impl fmt::Display for CoverageTool {
 }
 
 /// Result of running a project's test suite after agent completion.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EvalResult {
     pub runner: TestRunner,
     pub exit_code: i32,
@@ -2958,5 +3272,216 @@ mod tests {
         assert_eq!(facts.attempted_path.as_deref(), Some("https://h/a"));
         assert!(facts.has_target(), "the URL is the target");
         assert!(facts.resolved_path.is_none(), "a URL is not workspace-resolved");
+    }
+
+    // ---- ADR-82 §3 verification outcomes ------------------------------------
+
+    /// Every constructor routes through the single construction path: the new
+    /// record always carries `Some(outcome)`, derives
+    /// `passed == (outcome == Passed)`, stamps `checked_at`, sets the current
+    /// schema version, and records no inconsistency.
+    #[test]
+    fn verification_constructors_enforce_the_some_outcome_invariant() {
+        let cases = [
+            (
+                VerificationSummary::passed("a.py", "py_compile", "ok"),
+                VerificationOutcome::Passed,
+                true,
+            ),
+            (
+                VerificationSummary::failed("a.py", "py_compile", "err"),
+                VerificationOutcome::Failed,
+                false,
+            ),
+            (
+                VerificationSummary::skipped("a.js", "npm test", "skip"),
+                VerificationOutcome::Skipped,
+                false,
+            ),
+            (
+                VerificationSummary::unavailable("a.rs", "cargo check", "no manifest"),
+                VerificationOutcome::Unavailable,
+                false,
+            ),
+            (
+                VerificationSummary::error("a.py", "py_compile", "spawn"),
+                VerificationOutcome::Error,
+                false,
+            ),
+            (
+                VerificationSummary::cancelled("a.py", "py_compile", "cancel"),
+                VerificationOutcome::Cancelled,
+                false,
+            ),
+        ];
+        for (record, outcome, passed) in cases {
+            assert_eq!(record.outcome, Some(outcome), "outcome must be Some from constructors");
+            assert_eq!(record.passed, passed, "passed must derive from the outcome");
+            assert!(record.checked_at.is_some(), "constructed records stamp checked_at");
+            assert_eq!(record.schema_version, VERIFICATION_SCHEMA_VERSION);
+            assert!(!record.inconsistent, "constructed raw values agree by construction");
+            assert!(!record.computed_inconsistent());
+            assert_eq!(record.effective_outcome(), outcome, "outcome is authoritative");
+        }
+    }
+
+    /// Legacy rows (no `outcome` key) decode with `None` and resolve through
+    /// the stored `passed` flag for display — but never count as evidence, not
+    /// even a legacy `passed: true` (which historically marked skipped checks).
+    #[test]
+    fn legacy_verification_record_decodes_display_only_never_evidence() {
+        let legacy_passed: VerificationSummary = serde_json::from_str(
+            r#"{"path":"a.js","command":"npm test","passed":true,"output":"skipped (no test script in package.json)"}"#,
+        )
+        .expect("legacy rows without outcome must still decode");
+        assert_eq!(legacy_passed.outcome, None);
+        assert_eq!(legacy_passed.checked_at, None);
+        assert_eq!(legacy_passed.schema_version, VERIFICATION_SCHEMA_VERSION);
+        assert!(legacy_passed.evidence_ids.is_empty());
+        // Display resolution preserves the old rendering ...
+        assert_eq!(legacy_passed.effective_outcome(), VerificationOutcome::Passed);
+        assert_eq!(legacy_passed.outcome_label(), "passed");
+        // ... while evidence status refuses the row: a legacy `passed: true`
+        // on a skipped check must NOT become trusted evidence by deserializing.
+        assert!(!legacy_passed.is_passing_evidence());
+
+        let legacy_failed: VerificationSummary = serde_json::from_str(
+            r#"{"path":"a.py","command":"py_compile","passed":false,"output":"SyntaxError"}"#,
+        )
+        .expect("legacy failed rows must still decode");
+        assert_eq!(legacy_failed.effective_outcome(), VerificationOutcome::Failed);
+        assert_eq!(legacy_failed.outcome_label(), "failed");
+        assert!(!legacy_failed.is_passing_evidence());
+    }
+
+    /// Inconsistent combinations retain both raw values and flag the mismatch
+    /// instead of silently normalizing: `outcome` still wins the resolution.
+    #[test]
+    fn inconsistent_outcome_and_passed_combination_is_flagged_not_normalized() {
+        let raw = serde_json::json!({
+            "path": "a.py",
+            "command": "py_compile",
+            "passed": true,
+            "output": "SyntaxError",
+            "outcome": "failed",
+        });
+        let record: VerificationSummary =
+            serde_json::from_value(raw.clone()).expect("inconsistent rows must decode");
+        assert_eq!(record.outcome, Some(VerificationOutcome::Failed));
+        assert!(record.passed, "the raw legacy boolean is retained verbatim");
+        assert!(record.computed_inconsistent(), "the disagreement must be detectable");
+        assert_eq!(
+            record.effective_outcome(),
+            VerificationOutcome::Failed,
+            "outcome is authoritative over passed"
+        );
+        assert!(!record.is_passing_evidence(), "disagreement can never be evidence");
+        // Both raw values survive a round-trip for auditors.
+        let round_tripped: VerificationSummary =
+            serde_json::from_str(&serde_json::to_string(&record).expect("serialize"))
+                .expect("round-trip");
+        assert_eq!(round_tripped.outcome, Some(VerificationOutcome::Failed));
+        assert!(round_tripped.passed);
+    }
+
+    /// Current-version records round-trip, including the harness `detail`
+    /// payload with its provenance.
+    #[test]
+    fn current_verification_record_round_trips_with_detail() {
+        let detail = EvalResult {
+            runner: TestRunner::Cargo,
+            exit_code: 0,
+            passed: true,
+            duration_ms: 12,
+            output_tail: "ok".into(),
+            coverage: None,
+            provenance: EvalProvenance::Fallback,
+        };
+        let record = VerificationSummary::passed("src/lib.rs", "eval", "eval harness passed")
+            .with_verifier("eval-harness")
+            .with_scope("src/lib.rs")
+            .with_content_fingerprint("abc123")
+            .with_generation("gen-1")
+            .with_duration_ms(12)
+            .with_exit_code(0)
+            .with_evidence_ids(vec!["evt-1".to_string()])
+            .with_detail(detail);
+        let decoded: VerificationSummary =
+            serde_json::from_str(&serde_json::to_string(&record).expect("serialize"))
+                .expect("current rows must round-trip");
+        assert_eq!(decoded, record);
+        assert_eq!(
+            decoded.detail.as_ref().map(|detail| detail.provenance),
+            Some(EvalProvenance::Fallback),
+            "harness|fallback provenance survives the round-trip"
+        );
+    }
+
+    /// `AgentOutput::summary` renders the effective outcome (display only):
+    /// legacy rows keep their old `passed`/`failed` words, new outcomes get
+    /// their own labels. Rendering never feeds a completion decision.
+    #[test]
+    fn agent_output_summary_renders_effective_outcomes() {
+        let output = AgentOutput {
+            task_id: TaskId::new(),
+            session_id: Ulid::new(),
+            final_message: String::new(),
+            files_modified: vec!["a.py".into()],
+            tool_call_count: 0,
+            eval_result: None,
+            tool_events: vec![],
+            verification: vec![
+                VerificationSummary::passed("a.py", "py_compile", "ok"),
+                VerificationSummary::skipped("b.js", "npm test", "no script"),
+                VerificationSummary::unavailable("c.rs", "cargo check", "no manifest"),
+            ],
+            project_root: None,
+            completion_status: AgentCompletionStatus::Completed,
+            provider_metrics: vec![],
+            checkpoint_json: None,
+        };
+        let summary = output.summary();
+        assert!(summary.contains("py_compile passed"), "{summary}");
+        assert!(summary.contains("npm test skipped"), "{summary}");
+        assert!(summary.contains("cargo check unavailable"), "{summary}");
+
+        // Legacy rows render exactly as before (display compatibility).
+        let legacy: VerificationSummary = serde_json::from_str(
+            r#"{"path":"a.js","command":"npm test","passed":true,"output":"skipped"}"#,
+        )
+        .expect("legacy decodes");
+        let legacy_output = AgentOutput { verification: vec![legacy], ..output };
+        assert!(legacy_output.summary().contains("npm test passed"));
+    }
+
+    /// The freshness predicate is one bounded check over the R2 field set: a
+    /// fully-stamped passing record counts, and each missing axis degrades it
+    /// to display-grade.
+    #[test]
+    fn passing_evidence_requires_the_full_freshness_basis() {
+        let fresh = VerificationSummary::passed("a.py", "py_compile", "ok")
+            .with_verifier("concerto-verify-sweep")
+            .with_scope("a.py")
+            .with_content_fingerprint("fp")
+            .with_generation("gen-1")
+            .with_evidence_ids(vec!["evt-1".to_string()]);
+        assert!(fresh.is_passing_evidence(), "the full R2 set counts as evidence");
+
+        // Each missing axis degrades the record.
+        assert!(!VerificationSummary::passed("a.py", "py_compile", "ok").is_passing_evidence());
+        let no_verifier = VerificationSummary { verifier: String::new(), ..fresh.clone() };
+        assert!(!no_verifier.is_passing_evidence());
+        let no_evidence = VerificationSummary { evidence_ids: Vec::new(), ..fresh.clone() };
+        assert!(!no_evidence.is_passing_evidence());
+        let no_checked_at = VerificationSummary { checked_at: None, ..fresh.clone() };
+        assert!(!no_checked_at.is_passing_evidence());
+        // A non-passing outcome is never evidence, however fresh.
+        let fresh_failure = VerificationSummary::failed("a.py", "py_compile", "err")
+            .with_verifier("concerto-verify-sweep")
+            .with_scope("a.py")
+            .with_content_fingerprint("fp")
+            .with_generation("gen-1")
+            .with_evidence_ids(vec!["evt-1".to_string()]);
+        assert!(!fresh_failure.is_passing_evidence());
     }
 }
