@@ -4,7 +4,7 @@
 //! extracted fact — plus the SQL that creates their tables, so the writers and
 //! readers of a shape sit side by side and a field rename is a single edit.
 
-use concerto_core::memory::ProjectId;
+use concerto_core::memory::{Confidence, ConfidenceSource, ProjectId};
 
 /// A single code entity extracted from source code.
 #[derive(Debug, Clone)]
@@ -68,6 +68,25 @@ pub struct FactEntry {
     pub expires_at: Option<i64>,
 }
 
+impl FactEntry {
+    /// Read-site lift of the stored model self-report into [`Confidence`]
+    /// (ADR-82 slice 7).
+    ///
+    /// Additive and trivial by design: the `confidence` column is untouched
+    /// (no storage change). `None` and any broken stored report (NaN,
+    /// infinite, out-of-range) read as [`Confidence::Unknown`] — absence of
+    /// calibration is one state, never a silent `0.0`. A present, valid
+    /// report lifts to `Known` with [`ConfidenceSource::ModelSelfReport`].
+    #[must_use]
+    pub fn confidence_evidence(&self) -> Confidence {
+        match self.confidence {
+            Some(value) => Confidence::known(f64::from(value), ConfidenceSource::ModelSelfReport)
+                .unwrap_or(Confidence::Unknown),
+            None => Confidence::Unknown,
+        }
+    }
+}
+
 /// Category of extracted fact.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
@@ -127,6 +146,38 @@ mod tests {
 
     /// Every `EntityKind` variant keeps its stable `Debug` spelling (the
     /// value the migration `CHECK` constraints and rows are written with).
+    ///
+    /// ADR-82 slice 7: the stored `FactEntry.confidence` lifts to
+    /// `Confidence` at read sites only — `None` and broken reports read as
+    /// `Unknown`, valid reports as `Known` with `ModelSelfReport`.
+    #[test]
+    fn fact_entry_confidence_lift_is_read_only_and_honest() {
+        let base = FactEntry {
+            id: "f".into(),
+            project_id: ProjectId("p".into()),
+            content: "c".into(),
+            category: FactCategory::Architecture,
+            source_file: None,
+            confidence: None,
+            expires_at: None,
+        };
+        assert_eq!(base.confidence_evidence(), Confidence::Unknown);
+        let known = FactEntry { confidence: Some(0.6), ..base.clone() };
+        match known.confidence_evidence() {
+            Confidence::Known { value, source } => {
+                assert!((value - f64::from(0.6_f32)).abs() < 1e-6);
+                assert_eq!(source, ConfidenceSource::ModelSelfReport);
+            }
+            Confidence::Unknown => panic!("0.6 must lift to Known"),
+        }
+        // The stored field is untouched by the lift.
+        assert_eq!(known.confidence, Some(0.6));
+        let broken = FactEntry { confidence: Some(f32::NAN), ..base.clone() };
+        assert_eq!(broken.confidence_evidence(), Confidence::Unknown);
+        let wild = FactEntry { confidence: Some(4.0), ..base };
+        assert_eq!(wild.confidence_evidence(), Confidence::Unknown);
+    }
+
     #[test]
     fn entity_kind_debug_output() {
         assert_eq!(format!("{:?}", EntityKind::Function), "Function");

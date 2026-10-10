@@ -31,6 +31,7 @@ pub mod decision_store;
 pub mod embedder;
 pub mod embedder_health;
 pub mod entities;
+pub mod evidence;
 pub mod fts;
 pub mod global;
 mod ignore_rules;

@@ -14,6 +14,7 @@ use concerto_core::error::MemoryError;
 use concerto_core::memory::{FtsResult, MemoryChunk, MemoryQuery, ProjectId, VectorResult};
 
 use crate::embedder_health::{EmbedderHealth, EMBEDDER_DEGRADED_NOTICE};
+use crate::evidence::{enrich_fused, EvidenceStamps, MemoryEvidence};
 use crate::fts::FullTextStore;
 use crate::recall::{
     allocate_char_budget, truncate_to_chars, RecallCapabilityEnvelope, RecallCostBounds,
@@ -334,6 +335,24 @@ impl HybridRetriever {
         config: &LinkCascadeConfig,
         cancel: CancellationToken,
     ) -> Vec<FusedResult> {
+        self.cascade_fetch_scored(query, embedding, k, start_tier, scorer, config, cancel).await.0
+    }
+
+    /// [`Self::cascade_fetch`] plus the link-score map it reordered on, for
+    /// the [`Self::retrieve_with_cascade_evidence`] enrichment path. The
+    /// reorder behavior is identical; exposing the scores lets the evidence
+    /// composite cite the same corroboration the order used.
+    #[allow(clippy::too_many_arguments)]
+    async fn cascade_fetch_scored(
+        &self,
+        query: &MemoryQuery,
+        embedding: &[f32],
+        k: usize,
+        start_tier: CascadeTier,
+        scorer: &dyn LinkScorer,
+        config: &LinkCascadeConfig,
+        cancel: CancellationToken,
+    ) -> (Vec<FusedResult>, HashMap<String, f64>) {
         let mut tier = start_tier;
         let mut fused = self
             .fetch_fused(query, embedding, k, tier.candidate_multiplier(), cancel.clone())
@@ -348,7 +367,7 @@ impl HybridRetriever {
         let ids: Vec<String> = fused.iter().map(|result| result.chunk_id.clone()).collect();
         let scores = self.score_links(scorer, &ids, config.score_timeout, cancel).await;
         if scores.is_empty() {
-            return fused;
+            return (fused, scores);
         }
 
         let gamma = tier.gamma();
@@ -360,7 +379,55 @@ impl HybridRetriever {
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
         });
-        ranked.into_iter().map(|(_, result)| result).collect()
+        (ranked.into_iter().map(|(_, result)| result).collect(), scores)
+    }
+
+    /// Retrieve like [`Self::retrieve_with_cascade`] and additionally
+    /// assemble one [`MemoryEvidence`] per returned result (ADR-82 slice 7).
+    ///
+    /// The fused results are identical to the cascade path (same fetch,
+    /// same reorder, same recall bounds); the evidence vector is aligned
+    /// 1:1 with them and cites the same link-score map the reorder used.
+    /// `snapshot_generation` stamps the workspace generation the caller
+    /// retrieved against; `observed_at` is stamped at assembly. Scoring
+    /// stays fail-open: a scorer error yields evidence with `0.0`
+    /// corroboration, never a failed query.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn retrieve_with_cascade_evidence(
+        &self,
+        query: &MemoryQuery,
+        embedding: &[f32],
+        top_k: Option<usize>,
+        start_tier: CascadeTier,
+        scorer: &dyn LinkScorer,
+        config: &LinkCascadeConfig,
+        snapshot_generation: u64,
+        cancel: CancellationToken,
+    ) -> (Vec<FusedResult>, Vec<MemoryEvidence>) {
+        let observed_at = time::OffsetDateTime::now_utc();
+        let k = top_k.unwrap_or(query.top_k).max(1);
+
+        if EmbedderHealth::for_project(&query.project_id).is_broken(std::time::Instant::now()) {
+            let degraded = self.bounded_recall(self.degraded_fts_results(query, k, cancel)).await;
+            let degraded = apply_recall_bounds(degraded, &self.bounds);
+            let evidence = enrich_fused(
+                &degraded,
+                &HashMap::new(),
+                EvidenceStamps { snapshot_generation, observed_at },
+            );
+            return (degraded, evidence);
+        }
+
+        let (fused, scores) = self
+            .bounded_recall_with(
+                self.cascade_fetch_scored(query, embedding, k, start_tier, scorer, config, cancel),
+                (Vec::new(), HashMap::new()),
+            )
+            .await;
+        let fused = apply_recall_bounds(fused, &self.bounds);
+        let evidence =
+            enrich_fused(&fused, &scores, EvidenceStamps { snapshot_generation, observed_at });
+        (fused, evidence)
     }
 
     /// One recall pass under the per-recall timeout.
@@ -373,13 +440,25 @@ impl HybridRetriever {
         &self,
         fetch: impl std::future::Future<Output = Vec<FusedResult>>,
     ) -> Vec<FusedResult> {
+        self.bounded_recall_with(fetch, Vec::new()).await
+    }
+
+    /// Generic form of [`Self::bounded_recall`] for passes whose output is
+    /// not a bare result vector (the evidence path carries its score map
+    /// alongside). Timeout semantics are identical: skip with a structured
+    /// warning, count the skip, yield the caller-supplied fallback.
+    async fn bounded_recall_with<T>(
+        &self,
+        fetch: impl std::future::Future<Output = T>,
+        fallback: T,
+    ) -> T {
         match tokio::time::timeout(self.bounds.timeout, fetch).await {
             Ok(results) => results,
             Err(_elapsed) => {
                 self.recalls_skipped.fetch_add(1, Ordering::Relaxed);
                 let failure = RecallFailure::timed_out(self.bounds.timeout);
                 tracing::warn!(code = %failure.code, timeout_ms = self.bounds.timeout.as_millis(), "{failure}");
-                Vec::new()
+                fallback
             }
         }
     }

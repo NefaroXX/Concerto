@@ -79,9 +79,10 @@ pub use authorization::{
 
 // Re-export Phase 4 memory types from the dedicated module.
 pub use memory::{
-    ChunkType, Decision, DecisionCategory, DecisionId, EmbeddingRecord, FtsResult, MemoryChunk,
-    MemoryEntry, MemoryFilter, MemoryId, MemoryLink, MemoryLinkKind, MemoryNamespace, MemoryQuery,
-    TaskNode, TaskNodeId, TaskStatus, VectorResult, WorkingMemorySnapshot,
+    ChunkType, Confidence, ConfidenceSource, Decision, DecisionCategory, DecisionId,
+    EmbeddingRecord, EvidenceScore, FactStatusView, FtsResult, MemoryChunk, MemoryEntry,
+    MemoryFilter, MemoryId, MemoryLink, MemoryLinkKind, MemoryNamespace, MemoryQuery, Relevance,
+    TaskNode, TaskNodeId, TaskStatus, VectorResult, WorkingMemorySnapshot, EVIDENCE_SCORE_MAX,
 };
 
 // Re-export traits needed by other crates
