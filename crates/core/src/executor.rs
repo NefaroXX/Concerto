@@ -1140,6 +1140,10 @@ impl ToolExecutor {
         session: &SessionContext,
         cancel: CancellationToken,
     ) {
+        // ADR-82 slice 1: the served row carries the same canonical accounting
+        // identity as an executed read, resolved from the executor's own
+        // registry (unknown tools keep None, as on every other row).
+        let canonical = self.canonical_effect(tool_name, input);
         let entry = AuditEntry {
             tool_name: tool_name.to_owned(),
             verdict: "ServedFromCache".to_owned(),
@@ -1170,8 +1174,8 @@ impl ToolExecutor {
             // cached payload directly, so there is no result to summarise
             // here without threading the payload through the API.
             result_facts: None,
-            canonical_tool: None,
-            canonical_operation: None,
+            canonical_tool: canonical.as_ref().map(|effect| effect.policy_name.clone()),
+            canonical_operation: canonical.as_ref().and_then(|effect| effect.operation.clone()),
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "served-read audit write failed");
@@ -1926,6 +1930,88 @@ mod tests {
         // Both rows share correlation_id and input_hash.
         assert_eq!(entries[0].correlation_id, entries[1].correlation_id);
         assert_eq!(entries[0].input_hash, entries[1].input_hash);
+    }
+
+    /// ADR-82 slice 1: a thin alias tool presenting the `filesystem` policy
+    /// view (like the real `write` tool).
+    struct AliasWriteTool;
+
+    #[async_trait]
+    impl Tool for AliasWriteTool {
+        fn name(&self) -> &str {
+            "write"
+        }
+        fn description(&self) -> &str {
+            "test alias presenting the filesystem policy view"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn capability_requirements(&self) -> CapabilitySet {
+            CapabilitySet::default()
+        }
+        fn policy_view(&self, input: &serde_json::Value) -> (String, serde_json::Value) {
+            let mut canonical = input.clone();
+            canonical["operation"] = serde_json::json!("write");
+            ("filesystem".to_owned(), canonical)
+        }
+        async fn execute(
+            &self,
+            input: serde_json::Value,
+            _policy: &dyn PolicyEngine,
+            _session: &SessionContext,
+            _cancel: CancellationToken,
+        ) -> Result<ToolOutput, ToolError> {
+            // Marker proving the REGISTERED implementation executed (no reroute):
+            // the executor must run `write`, not `filesystem`.
+            let mut data = input;
+            data["executed_by"] = serde_json::json!("write-alias");
+            Ok(ToolOutput { summary: serde_json::to_string(&data).unwrap_or_default(), data })
+        }
+    }
+
+    /// ADR-82 slice 1: an alias call's verdict + completion rows carry BOTH
+    /// identities — the requested name for attribution, the canonical pair
+    /// for accounting — and the registered implementation is what executes.
+    #[tokio::test]
+    async fn alias_write_rows_carry_requested_and_canonical_identities() {
+        let audit = Arc::new(RecordingAudit::default());
+        let policy = Arc::new(SimplePolicyEngine::new(
+            vec![PolicyRule::AutoApprove(Condition::Always)],
+            audit.clone(),
+        ));
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(AliasWriteTool));
+        let executor = ToolExecutor::new(Arc::new(registry), policy);
+
+        let output = executor
+            .execute(
+                "write",
+                serde_json::json!({"path": "w.md"}),
+                &test_session(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("alias executes");
+        assert_eq!(
+            output.data.get("executed_by").and_then(|v| v.as_str()),
+            Some("write-alias"),
+            "the registered alias implementation executed, not the canonical tool"
+        );
+
+        let entries = audit.entries.lock().unwrap();
+        assert_eq!(entries.len(), 2, "expected policy row + post-execution row");
+        // Verdict row keys on the canonical effect policy evaluated.
+        assert_eq!(entries[0].verdict, "Allow");
+        assert_eq!(entries[0].tool_name, "filesystem");
+        assert_eq!(entries[0].canonical_tool.as_deref(), Some("filesystem"));
+        assert_eq!(entries[0].canonical_operation.as_deref(), Some("write"));
+        // Completion row keeps the requested name and repeats the pair.
+        assert_eq!(entries[1].verdict, "ExecutionSucceeded");
+        assert_eq!(entries[1].tool_name, "write");
+        assert_eq!(entries[1].canonical_tool.as_deref(), Some("filesystem"));
+        assert_eq!(entries[1].canonical_operation.as_deref(), Some("write"));
+        assert_eq!(entries[0].correlation_id, entries[1].correlation_id);
     }
 
     /// A path-shaped tool's structured facts reach both the policy decision row

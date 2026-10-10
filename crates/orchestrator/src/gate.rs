@@ -2634,6 +2634,123 @@ mod tests {
         assert_eq!(applied_row(&pool, "pic-4").await.pre_image_hash, None);
     }
 
+    /// A `write` alias stub: presents the `filesystem` policy view like the
+    /// real `WriteTool`, but executes as itself with a marker so tests prove
+    /// canonicalization never reroutes execution.
+    struct AliasWriteStub;
+
+    #[async_trait]
+    impl Tool for AliasWriteStub {
+        fn name(&self) -> &str {
+            "write"
+        }
+        fn description(&self) -> &str {
+            "test alias presenting the filesystem policy view"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            json!({})
+        }
+        fn capability_requirements(&self) -> CapabilitySet {
+            CapabilitySet::default()
+        }
+        fn policy_view(&self, input: &serde_json::Value) -> (String, serde_json::Value) {
+            let mut canonical = input.clone();
+            canonical["operation"] = json!("write");
+            ("filesystem".to_owned(), canonical)
+        }
+        async fn execute(
+            &self,
+            input: serde_json::Value,
+            _policy: &dyn PolicyEngine,
+            _session: &SessionContext,
+            _cancel: CancellationToken,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput {
+                summary: "alias-executed".into(),
+                data: json!({ "executed_by": "write-alias", "input": input }),
+            })
+        }
+    }
+
+    /// ADR-82 slice 1 end-to-end: a `write` alias canonicalized at request
+    /// assembly (before the stamp both backends share) closes the accounting
+    /// escapes — versioned targets exist, the pre-image is captured, and the
+    /// `WriteApplied` row records the canonical tool with the registered
+    /// name echoed — while the registered implementation still executes.
+    #[tokio::test]
+    async fn alias_write_canonicalizes_before_stamp_and_records_both_identities() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        let root = dir.path().to_path_buf();
+        let (_pool_dir, pool) = test_pool(8).await;
+
+        // Gate with the alias registered (mirrors `gate_with` plus the alias).
+        let policy = allow_engine();
+        let mut registry = registry(None);
+        registry.register(Box::new(AliasWriteStub));
+        registry.register(Box::new(CountingTool { calls: Arc::new(AtomicUsize::new(0)) }));
+        let executor = Arc::new(ToolExecutor::new(Arc::new(registry), policy.clone()));
+        let gate = Arc::new(WriteGate::new(
+            policy,
+            executor,
+            pool.clone(),
+            Arc::new(FilePreImageReader::new(root.clone())),
+            root.clone(),
+            1,
+        ));
+
+        std::fs::write(root.join("notes.txt"), "v1").expect("seed file");
+        let mut req = GateRequest {
+            call_id: "alias-1".to_owned(),
+            agent_id: "agent-a".to_owned(),
+            // Raw alias shape: no `operation` field, registered name only.
+            tool: "write".to_owned(),
+            input: json!({ "path": "notes.txt", "content": "v2" }),
+            registered_as: None,
+            session_id: None,
+            scope: "fs".to_owned(),
+            plan_id: None,
+            causation: None,
+            base_versions: BTreeMap::new(),
+            orchestrator_authority: false,
+        };
+        // Production assembly ordering (both backends): canonicalize FIRST,
+        // then stamp, then submit.
+        gate.canonicalize_request(&mut req);
+        assert_eq!(req.tool, "filesystem", "accounting identity is canonical");
+        assert_eq!(req.registered_as.as_deref(), Some("write"), "requested identity preserved");
+        assert_eq!(req.input["operation"], json!("write"), "operation forced by the view");
+        stamp_base_versions(&gate, &mut req).await;
+        assert!(
+            !req.base_versions.is_empty(),
+            "canonical operation yields versioned targets (the escape left none)"
+        );
+
+        let outcome = gate
+            .submit(req, CancellationToken::new())
+            .await
+            .expect("canonicalized alias write allowed");
+        assert!(!outcome.replayed, "fresh execution, not a replay");
+        assert_eq!(
+            outcome
+                .result
+                .get("data")
+                .and_then(|data| data.get("executed_by"))
+                .and_then(|v| v.as_str()),
+            Some("write-alias"),
+            "the registered alias implementation executed (no reroute)"
+        );
+
+        let applied = applied_row(&pool, "alias-1").await;
+        assert_eq!(applied.kind, WhiteboardKind::WriteApplied);
+        assert_eq!(
+            applied.pre_image_hash,
+            Some(blake3::hash(b"v1").to_hex().to_string()),
+            "pre-image captured through the canonical targets"
+        );
+        assert_eq!(applied.payload["tool"], json!("filesystem"));
+        assert_eq!(applied.payload["registered_as"], json!("write"));
+    }
+
     /// Issue #136 contract (real writer path): the write gate's applied-write
     /// record — produced by the gate itself, never hand-assembled — projects
     /// into the world model as a VERIFIED fact naming the written path, with
