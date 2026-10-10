@@ -88,21 +88,30 @@ pub fn consult_finding_payload(
 }
 
 /// Build the payload of the write gate's `WriteApplied` record (issue #136):
-/// `{ tool, input, policy_verdict: "allow", pre_images }`. An applied write
-/// is by definition allowed; [`write_applied_path`] reads the path back from
-/// `input.path`, sharing the `input` key so writer/reader cannot drift.
+/// `{ tool, input, policy_verdict: "allow", pre_images }` plus, when the
+/// request was canonicalized supervisor/in-process-side (ADR-82 slice 1), a
+/// `registered_as` echo of the tool name the caller actually invoked. An
+/// applied write is by definition allowed; [`write_applied_path`] reads the
+/// path back from `input.path`, sharing the `input` key, and
+/// [`write_applied_registered_as`] reads the echo back — writer and reader
+/// cannot drift.
 #[must_use]
 pub fn write_applied_payload(
     tool: &str,
     input: &serde_json::Value,
     pre_images: &BTreeMap<String, String>,
+    registered_as: Option<&str>,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "tool": tool,
         WRITE_INPUT_KEY: input,
         "policy_verdict": "allow",
         "pre_images": pre_images,
-    })
+    });
+    if let Some(registered_as) = registered_as {
+        payload["registered_as"] = serde_json::Value::String(registered_as.to_owned());
+    }
+    payload
 }
 
 /// Read the path a `WriteApplied` event wrote (`input.path`, the write gate's
@@ -115,6 +124,22 @@ pub fn write_applied_path(payload: &serde_json::Value) -> Option<&str> {
         .get(WRITE_INPUT_KEY)
         .and_then(|input| input.get(PATH_KEY))
         .and_then(serde_json::Value::as_str)
+}
+
+/// `WriteApplied` payload key echoing the **registered** tool name the caller
+/// invoked, present only on rows whose request was canonicalized
+/// (supervisor/in-process request assembly, ADR-82 slice 1): the `tool` key
+/// carries the canonical policy-view name there, and this echo preserves the
+/// requested identity for forensics.
+const WRITE_REGISTERED_AS_KEY: &str = "registered_as";
+
+/// Read the registered tool name a `WriteApplied` event was invoked under
+/// (ADR-82 slice 1). `None` on rows written before canonicalization (their
+/// `tool` key already IS the registered name) and on non-alias writes (the
+/// two names agree); never inferred from `tool`.
+#[must_use]
+pub fn write_applied_registered_as(payload: &serde_json::Value) -> Option<&str> {
+    payload.get(WRITE_REGISTERED_AS_KEY).and_then(serde_json::Value::as_str)
 }
 
 /// Extract the file paths touched by a `WriteApplied` payload, using the
@@ -215,6 +240,14 @@ pub struct ToolExecutedView<'a> {
     /// failure's structure; `None` when absent, null, non-numeric or out of
     /// `i32` range).
     pub exit_code: Option<i32>,
+    /// The canonical policy-view tool name (ADR-82 slice 1): `filesystem`
+    /// for a `write` alias; `None` on payloads recorded before the canonical
+    /// keys existed.
+    pub canonical_tool: Option<&'a str>,
+    /// The canonical operation from the policy-view input (`Some("write")`
+    /// for an alias write whose recorded args named no `operation` field);
+    /// `None` on legacy payloads.
+    pub canonical_operation: Option<&'a str>,
 }
 
 /// The `args` stand-in for a payload that carries none — a view sentinel
@@ -240,6 +273,8 @@ pub fn tool_executed_view(payload: &serde_json::Value) -> ToolExecutedView<'_> {
             .get("exit_code")
             .and_then(serde_json::Value::as_i64)
             .and_then(|code| i32::try_from(code).ok()),
+        canonical_tool: payload.get("canonical_tool").and_then(serde_json::Value::as_str),
+        canonical_operation: payload.get("canonical_operation").and_then(serde_json::Value::as_str),
         paths: payload
             .get("paths")
             .and_then(serde_json::Value::as_array)
@@ -330,13 +365,21 @@ mod tests {
     fn write_applied_payload_reads_back_through_write_applied_path() {
         let input = json!({"op": "write", "path": "notes.md", "content": "x"});
         let pre_images = BTreeMap::from([("notes.md".to_owned(), "hash-1".to_owned())]);
-        let payload = write_applied_payload("filesystem", &input, &pre_images);
+        let payload = write_applied_payload("filesystem", &input, &pre_images, None);
 
         assert_eq!(write_applied_path(&payload), Some("notes.md"));
         assert_eq!(payload["tool"], json!("filesystem"));
         assert_eq!(payload["input"], input);
         assert_eq!(payload["policy_verdict"], json!("allow"));
         assert_eq!(payload["pre_images"], json!({"notes.md": "hash-1"}));
+        // ADR-82 slice 1: no registered-name echo for a non-alias request.
+        assert_eq!(write_applied_registered_as(&payload), None);
+
+        // ADR-82 slice 1: a canonicalized alias records the canonical `tool`
+        // and echoes the registered name it was invoked under.
+        let alias = write_applied_payload("filesystem", &input, &pre_images, Some("write"));
+        assert_eq!(alias["tool"], json!("filesystem"));
+        assert_eq!(write_applied_registered_as(&alias), Some("write"));
 
         assert_eq!(write_applied_path(&json!({"input": {"op": "read"}})), None);
         assert_eq!(write_applied_path(&json!({"tool": "filesystem"})), None);

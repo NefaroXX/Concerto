@@ -84,13 +84,25 @@ pub(super) fn audited_file_changes(output: &AgentOutput) -> u32 {
         .unwrap_or(u32::MAX)
 }
 
-/// True when a tool-execution summary names a mutating tool or operation —
-/// the same grammar [`crate::tool_facts::is_file_affecting_tool`] uses on the
-/// RAW arguments, applied to the summary the executor produced, with the
-/// filesystem tool's own write/delete success marker ("Wrote …"/"Deleted …")
-/// as the fallback for normalized (alias/inferred) calls whose raw
-/// `operation` field was absent.
+/// True when a tool-execution summary names a mutating tool or operation.
+///
+/// ADR-82 slice 1: when the summary carries the canonical policy-view identity
+/// it is **authoritative** — a `write` alias resolves to its
+/// `("filesystem", "write")` effect and is classified structurally by
+/// [`crate::tool_facts::is_file_affecting_tool`], not by a per-site name arm or
+/// a prose marker. Summaries without a canonical identity (legacy records, or
+/// the supervised child, which cannot see the registry) fall back to the
+/// operation field and then the registered-name grammar.
+///
+/// The former `"Wrote "`/`"Deleted "` Display-parse fallback is **removed**:
+/// classification reads structured identity only, never prose.
 fn is_audited_mutation_event(event: &ToolExecutionSummary) -> bool {
+    if let Some(tool) = event.canonical_tool.as_deref() {
+        return crate::tool_facts::is_file_affecting_tool(
+            tool,
+            event.canonical_operation.as_deref(),
+        );
+    }
     if event
         .operation
         .as_deref()
@@ -98,15 +110,10 @@ fn is_audited_mutation_event(event: &ToolExecutionSummary) -> bool {
     {
         return true;
     }
-    if matches!(
+    matches!(
         event.tool_name.as_str(),
         "write" | "write_file" | "delete_file" | "edit_file" | "create_file" | "modify_file"
-    ) {
-        return true;
-    }
-    // Normalized writes whose raw arguments carried no `operation` field:
-    // classify from the tool's own success summary vocabulary.
-    ["Wrote ", "Deleted "].iter().any(|marker| event.summary.starts_with(marker))
+    )
 }
 
 /// Hard completion condition: verification must actually pass when the task
@@ -149,7 +156,8 @@ mod tests {
         }
     }
 
-    /// Build one tool-execution summary for the classification tests.
+    /// Build one tool-execution summary for the classification tests (no
+    /// canonical identity — the legacy shape).
     fn event(
         tool_name: &str,
         operation: Option<&str>,
@@ -162,6 +170,25 @@ mod tests {
             path: None,
             success,
             summary: summary.to_string(),
+            canonical_tool: None,
+            canonical_operation: None,
+        }
+    }
+
+    /// Build one summary carrying an ADR-82 slice-1 canonical identity.
+    fn canonical_event(
+        tool_name: &str,
+        canonical_tool: &str,
+        canonical_operation: Option<&str>,
+    ) -> ToolExecutionSummary {
+        ToolExecutionSummary {
+            tool_name: tool_name.to_string(),
+            operation: None,
+            path: None,
+            success: true,
+            summary: String::new(),
+            canonical_tool: Some(canonical_tool.to_string()),
+            canonical_operation: canonical_operation.map(str::to_string),
         }
     }
 
@@ -212,15 +239,30 @@ mod tests {
         assert!(!is_audited_mutation_event(&event("write_file_v2", None, true, "")));
     }
 
-    /// Summary-vocabulary fallback for normalized writes: the marker must be
-    /// an exact prefix including the trailing space, so `Wrote` alone (no
-    /// space), a lower-case `wrote `, or a mid-string occurrence never counts.
+    /// ADR-82 slice 1: the canonical policy-view identity is authoritative and
+    /// classifies the `write` alias structurally — no name arm, no prose
+    /// marker. A non-filesystem canonical name with a mutating operation still
+    /// classifies via the shared grammar.
     #[test]
-    fn mutation_class_from_summary_requires_exact_marker_prefix() {
-        assert!(is_audited_mutation_event(&event("fs", None, true, "Wrote 42 bytes")));
-        assert!(is_audited_mutation_event(&event("fs", None, true, "Deleted a.txt")));
-        assert!(!is_audited_mutation_event(&event("fs", None, true, "Wrote")));
-        assert!(!is_audited_mutation_event(&event("fs", None, true, "wrote 42 bytes")));
+    fn mutation_class_prefers_canonical_identity_for_alias_writes() {
+        // A `write` alias: raw args name no operation and the name grammar is
+        // deliberately bypassed because a canonical identity is present.
+        assert!(is_audited_mutation_event(&canonical_event("write", "filesystem", Some("write"))));
+        assert!(is_audited_mutation_event(&canonical_event("apply", "filesystem", Some("delete"))));
+        assert!(is_audited_mutation_event(&canonical_event("write_file", "write_file", None)));
+        // Canonical read identity never counts, even with a write-ish summary.
+        let mut read = canonical_event("filesystem", "filesystem", Some("read"));
+        read.summary = "Wrote 42 bytes".to_owned();
+        assert!(!is_audited_mutation_event(&read));
+    }
+
+    /// ADR-82 slice 1: the prose-marker fallback is removed — a summary that
+    /// merely *looks* like a write in prose (and carries no canonical identity,
+    /// operation, or write-tool name) is never classified as a mutation.
+    #[test]
+    fn mutation_class_ignores_prose_markers() {
+        assert!(!is_audited_mutation_event(&event("fs", None, true, "Wrote 42 bytes")));
+        assert!(!is_audited_mutation_event(&event("fs", None, true, "Deleted a.txt")));
         assert!(!is_audited_mutation_event(&event("fs", None, true, "reads Wrote 42 bytes")));
     }
 

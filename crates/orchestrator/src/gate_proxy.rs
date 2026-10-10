@@ -410,6 +410,7 @@ impl ToolExecutionBackend for GateProxyBackend {
             agent_id: self.agent_id.clone(),
             tool: tool_name.to_owned(),
             input,
+            registered_as: None,
             session_id: Some(session.session_id.to_string()),
             scope: Self::SCOPE.to_owned(),
             // Ledger enrichment (ADR-60 D7): the run's approved plan, when
@@ -778,6 +779,7 @@ mod tests {
                     agent_id: "agent-a".to_owned(),
                     tool: "write_file".to_owned(),
                     input: serde_json::json!({ "operation": "write" }),
+                    registered_as: None,
                     session_id: None,
                     scope: "fs".to_owned(),
                     plan_id: None,

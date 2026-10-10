@@ -31,6 +31,64 @@ struct ExecutionAuditContext {
     input_hash: String,
     facts: Option<CommandPolicyFacts>,
     path_facts: Option<PathPolicyFacts>,
+    /// Canonical policy-view tool name (ADR-82 slice 1): the accounting
+    /// identity of the call, recorded alongside the registered name.
+    canonical_tool: Option<String>,
+    /// Canonical operation from the policy-view input; `None` when the
+    /// canonical input names no operation.
+    canonical_operation: Option<String>,
+}
+
+/// The canonical **policy-view effect** of one tool call (ADR-82 slice 1).
+///
+/// The executor owns the registry, so it is the single producer of this
+/// grammar: the identity is derived from the same [`Tool::policy_view`] the
+/// policy engine evaluates, never from the registered name alone. Thin alias
+/// tools (e.g. a `write` alias delegating to `filesystem`) therefore resolve
+/// to their canonical effect — `("filesystem", "write")` — and every
+/// accounting seam (write gate, fact writer, audit rows) keys on that pair
+/// instead of the registered name, which closed the alias-write accounting
+/// escapes.
+///
+/// **Canonicalization is accounting/attribution only — never a reroute.** The
+/// implementation that executes stays the one registered under the requested
+/// name; the canonical effect only determines how that execution is accounted,
+/// versioned, and attributed. Callers that must also record the requested
+/// identity keep both: requested name for attribution/forensics, canonical
+/// effect for accounting.
+///
+/// Layering (ADR-82): this is a core vocabulary type — it names only
+/// core-and-below types.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CanonicalEffect {
+    /// The canonical tool name policy evaluates (`policy_view`'s first
+    /// element): `filesystem` for the `write` alias, the registered name for
+    /// every non-alias tool.
+    pub policy_name: String,
+    /// The canonical policy-view **input** (`policy_view`'s second element) —
+    /// for an alias write, the caller's raw input with `operation` forced to
+    /// `"write"`. The write gate adopts this as the request's policy input so
+    /// its versioned targets, pre-image capture and conflict check all key on
+    /// the canonical operation; it is never the input the registered
+    /// implementation executes with (execution keeps the registered name and
+    /// input — see [`Self`]).
+    pub policy_input: serde_json::Value,
+    /// The canonical operation, read from the policy-view input's
+    /// `operation` field (`"write"` for an alias write whose raw input named
+    /// none). `None` when the canonical input carries no `operation` field.
+    pub operation: Option<String>,
+}
+
+/// Derive the canonical policy-view effect of a call on `tool` (ADR-82
+/// slice 1) — the shared derivation behind [`ToolExecutor::canonical_effect`]
+/// and the audit contexts the executing paths already build: the identity is
+/// always the one [`Tool::policy_view`] produces, so the service and the
+/// audit rows can never disagree.
+fn canonical_effect_of(tool: &dyn Tool, input: &serde_json::Value) -> CanonicalEffect {
+    let (policy_name, policy_input) = tool.policy_view(input);
+    let operation =
+        policy_input.get("operation").and_then(serde_json::Value::as_str).map(str::to_owned);
+    CanonicalEffect { policy_name, policy_input, operation }
 }
 
 /// Construct the policy action for a tool call, shared by the executing path
@@ -155,6 +213,27 @@ impl ToolExecutor {
         self.registry.has_capability_gated_tools(caps)
     }
 
+    /// Resolve the canonical policy-view effect of a proposed call (ADR-82
+    /// slice 1): the `(policy_name, operation)` identity — plus the canonical
+    /// policy input — that policy will evaluate, derived from the registry
+    /// this executor owns (the single grammar producer).
+    ///
+    /// `None` when `tool_name` is not registered: an unknown tool has no
+    /// canonical identity, and callers keep their existing behavior (the
+    /// ordinary execute path surfaces the "tool not found" refusal).
+    ///
+    /// This is an accounting/attribution view only — it never selects an
+    /// implementation to run. The executing implementation stays the one
+    /// registered under `tool_name`; see [`CanonicalEffect`].
+    pub fn canonical_effect(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> Option<CanonicalEffect> {
+        let tool = self.registry.get(tool_name)?;
+        Some(canonical_effect_of(tool, input))
+    }
+
     async fn execute_allowed(
         &self,
         tool: &dyn Tool,
@@ -172,7 +251,14 @@ impl ToolExecutor {
         // its exit code, and its duration. The ADR-28 §6 shell fields are derived
         // from `command_facts` when present and stay `None` otherwise, so
         // non-shell tools get a minimal, truthful completion row.
-        let ExecutionAuditContext { correlation_id, input_hash, facts, path_facts } = audit;
+        let ExecutionAuditContext {
+            correlation_id,
+            input_hash,
+            facts,
+            path_facts,
+            canonical_tool,
+            canonical_operation,
+        } = audit;
         let exit_code = result
             .as_ref()
             .ok()
@@ -225,6 +311,12 @@ impl ToolExecutor {
             source_revision: None,
             path_facts,
             result_facts,
+            // ADR-82 slice 1: the completion row records BOTH identities —
+            // `tool_name` above is the requested (registered) name for
+            // attribution/forensics, the canonical pair below is what
+            // accounting keys on (they diverge for alias calls).
+            canonical_tool,
+            canonical_operation,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel.clone()).await {
             tracing::error!(%error, "post-execution audit write failed");
@@ -309,6 +401,8 @@ impl ToolExecutor {
             source_revision: None,
             path_facts: action.path_facts.clone(),
             result_facts: None,
+            canonical_tool: None,
+            canonical_operation: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "approval-decision audit write failed");
@@ -365,6 +459,8 @@ impl ToolExecutor {
             source_revision: None,
             path_facts: None,
             result_facts: None,
+            canonical_tool: None,
+            canonical_operation: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "ack-decision audit write failed");
@@ -423,6 +519,8 @@ impl ToolExecutor {
             source_revision: None,
             path_facts: None,
             result_facts: None,
+            canonical_tool: None,
+            canonical_operation: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "coordinator-shape audit write failed");
@@ -480,6 +578,8 @@ impl ToolExecutor {
             source_revision: None,
             path_facts: None,
             result_facts: None,
+            canonical_tool: None,
+            canonical_operation: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::warn!(%error, decision, "coordinator-decision audit write failed (fail-soft)");
@@ -542,6 +642,8 @@ impl ToolExecutor {
             source_revision: source_revision.map(str::to_owned),
             path_facts: None,
             result_facts: None,
+            canonical_tool: None,
+            canonical_operation: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "plan-decision audit write failed");
@@ -609,6 +711,8 @@ impl ToolExecutor {
             source_revision: None,
             path_facts: None,
             result_facts: None,
+            canonical_tool: None,
+            canonical_operation: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "capability-refusal audit write failed");
@@ -672,6 +776,8 @@ impl ToolExecutor {
             source_revision: None,
             path_facts: None,
             result_facts: None,
+            canonical_tool: None,
+            canonical_operation: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "tool-driver audit write failed");
@@ -762,11 +868,20 @@ impl ToolExecutor {
         }
 
         // Policy evaluates the tool's canonical view (alias tools present the
-        // canonical tool name and operation-bearing input); execution and
-        // audit below still use the registered name and the caller's input.
-        let (policy_name, policy_input) = tool.policy_view(&input);
-        let action =
-            build_action(&policy_name, &policy_input, tool, session, orchestrator_authority);
+        // canonical tool name and operation-bearing input); execution below
+        // still uses the registered name and the caller's input. The same
+        // canonical identity — derived by the one shared service — is recorded
+        // on the completion row (ADR-82 slice 1): requested name for
+        // attribution, canonical pair for accounting.
+        let canonical = canonical_effect_of(tool, &input);
+        let canonical_audit = (Some(canonical.policy_name.clone()), canonical.operation.clone());
+        let action = build_action(
+            &canonical.policy_name,
+            &canonical.policy_input,
+            tool,
+            session,
+            orchestrator_authority,
+        );
         let correlation_id = action.correlation_id;
         let input_hash = crate::policy::compute_input_hash(&input);
         let command_facts = action.command_facts.clone();
@@ -785,6 +900,8 @@ impl ToolExecutor {
                         input_hash,
                         facts: command_facts,
                         path_facts,
+                        canonical_tool: canonical_audit.0,
+                        canonical_operation: canonical_audit.1,
                     },
                 )
                 .await
@@ -826,6 +943,8 @@ impl ToolExecutor {
                                             input_hash,
                                             facts: command_facts,
                                             path_facts,
+                                            canonical_tool: canonical_audit.0,
+                                            canonical_operation: canonical_audit.1,
                                         },
                                     )
                                     .await
@@ -901,6 +1020,8 @@ impl ToolExecutor {
             source_revision: None,
             path_facts: None,
             result_facts: None,
+            canonical_tool: None,
+            canonical_operation: None,
         };
         if let Err(audit_error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%audit_error, "preparation refusal audit write failed");
@@ -947,8 +1068,11 @@ impl ToolExecutor {
         // Build the audit context the same way `execute`'s allowed path does,
         // but without evaluating the action: the canonical policy view still
         // names the completion row's tool, and `command_facts` still enrich it.
-        let (policy_name, policy_input) = tool.policy_view(&input);
-        let action = build_action(&policy_name, &policy_input, tool, session, false);
+        // ADR-82 slice 1: the canonical pair rides the completion row here
+        // too, so alias calls are accounted identically on the fast path.
+        let canonical = canonical_effect_of(tool, &input);
+        let action =
+            build_action(&canonical.policy_name, &canonical.policy_input, tool, session, false);
         if !matches!(
             self.policy.evaluate_security_ceiling(&action, cancel.clone()).await,
             Ok(PolicyVerdict::Allow)
@@ -962,6 +1086,8 @@ impl ToolExecutor {
             input_hash: crate::policy::compute_input_hash(&input),
             facts: action.command_facts.clone(),
             path_facts: action.path_facts.clone(),
+            canonical_tool: Some(canonical.policy_name),
+            canonical_operation: canonical.operation,
         };
         self.execute_allowed(tool, tool_name, input, session, cancel, audit).await
     }
@@ -1044,6 +1170,8 @@ impl ToolExecutor {
             // cached payload directly, so there is no result to summarise
             // here without threading the payload through the API.
             result_facts: None,
+            canonical_tool: None,
+            canonical_operation: None,
         };
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "served-read audit write failed");
@@ -2470,6 +2598,8 @@ mod tests {
                 source_revision: None,
                 path_facts: None,
                 result_facts: None,
+                canonical_tool: None,
+                canonical_operation: None,
             };
             self.audit.entries.lock().unwrap().push(entry);
             Ok(PolicyVerdict::RequireApproval { timeout: Duration::from_secs(30) })

@@ -635,6 +635,18 @@ impl SimplePolicyEngine {
             source_revision: None,
             path_facts: action.path_facts.clone(),
             result_facts: None,
+            // ADR-82 slice 1: verdict rows record the canonical effect too.
+            // `action.tool_name` IS the canonical policy-view name (the
+            // executor builds the action from `Tool::policy_view`), so the
+            // pair is derived from the action itself; `tool_name` above
+            // stays the canonical spelling for this row, and the requested
+            // (registered) name is recorded on the executor's completion row.
+            canonical_tool: Some(action.tool_name.to_string()),
+            canonical_operation: action
+                .input
+                .get("operation")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
         };
         self.record_audit(entry, cancel).await;
     }

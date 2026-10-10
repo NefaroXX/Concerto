@@ -59,6 +59,22 @@ pub trait ToolExecutionBackend: Send + Sync {
     /// Tool definitions to present to the model (may be cached/fetched).
     fn tool_definitions(&self) -> Vec<ToolDefinition>;
 
+    /// ADR-82 slice 1: resolve the canonical policy-view effect of a proposed
+    /// call from the backend's own registry, if it has one.
+    ///
+    /// The in-process backend delegates to its [`ToolExecutor`] (the single
+    /// grammar producer). The supervised gate-proxy backend has **no** local
+    /// registry — the child cannot see it — so it keeps the `None` default and
+    /// the canonical identity is resolved supervisor-side at the gate instead.
+    /// Accounting only: the caller still executes the registered tool.
+    fn canonical_effect(
+        &self,
+        _tool_name: &str,
+        _input: &serde_json::Value,
+    ) -> Option<concerto_core::executor::CanonicalEffect> {
+        None
+    }
+
     /// Execute one tool call.
     ///
     /// `call_id` is the idempotency key the supervised path forwards to the
@@ -222,6 +238,14 @@ pub trait ToolExecutionBackend: Send + Sync {
 impl ToolExecutionBackend for ToolExecutor {
     fn tool_definitions(&self) -> Vec<ToolDefinition> {
         ToolExecutor::tool_definitions(self)
+    }
+
+    fn canonical_effect(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> Option<concerto_core::executor::CanonicalEffect> {
+        ToolExecutor::canonical_effect(self, tool_name, input)
     }
 
     async fn execute(

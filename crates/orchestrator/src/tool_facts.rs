@@ -170,6 +170,13 @@ impl ToolFactContext {
                 "generation": fact.generation,
                 "project_root_hash": root_hash,
                 "paths": serde_json::to_value(&observed).unwrap_or_else(|_| serde_json::json!([])),
+                // ADR-82 slice 1: the canonical policy-view identity rides the
+                // event payload so downstream evidence (world model, design-doc
+                // verifier, coordinator) keys on it instead of the registered
+                // name. Absent/None for legacy producers and the supervised
+                // child, whose consumers fall back to the name grammar.
+                "canonical_tool": fact.canonical_tool,
+                "canonical_operation": fact.canonical_operation,
             }),
             pre_image_hash: single_path_pre_image(fact),
             created_at,
@@ -218,6 +225,8 @@ impl ToolFactContext {
                 // ADR-65 §4: an ordinary executed tool call is never a cache
                 // serve — served reads are recorded via `record_served_read`.
                 served_from: None,
+                canonical_tool: fact.canonical_tool.map(str::to_owned),
+                canonical_operation: fact.canonical_operation.map(str::to_owned),
             };
             if let Err(err) =
                 facts.apply_observed(&event_id, &self.agent_id, created_at, &payload, cancel).await
@@ -281,6 +290,9 @@ impl ToolFactContext {
                 "project_root_hash": root_hash,
                 "paths": serde_json::json!([]),
                 "served_from": served_from,
+                // ADR-82 slice 1: canonical identity, as in `record_tool_executed`.
+                "canonical_tool": fact.canonical_tool,
+                "canonical_operation": fact.canonical_operation,
             }),
             pre_image_hash: None,
             created_at: unix_ms(),
@@ -365,6 +377,16 @@ pub struct ToolExecutedFact<'a> {
     /// Pre-write content hashes captured before execution
     /// ([`ToolFactContext::pre_image_hashes`]).
     pub pre_image_hashes: HashMap<String, Option<String>>,
+    /// ADR-82 slice 1: the canonical policy-view tool name of the call
+    /// (`filesystem` for a `write` alias; equal to `tool` for non-alias tools),
+    /// when the producer could resolve it. `None` for backends with no local
+    /// registry (the supervised child) and for producers that predate the
+    /// field — consumers then fall back to the registered-name grammar.
+    pub canonical_tool: Option<&'a str>,
+    /// The canonical operation from the policy-view input (`Some("write")` for
+    /// an alias write whose raw args named no `operation`). Populated alongside
+    /// [`Self::canonical_tool`].
+    pub canonical_operation: Option<&'a str>,
 }
 
 impl ToolExecutedFact<'_> {
@@ -566,15 +588,38 @@ pub(crate) fn unix_ms() -> i64 {
         .unwrap_or_default()
 }
 
-/// Whether a tool command is file-affecting (write/delete/edit), using the
-/// same defensive grammar the single-agent loop already uses for its
-/// file-change accounting: dedicated write tools, or the `filesystem` tool
-/// with a mutating operation. Side-effecting shells/git are intentionally out
-/// of scope — their writes are surfaced by `WriteApplied` gate events instead.
-pub(crate) fn is_file_affecting_tool(tool: &str, args: &serde_json::Value) -> bool {
-    let operation = args.get("operation").and_then(|v| v.as_str());
-    matches!(tool, "write_file" | "delete_file" | "edit_file" | "create_file" | "modify_file")
-        || (tool == "filesystem" && matches!(operation, Some("write" | "delete" | "move" | "copy")))
+/// Whether a tool command is file-affecting (write/delete/edit), keyed on the
+/// **canonical policy-view identity** (ADR-82 slice 1): the canonical tool name
+/// and the canonical operation, not the registered name plus raw arguments.
+///
+/// A `write` alias therefore classifies through its canonical
+/// `("filesystem", Some("write"))` identity instead of needing a per-site
+/// `"write"` arm. Callers that hold a record written before the canonical
+/// fields existed fall back to the registered name and the args' own
+/// `operation` field (see the `_legacy` helper); a registered `"write"` with
+/// no canonical identity is *not* recovered — that was the alias-write escape,
+/// and only a canonical identity closes it.
+///
+/// Side-effecting shells/git are intentionally out of scope — their writes are
+/// surfaced by `WriteApplied` gate events instead.
+pub(crate) fn is_file_affecting_tool(
+    canonical_tool: &str,
+    canonical_operation: Option<&str>,
+) -> bool {
+    matches!(
+        canonical_tool,
+        "write_file" | "delete_file" | "edit_file" | "create_file" | "modify_file"
+    ) || (canonical_tool == "filesystem"
+        && matches!(canonical_operation, Some("write" | "delete" | "move" | "copy")))
+}
+
+/// Legacy raw-argument form of [`is_file_affecting_tool`] for records written
+/// before the canonical fields existed: the registered name is treated as the
+/// canonical tool and the operation is read from the args. New code should
+/// pass the canonical identity; this exists only so old evidence does not
+/// regress.
+pub(crate) fn is_file_affecting_tool_legacy(tool: &str, args: &serde_json::Value) -> bool {
+    is_file_affecting_tool(tool, args.get("operation").and_then(serde_json::Value::as_str))
 }
 
 /// Extract the paths a tool command touches, using the same defensive grammar
@@ -784,6 +829,8 @@ mod tests {
                 paths: &["a.md".to_owned()],
                 file_affecting: false,
                 pre_image_hashes: HashMap::new(),
+                canonical_tool: None,
+                canonical_operation: None,
             },
             &cancel,
         )
@@ -866,6 +913,8 @@ mod tests {
                         content_hash: Some("pre".to_owned()),
                     }],
                     served_from: None,
+                    canonical_tool: None,
+                    canonical_operation: None,
                 },
                 &cancel,
             )
@@ -896,6 +945,8 @@ mod tests {
                 paths: &["b.rs".to_owned()],
                 file_affecting: true,
                 pre_image_hashes: pre_images,
+                canonical_tool: None,
+                canonical_operation: None,
             },
             &cancel,
         )
@@ -941,6 +992,8 @@ mod tests {
                 paths: &["c.txt".to_owned()],
                 file_affecting: false,
                 pre_image_hashes: HashMap::new(),
+                canonical_tool: None,
+                canonical_operation: None,
             },
             &cancel,
         )
@@ -972,6 +1025,8 @@ mod tests {
                 paths: &["x".to_owned()],
                 file_affecting: true,
                 pre_image_hashes: HashMap::new(),
+                canonical_tool: None,
+                canonical_operation: None,
             },
             &cancel,
         )
@@ -1020,6 +1075,8 @@ mod tests {
                 paths,
                 file_affecting,
                 pre_image_hashes: pre_images.clone(),
+                canonical_tool: None,
+                canonical_operation: None,
             }
         }
         let single = HashMap::from([("one.md".to_owned(), Some("h".to_owned()))]);
@@ -1136,6 +1193,8 @@ mod tests {
             paths: &paths,
             file_affecting: true,
             pre_image_hashes: single.clone(),
+            canonical_tool: None,
+            canonical_operation: None,
         };
         assert_eq!(
             single_path_pre_image(&fact).as_deref(),
@@ -1159,6 +1218,8 @@ mod tests {
             paths: &paths,
             file_affecting: true,
             pre_image_hashes: single,
+            canonical_tool: None,
+            canonical_operation: None,
         };
         assert_eq!(
             single_path_pre_image(&fact).as_deref(),
@@ -1194,6 +1255,8 @@ mod tests {
                 paths: &["a.md".to_owned()],
                 file_affecting: false,
                 pre_image_hashes: HashMap::new(),
+                canonical_tool: None,
+                canonical_operation: None,
             },
             &cancel,
         )
@@ -1231,6 +1294,8 @@ mod tests {
                 paths: &["c.txt".to_owned()],
                 file_affecting: false,
                 pre_image_hashes: HashMap::new(),
+                canonical_tool: None,
+                canonical_operation: None,
             },
             &cancel,
         )
@@ -1268,6 +1333,8 @@ mod tests {
                 paths: &["d.txt".to_owned()],
                 file_affecting: false,
                 pre_image_hashes: HashMap::new(),
+                canonical_tool: None,
+                canonical_operation: None,
             },
             &cancel,
         )
@@ -1310,6 +1377,8 @@ mod tests {
                 paths: &["e.txt".to_owned()],
                 file_affecting: false,
                 pre_image_hashes: HashMap::new(),
+                canonical_tool: None,
+                canonical_operation: None,
             },
             &cancel,
         )
@@ -1400,6 +1469,8 @@ mod tests {
                 paths: &[],
                 file_affecting: false,
                 pre_image_hashes: HashMap::new(),
+                canonical_tool: None,
+                canonical_operation: None,
             },
             &cancel,
         )

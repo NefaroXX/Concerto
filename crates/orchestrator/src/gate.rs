@@ -202,9 +202,29 @@ pub struct GateRequest {
     /// Agent producing the write (whiteboard attribution).
     pub agent_id: String,
     /// Tool name to execute, e.g. `filesystem`.
+    ///
+    /// ADR-82 slice 1: on the accounting path this carries the **canonical
+    /// policy-view** name after [`WriteGate::canonicalize_request`] rewrites an
+    /// alias request (a `write` alias resolves to `filesystem`); the registered
+    /// name is preserved in [`Self::registered_as`] and is what actually
+    /// executes. Non-alias requests are unchanged.
     pub tool: String,
     /// Tool input (policy-evaluated and passed through to the tool).
+    ///
+    /// ADR-82 slice 1: canonicalization replaces an alias's raw input with the
+    /// policy-view input (`operation` forced) so the gate's versioned targets,
+    /// pre-image capture and conflict check key on the canonical operation.
     pub input: serde_json::Value,
+    /// ADR-82 slice 1: the **registered** tool name the caller invoked, present
+    /// only when [`WriteGate::canonicalize_request`] rewrote [`Self::tool`] to a
+    /// different canonical name (i.e. the request was an alias). It is the name
+    /// the gate executes and the identity echoed onto the `WriteApplied`
+    /// payload's `registered_as` key. Absent for non-alias requests and for
+    /// every client that predates the field (`#[serde(default)]`); never sent
+    /// supervisor-bound, where canonicalization happens (skip-if-none keeps the
+    /// wire unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registered_as: Option<String>,
     /// Owning session, when known.
     pub session_id: Option<String>,
     /// Subscription/topic filter.
@@ -984,6 +1004,49 @@ impl WriteGate {
         }
     }
 
+    /// ADR-82 slice 1: resolve the canonical policy-view effect of a proposed
+    /// call from this gate's executor (the single grammar producer). A thin
+    /// delegate so request-assembly call sites (supervisor and in-process
+    /// backend) never re-implement the resolution.
+    ///
+    /// `None` when the tool is not registered. Accounting only — the caller
+    /// still executes the registered implementation.
+    pub fn canonical_effect(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> Option<concerto_core::executor::CanonicalEffect> {
+        self.executor.canonical_effect(tool_name, input)
+    }
+
+    /// ADR-82 slice 1: rewrite `request`'s **accounting identity** to the
+    /// canonical policy-view effect, preserving the registered name in
+    /// [`GateRequest::registered_as`].
+    ///
+    /// Called at request assembly, **before** [`stamp_base_versions`], on both
+    /// execution paths, so the stamped targets, the pre-image capture, the
+    /// conflict check, the policy action, the `WriteApplied` row and the
+    /// executor's audit row all key on the canonical operation.
+    ///
+    /// **Not a reroute**: only [`GateRequest::tool`]/[`GateRequest::input`]
+    /// (the accounting identity) are rewritten; the registered name stays in
+    /// `registered_as` and is what [`WriteGate::run_gated`] executes. A
+    /// request for an unknown tool, or one whose policy view already names the
+    /// registered tool, is left untouched (the input is adopted only when the
+    /// canonical view actually differs).
+    pub(crate) fn canonicalize_request(&self, request: &mut GateRequest) {
+        let Some(canonical) = self.canonical_effect(&request.tool, &request.input) else {
+            return;
+        };
+        if canonical.policy_name != request.tool {
+            request.registered_as =
+                Some(std::mem::replace(&mut request.tool, canonical.policy_name));
+        }
+        if canonical.policy_input != request.input {
+            request.input = canonical.policy_input;
+        }
+    }
+
     /// Submit a write request for policy evaluation and gated execution.
     ///
     /// Ordering (WAL-before-execute, see module docs): replay check → claim →
@@ -1196,10 +1259,13 @@ impl WriteGate {
         }
 
         // Direct execute: no policy decision, no WAL row, no ownership/lock.
+        // ADR-82 slice 1: the advisory action above used the canonical policy
+        // name; execution still runs the registered implementation.
+        let exec_tool = req.registered_as.as_deref().unwrap_or(&req.tool);
         let session_ctx = self.session(session_id);
         let output = self
             .executor
-            .execute_read_only(&req.tool, req.input, &session_ctx, cancel)
+            .execute_read_only(exec_tool, req.input, &session_ctx, cancel)
             .await
             .map_err(GateError::from)?;
         let result = serde_json::to_value(&output)
@@ -1399,7 +1465,13 @@ impl WriteGate {
         // (issue #136): the world model reads `input.path` back through the
         // accessor paired with this builder, so writer and reader cannot
         // drift apart silently. Gate-specific additions below.
-        let mut payload = write_applied_payload(&req.tool, &req.input, &pre_images);
+        // ADR-82 slice 1: `req.tool` is the canonical policy-view name when the
+        // request was canonicalized; the `WriteApplied` row records that
+        // canonical accounting identity as `tool` and echoes the registered
+        // name it was invoked under as `registered_as` (absent for non-alias
+        // requests, whose two names agree).
+        let mut payload =
+            write_applied_payload(&req.tool, &req.input, &pre_images, req.registered_as.as_deref());
         if !acquired_now.is_empty() {
             payload["ownership_acquired"] = serde_json::Value::Array(
                 acquired_now.clone().into_iter().map(serde_json::Value::String).collect(),
@@ -1449,10 +1521,14 @@ impl WriteGate {
         // authority marker exists to skip).
         let session_ctx = self.session(session_id);
         let input = req.input.clone(); // keep `req` intact for failure logging below
+                                       // ADR-82 slice 1: execute the REGISTERED implementation the caller
+                                       // invoked, never the canonical name that only accounts for the call.
+                                       // For a non-alias request the two are the same name.
+        let exec_tool = req.registered_as.as_deref().unwrap_or(&req.tool);
         let output = if req.orchestrator_authority {
-            self.executor.execute_with_authority(&req.tool, input, &session_ctx, cancel).await
+            self.executor.execute_with_authority(exec_tool, input, &session_ctx, cancel).await
         } else {
-            self.executor.execute(&req.tool, input, &session_ctx, cancel).await
+            self.executor.execute(exec_tool, input, &session_ctx, cancel).await
         };
         let output = match output {
             Ok(output) => output,
@@ -1497,7 +1573,10 @@ impl WriteGate {
                 plan_id: req.plan_id.clone(),
                 causation: req.causation.clone(),
                 payload: serde_json::json!({
-                    "tool": &req.tool,
+                    // ADR-82 slice 1: attribution keeps the registered name the
+                    // caller invoked (unchanged from before canonicalization);
+                    // the canonical identity is the gate's accounting key.
+                    "tool": req.registered_as.as_deref().unwrap_or(&req.tool),
                     "input": &req.input,
                     "reason": format!("{verdict:?}"),
                     "pre_images": pre_images,
@@ -1525,7 +1604,9 @@ impl WriteGate {
                 plan_id: req.plan_id.clone(),
                 causation: Some(req.call_id.clone()),
                 payload: serde_json::json!({
-                    "tool": &req.tool,
+                    // ADR-82 slice 1: attribution keeps the registered name
+                    // (see `append_rejected`).
+                    "tool": req.registered_as.as_deref().unwrap_or(&req.tool),
                     "error": error.to_string(),
                 }),
                 pre_image_hash: None,
@@ -1699,9 +1780,11 @@ impl WriteGate {
 ///   never stamped here — the gate still records their pre-image for
 ///   attribution on the WAL row.
 ///
-/// Reusable by every path that submits a gated write: the supervisor's
-/// `handle_execute_tool` today, the in-process agent loop (a later stage)
-/// tomorrow.
+/// Both gated-write paths call this, in the same order relative to
+/// [`WriteGate::canonicalize_request`]: the supervisor's `handle_execute_tool`
+/// and the in-process agent loop's `InProcessGateBackend::execute_gated` each
+/// canonicalize the request first, then stamp, so the stamped targets always
+/// reflect the canonical operation.
 pub(crate) async fn stamp_base_versions(gate: &WriteGate, request: &mut GateRequest) {
     let targets: Vec<String> = versioned_targets(request).into_iter().map(str::to_owned).collect();
     if targets.is_empty() {
@@ -2101,6 +2184,7 @@ mod tests {
             agent_id: "agent-a".to_owned(),
             tool: "gate_test".to_owned(),
             input: json!({}),
+            registered_as: None,
             session_id: None,
             scope: "fs".to_owned(),
             plan_id: None,
@@ -2116,6 +2200,7 @@ mod tests {
             agent_id: "agent-a".to_owned(),
             tool: "filesystem".to_owned(),
             input: json!({ "operation": operation, "path": path }),
+            registered_as: None,
             session_id: None,
             scope: "fs".to_owned(),
             plan_id: None,
@@ -2618,6 +2703,7 @@ mod tests {
             agent_id: "agent-a".to_owned(),
             tool: "filesystem".to_owned(),
             input: json!({ "operation": "write", "path": path, "content": content }),
+            registered_as: None,
             session_id: None,
             scope: "fs".to_owned(),
             plan_id: None,
