@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::text::{Line, Span};
@@ -153,19 +153,51 @@ pub(crate) enum ReviewStatus {
     Blocked(String),
 }
 
+/// Guard message when the on-disk file diverged from the fingerprint that
+/// was captured when the review was rendered.
+const STALE_DISK_MESSAGE: &str = "File changed on disk since review; re-review before deciding.";
+
+/// Cheap on-disk fingerprint (size + mtime) of a reviewed path, captured when
+/// the diff is rendered. `materialize_paths` would otherwise write the
+/// possibly-stale overlay content over any external edit that landed after
+/// the review; comparing this fingerprint immediately before the write makes
+/// that interleave fail closed. An unreadable or absent file fingerprints as
+/// `(None, None)`, so a file appearing/disappearing also trips the guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiskFingerprint {
+    /// File length in bytes; `None` when the file cannot be stat'd.
+    len: Option<u64>,
+    /// Last-modified time; `None` when absent or unsupported by the platform.
+    modified: Option<SystemTime>,
+}
+
+impl DiskFingerprint {
+    /// Stat `path` and fold the result into a comparable fingerprint.
+    fn capture(path: &camino::Utf8Path) -> Self {
+        match std::fs::metadata(path.as_std_path()) {
+            Ok(meta) => Self { len: Some(meta.len()), modified: meta.modified().ok() },
+            Err(_) => Self { len: None, modified: None },
+        }
+    }
+}
+
 /// State of the staged unified-diff review screen (P02 CLI/parity slice).
 ///
 /// The diff is never computed here: `results` come from
 /// [`compute_diffs_from_virtual_fs`] over the shared overlay, exactly like
 /// the Desktop review. `entries` freezes the overlay entries as presented so
 /// a later decision fails closed when the overlay moved on — the TUI twin of
-/// Desktop `decide_staged`'s stale-review guard.
+/// Desktop `decide_staged`'s stale-review guard. `disks` freezes the on-disk
+/// fingerprints for the same paths so a later accept also fails closed when
+/// the *disk* (not the overlay) moved on.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DiffReviewState {
     /// Reviewable staged files, sorted by path.
     pub(crate) results: Vec<DiffResult>,
     /// The reviewed overlay entry per path (the stale-review baseline).
     pub(crate) entries: HashMap<camino::Utf8PathBuf, VirtualFsEntry>,
+    /// The reviewed on-disk fingerprint per path (the disk baseline).
+    pub(crate) disks: HashMap<camino::Utf8PathBuf, DiskFingerprint>,
     /// Index of the selected file.
     pub(crate) index: usize,
     /// Scroll offset into the selected file's unified diff.
@@ -1752,7 +1784,9 @@ impl App {
     // ------------------------------------------------------------------
 
     /// Reload the review from the shared overlay: the unified diffs come from
-    /// [`staged_review`], the reviewed-entry baseline is re-captured, the
+    /// [`staged_review`], the reviewed-entry baseline is re-captured together
+    /// with the on-disk fingerprints of the reviewed paths (so a later accept
+    /// can detect an external disk edit between render and decision), the
     /// selection stays on the file it was showing (falling back to the first),
     /// and the scroll restarts at the top. The previous status is dropped — a
     /// reload is a fresh view; a decision re-sets its own feedback afterwards.
@@ -1762,10 +1796,14 @@ impl App {
         self.diff_review = match self.vfs.lock() {
             Ok(guard) => {
                 let (results, entries) = staged_review(&guard);
+                let disks = entries
+                    .keys()
+                    .map(|path| (path.clone(), DiskFingerprint::capture(path)))
+                    .collect();
                 let index = selected
                     .and_then(|path| results.iter().position(|result| result.path == path))
                     .unwrap_or(0);
-                DiffReviewState { results, entries, index, scroll: 0, status: None }
+                DiffReviewState { results, entries, disks, index, scroll: 0, status: None }
             }
             // Fail closed: a poisoned overlay must not leave a reviewable
             // list behind that could no longer be acted on safely.
@@ -1832,7 +1870,11 @@ impl App {
     /// 2. nothing staged for `path` → `This file has no staged changes`,
     /// 3. the presented entry no longer matches the overlay → fail closed
     ///    with the stale-review message,
-    /// 4. accept materializes then unstages; reject only unstages — the
+    /// 4. on accept, the on-disk fingerprint no longer matches the one
+    ///    captured when the review was rendered → fail closed (an external
+    ///    edit landed after the diff was presented; overwriting it would
+    ///    silently discard the newer disk state),
+    /// 5. accept materializes then unstages; reject only unstages — the
     ///    on-disk state is authoritative, exactly as on Desktop.
     pub(crate) fn decide_staged(
         &self,
@@ -1844,6 +1886,7 @@ impl App {
             return Err("Save your edits before accepting or discarding staged changes.".into());
         }
         let reviewed = self.diff_review.entries.get(path).cloned();
+        let disk_reviewed = self.diff_review.disks.get(path).cloned();
         let mut guard =
             self.vfs.lock().map_err(|_| "Staged changes are unavailable".to_string())?;
         if !guard.changed_paths().contains(&path) {
@@ -1853,6 +1896,13 @@ impl App {
             return Err("Staged changes changed. Review the latest diff before deciding.".into());
         }
         if accept {
+            // Re-stat immediately before the write: the overlay may be
+            // intact while the disk file changed under the review. A missing
+            // baseline (never captured at render) also fails closed.
+            match disk_reviewed {
+                Some(baseline) if DiskFingerprint::capture(path) == baseline => {}
+                _ => return Err(STALE_DISK_MESSAGE.to_string()),
+            }
             guard.materialize_paths(&[path.to_path_buf()]).map_err(|error| error.to_string())?;
         }
         guard.unstage(path);
@@ -4330,6 +4380,35 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).expect("disk"), "original\n");
         assert!(app.vfs.lock().expect("vfs lock").get(&path).is_some());
         assert_eq!(app.diff_review.results.len(), 1, "the stale review is retained");
+    }
+
+    #[test]
+    fn review_accept_refuses_when_the_file_changed_on_disk_after_render() {
+        let (_dir, path, mut app) = staged_review_app();
+        app.screen = Screen::DiffReview;
+        // An external editor rewrites the file after the diff was rendered
+        // but before the decision lands (different length → the mtime+len
+        // fingerprint must differ regardless of timestamp granularity).
+        std::fs::write(&path, "external edit landed first\n").expect("external write");
+
+        app.handle_key(key_event(KeyCode::Char('a'), KeyModifiers::empty()));
+        assert_eq!(app.diff_review.status, Some(ReviewStatus::Blocked(STALE_DISK_MESSAGE.into())));
+        // Fail closed: the stale overlay never reached disk, nothing was
+        // unstaged, and the stale review is retained for re-review.
+        assert_eq!(std::fs::read_to_string(&path).expect("disk"), "external edit landed first\n");
+        assert!(app.vfs.lock().expect("vfs lock").get(&path).is_some());
+        assert_eq!(app.diff_review.results.len(), 1, "the stale review is retained");
+
+        // Re-review re-captures the disk baseline, so the accept then goes
+        // through and the reviewed proposal overwrites the disk on purpose.
+        app.refresh_diff_review();
+        app.handle_key(key_event(KeyCode::Char('a'), KeyModifiers::empty()));
+        assert_eq!(
+            app.diff_review.status,
+            Some(ReviewStatus::Decided { path: path.to_string(), accept: true })
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("disk"), "proposal\n");
+        assert!(app.vfs.lock().expect("vfs lock").get(&path).is_none(), "the entry is dropped");
     }
 
     #[test]
