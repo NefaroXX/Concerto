@@ -8,6 +8,7 @@
 //! approval), and foundational types.
 
 pub mod authorization;
+pub mod checkpoint;
 pub mod error;
 pub mod event;
 pub mod executor;
@@ -88,6 +89,21 @@ pub use traits::context_overflow::{ContextOverflowStrategy, NoOpOverflowStrategy
 pub use traits::memory::MemoryStore;
 pub use traits::provider::LlmProvider;
 pub use traits::vector_store::{RowIndexFact, VectorStore};
+
+/// Durable file checkpoints (ADR-82 §4, slice 5): the record envelope, the
+/// sidecar byte budget, the capture grammar, and the restore collaborator
+/// traits the executor restores through.
+pub use checkpoint::{
+    plan_capture, versioned_fs_targets, CaptureKind, CheckpointByteRef, CheckpointExclusion,
+    CheckpointExclusionClass, CheckpointRecord, CheckpointRecordError, CheckpointResource,
+    CheckpointResourceKind, CheckpointScope, CheckpointStatus, CheckpointStore,
+    CheckpointStoreError, MutationCaptureSink, OwnershipConflictInfo, OwnershipOracle,
+    PlannedCapture, PreImageBytes, RestoreError, RestoreMethod, RestoreOutcome, StashRestorer,
+    CHECKPOINT_BLOB_LIMIT_BYTES, CHECKPOINT_LIMITATIONS_MAX_ENTRIES,
+    CHECKPOINT_LIMITATION_MAX_BYTES, CHECKPOINT_METADATA_MAX_ENTRIES,
+    CHECKPOINT_METADATA_MAX_KEY_BYTES, CHECKPOINT_METADATA_MAX_VALUE_BYTES,
+    CHECKPOINT_PATH_MAX_BYTES, CHECKPOINT_RECORD_SCHEMA_VERSION, PARTIAL_SCOPE_LIMITATION,
+};
 
 /// Typed tool-failure envelope (ADR-82 §1, slice 2): the bounded failure
 /// vocabulary core owns so no consumer parses `Display` text to classify a

@@ -136,6 +136,7 @@
 
 use crate::hunk::{stage_three_way, HunkStaging};
 use crate::ownership::{OwnershipRecord, OwnershipState, OwnershipTable, OwnershipVerdict};
+use concerto_core::checkpoint::versioned_fs_targets;
 use concerto_core::error::{PolicyError, ToolError};
 use concerto_core::executor::ToolExecutor;
 use concerto_core::ids::{new_id, Ulid};
@@ -144,6 +145,7 @@ use concerto_core::types::{
     CapabilitySet, PolicyAction, PolicyVerdict, SessionContext, ToolDefinition,
 };
 use concerto_core::CancellationToken;
+use concerto_sessions::file_checkpoints::FileCheckpointStore;
 use concerto_sessions::whiteboard::{
     append_whiteboard_event, latest_gate_seq, load_whiteboard_events_up_to, write_applied_payload,
     NewWhiteboardEvent, WhiteboardKind,
@@ -534,6 +536,11 @@ pub struct WriteGate {
     /// Observed pre-image bytes keyed by blake3 hex — lets hunk staging
     /// recover a claimed base text without a wire format change.
     text_cache: Mutex<PreImageTextCache>,
+    /// ADR-82 slice 5 (a): checkpoint sidecar backfill target. When set, every
+    /// gated write banks its pre-image bytes (already in hand for hashing)
+    /// for active checkpoints covering the path — beside the `WriteApplied`
+    /// append, never before the decision. `None` disables the seam.
+    checkpoint_store: Option<FileCheckpointStore>,
     /// Run-start wall clock (Unix epoch millis, UTC) captured at construction.
     ///
     /// The gate is constructed once per run (the in-process single-agent path
@@ -561,6 +568,11 @@ pub struct WriteGate {
 /// pre-image capture, the base_version conflict check, and the supervisor's
 /// always-on stamp all key off it, so they can never drift.
 ///
+/// The grammar itself lives in core
+/// ([`versioned_fs_targets`](concerto_core::checkpoint::versioned_fs_targets) —
+/// shared with the executor's pre-execution capture seam, ADR-82 slice 5);
+/// this wrapper keeps the gate's call sites unchanged.
+///
 /// READ-ONLY vs MUTATED distinction: every entry here is mutated and fully
 /// versioned — attributed (pre-image captured for the WAL row) AND
 /// conflict-checked AND claim-stamped. The one exception is the `copy`
@@ -571,35 +583,8 @@ pub struct WriteGate {
 /// audit trail) but never conflict-checked and never claim-stamped. A
 /// `move`'s source IS mutated (the file is removed), so it is a versioned
 /// target on equal footing with the destination.
-fn versioned_targets(req: &GateRequest) -> Vec<&str> {
-    if req.tool != "filesystem" {
-        return Vec::new();
-    }
-    let Some(operation) = req.input.get("operation").and_then(serde_json::Value::as_str) else {
-        return Vec::new();
-    };
-    let path = req.input.get("path").and_then(serde_json::Value::as_str);
-    let destination = req.input.get("destination").and_then(serde_json::Value::as_str);
-    match operation {
-        "write" | "delete" => path.into_iter().collect(),
-        // A move removes the source and writes the destination: both are
-        // mutated and both must be versioned (see module docs for why).
-        "move" => {
-            let mut targets = Vec::with_capacity(2);
-            if let Some(source) = path {
-                targets.push(source);
-            }
-            if let Some(destination) = destination {
-                targets.push(destination);
-            }
-            targets
-        }
-        // A copy writes only the destination; the source is read-only (see
-        // the doc comment above) and is handled separately by
-        // [`attributed_paths`].
-        "copy" => destination.into_iter().collect(),
-        _ => Vec::new(),
-    }
+fn versioned_targets(req: &GateRequest) -> Vec<String> {
+    versioned_fs_targets(&req.tool, &req.input)
 }
 
 /// INTERNAL/legacy: the PRIMARY versioned target of a request — the path
@@ -613,7 +598,19 @@ fn versioned_targets(req: &GateRequest) -> Vec<&str> {
 /// [`versioned_targets`] — the multi-target source of truth — never this
 /// legacy projection. `None` for non-versioned requests.
 fn versioned_target(req: &GateRequest) -> Option<&str> {
-    versioned_targets(req).last().copied()
+    // `versioned_targets` is owned now (the grammar lives in core); the
+    // legacy projection borrows from a temporary — so recompute the primary
+    // directly from the canonical input instead of indexing the owned vec.
+    let input = &req.input;
+    if req.tool != "filesystem" {
+        return None;
+    }
+    let operation = input.get("operation").and_then(serde_json::Value::as_str)?;
+    match operation {
+        "write" | "delete" => input.get("path").and_then(serde_json::Value::as_str),
+        "move" | "copy" => input.get("destination").and_then(serde_json::Value::as_str),
+        _ => None,
+    }
 }
 
 /// True when a request is a read-only `filesystem` operation that must never
@@ -648,14 +645,16 @@ fn is_read_only_request(req: &GateRequest) -> bool {
 /// recorded on the WAL row for the audit trail even though it is not a
 /// versioned/conflict-checked target). Paths that do not exist simply carry
 /// no hash in the capture map.
-fn attributed_paths(req: &GateRequest) -> Vec<&str> {
+fn attributed_paths(req: &GateRequest) -> Vec<String> {
+    // Owned: the versioned-target grammar lives in core (single source of
+    // truth); the read-only `copy` source is appended here for attribution.
     let mut paths = versioned_targets(req);
     if req.tool == "filesystem"
         && req.input.get("operation").and_then(serde_json::Value::as_str) == Some("copy")
     {
         if let Some(source) = req.input.get("path").and_then(serde_json::Value::as_str) {
-            if !paths.contains(&source) {
-                paths.push(source);
+            if !paths.iter().any(|p| p == source) {
+                paths.push(source.to_owned());
             }
         }
     }
@@ -709,8 +708,19 @@ impl WriteGate {
             locks: Arc::new(Mutex::new(HashMap::new())),
             ownership: Arc::new(Mutex::new(OwnershipTable::new())),
             text_cache: Mutex::new(PreImageTextCache::default()),
+            checkpoint_store: None,
             run_started_at_ms: now_millis(),
         }
+    }
+
+    /// Attach the ADR-82 slice 5 (a) checkpoint sidecar: gated writes bank
+    /// their pre-image bytes for active checkpoints covering the path, beside
+    /// the `WriteApplied` append. Zero extra disk reads (the bytes are already
+    /// in hand for hashing); fail-soft (a backfill failure is debug-logged,
+    /// never fails the write).
+    pub fn with_checkpoint_store(mut self, store: FileCheckpointStore) -> Self {
+        self.checkpoint_store = Some(store);
+        self
     }
 
     /// The tool registry the gate executes under — the single source of
@@ -1320,6 +1330,11 @@ impl WriteGate {
         // when computable and the conflict check below compares against the
         // same capture.
         let pre_images = self.pre_image_hashes(&req).await?;
+        // ADR-82 slice 5 (a): bank the captured bytes for active checkpoints
+        // covering the attributed paths, beside the WAL append below. The
+        // bytes are already in hand (hashed above) — zero extra disk reads —
+        // and the backfill is fail-soft: it never fails the write.
+        self.backfill_checkpoint_pre_images(&req, &pre_images, cancel.clone()).await;
         // The whiteboard `pre_image_hash` column keeps the PRIMARY target's
         // hash (the single-target-era semantics, so the column is stable).
         let primary_pre_image =
@@ -1338,8 +1353,7 @@ impl WriteGate {
         // WAL append — with holder info in the reason. The reserving owner
         // proceeds through its own lock, and an expired reservation has
         // already lapsed (lazy purge).
-        let versioned =
-            versioned_targets(&req).into_iter().map(str::to_owned).collect::<Vec<String>>();
+        let versioned = versioned_targets(&req);
         {
             let mut locks = self.locks.lock().map_err(|error| {
                 GateError::Policy(format!("write-gate lock table poisoned: {error}"))
@@ -1628,9 +1642,10 @@ impl WriteGate {
     ) -> Result<BTreeMap<String, String>, GateError> {
         let mut hashes = BTreeMap::new();
         for relative_path in attributed_paths(req) {
-            let bytes = self.pre_image.read(Path::new(relative_path)).await.map_err(|error| {
-                GateError::PreImage(format!("read pre-image for {relative_path:?}: {error}"))
-            })?;
+            let bytes =
+                self.pre_image.read(Path::new(relative_path.as_str())).await.map_err(|error| {
+                    GateError::PreImage(format!("read pre-image for {relative_path:?}: {error}"))
+                })?;
             if let Some(bytes) = bytes {
                 let hash = blake3::hash(&bytes).to_hex().to_string();
                 // Cache the observed bytes (content-addressed by hash) so
@@ -1649,6 +1664,54 @@ impl WriteGate {
             }
         }
         Ok(hashes)
+    }
+
+    /// ADR-82 slice 5 (a): bank this write's pre-image bytes for every active
+    /// checkpoint covering an attributed path, beside the `WriteApplied`
+    /// append. The bytes come from the in-memory text cache (populated by
+    /// [`Self::pre_image_hashes`] just above) — no second disk read. `INSERT
+    /// OR IGNORE` in the store keeps a checkpoint-creation snapshot
+    /// authoritative; oversized captures are skipped at the store boundary.
+    /// Fail-soft: every failure path debug-logs and returns, never failing
+    /// the write (capture failure downgrades the resource, per the slice).
+    async fn backfill_checkpoint_pre_images(
+        &self,
+        req: &GateRequest,
+        pre_images: &BTreeMap<String, String>,
+        cancel: CancellationToken,
+    ) {
+        let Some(store) = self.checkpoint_store.as_ref() else {
+            return;
+        };
+        if pre_images.is_empty() || cancel.is_cancelled() {
+            return;
+        }
+        let captures: Vec<(String, String, Vec<u8>)> = match self.text_cache.lock() {
+            Ok(cache) => pre_images
+                .iter()
+                .filter_map(|(path, hash)| {
+                    cache.get(hash).map(|bytes| (path.clone(), hash.clone(), bytes.to_vec()))
+                })
+                .collect(),
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    "checkpoint backfill skipped: pre-image text cache poisoned (fail-soft)"
+                );
+                return;
+            }
+        };
+        if captures.is_empty() {
+            return;
+        }
+        if let Err(error) =
+            store.backfill_pre_images(&captures, req.session_id.as_deref(), &cancel).await
+        {
+            tracing::debug!(
+                %error,
+                "checkpoint sidecar backfill failed beside the WriteApplied append (fail-soft)"
+            );
+        }
     }
 
     /// Parse a caller session id, or mint one when absent (policy/eval need a
@@ -1786,7 +1849,7 @@ impl WriteGate {
 /// canonicalize the request first, then stamp, so the stamped targets always
 /// reflect the canonical operation.
 pub(crate) async fn stamp_base_versions(gate: &WriteGate, request: &mut GateRequest) {
-    let targets: Vec<String> = versioned_targets(request).into_iter().map(str::to_owned).collect();
+    let targets: Vec<String> = versioned_targets(request);
     if targets.is_empty() {
         return;
     }
