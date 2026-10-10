@@ -1315,6 +1315,11 @@ pub struct ToolExecutionSummary {
     /// Populated alongside [`Self::canonical_tool`].
     #[serde(default)]
     pub canonical_operation: Option<String>,
+    /// ADR-82 slice 2: the typed failure envelope for a failed execution.
+    /// `None` for successes and for summaries recorded before the field
+    /// existed (legacy checkpoints/transcripts decode with `None`).
+    #[serde(default)]
+    pub failure: Option<crate::tool_failure::ToolFailure>,
 }
 
 /// One structured verification result for a written file.

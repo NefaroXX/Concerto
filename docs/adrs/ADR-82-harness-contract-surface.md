@@ -124,13 +124,13 @@ falls back to `Opaque`. The mapping:
 |---|---|---|---|
 | `PolicyDenied { rule }` | `policy_denied` | policy | `do-not-re-issue` |
 | `PausedAwaitingApproval { .. }` | `awaiting_approval` | policy | `awaiting-decision` |
-| `ExecutionFailed { message }` | `execution_failed` | execution | prose payload → routed through the compatibility predicate below |
+| `ExecutionFailed { message }` | `execution_failed` | execution | shared marker grammar (`DETERMINISTIC_FAILURE_MARKERS`, same constants the ledger parses): match → `do-not-re-issue`, else `unknown` — INTERIM pending H02 construction-site typing |
 | `NotARepository { .. }` | `not_a_repository` | environment | `do-not-re-issue` |
 | `Timeout { .. }` | `timeout` | execution | `bounded-retry-with-backoff` |
 | `Cancelled` | `cancelled` | control | `do-not-re-issue-same-intent` |
 | `VirtualFsConflict { reason }` | `virtual_fs_conflict` | workspace | containment → `do-not-re-issue`; else `retryable-after-rebase` |
 | `RollbackNotSupported` | `rollback_not_supported` | environment | `do-not-re-issue` |
-| `LspError { .. }` | `lsp_error` | execution | `bounded-retry-with-backoff` |
+| `LspError { .. }` | `lsp_error` | execution | `unknown` (faults heterogeneous — missing binary vs transient crash — with no structural signal in the variant; calibration deferred) |
 | `Io(kind)` | `io_error` | execution | structural `ErrorKind`s (below) → `do-not-re-issue`; else `bounded-retry-with-backoff` |
 | unknown variant (`#[non_exhaustive]`) | `opaque` | opaque | compatibility predicate (below) |
 
@@ -150,7 +150,8 @@ the cases that a boolean collapses:
   operator; resolution is the answer, not a retry (`PausedAwaitingApproval`).
 - `bounded-retry-with-backoff` — **timeout** and transient execution faults:
   may resolve on a later attempt, retried with backoff and a bound
-  (`Timeout`, non-structural `Io`, `LspError`).
+  (`Timeout`, non-structural `Io` — `LspError` is deliberately `unknown`,
+  not here, for the heterogeneity reason in the table).
 - `retryable-after-rebase` — a genuine overlay conflict (a concurrent edit) may
   resolve after the agent reconciles the workspace (`VirtualFsConflict` with a
   non-containment `reason`).

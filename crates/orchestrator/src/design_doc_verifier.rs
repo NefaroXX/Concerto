@@ -796,6 +796,7 @@ mod tests {
                 served_from: None,
                 canonical_tool: None,
                 canonical_operation: None,
+                failure: None,
                 paths: vec![ObservedPath {
                     path: "src/main.rs".to_owned(),
                     size_bytes: Some(10),
@@ -824,6 +825,7 @@ mod tests {
                 served_from: None,
                 canonical_tool: None,
                 canonical_operation: None,
+                failure: None,
                 paths: vec![ObservedPath {
                     path: "src/out.rs".to_owned(),
                     size_bytes: Some(5),
@@ -855,6 +857,7 @@ mod tests {
                 paths: vec![],
                 canonical_tool: None,
                 canonical_operation: None,
+                failure: None,
             },
         )
         .await;
@@ -877,6 +880,7 @@ mod tests {
                 served_from: None,
                 canonical_tool: None,
                 canonical_operation: None,
+                failure: None,
                 paths: vec![],
             },
         )
@@ -950,6 +954,7 @@ mod tests {
                 served_from: None,
                 canonical_tool: None,
                 canonical_operation: None,
+                failure: None,
                 paths: vec![ObservedPath {
                     path: "src/observed.rs".to_owned(),
                     size_bytes: Some(1),
@@ -978,6 +983,7 @@ mod tests {
                 served_from: None,
                 canonical_tool: None,
                 canonical_operation: None,
+                failure: None,
                 paths: vec![ObservedPath {
                     path: "elsewhere.rs".to_owned(),
                     size_bytes: Some(1),
@@ -1048,6 +1054,7 @@ mod tests {
                 paths: vec![],
                 canonical_tool: None,
                 canonical_operation: None,
+                failure: None,
             },
         )
         .await;

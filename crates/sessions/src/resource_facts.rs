@@ -131,6 +131,11 @@ pub struct ToolExecutedPayload {
     /// Populated alongside [`Self::canonical_tool`].
     #[serde(default)]
     pub canonical_operation: Option<String>,
+    /// ADR-82 slice 2: the typed failure envelope for a failed execution.
+    /// `None` for successes and for rows recorded before the field existed
+    /// (legacy payloads decode with `None`).
+    #[serde(default)]
+    pub failure: Option<concerto_core::tool_failure::ToolFailure>,
 }
 
 /// Payload of a `WorkspaceSnapshot` whiteboard event — a read-only workspace
@@ -776,6 +781,7 @@ mod tests {
             served_from: None,
             canonical_tool: None,
             canonical_operation: None,
+            failure: None,
         }
     }
 
@@ -1424,6 +1430,42 @@ mod tests {
         let minimal: ToolExecutedPayload =
             serde_json::from_value(json!({ "tool": "ls" })).expect("minimal decodes");
         assert_eq!(minimal.served_from, None, "old events decode with served_from absent");
+    }
+
+    #[tokio::test]
+    async fn failure_envelope_round_trips_and_defaults_to_none() {
+        // ADR-82 slice 2 compat: round-trip of the additive `failure` key,
+        // plus legacy decode of payloads recorded before the key existed.
+        let mut executed = observed("a.md", "h1", "1");
+        assert_eq!(executed.failure, None, "ordinary facts carry no failure");
+        executed.failure = Some(
+            serde_json::from_value(serde_json::json!({
+                "schema_version": 1,
+                "code": "exec.timeout",
+                "category": "execution",
+                "status": "recoverable_failure",
+                "diagnostics": [],
+                "disposition": "bounded-retry-with-backoff",
+                "detail": null,
+                "message": "operation timed out after 30s",
+                "opaque": false,
+                "origin": "builtin",
+            }))
+            .expect("envelope decodes"),
+        );
+        let json = serde_json::to_value(&executed).expect("serialize");
+        let back: ToolExecutedPayload = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(
+            back.failure.as_ref().map(|failure| failure.code.as_str()),
+            Some("exec.timeout"),
+            "failure envelope round trips"
+        );
+
+        let mut legacy = serde_json::to_value(observed("a.md", "h1", "1")).expect("serialize");
+        assert!(legacy.get("failure").is_some(), "current writers emit the key");
+        legacy.as_object_mut().expect("object").remove("failure");
+        let back: ToolExecutedPayload = serde_json::from_value(legacy).expect("legacy decodes");
+        assert_eq!(back.failure, None, "pre-envelope events decode with failure absent");
     }
 
     #[tokio::test]

@@ -177,6 +177,9 @@ impl ToolFactContext {
                 // child, whose consumers fall back to the name grammar.
                 "canonical_tool": fact.canonical_tool,
                 "canonical_operation": fact.canonical_operation,
+                // ADR-82 slice 2: the typed failure envelope (`None` for
+                // successes). Serializes as null when absent.
+                "failure": fact.failure,
             }),
             pre_image_hash: single_path_pre_image(fact),
             created_at,
@@ -227,6 +230,7 @@ impl ToolFactContext {
                 served_from: None,
                 canonical_tool: fact.canonical_tool.map(str::to_owned),
                 canonical_operation: fact.canonical_operation.map(str::to_owned),
+                failure: fact.failure.cloned(),
             };
             if let Err(err) =
                 facts.apply_observed(&event_id, &self.agent_id, created_at, &payload, cancel).await
@@ -293,6 +297,10 @@ impl ToolFactContext {
                 // ADR-82 slice 1: canonical identity, as in `record_tool_executed`.
                 "canonical_tool": fact.canonical_tool,
                 "canonical_operation": fact.canonical_operation,
+                // ADR-82 slice 2: the typed failure envelope for a failed
+                // execution (`None` for successes). Serializes as null when
+                // absent, like the canonical pair above.
+                "failure": fact.failure,
             }),
             pre_image_hash: None,
             created_at: unix_ms(),
@@ -387,6 +395,10 @@ pub struct ToolExecutedFact<'a> {
     /// an alias write whose raw args named no `operation`). Populated alongside
     /// [`Self::canonical_tool`].
     pub canonical_operation: Option<&'a str>,
+    /// ADR-82 slice 2: the typed failure envelope for a failed execution
+    /// (`None` for successes). Rides the event payload and the derived-store
+    /// payload alongside the canonical pair.
+    pub failure: Option<&'a concerto_core::tool_failure::ToolFailure>,
 }
 
 impl ToolExecutedFact<'_> {
@@ -831,6 +843,7 @@ mod tests {
                 pre_image_hashes: HashMap::new(),
                 canonical_tool: None,
                 canonical_operation: None,
+                failure: None,
             },
             &cancel,
         )
@@ -915,6 +928,7 @@ mod tests {
                     served_from: None,
                     canonical_tool: None,
                     canonical_operation: None,
+                    failure: None,
                 },
                 &cancel,
             )
@@ -947,6 +961,7 @@ mod tests {
                 pre_image_hashes: pre_images,
                 canonical_tool: None,
                 canonical_operation: None,
+                failure: None,
             },
             &cancel,
         )
@@ -994,6 +1009,7 @@ mod tests {
                 pre_image_hashes: HashMap::new(),
                 canonical_tool: None,
                 canonical_operation: None,
+                failure: None,
             },
             &cancel,
         )
@@ -1027,6 +1043,7 @@ mod tests {
                 pre_image_hashes: HashMap::new(),
                 canonical_tool: None,
                 canonical_operation: None,
+                failure: None,
             },
             &cancel,
         )
@@ -1077,6 +1094,7 @@ mod tests {
                 pre_image_hashes: pre_images.clone(),
                 canonical_tool: None,
                 canonical_operation: None,
+                failure: None,
             }
         }
         let single = HashMap::from([("one.md".to_owned(), Some("h".to_owned()))]);
@@ -1195,6 +1213,7 @@ mod tests {
             pre_image_hashes: single.clone(),
             canonical_tool: None,
             canonical_operation: None,
+            failure: None,
         };
         assert_eq!(
             single_path_pre_image(&fact).as_deref(),
@@ -1220,6 +1239,7 @@ mod tests {
             pre_image_hashes: single,
             canonical_tool: None,
             canonical_operation: None,
+            failure: None,
         };
         assert_eq!(
             single_path_pre_image(&fact).as_deref(),
@@ -1257,6 +1277,7 @@ mod tests {
                 pre_image_hashes: HashMap::new(),
                 canonical_tool: None,
                 canonical_operation: None,
+                failure: None,
             },
             &cancel,
         )
@@ -1296,6 +1317,7 @@ mod tests {
                 pre_image_hashes: HashMap::new(),
                 canonical_tool: None,
                 canonical_operation: None,
+                failure: None,
             },
             &cancel,
         )
@@ -1335,6 +1357,7 @@ mod tests {
                 pre_image_hashes: HashMap::new(),
                 canonical_tool: None,
                 canonical_operation: None,
+                failure: None,
             },
             &cancel,
         )
@@ -1379,6 +1402,7 @@ mod tests {
                 pre_image_hashes: HashMap::new(),
                 canonical_tool: None,
                 canonical_operation: None,
+                failure: None,
             },
             &cancel,
         )
@@ -1443,6 +1467,60 @@ mod tests {
         }
     }
 
+    /// ADR-82 slice 2: a failed execution records its typed failure
+    /// envelope on the event payload, and the derived-store payload decodes
+    /// it back — the additive `failure` key round-trips through the writer.
+    #[tokio::test]
+    async fn writer_records_typed_failure_envelope_for_failed_tool() {
+        use concerto_core::tool_failure::{ToolFailure, ToolFailureContext};
+
+        let (_dir, pool) = test_pool().await;
+        let (ctx, _store) = facts_for(&pool);
+        let root = tempfile::tempdir().expect("tempdir created");
+        std::fs::write(root.path().join("c.txt"), b"x").expect("write fixture");
+        let cancel = cancel();
+        let error = concerto_core::ToolError::Timeout { timeout_secs: 30 };
+        let failure = ToolFailure::from_error(&error, ToolFailureContext::builtin());
+
+        ctx.record_tool_executed(
+            &ToolExecutedFact {
+                session_id: "session-1",
+                task_id: None,
+                run_id: None,
+                generation: "",
+                project_root: root.path(),
+                tool: "shell",
+                args: &serde_json::json!({ "command": "sleep 60" }),
+                success: false,
+                outcome: tool_outcome_for_error(&error),
+                exit_code: None,
+                paths: &["c.txt".to_owned()],
+                file_affecting: false,
+                pre_image_hashes: HashMap::new(),
+                canonical_tool: None,
+                canonical_operation: None,
+                failure: Some(&failure),
+            },
+            &cancel,
+        )
+        .await;
+
+        let events = load_tool_events(&pool).await;
+        assert_eq!(events.len(), 1, "failed execution still recorded");
+        assert_eq!(
+            events[0].payload["failure"]["code"], "exec.timeout",
+            "the envelope rides the event payload"
+        );
+        assert_eq!(events[0].payload["failure"]["disposition"], "bounded-retry-with-backoff");
+        let payload: ToolExecutedPayload =
+            serde_json::from_value(events[0].payload.clone()).expect("payload decodes");
+        assert_eq!(
+            payload.failure.as_ref().map(|failure| failure.code.as_str()),
+            Some("exec.timeout"),
+            "the derived-store payload carries the envelope"
+        );
+    }
+
     /// W1 S5: the writer persists no free-text failure — no stderr, no
     /// message/error-text keys on the event payload.
     #[tokio::test]
@@ -1471,6 +1549,7 @@ mod tests {
                 pre_image_hashes: HashMap::new(),
                 canonical_tool: None,
                 canonical_operation: None,
+                failure: None,
             },
             &cancel,
         )

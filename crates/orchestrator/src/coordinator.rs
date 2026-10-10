@@ -33968,6 +33968,7 @@ mod tests {
                 served_from: None,
                 canonical_tool: None,
                 canonical_operation: None,
+                failure: None,
                 paths: vec![concerto_sessions::ObservedPath {
                     path: path.to_owned(),
                     size_bytes: Some(size),
@@ -34082,6 +34083,7 @@ mod tests {
             served_from: None,
             canonical_tool: None,
             canonical_operation: None,
+            failure: None,
             paths: vec![concerto_sessions::ObservedPath {
                 path: "lib.rs".to_owned(),
                 size_bytes: Some(meta.len()),
@@ -34108,6 +34110,7 @@ mod tests {
             served_from: None,
             canonical_tool: None,
             canonical_operation: None,
+            failure: None,
             paths: vec![concerto_sessions::ObservedPath {
                 path: "gone.md".to_owned(),
                 size_bytes: Some(gone_meta.len()),
@@ -34224,6 +34227,7 @@ mod tests {
             served_from: None,
             canonical_tool: None,
             canonical_operation: None,
+            failure: None,
             paths: vec![concerto_sessions::ObservedPath {
                 path: "src/main.rs".to_owned(),
                 size_bytes: Some(1024),
@@ -36002,6 +36006,7 @@ mod tests {
             // to the registered-name grammar (tool is "filesystem" here).
             canonical_tool: None,
             canonical_operation: None,
+            failure: None,
         };
         ctx.record_tool_executed(&fact, &CancellationToken::new()).await;
         newest_row_id(pool, "tool-executed").await
