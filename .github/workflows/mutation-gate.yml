@@ -87,7 +87,7 @@ jobs:
           path: repo
 
       - name: Install Rust toolchain (1.96.0)
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@1.120.0
 
       - name: Install cargo-mutants (pinned, locked)
         run: cargo install --locked --version 27.1.0 cargo-mutants
@@ -169,7 +169,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install Rust toolchain (1.96.0)
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@1.120.0
 
       - name: Install cargo-mutants (pinned, locked)
         run: cargo install --locked --version 27.1.0 cargo-mutants
