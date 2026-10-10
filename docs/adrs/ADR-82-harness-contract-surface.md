@@ -632,7 +632,11 @@ corresponding upgrades (see the milestone note in Consequences).
    pruned ⇒ `Expired`, restorable claim withdrawn); the byte budget is
    `CHECKPOINT_BLOB_LIMIT_BYTES`, not `CACHE_LIMIT_BYTES`; **compatibility
    test**: named-version policy (current as-is, named legacy versions migrate,
-   unknown rejected — per `checkpoint.rs:503-541`). **Partial milestone**: the
+   unknown rejected — per `checkpoint.rs:503-541`). **Follow-up filed (slice-1
+   review)**: promote the slice-1 `user_response`-envelope canonical pair to
+   dedicated `audit_log` columns, coordinated with the archive schema
+   (`audit_retention.rs` explicit column list) — forensic queries should not
+   JSON-parse a free-text column permanently. **Partial milestone**: the
    ≤ 64 KiB text slice does not complete binary/untracked-file restoration;
    the streaming/block-based pre-image store is the completing step and is
    planned separately.
