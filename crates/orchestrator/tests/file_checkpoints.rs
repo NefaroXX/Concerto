@@ -831,3 +831,338 @@ async fn policy_denial_aborts_restore_loudly() {
         .expect("record survives");
     assert!(matches!(back.status, CheckpointStatus::Active), "denial is retriable");
 }
+
+/// Binary (≤budget, non-UTF-8) content degrades honestly: hash-only +
+/// excluded at creation, and the mixed restore is `Partial` with the binary
+/// limitation — nothing is written for the binary path and no success is
+/// claimed. (The streaming store that would restore bytes is deferred.)
+#[tokio::test]
+async fn binary_file_degrades_to_partial_with_limitation() {
+    let h = Harness::new().await;
+    let binary = [0x00u8, 0x01, 0xfe, 0xff, 0x7f, 0x80];
+    std::fs::write(h.root.join("bin.dat"), binary).expect("seed binary");
+    h.gated_write("w-small", "agent-a", "small.txt", "small-v1").await;
+
+    let record = create_file_checkpoint(
+        &h.store,
+        &h.root,
+        h.session_id,
+        fs_scope(&["bin.dat", "small.txt"]),
+        vec!["bin.dat".to_string(), "small.txt".to_string()],
+        "agent-a",
+        BTreeMap::new(),
+        Vec::new(),
+        None,
+        None,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("checkpoint creation");
+    assert_eq!(
+        record.restore_method,
+        RestoreMethod::PreImageStore,
+        "the small text file banks bytes"
+    );
+    assert!(
+        matches!(record.status, CheckpointStatus::Partial { .. }),
+        "hash-only binary path makes the checkpoint Partial, got {:?}",
+        record.status
+    );
+    assert!(
+        record
+            .excluded
+            .iter()
+            .any(|e| { e.path.as_deref() == Some("bin.dat") && e.reason.contains("binary") }),
+        "the binary exclusion names the path, got {:?}",
+        record.excluded
+    );
+
+    // Mutate both paths after the checkpoint.
+    let mutated = [0xdeu8, 0xad, 0xbe, 0xef];
+    std::fs::write(h.root.join("bin.dat"), mutated).expect("mutate binary");
+    h.gated_write("w-small-2", "agent-a", "small.txt", "small-v2").await;
+
+    match restore_file_checkpoint(
+        &h.executor,
+        &h.store,
+        &h.gate,
+        None,
+        &h.session(),
+        &record.checkpoint_id.to_string(),
+        "agent-a",
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("partial restore surfaces, never fails")
+    {
+        concerto_core::checkpoint::RestoreOutcome::Partial { restored, missing, limitations } => {
+            assert_eq!(restored, vec!["small.txt".to_string()]);
+            assert_eq!(missing, vec!["bin.dat".to_string()]);
+            assert!(
+                limitations.iter().any(|l| l.contains("bin.dat") && l.contains("binary")),
+                "the binary limitation names the path, got {limitations:?}"
+            );
+        }
+        other => panic!("expected Partial (never a success claim), got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read(h.root.join("bin.dat")).expect("binary survives on disk"),
+        mutated,
+        "no write was attempted for the binary path"
+    );
+    assert_eq!(h.disk("small.txt"), "small-v1", "the bankable subset restored");
+}
+
+/// TOCTOU race (locks the Phase-2 ownership re-check): Phase 1 passes while
+/// the path is self-owned; a coordinator-mediated transfer then hands it to
+/// a sibling — injected at the restore's first sidecar-byte load, the only
+/// await point between the pre-check and the gated write — and the Phase-2
+/// write re-checks the gate's live table, aborting with the STRUCTURED
+/// `OwnershipConflict` naming the new owner. Never a generic denial, never
+/// a silent overwrite, status left retriable.
+#[tokio::test]
+async fn toctou_sibling_acquire_between_phases_surfaces_structured_conflict() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use concerto_core::checkpoint::{
+        CheckpointRecord, CheckpointStore, CheckpointStoreError, PreImageBytes, RestoreError,
+    };
+    use concerto_orchestrator::file_checkpoint::GateOwnershipOracle;
+
+    /// Sidecar store that fires the sibling's ownership acquisition on the
+    /// first byte load (the Phase-1→Phase-2 interleave point), then
+    /// delegates every method to the real store.
+    struct HijackStore {
+        inner: FileCheckpointStore,
+        gate: Arc<WriteGate>,
+        fired: AtomicBool,
+    }
+
+    impl HijackStore {
+        /// The sibling acquires the contested path mid-restore via the only
+        /// legitimate hand-off: a coordinator-mediated transfer (a steal
+        /// through the gate would itself be refused).
+        async fn acquire_as_sibling(&self) {
+            self.gate
+                .transfer_ownership("race.txt", "agent-a", "agent-b", "transfer-1")
+                .await
+                .expect("coordinator-mediated transfer hands the path to agent-b");
+        }
+    }
+
+    #[async_trait]
+    impl CheckpointStore for HijackStore {
+        async fn load_record(
+            &self,
+            checkpoint_id: &str,
+            cancel: CancellationToken,
+        ) -> Result<Option<CheckpointRecord>, CheckpointStoreError> {
+            self.inner.load_record(checkpoint_id, cancel).await
+        }
+
+        async fn load_bytes(
+            &self,
+            checkpoint_id: &str,
+            canonical_path: &str,
+            cancel: CancellationToken,
+        ) -> Result<PreImageBytes, CheckpointStoreError> {
+            if !self.fired.swap(true, Ordering::SeqCst) {
+                self.acquire_as_sibling().await;
+            }
+            self.inner.load_bytes(checkpoint_id, canonical_path, cancel).await
+        }
+
+        async fn mark_restored(
+            &self,
+            checkpoint_id: &str,
+            at_ms: i64,
+            by: &str,
+            cancel: CancellationToken,
+        ) -> Result<bool, CheckpointStoreError> {
+            self.inner.mark_restored(checkpoint_id, at_ms, by, cancel).await
+        }
+
+        async fn mark_partial(
+            &self,
+            checkpoint_id: &str,
+            missing: Vec<String>,
+            cancel: CancellationToken,
+        ) -> Result<(), CheckpointStoreError> {
+            self.inner.mark_partial(checkpoint_id, missing, cancel).await
+        }
+    }
+
+    /// No-op stash restorer (a PreImageStore record never consults it).
+    #[derive(Debug)]
+    struct NoopStash;
+
+    impl concerto_core::checkpoint::StashRestorer for NoopStash {
+        fn restore_stash(&self, _checkpoint: &CheckpointRecord) -> Result<String, String> {
+            Err("not a stash checkpoint".to_string())
+        }
+    }
+
+    let h = Harness::new().await;
+    h.gated_write("w-1", "agent-a", "race.txt", "checkpoint-v1").await;
+    let record = create_file_checkpoint(
+        &h.store,
+        &h.root,
+        h.session_id,
+        fs_scope(&["race.txt"]),
+        vec!["race.txt".to_string()],
+        "agent-a",
+        BTreeMap::new(),
+        Vec::new(),
+        None,
+        None,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("checkpoint creation");
+    h.gated_write("w-2", "agent-a", "race.txt", "mutated-v2").await;
+
+    let hijack =
+        HijackStore { inner: h.store.clone(), gate: h.gate.clone(), fired: AtomicBool::new(false) };
+    match h
+        .executor
+        .restore_checkpoint(
+            &record.checkpoint_id.to_string(),
+            &hijack,
+            &GateOwnershipOracle::new(h.gate.clone()),
+            &NoopStash,
+            &h.session(),
+            "agent-a",
+            CancellationToken::new(),
+        )
+        .await
+    {
+        Err(RestoreError::OwnershipConflict(conflicts)) => {
+            assert_eq!(conflicts.len(), 1);
+            assert_eq!(conflicts[0].path, "race.txt");
+            assert_eq!(
+                conflicts[0].owner, "agent-b",
+                "the conflict names the CURRENT owner acquired mid-restore"
+            );
+        }
+        other => panic!("expected structured OwnershipConflict, got {other:?}"),
+    }
+    assert_eq!(h.disk("race.txt"), "mutated-v2", "no restore write ran after the transfer");
+    let back = h
+        .store
+        .load_checkpoint_record(&record.checkpoint_id.to_string(), &CancellationToken::new())
+        .await
+        .expect("load")
+        .expect("record survives");
+    assert!(
+        matches!(back.status, CheckpointStatus::Active),
+        "mid-restore abort leaves the status retriable"
+    );
+}
+
+/// Partial retry convergence: a policy denial mid-restore aborts loudly
+/// (`PolicyDenied`), writes only the already-gated prefix, and leaves the
+/// status `Active` (retriable); the retry converges to a full, accurate
+/// `Restored`. The interrupted attempt never claims success.
+#[tokio::test]
+async fn policy_denied_mid_restore_converges_on_retry() {
+    let h = Harness::new().await;
+    h.gated_write("w-1", "agent-a", "a_first.txt", "first-v1").await;
+    h.gated_write("w-2", "agent-a", "b_denied.txt", "second-v1").await;
+    let record = create_file_checkpoint(
+        &h.store,
+        &h.root,
+        h.session_id,
+        fs_scope(&["a_first.txt", "b_denied.txt"]),
+        vec!["a_first.txt".to_string(), "b_denied.txt".to_string()],
+        "agent-a",
+        BTreeMap::new(),
+        Vec::new(),
+        None,
+        None,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("checkpoint creation");
+    h.gated_write("w-3", "agent-a", "a_first.txt", "first-v2").await;
+    h.gated_write("w-4", "agent-a", "b_denied.txt", "second-v2").await;
+
+    // Deny only the second path (sorted scope order: a_first writes first,
+    // b_denied aborts the restore mid-flight).
+    let deny_second = Arc::new(SimplePolicyEngine::new(
+        vec![
+            PolicyRule::AutoDeny(Condition::PathGlob("b_denied*".to_string())),
+            PolicyRule::AutoApprove(Condition::Always),
+        ],
+        Arc::new(TestAudit),
+    ));
+    let mut registry = ToolRegistry::default();
+    registry.register(Box::new(FilesystemTool::new(
+        camino::Utf8PathBuf::from_path_buf(h.root.clone()).expect("utf-8"),
+    )));
+    let deny_executor = Arc::new(ToolExecutor::new(Arc::new(registry), deny_second));
+
+    match restore_file_checkpoint(
+        &deny_executor,
+        &h.store,
+        &h.gate,
+        None,
+        &h.session(),
+        &record.checkpoint_id.to_string(),
+        "agent-a",
+        &CancellationToken::new(),
+    )
+    .await
+    {
+        Err(concerto_core::checkpoint::RestoreError::PolicyDenied(_)) => {}
+        other => panic!("expected PolicyDenied, got {other:?}"),
+    }
+    // Real mid-flight progress, no silent success: the first path is back,
+    // the denied one is untouched, the status is still retriable.
+    assert_eq!(h.disk("a_first.txt"), "first-v1", "the gated prefix restored");
+    assert_eq!(h.disk("b_denied.txt"), "second-v2", "the denied path is untouched");
+    let back = h
+        .store
+        .load_checkpoint_record(&record.checkpoint_id.to_string(), &CancellationToken::new())
+        .await
+        .expect("load")
+        .expect("record survives");
+    assert!(
+        matches!(back.status, CheckpointStatus::Active),
+        "the interrupted attempt left the status retriable"
+    );
+
+    // Retry with the allowing executor: the same bytes rewrite idempotently
+    // and the second write lands — a full, accurate Restored.
+    match restore_file_checkpoint(
+        &h.executor,
+        &h.store,
+        &h.gate,
+        None,
+        &h.session(),
+        &record.checkpoint_id.to_string(),
+        "agent-a",
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("retry restores")
+    {
+        concerto_core::checkpoint::RestoreOutcome::Restored { restored, .. } => {
+            let mut sorted = restored.clone();
+            sorted.sort();
+            assert_eq!(sorted, vec!["a_first.txt".to_string(), "b_denied.txt".to_string()]);
+        }
+        other => panic!("expected Restored on retry, got {other:?}"),
+    }
+    assert_eq!(h.disk("a_first.txt"), "first-v1");
+    assert_eq!(h.disk("b_denied.txt"), "second-v1", "retry converged byte-exact");
+    let back = h
+        .store
+        .load_checkpoint_record(&record.checkpoint_id.to_string(), &CancellationToken::new())
+        .await
+        .expect("load")
+        .expect("record survives");
+    assert!(
+        matches!(back.status, CheckpointStatus::Restored { .. }),
+        "the converged retry records Restored"
+    );
+}

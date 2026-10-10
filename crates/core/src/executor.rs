@@ -147,6 +147,24 @@ fn missing_bytes_limitation(record: &crate::checkpoint::CheckpointRecord, path: 
     format!("{path}: no restorable bytes banked; hash-only (drift-detectable, not reconstructible)")
 }
 
+/// One restore-path ownership check against the oracle (the gate's typed
+/// read surface): `None` when the path is unowned or held by the restoring
+/// agent (the write may proceed); `Some` names the foreign holder — surfaced
+/// as [`RestoreError::OwnershipConflict`] without parsing any denial prose
+/// (ADR-82). Shared by the Phase-1 pre-check and the Phase-2 per-write
+/// re-check so both emit the identical structured conflict.
+fn ownership_conflict(
+    ownership: &dyn OwnershipOracle,
+    path: &str,
+    by_agent: &str,
+) -> Option<crate::checkpoint::OwnershipConflictInfo> {
+    let owner = ownership.owner_of(path)?;
+    if owner == by_agent {
+        return None;
+    }
+    Some(crate::checkpoint::OwnershipConflictInfo { path: path.to_owned(), owner })
+}
+
 /// Derive the audit-safe result summary of a read-only tool call from the
 /// result the executor already holds.
 ///
@@ -1263,7 +1281,11 @@ impl ToolExecutor {
     ///    writing; `GitStash` delegates to the [`StashRestorer`]).
     /// 2. **Write everything**: policy-denied or failed writes abort
     ///    mid-restore with the checkpoint status left unchanged (retriable —
-    ///    a retry rewrites the same bytes idempotently).
+    ///    a retry rewrites the same bytes idempotently). Each write re-checks
+    ///    the ownership oracle immediately before execution, so a sibling
+    ///    that acquires a path after the Phase-1 pre-check aborts with the
+    ///    same structured [`RestoreError::OwnershipConflict`] (the current
+    ///    owner named) instead of overwriting silently.
     ///
     /// A second restore of the same id is a recorded no-op
     /// ([`RestoreOutcome::AlreadyRestored`]); the first restore's
@@ -1342,13 +1364,10 @@ impl ToolExecutor {
         // self-owned paths pass; foreign-owned paths abort the restore.
         let mut conflicts = Vec::new();
         for resource in &record.included {
-            if let Some(owner) = ownership.owner_of(&resource.canonical_path) {
-                if owner != by_agent {
-                    conflicts.push(crate::checkpoint::OwnershipConflictInfo {
-                        path: resource.canonical_path.clone(),
-                        owner,
-                    });
-                }
+            if let Some(conflict) =
+                ownership_conflict(ownership, &resource.canonical_path, by_agent)
+            {
+                conflicts.push(conflict);
             }
         }
         if !conflicts.is_empty() {
@@ -1369,7 +1388,8 @@ impl ToolExecutor {
             let path = resource.canonical_path.clone();
             if resource.kind == CheckpointResourceKind::FileDelete {
                 // Absent at checkpoint time: ensure deletion (exact, no bytes).
-                self.execute_filesystem_delete(&path, session, cancel.clone()).await?;
+                self.execute_filesystem_delete(&path, ownership, by_agent, session, cancel.clone())
+                    .await?;
                 deleted.push(path);
                 continue;
             }
@@ -1394,7 +1414,15 @@ impl ToolExecutor {
                         }
                     };
                     let existed = std::fs::metadata(session.project_dir.join(&path)).is_ok();
-                    self.execute_filesystem_write(&path, &content, session, cancel.clone()).await?;
+                    self.execute_filesystem_write(
+                        &path,
+                        &content,
+                        ownership,
+                        by_agent,
+                        session,
+                        cancel.clone(),
+                    )
+                    .await?;
                     if existed {
                         restored.push(path.clone());
                     } else {
@@ -1447,13 +1475,25 @@ impl ToolExecutor {
 
     /// One gated `filesystem` write for restore: policy + `VirtualFs` apply
     /// exactly as for any other write (never a bypass).
+    ///
+    /// The ownership oracle is re-consulted immediately before the write: a
+    /// sibling that acquired the path after the Phase-1 pre-check aborts
+    /// here with the structured [`RestoreError::OwnershipConflict`] (the
+    /// current owner named, read from the gate's typed ownership surface —
+    /// never string-matched denial prose, per ADR-82) and no write runs.
+    /// Non-ownership denials keep their `PolicyDenied` mapping.
     async fn execute_filesystem_write(
         &self,
         path: &str,
         content: &str,
+        ownership: &dyn OwnershipOracle,
+        by_agent: &str,
         session: &SessionContext,
         cancel: CancellationToken,
     ) -> Result<(), RestoreError> {
+        if let Some(conflict) = ownership_conflict(ownership, path, by_agent) {
+            return Err(RestoreError::OwnershipConflict(vec![conflict]));
+        }
         let input = serde_json::json!({"operation": "write", "path": path, "content": content});
         self.execute("filesystem", input, session, cancel).await.map(|_| ()).map_err(|error| {
             match error {
@@ -1465,12 +1505,18 @@ impl ToolExecutor {
     }
 
     /// One gated `filesystem` delete for restore (absent-at-checkpoint paths).
+    /// Same Phase-2 ownership re-check as [`Self::execute_filesystem_write`].
     async fn execute_filesystem_delete(
         &self,
         path: &str,
+        ownership: &dyn OwnershipOracle,
+        by_agent: &str,
         session: &SessionContext,
         cancel: CancellationToken,
     ) -> Result<(), RestoreError> {
+        if let Some(conflict) = ownership_conflict(ownership, path, by_agent) {
+            return Err(RestoreError::OwnershipConflict(vec![conflict]));
+        }
         let input = serde_json::json!({"operation": "delete", "path": path});
         self.execute("filesystem", input, session, cancel).await.map(|_| ()).map_err(|error| {
             match error {
@@ -3919,6 +3965,78 @@ mod restore_tests {
         assert_eq!(fs.calls(), 0, "no write ran once a conflict surfaced");
         assert_eq!(fs.content("a.txt").as_deref(), Some("x"));
         assert!(matches!(store.status(), CheckpointStatus::Active), "status unchanged (retriable)");
+    }
+
+    /// Oracle modelling the TOCTOU race: the first lookup of the contested
+    /// path (the Phase-1 pre-check) sees it unowned; every later lookup (the
+    /// Phase-2 per-write re-check) sees the sibling's fresh acquisition.
+    #[derive(Debug)]
+    struct FlippingOracle {
+        path: String,
+        late_owner: String,
+        lookups: Mutex<usize>,
+    }
+
+    impl OwnershipOracle for FlippingOracle {
+        fn owner_of(&self, canonical_path: &str) -> Option<String> {
+            if canonical_path != self.path {
+                return None;
+            }
+            let mut seen = self.lookups.lock().expect("oracle lock");
+            *seen += 1;
+            if *seen == 1 {
+                None
+            } else {
+                Some(self.late_owner.clone())
+            }
+        }
+    }
+
+    /// TOCTOU race: a sibling acquires ownership between the Phase-1
+    /// pre-check and the Phase-2 gated write — the write's oracle re-check
+    /// aborts with the STRUCTURED conflict naming the new owner (never a
+    /// generic denial, never a silent overwrite), status left retriable.
+    #[tokio::test]
+    async fn phase2_ownership_recheck_surfaces_new_owner() {
+        let (executor, fs, session, stash) =
+            harness(HashMap::from([("a.txt".to_string(), "mutated".to_string())]));
+        let (record, id) =
+            active_record(vec![overwrite_resource("a.txt", None)], RestoreMethod::PreImageStore);
+        let store = FakeStore::new(record).with_bytes("a.txt", b"original", CaptureKind::Snapshot);
+        let oracle = FlippingOracle {
+            path: "a.txt".to_string(),
+            late_owner: "agent-b".to_string(),
+            lookups: Mutex::new(0),
+        };
+
+        match executor
+            .restore_checkpoint(
+                &id,
+                &store,
+                &oracle,
+                &*stash,
+                &session,
+                "agent-a",
+                CancellationToken::new(),
+            )
+            .await
+        {
+            Err(RestoreError::OwnershipConflict(conflicts)) => {
+                assert_eq!(conflicts.len(), 1);
+                assert_eq!(conflicts[0].path, "a.txt");
+                assert_eq!(
+                    conflicts[0].owner, "agent-b",
+                    "the conflict names the CURRENT owner, not a generic denial"
+                );
+            }
+            other => panic!("expected structured OwnershipConflict, got {other:?}"),
+        }
+        assert_eq!(fs.calls(), 0, "the Phase-2 re-check aborts before any write");
+        assert_eq!(fs.content("a.txt").as_deref(), Some("mutated"));
+        assert!(
+            matches!(store.status(), CheckpointStatus::Active),
+            "mid-restore abort leaves the status unchanged (retriable)"
+        );
     }
 
     #[tokio::test]

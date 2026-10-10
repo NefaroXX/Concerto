@@ -154,6 +154,11 @@ impl concerto_core::checkpoint::StashRestorer for RefusingStashRestorer {
 ///   continues).
 /// * `extra_excluded` carries caller-declared non-file effects (shell side
 ///   effects, network, database, process) — always excluded, never reversed.
+///   **Contract:** the capture loop covers filesystem paths only and never
+///   infers side effects, so a `Run`- or `Task`-scoped checkpoint REQUIRES
+///   the caller to populate `extra_excluded` for every shell, network,
+///   database, and process effect observed in scope. An undeclared side
+///   effect is out of the restore claim by construction.
 /// * `method_override` forces [`RestoreMethod::GitStash`] for stash-backed
 ///   checkpoints (commit the stash BEFORE calling); otherwise the method
 ///   follows the plan (`Manual` when nothing banked bytes).
