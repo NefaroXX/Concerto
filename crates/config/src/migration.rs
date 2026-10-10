@@ -107,6 +107,9 @@ fn migrate_v1_to_v2(config: AppConfig) -> Result<AppConfig, ConfigError> {
         tool_settings: None,
         // [audit] is additive; old configs keep it None (plaintext, no retention).
         audit: None,
+        // ADR-82 slice 4 adds [agent]; additive Option, no version bump.
+        // Preserve any deserialized value (a v1 file may already carry it).
+        agent: config.agent,
         // ADR-70 adds [project_context]; additive Option defaults to None.
         project_context: None,
         orchestration: None,
@@ -155,6 +158,9 @@ fn migrate_v2_to_v3(config: AppConfig) -> Result<AppConfig, ConfigError> {
         tool_settings: None,
         // [audit] is additive; old configs keep it None (plaintext, no retention).
         audit: None,
+        // ADR-82 slice 4 adds [agent]; additive Option, no version bump.
+        // Preserve any deserialized value (a v2 file may already carry it).
+        agent: config.agent,
         // ADR-70 adds [project_context]; additive Option defaults to None.
         project_context: None,
         orchestration: None,
@@ -253,6 +259,8 @@ mod tests {
             tool_settings: None,
             // [audit] is additive; old configs keep it None (plaintext, no retention).
             audit: None,
+            // ADR-82 slice 4 adds [agent]; additive Option, no version bump.
+            agent: None,
             // ADR-70 adds [project_context]; additive Option defaults to None.
             project_context: None,
             orchestration: None,
@@ -288,6 +296,8 @@ mod tests {
             tool_settings: None,
             // [audit] is additive; old configs keep it None (plaintext, no retention).
             audit: None,
+            // ADR-82 slice 4 adds [agent]; additive Option, no version bump.
+            agent: None,
             // ADR-70 adds [project_context]; additive Option defaults to None.
             project_context: None,
             orchestration: None,
@@ -345,6 +355,8 @@ mod tests {
             tool_settings: None,
             // [audit] is additive; old configs keep it None (plaintext, no retention).
             audit: None,
+            // ADR-82 slice 4 adds [agent]; additive Option, no version bump.
+            agent: None,
             // ADR-70 adds [project_context]; additive Option defaults to None.
             project_context: None,
             orchestration: None,

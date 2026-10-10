@@ -1262,6 +1262,11 @@ async fn execute_agent_loop(
     .with_advertised_tool_support(advertised_tool_support)
     .with_initial_messages(req.conversation_history)
     .with_session_store(session_store)
+    // ADR-82 slice 4: opt-in, default-off completion-honesty gate, wired from
+    // `[agent] strict_verification_gate` (config-driven v1, next-run
+    // semantics). Single-agent path only: `run_multi_agent` (the Coordinator
+    // path) never reads this key, so multi-agent runs cannot observe it.
+    .with_strict_verification_gate(services.config.strict_verification_gate())
     .with_tool_facts(fact_pool.map(|pool| {
         crate::tool_facts::ToolFactContext::new(Some(pool), crate::tool_facts::SINGLE_AGENT_FACT_ID)
     }));
