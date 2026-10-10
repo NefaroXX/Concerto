@@ -56,7 +56,7 @@ pub use saving::{
 };
 pub use schema::{
     builtin_agent_seeds, default_global_agents_path, parse_tool_schema_mode,
-    resolve_reduced_motion, resolve_terminal_title_enabled, AgentCapabilities,
+    resolve_reduced_motion, resolve_terminal_title_enabled, AgentCapabilities, AgentConfig,
     AgentModelAssignment, AgentRelationshipConfig, AppConfig, ConditionDef, ContextConfig,
     CustomAgentConfig, DiscoveryOutcome, DisplayConfig, FewShotExample, IntentConfig, McpConfig,
     McpServerConfig, MemoryConfig, ModelPinConfig, ModelProfileOverride, ModelSettings,
@@ -1001,6 +1001,67 @@ mod tests {
         assert_eq!(context.retain_user_turns, Some(2));
         assert_eq!(context.minimum_user_turns, Some(4));
         assert_eq!(context.cache_stable_prefix, Some(true));
+    }
+
+    // ---- ADR-82 slice 4: [agent] strict_verification_gate ----
+
+    /// Old configs without `[agent]` load unchanged with the gate off (R6):
+    /// default-off preserves today's `decide_exit` behavior exactly, with no
+    /// `SCHEMA_VERSION` bump.
+    #[test]
+    fn agent_section_absent_defaults_to_gate_off() {
+        let without = load_config(None, None).expect("defaults must load");
+        assert!(without.agent.is_none(), "no [agent] section -> None");
+        assert!(!without.strict_verification_gate(), "absent section reads gate off");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "schema_version = 8\n").unwrap();
+        let old = load_config(Some(&path), None).expect("old config without [agent] must load");
+        assert!(old.agent.is_none(), "old config keeps agent None");
+        assert!(!old.strict_verification_gate(), "old config reads gate off");
+        assert_eq!(old.schema_version, SCHEMA_VERSION, "no version bump for the additive key");
+    }
+
+    /// `[agent] strict_verification_gate` parses, defaults false when the key
+    /// is absent, tolerates unknown future keys, and round-trips (R6).
+    #[test]
+    fn agent_strict_verification_gate_parses_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "schema_version = 8\n[agent]\nstrict_verification_gate = true\n")
+            .unwrap();
+        let cfg = load_config(Some(&path), None).expect("config with [agent] must load");
+        let agent = cfg.agent.clone().expect("[agent] section must be present");
+        assert!(agent.strict_verification_gate);
+        assert!(cfg.strict_verification_gate());
+
+        // Round-trip: the key survives serialize -> decode.
+        let reparsed: AppConfig =
+            toml::from_str(&toml::to_string(&cfg).expect("config must serialize"))
+                .expect("round-trip must decode");
+        assert_eq!(reparsed.agent, cfg.agent);
+        assert!(reparsed.strict_verification_gate());
+
+        // Section present without the key: the gate stays off.
+        let bare_path = dir.path().join("bare.toml");
+        std::fs::write(&bare_path, "schema_version = 8\n[agent]\n").unwrap();
+        let bare = load_config(Some(&bare_path), None).expect("bare [agent] must load");
+        assert_eq!(bare.agent, Some(AgentConfig::default()));
+        assert!(!bare.strict_verification_gate());
+
+        // Unknown future keys inside `[agent]` are ignored — the forward
+        // half of the documented claim whose backward half is that older
+        // binaries ignore the section entirely.
+        let future_path = dir.path().join("future.toml");
+        std::fs::write(
+            &future_path,
+            "schema_version = 8\n[agent]\nstrict_verification_gate = false\nsome_future_key = 1\n",
+        )
+        .unwrap();
+        let future =
+            load_config(Some(&future_path), None).expect("unknown [agent] keys must be ignored");
+        assert!(!future.strict_verification_gate());
     }
 
     // ---- ADR-58: [orchestration] loads and validates at load time ----

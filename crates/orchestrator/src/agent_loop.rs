@@ -149,6 +149,16 @@ pub struct AgentLoop {
     /// ONE degraded note instead of a Decision row per drop. The individual
     /// `warn` logs are unchanged.
     degraded: AtomicBool,
+
+    /// ADR-82 slice 4: opt-in, default-off completion-honesty gate. When
+    /// `true`, [`Self::decide_exit`] refuses to report `Done` for an
+    /// `ActionRequired { require_verification: true }` task whose run-scoped
+    /// verification ledger holds no typed `Passed` record, exiting `Blocked`
+    /// with a machine-checkable reason instead. `false` (the default)
+    /// preserves today's warn-and-continue exactly. Wired from
+    /// `[agent] strict_verification_gate` via `run_shared_agent`
+    /// (`runtime_runner.rs`); the multi-agent Coordinator path never sets it.
+    strict_verification_gate: bool,
 }
 
 /// Maximum number of auto-continuation rounds before escalating a run to a
@@ -268,6 +278,80 @@ fn latest_assistant_text(messages: &[Message]) -> Option<&str> {
         .map(|message| message.content.as_str())
 }
 
+/// ADR-82 slice 4: does the run-scoped verification ledger contain a typed
+/// `Passed` record?
+///
+/// Only `outcome == Some(Passed)` counts. Legacy records (`outcome: None`)
+/// never count — they are display data, not evidence (§3: a missing `outcome`
+/// never counts as passing evidence). Slice 4 is deliberately this coarse
+/// outcome check; demanding *fresh* passing evidence (the §3 freshness basis
+/// feeding the gate) is the planned H04 completing step, not this slice.
+fn has_passed_verification(output: &AgentOutput) -> bool {
+    output
+        .verification
+        .iter()
+        .any(|record| matches!(record.outcome, Some(VerificationOutcome::Passed)))
+}
+
+/// Machine-checkable ledger label for one verification record: the typed
+/// outcome where present, else the legacy display resolution marked as such —
+/// so a legacy `passed: true` can never be mistaken for typed evidence.
+fn verification_ledger_label(record: &VerificationSummary) -> &'static str {
+    match record.outcome {
+        Some(outcome) => outcome.as_str(),
+        None if record.passed => "legacy-passed",
+        None => "legacy-failed",
+    }
+}
+
+/// Maximum ledger records itemized in a strict-gate `Blocked` reason; the
+/// per-outcome counts cover the whole ledger, so the bound drops prose only,
+/// never signal.
+const STRICT_GATE_REASON_DETAIL_LIMIT: usize = 8;
+
+/// Build the machine-checkable `Blocked` reason for the strict verification
+/// gate (ADR-82 slice 4, R5).
+///
+/// "Task finished" (`task_finished`) and "required verification passed"
+/// (`verification_passed=false` — the caller only builds this when no typed
+/// pass exists) are reported as distinct states, followed by the structured
+/// ledger state: the record count plus per-outcome counts, with the first few
+/// `path:command:outcome` entries itemized.
+fn strict_gate_blocked_reason(output: &AgentOutput, task_finished: bool) -> String {
+    let mut counts: std::collections::BTreeMap<&'static str, usize> =
+        std::collections::BTreeMap::new();
+    for record in &output.verification {
+        *counts.entry(verification_ledger_label(record)).or_default() += 1;
+    }
+    let outcomes = if counts.is_empty() {
+        "absent".to_owned()
+    } else {
+        counts.iter().map(|(label, count)| format!("{label}:{count}")).collect::<Vec<_>>().join(",")
+    };
+    let mut reason = format!(
+        "strict_verification_gate: action-required task ended without required verification \
+         (task_finished={task_finished} verification_passed=false require_verification=true \
+         records={} outcomes=[{outcomes}])",
+        output.verification.len(),
+    );
+    let detail: Vec<String> = output
+        .verification
+        .iter()
+        .take(STRICT_GATE_REASON_DETAIL_LIMIT)
+        .map(|record| {
+            format!("{}:{}:{}", record.path, record.command, verification_ledger_label(record))
+        })
+        .collect();
+    if !detail.is_empty() {
+        reason.push_str(&format!(" detail=[{}]", detail.join("; ")));
+        let rest = output.verification.len().saturating_sub(detail.len());
+        if rest > 0 {
+            reason.push_str(&format!(" +{rest} more"));
+        }
+    }
+    reason
+}
+
 impl AgentLoop {
     /// Create a new agent loop.
     #[allow(clippy::too_many_arguments)]
@@ -349,6 +433,7 @@ impl AgentLoop {
             usage_latency_ms: 0,
             pending_approval: None,
             degraded: AtomicBool::new(false),
+            strict_verification_gate: false,
         }
     }
 
@@ -406,6 +491,14 @@ impl AgentLoop {
     /// affects tool results.
     pub fn with_tool_facts(mut self, facts: Option<ToolFactContext>) -> Self {
         self.tool_facts = facts;
+        self
+    }
+
+    /// Arm the ADR-82 slice-4 completion-honesty gate (opt-in, default-off).
+    /// Wired from `[agent] strict_verification_gate`; config-driven v1 with
+    /// next-run semantics (read at run start, like every other config knob).
+    pub fn with_strict_verification_gate(mut self, enabled: bool) -> Self {
+        self.strict_verification_gate = enabled;
         self
     }
 
@@ -1702,6 +1795,17 @@ impl AgentLoop {
     /// Phase 10: Decide whether to exit with a blocking error or iteration-cap
     /// return. Returns `Ok(Some(exit))` for non-Done exits, `Ok(None)` when the
     /// caller should proceed to `finalize_completion`.
+    ///
+    /// ADR-82 slice 4 (R5): with [`Self::strict_verification_gate`] armed, an
+    /// `ActionRequired { require_verification: true }` task whose run-scoped
+    /// verification ledger holds no typed `Passed` record exits `Blocked`
+    /// here instead of warn-and-complete. "Task finished" (`completed`) and
+    /// "required verification passed" (ledger state) are reported as distinct
+    /// states in the `Blocked` reason; the reason carries the machine-checkable
+    /// `strict_verification_gate`, `task_finished=`, `verification_passed=`,
+    /// `require_verification=`, `records=`, and per-record `outcomes=[..]`
+    /// ledger tokens. Flag off (the default) preserves the warn-and-continue
+    /// below byte-identically.
     #[allow(clippy::too_many_arguments)]
     fn decide_exit(
         &mut self,
@@ -1750,6 +1854,23 @@ impl AgentLoop {
                     task_id = %task.id,
                     "action-required task completed without verification result"
                 );
+            }
+            // ADR-82 slice 4 (opt-in only): the warn above is preserved
+            // verbatim on every path, flag on or off. With the gate armed, an
+            // unmet `require_verification` contract additionally refuses the
+            // completion claim: no typed `Passed` record in the run-scoped
+            // ledger means the required verification never passed, so the run
+            // exits `Blocked` with the ledger state in the reason instead of
+            // proceeding to `finalize_completion`. Flag off (default) falls
+            // through exactly as before.
+            if require_verification
+                && self.strict_verification_gate
+                && !has_passed_verification(output)
+            {
+                return Ok(Some(AgentRunExit::Blocked {
+                    reason: strict_gate_blocked_reason(output, completed),
+                    partial: output.clone(),
+                }));
             }
         }
 
@@ -8605,6 +8726,180 @@ mod tests {
             matches!(blocked, Some(AgentRunExit::Blocked { .. })),
             "with no audited mutation the ActionRequired verdict is still Blocked"
         );
+    }
+
+    // ---- ADR-82 slice 4: opt-in strict_verification_gate ----
+
+    /// Build an `AgentOutput` whose audited successful `filesystem` write
+    /// discharges the file-changing requirement, carrying the given
+    /// run-scoped verification ledger.
+    fn strict_gate_output(verification: Vec<VerificationSummary>) -> AgentOutput {
+        AgentOutput {
+            tool_call_count: 1,
+            final_message: "done".to_owned(),
+            files_modified: vec!["src/lib.rs".into()],
+            tool_events: vec![ToolExecutionSummary {
+                tool_name: "filesystem".to_owned(),
+                operation: Some("write".to_owned()),
+                path: Some("src/lib.rs".into()),
+                success: true,
+                summary: "Wrote 9 bytes to src/lib.rs".to_owned(),
+                canonical_tool: None,
+                canonical_operation: None,
+                failure: None,
+            }],
+            verification,
+            ..agent_output_base()
+        }
+    }
+
+    /// Flag off (the default): an unmet `require_verification` contract keeps
+    /// today's warn-and-continue byte-identically — `decide_exit` proceeds to
+    /// `finalize_completion` (`None`) with no ledger inspection.
+    #[tokio::test]
+    async fn strict_gate_off_warns_and_continues() {
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop(provider, approval, 4);
+        assert!(!loop_.strict_verification_gate, "the gate defaults off on a freshly built loop");
+        // `new_action_required` carries `require_verification: true`.
+        let task = AgentTask::new_action_required(Ulid::new(), "write code to file");
+        let output = strict_gate_output(Vec::new());
+        let decision = loop_.decide_exit(&task, &output, 1, 1, 0, &None, true, Vec::new()).unwrap();
+        assert!(
+            decision.is_none(),
+            "flag off: unmet verification contract still proceeds (warn-and-continue)"
+        );
+    }
+
+    /// Flag on: an `ActionRequired { require_verification: true }` task with
+    /// an empty ledger exits `Blocked` with a machine-checkable reason naming
+    /// the absent ledger — reporting "task finished" and "required
+    /// verification passed" as distinct states (R5).
+    #[tokio::test]
+    async fn strict_gate_on_blocks_empty_ledger_with_machine_checkable_reason() {
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop(provider, approval, 4).with_strict_verification_gate(true);
+        let task = AgentTask::new_action_required(Ulid::new(), "write code to file");
+        let output = strict_gate_output(Vec::new());
+        let decision = loop_.decide_exit(&task, &output, 1, 1, 0, &None, true, Vec::new()).unwrap();
+        let reason = match decision {
+            Some(AgentRunExit::Blocked { reason, .. }) => reason,
+            other => panic!("flag on with an empty ledger must exit Blocked, got {other:?}"),
+        };
+        for token in [
+            "strict_verification_gate",
+            "task_finished=true",
+            "verification_passed=false",
+            "require_verification=true",
+            "records=0",
+            "outcomes=[absent]",
+        ] {
+            assert!(reason.contains(token), "Blocked reason must carry `{token}`: {reason}");
+        }
+    }
+
+    /// Flag on: non-`Passed` ledger outcomes (`Unavailable`, `Error`) are
+    /// named per-outcome in the reason's structured ledger state.
+    #[tokio::test]
+    async fn strict_gate_on_names_non_passing_ledger_outcomes() {
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop(provider, approval, 4).with_strict_verification_gate(true);
+        let task = AgentTask::new_action_required(Ulid::new(), "write code to file");
+        let output = strict_gate_output(vec![
+            VerificationSummary::unavailable("a.rs", "cargo check", "no manifest"),
+            VerificationSummary::error("b.py", "py_compile", "spawn failed"),
+        ]);
+        let decision = loop_.decide_exit(&task, &output, 1, 1, 0, &None, true, Vec::new()).unwrap();
+        let reason = match decision {
+            Some(AgentRunExit::Blocked { reason, .. }) => reason,
+            other => panic!("unmet ledger must exit Blocked, got {other:?}"),
+        };
+        for token in ["records=2", "unavailable:1", "error:1", "cargo check:unavailable"] {
+            assert!(reason.contains(token), "Blocked reason must carry `{token}`: {reason}");
+        }
+        assert!(
+            !reason.contains("verification_passed=true"),
+            "the reason must never claim verification passed: {reason}"
+        );
+    }
+
+    /// Flag on: a single typed `Passed` record satisfies the contract — the
+    /// run proceeds to `finalize_completion` (`None`).
+    #[tokio::test]
+    async fn strict_gate_on_passes_with_typed_pass() {
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop(provider, approval, 4).with_strict_verification_gate(true);
+        let task = AgentTask::new_action_required(Ulid::new(), "write code to file");
+        let output = strict_gate_output(vec![
+            VerificationSummary::skipped("b.js", "npm test", "no test script"),
+            VerificationSummary::passed("a.rs", "cargo check", "ok"),
+        ]);
+        let decision = loop_.decide_exit(&task, &output, 1, 1, 0, &None, true, Vec::new()).unwrap();
+        assert!(
+            decision.is_none(),
+            "a typed Passed record satisfies the contract and must proceed"
+        );
+    }
+
+    /// Flag on: a legacy record (`outcome: None`, `passed: true`) never
+    /// counts as passing evidence (§3 display-only rule) — the run still
+    /// exits `Blocked`, with the legacy state marked as such in the reason.
+    #[tokio::test]
+    async fn strict_gate_on_ignores_legacy_pass() {
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop(provider, approval, 4).with_strict_verification_gate(true);
+        let task = AgentTask::new_action_required(Ulid::new(), "write code to file");
+        let legacy_pass = VerificationSummary {
+            outcome: None,
+            passed: true,
+            ..VerificationSummary::passed("a.rs", "cargo check", "ok")
+        };
+        let output = strict_gate_output(vec![legacy_pass]);
+        let decision = loop_.decide_exit(&task, &output, 1, 1, 0, &None, true, Vec::new()).unwrap();
+        let reason = match decision {
+            Some(AgentRunExit::Blocked { reason, .. }) => reason,
+            other => panic!("a legacy pass must not satisfy the gate, got {other:?}"),
+        };
+        assert!(
+            reason.contains("legacy-passed:1"),
+            "the reason must mark the legacy state distinctly: {reason}"
+        );
+    }
+
+    /// Flag on: non-action-required tasks are unaffected — an answer-only
+    /// task with an empty ledger still proceeds.
+    #[tokio::test]
+    async fn strict_gate_on_leaves_non_action_required_unaffected() {
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop(provider, approval, 4).with_strict_verification_gate(true);
+        let task = AgentTask::new(Ulid::new(), "say something");
+        let output = strict_gate_output(Vec::new());
+        let decision = loop_.decide_exit(&task, &output, 0, 0, 0, &None, true, Vec::new()).unwrap();
+        assert!(decision.is_none(), "the gate is scoped to the action-required path only");
+    }
+
+    /// Flag on: `ActionRequired` with `require_verification: false` is
+    /// unaffected — the contract was never required, so an empty ledger
+    /// still proceeds.
+    #[tokio::test]
+    async fn strict_gate_on_leaves_verification_optional_task_unaffected() {
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop(provider, approval, 4).with_strict_verification_gate(true);
+        let task = AgentTask::new_with_execution_mode(
+            Ulid::new(),
+            "write code to file",
+            TaskExecutionMode::ActionRequired { min_tool_calls: 1, require_verification: false },
+        );
+        let output = strict_gate_output(Vec::new());
+        let decision = loop_.decide_exit(&task, &output, 1, 1, 0, &None, true, Vec::new()).unwrap();
+        assert!(decision.is_none(), "the gate only enforces a contract the task itself required");
     }
 
     /// The loop-end reason persists into the session event log (the

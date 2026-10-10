@@ -552,6 +552,17 @@ pub struct AppConfig {
     #[serde(default)]
     pub audit: Option<AuditConfig>,
 
+    /// `[agent]` — single-agent completion-honesty gate (ADR-82 slice 4).
+    ///
+    /// `None` (no `[agent]` section) keeps the gate off: `decide_exit` keeps
+    /// today's warn-and-continue exactly. Additive serde-default only — every
+    /// pre-existing config loads unchanged and needs no schema-version bump
+    /// (the `[skills]`/`[mcp]`/ADR-70 trajectory). Deliberately NOT under
+    /// `[orchestration]`, which rejects unknown keys (`deny_unknown_fields`),
+    /// so older binaries ignore this section entirely.
+    #[serde(default)]
+    pub agent: Option<AgentConfig>,
+
     /// ADR-58 `[orchestration]` — the Orchestration Blueprint pipeline.
     ///
     /// `None` (no `[orchestration]` table) keeps the engine's embedded
@@ -620,6 +631,7 @@ impl PartialEq for AppConfig {
             && self.context == other.context
             && self.tool_settings == other.tool_settings
             && self.audit == other.audit
+            && self.agent == other.agent
             && self.orchestration == other.orchestration
     }
 }
@@ -652,6 +664,7 @@ impl Default for AppConfig {
             context: None,
             tool_settings: None,
             audit: None,
+            agent: None,
             orchestration: None,
             resolved_blueprint: None,
             agent_files_authoritative: false,
@@ -815,6 +828,13 @@ impl AppConfig {
             None => ShellSettings::default(),
         }
     }
+
+    /// Whether the opt-in single-agent completion-honesty gate is armed
+    /// (ADR-82 slice 4). Absent section or absent key both read `false`:
+    /// default-off preserves today's `decide_exit` behavior exactly.
+    pub fn strict_verification_gate(&self) -> bool {
+        self.agent.as_ref().is_some_and(|agent| agent.strict_verification_gate)
+    }
 }
 
 // ---- Tool settings: automatic `git init` -------------------------------------
@@ -882,6 +902,27 @@ pub struct AuditConfig {
     /// readable while `encrypt_at_rest` stays enabled with the same key.
     #[serde(default)]
     pub archive_dir: Option<Utf8PathBuf>,
+}
+
+// ---- [agent]: single-agent completion-honesty gate (ADR-82 slice 4) ----------
+
+/// `[agent]` — opt-in, default-off completion-honesty gate for the
+/// single-agent action-required path.
+///
+/// Additive serde-default only: a config without an `[agent]` section (or
+/// without the key) keeps today's behavior exactly — no run outcome tightens
+/// unless the operator opts in — so no schema-version bump is needed.
+/// No validation beyond the bool itself: the flag is a pure opt-in switch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AgentConfig {
+    /// When `true`, the single-agent loop refuses to report `Done` for an
+    /// `ActionRequired { require_verification: true }` task whose run-scoped
+    /// verification ledger holds no typed `Passed` record, exiting `Blocked`
+    /// with a machine-checkable reason instead of warn-and-complete.
+    /// Default: `false` (opt-in). Single-agent path only — the multi-agent
+    /// Coordinator path never reads this key.
+    #[serde(default)]
+    pub strict_verification_gate: bool,
 }
 
 // ---- Phase 8: observability export configuration ------------------------------
