@@ -31,7 +31,7 @@ dirs = { workspace = true }
 camino = { workspace = true }
 
 # CSPRNG for the at-rest encryption key (`AtRestKey::generate`).
-getrandom = "0.3"
+getrandom = "0.4"
 # `log::LevelFilter` for `SqliteConnectOptions::log_statements` — keyed
 # connections silence statement logging so `PRAGMA key` never reaches logs.
 log = "0.4"
