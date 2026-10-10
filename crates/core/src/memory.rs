@@ -10,7 +10,7 @@ use crate::ids::Ulid;
 // Re-use the canonical ProjectId from types — do not redefine it here.
 pub use crate::types::ProjectId;
 use camino::Utf8PathBuf;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use time::OffsetDateTime;
 
 // ---------------------------------------------------------------------------
@@ -315,6 +315,402 @@ pub struct Decision {
     pub created_at: OffsetDateTime,
 }
 
+impl Decision {
+    /// Read-site lift of the stored model self-report into [`Confidence`].
+    ///
+    /// Additive and trivial by design: the `confidence: f32` column is
+    /// untouched (no storage change), and this interprets it as
+    /// [`ConfidenceSource::ModelSelfReport`] — uncalibrated by construction.
+    /// A stored NaN, infinite, or out-of-range report becomes
+    /// [`Confidence::Unknown`] rather than a clamped invention: the store
+    /// never promised a calibration, so a broken one reads as absent.
+    #[must_use]
+    pub fn confidence_evidence(&self) -> Confidence {
+        Confidence::known(f64::from(self.confidence), ConfidenceSource::ModelSelfReport)
+            .unwrap_or(Confidence::Unknown)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ADR-82 slice 7 — MemoryEvidence vocabulary (truth / relevance /
+// corroboration / confidence / freshness axes)
+// ---------------------------------------------------------------------------
+
+/// Ceiling of the corroboration axis: the `0..=LINK_SCORE_MAX` range of
+/// [`EvidenceScore`].
+///
+/// Single source of truth for the bound. The memory crate's
+/// `scoring::LINK_SCORE_MAX` aliases this constant, so the cascade reorder,
+/// the orphan prune, and this vocabulary can never drift apart.
+pub const EVIDENCE_SCORE_MAX: f64 = 10.0;
+
+/// Where a [`Confidence::Known`] value was reported from.
+///
+/// `#[non_exhaustive]`: new calibration sources arrive as new variants, and
+/// every downstream match must stay explicit. This enum is never constructed
+/// outside `concerto-core` today (read-site lifts live next to the stored
+/// fields they lift), so the exhaustiveness cost lands only on future
+/// constructors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum ConfidenceSource {
+    /// The model reported its own certainty (e.g. `Decision.confidence`).
+    /// Uncalibrated by construction — a self-report, not a measurement.
+    ModelSelfReport,
+    /// An empirical calibration of past accuracy (reserved: no producer
+    /// emits this yet; the variant exists so the vocabulary need not break
+    /// when calibration lands).
+    RuntimeCalibration,
+}
+
+impl std::fmt::Display for ConfidenceSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ModelSelfReport => write!(f, "model-self-report"),
+            Self::RuntimeCalibration => write!(f, "runtime-calibration"),
+        }
+    }
+}
+
+/// How much the stored evidence should be trusted — and whether that
+/// question even has an answer.
+///
+/// `Unknown` is a first-class state, not a zero: it has **no numeric
+/// accessor** (not even `Option<f64>` — the only exit is pattern matching),
+/// renders as the literal word `unknown` (never `0.0`, per the world-model
+/// `bounded()` render discipline: a missing calibration must never read as
+/// measured certainty-of-nothing), and deserializes from the literal string
+/// `"unknown"`.
+///
+/// There is deliberately **no clamping constructor**: clamping a confidence
+/// invents certainty the evidence never had. The only `Known` path is the
+/// rejecting [`Self::known`], which refuses NaN, infinities, and
+/// out-of-range values.
+///
+/// There is deliberately **no `From<f64>`** (in either direction) and no
+/// `Option<Confidence>` anywhere: `None` beside `Some(Unknown)` would be two
+/// different unknowns, and a missing key collapsing to `Known(0.0)` would
+/// re-open the exact drift hazard this type closes. Struct fields holding a
+/// `Confidence` use `#[serde(default)]` so a missing key means `Unknown` —
+/// one unknown, spelled one way. (Absence of the forbidden impls is
+/// constructor-plus-convention-plus-test enforcement, not a proof: a caller
+/// holding a raw `f64` can still deliberately call `known()` with the wrong
+/// number. Verified by grep — see the test module: no
+/// `impl From<…> for Confidence`, no `Option<Confidence>`, no `value()`
+/// accessor must appear in this file.)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Confidence {
+    /// No calibration exists for this evidence. Renders `unknown`.
+    Unknown,
+    /// A validated 0.0..=1.0 calibration with its reporting source.
+    Known {
+        /// Validated at construction and deserialization: always finite and
+        /// within `0.0..=1.0`. Readable only by pattern matching.
+        value: f64,
+        source: ConfidenceSource,
+    },
+}
+
+impl Default for Confidence {
+    /// Missing keys deserialize to `Unknown` (supports `#[serde(default)]`).
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+impl Confidence {
+    /// The absence constructor.
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self::Unknown
+    }
+
+    /// The only `Known` path: rejecting, never clamping. Returns `None`
+    /// for NaN, infinities, and values outside `0.0..=1.0` — including a
+    /// `Known(0.0)` attempt with an invalid source is impossible by
+    /// construction (the source travels with the value).
+    #[must_use]
+    pub fn known(value: f64, source: ConfidenceSource) -> Option<Self> {
+        if valid_unit_value(value) {
+            Some(Self::Known { value, source })
+        } else {
+            None
+        }
+    }
+
+    /// Whether any calibration exists.
+    #[must_use]
+    pub fn is_known(&self) -> bool {
+        matches!(self, Self::Known { .. })
+    }
+
+    /// The reporting source of a `Known` value, `None` for `Unknown`.
+    /// This exposes the *source*, never the number — the numeric exit
+    /// remains pattern matching alone.
+    #[must_use]
+    pub fn source(&self) -> Option<ConfidenceSource> {
+        match self {
+            Self::Known { source, .. } => Some(*source),
+            Self::Unknown => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Confidence {
+    /// `Unknown` renders as the literal word `unknown` — never `0.0`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unknown => write!(f, "unknown"),
+            Self::Known { value, source } => write!(f, "{value:.2} ({source})"),
+        }
+    }
+}
+
+impl Serialize for Confidence {
+    /// `Unknown` serializes as the literal string `"unknown"`; `Known`
+    /// serializes as `{"value": <0.0..=1.0>, "source": <kebab-case>}`.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Unknown => serializer.serialize_str("unknown"),
+            Self::Known { value, source } => {
+                KnownConfidenceView { value: *value, source: *source }.serialize(serializer)
+            }
+        }
+    }
+}
+
+/// Serde view of the `Known` arm (construction still goes through
+/// [`Confidence::known`], so validation cannot be bypassed).
+#[derive(Serialize, Deserialize)]
+struct KnownConfidenceView {
+    value: f64,
+    source: ConfidenceSource,
+}
+
+impl<'de> Deserialize<'de> for Confidence {
+    /// Boundary enforcement: accepts the literal `"unknown"` and validated
+    /// `{"value", "source"}` maps only. Rejects NaN, infinities,
+    /// out-of-range values, and every unknown-collapsing shape (`null`,
+    /// bare numbers, other strings, sequences, and maps missing either
+    /// key) — a hostile or stale payload never reaches an invalid
+    /// `Confidence`. A *missing* key is not handled here: enclosing structs
+    /// declare `#[serde(default)]` so absence means `Unknown`.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ConfidenceVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ConfidenceVisitor {
+            type Value = Confidence;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "the string \"unknown\" or a {{\"value\", \"source\"}} map")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                if value == "unknown" {
+                    Ok(Confidence::Unknown)
+                } else {
+                    Err(E::invalid_value(serde::de::Unexpected::Str(value), &self))
+                }
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let view = KnownConfidenceView::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+                Confidence::known(view.value, view.source).ok_or_else(|| {
+                    serde::de::Error::invalid_value(
+                        serde::de::Unexpected::Float(view.value),
+                        &"a finite value within 0.0..=1.0",
+                    )
+                })
+            }
+        }
+
+        deserializer.deserialize_any(ConfidenceVisitor)
+    }
+}
+
+/// Whether `value` is a usable unit-range calibration: finite and within
+/// `0.0..=1.0`. NaN fails the range check (unordered), infinities fail both.
+fn valid_unit_value(value: f64) -> bool {
+    value.is_finite() && (0.0..=1.0).contains(&value)
+}
+
+/// Query-time relevance of a chunk to the query, `0.0..=1.0`.
+///
+/// A distinct newtype from [`EvidenceScore`] on purpose: relevance (does
+/// this match the query?) and corroboration (do other chunks support this?)
+/// share neither range nor meaning, so they share no conversions either —
+/// no `From<f64>` in either direction and no `From`/`Into` between the two
+/// (grep-verified, see the test module). Two constructors: rejecting
+/// [`Self::new`] for validated inputs, clamping [`Self::clamped`] for
+/// order-preserving lifts of unbounded rank signals (NaN floors to `0.0`:
+/// an unordered signal ranks last, never first).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct Relevance(f64);
+
+impl Relevance {
+    /// Rejecting constructor: `None` for NaN, infinities, and values
+    /// outside `0.0..=1.0`.
+    #[must_use]
+    pub fn new(value: f64) -> Option<Self> {
+        if valid_unit_value(value) {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+
+    /// Clamping constructor for lifting unbounded rank signals: NaN maps to
+    /// `0.0` (`f64::clamp` would panic on NaN), everything else clamps to
+    /// `0.0..=1.0` order-preservingly.
+    #[must_use]
+    pub fn clamped(value: f64) -> Self {
+        if value.is_nan() {
+            Self(0.0)
+        } else {
+            Self(value.clamp(0.0, 1.0))
+        }
+    }
+
+    /// The validated score.
+    #[must_use]
+    pub fn value(&self) -> f64 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for Relevance {
+    /// Boundary enforcement: rejects NaN, infinities, and out-of-range
+    /// values at deserialization, mirroring [`Self::new`].
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = f64::deserialize(deserializer)?;
+        Self::new(value).ok_or_else(|| {
+            serde::de::Error::invalid_value(
+                serde::de::Unexpected::Float(value),
+                &"a finite value within 0.0..=1.0",
+            )
+        })
+    }
+}
+
+/// Query-time corroboration of a chunk by its incoming links,
+/// `0.0..=[`EVIDENCE_SCORE_MAX`]` (the `chunk_link_score` range).
+///
+/// A distinct newtype from [`Relevance`] on purpose: corroboration (do other
+/// chunks support this?) and relevance (does this match the query?) share
+/// neither range nor meaning, so they share no conversions either — no
+/// `From<f64>` in either direction and no `From`/`Into` between the two
+/// (grep-verified, see the test module). Two constructors: rejecting
+/// [`Self::new`] for validated inputs, clamping [`Self::clamped`] for lifts
+/// of scorer outputs that may overshoot (NaN floors to `0.0`: an unordered
+/// signal corroborates nothing).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct EvidenceScore(f64);
+
+impl EvidenceScore {
+    /// Rejecting constructor: `None` for NaN, infinities, and values
+    /// outside `0.0..=[`EVIDENCE_SCORE_MAX`]`.
+    #[must_use]
+    pub fn new(value: f64) -> Option<Self> {
+        if value.is_finite() && (0.0..=EVIDENCE_SCORE_MAX).contains(&value) {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+
+    /// Clamping constructor for lifting scorer outputs: NaN maps to `0.0`
+    /// (`f64::clamp` would panic on NaN), everything else clamps to
+    /// `0.0..=[`EVIDENCE_SCORE_MAX`]` order-preservingly.
+    #[must_use]
+    pub fn clamped(value: f64) -> Self {
+        if value.is_nan() {
+            Self(0.0)
+        } else {
+            Self(value.clamp(0.0, EVIDENCE_SCORE_MAX))
+        }
+    }
+
+    /// The validated score.
+    #[must_use]
+    pub fn value(&self) -> f64 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for EvidenceScore {
+    /// Boundary enforcement: rejects NaN, infinities, and out-of-range
+    /// values at deserialization, mirroring [`Self::new`].
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = f64::deserialize(deserializer)?;
+        Self::new(value).ok_or_else(|| {
+            serde::de::Error::invalid_value(
+                serde::de::Unexpected::Float(value),
+                &"a finite value within 0.0..=EVIDENCE_SCORE_MAX",
+            )
+        })
+    }
+}
+
+/// Truth status of a memory item, in core vocabulary.
+///
+/// Core may not name the real `FactStatus` (it lives in the orchestrator,
+/// which sits above core — dependency-layering rule), so this enum mirrors
+/// its *shape* without naming it; the conversion lives in the orchestrator
+/// (`FactStatus::to_view`), the only crate that sees both. `OutsideWindow`
+/// has no orchestrator source: memory assigns it when the corroborating
+/// evidence has decayed beyond the window — the item may once have been
+/// true, but nothing in range corroborates it now.
+///
+/// Deliberately **not** `#[non_exhaustive]`: cross-crate construction is
+/// the point (the orchestrator builds these values), and exhaustive matches
+/// keep a truth-from-score derivation a compile-visible act. There is no
+/// constructor from any score type — truth is never computed from a number
+/// (G-NOUPGRADE preserved by construction: no API takes an `f64` and
+/// returns a `FactStatusView`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FactStatusView {
+    /// Backed by an executed observation.
+    Verified,
+    /// Backed only by an assertion.
+    Assumed,
+    /// Invalidated by a newer write or a generation change.
+    Stale,
+    /// An executed observation contradicts the claim.
+    Contradicted,
+    /// Corroborating evidence decayed beyond the window. Memory-side only:
+    /// assigned at retrieval, never by the orchestrator conversion.
+    OutsideWindow,
+}
+
+impl FactStatusView {
+    /// The stable string form used in serialized evidence.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::Assumed => "assumed",
+            Self::Stale => "stale",
+            Self::Contradicted => "contradicted",
+            Self::OutsideWindow => "outside-window",
+        }
+    }
+}
+
+impl std::fmt::Display for FactStatusView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TaskNode — task decomposition tree
 // ---------------------------------------------------------------------------
@@ -483,5 +879,202 @@ mod tests {
         assert_eq!(link.to, "b");
         assert_eq!(link.kind, MemoryLinkKind::Supersedes);
         assert_eq!(link.weight, 1.0);
+    }
+
+    // --- ADR-82 slice 7: axis-separation vocabulary -----------------------
+    //
+    // Non-interchangeability is constructor-plus-convention-plus-test
+    // enforcement, not absolute type safety: a caller holding a raw `f64`
+    // can still deliberately construct the wrong newtype. What the types DO
+    // guarantee is enforced here and at the serde boundary. The absences
+    // below are additionally grep-verified; these patterns must return
+    // nothing in this file:
+    //   `impl From<.*> for (Confidence|Relevance|EvidenceScore)`
+    //   `impl From<(Confidence|Relevance|EvidenceScore)>`
+    //   `Option<Confidence>`
+    //   `fn value(&self)` on `Confidence` (numeric exit is pattern matching)
+
+    #[test]
+    fn confidence_unknown_renders_as_the_literal_word() {
+        assert_eq!(Confidence::Unknown.to_string(), "unknown");
+        assert_eq!(Confidence::default(), Confidence::Unknown);
+        assert!(!Confidence::Unknown.is_known());
+        assert_eq!(Confidence::Unknown.source(), None);
+        // The word, never a number.
+        let json = serde_json::to_string(&Confidence::Unknown).expect("serializes");
+        assert_eq!(json, "\"unknown\"");
+        let back: Confidence = serde_json::from_str(&json).expect("round-trips");
+        assert_eq!(back, Confidence::Unknown);
+    }
+
+    #[test]
+    fn confidence_known_round_trips_with_source() {
+        let known = Confidence::known(0.8, ConfidenceSource::ModelSelfReport).expect("valid");
+        assert!(known.is_known());
+        assert_eq!(known.source(), Some(ConfidenceSource::ModelSelfReport));
+        assert_eq!(known.to_string(), "0.80 (model-self-report)");
+        let json = serde_json::to_string(&known).expect("serializes");
+        let back: Confidence = serde_json::from_str(&json).expect("round-trips");
+        assert_eq!(back, known);
+    }
+
+    #[test]
+    fn confidence_known_zero_is_not_unknown() {
+        // 0.0 is a measured certainty-of-nothing, distinct from absence.
+        let zero = Confidence::known(0.0, ConfidenceSource::ModelSelfReport).expect("0.0 valid");
+        assert_ne!(zero, Confidence::Unknown);
+        assert_eq!(zero.to_string(), "0.00 (model-self-report)");
+        let json = serde_json::to_string(&zero).expect("serializes");
+        assert_ne!(json, "\"unknown\"");
+        let back: Confidence = serde_json::from_str(&json).expect("round-trips");
+        assert_eq!(back, zero);
+    }
+
+    #[test]
+    fn confidence_known_rejects_nan_infinite_and_out_of_range() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, -1.0, 1.1, 2.0] {
+            assert!(
+                Confidence::known(bad, ConfidenceSource::ModelSelfReport).is_none(),
+                "must reject {bad}"
+            );
+        }
+        // Boundaries are inclusive.
+        assert!(Confidence::known(0.0, ConfidenceSource::ModelSelfReport).is_some());
+        assert!(Confidence::known(1.0, ConfidenceSource::RuntimeCalibration).is_some());
+    }
+
+    #[test]
+    fn confidence_deserialize_rejects_unknown_collapsing_inputs() {
+        // Every shape that would collapse "no calibration" into a number —
+        // or a number into an unvalidated calibration — is refused.
+        for raw in [
+            "null",
+            "0.8",
+            "0.0",
+            "\"\"",
+            "\"UNKNOWN\"",
+            "\"none\"",
+            "[]",
+            "{}",
+            "{\"value\": 0.8}",
+            "{\"source\": \"model-self-report\"}",
+            "{\"value\": 1.5, \"source\": \"model-self-report\"}",
+            "{\"value\": -0.1, \"source\": \"model-self-report\"}",
+            "{\"value\": 0.8, \"source\": \"no-such-source\"}",
+        ] {
+            assert!(serde_json::from_str::<Confidence>(raw).is_err(), "must refuse {raw:?}");
+        }
+        // serde_json has no NaN literal: the closest hostile input is
+        // rejected before a float is ever produced.
+        assert!(serde_json::from_str::<Confidence>("NaN").is_err());
+    }
+
+    #[test]
+    fn confidence_missing_key_defaults_to_unknown() {
+        // The single-unknown rule: enclosing structs declare
+        // `#[serde(default)]`, so absence means Unknown — never a second
+        // unknown channel and never a silent 0.0.
+        #[derive(Deserialize, PartialEq, Debug)]
+        struct Holder {
+            #[serde(default)]
+            confidence: Confidence,
+        }
+        let decoded: Holder = serde_json::from_str("{}").expect("missing key loads");
+        assert_eq!(decoded.confidence, Confidence::Unknown);
+        let decoded: Holder =
+            serde_json::from_str("{\"confidence\": \"unknown\"}").expect("word loads");
+        assert_eq!(decoded.confidence, Confidence::Unknown);
+    }
+
+    #[test]
+    fn relevance_rejects_and_clamps_on_distinct_paths() {
+        assert!(Relevance::new(0.5).is_some());
+        assert!(Relevance::new(0.0).is_some());
+        assert!(Relevance::new(1.0).is_some());
+        for bad in [f64::NAN, f64::INFINITY, -0.1, 1.1] {
+            assert!(Relevance::new(bad).is_none(), "rejecting path must refuse {bad}");
+        }
+        assert_eq!(Relevance::clamped(2.0).value(), 1.0);
+        assert_eq!(Relevance::clamped(-3.0).value(), 0.0);
+        // NaN floors (clamp would panic); an unordered signal ranks last.
+        assert_eq!(Relevance::clamped(f64::NAN).value(), 0.0);
+        // Order is preserved through the clamping lift.
+        assert!(Relevance::clamped(0.2).value() < Relevance::clamped(0.3).value());
+    }
+
+    #[test]
+    fn evidence_score_range_is_the_shared_max() {
+        assert_eq!(EVIDENCE_SCORE_MAX, 10.0);
+        assert!(EvidenceScore::new(0.0).is_some());
+        assert!(EvidenceScore::new(EVIDENCE_SCORE_MAX).is_some());
+        for bad in [f64::NAN, f64::INFINITY, -0.1, EVIDENCE_SCORE_MAX + 0.1] {
+            assert!(EvidenceScore::new(bad).is_none(), "rejecting path must refuse {bad}");
+        }
+        assert_eq!(EvidenceScore::clamped(99.0).value(), EVIDENCE_SCORE_MAX);
+        assert_eq!(EvidenceScore::clamped(-1.0).value(), 0.0);
+        assert_eq!(EvidenceScore::clamped(f64::NAN).value(), 0.0);
+    }
+
+    #[test]
+    fn score_newtypes_reject_invalid_wire_values() {
+        for raw in ["1.5", "-0.1", "null", "\"x\""] {
+            assert!(serde_json::from_str::<Relevance>(raw).is_err(), "relevance: {raw:?}");
+        }
+        for raw in ["10.1", "-0.1", "null", "\"x\""] {
+            assert!(serde_json::from_str::<EvidenceScore>(raw).is_err(), "evidence: {raw:?}");
+        }
+        let relevance: Relevance = serde_json::from_str("0.5").expect("valid relevance");
+        assert_eq!(relevance.value(), 0.5);
+        let score: EvidenceScore = serde_json::from_str("7.5").expect("valid score");
+        assert_eq!(score.value(), 7.5);
+    }
+
+    #[test]
+    fn fact_status_view_serializes_kebab_case() {
+        for (view, expected) in [
+            (FactStatusView::Verified, "\"verified\""),
+            (FactStatusView::Assumed, "\"assumed\""),
+            (FactStatusView::Stale, "\"stale\""),
+            (FactStatusView::Contradicted, "\"contradicted\""),
+            (FactStatusView::OutsideWindow, "\"outside-window\""),
+        ] {
+            let json = serde_json::to_string(&view).expect("serializes");
+            assert_eq!(json, expected);
+            assert_eq!(view.to_string(), view.as_str());
+            let back: FactStatusView = serde_json::from_str(&json).expect("round-trips");
+            assert_eq!(back, view);
+        }
+    }
+
+    #[test]
+    fn decision_confidence_lift_is_read_only_and_honest() {
+        use crate::ids::Ulid;
+        let mut decision = Decision {
+            id: DecisionId(Ulid::nil()),
+            session_id: Ulid::nil(),
+            task_id: None,
+            what: "w".into(),
+            why: "y".into(),
+            outcome: None,
+            category: DecisionCategory::Architecture,
+            confidence: 0.7,
+            superseded_by: None,
+            created_at: OffsetDateTime::now_utc(),
+        };
+        // The stored field is untouched by the lift.
+        let lifted = decision.confidence_evidence();
+        assert_eq!(lifted.source(), Some(ConfidenceSource::ModelSelfReport));
+        assert_eq!(decision.confidence, 0.7);
+        match lifted {
+            Confidence::Known { value, .. } => {
+                assert!((value - f64::from(0.7_f32)).abs() < 1e-6);
+            }
+            Confidence::Unknown => panic!("0.7 must lift to Known"),
+        }
+        // A broken stored report reads as absent, never as clamped truth.
+        decision.confidence = f32::NAN;
+        assert_eq!(decision.confidence_evidence(), Confidence::Unknown);
+        decision.confidence = 2.0;
+        assert_eq!(decision.confidence_evidence(), Confidence::Unknown);
     }
 }

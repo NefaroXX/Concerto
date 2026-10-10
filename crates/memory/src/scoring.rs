@@ -20,12 +20,16 @@
 //! This module has no clocks and no I/O: callers pass `now_unix` (seconds)
 //! and the store hands over already-decoded [`TimedLink`]s.
 
-use concerto_core::memory::{MemoryLink, MemoryLinkKind};
+use concerto_core::memory::{MemoryLink, MemoryLinkKind, EVIDENCE_SCORE_MAX};
 use time::OffsetDateTime;
 
 /// Maximum link score — the ceiling both the cascade reorder and the score
 /// clamp scale against.
-pub const LINK_SCORE_MAX: f64 = 10.0;
+///
+/// Aliases the core [`EVIDENCE_SCORE_MAX`] vocabulary constant (ADR-82
+/// slice 7): one definition site, so the scorer and the `EvidenceScore`
+/// newtype range can never drift apart.
+pub const LINK_SCORE_MAX: f64 = EVIDENCE_SCORE_MAX;
 
 /// Score at or below which [`crate::ttl::prune_orphaned_derived`] treats a
 /// derived row as orphaned evidence and deletes it.

@@ -209,6 +209,8 @@ use concerto_sessions::whiteboard::{
 };
 use concerto_sessions::WhiteboardKind;
 
+use concerto_core::memory::FactStatusView;
+
 use crate::checkpoint::CheckpointPendingDecision;
 use crate::decisions::{CoordinatorDecision, DecisionStatus};
 use crate::failure_diagnosis::FailureDiagnosis;
@@ -316,6 +318,26 @@ pub enum FactStatus {
 }
 
 impl FactStatus {
+    /// Convert into the core [`FactStatusView`] vocabulary (ADR-82 slice 7).
+    ///
+    /// This conversion lives here — not in core — because only the
+    /// orchestrator sees both types (dependency-layering rule). The mapping
+    /// is total and 1:1 over the four world-model variants;
+    /// [`FactStatusView::OutsideWindow`] is never produced here: it is a
+    /// memory-side retrieval assignment (evidence decayed beyond the
+    /// window), and the world model has no window concept. Like every other
+    /// axis rule, no score participates: truth comes from derivation
+    /// provenance, never from a number.
+    #[must_use]
+    pub fn to_view(self) -> FactStatusView {
+        match self {
+            Self::Verified => FactStatusView::Verified,
+            Self::Contradicted => FactStatusView::Contradicted,
+            Self::Assumed => FactStatusView::Assumed,
+            Self::Stale => FactStatusView::Stale,
+        }
+    }
+
     /// Eviction precedence for the fact cap (issue #170 as reviewed):
     /// `Verified` outranks `Contradicted`, which outranks `Assumed`, which
     /// outranks `Stale`. Disproof must not evict proof — the render order
@@ -4957,6 +4979,24 @@ mod tests {
     /// Issue #141 + G-NOUPGRADE: a Finding's citations survive the
     /// projection and render compactly, but grounding NEVER upgrades the
     /// fact — only an executed observation (F-VERIFY) does that.
+    ///
+    /// ADR-82 slice 7: the world-model truth converts 1:1 into the core
+    /// `FactStatusView` vocabulary via `FactStatus::to_view` — the only
+    /// crate that sees both types owns the conversion. `OutsideWindow` has
+    /// no source here (memory-side retrieval assignment only), and no score
+    /// participates in the mapping.
+    #[test]
+    fn fact_status_view_conversion_is_total_and_score_free() {
+        for (status, expected) in [
+            (FactStatus::Verified, FactStatusView::Verified),
+            (FactStatus::Contradicted, FactStatusView::Contradicted),
+            (FactStatus::Assumed, FactStatusView::Assumed),
+            (FactStatus::Stale, FactStatusView::Stale),
+        ] {
+            assert_eq!(status.to_view(), expected);
+        }
+    }
+
     #[test]
     fn grounded_finding_renders_refs_but_stays_assumed() {
         let events =
