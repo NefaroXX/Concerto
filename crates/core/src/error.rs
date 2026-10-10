@@ -473,16 +473,20 @@ pub enum ToolError {
 /// (missing path, wrong path shape, unsatisfiable input, denied permission)
 /// rather than a fault. Compared against the lowercased message.
 ///
-/// One grammar, one place: [`ToolError::is_deterministic_failure`] and
-/// `concerto-orchestrator`'s `failure_diagnosis::diagnose_outcome_failure`
-/// both key on these markers, so an error classified as provably impossible
-/// in the loop and in the Coordinator's diagnosis can never disagree.
+/// One grammar, one place: [`ToolError::is_deterministic_failure`],
+/// `concerto-orchestrator`'s `failure_diagnosis::diagnose_outcome_failure`,
+/// and the native [`ToolError::ExecutionFailed`] arm of
+/// [`crate::tool_failure::ToolFailure::from_error`] all key on these markers,
+/// so an error classified as provably impossible in the loop, in the
+/// Coordinator's diagnosis, and on the failure envelope can never disagree.
+/// `pub(crate)` so the envelope derives from the shared list instead of a
+/// copy.
 ///
 /// Deliberately conservative: transport-shaped faults (connection reset,
 /// timeout, 429/5xx) and anything unrecognized return `false`, because a
 /// false "impossible" blocks a retry that could have succeeded, while a
 /// false "transient" merely costs one extra attempt.
-const DETERMINISTIC_FAILURE_MARKERS: &[&str] = &[
+pub(crate) const DETERMINISTIC_FAILURE_MARKERS: &[&str] = &[
     // Missing source/target — the action's precondition is absent.
     "file not found",
     "no such file",
@@ -526,7 +530,9 @@ const DETERMINISTIC_FAILURE_MARKERS: &[&str] = &[
 /// the workspace configuration, so the identical command is rejected again
 /// without executing. A genuine overlay conflict (a concurrent edit) matches
 /// none of these and stays retryable. Compared lowercased.
-const DETERMINISTIC_CONTAINMENT_MARKERS: &[&str] =
+/// `pub(crate)` so `tool_failure`'s containment check reads this single
+/// definition site instead of keeping a copy.
+pub(crate) const DETERMINISTIC_CONTAINMENT_MARKERS: &[&str] =
     &["escapes workspace root", "outside the project root", "path traversal"];
 
 /// Whether an error message states a DETERMINISTIC failure: re-issuing the

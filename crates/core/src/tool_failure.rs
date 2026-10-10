@@ -18,7 +18,10 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::error::{is_deterministic_failure_message, ToolError};
+use crate::error::{
+    is_deterministic_failure_message, ToolError, DETERMINISTIC_CONTAINMENT_MARKERS,
+    DETERMINISTIC_FAILURE_MARKERS,
+};
 
 /// Current wire-schema version for [`ToolFailure`].
 pub const TOOL_FAILURE_SCHEMA_VERSION: u16 = 1;
@@ -342,7 +345,9 @@ impl ToolFailure {
     ///
     /// The substring predicate ([`is_deterministic_failure_message`]) is used
     /// ONLY in the opaque-fallback arms below — never as the derivation
-    /// source for native variants.
+    /// source for native variants. The one native arm that must read message
+    /// text (`ExecutionFailed`, stringly until H02) derives from the shared
+    /// marker constants instead, so envelope and ledger key on one grammar.
     #[must_use]
     pub fn from_error(error: &ToolError, ctx: ToolFailureContext) -> Self {
         if !ctx.origin.is_builtin() {
@@ -355,6 +360,15 @@ impl ToolFailure {
             // Unknown future variant (`#[non_exhaustive]`): safe degradation.
             // The ONLY arm that consults the prose predicate, as a
             // compatibility fallback for opaque failure text.
+            //
+            // TOTALITY SAFEGUARD: adding a `ToolError` variant REQUIRES (1) an
+            // explicit arm in `native_envelope_parts` (the wildcard there
+            // would otherwise silently degrade the new variant to this
+            // opaque envelope) and (2) a case in the
+            // `from_error_maps_every_native_variant` table below.
+            // `native_envelope_match_is_exhaustive_over_tool_error` fails to
+            // COMPILE when (1) is missed; the table fails at runtime when
+            // (2) is.
             None => Self::opaque_envelope(&error.to_string(), ctx),
         }
     }
@@ -431,13 +445,28 @@ impl ToolFailure {
                 }),
                 None,
             )),
-            // Native execution fault. The disposition is static (`Unknown`
-            // for the unclassified case): consulting the prose predicate
-            // here would make Display text the derivation source again.
+            // Native execution fault. The disposition derives from the SHARED
+            // marker grammar (`DETERMINISTIC_FAILURE_MARKERS` — the same
+            // constants the ledger's `is_deterministic_failure` parses), so
+            // the envelope and the ledger can never disagree on this, the
+            // most common native failure shape: marker match →
+            // `DoNotReIssue`, no match → `Unknown` (never a fabricated retry
+            // claim). The grammar is referenced, never copied.
+            // INTERIM pending H02 construction-site typing: tools should
+            // construct a typed `ToolError::Io` instead of the stringly
+            // `ExecutionFailed`, which would retire message matching on this
+            // native path entirely. Until then the prose predicate remains
+            // the fallback for OPAQUE origins only (non-builtin origins and
+            // unknown future variants — unchanged path, see
+            // `opaque_envelope`).
             ToolError::ExecutionFailed { message } => Some((
                 "exec.execution_failed",
                 ToolFailureCategory::Execution,
-                ToolDisposition::Unknown,
+                if matches_markers(message, DETERMINISTIC_FAILURE_MARKERS) {
+                    ToolDisposition::DoNotReIssue
+                } else {
+                    ToolDisposition::Unknown
+                },
                 message.clone(),
                 serde_json::Value::Null,
                 None,
@@ -493,10 +522,20 @@ impl ToolFailure {
                 serde_json::Value::Null,
                 None,
             )),
+            // Slice-2 review fix: `BoundedRetryWithBackoff` OVER-CLAIMED —
+            // this variant also carries permanent faults (missing server
+            // binary, protocol mismatch, closed response channel) and the
+            // variant has no structural signal to split those from transient
+            // ones. `Unknown` states "neither retryable nor deterministic"
+            // honestly; calibration of the sub-cases is deferred (it needs
+            // typed sub-kinds, i.e. construction-site work beyond slice 2).
+            // Loop behavior is unchanged: the ledger predicate still returns
+            // `false` for `LspError`, so a retry remains allowed exactly as
+            // before — only the envelope stops promising it.
             ToolError::LspError { message } => Some((
                 "exec.lsp_error",
                 ToolFailureCategory::Execution,
-                ToolDisposition::BoundedRetryWithBackoff,
+                ToolDisposition::Unknown,
                 message.clone(),
                 serde_json::Value::Null,
                 None,
@@ -528,6 +567,11 @@ impl ToolFailure {
             // Unknown future variant (`#[non_exhaustive]`): safe degradation
             // (see the fn docs). `None` routes to the opaque envelope, the
             // ONLY path that consults the prose predicate.
+            // TOTALITY: a new `ToolError` variant REQUIRES an explicit arm
+            // above (plus a case in the `from_error_maps_every_native_variant`
+            // table) — this wildcard must not become its resting place.
+            // `native_envelope_match_is_exhaustive_over_tool_error` fails to
+            // compile until the arm exists.
             _ => None,
         }
     }
@@ -601,13 +645,19 @@ fn status_for_disposition(disposition: ToolDisposition) -> ToolStatus {
 /// Whether a `VirtualFsConflict` reason is a containment/traversal rejection
 /// (workspace boundary fact — the identical command is rejected again) as
 /// opposed to a genuine overlay conflict (retryable after a rebase).
-/// Same grammar as `DETERMINISTIC_CONTAINMENT_MARKERS`
-/// (`crate::error`, compared lowercased).
+/// Reads the shared `DETERMINISTIC_CONTAINMENT_MARKERS` grammar
+/// (`crate::error`) — the single definition site, no local copy.
 fn is_containment_reason(reason: &str) -> bool {
-    let lowered = reason.to_ascii_lowercase();
-    ["escapes workspace root", "outside the project root", "path traversal"]
-        .iter()
-        .any(|marker| lowered.contains(marker))
+    matches_markers(reason, DETERMINISTIC_CONTAINMENT_MARKERS)
+}
+
+/// Whether `text` contains any of `markers`, compared lowercased — the one
+/// fold over the shared marker grammar from `crate::error`. The marker lists
+/// are referenced, never copied, so the envelope cannot drift from the
+/// ledger.
+fn matches_markers(text: &str, markers: &[&str]) -> bool {
+    let lowered = text.to_ascii_lowercase();
+    markers.iter().any(|marker| lowered.contains(marker))
 }
 
 /// Whether a failure code follows the `<area>.<name>` grammar: at least two
@@ -801,10 +851,12 @@ mod tests {
                 ToolDisposition::DoNotReIssue,
             ),
             (
+                // Review fix: `Unknown`, not `bounded-retry-with-backoff` —
+                // see the rationale on the arm (and its dedicated test).
                 ToolError::LspError { message: "server crashed".into() },
                 "exec.lsp_error",
                 ToolFailureCategory::Execution,
-                ToolDisposition::BoundedRetryWithBackoff,
+                ToolDisposition::Unknown,
             ),
             (
                 ToolError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "gone")),
@@ -873,17 +925,105 @@ mod tests {
         }
     }
 
+    /// Slice-2 review fix (blocking): the native `ExecutionFailed`
+    /// disposition and the ledger's `is_deterministic_failure` parse the
+    /// SAME shared marker grammar, so the two surfaces agree on the most
+    /// common native failure shape — while non-builtin origins keep the
+    /// forced opaque path unchanged.
     #[test]
-    fn execution_failed_prose_never_drives_the_disposition() {
-        // The substring predicate would call this deterministic; the envelope
-        // must not — Display text is never the derivation source for natives.
-        let failure = ToolFailure::from_error(
-            &ToolError::ExecutionFailed { message: "file not found: src/main.rs".into() },
-            builtin_ctx(),
+    fn native_execution_failed_agrees_with_the_ledger_grammar() {
+        // Marker-shaped native message ("file not found" is in
+        // DETERMINISTIC_FAILURE_MARKERS): both surfaces say the identical
+        // re-issue cannot succeed.
+        let deterministic =
+            ToolError::ExecutionFailed { message: "file not found: src/main.rs".into() };
+        assert!(
+            deterministic.is_deterministic_failure(),
+            "ledger classifies the message deterministic"
         );
-        assert_eq!(failure.disposition, ToolDisposition::Unknown);
-        assert_eq!(failure.code, "exec.execution_failed");
-        assert!(!failure.opaque);
+        let envelope = ToolFailure::from_error(&deterministic, builtin_ctx());
+        assert_eq!(envelope.disposition, ToolDisposition::DoNotReIssue, "envelope agrees");
+        assert_eq!(envelope.code, "exec.execution_failed", "code unchanged");
+        assert_eq!(envelope.category, ToolFailureCategory::Execution);
+        assert!(!envelope.opaque, "native origin stays native");
+        assert_eq!(envelope.status, ToolStatus::Blocked, "deterministic refusals block");
+
+        // The identical text from a non-builtin origin still takes the
+        // forced opaque path (trust rule): code degrades, the disposition
+        // remains predicate-driven — unchanged behavior.
+        let opaque = ToolFailure::from_error(
+            &ToolError::ExecutionFailed { message: "file not found: src/main.rs".into() },
+            ToolFailureContext::with_origin(ToolOrigin::Plugin("evil".into())),
+        );
+        assert!(opaque.opaque, "non-builtin origins are opaque");
+        assert_eq!(opaque.code, "exec.opaque");
+        assert_eq!(opaque.category, ToolFailureCategory::Opaque);
+        assert_eq!(opaque.disposition, ToolDisposition::DoNotReIssue);
+        assert_eq!(opaque.origin, ToolOrigin::Plugin("evil".into()));
+
+        // Unparseable native text: no marker match, so the envelope reports
+        // `Unknown` — the same "not deterministic" verdict as the ledger,
+        // with no fabricated retry claim in either direction.
+        let unknown =
+            ToolError::ExecutionFailed { message: "the model produced malformed JSON".into() };
+        assert!(!unknown.is_deterministic_failure(), "ledger says not deterministic");
+        let envelope = ToolFailure::from_error(&unknown, builtin_ctx());
+        assert_eq!(envelope.disposition, ToolDisposition::Unknown, "envelope agrees");
+        assert_eq!(envelope.code, "exec.execution_failed");
+        assert!(!envelope.opaque);
+        assert_eq!(envelope.status, ToolStatus::RecoverableFailure, "unclassified never blocks");
+    }
+
+    /// Slice-2 review fix (high): `LspError` stops over-claiming
+    /// `bounded-retry-with-backoff`. Rationale: the variant carries
+    /// heterogeneous faults — permanent ones (missing binary, protocol
+    /// mismatch, closed response channel) alongside transient ones — and
+    /// exposes no structural field to split on, so the envelope reports
+    /// `Unknown` ("neither retryable nor deterministic") until calibration
+    /// gets typed sub-kinds. Loop behavior is deliberately unchanged: the
+    /// ledger predicate still returns `false` for `LspError`, so a retry
+    /// remains allowed exactly as before.
+    #[test]
+    fn lsp_error_reports_unknown_instead_of_over_claiming_retry() {
+        for message in ["lsp server binary not found on PATH", "protocol mismatch: bad handshake"] {
+            let error = ToolError::LspError { message: message.into() };
+            assert!(!error.is_deterministic_failure(), "ledger unchanged: retry stays allowed");
+            let failure = ToolFailure::from_error(&error, builtin_ctx());
+            assert_eq!(failure.disposition, ToolDisposition::Unknown, "for {message}");
+            assert_eq!(failure.code, "exec.lsp_error");
+            assert_eq!(failure.category, ToolFailureCategory::Execution);
+            assert!(!failure.opaque, "native origin stays native");
+            assert_eq!(
+                failure.status,
+                ToolStatus::RecoverableFailure,
+                "an unclassified fault must not stop anything"
+            );
+        }
+    }
+
+    /// Totality safeguard, compile-time half: this match deliberately has NO
+    /// wildcard arm, so adding a `ToolError` variant without handling it in
+    /// `ToolFailure::native_envelope_parts` fails `cargo test` (and
+    /// `clippy --all-targets`) at COMPILE time. The runtime half is
+    /// [`from_error_maps_every_native_variant`], which fails when the new
+    /// variant has an arm but no table case.
+    #[test]
+    fn native_envelope_match_is_exhaustive_over_tool_error() {
+        fn covered(error: &ToolError) {
+            match error {
+                ToolError::PolicyDenied { .. }
+                | ToolError::PausedAwaitingApproval { .. }
+                | ToolError::ExecutionFailed { .. }
+                | ToolError::NotARepository { .. }
+                | ToolError::Timeout { .. }
+                | ToolError::Cancelled
+                | ToolError::VirtualFsConflict { .. }
+                | ToolError::RollbackNotSupported
+                | ToolError::LspError { .. }
+                | ToolError::Io(_) => {}
+            }
+        }
+        covered(&ToolError::Cancelled);
     }
 
     #[test]
