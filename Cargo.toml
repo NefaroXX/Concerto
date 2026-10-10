@@ -88,7 +88,7 @@ tiktoken-rs = "0.6"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate", "time", "uuid"] }
 # SQLCipher build of the same libsqlite3-sys sqlx links (feature unification).
 # Enables `PRAGMA key` at-rest encryption for the sessions/audit database.
-libsqlite3-sys = { version = "0.30", features = ["bundled-sqlcipher"] }
+libsqlite3-sys = { version = "0.37", features = ["bundled-sqlcipher"] }
 
 # ---- Filesystem & paths (Phase 1, sessions) ----
 dirs = "6"
