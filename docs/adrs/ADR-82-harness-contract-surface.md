@@ -1,8 +1,7 @@
 # ADR-82: Harness Contract Surface — Typed Failures, Verification Outcomes, Environment Manifest, Checkpoints, and Memory Evidence
 
-**Status:** Proposed — revised 2026-10-10 to address review items R1–R6 and two
-small corrections (context Q1 and Confidence validation); still awaiting
-acceptance. This is the H01 scoping decision of the harness-upgrade effort:
+**Status:** Accepted 2026-10-10 (revised same day to address review items R1–R6 and two
+small corrections). This is the H01 scoping decision of the harness-upgrade effort:
 **extend the existing type surface rather than introduce five parallel
 greenfield contracts**, because the H00 audit found most of the required
 infrastructure already exists. It records design only; no source change lands
@@ -758,5 +757,5 @@ tests that must each be written and kept green (Compatibility section).
 
 ---
 
-*Proposed 2026-10-09 (revised 2026-10-10): H01 harness-upgrade scoping
+*Proposed 2026-10-09 (revised 2026-10-10); accepted 2026-10-10: H01 harness-upgrade scoping
 decision. Design only — nothing in this ADR is implemented by it.*
