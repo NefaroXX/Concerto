@@ -2202,6 +2202,9 @@ impl AgentLoop {
                     path: None,
                     success: false,
                     summary: summary.clone(),
+                    // Rejected before execution: no canonical call happened.
+                    canonical_tool: None,
+                    canonical_operation: None,
                 });
                 let _ = self.bus.publish_for_session(
                     task.session_id,
@@ -2281,6 +2284,9 @@ impl AgentLoop {
                 path: None,
                 success: false,
                 summary: summary.clone(),
+                // Refused before execution: no canonical call happened.
+                canonical_tool: None,
+                canonical_operation: None,
             });
             let _ = self.bus.publish_for_session(
                 task.session_id,
@@ -2395,11 +2401,26 @@ impl AgentLoop {
             },
         );
 
+        // ADR-82 slice 1: resolve the canonical policy-view identity once for
+        // this call. The in-process backend owns the registry and resolves it;
+        // the supervised child cannot see the registry, so it stays `None`
+        // there and the legacy registered-name grammar is the fallback. The
+        // canonical pair rides the tool summary and the evidence fact; the
+        // registered name stays for attribution.
+        let canonical = self.tool_executor.canonical_effect(&tc.name, &arguments);
+        let canonical_tool = canonical.as_ref().map(|effect| effect.policy_name.clone());
+        let canonical_operation = canonical.as_ref().and_then(|effect| effect.operation.clone());
         // ADR-65 §3: a completed tool command is evidence. Capture the
         // pre-write content hashes now (before execution) so the fact can
         // record the workspace state prior to this command — the write
         // classifier mirrors the in-arm file-change accounting below.
-        let file_affecting = crate::tool_facts::is_file_affecting_tool(&tc.name, &arguments);
+        let file_affecting = match &canonical {
+            Some(effect) => crate::tool_facts::is_file_affecting_tool(
+                &effect.policy_name,
+                effect.operation.as_deref(),
+            ),
+            None => crate::tool_facts::is_file_affecting_tool_legacy(&tc.name, &arguments),
+        };
         let pre_image_hashes = match &self.tool_facts {
             Some(facts) => {
                 let affected = crate::tool_facts::extract_affected_paths(&arguments, None);
@@ -2464,6 +2485,8 @@ impl AgentLoop {
                 path: Some(Utf8PathBuf::from(&serve.path)),
                 success: true,
                 summary: served_summary.clone(),
+                canonical_tool: canonical_tool.clone(),
+                canonical_operation: canonical_operation.clone(),
             });
             let served_data = serde_json::json!({
                 "content": serve.content,
@@ -2505,6 +2528,8 @@ impl AgentLoop {
                 &tc.name,
                 &arguments,
                 &serve.event_id,
+                canonical_tool.as_deref(),
+                canonical_operation.as_deref(),
                 &cancel,
             )
             .await;
@@ -2581,6 +2606,8 @@ impl AgentLoop {
                     path: detail_path.clone().map(camino::Utf8PathBuf::from),
                     success: true,
                     summary: output.summary.clone(),
+                    canonical_tool: canonical_tool.clone(),
+                    canonical_operation: canonical_operation.clone(),
                 });
                 let finished_detail =
                     match output.data.get("absolute_path").and_then(|v| v.as_str()) {
@@ -2632,6 +2659,8 @@ impl AgentLoop {
                     crate::tool_facts::extract_affected_paths(&arguments, Some(&output.data)),
                     audited_mutation,
                     pre_image_hashes.clone(),
+                    canonical_tool.as_deref(),
+                    canonical_operation.as_deref(),
                     &cancel,
                 )
                 .await;
@@ -2686,6 +2715,8 @@ impl AgentLoop {
                     summary: format!(
                         "awaiting approval (timed out after {timeout_secs}s): {detail}"
                     ),
+                    canonical_tool: canonical_tool.clone(),
+                    canonical_operation: canonical_operation.clone(),
                 });
                 let _ = self.bus.publish_for_session(
                     task.session_id,
@@ -2727,6 +2758,8 @@ impl AgentLoop {
                     path: detail_path.clone().map(camino::Utf8PathBuf::from),
                     success: false,
                     summary: format!("policy denied: {}", rule),
+                    canonical_tool: canonical_tool.clone(),
+                    canonical_operation: canonical_operation.clone(),
                 });
                 let _ = self.bus.publish_for_session(
                     task.session_id,
@@ -2768,6 +2801,8 @@ impl AgentLoop {
                     crate::tool_facts::extract_affected_paths(&arguments, None),
                     file_affecting,
                     pre_image_hashes.clone(),
+                    canonical_tool.as_deref(),
+                    canonical_operation.as_deref(),
                     &cancel,
                 )
                 .await;
@@ -2806,6 +2841,8 @@ impl AgentLoop {
                     path: detail_path.clone().map(camino::Utf8PathBuf::from),
                     success: false,
                     summary: e.to_string(),
+                    canonical_tool: canonical_tool.clone(),
+                    canonical_operation: canonical_operation.clone(),
                 });
                 let _ = self.bus.publish_for_session(
                     task.session_id,
@@ -2847,6 +2884,8 @@ impl AgentLoop {
                     crate::tool_facts::extract_affected_paths(&arguments, None),
                     file_affecting,
                     pre_image_hashes.clone(),
+                    canonical_tool.as_deref(),
+                    canonical_operation.as_deref(),
                     &cancel,
                 )
                 .await;
@@ -2957,6 +2996,8 @@ impl AgentLoop {
         paths: Vec<String>,
         file_affecting: bool,
         pre_image_hashes: HashMap<String, Option<String>>,
+        canonical_tool: Option<&str>,
+        canonical_operation: Option<&str>,
         cancel: &CancellationToken,
     ) {
         let Some(facts) = &self.tool_facts else {
@@ -2980,6 +3021,8 @@ impl AgentLoop {
                     paths: &paths,
                     file_affecting,
                     pre_image_hashes,
+                    canonical_tool,
+                    canonical_operation,
                 },
                 cancel,
             )
@@ -2990,6 +3033,9 @@ impl AgentLoop {
     /// `served_from` (the original observation's event id). The fact's paths
     /// are intentionally empty — see `ToolFactContext::record_served_read`.
     /// Fail-soft, like every evidence write.
+    /// Nine args like the `record_tool_fact` sibling above: the canonical
+    /// pair travels with the call so the fact keys on it (ADR-82 slice 1).
+    #[allow(clippy::too_many_arguments)]
     async fn record_served_read_fact(
         &self,
         session: &SessionContext,
@@ -2997,6 +3043,8 @@ impl AgentLoop {
         tool: &str,
         args: &serde_json::Value,
         served_from: &str,
+        canonical_tool: Option<&str>,
+        canonical_operation: Option<&str>,
         cancel: &CancellationToken,
     ) {
         let Some(facts) = &self.tool_facts else {
@@ -3020,6 +3068,8 @@ impl AgentLoop {
                     paths: &[],
                     file_affecting: false,
                     pre_image_hashes: HashMap::new(),
+                    canonical_tool,
+                    canonical_operation,
                 },
                 served_from,
                 cancel,
@@ -8042,6 +8092,8 @@ mod tests {
                 path: Some("Cargo.toml".into()),
                 success: true,
                 summary: "Wrote 9 bytes to Cargo.toml".to_owned(),
+                canonical_tool: None,
+                canonical_operation: None,
             }],
             ..agent_output_base()
         };
@@ -8073,6 +8125,8 @@ mod tests {
             path: None,
             success: true,
             summary: "Read 3 bytes".to_owned(),
+            canonical_tool: None,
+            canonical_operation: None,
         }];
         let blocked =
             loop_.decide_exit(&task, &no_writes, 1, 0, 0, &None, true, Vec::new()).unwrap();

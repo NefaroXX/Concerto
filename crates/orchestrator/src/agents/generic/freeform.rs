@@ -260,15 +260,26 @@ impl GenericSpecialistAgent {
                         continue;
                     }
                 };
-                // The write classification reads the guarded arguments so a
-                // heuristically repaired filesystem write is still recorded.
-                let is_file_change = matches!(
-                    tool_call.name.as_str(),
-                    "write_file" | "delete_file" | "edit_file" | "create_file" | "modify_file"
-                ) || (tool_call.name == "filesystem"
-                    && arguments.get("operation").and_then(|value| value.as_str()).is_some_and(
-                        |operation| matches!(operation, "write" | "delete" | "move" | "copy"),
-                    ));
+                // ADR-82 slice 1: resolve the canonical policy-view identity
+                // once per call (the backend owns the registry; a backend
+                // without one yields None and the legacy grammar applies).
+                // The write classification reads the canonical identity so a
+                // `write` alias classifies as a filesystem write, while still
+                // reading the guarded arguments.
+                let canonical = executor.canonical_effect(&tool_call.name, &arguments);
+                let canonical_tool = canonical.as_ref().map(|effect| effect.policy_name.clone());
+                let canonical_operation =
+                    canonical.as_ref().and_then(|effect| effect.operation.clone());
+                let is_file_change = match &canonical {
+                    Some(effect) => crate::tool_facts::is_file_affecting_tool(
+                        &effect.policy_name,
+                        effect.operation.as_deref(),
+                    ),
+                    None => crate::tool_facts::is_file_affecting_tool_legacy(
+                        &tool_call.name,
+                        &arguments,
+                    ),
+                };
                 // ADR-65 §3: hash the pre-write state of every path this
                 // command will touch before it runs (fail-soft).
                 let pre_image_hashes = match &self.tool_facts {
@@ -341,6 +352,8 @@ impl GenericSpecialistAgent {
                         &tool_call.name,
                         &arguments,
                         &serve.event_id,
+                        canonical_tool.as_deref(),
+                        canonical_operation.as_deref(),
                         &cancel,
                     )
                     .await;
@@ -397,6 +410,8 @@ impl GenericSpecialistAgent {
                             Some(&output.data),
                             is_file_change,
                             pre_image_hashes.clone(),
+                            canonical_tool.as_deref(),
+                            canonical_operation.as_deref(),
                             &cancel,
                         )
                         .await;
@@ -441,6 +456,8 @@ impl GenericSpecialistAgent {
                             None,
                             is_file_change,
                             pre_image_hashes.clone(),
+                            canonical_tool.as_deref(),
+                            canonical_operation.as_deref(),
                             &cancel,
                         )
                         .await;

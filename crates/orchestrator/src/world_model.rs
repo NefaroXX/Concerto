@@ -820,9 +820,19 @@ fn extract_writes_and_facts(events: &[WhiteboardEvent]) -> Extraction {
                     }
                     ToolOutcome::Ok => {}
                 }
-                let file_affecting = view
-                    .tool
-                    .is_some_and(|tool| crate::tool_facts::is_file_affecting_tool(tool, view.args));
+                // ADR-82 slice 1: classify on the canonical policy-view
+                // identity when the record carries one (a `write` alias then
+                // resolves to its `filesystem` write); fall back to the
+                // registered name + args for records written before the
+                // canonical fields existed.
+                let file_affecting = match view.canonical_tool {
+                    Some(tool) => {
+                        crate::tool_facts::is_file_affecting_tool(tool, view.canonical_operation)
+                    }
+                    None => view.tool.is_some_and(|tool| {
+                        crate::tool_facts::is_file_affecting_tool_legacy(tool, view.args)
+                    }),
+                };
                 let tool_label = view.tool.unwrap_or("tool");
                 if file_affecting {
                     // Not counted as unattributable (issue #140): this arm's

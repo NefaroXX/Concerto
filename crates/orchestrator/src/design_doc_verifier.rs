@@ -172,8 +172,17 @@ pub fn is_empty_claim(proposed_paths: &[String]) -> bool {
 /// count (ADR-65 F7): a served read (served from the read-dedupe cache) or a
 /// non-file-affecting tool call. Write/delete/edit tools never count as reads
 /// — they mutate, they do not observe.
-pub fn classifies_as_read(tool: &str, args: &serde_json::Value, served_from: Option<&str>) -> bool {
-    served_from.is_some() || !is_file_affecting_tool(tool, args)
+///
+/// ADR-82 slice 1: classification keys on the **canonical** policy-view
+/// identity (a `write` alias is a `filesystem` write, not a read); callers
+/// pass the canonical name/operation when the record carries them, falling
+/// back to the registered name and the args' own `operation`.
+pub fn classifies_as_read(
+    canonical_tool: &str,
+    canonical_operation: Option<&str>,
+    served_from: Option<&str>,
+) -> bool {
+    served_from.is_some() || !is_file_affecting_tool(canonical_tool, canonical_operation)
 }
 
 /// `true` when a canonical proposed path conflicts with the observed tree: the
@@ -447,7 +456,18 @@ pub async fn collect_design_doc_evidence(
             if !is_author || !payload.success {
                 continue;
             }
-            if classifies_as_read(&payload.tool, &payload.args, payload.served_from.as_deref()) {
+            // ADR-82 slice 1: canonical identity when present, else the
+            // registered name + the args' own operation (legacy records).
+            let canonical_tool = payload.canonical_tool.as_deref().unwrap_or(&payload.tool);
+            let canonical_operation = payload
+                .canonical_operation
+                .as_deref()
+                .or_else(|| payload.args.get("operation").and_then(serde_json::Value::as_str));
+            if classifies_as_read(
+                canonical_tool,
+                canonical_operation,
+                payload.served_from.as_deref(),
+            ) {
                 author_read_count += 1;
             }
         }
@@ -665,16 +685,16 @@ mod tests {
 
     #[test]
     fn reads_count_served_and_read_tools_but_not_writes() {
-        assert!(classifies_as_read("read_file", &serde_json::json!({}), None));
-        assert!(classifies_as_read("grep", &serde_json::json!({}), None));
-        assert!(!classifies_as_read("write_file", &serde_json::json!({}), None));
-        assert!(!classifies_as_read(
-            "filesystem",
-            &serde_json::json!({ "operation": "write" }),
-            None
-        ));
+        // ADR-82 slice 1: the classifier takes the canonical identity.
+        assert!(classifies_as_read("read_file", None, None));
+        assert!(classifies_as_read("grep", None, None));
+        assert!(!classifies_as_read("write_file", None, None));
+        assert!(!classifies_as_read("filesystem", Some("write"), None));
+        // A `write` alias resolves to its canonical filesystem write — never a
+        // read, even with no `operation` in the raw args.
+        assert!(!classifies_as_read("filesystem", Some("write"), None));
         // A served read is a successful observation regardless of the tool.
-        assert!(classifies_as_read("write_file", &serde_json::json!({}), Some("ev-1")));
+        assert!(classifies_as_read("write_file", None, Some("ev-1")));
     }
 
     #[test]
@@ -774,6 +794,8 @@ mod tests {
                 generation: "gen-1".to_owned(),
                 project_root_hash: root_hash.clone(),
                 served_from: None,
+                canonical_tool: None,
+                canonical_operation: None,
                 paths: vec![ObservedPath {
                     path: "src/main.rs".to_owned(),
                     size_bytes: Some(10),
@@ -800,6 +822,8 @@ mod tests {
                 generation: "gen-1".to_owned(),
                 project_root_hash: root_hash.clone(),
                 served_from: None,
+                canonical_tool: None,
+                canonical_operation: None,
                 paths: vec![ObservedPath {
                     path: "src/out.rs".to_owned(),
                     size_bytes: Some(5),
@@ -829,6 +853,8 @@ mod tests {
                 project_root_hash: root_hash.clone(),
                 served_from: Some("ev-cache".to_owned()),
                 paths: vec![],
+                canonical_tool: None,
+                canonical_operation: None,
             },
         )
         .await;
@@ -849,6 +875,8 @@ mod tests {
                 generation: "gen-1".to_owned(),
                 project_root_hash: root_hash.clone(),
                 served_from: None,
+                canonical_tool: None,
+                canonical_operation: None,
                 paths: vec![],
             },
         )
@@ -920,6 +948,8 @@ mod tests {
                 generation: "gen-1".to_owned(),
                 project_root_hash: root_hash.clone(),
                 served_from: None,
+                canonical_tool: None,
+                canonical_operation: None,
                 paths: vec![ObservedPath {
                     path: "src/observed.rs".to_owned(),
                     size_bytes: Some(1),
@@ -946,6 +976,8 @@ mod tests {
                 generation: "gen-1".to_owned(),
                 project_root_hash: "foreign-root-hash".to_owned(),
                 served_from: None,
+                canonical_tool: None,
+                canonical_operation: None,
                 paths: vec![ObservedPath {
                     path: "elsewhere.rs".to_owned(),
                     size_bytes: Some(1),
@@ -1014,6 +1046,8 @@ mod tests {
                 project_root_hash: root_hash.clone(),
                 served_from: Some("ev-cache".to_owned()),
                 paths: vec![],
+                canonical_tool: None,
+                canonical_operation: None,
             },
         )
         .await;

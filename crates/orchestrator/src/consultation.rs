@@ -224,6 +224,8 @@ impl ConsultReadOnlyPolicy {
             source_revision: None,
             path_facts: None,
             result_facts: None,
+            canonical_tool: None,
+            canonical_operation: None,
         };
         if let Err(error) = self.inner.audit_log().record(entry, cancel).await {
             tracing::warn!(

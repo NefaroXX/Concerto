@@ -387,6 +387,8 @@ where
                     // (the tool-call arguments), not via a separate knob.
                     base_versions: BTreeMap::new(),
                     orchestrator_authority: false,
+                    // Non-alias request: no canonical rewrite to record.
+                    registered_as: None,
                 },
             },
         };

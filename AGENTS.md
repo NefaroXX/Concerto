@@ -98,9 +98,15 @@ cargo audit
   move it to an unpatched release without checking the advisory and API
   (`crates/plugins/src/host.rs` pins `config.wasm_memory64(false)` — keep
   `winch` off on any bump, see deny.toml).
-- **Policy gates**: every file write / shell / git op is policy-gated and
-  reversible via git stash/branch rollback. Don't bypass `SimplePolicyEngine` or
-  `VirtualFs`.
+- **Policy gates**: every file write / shell / git op is policy-gated, but do
+  not read "reversible via git stash/branch rollback" as a universal property:
+  there is no automatic rollback pipeline (`ToolExecutor` never calls
+  `Tool::rollback`; `RollbackSnapshot` is never constructed), `VirtualFs::restore`
+  reverts overlay state only, never disk (`crates/tools/src/virtual_fs.rs:743-746`),
+  agent `filesystem` writes hit disk at execute time
+  (`crates/tools/src/filesystem.rs:450`), and git-stash undo omits untracked
+  files (no `-u`; `crates/tools/src/undo.rs:56-57`) — see the ADR-62 amendment
+  (2026-10-09). Don't bypass `SimplePolicyEngine` or `VirtualFs`.
 
 ## Key entrypoints (start reading here)
 - Single-agent loop: `crates/orchestrator/src/agent_loop.rs`

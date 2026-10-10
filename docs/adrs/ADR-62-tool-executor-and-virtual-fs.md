@@ -1,7 +1,11 @@
 # ADR-62: Tool Execution Pipeline — `ToolExecutor`, Policy Gates, and `VirtualFs` Staging
 
-**Status:** Accepted
-**Date:** 2026-08-19
+**Status:** Accepted — **revised in place 2026-10-09** (amendment: the
+agent-path `VirtualFs` staging claims in §4 and the Consequences are corrected
+for the `filesystem` tool; see the dated **Amendment (2026-10-09)** before
+References. The executor-chokepoint, deny-by-default, audit-trail, and
+path-confinement decisions are unchanged.)
+**Date:** 2026-08-19 (original), 2026-10-09 (amendment)
 **Deciders:** Concerto architecture
 **Related crates:** `concerto-core`, `concerto-tools`, `concerto-config`, `concerto-sessions`
 **Supersedes:** nothing — codifies the tool/policy/filesystem layer that every
@@ -81,9 +85,15 @@ with the preceding verdict row, so "what was asked, what was answered" is
 always reconstructable. Ack-style prompts (`request_ack`) use the same audited
 channel.
 
-### 4. `VirtualFs` stages every write
+### 4. `VirtualFs` staging — review gate for the human review chains, audit/diff record for agent writes
 
-Filesystem mutations from agents land in the `VirtualFs` overlay first:
+`VirtualFs` is the overlay the review surfaces (desktop diff view, desktop
+code-editor staged review, CLI diff review) operate on. **Agent** `filesystem`
+tool writes/deletes do **not** land in the overlay first: they materialize to
+disk synchronously inside `execute` and update the overlay afterward — for
+them the overlay is a **post-disk audit/diff record**, not a pre-disk gate
+(see **Amendment (2026-10-09)**). The staged-overlay capabilities below
+describe the overlay itself:
 
 - writes create pending entries; reads resolve through the overlay onto disk;
 - snapshots capture pre-review state; diffs are computed once by
@@ -125,8 +135,11 @@ desktop Tool Log and CLI transcript.
 - Read-only specialists are enforced by constructing their registries with
   read-only capability sets — write tools are absent, not merely discouraged
   (ADR-19).
-- Per-hunk review keeps large agent edits inspectable; rejected hunks never
-  touch disk.
+- Per-hunk review keeps large **staged** edits inspectable; rejected hunks
+  never touch disk **for content that entered the overlay** (the human review
+  path). Agent `filesystem` writes/deletes are materialized to disk at
+  `execute` time, so hunk rejection cannot gate them — see
+  **Amendment (2026-10-09)**.
 - The audit trail records what *actually* ran, enabling post-hoc forensics.
 - Costs: one indirection on every tool call; overlay memory proportional to
   pending changes (bounded by snapshot/commit cadence); policy usability
@@ -135,7 +148,11 @@ desktop Tool Log and CLI transcript.
 ## Alternatives Considered
 
 - **Direct writes with post-hoc audit:** rejected — review-before-disk is the
-  core safety property; undo after damage is not equivalent.
+  core safety property for the human overlay path; undo after damage is not
+  equivalent. (The agent `filesystem` path is, in practice, direct-write with
+  post-hoc audit — the correction recorded in **Amendment (2026-10-09)**; the
+  review-before-disk property holds for content that enters the overlay, not
+  for the agent tool's own write.)
 - **Per-tool ad-hoc permission checks inside each tool implementation:**
   rejected — scattered enforcement invites bypass; the executor is the single
   chokepoint (and ADR-60 preserves exactly this property when tools move
@@ -145,6 +162,117 @@ desktop Tool Log and CLI transcript.
   semantics no sandbox supplies.
 - **Allow-by-default with deny rules only:** rejected — silent mutation of
   user projects must require affirmative configuration.
+
+## Amendment (2026-10-09) — agent `filesystem` writes are not staged before disk; the overlay is their post-disk audit/diff record
+
+Scope: this amendment corrects the `VirtualFs` staging claims in §4 and the
+Consequences for the **agent `filesystem` tool path**. It does **not** reopen
+the executor/policy decision (§§1–3, 5–6 remain in force), and it leaves the
+path-confinement property (the §4 bullet on `resolve_path` and traversal
+rejection) and the "not an OS sandbox or a backup system" caveat (§4) intact —
+both are accurate. The Context requirement "reviewable before they reach disk,
+reversible after the fact" is met by the human review chain; for agent writes
+it holds only in the weaker sense of post-hoc audit/diff records, as
+corrected below.
+
+### Corrected claim 1 — agent writes do not land in the overlay first
+
+**Original (§4):** *"Filesystem mutations from agents land in the `VirtualFs`
+overlay first:"*
+
+**Actual behavior.** The `filesystem` tool's `write` operation calls
+`std::fs::write(path.as_std_path(), content)` (`crates/tools/src/filesystem.rs:450`)
+and only then updates the shared overlay via `vfs.write(&path, ...)`
+(`filesystem.rs:458`); the `ToolOutput` reports `"materialized": true`
+(`filesystem.rs:466`). Deletion is synchronous inside the same `execute`:
+the overlay is staged (`filesystem.rs:475`) and the disk file is removed
+when it exists (`filesystem.rs:477-483`), with the same `"materialized": true`
+flag (`filesystem.rs:490`). Neither operation leaves a reviewable pre-disk
+window in `execute`: for `write` the overlay update follows the disk write;
+for `delete` the overlay is staged and the on-disk file is then removed in the
+same call. The overlay is therefore an **audit and diff record** of agent
+writes — it can
+diff them later (`compute_diffs_from_virtual_fs`,
+`crates/tools/src/diff.rs:321`) and retains the pre-image of `Modified`
+entries (`crates/tools/src/virtual_fs.rs:88-90`) — but it is **not a pre-disk
+gate** for the agent path.
+
+Separate mechanism, not contradicted: the orchestrator write gate (ADR-60)
+captures a pre-image hash and appends a `write-applied` WAL entry **before**
+the tool runs, and refuses denied/approval-required writes before execution
+(`crates/orchestrator/src/gate.rs:14-23`). That is a durability
+and attribution record (plus policy denial before execution); it is not
+overlay staging and not an automatic rollback, and this amendment does not
+speak against it.
+
+### Corrected claim 2 — "rejected hunks never touch disk" holds only for staged content
+
+**Original (Consequences):** *"rejected hunks never touch disk."*
+
+**Actual behavior.** Hunk rejection is an overlay operation
+(`VirtualFs::reject_hunks`, `crates/tools/src/virtual_fs.rs:636`), and it
+affects disk only through `materialize_paths` (`virtual_fs.rs:698`, disk
+writes/removals at `:712-734`). The claim holds **only** where hunks exist to
+reject — content staged in the overlay and reviewed before materialization,
+i.e. the human review path. It does **not** hold for agent `filesystem`
+writes/deletes, which were never staged before disk: at the moment the disk
+effect occurred there was no hunk to reject.
+
+### The review-before-disk path that does exist (human/editor review chains)
+
+`VirtualFs::restore` (`crates/tools/src/virtual_fs.rs:743-746`) swaps the
+in-memory entries map and performs **no disk I/O**; disk effects are
+concentrated in `materialize_paths` (`virtual_fs.rs:712-734`). The
+restore → `reject_hunks` → `materialize_paths` chain is real and is the
+review surface for staged content:
+
+- desktop diff view: `crates/desktop/src/views/diff.rs:107-119` — `restore`
+  at `:107`, `reject_hunks` at `:117`, `materialize_paths` at `:119`;
+- desktop code-editor staged-file review: `decide_staged`
+  (`crates/desktop/src/views/code_editor/workspace.rs:349-377`;
+  `materialize_paths` on accept at `:374`), with the editor's own buffer
+  undo/redo restoring text state only (`editor_core.rs:347,359`);
+- CLI staged review: `crates/cli/src/app.rs:1829` (self-described "Same guard
+  chain, same messages, same `materialize_paths`/`unstage`"), `materialize_paths`
+  at `app.rs:1856`; reject only unstages — "the on-disk state is authoritative"
+  (`app.rs:1835-1836`).
+
+Caveat in the same split: a plain desktop-editor **Save** writes to disk
+directly (`workspace.rs:171`, background `:218`) and clears the overlay entry
+(`workspace.rs:178,227`); new-file creation writes directly too
+(`editor_core.rs:209,227`). So even "human/editor-originated edits" are not
+universally staged before disk: the staged-review chains govern content that
+entered the overlay; a bare Save bypasses the overlay entirely.
+
+### No automatic undo/rollback pipeline exists
+
+`Tool::rollback_support()` defaults to `false`
+(`crates/core/src/traits/tool.rs:85-87`) and `Tool::rollback()` defaults to
+`Err(ToolError::RollbackNotSupported)` (`tool.rs:97-103`; variant defined at
+`crates/core/src/error.rs:446-451`). `ToolExecutor`
+(`crates/core/src/executor.rs`) has **zero** call sites for either method, and
+`RollbackSnapshot` (`crates/core/src/types.rs:294-298`) is never constructed
+anywhere in the tree. No reader should infer a tool-level rollback is
+available: it is a declared but unwired seam.
+
+`UndoManager`-based session undo exists and uses git infrastructure
+(`crates/tools/src/undo.rs:56-57`), but the stash command is
+`git stash push -m <msg>` **without** `-u`/`--include-untracked`
+(`undo.rs:57`), so untracked files are not captured by a stash-based restore.
+`session undo` support must not be read as a complete-workspace restore.
+
+### Forward intent — open gap, no design committed
+
+Durable file checkpoints and an executor-seam pre-image/rollback dispatch are
+planned as part of the harness-upgrade work (tracking items H01 contract
+schemas, H06 durable checkpoints, H07 executor-seam pre-image/rollback
+dispatch). This amendment records the gap so that work starts from the
+corrected premise above (the H00 audit finding that prompted this amendment);
+it deliberately specifies **no** schemas or interfaces — that is a separate
+ADR. Until then, agent file effects are recoverable in practice only through
+mechanisms outside this ADR's scope — git history/stashes for tracked files,
+and the overlay's retained pre-images while entries remain staged for review —
+never through an automatic rollback pipeline.
 
 ## References
 
@@ -163,4 +291,7 @@ desktop Tool Log and CLI transcript.
 ---
 
 *Decision codified from inception 2025-07-10; document stabilized 2026-08-19
-(retrospective consolidation — see [README](./README.md)).*
+(retrospective consolidation — see [README](./README.md)). Amended in place
+2026-10-09: agent `filesystem` writes materialize to disk at `execute` time
+and the overlay is their post-disk audit/diff record, not a pre-disk gate
+(VirtualFs staging claims corrected — H00 harness-upgrade audit follow-up).*

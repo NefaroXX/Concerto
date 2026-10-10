@@ -126,6 +126,8 @@ mod tests {
             generation: "g1".to_owned(),
             project_root_hash: root_hash.clone(),
             served_from: None,
+            canonical_tool: None,
+            canonical_operation: None,
             paths: vec![ObservedPath {
                 path: path.to_owned(),
                 size_bytes: Some(bytes.len() as u64),

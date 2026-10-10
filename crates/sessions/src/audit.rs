@@ -18,6 +18,53 @@ impl SqliteAuditLog {
     }
 }
 
+/// Fold the ADR-82 slice-1 canonical accounting identity into a row's
+/// `user_response` value as a compact JSON envelope (`{canonical_tool,
+/// canonical_operation}`).
+///
+/// Total and lossless: a row without canonical fields keeps its
+/// `user_response` exactly as the writer set it; a row with canonical fields
+/// and no existing response stores the envelope alone; a row with both merges
+/// the canonical keys into an existing JSON object, or wraps a non-JSON
+/// response under a `detail` key — no recorded text is ever dropped.
+///
+/// `None` for both inputs is the common case (synthetic rows — acks, plan
+/// decisions, infra failures — and every row written before the canonical
+/// fields existed).
+fn encode_canonical_effect(
+    canonical_tool: Option<String>,
+    canonical_operation: Option<String>,
+    user_response: Option<String>,
+) -> Option<String> {
+    if canonical_tool.is_none() && canonical_operation.is_none() {
+        return user_response;
+    }
+    // Retain the original response for the (practically unreachable) case where
+    // serializing the envelope fails: never drop recorded text.
+    let fallback = user_response.clone();
+    let mut envelope = match user_response {
+        None => serde_json::Map::new(),
+        Some(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(serde_json::Value::Object(map)) => map,
+            _ => {
+                // A human-readable (non-JSON) response: preserve it verbatim
+                // under `detail` rather than dropping it. No current row
+                // builder sets both, so this arm is defensive totality.
+                let mut map = serde_json::Map::new();
+                map.insert("detail".to_owned(), serde_json::Value::String(text));
+                map
+            }
+        },
+    };
+    if let Some(tool) = canonical_tool {
+        envelope.insert("canonical_tool".to_owned(), serde_json::Value::String(tool));
+    }
+    if let Some(operation) = canonical_operation {
+        envelope.insert("canonical_operation".to_owned(), serde_json::Value::String(operation));
+    }
+    serde_json::to_string(&serde_json::Value::Object(envelope)).ok().or(fallback)
+}
+
 #[async_trait::async_trait]
 impl AuditLog for SqliteAuditLog {
     async fn record(
@@ -55,6 +102,19 @@ impl AuditLog for SqliteAuditLog {
         // from the typed carrier, or NULL when the operation was mutating,
         // failed, or names no read-only result. Never file content.
         let result_facts = entry.result_facts.map(|facts| facts.to_string());
+        // ADR-82 slice 1: the canonical accounting identity rides a compact
+        // JSON envelope in the existing free-form `user_response` column.
+        // The audit schema keeps its column set (the next migration number
+        // is earmarked by ADR-82 for the checkpoint sidecar, and session
+        // migrations are out of this slice's scope), so the envelope follows
+        // the precedent the coordinator-shape / plan-decision rows already
+        // set. `tool_name` still records the requested (registered) name —
+        // attribution by the former, accounting by the latter.
+        let user_response = encode_canonical_effect(
+            entry.canonical_tool,
+            entry.canonical_operation,
+            entry.user_response,
+        );
 
         sqlx::query(
             "INSERT INTO audit_log (\
@@ -74,7 +134,7 @@ impl AuditLog for SqliteAuditLog {
         .bind(&entry.verdict)
         .bind(&entry.input_hash)
         .bind(&entry.rule_matched)
-        .bind(&entry.user_response)
+        .bind(&user_response)
         .bind(created_at_unix)
         .bind(entry.profile_id)
         .bind(entry.resolved_executable)
@@ -360,6 +420,8 @@ mod tests {
             source_revision: None,
             path_facts: None,
             result_facts: None,
+            canonical_tool: None,
+            canonical_operation: None,
         };
         let result = audit.record(entry, CancellationToken::new()).await;
         assert!(result.is_ok(), "record should succeed: {:?}", result.err());
@@ -504,6 +566,8 @@ mod tests {
             source_revision: Some("abc1234".into()),
             path_facts: None,
             result_facts: None,
+            canonical_tool: None,
+            canonical_operation: None,
         };
         audit.record(entry, CancellationToken::new()).await.unwrap();
         let count: (i64,) =
@@ -539,6 +603,8 @@ mod tests {
             source_revision: None,
             path_facts: None,
             result_facts: None,
+            canonical_tool: None,
+            canonical_operation: None,
         };
         audit.record(entry, CancellationToken::new()).await.unwrap();
         let count: (i64,) =
@@ -579,6 +645,8 @@ mod tests {
                     source_revision: None,
                     path_facts: None,
                     result_facts: None,
+                    canonical_tool: None,
+                    canonical_operation: None,
                 };
                 a.record(entry, CancellationToken::new()).await
             }));
@@ -620,6 +688,8 @@ mod tests {
             source_revision: None,
             path_facts: None,
             result_facts: None,
+            canonical_tool: None,
+            canonical_operation: None,
         };
         audit.record(entry, CancellationToken::new()).await.unwrap();
         // Read back the raw argv column and verify it is valid JSON.
@@ -667,6 +737,8 @@ mod tests {
             source_revision: Some(source_revision.into()),
             path_facts: None,
             result_facts: None,
+            canonical_tool: None,
+            canonical_operation: None,
         };
         audit.record(entry, CancellationToken::new()).await.unwrap();
 
@@ -715,6 +787,8 @@ mod tests {
             source_revision: None,
             path_facts: None,
             result_facts: None,
+            canonical_tool: None,
+            canonical_operation: None,
         };
         let e2 = AuditEntry { tool_name: "second".into(), ..e1.clone() };
         log.record(e1.clone(), CancellationToken::new()).await.unwrap();
@@ -755,6 +829,8 @@ mod tests {
                 source_revision: None,
                 path_facts: None,
                 result_facts: None,
+                canonical_tool: None,
+                canonical_operation: None,
             };
             log.record(entry, CancellationToken::new()).await.unwrap();
         }
@@ -793,6 +869,8 @@ mod tests {
                     source_revision: None,
                     path_facts: None,
                     result_facts: None,
+                    canonical_tool: None,
+                    canonical_operation: None,
                 };
                 l.record(entry, CancellationToken::new()).await.unwrap();
             }));
@@ -830,6 +908,8 @@ mod tests {
             source_revision: Some("deadbeef".into()),
             path_facts: None,
             result_facts: None,
+            canonical_tool: None,
+            canonical_operation: None,
         };
         let clone = entry.clone();
         // Field-by-field comparison.
@@ -1029,6 +1109,8 @@ mod tests {
             source_revision: None,
             path_facts,
             result_facts: None,
+            canonical_tool: None,
+            canonical_operation: None,
         }
     }
 

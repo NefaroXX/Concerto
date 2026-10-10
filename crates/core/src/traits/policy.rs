@@ -255,4 +255,27 @@ pub struct AuditEntry {
     /// unbounded value — only a boolean / count / size, per the rule on
     /// [`ReadResultFacts`].
     pub result_facts: Option<ReadResultFacts>,
+    // ---- Canonical effect identity (additive, ADR-82 slice 1) --------------
+    /// The **canonical policy-view tool name** of the recorded action — the
+    /// identity policy evaluated ([`Tool::policy_view`]'s first element),
+    /// which thin alias tools map onto their canonical tool (a `write` alias
+    /// records `filesystem` here). Populated on policy verdict rows and
+    /// post-execution completion rows; `None` on synthetic rows that name no
+    /// tool call.
+    ///
+    /// `tool_name` keeps recording the **requested** (registered) name for
+    /// attribution and forensics: an audit row saying the caller invoked
+    /// `write` is correct. Accounting keys on the canonical identity instead
+    /// — that split is the ADR-82 slice-1 fix — so a consumer must never
+    /// re-derive the canonical name from `tool_name` (the two diverge for
+    /// alias calls, which was the accounting escape).
+    ///
+    /// [`Tool::policy_view`]: crate::traits::tool::Tool::policy_view
+    pub canonical_tool: Option<String>,
+    /// The **canonical operation** of the recorded action: the `operation`
+    /// field of the policy-view input (for a `write` alias call, `"write"`
+    /// even though the caller's raw input carried no `operation` field).
+    /// Populated alongside [`Self::canonical_tool`] on verdict and completion
+    /// rows; `None` when the canonical input names no operation.
+    pub canonical_operation: Option<String>,
 }

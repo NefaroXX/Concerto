@@ -1302,6 +1302,19 @@ pub struct ToolExecutionSummary {
     pub success: bool,
     /// Human-readable one-line summary (e.g. "Wrote 42 bytes" or the error).
     pub summary: String,
+    /// Canonical policy-view tool name (ADR-82 slice 1): the accounting
+    /// identity of the call — `filesystem` for a `write` alias, equal to
+    /// `tool_name` for non-alias tools. `None` on summaries recorded before
+    /// the field existed (legacy checkpoints/transcripts) or by backends
+    /// that cannot see the registry (the supervised child resolves identity
+    /// supervisor-side instead).
+    #[serde(default)]
+    pub canonical_tool: Option<String>,
+    /// Canonical operation from the policy-view input — `Some("write")` for
+    /// an alias write whose raw arguments named no `operation` field.
+    /// Populated alongside [`Self::canonical_tool`].
+    #[serde(default)]
+    pub canonical_operation: Option<String>,
 }
 
 /// One structured verification result for a written file.

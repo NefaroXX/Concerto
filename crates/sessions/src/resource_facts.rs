@@ -120,6 +120,17 @@ pub struct ToolExecutedPayload {
     /// `None` for every ordinary executed tool call.
     #[serde(default)]
     pub served_from: Option<String>,
+    /// ADR-82 slice 1: the canonical policy-view tool name of the recorded
+    /// call (`filesystem` for a `write` alias; equal to `tool` for non-alias
+    /// tools). `None` on rows recorded before the field existed — consumers
+    /// fall back to `tool` + the args' own `operation` for those.
+    #[serde(default)]
+    pub canonical_tool: Option<String>,
+    /// The canonical operation from the policy-view input (`Some("write")`
+    /// for an alias write whose recorded args named no `operation` field).
+    /// Populated alongside [`Self::canonical_tool`].
+    #[serde(default)]
+    pub canonical_operation: Option<String>,
 }
 
 /// Payload of a `WorkspaceSnapshot` whiteboard event — a read-only workspace
@@ -763,6 +774,8 @@ mod tests {
                 content_hash: Some(hash.to_owned()),
             }],
             served_from: None,
+            canonical_tool: None,
+            canonical_operation: None,
         }
     }
 

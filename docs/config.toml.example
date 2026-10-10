@@ -373,3 +373,13 @@ update_frequency = 1  # nudge every N dispatches when auto_update is on
 [updates]
 check_on_startup = false
 # update_endpoint = "https://example.invalid/concerto/version"
+
+# Single-agent completion-honesty gate (ADR-82). Opt-in and default-off: no
+# run outcome tightens unless this is set. When true, the single-agent
+# action-required path refuses to report `Done` when the task's own
+# `require_verification` contract was unmet — a missing npm test script or a
+# manifest-less file records `Skipped`/`Unavailable` instead of `passed: true`
+# or no record at all. Deliberately NOT under `[orchestration]`, which rejects
+# unknown keys, so older binaries ignore this section entirely.
+[agent]
+strict_verification_gate = false

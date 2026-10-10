@@ -1834,6 +1834,15 @@ async fn handle_execute_tool(
     // in-process orchestrator path (`InProcessGateBackend`) does not pass
     // through this handler and may legitimately carry authority.
     request.orchestrator_authority = false;
+    // ADR-82 slice 1 (IPC/contract review point): the canonical policy-view
+    // identity is resolved HERE, from the supervisor's own registry via the
+    // gate's delegate — never inferred from what the untrusted child sent. The
+    // child cannot see the registry, so a request that arrives as the `write`
+    // alias is canonicalized to `("filesystem", {operation: "write"})` before
+    // the stamp below, so the versioned targets, pre-image and conflict check
+    // all key on the canonical operation while the registered name still
+    // executes.
+    services.gate.canonicalize_request(&mut request);
     // ADR-60 D5 always-on: the supervisor attests each mutated target's
     // current state at request arrival so every versioned write carries
     // per-target `base_versions` claims (see [`crate::gate::stamp_base_versions`]);
@@ -2711,6 +2720,7 @@ mod write_path_tests {
             agent_id: "wire-value-ignored".to_owned(),
             tool: "filesystem".to_owned(),
             input: json!({ "operation": "write", "path": path, "content": content }),
+            registered_as: None,
             session_id: None,
             scope: "fs".to_owned(),
             plan_id: None,

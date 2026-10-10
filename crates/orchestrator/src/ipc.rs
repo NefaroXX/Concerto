@@ -936,6 +936,7 @@ mod tests {
             agent_id: "agent-a".to_owned(),
             tool: "gate_test".to_owned(),
             input: json!({}),
+            registered_as: None,
             session_id: None,
             scope: "fs".to_owned(),
             plan_id: None,

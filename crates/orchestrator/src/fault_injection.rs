@@ -1634,6 +1634,8 @@ async fn external_workspace_modification_surfaces_in_evidence() {
         generation: "g1".to_owned(),
         project_root_hash: root_hash.clone(),
         served_from: None,
+        canonical_tool: None,
+        canonical_operation: None,
         paths: vec![concerto_sessions::ObservedPath {
             path: path.to_owned(),
             size_bytes: Some(meta.len()),

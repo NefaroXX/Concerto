@@ -3354,6 +3354,8 @@ mod tests {
                     source_revision: None,
                     path_facts: None,
                     result_facts: None,
+                    canonical_tool: None,
+                    canonical_operation: None,
                 },
                 cancel.clone(),
             )
@@ -3673,6 +3675,8 @@ mod tests {
             source_revision: None,
             path_facts: None,
             result_facts: None,
+            canonical_tool: None,
+            canonical_operation: None,
         }
     }
 

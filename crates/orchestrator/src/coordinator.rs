@@ -1211,10 +1211,17 @@ fn normalize_evidence_path(raw: &str) -> String {
 }
 
 /// Whether a recorded tool fact names a mutating file operation (write /
-/// delete / move / copy / edit). Reuses the evidence-spine grammar
-/// ([`crate::tool_facts::is_file_affecting_tool`]) plus the `write` alias.
-fn is_mutating_tool_fact(tool: &str, args: &serde_json::Value) -> bool {
-    tool == "write" || crate::tool_facts::is_file_affecting_tool(tool, args)
+/// delete / move / copy / edit), keyed on the canonical policy-view identity
+/// (ADR-82 slice 1). The former per-site `tool == "write"` patch is gone: the
+/// canonical key covers the alias structurally. Records written before the
+/// canonical fields existed fall back to the registered-name grammar.
+fn is_mutating_tool_fact(fact: &concerto_sessions::ToolExecutedPayload) -> bool {
+    match fact.canonical_tool.as_deref() {
+        Some(tool) => {
+            crate::tool_facts::is_file_affecting_tool(tool, fact.canonical_operation.as_deref())
+        }
+        None => crate::tool_facts::is_file_affecting_tool_legacy(&fact.tool, &fact.args),
+    }
 }
 
 /// Whether a recorded `shell` tool command is a build/test/lint/format
@@ -1329,7 +1336,7 @@ fn tool_fact_verification_evidence(
                 detail: format!("successful build/test/lint command via `{}`", fact.tool),
             });
         }
-        if is_mutating_tool_fact(&fact.tool, &fact.args)
+        if is_mutating_tool_fact(&fact)
             && fact_touches_declared_deliverable(&fact.args, &fact.paths, declared)
         {
             return Some(VerificationEvidence {
@@ -2547,8 +2554,21 @@ fn own_write_paths(
             WhiteboardKind::ToolExecuted => {
                 let tool = event.payload.get("tool").and_then(serde_json::Value::as_str);
                 let args = event.payload.get("args").cloned().unwrap_or(serde_json::Value::Null);
-                let file_affecting =
-                    tool.is_some_and(|tool| crate::tool_facts::is_file_affecting_tool(tool, &args));
+                // ADR-82 slice 1: key on the canonical policy-view identity when
+                // the record carries it (a `write` alias resolves to a
+                // `filesystem` write), else the legacy registered-name grammar.
+                let canonical_tool =
+                    event.payload.get("canonical_tool").and_then(serde_json::Value::as_str);
+                let canonical_operation =
+                    event.payload.get("canonical_operation").and_then(serde_json::Value::as_str);
+                let file_affecting = match canonical_tool {
+                    Some(tool) => {
+                        crate::tool_facts::is_file_affecting_tool(tool, canonical_operation)
+                    }
+                    None => tool.is_some_and(|tool| {
+                        crate::tool_facts::is_file_affecting_tool_legacy(tool, &args)
+                    }),
+                };
                 if !(file_affecting
                     && event.payload.get("success").and_then(serde_json::Value::as_bool)
                         == Some(true))
@@ -24092,9 +24112,25 @@ mod tests {
 
     #[test]
     fn c06_mutating_fact_and_deliverable_matching() {
-        assert!(is_mutating_tool_fact("filesystem", &serde_json::json!({ "operation": "move" })));
-        assert!(is_mutating_tool_fact("write", &serde_json::json!({ "path": "x" })));
-        assert!(!is_mutating_tool_fact("filesystem", &serde_json::json!({ "operation": "read" })));
+        // ADR-82 slice 1: the `write` alias is covered by its canonical
+        // `("filesystem", "write")` identity — no per-site `"write"` patch.
+        let payload = |tool: &str,
+                       canonical_tool: Option<&str>,
+                       canonical_operation: Option<&str>| {
+            serde_json::from_value::<concerto_sessions::ToolExecutedPayload>(serde_json::json!({
+                "tool": tool,
+                "args": {},
+                "success": true,
+                "canonical_tool": canonical_tool,
+                "canonical_operation": canonical_operation,
+            }))
+            .expect("tool-executed payload decodes")
+        };
+        assert!(is_mutating_tool_fact(&payload("filesystem", Some("filesystem"), Some("move"))));
+        assert!(is_mutating_tool_fact(&payload("write", Some("filesystem"), Some("write"))));
+        assert!(!is_mutating_tool_fact(&payload("filesystem", Some("filesystem"), Some("read"))));
+        // Legacy record with no canonical identity: registered-name grammar.
+        assert!(!is_mutating_tool_fact(&payload("write", None, None)));
         let paths = vec![];
         // The move destination lives in the arguments, not the observed paths.
         assert!(fact_touches_declared_deliverable(
@@ -33930,6 +33966,8 @@ mod tests {
                 generation: generation.to_owned(),
                 project_root_hash: root_hash.clone(),
                 served_from: None,
+                canonical_tool: None,
+                canonical_operation: None,
                 paths: vec![concerto_sessions::ObservedPath {
                     path: path.to_owned(),
                     size_bytes: Some(size),
@@ -34042,6 +34080,8 @@ mod tests {
             generation: "g1".to_owned(),
             project_root_hash: root_hash.clone(),
             served_from: None,
+            canonical_tool: None,
+            canonical_operation: None,
             paths: vec![concerto_sessions::ObservedPath {
                 path: "lib.rs".to_owned(),
                 size_bytes: Some(meta.len()),
@@ -34066,6 +34106,8 @@ mod tests {
             generation: "g1".to_owned(),
             project_root_hash: root_hash.clone(),
             served_from: None,
+            canonical_tool: None,
+            canonical_operation: None,
             paths: vec![concerto_sessions::ObservedPath {
                 path: "gone.md".to_owned(),
                 size_bytes: Some(gone_meta.len()),
@@ -34180,6 +34222,8 @@ mod tests {
             generation: "gen-1".to_owned(),
             project_root_hash: root_hash.clone(),
             served_from: None,
+            canonical_tool: None,
+            canonical_operation: None,
             paths: vec![concerto_sessions::ObservedPath {
                 path: "src/main.rs".to_owned(),
                 size_bytes: Some(1024),
@@ -35954,6 +35998,10 @@ mod tests {
             paths: &paths,
             file_affecting: false,
             pre_image_hashes: std::collections::HashMap::new(),
+            // Test-constructed fact predates canonical identity: fall back
+            // to the registered-name grammar (tool is "filesystem" here).
+            canonical_tool: None,
+            canonical_operation: None,
         };
         ctx.record_tool_executed(&fact, &CancellationToken::new()).await;
         newest_row_id(pool, "tool-executed").await
@@ -35968,6 +36016,7 @@ mod tests {
             agent_id: "coder".to_owned(),
             tool: "filesystem".to_owned(),
             input: serde_json::json!({ "operation": "write", "path": "w2.md", "content": "v1" }),
+            registered_as: None,
             session_id: None,
             scope: "fs".to_owned(),
             plan_id: None,
@@ -36870,6 +36919,7 @@ mod tests {
             input: serde_json::json!({
                 "operation": "write", "path": "shared.txt", "content": "v1"
             }),
+            registered_as: None,
             session_id: None,
             scope: "fs".to_owned(),
             plan_id: None,
@@ -36984,6 +37034,7 @@ mod tests {
             input: serde_json::json!({
                 "operation": "write", "path": "multi.txt", "content": "v1"
             }),
+            registered_as: None,
             session_id: None,
             scope: "fs".to_owned(),
             plan_id: None,

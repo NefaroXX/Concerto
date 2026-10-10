@@ -74,6 +74,17 @@ impl ToolExecutionBackend for InProcessGateBackend {
         self.gate.tool_definitions()
     }
 
+    /// ADR-82 slice 1: the in-process backend holds the real registry (via its
+    /// executor), so it resolves the canonical policy-view effect locally — the
+    /// supervised child cannot and leaves the default `None`.
+    fn canonical_effect(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> Option<concerto_core::executor::CanonicalEffect> {
+        self.executor.canonical_effect(tool_name, input)
+    }
+
     async fn execute(
         &self,
         tool_name: &str,
@@ -223,6 +234,7 @@ impl InProcessGateBackend {
             agent_id: self.agent_id.clone(),
             tool: tool_name.to_owned(),
             input,
+            registered_as: None,
             session_id: Some(session.session_id.to_string()),
             scope: self.scope.clone(),
             plan_id: None,
@@ -230,6 +242,13 @@ impl InProcessGateBackend {
             base_versions,
             orchestrator_authority,
         };
+        // ADR-82 slice 1: resolve the canonical policy-view identity at request
+        // assembly, BEFORE the always-on stamp below — the load-bearing
+        // ordering both execution paths share (the supervisor does the same in
+        // `handle_execute_tool`). The gate's versioned targets, pre-image
+        // capture and conflict check then key on the canonical operation; the
+        // registered name is preserved for execution.
+        self.gate.canonicalize_request(&mut request);
         // ADR-60 D5 always-on: stamp each mutated target's current pre-image
         // hash before submission — the same injection the supervisor applies
         // in `handle_execute_tool` — so the in-process loop's base_version

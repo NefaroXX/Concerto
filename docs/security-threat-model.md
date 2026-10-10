@@ -133,10 +133,10 @@ Concerto is a local-first AI coding agent that executes model-generated actions 
 **Current Mitigation**:
 - `FilesystemTool` resolves paths under project root
 - Root/path validation rejects traversal attempts
-- `VirtualFs` stages changes before commit
+- Agent writes hit disk at `execute` time; the overlay is a post-disk audit/diff record, not a pre-disk gate (see ADR-62 amendment 2026-10-09)
 
 **Residual Risk**:
-- Shell commands can bypass filesystem overlay
+- Shell command file effects are not captured by the filesystem overlay
 - OS ACLs and external processes can race files
 - Virtual staging is not an independent backup
 
