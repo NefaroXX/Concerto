@@ -464,7 +464,7 @@ impl DestructiveClass {
 /// (`sandbox_containerized_routing_missing`), and this marker without a
 /// `Containerized` profile is denied
 /// (`sandbox_container_routing_profile_mismatch`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum CommandRouting {
     /// The invocation launches directly on the host (default, safe).
@@ -2247,6 +2247,12 @@ pub struct AgentContext {
     /// snapshot (e.g. readability or fail-soft); `Some` at dispatch time so
     /// every agent starts grounded in the deterministic inventory.
     pub workspace_snapshot_digest: Option<String>,
+    /// ADR-82 §2: the cached per-run environment-manifest summary ("what can
+    /// this run do" — backend, sandbox, tool set, persistence, restore
+    /// ceilings). `None` when no manifest was collected for the run; `Some`
+    /// at dispatch time beside the snapshot digest. Descriptive only — agents
+    /// read it as context, and no gate ever consults it.
+    pub environment_manifest_digest: Option<String>,
     /// ADR-65 §3: the content-addressed workspace `generation` (see
     /// `WorkspaceSnapshotRecord::generation`) at dispatch time, attached by the
     /// coordinator so tool-executed evidence facts record the generation the
@@ -2278,6 +2284,7 @@ impl AgentContext {
             expected_artifacts: Vec::new(),
             workspace_capsule: None,
             workspace_snapshot_digest: None,
+            environment_manifest_digest: None,
             workspace_generation: None,
             run_id: None,
         }

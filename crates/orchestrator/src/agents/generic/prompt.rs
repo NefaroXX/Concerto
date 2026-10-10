@@ -59,6 +59,16 @@ impl GenericSpecialistAgent {
             prompt.push_str("\n</workspace_snapshot>");
         }
 
+        // ADR-82 §2 (slice 6): the cached environment-manifest summary —
+        // what the run can do (backend, sandbox, tool set, persistence,
+        // restore ceilings). Rendered from the cached manifest beside the
+        // snapshot digest; descriptive context only, never an authorization.
+        if let Some(digest) = &context.environment_manifest_digest {
+            prompt.push_str("\n\n<environment_manifest>\n");
+            prompt.push_str(digest);
+            prompt.push_str("\n</environment_manifest>");
+        }
+
         if !context.previous_results.is_empty() {
             prompt.push_str("\n\n");
             prompt.push_str(&task_contract::format_handoffs(task, context));

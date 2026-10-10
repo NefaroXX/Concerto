@@ -2284,6 +2284,12 @@ pub struct CoordinatorAgent {
     /// Never used to gate behavior in this phase — persistence/write gating is
     /// load-bearing only with the Phase 5/6 evidence checks.
     workspace_snapshot: Option<crate::workspace_snapshot::WorkspaceSnapshotRecord>,
+    /// ADR-82 §2 (slice 6): the run's cached environment manifest, collected
+    /// once per run by the manifest barrier and threaded through to agent
+    /// dispatch so every dispatched agent receives the manifest summary in
+    /// its context beside the snapshot digest. Descriptive only — never used
+    /// to gate behavior anywhere.
+    environment_manifest: Option<concerto_core::environment_manifest::EnvironmentManifest>,
     /// Phase 6 M3c step 5: the confirmed plan drift a resume re-armed Pending
     /// (the affected COMPLETED subtasks), held until the completion tail so a
     /// re-dispatch that never settles can attach the diff to its Partial note.
@@ -3927,6 +3933,7 @@ impl CoordinatorAgent {
             review_store: None,
             write_gate: None,
             workspace_snapshot: None,
+            environment_manifest: None,
             plan_drift_redispatch: None,
             run_id: None,
             memory_decision_store: None,
@@ -5039,6 +5046,26 @@ impl CoordinatorAgent {
     ) -> Self {
         self.workspace_snapshot = Some(snapshot);
         self
+    }
+
+    /// ADR-82 §2 (slice 6): attach the run's cached environment manifest so
+    /// its summary rides into every dispatched agent's context beside the
+    /// snapshot digest. Purely additive — the manifest is never used to gate
+    /// behavior here. Re-attaching (explicit refresh) replaces the cached
+    /// revision; collection assigns the bumped revision.
+    pub fn with_environment_manifest(
+        mut self,
+        manifest: concerto_core::environment_manifest::EnvironmentManifest,
+    ) -> Self {
+        self.environment_manifest = Some(manifest);
+        self
+    }
+
+    /// The cached manifest summary for context injection; `None` when no
+    /// manifest was collected for the run. A pure render over the cached
+    /// manifest — it performs zero probes (the collector owns all probing).
+    pub fn environment_manifest_summary(&self) -> Option<String> {
+        self.environment_manifest.as_ref().map(|manifest| manifest.summary())
     }
 
     /// The pre-planning snapshot digest for context injection; `None` when the
@@ -9372,6 +9399,7 @@ impl CoordinatorAgent {
                         expected_artifacts: task_artifacts,
                         workspace_capsule: task_capsule,
                         workspace_snapshot_digest: this.snapshot_digest(&cancel_clone).await,
+                        environment_manifest_digest: this.environment_manifest_summary(),
                         run_id: this.run_id.clone(),
                         workspace_generation: this.snapshot_generation(),
                     };
@@ -10391,6 +10419,7 @@ impl CoordinatorAgent {
                                 expected_artifacts: ladder_artifacts,
                                 workspace_capsule: None,
                                 workspace_snapshot_digest: self.snapshot_digest(cancel).await,
+                                environment_manifest_digest: self.environment_manifest_summary(),
                                 run_id: self.run_id.clone(),
                                 workspace_generation: self.snapshot_generation(),
                             };
@@ -11052,6 +11081,7 @@ impl CoordinatorAgent {
                         expected_artifacts: ladder_artifacts,
                         workspace_capsule: None,
                         workspace_snapshot_digest: self.snapshot_digest(cancel).await,
+                        environment_manifest_digest: self.environment_manifest_summary(),
                         run_id: self.run_id.clone(),
                         workspace_generation: self.snapshot_generation(),
                     };
@@ -13918,6 +13948,7 @@ impl CoordinatorAgent {
             expected_artifacts: expected_for_dispatch,
             workspace_capsule: None,
             workspace_snapshot_digest: self.snapshot_digest(cancel).await,
+            environment_manifest_digest: self.environment_manifest_summary(),
             run_id: self.run_id.clone(),
             workspace_generation: self.snapshot_generation(),
         };
@@ -14988,6 +15019,7 @@ impl CoordinatorAgent {
             working_memory: base_ctx.working_memory.clone(),
             retrieved_chunks: base_ctx.retrieved_chunks.clone(),
             snapshot_digest: self.snapshot_digest(cancel).await,
+            environment_manifest_digest: self.environment_manifest_summary(),
             run_id: self.run_id.clone(),
             workspace_generation: self.snapshot_generation(),
             cancel: cancel.clone(),
@@ -15201,6 +15233,7 @@ impl CoordinatorAgent {
         //    Same concurrency shape as `execute_graph`: one future per
         //    hypothesis, all owned data, `join_all` waits for all.
         let snapshot_digest = self.snapshot_digest(cancel).await;
+        let environment_manifest_digest = self.environment_manifest_summary();
         let workspace_generation = self.snapshot_generation();
         let planning_provider = self.planning_provider.clone();
         let bus = self.bus.clone();
@@ -15280,6 +15313,7 @@ impl CoordinatorAgent {
                     working_memory: working_memory.clone(),
                     retrieved_chunks: retrieved_chunks.clone(),
                     snapshot_digest: snapshot_digest.clone(),
+                    environment_manifest_digest: environment_manifest_digest.clone(),
                     run_id: run_id.clone(),
                     workspace_generation: workspace_generation.clone(),
                     cancel: cancel.clone(),
@@ -19129,6 +19163,47 @@ mod tests {
     ) -> CoordinatorAgent {
         coordinator_with_turns(bus, registry, turns)
             .with_workspace_snapshot(grounded_snapshot(proposed))
+    }
+
+    /// ADR-82 slice 6: the manifest cache starts empty, attaches by value,
+    /// and renders a dispatch summary — a pure render over the cached
+    /// manifest that performs zero probes (the collector owns all probing).
+    #[test]
+    fn environment_manifest_cache_attaches_and_renders() {
+        use concerto_core::environment_manifest::{
+            EnvironmentManifest, ManifestExecutionBackend, ENVIRONMENT_MANIFEST_SCHEMA_VERSION,
+        };
+        let coordinator =
+            coordinator_with(EventBus::new(64), Arc::new(AgentRegistry::new()), "done".to_string());
+        assert!(
+            coordinator.environment_manifest_summary().is_none(),
+            "no manifest is cached before the barrier attaches one"
+        );
+        let manifest = EnvironmentManifest {
+            schema_version: ENVIRONMENT_MANIFEST_SCHEMA_VERSION,
+            run_id: "run-cache".to_string(),
+            session_id: "sess-cache".to_string(),
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            backend: Some(ManifestExecutionBackend::Supervised),
+            sandbox_profile: None,
+            container_routing: concerto_core::types::CommandRouting::Direct,
+            project_root: "/proj".to_string(),
+            project_root_hash: "hash".to_string(),
+            tools: Vec::new(),
+            executables: Vec::new(),
+            policy_scope: None,
+            persistence: Vec::new(),
+            restore: None,
+            collected_at_ms: 1,
+            revision: 3,
+            freshness: None,
+        };
+        let coordinator = coordinator.with_environment_manifest(manifest);
+        let summary =
+            coordinator.environment_manifest_summary().expect("summary renders once attached");
+        assert!(summary.contains("backend=supervised"), "{summary}");
+        assert!(summary.contains("revision=3"), "{summary}");
     }
 
     /// A `CustomAgentConfig` marking `id` as a DesignDoc-mode design-stage

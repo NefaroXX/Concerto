@@ -3382,6 +3382,69 @@ async fn run_multi_agent(
         context.workspace_snapshot_digest = Some(snapshot.digest());
         coordinator = coordinator.with_workspace_snapshot(snapshot);
     }
+    // ---- ADR-82 §2 (slice 6): environment-manifest barrier ----
+    //
+    // A descriptive, cached per-run environment declaration ("what can this
+    // run do") collected once per run from the executor's registry (both
+    // tool identities via the slice-1 canonical-effect service), the session
+    // pool, and the workspace paths. On resume the stored manifest is
+    // restored from its `EnvironmentObserved` whiteboard row instead of
+    // re-probing; the summary rides into every dispatched agent's context
+    // beside the snapshot digest. Fail-soft by contract: collection and
+    // persistence never fail the run, and the manifest never authorizes
+    // anything — no gate reads it.
+    {
+        use crate::environment_manifest::{
+            inventory_from_executor, run_manifest_barrier, ManifestInputs, SystemVersionProber,
+        };
+        use concerto_core::environment_manifest::{
+            ManifestExecutionBackend, PersistenceClass, PolicyScopeDescription,
+        };
+        let configured_rules: Option<usize> = services
+            .config
+            .policy
+            .as_ref()
+            .map(|policy| policy.to_rules())
+            .filter(|rules| !rules.is_empty())
+            .map(|rules| rules.len());
+        let default_rule_count =
+            concerto_core::policy_presets::PolicyPresets::default_rules().len();
+        let mut persistence = vec![PersistenceClass::WorkspaceFiles];
+        if gate_log_pool.is_some() {
+            persistence.push(PersistenceClass::SessionDatabase);
+        }
+        let manifest_inputs = ManifestInputs {
+            run_id: concerto_core::ids::Ulid::new().to_string(),
+            session_id: session_id.to_string(),
+            project_root: &project_dir,
+            backend: ManifestExecutionBackend::InProcess,
+            sandbox_profile: None,
+            container_routing: concerto_core::types::CommandRouting::Direct,
+            inventory: inventory_from_executor(&executor),
+            policy_scope: PolicyScopeDescription::for_run(
+                configured_rules,
+                default_rule_count,
+                None,
+            ),
+            persistence,
+            memory_enabled: req.memory_enabled,
+            previous_revision: None,
+            candidates: None,
+            path_dirs: None,
+        };
+        let prober = SystemVersionProber::default();
+        if let Some(manifest) = run_manifest_barrier(
+            gate_log_pool.as_ref(),
+            manifest_inputs,
+            req.resume_checkpoint_json.is_some(),
+            &prober,
+            &req.cancel_token,
+        )
+        .await
+        {
+            coordinator = coordinator.with_environment_manifest(manifest);
+        }
+    }
     let mut output = match coordinator
         .run(multi_task, context, req.cancel_token.clone(), req.resume_checkpoint_json.clone())
         .await
