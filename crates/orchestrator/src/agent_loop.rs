@@ -2205,6 +2205,7 @@ impl AgentLoop {
                     // Rejected before execution: no canonical call happened.
                     canonical_tool: None,
                     canonical_operation: None,
+                    failure: None,
                 });
                 let _ = self.bus.publish_for_session(
                     task.session_id,
@@ -2287,6 +2288,7 @@ impl AgentLoop {
                 // Refused before execution: no canonical call happened.
                 canonical_tool: None,
                 canonical_operation: None,
+                failure: None,
             });
             let _ = self.bus.publish_for_session(
                 task.session_id,
@@ -2487,6 +2489,7 @@ impl AgentLoop {
                 summary: served_summary.clone(),
                 canonical_tool: canonical_tool.clone(),
                 canonical_operation: canonical_operation.clone(),
+                failure: None,
             });
             let served_data = serde_json::json!({
                 "content": serve.content,
@@ -2608,6 +2611,7 @@ impl AgentLoop {
                     summary: output.summary.clone(),
                     canonical_tool: canonical_tool.clone(),
                     canonical_operation: canonical_operation.clone(),
+                    failure: None,
                 });
                 let finished_detail =
                     match output.data.get("absolute_path").and_then(|v| v.as_str()) {
@@ -2661,6 +2665,7 @@ impl AgentLoop {
                     pre_image_hashes.clone(),
                     canonical_tool.as_deref(),
                     canonical_operation.as_deref(),
+                    None,
                     &cancel,
                 )
                 .await;
@@ -2717,6 +2722,7 @@ impl AgentLoop {
                     ),
                     canonical_tool: canonical_tool.clone(),
                     canonical_operation: canonical_operation.clone(),
+                    failure: None,
                 });
                 let _ = self.bus.publish_for_session(
                     task.session_id,
@@ -2760,6 +2766,7 @@ impl AgentLoop {
                     summary: format!("policy denied: {}", rule),
                     canonical_tool: canonical_tool.clone(),
                     canonical_operation: canonical_operation.clone(),
+                    failure: None,
                 });
                 let _ = self.bus.publish_for_session(
                     task.session_id,
@@ -2803,6 +2810,7 @@ impl AgentLoop {
                     pre_image_hashes.clone(),
                     canonical_tool.as_deref(),
                     canonical_operation.as_deref(),
+                    None,
                     &cancel,
                 )
                 .await;
@@ -2824,16 +2832,30 @@ impl AgentLoop {
                         )
                         .await;
                 }
+                // ADR-82 slice 2: typed failure envelope. The loop only ever
+                // sees `ToolError` (the orchestrator does not depend on the
+                // shell crate), so the envelope is reconstructed from core
+                // types alone. The origin derives from the registered tool
+                // name: bridge tools (`mcp:*`, `plugin:*`) degrade to opaque.
+                let failure = concerto_core::tool_failure::ToolFailure::from_error(
+                    &e,
+                    concerto_core::tool_failure::ToolFailureContext {
+                        origin: concerto_core::tool_failure::ToolOrigin::for_tool_name(&tc.name),
+                        correlation_id: Some(correlation_id.to_string()),
+                        ..concerto_core::tool_failure::ToolFailureContext::builtin()
+                    },
+                );
                 // DETERMINISTIC-FAILURE LEDGER (record): the precondition of
                 // this exact `(tool, input)` is provably absent, so any later
                 // identical repeat is refused before it executes (refusal arm
                 // above). Approval pauses, policy denials, cancellation and
                 // transient faults are NOT recorded — the first two have
                 // their own arms, and the rest may resolve on a re-run.
+                // Slice 2: the ledger stores the typed failure code instead
+                // of prose; the refusal text renders it unchanged.
                 if e.is_deterministic_failure() {
-                    let bounded: String = e.to_string().chars().take(240).collect();
                     self.deterministic_failures
-                        .insert((tc.name.clone(), input_key.clone()), bounded);
+                        .insert((tc.name.clone(), input_key.clone()), failure.code.clone());
                 }
                 tool_events.push(ToolExecutionSummary {
                     tool_name: tc.name.clone(),
@@ -2843,6 +2865,7 @@ impl AgentLoop {
                     summary: e.to_string(),
                     canonical_tool: canonical_tool.clone(),
                     canonical_operation: canonical_operation.clone(),
+                    failure: Some(failure.clone()),
                 });
                 let _ = self.bus.publish_for_session(
                     task.session_id,
@@ -2865,14 +2888,17 @@ impl AgentLoop {
                     tool_results: Some(vec![concerto_core::types::ToolResult {
                         id: tc.id.clone(),
                         name: tc.name.clone(),
-                        content: serde_json::json!({ "error": "execution_failed", "message": e.to_string() }),
+                        // Slice 2: the typed `failure` envelope rides
+                        // alongside the legacy `error` key, which stays one
+                        // release for prompt-shape compatibility.
+                        content: serde_json::json!({ "error": "execution_failed", "message": e.to_string(), "failure": failure }),
                     }]),
                     reasoning_content: None,
                 tokens_in: None,
                 tokens_out: None,
                 });
                 // Execution errored before completing; record the failed
-                // attempt as a negative fact.
+                // attempt as a negative fact, carrying the typed envelope.
                 self.record_tool_fact(
                     session,
                     task,
@@ -2886,6 +2912,7 @@ impl AgentLoop {
                     pre_image_hashes.clone(),
                     canonical_tool.as_deref(),
                     canonical_operation.as_deref(),
+                    Some(&failure),
                     &cancel,
                 )
                 .await;
@@ -2982,7 +3009,9 @@ impl AgentLoop {
     /// run/generation concept (no ADR-65 §2 barrier, no checkpoint run id), so
     /// both are recorded honestly as absent. W1: `outcome` is classified at
     /// the call site (ok / denied / interrupted / failed) while `success`
-    /// stays the raw pass flag the loop already decided on.
+    /// stays the raw pass flag the loop already decided on. ADR-82 slice 2:
+    /// a failed execution additionally carries its typed failure envelope
+    /// (`None` for successes and refusals without one).
     #[allow(clippy::too_many_arguments)]
     async fn record_tool_fact(
         &self,
@@ -2998,6 +3027,7 @@ impl AgentLoop {
         pre_image_hashes: HashMap<String, Option<String>>,
         canonical_tool: Option<&str>,
         canonical_operation: Option<&str>,
+        failure: Option<&concerto_core::tool_failure::ToolFailure>,
         cancel: &CancellationToken,
     ) {
         let Some(facts) = &self.tool_facts else {
@@ -3023,6 +3053,7 @@ impl AgentLoop {
                     pre_image_hashes,
                     canonical_tool,
                     canonical_operation,
+                    failure,
                 },
                 cancel,
             )
@@ -3070,6 +3101,7 @@ impl AgentLoop {
                     pre_image_hashes: HashMap::new(),
                     canonical_tool,
                     canonical_operation,
+                    failure: None,
                 },
                 served_from,
                 cancel,
@@ -7414,8 +7446,8 @@ mod tests {
             .find(|message| message.content.contains("[IMPOSSIBLE ACTION]"))
             .expect("the refusal tells the model what to do instead");
         assert!(
-            refusal.content.contains("file not found: /usr/bin/missing-tool"),
-            "the refusal carries the original proof: {}",
+            refusal.content.contains("exec.execution_failed"),
+            "the refusal carries the recorded failure code (ADR-82 slice 2 stores codes, not prose): {}",
             refusal.content
         );
         assert_eq!(
@@ -7426,6 +7458,94 @@ mod tests {
             3,
             "every refused repeat is observable on the event stream"
         );
+    }
+
+    /// ADR-82 slice 2: the error arm emits the typed `failure` envelope on
+    /// the model-boundary payload (keeping the legacy `error` key), stamps
+    /// it on the tool summary, and records the failure *code* — not prose —
+    /// in the deterministic-failure ledger.
+    #[tokio::test]
+    async fn tool_error_arm_emits_typed_failure_and_codes_the_ledger() {
+        let (mut loop_, task, session, _calls) =
+            shell_repair_harness(ScriptedShellOutcome::SpawnFailed(
+                "failed to spawn process: file not found: /usr/bin/missing-tool".into(),
+            ));
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+        let tc = ToolCall {
+            id: "call_missing".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({ "command": "missing-tool", "args": [] }),
+
+            ..Default::default()
+        };
+        execute_one_tool_call(&mut loop_, &tc, &task, &session, &mut messages, &mut tool_events)
+            .await;
+
+        // The model-boundary payload carries the typed envelope alongside
+        // the legacy key (prompt-shape compat, one release).
+        let tool_message = messages.iter().find(|m| m.role == Role::Tool).expect("one tool result");
+        let content = tool_message
+            .tool_results
+            .as_ref()
+            .expect("tool results")
+            .first()
+            .expect("one result")
+            .content
+            .clone();
+        assert_eq!(content["error"], "execution_failed", "legacy key stays");
+        assert_eq!(
+            content["failure"]["code"], "exec.execution_failed",
+            "typed envelope rides the payload: {content}"
+        );
+        assert_eq!(content["failure"]["category"], "execution");
+        assert_eq!(content["failure"]["schema_version"], 1);
+
+        // The summary carries the same envelope.
+        assert_eq!(tool_events.len(), 1);
+        let envelope = tool_events[0].failure.as_ref().expect("summary carries the envelope");
+        assert_eq!(envelope.code, "exec.execution_failed");
+
+        // The ledger stores the code, not prose.
+        assert_eq!(loop_.deterministic_failures.len(), 1, "deterministic failure recorded");
+        let stored = loop_.deterministic_failures.values().next().expect("one ledger entry");
+        assert_eq!(stored, "exec.execution_failed", "ledger stores the code: {stored}");
+    }
+
+    /// A transient fault still emits the envelope (with its own code) but
+    /// records nothing in the ledger — the identical re-issue must execute.
+    #[tokio::test]
+    async fn transient_error_arm_emits_failure_without_ledger_entry() {
+        let (mut loop_, task, session, calls) =
+            shell_repair_harness(ScriptedShellOutcome::Timeout(5));
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+        let tc = ToolCall {
+            id: "call_slow".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({ "command": "sleep 100", "args": [] }),
+
+            ..Default::default()
+        };
+        execute_one_tool_call(&mut loop_, &tc, &task, &session, &mut messages, &mut tool_events)
+            .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let tool_message = messages.iter().find(|m| m.role == Role::Tool).expect("one tool result");
+        let content = tool_message
+            .tool_results
+            .as_ref()
+            .expect("tool results")
+            .first()
+            .expect("one result")
+            .content
+            .clone();
+        assert_eq!(content["error"], "execution_failed", "legacy key stays");
+        assert_eq!(content["failure"]["code"], "exec.timeout", "timeout code: {content}");
+        assert_eq!(content["failure"]["disposition"], "bounded-retry-with-backoff");
+        let envelope = tool_events[0].failure.as_ref().expect("summary carries the envelope");
+        assert_eq!(envelope.code, "exec.timeout");
+        assert!(loop_.deterministic_failures.is_empty(), "transient faults never touch the ledger");
     }
 
     /// Transient faults keep their retry path: an identical TIMEOUT re-issue
@@ -8094,6 +8214,7 @@ mod tests {
                 summary: "Wrote 9 bytes to Cargo.toml".to_owned(),
                 canonical_tool: None,
                 canonical_operation: None,
+                failure: None,
             }],
             ..agent_output_base()
         };
@@ -8127,6 +8248,7 @@ mod tests {
             summary: "Read 3 bytes".to_owned(),
             canonical_tool: None,
             canonical_operation: None,
+            failure: None,
         }];
         let blocked =
             loop_.decide_exit(&task, &no_writes, 1, 0, 0, &None, true, Vec::new()).unwrap();

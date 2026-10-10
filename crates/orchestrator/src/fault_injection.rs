@@ -1636,6 +1636,7 @@ async fn external_workspace_modification_surfaces_in_evidence() {
         served_from: None,
         canonical_tool: None,
         canonical_operation: None,
+        failure: None,
         paths: vec![concerto_sessions::ObservedPath {
             path: path.to_owned(),
             size_bytes: Some(meta.len()),

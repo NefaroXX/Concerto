@@ -213,6 +213,7 @@ mod tests {
             served_from: None,
             canonical_tool: None,
             canonical_operation: None,
+            failure: None,
             paths: vec![ObservedPath {
                 path: "big.bin".to_owned(),
                 size_bytes: Some(meta.len()),

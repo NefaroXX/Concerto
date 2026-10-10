@@ -26,6 +26,7 @@ pub mod shell_security;
 #[cfg(test)]
 pub mod testing;
 pub mod text;
+pub mod tool_failure;
 pub mod traits;
 pub mod transcript;
 pub mod types;
@@ -87,6 +88,15 @@ pub use traits::context_overflow::{ContextOverflowStrategy, NoOpOverflowStrategy
 pub use traits::memory::MemoryStore;
 pub use traits::provider::LlmProvider;
 pub use traits::vector_store::{RowIndexFact, VectorStore};
+
+/// Typed tool-failure envelope (ADR-82 §1, slice 2): the bounded failure
+/// vocabulary core owns so no consumer parses `Display` text to classify a
+/// native failure.
+pub use tool_failure::{
+    is_valid_code, ToolDiagnostic, ToolDisposition, ToolFailure, ToolFailureCategory,
+    ToolFailureContext, ToolOrigin, ToolResource, ToolSeverity, ToolStatus,
+    TOOL_FAILURE_DETAIL_LIMIT_BYTES, TOOL_FAILURE_MESSAGE_LIMIT_BYTES, TOOL_FAILURE_SCHEMA_VERSION,
+};
 
 /// Durable typed session transcript model (ADR-36).
 pub use transcript::{

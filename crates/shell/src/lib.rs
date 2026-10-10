@@ -20,6 +20,7 @@ mod path;
 mod profile;
 mod registry;
 mod runtime;
+mod tool_failure;
 
 pub use command::{CommandEffect, CommandInvocation, CommandServices, CommandSpec, ShellCommand};
 pub use context::ShellContext;

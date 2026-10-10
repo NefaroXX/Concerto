@@ -172,6 +172,7 @@ mod tests {
             summary: summary.to_string(),
             canonical_tool: None,
             canonical_operation: None,
+            failure: None,
         }
     }
 
@@ -189,6 +190,7 @@ mod tests {
             summary: String::new(),
             canonical_tool: Some(canonical_tool.to_string()),
             canonical_operation: canonical_operation.map(str::to_string),
+            failure: None,
         }
     }
 

@@ -271,6 +271,7 @@ impl GenericSpecialistAgent {
                     pre_image_hashes,
                     canonical_tool,
                     canonical_operation,
+                    failure: None,
                 },
                 cancel,
             )
@@ -316,6 +317,7 @@ impl GenericSpecialistAgent {
                     pre_image_hashes: HashMap::new(),
                     canonical_tool,
                     canonical_operation,
+                    failure: None,
                 },
                 served_from,
                 cancel,
