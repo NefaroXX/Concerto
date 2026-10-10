@@ -1,3 +1,7 @@
+use crate::checkpoint::{
+    versioned_fs_targets, CheckpointStore, MutationCaptureSink, OwnershipOracle, PreImageBytes,
+    RestoreError, RestoreOutcome, StashRestorer,
+};
 use crate::error::{PolicyError, ToolError};
 use crate::event::{EventBus, EventKind};
 use crate::traits::approval::ApprovalDecision;
@@ -24,6 +28,11 @@ pub struct ToolExecutor {
     policy: Arc<dyn PolicyEngine>,
     approval_sink: Option<Arc<dyn ApprovalSink>>,
     event_bus: Option<EventBus>,
+    /// ADR-82 slice 5 (b): pre-execution capture sink for mutating canonical
+    /// filesystem ops on the direct (ungated) path. Banked bytes backfill the
+    /// sidecar for active checkpoints covering the path (`INSERT OR IGNORE` —
+    /// a checkpoint-creation snapshot always wins). `None` disables the seam.
+    mutation_sink: Option<Arc<dyn MutationCaptureSink>>,
 }
 
 struct ExecutionAuditContext {
@@ -128,6 +137,34 @@ fn build_action<'a>(
     }
 }
 
+/// Honest limitation for a path the checkpoint anchors but the sidecar cannot
+/// return bytes for: prefer the record's own exclusion reason (it names the
+/// real ceiling), else the generic hash-only note.
+fn missing_bytes_limitation(record: &crate::checkpoint::CheckpointRecord, path: &str) -> String {
+    if let Some(exclusion) = record.excluded.iter().find(|e| e.path.as_deref() == Some(path)) {
+        return format!("{path}: {}", exclusion.reason);
+    }
+    format!("{path}: no restorable bytes banked; hash-only (drift-detectable, not reconstructible)")
+}
+
+/// One restore-path ownership check against the oracle (the gate's typed
+/// read surface): `None` when the path is unowned or held by the restoring
+/// agent (the write may proceed); `Some` names the foreign holder — surfaced
+/// as [`RestoreError::OwnershipConflict`] without parsing any denial prose
+/// (ADR-82). Shared by the Phase-1 pre-check and the Phase-2 per-write
+/// re-check so both emit the identical structured conflict.
+fn ownership_conflict(
+    ownership: &dyn OwnershipOracle,
+    path: &str,
+    by_agent: &str,
+) -> Option<crate::checkpoint::OwnershipConflictInfo> {
+    let owner = ownership.owner_of(path)?;
+    if owner == by_agent {
+        return None;
+    }
+    Some(crate::checkpoint::OwnershipConflictInfo { path: path.to_owned(), owner })
+}
+
 /// Derive the audit-safe result summary of a read-only tool call from the
 /// result the executor already holds.
 ///
@@ -163,7 +200,7 @@ fn read_result_facts(operation: &str, output: &ToolOutput) -> Option<ReadResultF
 
 impl ToolExecutor {
     pub fn new(registry: Arc<ToolRegistry>, policy: Arc<dyn PolicyEngine>) -> Self {
-        Self { registry, policy, approval_sink: None, event_bus: None }
+        Self { registry, policy, approval_sink: None, event_bus: None, mutation_sink: None }
     }
 
     pub fn with_approval_sink(mut self, sink: Arc<dyn ApprovalSink>) -> Self {
@@ -176,6 +213,19 @@ impl ToolExecutor {
     /// [`EventKind::ApprovalResolved`] once it is answered) to subscribers.
     pub fn with_event_bus(mut self, bus: EventBus) -> Self {
         self.event_bus = Some(bus);
+        self
+    }
+
+    /// Attach the ADR-82 slice 5 (b) pre-execution capture sink: after an
+    /// `Allow` verdict (or an approval) and before the tool materializes a
+    /// mutating canonical filesystem op, the executor banks the current bytes
+    /// for active checkpoints covering the targets. Mirrors the filesystem
+    /// tool's own capture-before-materialize discipline, lifted to the seam so
+    /// the direct (ungated) path captures too. Fail-soft by contract (the sink
+    /// swallows its own errors); a cancelled token skips the capture and the
+    /// execution surfaces `Cancelled` itself.
+    pub fn with_mutation_sink(mut self, sink: Arc<dyn MutationCaptureSink>) -> Self {
+        self.mutation_sink = Some(sink);
         self
     }
 
@@ -845,6 +895,31 @@ impl ToolExecutor {
         self.execute_resolved(tool.name(), tool, input, session, cancel, false).await
     }
 
+    /// ADR-82 slice 5 (b): bank pre-mutation bytes for the canonical
+    /// filesystem targets of an authorized call, when a capture sink is
+    /// attached. Read-only operations, non-filesystem tools, and calls without
+    /// versioned targets return immediately (no sink traffic); a cancelled
+    /// token skips the capture (the execution surfaces `Cancelled` itself).
+    /// Fail-soft by the sink's contract: nothing here can fail the write.
+    async fn note_mutation_targets(
+        &self,
+        canonical: &CanonicalEffect,
+        session: &SessionContext,
+        cancel: CancellationToken,
+    ) {
+        let Some(sink) = self.mutation_sink.as_ref() else {
+            return;
+        };
+        if cancel.is_cancelled() {
+            return;
+        }
+        let targets = versioned_fs_targets(&canonical.policy_name, &canonical.policy_input);
+        if targets.is_empty() {
+            return;
+        }
+        sink.capture_before_mutation(targets, session, cancel).await;
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn execute_resolved(
         &self,
@@ -889,6 +964,9 @@ impl ToolExecutor {
 
         match self.policy.evaluate(&action, cancel.clone()).await {
             Ok(PolicyVerdict::Allow) => {
+                // ADR-82 slice 5 (b): the write is authorized — bank current
+                // bytes for active checkpoints BEFORE the tool materializes it.
+                self.note_mutation_targets(&canonical, session, cancel.clone()).await;
                 self.execute_allowed(
                     tool,
                     tool_name,
@@ -932,6 +1010,10 @@ impl ToolExecutor {
                             match decision {
                                 ApprovalDecision::Approve
                                 | ApprovalDecision::ApproveAllForSession => {
+                                    // ADR-82 slice 5 (b): same pre-execution
+                                    // capture as the direct-Allow path above.
+                                    self.note_mutation_targets(&canonical, session, cancel.clone())
+                                        .await;
                                     self.execute_allowed(
                                         tool,
                                         tool_name,
@@ -1180,6 +1262,269 @@ impl ToolExecutor {
         if let Err(error) = self.policy.audit_log().record(entry, cancel).await {
             tracing::error!(%error, "served-read audit write failed");
         }
+    }
+
+    /// Restore a file checkpoint (ADR-82 §4, slice 5): an authorized,
+    /// policy-gated, ownership-checked, idempotent mutation — never a bypass.
+    ///
+    /// Each byte-carrying resource restores as a normal gated `filesystem`
+    /// write of its sidecar pre-image bytes through [`Self::execute`], so
+    /// policy and `VirtualFs` apply exactly as for any other write; resources
+    /// that were absent at checkpoint time restore as gated deletes (exact —
+    /// absence needs no bytes). Two phases, fail-closed:
+    ///
+    /// 1. **Check everything**: ownership for every included path (a foreign
+    ///    owner aborts the whole restore before any write — surfaced, never a
+    ///    silent overwrite) and method/status gating (`Expired`/`Superseded`
+    ///    refuse loudly — never advertise restorable without bytes;
+    ///    `Manual` returns [`RestoreOutcome::RequiresOperator`] without
+    ///    writing; `GitStash` delegates to the [`StashRestorer`]).
+    /// 2. **Write everything**: policy-denied or failed writes abort
+    ///    mid-restore with the checkpoint status left unchanged (retriable —
+    ///    a retry rewrites the same bytes idempotently). Each write re-checks
+    ///    the ownership oracle immediately before execution, so a sibling
+    ///    that acquires a path after the Phase-1 pre-check aborts with the
+    ///    same structured [`RestoreError::OwnershipConflict`] (the current
+    ///    owner named) instead of overwriting silently.
+    ///
+    /// A second restore of the same id is a recorded no-op
+    /// ([`RestoreOutcome::AlreadyRestored`]); the first restore's
+    /// `Restored{at, by}` is the record. Restoring never acquires ownership:
+    /// the gate's table is untouched (documented drift — the table only tracks
+    /// gate-mediated acquires), and the pre-check is what keeps a restore
+    /// from silently overwriting a foreign owner's artifact.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn restore_checkpoint(
+        &self,
+        checkpoint_id: &str,
+        store: &dyn CheckpointStore,
+        ownership: &dyn OwnershipOracle,
+        stash: &dyn StashRestorer,
+        session: &SessionContext,
+        by_agent: &str,
+        cancel: CancellationToken,
+    ) -> Result<RestoreOutcome, RestoreError> {
+        use crate::checkpoint::{CheckpointResourceKind, CheckpointStatus, RestoreMethod};
+        if cancel.is_cancelled() {
+            return Err(RestoreError::Cancelled);
+        }
+        let record = store
+            .load_record(checkpoint_id, cancel.clone())
+            .await
+            .map_err(RestoreError::Store)?
+            .ok_or_else(|| RestoreError::NotFound(checkpoint_id.to_owned()))?;
+
+        if let CheckpointStatus::Restored { at_ms, by } = &record.status {
+            return Ok(RestoreOutcome::AlreadyRestored { at_ms: *at_ms, by: by.clone() });
+        }
+        match &record.status {
+            CheckpointStatus::Expired { reason } => {
+                return Err(RestoreError::NotRestorable {
+                    id: checkpoint_id.to_owned(),
+                    reason: format!("expired: {reason}"),
+                });
+            }
+            CheckpointStatus::Superseded => {
+                return Err(RestoreError::NotRestorable {
+                    id: checkpoint_id.to_owned(),
+                    reason: "superseded".to_string(),
+                });
+            }
+            CheckpointStatus::Active | CheckpointStatus::Partial { .. } => {}
+            CheckpointStatus::Restored { .. } => {}
+        }
+
+        match record.restore_method {
+            RestoreMethod::Manual => {
+                let mut limitations = record.limitations.clone();
+                if limitations.is_empty() {
+                    limitations.push(
+                        "checkpoint restores as Manual: follow the record's excluded entries"
+                            .to_string(),
+                    );
+                }
+                return Ok(RestoreOutcome::RequiresOperator { limitations });
+            }
+            RestoreMethod::GitStash => {
+                let detail = stash.restore_stash(&record).map_err(RestoreError::ExecutionFailed)?;
+                if cancel.is_cancelled() {
+                    return Err(RestoreError::Cancelled);
+                }
+                let _ = store
+                    .mark_restored(checkpoint_id, crate::checkpoint::now_millis(), by_agent, cancel)
+                    .await
+                    .map_err(RestoreError::Store)?;
+                return Ok(RestoreOutcome::StashRestored { detail });
+            }
+            RestoreMethod::PreImageStore => {}
+        }
+
+        // Phase 1: ownership pre-check over every included path, before any
+        // write. Unowned paths pass (the gated writes below auto-attribute);
+        // self-owned paths pass; foreign-owned paths abort the restore.
+        let mut conflicts = Vec::new();
+        for resource in &record.included {
+            if let Some(conflict) =
+                ownership_conflict(ownership, &resource.canonical_path, by_agent)
+            {
+                conflicts.push(conflict);
+            }
+        }
+        if !conflicts.is_empty() {
+            return Err(RestoreError::OwnershipConflict(conflicts));
+        }
+
+        // Phase 2: restore through gated writes.
+        let mut restored = Vec::new();
+        let mut recreated = Vec::new();
+        let mut deleted = Vec::new();
+        let mut missing = Vec::new();
+        let mut limitations = Vec::new();
+        let mut notes = Vec::new();
+        for resource in &record.included {
+            if cancel.is_cancelled() {
+                return Err(RestoreError::Cancelled);
+            }
+            let path = resource.canonical_path.clone();
+            if resource.kind == CheckpointResourceKind::FileDelete {
+                // Absent at checkpoint time: ensure deletion (exact, no bytes).
+                self.execute_filesystem_delete(&path, ownership, by_agent, session, cancel.clone())
+                    .await?;
+                deleted.push(path);
+                continue;
+            }
+            // Byte-carrying kinds: the sidecar must hold verified bytes.
+            match store.load_bytes(checkpoint_id, &path, cancel.clone()).await {
+                Ok(PreImageBytes::Stored { bytes, hash, captured_at_ms: _, capture_kind }) => {
+                    if blake3::hash(&bytes).to_hex().to_string() != hash {
+                        missing.push(path.clone());
+                        limitations.push(format!(
+                            "{path}: sidecar bytes failed hash verification; refusing to write unverified bytes"
+                        ));
+                        continue;
+                    }
+                    let content = match String::from_utf8(bytes) {
+                        Ok(content) => content,
+                        Err(_) => {
+                            missing.push(path.clone());
+                            limitations.push(format!(
+                                "{path}: sidecar bytes are not UTF-8; binary restore is deferred to the streaming store"
+                            ));
+                            continue;
+                        }
+                    };
+                    let existed = std::fs::metadata(session.project_dir.join(&path)).is_ok();
+                    self.execute_filesystem_write(
+                        &path,
+                        &content,
+                        ownership,
+                        by_agent,
+                        session,
+                        cancel.clone(),
+                    )
+                    .await?;
+                    if existed {
+                        restored.push(path.clone());
+                    } else {
+                        recreated.push(path.clone());
+                    }
+                    if capture_kind == crate::checkpoint::CaptureKind::PreImage {
+                        notes.push(format!(
+                            "{path}: bytes backfilled by the first post-checkpoint mutation (pre-image provenance); exact when nothing changed between checkpoint creation and that mutation"
+                        ));
+                    }
+                }
+                Ok(PreImageBytes::HashOnly { .. }) | Ok(PreImageBytes::Absent) => {
+                    missing.push(path.clone());
+                    limitations.push(missing_bytes_limitation(&record, &path));
+                }
+                Err(error) => return Err(RestoreError::Store(error)),
+            }
+        }
+
+        if missing.is_empty() {
+            let transitioned = store
+                .mark_restored(checkpoint_id, crate::checkpoint::now_millis(), by_agent, cancel)
+                .await
+                .map_err(RestoreError::Store)?;
+            if transitioned {
+                Ok(RestoreOutcome::Restored { restored, recreated, deleted, notes })
+            } else {
+                // Lost a race with a concurrent restore: report the stored
+                // no-op rather than claiming this call restored.
+                match store
+                    .load_record(checkpoint_id, CancellationToken::new())
+                    .await
+                    .map_err(RestoreError::Store)?
+                    .map(|record| record.status)
+                {
+                    Some(CheckpointStatus::Restored { at_ms, by }) => {
+                        Ok(RestoreOutcome::AlreadyRestored { at_ms, by })
+                    }
+                    _ => Ok(RestoreOutcome::Restored { restored, recreated, deleted, notes }),
+                }
+            }
+        } else {
+            store
+                .mark_partial(checkpoint_id, missing.clone(), cancel)
+                .await
+                .map_err(RestoreError::Store)?;
+            Ok(RestoreOutcome::Partial { restored, missing, limitations })
+        }
+    }
+
+    /// One gated `filesystem` write for restore: policy + `VirtualFs` apply
+    /// exactly as for any other write (never a bypass).
+    ///
+    /// The ownership oracle is re-consulted immediately before the write: a
+    /// sibling that acquired the path after the Phase-1 pre-check aborts
+    /// here with the structured [`RestoreError::OwnershipConflict`] (the
+    /// current owner named, read from the gate's typed ownership surface —
+    /// never string-matched denial prose, per ADR-82) and no write runs.
+    /// Non-ownership denials keep their `PolicyDenied` mapping.
+    async fn execute_filesystem_write(
+        &self,
+        path: &str,
+        content: &str,
+        ownership: &dyn OwnershipOracle,
+        by_agent: &str,
+        session: &SessionContext,
+        cancel: CancellationToken,
+    ) -> Result<(), RestoreError> {
+        if let Some(conflict) = ownership_conflict(ownership, path, by_agent) {
+            return Err(RestoreError::OwnershipConflict(vec![conflict]));
+        }
+        let input = serde_json::json!({"operation": "write", "path": path, "content": content});
+        self.execute("filesystem", input, session, cancel).await.map(|_| ()).map_err(|error| {
+            match error {
+                ToolError::PolicyDenied { rule } => RestoreError::PolicyDenied(rule),
+                ToolError::Cancelled => RestoreError::Cancelled,
+                other => RestoreError::ExecutionFailed(other.to_string()),
+            }
+        })
+    }
+
+    /// One gated `filesystem` delete for restore (absent-at-checkpoint paths).
+    /// Same Phase-2 ownership re-check as [`Self::execute_filesystem_write`].
+    async fn execute_filesystem_delete(
+        &self,
+        path: &str,
+        ownership: &dyn OwnershipOracle,
+        by_agent: &str,
+        session: &SessionContext,
+        cancel: CancellationToken,
+    ) -> Result<(), RestoreError> {
+        if let Some(conflict) = ownership_conflict(ownership, path, by_agent) {
+            return Err(RestoreError::OwnershipConflict(vec![conflict]));
+        }
+        let input = serde_json::json!({"operation": "delete", "path": path});
+        self.execute("filesystem", input, session, cancel).await.map(|_| ()).map_err(|error| {
+            match error {
+                ToolError::PolicyDenied { rule } => RestoreError::PolicyDenied(rule),
+                ToolError::Cancelled => RestoreError::Cancelled,
+                other => RestoreError::ExecutionFailed(other.to_string()),
+            }
+        })
     }
 
     /// Park on the user's approval decision — **there is no auto-expiry**.
@@ -3140,5 +3485,906 @@ mod tests {
         assert_eq!(entries[0].working_directory, None);
         assert_eq!(entries[0].exit_code, None);
         assert_eq!(entries[0].duration_ms, None);
+    }
+}
+
+#[cfg(test)]
+mod restore_tests {
+    //! ADR-82 slice 5: `restore_checkpoint` is an authorized, ownership-checked,
+    //! idempotent mutation. Fakes stand in for the sessions store, the
+    //! ownership table, the stash, and the filesystem tool so these tests pin
+    //! the executor's own contract (gated writes, two-phase ordering,
+    //! no-op/partial/manual outcomes) without a database.
+
+    use super::*;
+    use crate::checkpoint::{
+        CaptureKind, CheckpointByteRef, CheckpointExclusion, CheckpointRecord, CheckpointResource,
+        CheckpointResourceKind, CheckpointScope, CheckpointStatus, CheckpointStoreError,
+        PreImageBytes, RestoreMethod,
+    };
+    use crate::ids::Ulid;
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// In-memory `filesystem` tool: `write`/`delete` mutate the map, every
+    /// call is counted so tests prove what did (and did not) execute.
+    /// Clonable around shared state so the registered box and the test
+    /// observe the same files.
+    #[derive(Clone)]
+    struct FakeFsTool {
+        files: Arc<Mutex<HashMap<String, String>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl FakeFsTool {
+        fn new(files: HashMap<String, String>) -> Self {
+            Self { files: Arc::new(Mutex::new(files)), calls: Arc::new(AtomicUsize::new(0)) }
+        }
+
+        fn content(&self, path: &str) -> Option<String> {
+            self.files.lock().expect("fake fs lock").get(path).cloned()
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl Tool for FakeFsTool {
+        fn name(&self) -> &str {
+            "filesystem"
+        }
+
+        fn description(&self) -> &str {
+            "in-memory filesystem for restore tests"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+
+        fn capability_requirements(&self) -> CapabilitySet {
+            CapabilitySet::default()
+        }
+
+        async fn execute(
+            &self,
+            input: serde_json::Value,
+            _policy: &dyn PolicyEngine,
+            _session: &SessionContext,
+            _cancel: CancellationToken,
+        ) -> Result<ToolOutput, ToolError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let operation = input.get("operation").and_then(serde_json::Value::as_str);
+            let path =
+                input.get("path").and_then(serde_json::Value::as_str).unwrap_or("").to_owned();
+            match operation {
+                Some("write") => {
+                    let content = input
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    self.files.lock().expect("fake fs lock").insert(path.clone(), content.clone());
+                    Ok(ToolOutput {
+                        summary: format!("Wrote {} bytes", content.len()),
+                        data: serde_json::json!({"path": path}),
+                    })
+                }
+                Some("delete") => {
+                    self.files.lock().expect("fake fs lock").remove(&path);
+                    Ok(ToolOutput {
+                        summary: "Deleted".to_string(),
+                        data: serde_json::json!({"path": path}),
+                    })
+                }
+                Some("read") => {
+                    let content = self
+                        .files
+                        .lock()
+                        .expect("fake fs lock")
+                        .get(&path)
+                        .cloned()
+                        .unwrap_or_default();
+                    Ok(ToolOutput {
+                        summary: "Read".to_string(),
+                        data: serde_json::json!({"path": path, "content": content}),
+                    })
+                }
+                _ => Err(ToolError::ExecutionFailed { message: "unknown op".to_string() }),
+            }
+        }
+    }
+
+    /// In-memory [`CheckpointStore`].
+    type BankedBytes = HashMap<String, (Vec<u8>, String, CaptureKind)>;
+
+    struct FakeStore {
+        record: Mutex<CheckpointRecord>,
+        bytes: Mutex<BankedBytes>,
+        hash_only: Mutex<HashMap<String, Option<String>>>,
+    }
+
+    impl FakeStore {
+        fn new(record: CheckpointRecord) -> Self {
+            Self {
+                record: Mutex::new(record),
+                bytes: Mutex::new(HashMap::new()),
+                hash_only: Mutex::new(HashMap::new()),
+            }
+        }
+
+        fn with_bytes(self, path: &str, bytes: &[u8], kind: CaptureKind) -> Self {
+            self.bytes.lock().expect("store lock").insert(
+                path.to_owned(),
+                (bytes.to_vec(), blake3::hash(bytes).to_hex().to_string(), kind),
+            );
+            self
+        }
+
+        fn status(&self) -> CheckpointStatus {
+            self.record.lock().expect("store lock").status.clone()
+        }
+    }
+
+    #[async_trait]
+    impl CheckpointStore for FakeStore {
+        async fn load_record(
+            &self,
+            _checkpoint_id: &str,
+            _cancel: CancellationToken,
+        ) -> Result<Option<CheckpointRecord>, CheckpointStoreError> {
+            Ok(Some(self.record.lock().expect("store lock").clone()))
+        }
+
+        async fn load_bytes(
+            &self,
+            _checkpoint_id: &str,
+            canonical_path: &str,
+            _cancel: CancellationToken,
+        ) -> Result<PreImageBytes, CheckpointStoreError> {
+            if let Some((bytes, hash, capture_kind)) =
+                self.bytes.lock().expect("store lock").get(canonical_path).cloned()
+            {
+                return Ok(PreImageBytes::Stored { bytes, hash, captured_at_ms: 0, capture_kind });
+            }
+            if let Some(hash) = self.hash_only.lock().expect("store lock").get(canonical_path) {
+                return Ok(PreImageBytes::HashOnly { hash: hash.clone() });
+            }
+            Ok(PreImageBytes::Absent)
+        }
+
+        async fn mark_restored(
+            &self,
+            _checkpoint_id: &str,
+            at_ms: i64,
+            by: &str,
+            _cancel: CancellationToken,
+        ) -> Result<bool, CheckpointStoreError> {
+            let mut record = self.record.lock().expect("store lock");
+            if matches!(record.status, CheckpointStatus::Restored { .. }) {
+                return Ok(false);
+            }
+            record.status = CheckpointStatus::Restored { at_ms, by: by.to_owned() };
+            Ok(true)
+        }
+
+        async fn mark_partial(
+            &self,
+            _checkpoint_id: &str,
+            missing: Vec<String>,
+            _cancel: CancellationToken,
+        ) -> Result<(), CheckpointStoreError> {
+            self.record.lock().expect("store lock").status = CheckpointStatus::Partial { missing };
+            Ok(())
+        }
+    }
+
+    /// Ownership oracle backed by a static map.
+    #[derive(Debug, Default)]
+    struct FakeOracle {
+        owners: HashMap<String, String>,
+    }
+
+    impl OwnershipOracle for FakeOracle {
+        fn owner_of(&self, canonical_path: &str) -> Option<String> {
+            self.owners.get(canonical_path).cloned()
+        }
+    }
+
+    /// Stash restorer recording its calls.
+    #[derive(Debug, Default)]
+    struct FakeStash {
+        calls: Mutex<usize>,
+    }
+
+    impl StashRestorer for FakeStash {
+        fn restore_stash(&self, _checkpoint: &CheckpointRecord) -> Result<String, String> {
+            *self.calls.lock().expect("stash lock") += 1;
+            Ok("stash popped".to_string())
+        }
+    }
+
+    /// Recording capture sink for the pre-execution hook tests.
+    #[derive(Debug, Default)]
+    struct RecordingSink {
+        captured: Mutex<Vec<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl MutationCaptureSink for RecordingSink {
+        async fn capture_before_mutation(
+            &self,
+            canonical_paths: Vec<String>,
+            _session: &SessionContext,
+            _cancel: CancellationToken,
+        ) {
+            self.captured.lock().expect("sink lock").push(canonical_paths);
+        }
+    }
+
+    fn session() -> SessionContext {
+        SessionContext::new(Ulid::new(), std::path::PathBuf::from("/tmp/restore-test-no-disk"))
+    }
+
+    fn harness(
+        files: HashMap<String, String>,
+    ) -> (ToolExecutor, FakeFsTool, SessionContext, Arc<FakeStash>) {
+        let tool = FakeFsTool::new(files);
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(tool.clone()));
+        let policy = Arc::new(AllowPolicyHarness);
+        let executor = ToolExecutor::new(Arc::new(registry), policy);
+        (executor, tool, session(), Arc::new(FakeStash::default()))
+    }
+
+    struct AllowPolicyHarness;
+
+    #[async_trait]
+    impl PolicyEngine for AllowPolicyHarness {
+        async fn evaluate(
+            &self,
+            _action: &PolicyAction<'_>,
+            _cancel: CancellationToken,
+        ) -> Result<PolicyVerdict, PolicyError> {
+            Ok(PolicyVerdict::Allow)
+        }
+
+        fn audit_log(&self) -> &dyn crate::traits::policy::AuditLog {
+            &IgnoreAuditHarness
+        }
+    }
+
+    struct IgnoreAuditHarness;
+
+    #[async_trait]
+    impl crate::traits::policy::AuditLog for IgnoreAuditHarness {
+        async fn record(
+            &self,
+            _entry: AuditEntry,
+            _cancel: CancellationToken,
+        ) -> Result<(), PolicyError> {
+            Ok(())
+        }
+    }
+
+    fn active_record(
+        included: Vec<CheckpointResource>,
+        method: RestoreMethod,
+    ) -> (CheckpointRecord, String) {
+        let checkpoint_id = Ulid::new();
+        let record = CheckpointRecord::new(
+            checkpoint_id,
+            Ulid::new(),
+            CheckpointScope::FilesystemWrites {
+                paths: included.iter().map(|r| r.canonical_path.clone()).collect(),
+            },
+            included,
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+            CheckpointStatus::Active,
+            method,
+            Vec::new(),
+            "agent-a".to_string(),
+            1_700_000_000_000,
+            None,
+        )
+        .expect("test record builds");
+        (record, checkpoint_id.to_string())
+    }
+
+    fn overwrite_resource(path: &str, pre: Option<&str>) -> CheckpointResource {
+        CheckpointResource {
+            kind: CheckpointResourceKind::FileOverwrite,
+            canonical_path: path.to_owned(),
+            pre_hash: pre.map(str::to_owned),
+            post_hash: None,
+            byte_ref: Some(CheckpointByteRef {
+                checkpoint_id: "cid".to_string(),
+                canonical_path: path.to_owned(),
+            }),
+            size_bytes: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_returns_byte_exact_content() {
+        // A real tempdir backs the session so the existed-vs-recreated
+        // heuristic observes the pre-restore file on disk.
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        std::fs::write(tmp.path().join("a.txt"), "mutated").expect("seed file");
+        let session = SessionContext::new(Ulid::new(), tmp.path().to_path_buf());
+        let fs = FakeFsTool::new(HashMap::from([("a.txt".to_string(), "mutated".to_string())]));
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(fs.clone()));
+        let executor = ToolExecutor::new(Arc::new(registry), Arc::new(AllowPolicyHarness));
+        let stash = Arc::new(FakeStash::default());
+        let (record, id) =
+            active_record(vec![overwrite_resource("a.txt", None)], RestoreMethod::PreImageStore);
+        let store = FakeStore::new(record).with_bytes("a.txt", b"original", CaptureKind::Snapshot);
+
+        let outcome = executor
+            .restore_checkpoint(
+                &id,
+                &store,
+                &FakeOracle::default(),
+                &*stash,
+                &session,
+                "agent-a",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("restore succeeds");
+        match outcome {
+            RestoreOutcome::Restored { restored, recreated, deleted, .. } => {
+                assert_eq!(restored, vec!["a.txt"]);
+                assert!(recreated.is_empty());
+                assert!(deleted.is_empty());
+            }
+            other => panic!("expected Restored, got {other:?}"),
+        }
+        assert_eq!(fs.content("a.txt").as_deref(), Some("original"));
+        assert!(matches!(store.status(), CheckpointStatus::Restored { .. }));
+    }
+
+    #[tokio::test]
+    async fn restore_recreates_when_absent_at_restore_time() {
+        // Session dir exists but the file does not: the write recreates it.
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let session = SessionContext::new(Ulid::new(), tmp.path().to_path_buf());
+        let tool = FakeFsTool::new(HashMap::new());
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(tool.clone()));
+        let executor = ToolExecutor::new(Arc::new(registry), Arc::new(AllowPolicyHarness));
+        let stash = Arc::new(FakeStash::default());
+        let (record, id) =
+            active_record(vec![overwrite_resource("a.txt", None)], RestoreMethod::PreImageStore);
+        let store = FakeStore::new(record).with_bytes("a.txt", b"v1", CaptureKind::Snapshot);
+
+        match executor
+            .restore_checkpoint(
+                &id,
+                &store,
+                &FakeOracle::default(),
+                &*stash,
+                &session,
+                "agent-a",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("restore succeeds")
+        {
+            RestoreOutcome::Restored { recreated, .. } => assert_eq!(recreated, vec!["a.txt"]),
+            other => panic!("expected Restored, got {other:?}"),
+        }
+        assert_eq!(tool.content("a.txt").as_deref(), Some("v1"));
+    }
+
+    #[tokio::test]
+    async fn double_restore_is_a_recorded_no_op() {
+        let (executor, fs, session, stash) =
+            harness(HashMap::from([("a.txt".to_string(), "mutated".to_string())]));
+        let (record, id) =
+            active_record(vec![overwrite_resource("a.txt", None)], RestoreMethod::PreImageStore);
+        let store = FakeStore::new(record).with_bytes("a.txt", b"v1", CaptureKind::Snapshot);
+        let oracle = FakeOracle::default();
+
+        executor
+            .restore_checkpoint(
+                &id,
+                &store,
+                &oracle,
+                &*stash,
+                &session,
+                "agent-a",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("first restore");
+        let calls_after_first = fs.calls();
+        assert_eq!(fs.content("a.txt").as_deref(), Some("v1"));
+
+        let outcome = executor
+            .restore_checkpoint(
+                &id,
+                &store,
+                &oracle,
+                &*stash,
+                &session,
+                "agent-a",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("second restore");
+        match outcome {
+            RestoreOutcome::AlreadyRestored { by, .. } => assert_eq!(by, "agent-a"),
+            other => panic!("expected AlreadyRestored, got {other:?}"),
+        }
+        assert_eq!(fs.calls(), calls_after_first, "no write ran on re-restore");
+        assert_eq!(fs.content("a.txt").as_deref(), Some("v1"));
+    }
+
+    #[tokio::test]
+    async fn ownership_conflict_refuses_before_any_write() {
+        let (executor, fs, session, stash) = harness(HashMap::from([
+            ("a.txt".to_string(), "x".to_string()),
+            ("b.txt".to_string(), "y".to_string()),
+        ]));
+        let (record, id) = active_record(
+            vec![overwrite_resource("a.txt", None), overwrite_resource("b.txt", None)],
+            RestoreMethod::PreImageStore,
+        );
+        let store = FakeStore::new(record)
+            .with_bytes("a.txt", b"ra", CaptureKind::Snapshot)
+            .with_bytes("b.txt", b"rb", CaptureKind::Snapshot);
+        let oracle =
+            FakeOracle { owners: HashMap::from([("b.txt".to_string(), "agent-b".to_string())]) };
+
+        match executor
+            .restore_checkpoint(
+                &id,
+                &store,
+                &oracle,
+                &*stash,
+                &session,
+                "agent-a",
+                CancellationToken::new(),
+            )
+            .await
+        {
+            Err(RestoreError::OwnershipConflict(conflicts)) => {
+                assert_eq!(conflicts.len(), 1);
+                assert_eq!(conflicts[0].path, "b.txt");
+                assert_eq!(conflicts[0].owner, "agent-b");
+            }
+            other => panic!("expected OwnershipConflict, got {other:?}"),
+        }
+        assert_eq!(fs.calls(), 0, "no write ran once a conflict surfaced");
+        assert_eq!(fs.content("a.txt").as_deref(), Some("x"));
+        assert!(matches!(store.status(), CheckpointStatus::Active), "status unchanged (retriable)");
+    }
+
+    /// Oracle modelling the TOCTOU race: the first lookup of the contested
+    /// path (the Phase-1 pre-check) sees it unowned; every later lookup (the
+    /// Phase-2 per-write re-check) sees the sibling's fresh acquisition.
+    #[derive(Debug)]
+    struct FlippingOracle {
+        path: String,
+        late_owner: String,
+        lookups: Mutex<usize>,
+    }
+
+    impl OwnershipOracle for FlippingOracle {
+        fn owner_of(&self, canonical_path: &str) -> Option<String> {
+            if canonical_path != self.path {
+                return None;
+            }
+            let mut seen = self.lookups.lock().expect("oracle lock");
+            *seen += 1;
+            if *seen == 1 {
+                None
+            } else {
+                Some(self.late_owner.clone())
+            }
+        }
+    }
+
+    /// TOCTOU race: a sibling acquires ownership between the Phase-1
+    /// pre-check and the Phase-2 gated write — the write's oracle re-check
+    /// aborts with the STRUCTURED conflict naming the new owner (never a
+    /// generic denial, never a silent overwrite), status left retriable.
+    #[tokio::test]
+    async fn phase2_ownership_recheck_surfaces_new_owner() {
+        let (executor, fs, session, stash) =
+            harness(HashMap::from([("a.txt".to_string(), "mutated".to_string())]));
+        let (record, id) =
+            active_record(vec![overwrite_resource("a.txt", None)], RestoreMethod::PreImageStore);
+        let store = FakeStore::new(record).with_bytes("a.txt", b"original", CaptureKind::Snapshot);
+        let oracle = FlippingOracle {
+            path: "a.txt".to_string(),
+            late_owner: "agent-b".to_string(),
+            lookups: Mutex::new(0),
+        };
+
+        match executor
+            .restore_checkpoint(
+                &id,
+                &store,
+                &oracle,
+                &*stash,
+                &session,
+                "agent-a",
+                CancellationToken::new(),
+            )
+            .await
+        {
+            Err(RestoreError::OwnershipConflict(conflicts)) => {
+                assert_eq!(conflicts.len(), 1);
+                assert_eq!(conflicts[0].path, "a.txt");
+                assert_eq!(
+                    conflicts[0].owner, "agent-b",
+                    "the conflict names the CURRENT owner, not a generic denial"
+                );
+            }
+            other => panic!("expected structured OwnershipConflict, got {other:?}"),
+        }
+        assert_eq!(fs.calls(), 0, "the Phase-2 re-check aborts before any write");
+        assert_eq!(fs.content("a.txt").as_deref(), Some("mutated"));
+        assert!(
+            matches!(store.status(), CheckpointStatus::Active),
+            "mid-restore abort leaves the status unchanged (retriable)"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_and_superseded_refuse_loudly() {
+        for status in [
+            CheckpointStatus::Expired { reason: "retention prune".to_string() },
+            CheckpointStatus::Superseded,
+        ] {
+            let (executor, fs, session, stash) =
+                harness(HashMap::from([("a.txt".to_string(), "x".to_string())]));
+            let checkpoint_id = Ulid::new();
+            let record = CheckpointRecord::new(
+                checkpoint_id,
+                Ulid::new(),
+                CheckpointScope::Run,
+                vec![overwrite_resource("a.txt", None)],
+                Vec::new(),
+                std::collections::BTreeMap::new(),
+                status,
+                RestoreMethod::PreImageStore,
+                Vec::new(),
+                "agent-a".to_string(),
+                0,
+                None,
+            )
+            .expect("test record builds");
+            let store = FakeStore::new(record).with_bytes("a.txt", b"ra", CaptureKind::Snapshot);
+            match executor
+                .restore_checkpoint(
+                    &checkpoint_id.to_string(),
+                    &store,
+                    &FakeOracle::default(),
+                    &*stash,
+                    &session,
+                    "agent-a",
+                    CancellationToken::new(),
+                )
+                .await
+            {
+                Err(RestoreError::NotRestorable { .. }) => {}
+                other => panic!("terminal status must refuse, got {other:?}"),
+            }
+            assert_eq!(fs.calls(), 0, "no write ran for a terminal checkpoint");
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_checkpoints_require_the_operator() {
+        let (executor, fs, session, stash) =
+            harness(HashMap::from([("big.bin".to_string(), "x".to_string())]));
+        let checkpoint_id = Ulid::new();
+        let record = CheckpointRecord::new(
+            checkpoint_id,
+            Ulid::new(),
+            CheckpointScope::Run,
+            Vec::new(),
+            vec![CheckpointExclusion {
+                class: crate::checkpoint::CheckpointExclusionClass::OversizedFile,
+                path: Some("big.bin".to_string()),
+                reason: "too big".to_string(),
+            }],
+            std::collections::BTreeMap::new(),
+            CheckpointStatus::Partial { missing: vec!["big.bin".to_string()] },
+            RestoreMethod::Manual,
+            vec!["binary deferred".to_string()],
+            "agent-a".to_string(),
+            0,
+            None,
+        )
+        .expect("test record builds");
+        let store = FakeStore::new(record);
+        match executor
+            .restore_checkpoint(
+                &checkpoint_id.to_string(),
+                &store,
+                &FakeOracle::default(),
+                &*stash,
+                &session,
+                "agent-a",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("manual surfaces, never fails")
+        {
+            RestoreOutcome::RequiresOperator { limitations } => {
+                assert!(!limitations.is_empty());
+            }
+            other => panic!("expected RequiresOperator, got {other:?}"),
+        }
+        assert_eq!(fs.calls(), 0, "Manual writes nothing");
+    }
+
+    #[tokio::test]
+    async fn missing_bytes_restore_partial_with_limitations() {
+        let (executor, fs, session, stash) =
+            harness(HashMap::from([("a.txt".to_string(), "x".to_string())]));
+        let (record, id) =
+            active_record(vec![overwrite_resource("gone.txt", None)], RestoreMethod::PreImageStore);
+        let store = FakeStore::new(record);
+        match executor
+            .restore_checkpoint(
+                &id,
+                &store,
+                &FakeOracle::default(),
+                &*stash,
+                &session,
+                "agent-a",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("partial restore succeeds")
+        {
+            RestoreOutcome::Partial { restored, missing, limitations } => {
+                assert!(restored.is_empty());
+                assert_eq!(missing, vec!["gone.txt"]);
+                assert!(!limitations.is_empty());
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+        assert_eq!(fs.calls(), 0);
+        match store.status() {
+            CheckpointStatus::Partial { missing } => assert_eq!(missing, vec!["gone.txt"]),
+            other => panic!("status must be Partial, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tampered_bytes_are_never_written() {
+        let (executor, fs, session, stash) =
+            harness(HashMap::from([("a.txt".to_string(), "x".to_string())]));
+        let (record, id) =
+            active_record(vec![overwrite_resource("a.txt", None)], RestoreMethod::PreImageStore);
+        let store = FakeStore::new(record);
+        // Bank bytes under a WRONG hash: the verifier must refuse them.
+        store.bytes.lock().expect("store lock").insert(
+            "a.txt".to_owned(),
+            (b"evil".to_vec(), "deadbeef".to_string(), CaptureKind::Snapshot),
+        );
+        match executor
+            .restore_checkpoint(
+                &id,
+                &store,
+                &FakeOracle::default(),
+                &*stash,
+                &session,
+                "agent-a",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("verifier refusal restores partial")
+        {
+            RestoreOutcome::Partial { missing, limitations, .. } => {
+                assert_eq!(missing, vec!["a.txt"]);
+                assert!(limitations.iter().any(|l| l.contains("hash verification")));
+            }
+            other => panic!("expected Partial, got {other:?}"),
+        }
+        assert_eq!(fs.content("a.txt").as_deref(), Some("x"), "unverified bytes never land");
+    }
+
+    #[tokio::test]
+    async fn delete_kind_restores_absence() {
+        let (executor, fs, session, stash) =
+            harness(HashMap::from([("new.txt".to_string(), "created after".to_string())]));
+        let (record, id) = active_record(
+            vec![CheckpointResource {
+                kind: CheckpointResourceKind::FileDelete,
+                canonical_path: "new.txt".to_owned(),
+                pre_hash: None,
+                post_hash: None,
+                byte_ref: None,
+                size_bytes: None,
+            }],
+            RestoreMethod::PreImageStore,
+        );
+        let store = FakeStore::new(record);
+        match executor
+            .restore_checkpoint(
+                &id,
+                &store,
+                &FakeOracle::default(),
+                &*stash,
+                &session,
+                "agent-a",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("delete restore succeeds")
+        {
+            RestoreOutcome::Restored { deleted, .. } => assert_eq!(deleted, vec!["new.txt"]),
+            other => panic!("expected Restored, got {other:?}"),
+        }
+        assert_eq!(fs.content("new.txt"), None);
+    }
+
+    #[tokio::test]
+    async fn git_stash_delegates_to_the_stash_restorer() {
+        let (executor, fs, session, stash) =
+            harness(HashMap::from([("a.txt".to_string(), "x".to_string())]));
+        let (mut record, id) = active_record(Vec::new(), RestoreMethod::GitStash);
+        record.status = CheckpointStatus::Active;
+        let store = FakeStore::new(record);
+        match executor
+            .restore_checkpoint(
+                &id,
+                &store,
+                &FakeOracle::default(),
+                &*stash,
+                &session,
+                "agent-a",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("stash restore succeeds")
+        {
+            RestoreOutcome::StashRestored { detail } => assert_eq!(detail, "stash popped"),
+            other => panic!("expected StashRestored, got {other:?}"),
+        }
+        assert_eq!(*stash.calls.lock().expect("stash lock"), 1);
+        assert_eq!(fs.calls(), 0, "stash restores outside the byte path");
+        assert!(matches!(store.status(), CheckpointStatus::Restored { .. }));
+    }
+
+    #[tokio::test]
+    async fn pre_execution_sink_fires_only_for_mutating_fs_ops() {
+        let tool = FakeFsTool::new(HashMap::new());
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(tool));
+        let sink = Arc::new(RecordingSink::default());
+        let executor = ToolExecutor::new(Arc::new(registry), Arc::new(AllowPolicyHarness))
+            .with_mutation_sink(sink.clone());
+        let session = session();
+
+        executor
+            .execute(
+                "filesystem",
+                serde_json::json!({"operation": "write", "path": "a.txt", "content": "hi"}),
+                &session,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("write executes");
+        executor
+            .execute(
+                "filesystem",
+                serde_json::json!({"operation": "read", "path": "a.txt"}),
+                &session,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("read executes");
+        assert!(
+            executor
+                .execute(
+                    "shell",
+                    serde_json::json!({"command": "ls"}),
+                    &session,
+                    CancellationToken::new(),
+                )
+                .await
+                .is_err(),
+            "unknown tool refuses"
+        );
+
+        let captured = sink.captured.lock().expect("sink lock").clone();
+        assert_eq!(captured, vec![vec!["a.txt".to_string()]], "only the mutating op captured");
+    }
+
+    #[tokio::test]
+    async fn cancelled_restore_writes_nothing() {
+        let (executor, fs, session, stash) =
+            harness(HashMap::from([("a.txt".to_string(), "x".to_string())]));
+        let (record, id) =
+            active_record(vec![overwrite_resource("a.txt", None)], RestoreMethod::PreImageStore);
+        let store = FakeStore::new(record).with_bytes("a.txt", b"v", CaptureKind::Snapshot);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        match executor
+            .restore_checkpoint(
+                &id,
+                &store,
+                &FakeOracle::default(),
+                &*stash,
+                &session,
+                "agent-a",
+                cancel,
+            )
+            .await
+        {
+            Err(RestoreError::Cancelled) => {}
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+        assert_eq!(fs.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn unknown_checkpoint_id_is_not_found() {
+        let (executor, _fs, session, stash) = harness(HashMap::new());
+        struct EmptyStore;
+        #[async_trait]
+        impl CheckpointStore for EmptyStore {
+            async fn load_record(
+                &self,
+                _id: &str,
+                _cancel: CancellationToken,
+            ) -> Result<Option<CheckpointRecord>, CheckpointStoreError> {
+                Ok(None)
+            }
+            async fn load_bytes(
+                &self,
+                _id: &str,
+                _path: &str,
+                _cancel: CancellationToken,
+            ) -> Result<PreImageBytes, CheckpointStoreError> {
+                Ok(PreImageBytes::Absent)
+            }
+            async fn mark_restored(
+                &self,
+                _id: &str,
+                _at: i64,
+                _by: &str,
+                _cancel: CancellationToken,
+            ) -> Result<bool, CheckpointStoreError> {
+                Ok(false)
+            }
+            async fn mark_partial(
+                &self,
+                _id: &str,
+                _missing: Vec<String>,
+                _cancel: CancellationToken,
+            ) -> Result<(), CheckpointStoreError> {
+                Ok(())
+            }
+        }
+        match executor
+            .restore_checkpoint(
+                "nope",
+                &EmptyStore,
+                &FakeOracle::default(),
+                &*stash,
+                &session,
+                "agent-a",
+                CancellationToken::new(),
+            )
+            .await
+        {
+            Err(RestoreError::NotFound(id)) => assert_eq!(id, "nope"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
     }
 }

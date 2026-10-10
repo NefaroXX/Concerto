@@ -8,6 +8,7 @@
 pub mod at_rest;
 pub mod audit;
 pub mod audit_retention;
+pub mod file_checkpoints;
 pub mod plan_bindings;
 pub mod plans;
 pub mod query;
@@ -19,6 +20,10 @@ pub mod whiteboard;
 pub use at_rest::{is_at_rest_encrypted, marker_path, AtRestKey};
 pub use audit::{AuditLogFilter, AuditLogRow};
 pub use audit_retention::AuditRetentionReport;
+pub use file_checkpoints::{
+    default_method_for_plan, plan_checkpoint_resource, record_covers_path, CheckpointCreateReport,
+    CheckpointPruneReport, FileCheckpointStore,
+};
 pub use plan_bindings::PlanBindingRecord;
 pub use resource_facts::{
     CachedRead, ObservedPath, ResourceFactRow, ResourceFacts, SnapshotEntry, ToolExecutedPayload,
@@ -493,6 +498,21 @@ impl SqliteSessionStore {
                     tracing::warn!(%error, "audit retention prune failed; the audit log was left untouched")
                 }
             }
+            // ADR-82 slice 5: the same retention run extends to the checkpoint
+            // sidecar (delete-only, no archive — hashes stay on the
+            // never-pruned log). Fail-soft like the audit half: a failed prune
+            // leaves sidecar rows in place and never blocks startup.
+            match store.prune_file_checkpoints(days, &CancellationToken::new()).await {
+                Ok(report) => tracing::info!(
+                    expired = report.expired,
+                    sidecar_rows_deleted = report.sidecar_rows_deleted,
+                    cutoff_unix = report.cutoff_unix,
+                    "checkpoint retention prune completed"
+                ),
+                Err(error) => {
+                    tracing::warn!(%error, "checkpoint retention prune failed; the sidecar was left untouched")
+                }
+            }
         }
 
         store._data_dir_lock = Some(data_dir_lock);
@@ -508,6 +528,21 @@ impl SqliteSessionStore {
     /// Audit writer on this store's already configured connection pool.
     pub fn audit_sink(&self) -> Arc<dyn concerto_core::traits::policy::AuditLog> {
         Arc::new(audit::SqliteAuditLog::new(self.pool.clone()))
+    }
+
+    /// Extend one retention run to the checkpoint sidecar (ADR-82 slice 5):
+    /// delete-only aging of `checkpoint_pre_images` with prune-eligibility
+    /// gated on checkpoint status (bytes pruned ⇒ `Expired`), sharing
+    /// `prune_audit`'s window. See
+    /// [`FileCheckpointStore::prune_checkpoints`](crate::file_checkpoints::FileCheckpointStore::prune_checkpoints).
+    pub async fn prune_file_checkpoints(
+        &self,
+        retention_days: u64,
+        cancel: &CancellationToken,
+    ) -> Result<crate::file_checkpoints::CheckpointPruneReport, SessionError> {
+        crate::file_checkpoints::FileCheckpointStore::new(self.pool.clone())
+            .prune_checkpoints(retention_days, cancel)
+            .await
     }
 
     /// Connect to an explicit database path. SQLite WAL and `busy_timeout`

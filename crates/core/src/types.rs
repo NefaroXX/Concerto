@@ -290,6 +290,14 @@ pub struct ToolOutput {
     pub data: serde_json::Value,
 }
 
+/// ADR-82 §4 (slice 5): deprecated, never constructed in-tree. The unwired
+/// rollback seam is superseded by [`crate::checkpoint::CheckpointRecord`] plus
+/// [`crate::executor::ToolExecutor::restore_checkpoint`]. Kept (not removed)
+/// so the deprecation is breaking-change-free; removal is deferred.
+#[deprecated(
+    since = "0.1.0",
+    note = "ADR-82 §4: unwired seam, superseded by CheckpointRecord + ToolExecutor::restore_checkpoint"
+)]
 #[derive(Debug, Clone)]
 pub struct RollbackSnapshot {
     pub tool_name: String,

@@ -33,6 +33,7 @@ pub mod design_doc_verifier;
 pub mod exec_backend;
 pub mod external_change;
 pub mod failure_diagnosis;
+pub mod file_checkpoint;
 pub mod fingerprint;
 pub mod gate;
 pub mod gate_proxy;
