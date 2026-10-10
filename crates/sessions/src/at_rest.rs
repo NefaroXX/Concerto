@@ -313,6 +313,26 @@ pub(crate) fn plain_options(db_path: &Path) -> SqliteConnectOptions {
         .synchronous(SqliteSynchronous::Normal)
 }
 
+/// Open an existing database without schema, retention, encryption or recovery
+/// mutations. SQLite's read-only flag is authoritative for every pooled handle.
+async fn read_only_pool(db_path: &Path, key: Option<&AtRestKey>) -> Result<SqlitePool, SessionError> {
+    let mut options = SqliteConnectOptions::new()
+        .filename(db_path)
+        .read_only(true)
+        .create_if_missing(false)
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .pragma("query_only", "ON")
+        .disable_statement_logging();
+    if let Some(key) = key {
+        ensure_sqlcipher_build().await?;
+        options = options.pragma("key", key.pragma_value());
+    }
+    let pool = PoolOptions::new().max_connections(1).connect_with(options).await?;
+    // Force key/header verification here rather than deferring it to a caller.
+    let _: i64 = sqlx::query_scalar("PRAGMA schema_version").fetch_one(&pool).await?;
+    Ok(pool)
+}
+
 /// Options for opening an encrypted database: the key pragma plus statement
 /// logging off, so `PRAGMA key = '…'` can never appear in a log line (sqlx
 /// logs statement text at `Debug` by default).
@@ -763,6 +783,34 @@ async fn open_keyed_pool(db_path: &Path, key: &AtRestKey) -> Result<SqlitePool, 
 // ---------------------------------------------------------------------------
 
 impl SqliteSessionStore {
+    /// Inspect the existing canonical database alongside a running frontend.
+    /// Does not acquire the instance lock, initialize/migrate/recover the DB,
+    /// run retention, or generate encryption keys. Pending encryption setup
+    /// must be completed by a normal application startup first.
+    pub async fn connect_read_only() -> Result<Self, SessionError> {
+        let path = crate::app_data_dir()?.join("sessions.db");
+        let settings = AuditSettings::from_global_config()?;
+        let key = if settings.encrypt_at_rest {
+            if !is_at_rest_encrypted(&path) {
+                return Err(SessionError::Storage(
+                    "encryption setup is pending; start Concerto before inspecting sessions".into(),
+                ));
+            }
+            let raw = CredentialStore::from_env()
+                .get(AT_REST_KEY_ACCOUNT)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| CredentialStore::new().get(AT_REST_KEY_ACCOUNT).ok())
+                .ok_or_else(|| SessionError::Storage("existing at-rest key is unavailable".into()))?;
+            Some(AtRestKey::parse_hex(&raw)?)
+        } else {
+            ensure_not_at_rest_encrypted(&path)?;
+            None
+        };
+        let pool = read_only_pool(&path, key.as_ref()).await?;
+        Ok(Self { pool, _data_dir_lock: None, at_rest_key: key })
+    }
+
     /// Connect to an explicit database path with at-rest encryption: the file
     /// at `db_path` is opened (or created, or migrated from plaintext) with
     /// SQLCipher and `key`.
@@ -803,6 +851,46 @@ impl SqliteSessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn read_only_inspection_never_initializes_or_changes_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inspection.db");
+        assert!(read_only_pool(&path, None).await.is_err());
+        assert!(!path.exists());
+        let writer = PoolOptions::new()
+            .connect_with(SqliteConnectOptions::new().filename(&path).create_if_missing(true))
+            .await.unwrap();
+        sqlx::query("CREATE TABLE fixture (value TEXT)").execute(&writer).await.unwrap();
+        sqlx::query("INSERT INTO fixture VALUES ('unchanged')").execute(&writer).await.unwrap();
+        let reader = read_only_pool(&path, None).await.unwrap();
+        let value: String = sqlx::query_scalar("SELECT value FROM fixture").fetch_one(&reader).await.unwrap();
+        assert_eq!(value, "unchanged");
+        assert!(sqlx::query("DELETE FROM fixture").execute(&reader).await.is_err());
+        assert!(sqlx::query("CREATE TABLE unwanted (value TEXT)").execute(&reader).await.is_err());
+        let tables: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type = 'table'").fetch_one(&reader).await.unwrap();
+        assert_eq!(tables, 1, "inspection must not run Concerto migrations");
+        reader.close().await;
+        writer.close().await;
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn read_only_encrypted_inspection_requires_the_existing_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("encrypted.db");
+        let key = AtRestKey::parse_hex(&"12".repeat(32)).unwrap();
+        let store = SqliteSessionStore::connect_with_at_rest(&path, &key).await.unwrap();
+        let reader = read_only_pool(&path, Some(&key)).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions").fetch_one(&reader).await.unwrap();
+        assert_eq!(count, 0);
+        assert!(sqlx::query("DELETE FROM sessions").execute(&reader).await.is_err());
+        reader.close().await;
+        let wrong = AtRestKey::parse_hex(&"34".repeat(32)).unwrap();
+        assert!(read_only_pool(&path, Some(&wrong)).await.is_err());
+        assert!(is_at_rest_encrypted(&path));
+        drop(store);
+    }
 
     fn write_fake_sqlite(path: &Path) {
         let mut bytes = b"SQLite format 3\0".to_vec();

@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span};
 use crate::approval::{
     ApprovalPrompt, CliApprovalSink, CliApprovalState, IntentPrompt, PlanPrompt,
 };
+use crate::dispatch::runtime::RuntimeInspector;
 use crate::theme::CliTheme;
 use crate::ui::{self, chat_line_with_theme, ChatRole};
 use concerto_api_types::diff::DiffResult;
@@ -141,6 +142,8 @@ pub enum Screen {
     AgentAssignments,
     /// Staged unified-diff review (P02): accept/reject each staged file.
     DiffReview,
+    /// Read-only persisted Coordinator state, shared with Desktop.
+    RuntimeInspector,
 }
 
 /// Outcome of a per-file review decision on the staged-diff screen.
@@ -529,6 +532,7 @@ pub struct App {
     pub(crate) vfs: Arc<Mutex<VirtualFs>>,
     /// Staged unified-diff review screen state (P02).
     pub(crate) diff_review: DiffReviewState,
+    pub(crate) runtime_inspector: RuntimeInspector,
 }
 
 impl Default for App {
@@ -548,7 +552,7 @@ impl App {
                 let mut initial = startup_signature_lines(styling_enabled());
                 initial.push(Line::from("Concerto CLI — type a message and press Enter"));
                 initial.push(Line::from(
-                    "Esc: commands/settings  [l] sessions  [t] log  [d] diff  [n] new  [p] project  Ctrl+C: cancel or quit",
+                    "Esc: commands/settings  [l] sessions  [t] log  [d] diff  [i] runtime  [n] new  [p] project  Ctrl+C: cancel or quit",
                 ));
                 initial
             },
@@ -595,6 +599,7 @@ impl App {
             cli_theme: CliTheme::by_name("Midnight"),
             vfs: Arc::new(Mutex::new(VirtualFs::new())),
             diff_review: DiffReviewState::default(),
+            runtime_inspector: RuntimeInspector::default(),
         }
     }
 
@@ -1082,6 +1087,7 @@ impl App {
                 self.sync_terminal_title();
             }
 
+            self.runtime_inspector.poll(self.session_id);
             terminal.draw(|frame| ui::draw(frame, self))?;
             // While a reveal is animating, poll at the typewriter cadence so
             // each tick can redraw a longer prefix; idle stays at the original
@@ -1568,6 +1574,7 @@ impl App {
             Screen::ToolLog => self.handle_tool_log_key(key.code),
             Screen::AgentAssignments => self.handle_agent_assignments_key(key.code),
             Screen::DiffReview => self.handle_diff_review_key(key.code),
+            Screen::RuntimeInspector => self.handle_runtime_key(key.code),
         }
     }
 
@@ -1642,6 +1649,10 @@ impl App {
             KeyCode::Char('d') if !self.input_mode => {
                 self.refresh_diff_review();
                 self.screen = Screen::DiffReview;
+            }
+            KeyCode::Char('i') if !self.input_mode => {
+                self.refresh_runtime_inspector();
+                self.screen = Screen::RuntimeInspector;
             }
             KeyCode::Char('n') if !self.input_mode => return Action::NewSession,
             KeyCode::Char('p') if !self.input_mode => {
@@ -1765,6 +1776,36 @@ impl App {
                 // Reload history into the chat display.
                 self.resume_session_display(session.id);
             }
+            _ => {}
+        }
+        Action::None
+    }
+
+    fn refresh_runtime_inspector(&mut self) {
+        let store = self.session_manager.as_ref().map(|manager| manager.store());
+        self.runtime_inspector.load(self.session_id, store);
+    }
+
+    fn handle_runtime_key(&mut self, key: KeyCode) -> Action {
+        match key {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.runtime_inspector = RuntimeInspector::default();
+                self.screen = Screen::Chat;
+            }
+            KeyCode::Char('r') => self.refresh_runtime_inspector(),
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.runtime_inspector.scroll = self.runtime_inspector.scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.runtime_inspector.scroll = self.runtime_inspector.scroll.saturating_add(1);
+            }
+            KeyCode::PageUp => {
+                self.runtime_inspector.scroll = self.runtime_inspector.scroll.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                self.runtime_inspector.scroll = self.runtime_inspector.scroll.saturating_add(10);
+            }
+            KeyCode::Home => self.runtime_inspector.scroll = 0,
             _ => {}
         }
         Action::None
@@ -4244,6 +4285,21 @@ mod tests {
     // ------------------------------------------------------------------
     // Staged unified-diff review (P02)
     // ------------------------------------------------------------------
+
+    #[test]
+    fn runtime_inspector_opens_scrolls_refreshes_and_closes() {
+        let mut app = App::new();
+        app.handle_key(key_event(KeyCode::Esc, KeyModifiers::empty()));
+        app.handle_key(key_event(KeyCode::Char('i'), KeyModifiers::empty()));
+        assert_eq!(app.screen, Screen::RuntimeInspector);
+        assert!(app.runtime_inspector.text.contains("No active session"));
+        app.handle_key(key_event(KeyCode::PageDown, KeyModifiers::empty()));
+        assert_eq!(app.runtime_inspector.scroll, 10);
+        app.handle_key(key_event(KeyCode::Char('r'), KeyModifiers::empty()));
+        assert_eq!(app.runtime_inspector.scroll, 0);
+        app.handle_key(key_event(KeyCode::Esc, KeyModifiers::empty()));
+        assert_eq!(app.screen, Screen::Chat);
+    }
 
     /// Stage one file in the overlay — `read_disk` registers the on-disk
     /// baseline, then `write` stages the proposal (the same overlay sequence

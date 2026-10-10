@@ -66,6 +66,7 @@ pub mod scheduler;
 mod shell_repair;
 pub mod skills_context;
 pub mod state;
+pub mod studio_runtime;
 pub mod subscriptions;
 pub mod suitability;
 pub mod supervisor;

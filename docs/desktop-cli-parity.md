@@ -1,7 +1,7 @@
 # Desktop ↔ CLI Parity Plan
 
-**Status: settings and configuration parity expanded 2026-10-03; interaction
-parity remains in progress.** The August R2–R4/P1–P7 checklist below is a
+**Status: settings and configuration parity expanded 2026-10-03; checkpoint
+runtime inspection added 2026-10-10; interaction parity remains in progress.** The August R2–R4/P1–P7 checklist below is a
 historical milestone, not proof of complete parity. [ADR-80](adrs/ADR-80-cli-settings-and-studio-parity.md)
 corrects the former blanket exclusions. See [CLI settings reference](cli-settings.md).
 
@@ -32,6 +32,7 @@ a graph has textual data; desktop appearance preferences can be set from CLI.
 | Desktop theme and font size | `preferences show/set ui_theme/set ui_font_size` | Existing preference store and instance lock; effective next Desktop startup |
 | CLI display | `config set display…` | Same flag/env precedence; CLI theme and desktop theme preferences are separate settings |
 | Roots, audit, updates, observability | `config set project_roots/audit…/updates…/observability…` | Existing readers and startup/run semantics |
+| Saved Coordinator runtime state | `sessions runtime ID [--view VIEW] [--json] [--limit N]`; TUI Esc → i | Same checkpoint reader, world model, decisions, diagnoses and suitability projection as Desktop; read-only database access alongside a running frontend |
 | TUI quick settings | 19 fields with scrolling selection | Adds memory, retention, retries, extensions, context, Git init, motion, title, theme, shell and update check |
 
 Standard builds now include both frontends. Commands automatically select CLI
@@ -67,13 +68,23 @@ These are real gaps, not GUI-only exclusions.
 
 | Priority | Capability | Planned CLI acceptance |
 |---|---|---|
-| P1 | Staged change review | TUI unified diff and accept/reject through the shared overlay/review service; narrow-terminal checks |
+| Done on current dev | Staged change review | TUI unified diff and accept/reject through the shared overlay; narrow-terminal checks |
 | P1 | Live Coordinator pause/resume/decisions | Same in-process control handles and checkpoint semantics; cross-process control requires a shared authenticated API |
-| P1 | Runtime Studio inspection | Text/JSON views of world model, decisions, diagnoses, suitability, evidence and topology through existing projections |
+| Partial | Runtime Studio inspection | Checkpoint world model, decisions (including evidence references), diagnoses and suitability now have text/JSON and TUI views. Dedicated evidence/topology navigation remains. |
 | P2 | Rich memory explorer | Search/detail/delete through the shared memory service; graph/explain commands cover only part of Desktop |
 | P2 | Structured TUI editors | Roster/provider/policy/MCP inspectors and multiline prompts backed by validated command services |
 | P2 | Editor operations | File/context selection, search, diagnostics, patch/review, attachments and external-editor integration |
 | P2 | Terminal workflow | Launch selected profile with the same toolchain/environment; only terminal-page layout is exempt |
+
+### Runtime inspection validation (2026-10-10)
+
+Focused coverage exercises checkpoint projection, malformed/missing state,
+cancellation, immutable database reads (including encrypted storage), command
+routing/JSON/filtering while another frontend holds the instance lock, stale
+TUI result disposal, keyboard navigation and rendering at 24×8–120×40.
+The implementation environment lacks Rust; build/test/lint results must be
+confirmed by PR CI before merging. Earlier validation below applies only to
+the October 3 branch, not to this change.
 
 ### Regression checks
 

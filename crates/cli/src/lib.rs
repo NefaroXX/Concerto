@@ -72,7 +72,7 @@ pub const CLI_COMMAND_HELP: &str =
     Note: protected_paths constrains only the built-in filesystem tool; native
     run commands and container project mounts are not covered.
     projects <list|current|use>
-    sessions <list|show|events|resume|prune>
+    sessions <list|show|events|runtime|resume|prune>
     memory <graph|explain>   health [--json]   audit   logs <path|show>
 
 SETTINGS EXAMPLES:
@@ -681,9 +681,12 @@ async fn run_prune(
 
 fn run_sessions_subcommand(args: &[String], project_root: &Path) -> anyhow::Result<()> {
     if args.is_empty() {
-        anyhow::bail!("usage: concerto sessions <list|show <id>|events <id>|resume <id>|prune>");
+        anyhow::bail!(
+            "usage: concerto sessions <list|show <id>|events <id>|runtime <id>|resume <id>|prune>"
+        );
     }
     match args[0].as_str() {
+        "runtime" => return dispatch::runtime::run(&args[1..]),
         "list" => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
@@ -813,7 +816,7 @@ fn run_sessions_subcommand(args: &[String], project_root: &Path) -> anyhow::Resu
         }
         other => {
             eprintln!("error: unknown sessions subcommand '{other}'");
-            eprintln!("available: list, show, events, resume, prune");
+            eprintln!("available: list, show, events, runtime, resume, prune");
             std::process::exit(1);
         }
     }
