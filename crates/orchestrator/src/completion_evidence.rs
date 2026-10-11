@@ -52,13 +52,26 @@ pub(crate) fn is_build_or_test_command(args: &serde_json::Value) -> bool {
         }
     }
     let command = parts.join(" ");
-    if command.chars().any(|ch| matches!(ch, ';' | '|' | '&' | '<' | '>' | '`' | '$' | '\n' | '\r')) {
+    if command.chars().any(|ch| matches!(ch, ';' | '|' | '&' | '<' | '>' | '`' | '$' | '\n' | '\r'))
+    {
         return false;
     }
     let tokens: Vec<_> = command.split_whitespace().collect();
     if tokens.iter().any(|token| {
-        matches!(*token, "-h" | "--help" | "-V" | "--version" | "--list" | "--list-tests"
-            | "--no-run" | "--collect-only" | "--dry-run")
+        matches!(
+            *token,
+            "-h" | "--help"
+                | "-V"
+                | "--version"
+                | "--list"
+                | "--list-tests"
+                | "--no-run"
+                | "--collect-only"
+                | "--co"
+                | "--collectonly"
+                | "-list"
+                | "--dry-run"
+        )
     }) {
         return false;
     }
@@ -74,8 +87,14 @@ pub(crate) fn is_build_or_test_command(args: &serde_json::Value) -> bool {
             _ => false,
         },
         "make" => matches!(second, "test" | "check" | "lint" | "build" | "verify"),
-        "npm" | "yarn" | "pnpm" => second == "test"
-            || (second == "run" && matches!(third, "test" | "build" | "lint" | "check" | "typecheck" | "verify")),
+        "npm" | "yarn" | "pnpm" => {
+            second == "test"
+                || (second == "run"
+                    && matches!(
+                        third,
+                        "test" | "build" | "lint" | "check" | "typecheck" | "verify"
+                    ))
+        }
         "pytest" => true,
         "python" | "python3" => second == "-m" && third == "pytest",
         "go" => matches!(second, "build" | "test" | "vet"),
@@ -95,10 +114,19 @@ mod tests {
 
     fn event(payload: serde_json::Value) -> WhiteboardEvent {
         WhiteboardEvent {
-            event_id: "fact-1".into(), gate_seq: 1, agent_id: "coder".into(), agent_seq: 1,
-            kind: WhiteboardKind::ToolExecuted, scope: String::new(), session_id: Some("s".into()),
-            plan_id: None, causation: None, payload, content_hash: String::new(),
-            pre_image_hash: None, created_at: 0,
+            event_id: "fact-1".into(),
+            gate_seq: 1,
+            agent_id: "coder".into(),
+            agent_seq: 1,
+            kind: WhiteboardKind::ToolExecuted,
+            scope: String::new(),
+            session_id: Some("s".into()),
+            plan_id: None,
+            causation: None,
+            payload,
+            content_hash: String::new(),
+            pre_image_hash: None,
+            created_at: 0,
         }
     }
 
@@ -116,40 +144,91 @@ mod tests {
     #[test]
     fn contradictory_outcomes_and_exit_codes_never_attest_success() {
         for outcome in ["failed", "denied", "interrupted", "skipped", "unavailable", "unknown"] {
-            assert!(successful_fact(&event(serde_json::json!({
-                "success": true, "outcome": outcome, "run_id": "r"
-            })), Some("r")).is_none());
+            assert!(successful_fact(
+                &event(serde_json::json!({
+                    "success": true, "outcome": outcome, "run_id": "r"
+                })),
+                Some("r")
+            )
+            .is_none());
         }
-        assert!(successful_fact(&event(serde_json::json!({
-            "success": true, "outcome": "ok", "exit_code": 1, "run_id": "r"
-        })), Some("r")).is_none());
-        assert!(successful_fact(&event(serde_json::json!({
-            "success": false, "outcome": "ok", "exit_code": 0, "run_id": "r"
-        })), Some("r")).is_none());
-        assert!(successful_fact(&event(serde_json::json!({
-            "success": true, "outcome": "ok", "exit_code": 0, "run_id": "r"
-        })), Some("r")).is_some());
+        assert!(successful_fact(
+            &event(serde_json::json!({
+                "success": true, "outcome": "ok", "exit_code": 1, "run_id": "r"
+            })),
+            Some("r")
+        )
+        .is_none());
+        assert!(successful_fact(
+            &event(serde_json::json!({
+                "success": false, "outcome": "ok", "exit_code": 0, "run_id": "r"
+            })),
+            Some("r")
+        )
+        .is_none());
+        assert!(successful_fact(
+            &event(serde_json::json!({
+                "success": true, "outcome": "ok", "exit_code": 0, "run_id": "r"
+            })),
+            Some("r")
+        )
+        .is_some());
         let failure = concerto_core::tool_failure::ToolFailure::from_error(
             &concerto_core::ToolError::Timeout { timeout_secs: 1 },
             concerto_core::tool_failure::ToolFailureContext::builtin(),
         );
-        assert!(successful_fact(&event(serde_json::json!({
-            "success": true, "outcome": "ok", "run_id": "r", "failure": failure
-        })), Some("r")).is_none());
+        assert!(successful_fact(
+            &event(serde_json::json!({
+                "success": true, "outcome": "ok", "run_id": "r", "failure": failure
+            })),
+            Some("r")
+        )
+        .is_none());
     }
 
     #[test]
     fn check_classifier_rejects_non_checks_and_compound_commands() {
-        for command in ["cargo test --help", "cargo test --no-run", "cargo nextest list",
-            "cargo deny --version", "cargo fmt", "rustfmt src/lib.rs", "npm run dev",
-            "make", "pytest --collect-only", "cargo test; false", "cargo test || true",
-            "cargo test && echo done", "cargo test\nfalse", "eslint --fix .", "tsc --watch"] {
-            assert!(!is_build_or_test_command(&serde_json::json!({"command": command})), "{command}");
+        for command in [
+            "cargo test --help",
+            "cargo test --no-run",
+            "cargo nextest list",
+            "cargo deny --version",
+            "cargo fmt",
+            "rustfmt src/lib.rs",
+            "npm run dev",
+            "make",
+            "pytest --collect-only",
+            "pytest --co",
+            "go test -list .",
+            "cargo test; false",
+            "cargo test || true",
+            "cargo test && echo done",
+            "cargo test\nfalse",
+            "eslint --fix .",
+            "tsc --watch",
+        ] {
+            assert!(
+                !is_build_or_test_command(&serde_json::json!({"command": command})),
+                "{command}"
+            );
         }
-        for command in ["cargo test", "cargo nextest run", "cargo fmt -- --check",
-            "cargo deny check", "make test", "npm run lint", "pytest", "rustfmt --check src/lib.rs"] {
-            assert!(is_build_or_test_command(&serde_json::json!({"command": command})), "{command}");
+        for command in [
+            "cargo test",
+            "cargo nextest run",
+            "cargo fmt -- --check",
+            "cargo deny check",
+            "make test",
+            "npm run lint",
+            "pytest",
+            "rustfmt --check src/lib.rs",
+        ] {
+            assert!(
+                is_build_or_test_command(&serde_json::json!({"command": command})),
+                "{command}"
+            );
         }
-        assert!(!is_build_or_test_command(&serde_json::json!({"command": "cargo", "args": ["test", false]})));
+        assert!(!is_build_or_test_command(
+            &serde_json::json!({"command": "cargo", "args": ["test", false]})
+        ));
     }
 }
