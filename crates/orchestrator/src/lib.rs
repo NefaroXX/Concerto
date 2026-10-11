@@ -30,6 +30,7 @@ pub mod decisions;
 pub mod declared_artifacts;
 pub mod delta;
 pub mod design_doc_verifier;
+pub mod environment_describe;
 pub mod environment_manifest;
 pub mod exec_backend;
 pub mod external_change;
