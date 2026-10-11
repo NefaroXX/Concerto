@@ -702,6 +702,21 @@ impl AgentLoop {
         self
     }
 
+    /// Attach the run's cached environment-manifest digest for single-agent
+    /// prompt injection (ADR-82 single-agent parity).
+    ///
+    /// Forwards to
+    /// [`PromptBuilder::with_environment_manifest`][crate::prompts::PromptBuilder::with_environment_manifest]:
+    /// the digest renders in the shared `<environment_manifest>` block shape
+    /// the coordinator path uses, beside the environment card. Descriptive
+    /// context only — never an authorization input, never read by policy.
+    /// `None` (or a blank digest) renders no block, so a run without a
+    /// collected manifest prompts exactly as before.
+    pub fn with_environment_manifest(mut self, digest: Option<String>) -> Self {
+        self.prompt_builder = self.prompt_builder.with_environment_manifest(digest);
+        self
+    }
+
     /// Run the agent loop for the given task.
     ///
     /// Thin wrapper that handles best-effort session persistence around the
@@ -4894,6 +4909,57 @@ mod tests {
             ..concerto_config::RetryConfig::default()
         }));
         (loop_, audit)
+    }
+
+    // -- ADR-82 single-agent environment-manifest prompt injection ---------
+
+    /// The loop's system prompt carries the shared `<environment_manifest>`
+    /// block when a manifest digest was attached (the barrier-collected run
+    /// manifest), and no block otherwise (fail-soft).
+    #[test]
+    fn single_agent_prompt_injects_manifest_block_when_manifest_collected() {
+        let digest = "environment-manifest schema=1 revision=0";
+        let loop_ = make_loop(
+            Arc::new(ScriptedProvider::new(vec![])),
+            Arc::new(ApprovalTestHarness::always_approve()),
+            5,
+        )
+        .with_environment_manifest(Some(digest.to_string()));
+        let request = loop_.build_provider_request("do the thing", 1, &[], &[], &[], &[], "");
+        let system = &request.messages[0].content;
+
+        let expected = crate::environment_manifest::format_manifest_block(Some(digest))
+            .expect("the digest renders a block");
+        assert!(
+            system.contains(&expected),
+            "single-agent prompt must carry the shared block: {system}"
+        );
+        assert!(system.contains(digest), "the digest rides the block: {system}");
+    }
+
+    #[test]
+    fn single_agent_prompt_omits_manifest_block_without_a_manifest() {
+        for digest in [None, Some(String::new()), Some("  \n ".to_string())] {
+            let loop_ = make_loop(
+                Arc::new(ScriptedProvider::new(vec![])),
+                Arc::new(ApprovalTestHarness::always_approve()),
+                5,
+            )
+            .with_environment_manifest(digest);
+            let request = loop_.build_provider_request("do the thing", 1, &[], &[], &[], &[], "");
+            assert!(
+                !request.messages[0].content.contains("<environment_manifest>"),
+                "absent/blank manifest must degrade to no block"
+            );
+        }
+        // A loop that never had a digest attached prompts as before.
+        let bare = make_loop(
+            Arc::new(ScriptedProvider::new(vec![])),
+            Arc::new(ApprovalTestHarness::always_approve()),
+            5,
+        );
+        let request = bare.build_provider_request("do the thing", 1, &[], &[], &[], &[], "");
+        assert!(!request.messages[0].content.contains("<environment_manifest>"));
     }
 
     /// Build a loop with extra tools alongside the default EchoTool.

@@ -47,6 +47,14 @@ pub struct PromptBuilder {
     /// Run-scoped project AGENTS.md context (ADR-70). When set and non-empty,
     /// the AGENTS section is appended after the skills section on every build.
     project_context: Option<Arc<ProjectContext>>,
+    /// ADR-82 single-agent manifest injection: the run's cached
+    /// environment-manifest digest ("what can this run do"), collected once
+    /// per run by the same [`crate::environment_manifest::run_manifest_barrier`]
+    /// the coordinator path uses. Rendered through the shared
+    /// [`crate::environment_manifest::format_manifest_block`] shape beside the
+    /// environment card so both paths present identically; descriptive context
+    /// only, never an authorization input. `None` (or blank) renders no block.
+    environment_manifest_digest: Option<String>,
     /// The session's selected shell profile (ADR-28). Rendered into the
     /// OS/shell identity card appended to every built system prompt.
     /// `None` renders the card from OS facts plus the detected OS default
@@ -72,6 +80,7 @@ impl PromptBuilder {
             system_template: system_template.into(),
             skills: None,
             project_context: None,
+            environment_manifest_digest: None,
             shell_profile: None,
             native_shell: false,
             cache_stable_prefix: false,
@@ -88,10 +97,26 @@ impl PromptBuilder {
             system_template: system_template.into(),
             skills,
             project_context: None,
+            environment_manifest_digest: None,
             shell_profile: None,
             native_shell: false,
             cache_stable_prefix: false,
         }
+    }
+
+    /// Attach the run's cached environment-manifest digest (ADR-82 single-agent
+    /// injection). The digest is run-stable (one probe set per run at the
+    /// barrier), so it belongs in the byte-stable head under
+    /// `cache_stable_prefix` like the skills, project-context, and environment
+    /// sections. `None` (or a blank digest) renders no block — fail-soft.
+    pub fn with_environment_manifest(mut self, digest: Option<String>) -> Self {
+        self.environment_manifest_digest = digest;
+        self
+    }
+
+    /// The attached manifest digest, when one was supplied.
+    pub fn environment_manifest_digest(&self) -> Option<&str> {
+        self.environment_manifest_digest.as_deref()
     }
 
     /// Attach the run-scoped project AGENTS.md context (ADR-70). When present
@@ -131,11 +156,13 @@ impl PromptBuilder {
 
     /// Assemble the complete system message: the template with `{summary}`
     /// and `{working_memory}` resolved, then the skills block, the project
-    /// AGENTS.md context and the environment card, in that order.
+    /// AGENTS.md context, the environment card, and the environment-manifest
+    /// block, in that order.
     ///
     /// `working_memory` is the only volatile member; everything substituted
     /// into the template from `prev_summary` and everything appended after it
-    /// is session-stable within a run.
+    /// is session-stable within a run (the manifest digest is collected once
+    /// per run at the barrier, so it is stable too).
     fn assemble_system(&self, working_memory: &str, prev_summary: Option<&str>) -> String {
         let mut system = self.system_template.clone();
 
@@ -194,6 +221,17 @@ impl PromptBuilder {
         system.push_str("\n\n");
         system.push_str(&card);
 
+        // ADR-82 single-agent manifest injection: the run's cached digest in
+        // the shared `<environment_manifest>` block shape (the same renderer
+        // the coordinator's specialist assembly uses), beside the environment
+        // card. Descriptive context only — never an authorization input, never
+        // read by policy. Absent/blank degrades to no block (fail-soft).
+        if let Some(block) = crate::environment_manifest::format_manifest_block(
+            self.environment_manifest_digest.as_deref(),
+        ) {
+            system.push_str(&block);
+        }
+
         system
     }
 
@@ -202,8 +240,9 @@ impl PromptBuilder {
     ///
     /// Every byte this returns is built from facts that do not change within
     /// a run: the template, the resolved `{summary}`, the skills block (sorted
-    /// and deduplicated by [`SkillsContext`]), the project AGENTS.md context
-    /// and the environment card. Tool schemas never enter this string at all —
+    /// and deduplicated by [`SkillsContext`]), the project AGENTS.md context,
+    /// the environment card, and the run's cached environment-manifest digest
+    /// (collected once per run at the barrier). Tool schemas never enter this string at all —
     /// they ride `CompletionRequest::tools`, rendered from the executor
     /// registry in registration order — so they are stable for the same
     /// reason.
@@ -1360,5 +1399,76 @@ mod tests {
         let card = system.find("## Environment").expect("environment card present");
         let block = system.find(WORKING_MEMORY_BLOCK).expect("working memory present");
         assert!(block > card, "the volatile tail follows the stable sections");
+    }
+
+    // -- ADR-82 single-agent environment-manifest injection ------------------
+
+    const MANIFEST_DIGEST: &str = "environment-manifest schema=1 revision=0";
+
+    /// A collected manifest renders the shared `<environment_manifest>` block
+    /// beside the environment card — the same block shape the coordinator's
+    /// specialist assembly emits.
+    #[test]
+    fn build_injects_manifest_block_when_digest_attached() {
+        let builder = PromptBuilder::new("System prompt".to_string())
+            .with_environment_manifest(Some(MANIFEST_DIGEST.to_string()));
+        let request = builder.build("", &[], None, None);
+        let system = &request.messages[0].content;
+
+        let expected = crate::environment_manifest::format_manifest_block(Some(MANIFEST_DIGEST))
+            .expect("the digest renders a block");
+        assert!(
+            system.contains(&expected),
+            "single-agent prompt must carry the shared block: {system}"
+        );
+        let card = system.find("## Environment").expect("environment card present");
+        let manifest = system.find("<environment_manifest>").expect("manifest block present");
+        assert!(manifest > card, "the manifest block follows the environment card: {system}");
+    }
+
+    /// Absent, empty, or whitespace-only digests degrade to no block —
+    /// fail-soft, never an empty or error block in the prompt.
+    #[test]
+    fn build_omits_manifest_block_when_digest_absent_or_blank() {
+        for digest in [None, Some(String::new()), Some("  \n ".to_string())] {
+            let builder =
+                PromptBuilder::new("System prompt".to_string()).with_environment_manifest(digest);
+            let request = builder.build("", &[], None, None);
+            let system = &request.messages[0].content;
+            assert!(
+                !system.contains("<environment_manifest>"),
+                "unexpected manifest block: {system}"
+            );
+        }
+        // A builder that never had a digest attached prompts as before.
+        let plain = PromptBuilder::new("System prompt".to_string());
+        let request = plain.build("", &[], None, None);
+        assert!(!request.messages[0].content.contains("<environment_manifest>"));
+    }
+
+    /// The manifest digest is run-stable (one probe set per run at the
+    /// barrier), so it rides the byte-stable head under `cache_stable_prefix`:
+    /// two builds over different working memory share head bytes including the
+    /// block, and the head matches the shared renderer exactly.
+    #[test]
+    fn manifest_digest_rides_the_stable_head() {
+        let builder = PromptBuilder::new("System prompt\nWM: {working_memory}".to_string())
+            .with_cache_stable_prefix(true)
+            .with_environment_manifest(Some(MANIFEST_DIGEST.to_string()));
+        let expected = crate::environment_manifest::format_manifest_block(Some(MANIFEST_DIGEST))
+            .expect("the digest renders a block");
+
+        let head = builder.stable_system_head(None);
+        assert!(head.contains(&expected), "the head carries the shared block: {head}");
+
+        let first = builder.build("<wm>one</wm>", &[user_message("one")], None, None);
+        let second = builder.build("<wm>two</wm>", &[user_message("two")], None, None);
+        assert!(first.messages[0].content.starts_with(&head));
+        assert!(second.messages[0].content.starts_with(&head));
+        assert_eq!(
+            first.messages[0].content.matches("<environment_manifest>").count(),
+            1,
+            "the block renders exactly once per build"
+        );
     }
 }

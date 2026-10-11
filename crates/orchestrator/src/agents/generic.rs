@@ -2361,6 +2361,68 @@ mod tests {
         assert!(snapshot < manifest, "manifest block must follow the snapshot block: {prompt}");
     }
 
+    /// Extract the `<environment_manifest>…</environment_manifest>` block
+    /// (inclusive) from a built prompt, or `None` when no block rendered.
+    fn manifest_block_of(prompt: &str) -> Option<&str> {
+        let start = prompt.find("<environment_manifest>")?;
+        let end = prompt.find("</environment_manifest>")? + "</environment_manifest>".len();
+        (end > start).then(|| &prompt[start..end])
+    }
+
+    #[tokio::test]
+    async fn single_agent_and_coordinator_manifest_blocks_match() {
+        // The same digest through both prompt paths must render the byte-
+        // identical shared block (`environment_manifest::format_manifest_block`
+        // is the single renderer both assemblies route through).
+        let digest = "environment-manifest schema=1 revision=0";
+        let agent = GenericSpecialistAgent::new(
+            AgentId::new("coder"),
+            "Coder".into(),
+            Some(AgentStage::new("implement")),
+            Arc::new(MockProvider::default()),
+            None,
+            EventBus::new(1024),
+            RetryPolicy::default(),
+            PromptSections { system_instructions: "You write code.".into(), ..Default::default() },
+            AgentCapabilities::default(),
+        );
+
+        let task = SubTask {
+            id: TaskId::new(),
+            parent_id: None,
+            session_id: concerto_core::ids::Ulid::new(),
+            role: AgentId::new("coder"),
+            description: "Implement the feature".into(),
+            status: concerto_core::types::SubTaskStatus::Pending,
+            dependencies: Vec::new(),
+            deliverable: None,
+            completed_at: None,
+            created_at: time::OffsetDateTime::now_utc(),
+        };
+        let mut grounded = ctx();
+        grounded.environment_manifest_digest = Some(digest.to_string());
+        let specialist_prompt = agent.build_prompt(&task, &grounded).await;
+        let specialist_block =
+            manifest_block_of(&specialist_prompt).expect("specialist block renders");
+
+        let builder = crate::prompts::PromptBuilder::new("System prompt".to_string())
+            .with_environment_manifest(Some(digest.to_string()));
+        let request = builder.build("", &[], None, None);
+        let single_block =
+            manifest_block_of(&request.messages[0].content).expect("single-agent block renders");
+
+        let shared = crate::environment_manifest::format_manifest_block(Some(digest))
+            .expect("the digest renders a block");
+        assert!(
+            specialist_block.ends_with(shared.trim_start_matches("\n\n")),
+            "coordinator block must be the shared shape: {specialist_block}"
+        );
+        assert_eq!(
+            specialist_block, single_block,
+            "both paths must present identically to the model"
+        );
+    }
+
     // ------------------------------------------------------------------
     // Tool loop
     // ------------------------------------------------------------------

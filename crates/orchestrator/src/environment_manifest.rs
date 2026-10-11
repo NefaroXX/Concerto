@@ -319,6 +319,33 @@ pub async fn collect_environment_manifest(
     }
 }
 
+/// Render the shared `<environment_manifest>` prompt block over a manifest
+/// digest, or `None` when there is nothing to inject (fail-soft).
+///
+/// This is the single block shape every prompt path uses: the coordinator's
+/// specialist assembly (`agents/generic/prompt.rs`) and the single-agent
+/// `PromptBuilder` both route through here so both paths present identically
+/// to the model. An absent, empty, or whitespace-only digest degrades to no
+/// block — never an empty or error block in the prompt.
+///
+/// Pure render: performs zero probes (the collector owns all probing).
+pub fn format_manifest_block(digest: Option<&str>) -> Option<String> {
+    let digest = digest.map(str::trim).filter(|trimmed| !trimmed.is_empty())?;
+    let mut block = String::with_capacity(digest.len() + 48);
+    block.push_str("\n\n<environment_manifest>\n");
+    block.push_str(digest);
+    block.push_str("\n</environment_manifest>");
+    Some(block)
+}
+
+/// Append the shared [`format_manifest_block`] rendering to `prompt` when a
+/// digest is available; no-op otherwise (fail-soft).
+pub fn append_manifest_block(prompt: &mut String, digest: Option<&str>) {
+    if let Some(block) = format_manifest_block(digest) {
+        prompt.push_str(&block);
+    }
+}
+
 /// Append the manifest as an `EnvironmentObserved` whiteboard event (the
 /// authoritative per-run record resume restores from).
 ///
@@ -789,5 +816,48 @@ mod tests {
         .await
         .expect("pool-less barrier still collects");
         assert_eq!(pool_less.run_id, "run-x");
+    }
+
+    #[test]
+    fn manifest_block_renders_the_shared_shape_and_fails_soft() {
+        // Fail-soft: absent, empty, or whitespace-only digests render no block
+        // — never an empty or error block in the prompt.
+        assert_eq!(format_manifest_block(None), None, "absent digest ⇒ no block");
+        assert_eq!(format_manifest_block(Some("")), None, "empty digest ⇒ no block");
+        assert_eq!(
+            format_manifest_block(Some("  \n\t ")),
+            None,
+            "whitespace-only digest ⇒ no block"
+        );
+
+        let digest = "environment-manifest schema=1 revision=0";
+        let block = format_manifest_block(Some(digest)).expect("a digest renders a block");
+        assert_eq!(
+            block,
+            "\n\n<environment_manifest>\nenvironment-manifest schema=1 revision=0\n</environment_manifest>",
+            "the shared block shape, byte-exact"
+        );
+
+        // Surrounding whitespace is trimmed, never rendered verbatim.
+        let padded =
+            format_manifest_block(Some("  environment-manifest schema=1\n")).expect("renders");
+        assert!(padded.contains("environment-manifest schema=1"));
+        assert!(!padded.contains("  environment-manifest"), "leading padding must not leak");
+    }
+
+    #[test]
+    fn append_manifest_block_is_a_no_op_without_a_digest() {
+        let mut prompt = String::from("base prompt");
+        append_manifest_block(&mut prompt, None);
+        assert_eq!(prompt, "base prompt", "absent digest leaves the prompt untouched");
+        append_manifest_block(&mut prompt, Some(""));
+        assert_eq!(prompt, "base prompt", "empty digest leaves the prompt untouched");
+
+        append_manifest_block(&mut prompt, Some("environment-manifest schema=1 revision=0"));
+        assert!(prompt.contains("<environment_manifest>"), "digest appends the block: {prompt}");
+        assert!(
+            prompt.contains("environment-manifest schema=1 revision=0"),
+            "digest rides the block: {prompt}"
+        );
     }
 }

@@ -763,3 +763,9 @@ mod auto_apply;
 // rather than duplicating the harness.
 #[path = "stage_feed.rs"]
 mod stage_feed;
+
+// Single-agent environment-manifest prompt injection (ADR-82 parity slice):
+// the shared barrier, the shared cache, and the shared block shape on the
+// single-agent path — one probe set per run, fail-soft without a manifest.
+#[path = "manifest_injection.rs"]
+mod manifest_injection;

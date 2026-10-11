@@ -237,6 +237,7 @@ async fn stage_tracker_emits_execute_sequence_for_action_required_run() {
         &stage_tracker,
         None, // no fact-writer pool in this test
         Arc::new(crate::project_context::ProjectContext::disabled()),
+        None, // no manifest digest in this test (fail-soft: no block)
     )
     .await
     .expect("action-required run should complete");
@@ -299,6 +300,7 @@ async fn stage_tracker_omits_complete_when_run_fails() {
         &stage_tracker,
         None, // no fact-writer pool in this test
         Arc::new(crate::project_context::ProjectContext::disabled()),
+        None, // no manifest digest in this test (fail-soft: no block)
     )
     .await;
 

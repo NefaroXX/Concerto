@@ -63,11 +63,13 @@ impl GenericSpecialistAgent {
         // what the run can do (backend, sandbox, tool set, persistence,
         // restore ceilings). Rendered from the cached manifest beside the
         // snapshot digest; descriptive context only, never an authorization.
-        if let Some(digest) = &context.environment_manifest_digest {
-            prompt.push_str("\n\n<environment_manifest>\n");
-            prompt.push_str(digest);
-            prompt.push_str("\n</environment_manifest>");
-        }
+        // The block shape is shared with the single-agent `PromptBuilder`
+        // (`environment_manifest::format_manifest_block`) so both paths
+        // present identically; absent/empty degrades to no block (fail-soft).
+        crate::environment_manifest::append_manifest_block(
+            &mut prompt,
+            context.environment_manifest_digest.as_deref(),
+        );
 
         if !context.previous_results.is_empty() {
             prompt.push_str("\n\n");
