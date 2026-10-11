@@ -117,7 +117,10 @@ fn draw_chat_screen(frame: &mut Frame, app: &App) {
     let project = app.project_dir.file_name().and_then(|name| name.to_str()).unwrap_or("project");
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" CONCERTO ", Style::default().fg(app.cli_theme.user).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " CONCERTO ",
+                Style::default().fg(app.cli_theme.user).add_modifier(Modifier::BOLD),
+            ),
             Span::raw(format!("/ {project}")),
         ])),
         chunks[0],
@@ -145,7 +148,8 @@ fn draw_chat_screen(frame: &mut Frame, app: &App) {
 }
 
 fn draw_chat(frame: &mut Frame, area: Rect, app: &App) {
-    let title = if app.follow_chat { " Conversation · LIVE " } else { " History · End for latest " };
+    let title =
+        if app.follow_chat { " Conversation · LIVE " } else { " History · End for latest " };
     let block = panel(title, &app.cli_theme);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -171,9 +175,11 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         " Message "
     };
-    let block = panel(title, &app.cli_theme).border_style(
-        Style::default().fg(if app.input_mode { app.cli_theme.success } else { app.cli_theme.muted }),
-    );
+    let block = panel(title, &app.cli_theme).border_style(Style::default().fg(if app.input_mode {
+        app.cli_theme.success
+    } else {
+        app.cli_theme.muted
+    }));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.is_empty() {
@@ -186,19 +192,30 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     let left = column.saturating_sub(usize::from(inner.width.saturating_sub(1)));
     // Slice the visible logical lines rather than casting unbounded offsets
     // to u16. The cursor always stays inside the composer, even for long paste.
-    let lines: Vec<Line> = app.input.split('\n').skip(top).take(usize::from(inner.height))
+    let lines: Vec<Line> = app
+        .input
+        .split('\n')
+        .skip(top)
+        .take(usize::from(inner.height))
         .map(|line| {
             let mut skipped = 0;
-            let visible: String = line.chars().skip_while(|c| {
-                if skipped >= left { return false; }
-                skipped += Span::raw(c.to_string()).width();
-                true
-            }).collect();
+            let visible: String = line
+                .chars()
+                .skip_while(|c| {
+                    if skipped >= left {
+                        return false;
+                    }
+                    skipped += Span::raw(c.to_string()).width();
+                    true
+                })
+                .collect();
             Line::from(format!("{}{visible}", " ".repeat(skipped.saturating_sub(left))))
-        }).collect();
+        })
+        .collect();
     if app.input.is_empty() && !app.project_picker_mode {
         frame.render_widget(
-            Paragraph::new("Ask a question or describe a change…").style(Style::default().fg(app.cli_theme.muted)),
+            Paragraph::new("Ask a question or describe a change…")
+                .style(Style::default().fg(app.cli_theme.muted)),
             inner,
         );
     } else {
@@ -227,16 +244,32 @@ fn draw_sessions_screen(frame: &mut Frame, app: &App) {
     frame.render_widget(block, frame.area());
     let areas = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(inner);
     if app.sessions_list.is_empty() {
-        frame.render_widget(Paragraph::new("No sessions in this project yet.\nEsc returns to your conversation.").wrap(Wrap { trim: false }), areas[0]);
+        frame.render_widget(
+            Paragraph::new("No sessions in this project yet.\nEsc returns to your conversation.")
+                .wrap(Wrap { trim: false }),
+            areas[0],
+        );
     } else {
-        let format = time::format_description::parse("[month]-[day] [hour]:[minute]").unwrap_or_default();
-        let items = app.sessions_list.iter().map(|session| {
-            let date = session.created_at.format(&format).unwrap_or_else(|_| "?".into());
-            ListItem::new(format!("{date}  {}  · {} messages · ${:.4}", session.model, session.message_count, session.total_cost_usd))
-        }).collect();
+        let format =
+            time::format_description::parse("[month]-[day] [hour]:[minute]").unwrap_or_default();
+        let items = app
+            .sessions_list
+            .iter()
+            .map(|session| {
+                let date = session.created_at.format(&format).unwrap_or_else(|_| "?".into());
+                ListItem::new(format!(
+                    "{date}  {}  · {} messages · ${:.4}",
+                    session.model, session.message_count, session.total_cost_usd
+                ))
+            })
+            .collect();
         draw_selected_list(frame, areas[0], items, app.sessions_index, &app.cli_theme);
     }
-    frame.render_widget(Paragraph::new("↑/↓ select · Enter resume\nEsc back to conversation").style(Style::default().fg(app.cli_theme.muted)), areas[1]);
+    frame.render_widget(
+        Paragraph::new("↑/↓ select · Enter resume\nEsc back to conversation")
+            .style(Style::default().fg(app.cli_theme.muted)),
+        areas[1],
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -249,14 +282,31 @@ fn draw_tool_log_screen(frame: &mut Frame, app: &App) {
     frame.render_widget(block, frame.area());
     let areas = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(inner);
     if app.tool_log.is_empty() {
-        frame.render_widget(Paragraph::new("No tool executions yet.\nActivity appears here during a run.").wrap(Wrap { trim: false }), areas[0]);
+        frame.render_widget(
+            Paragraph::new("No tool executions yet.\nActivity appears here during a run.")
+                .wrap(Wrap { trim: false }),
+            areas[0],
+        );
     } else {
-        let items = app.tool_log.iter().rev()
-            .map(|entry| ListItem::new(tool_log_line_with_theme(entry, crate::app::styling_enabled(), &app.cli_theme)))
+        let items = app
+            .tool_log
+            .iter()
+            .rev()
+            .map(|entry| {
+                ListItem::new(tool_log_line_with_theme(
+                    entry,
+                    crate::app::styling_enabled(),
+                    &app.cli_theme,
+                ))
+            })
             .collect();
         draw_selected_list(frame, areas[0], items, app.tool_log_index, &app.cli_theme);
     }
-    frame.render_widget(Paragraph::new("↑/↓ browse · c clear view\nEsc back · newest first").style(Style::default().fg(app.cli_theme.muted)), areas[1]);
+    frame.render_widget(
+        Paragraph::new("↑/↓ browse · c clear view\nEsc back · newest first")
+            .style(Style::default().fg(app.cli_theme.muted)),
+        areas[1],
+    );
 }
 
 /// One tool-log row: status icon + name + duration + detail + provenance rail.
@@ -452,28 +502,43 @@ fn draw_agent_assignments_screen(frame: &mut Frame, app: &App) {
     frame.render_widget(block, frame.area());
     let areas = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(inner);
     if app.agent_assignments.is_empty() {
-        frame.render_widget(Paragraph::new("No agent assignments configured.").wrap(Wrap { trim: false }), areas[0]);
+        frame.render_widget(
+            Paragraph::new("No agent assignments configured.").wrap(Wrap { trim: false }),
+            areas[0],
+        );
     } else {
-        let items = app.agent_assignments.iter().map(|assignment| {
-            ListItem::new(format!("{}: {}", assignment.agent_role, assignment.model_override.as_deref().unwrap_or("(default)")))
-        }).collect();
+        let items = app
+            .agent_assignments
+            .iter()
+            .map(|assignment| {
+                ListItem::new(format!(
+                    "{}: {}",
+                    assignment.agent_role,
+                    assignment.model_override.as_deref().unwrap_or("(default)")
+                ))
+            })
+            .collect();
         draw_selected_list(frame, areas[0], items, app.agent_assignment_index, &app.cli_theme);
     }
-    frame.render_widget(Paragraph::new("↑/↓ select · ←/→ model\nEnter next model\nEsc save and return").style(Style::default().fg(app.cli_theme.muted)), areas[1]);
+    frame.render_widget(
+        Paragraph::new("↑/↓ select · ←/→ model\nEnter next model\nEsc save and return")
+            .style(Style::default().fg(app.cli_theme.muted)),
+        areas[1],
+    );
 }
 
 fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
-    let state = if app.running {
-        app.run_stage.map(run_stage_label).unwrap_or("Running")
-    } else {
-        "Ready"
-    };
+    let state =
+        if app.running { app.run_stage.map(run_stage_label).unwrap_or("Running") } else { "Ready" };
     let status = if area.width < 80 {
         format!(" {state} · {}", app.model_label())
     } else {
         format!(" {state} · {}", status_line(app))
     };
-    frame.render_widget(Paragraph::new(status).style(Style::default().fg(app.cli_theme.muted)), area);
+    frame.render_widget(
+        Paragraph::new(status).style(Style::default().fg(app.cli_theme.muted)),
+        area,
+    );
 }
 
 /// Status-bar text for `app` (pure: extracted for tests).
@@ -1103,29 +1168,35 @@ mod tests {
         use concerto_sessions::SessionSummary;
         for (width, height) in [(24, 8), (40, 12), (80, 24), (120, 40)] {
             let mut app = App::new();
-            app.sessions_list = (0..40).map(|i| SessionSummary {
-                id: ulid::Ulid::new(),
-                created_at: time::OffsetDateTime::UNIX_EPOCH,
-                provider: "test".into(),
-                model: if i == 39 { "LAST".into() } else { format!("model-{i}") },
-                message_count: i,
-                total_cost_usd: 0.0,
-                total_tokens_in: 0,
-                total_tokens_out: 0,
-            }).collect();
+            app.sessions_list = (0..40)
+                .map(|i| SessionSummary {
+                    id: ulid::Ulid::new(),
+                    created_at: time::OffsetDateTime::UNIX_EPOCH,
+                    provider: "test".into(),
+                    model: if i == 39 { "LAST".into() } else { format!("model-{i}") },
+                    message_count: i,
+                    total_cost_usd: 0.0,
+                    total_tokens_in: 0,
+                    total_tokens_out: 0,
+                })
+                .collect();
             app.sessions_index = 39;
-            app.agent_assignments = (0..40).map(|i| AgentModelAssignment {
-                agent_role: if i == 39 { "LAST".into() } else { format!("agent-{i}") },
-                provider_config_id: "test".into(),
-                model_override: None,
-            }).collect();
+            app.agent_assignments = (0..40)
+                .map(|i| AgentModelAssignment {
+                    agent_role: if i == 39 { "LAST".into() } else { format!("agent-{i}") },
+                    provider_config_id: "test".into(),
+                    model_override: None,
+                })
+                .collect();
             app.agent_assignment_index = 39;
-            app.tool_log = (0..40).map(|i| ToolLogEntry {
-                tool_name: if i == 0 { "LAST".into() } else { format!("tool-{i}") },
-                status: ToolStatus::Success,
-                duration_ms: Some(1),
-                detail: None,
-            }).collect();
+            app.tool_log = (0..40)
+                .map(|i| ToolLogEntry {
+                    tool_name: if i == 0 { "LAST".into() } else { format!("tool-{i}") },
+                    status: ToolStatus::Success,
+                    duration_ms: Some(1),
+                    detail: None,
+                })
+                .collect();
             app.tool_log_index = 39;
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             for screen in [Screen::Sessions, Screen::AgentAssignments, Screen::ToolLog] {
@@ -1147,7 +1218,9 @@ mod tests {
             app.input = "draft-kept".into();
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal.draw(|frame| draw(frame, &app)).unwrap();
-            let row = |y| (0..width).map(|x| terminal.backend().buffer()[(x, y)].symbol()).collect::<String>();
+            let row = |y| {
+                (0..width).map(|x| terminal.backend().buffer()[(x, y)].symbol()).collect::<String>()
+            };
             assert!(row(height - 1).contains("Ready"));
             assert!(row(height - 2).contains("Enter send"));
             assert!(row(height - 3).starts_with('╰'));

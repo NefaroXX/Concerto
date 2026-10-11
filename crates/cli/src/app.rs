@@ -1255,8 +1255,8 @@ impl App {
                 self.session_id = Some(session.session_id);
                 self.approval_sink.set_auto_approve(false);
                 self.messages.clear();
-        self.follow_chat = true;
-        self.scroll = 0;
+                self.follow_chat = true;
+                self.scroll = 0;
                 self.push_line(Line::from(format!(
                     "New session {} — {}",
                     session.session_id,
@@ -1511,10 +1511,8 @@ impl App {
                 && !self.is_awaiting_approval()
             {
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                let text: String = text
-                    .chars()
-                    .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
-                    .collect();
+                let text: String =
+                    text.chars().filter(|c| !c.is_control() || *c == '\n' || *c == '\t').collect();
                 let text = text.replace('\t', "    ");
                 self.insert_input(&text);
             }
@@ -1616,7 +1614,9 @@ impl App {
             if let Some(selected) = self.command_menu {
                 let choice = match key.code {
                     KeyCode::Enter => Some(selected),
-                    KeyCode::Char(c) => ui::CHAT_COMMANDS.iter().position(|(shortcut, _)| *shortcut == c),
+                    KeyCode::Char(c) => {
+                        ui::CHAT_COMMANDS.iter().position(|(shortcut, _)| *shortcut == c)
+                    }
                     _ => None,
                 };
                 if let Some(choice) = choice {
@@ -1708,20 +1708,20 @@ impl App {
     fn edit_input(&mut self, key: KeyCode) -> bool {
         let cursor = self.cursor_offset();
         let previous = self.input[..cursor].char_indices().last().map(|(i, _)| i).unwrap_or(0);
-        let next = self.input[cursor..]
-            .chars()
-            .next()
-            .map(|c| cursor + c.len_utf8())
-            .unwrap_or(cursor);
+        let next =
+            self.input[cursor..].chars().next().map(|c| cursor + c.len_utf8()).unwrap_or(cursor);
         match key {
             KeyCode::Char(c) if !c.is_control() => self.insert_input(&c.to_string()),
             KeyCode::Left => self.input_cursor = Some(previous),
             KeyCode::Right => self.input_cursor = Some(next),
             KeyCode::Home => {
-                self.input_cursor = Some(self.input[..cursor].rfind('\n').map(|i| i + 1).unwrap_or(0));
+                self.input_cursor =
+                    Some(self.input[..cursor].rfind('\n').map(|i| i + 1).unwrap_or(0));
             }
             KeyCode::End => {
-                self.input_cursor = Some(self.input[cursor..].find('\n').map(|i| cursor + i).unwrap_or(self.input.len()));
+                self.input_cursor = Some(
+                    self.input[cursor..].find('\n').map(|i| cursor + i).unwrap_or(self.input.len()),
+                );
             }
             KeyCode::Backspace => {
                 self.input.replace_range(previous..cursor, "");
@@ -1946,7 +1946,8 @@ impl App {
                 self.tool_log_index = self.tool_log_index.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.tool_log_index = (self.tool_log_index + 1).min(self.tool_log.len().saturating_sub(1));
+                self.tool_log_index =
+                    (self.tool_log_index + 1).min(self.tool_log.len().saturating_sub(1));
             }
             KeyCode::Home => self.tool_log_index = 0,
             KeyCode::End => self.tool_log_index = self.tool_log.len().saturating_sub(1),
@@ -3708,7 +3709,10 @@ mod tests {
         assert_eq!(app.input, "hi界");
         app.handle_key(key_event(KeyCode::Delete, KeyModifiers::empty()));
         assert_eq!(app.input, "hi");
-        assert!(matches!(app.handle_key(Event::Paste("\r\nnext\rline\t\u{7}".into())), Action::None));
+        assert!(matches!(
+            app.handle_key(Event::Paste("\r\nnext\rline\t\u{7}".into())),
+            Action::None
+        ));
         assert_eq!(app.input, "hi\nnext\nline    ");
         app.handle_key(key_event(KeyCode::Char('j'), KeyModifiers::CONTROL));
         assert!(app.input.ends_with('\n'));
