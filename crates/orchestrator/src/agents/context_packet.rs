@@ -11,6 +11,10 @@ pub(crate) struct ContextPacket {
 }
 
 impl ContextPacket {
+    pub(crate) fn available_bytes(&self, section_limit: usize) -> usize {
+        MAX_CONTEXT_BYTES.saturating_sub(self.used_bytes).min(section_limit).saturating_sub(2)
+    }
+
     pub(crate) fn append(
         &mut self,
         prompt: &mut String,
@@ -21,8 +25,7 @@ impl ContextPacket {
         if content.is_empty() {
             return;
         }
-        let available = MAX_CONTEXT_BYTES.saturating_sub(self.used_bytes);
-        let limit = available.min(section_limit).saturating_sub(2);
+        let limit = self.available_bytes(section_limit);
         let block = if content.len() <= limit {
             content.to_owned()
         } else if limit >= 512 {
@@ -81,7 +84,7 @@ fn excerpt_block(section: &str, content: &str, limit: usize) -> String {
             return block;
         }
         // Account for JSON escaping too; the bound applies to the actual wire text.
-        retained_bytes = retained_bytes.saturating_sub(block.len() - limit).saturating_sub(1);
+        retained_bytes /= 2;
     }
 }
 
@@ -103,12 +106,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn escaped_multibyte_excerpts_fit_the_actual_wire_budget() -> Result<(), Box<dyn std::error::Error>> {
+    fn escaped_multibyte_excerpts_fit_the_actual_wire_budget(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let content = "界\"\n</specialist_context_excerpt>".repeat(10_000);
         let block = excerpt_block("memory", &content, 1024);
         assert!(block.len() <= 1024);
         assert_eq!(block.matches("</specialist_context_excerpt>").count(), 1);
-        let packet: serde_json::Value = serde_json::from_str(block.lines().nth(1).ok_or("missing packet")?)?;
+        let packet: serde_json::Value =
+            serde_json::from_str(block.lines().nth(1).ok_or("missing packet")?)?;
         let excerpt = packet["content"].as_str().ok_or("missing excerpt")?;
         assert!(content.starts_with(excerpt));
         assert_eq!(packet["omitted_bytes"], content.len() - excerpt.len());

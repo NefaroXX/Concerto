@@ -4,7 +4,7 @@ use super::*;
 use std::collections::HashSet;
 use std::io::Read;
 
-use crate::agents::context_packet::{prompt_json, ContextPacket};
+use crate::agents::context_packet::{byte_prefix, prompt_json, ContextPacket};
 use crate::agents::task_contract;
 
 const MAX_REVIEW_FILE_ENTRIES: usize = 16;
@@ -113,10 +113,14 @@ impl GenericSpecialistAgent {
                 let mut considered_entries = 0_usize;
                 let mut observed_paths = 0_usize;
                 let mut unavailable_entries = 0_usize;
+                let mut not_inlined_entries = 0_usize;
+                let mut duplicate_entries = 0_usize;
+                let review_byte_limit = packet.available_bytes(24 * 1024).saturating_sub(1024);
                 for result in handoffs {
                     for changed_path in &result.files_modified {
                         if included_chars >= MAX_REVIEW_TOTAL_CHARS
                             || considered_entries >= MAX_REVIEW_FILE_ENTRIES
+                            || changed_file_context.len() >= review_byte_limit
                         {
                             break;
                         }
@@ -128,6 +132,7 @@ impl GenericSpecialistAgent {
                         };
                         let path = path.into_std_path_buf();
                         if !seen_paths.insert(path.clone()) {
+                            duplicate_entries = duplicate_entries.saturating_add(1);
                             continue;
                         }
                         let remaining = MAX_REVIEW_TOTAL_CHARS.saturating_sub(included_chars);
@@ -143,19 +148,20 @@ impl GenericSpecialistAgent {
                             unavailable_entries = unavailable_entries.saturating_add(1);
                             continue;
                         };
+                        included_chars =
+                            included_chars.saturating_add(observation.excerpt.chars().count());
+                        let wire_limit = review_byte_limit
+                            .saturating_sub(changed_file_context.len())
+                            .saturating_sub(1);
+                        let Some(observation) =
+                            fit_review_observation(result.task_id, changed_path, observation, wire_limit)
+                        else {
+                            not_inlined_entries = not_inlined_entries.saturating_add(1);
+                            continue;
+                        };
                         observed_paths = observed_paths.saturating_add(1);
-                        let excerpt = &observation.excerpt;
-                        included_chars = included_chars.saturating_add(excerpt.chars().count());
-                        let observation = serde_json::json!({
-                            "label": format!("Changed file `{changed_path}`"),
-                            "source_task_id": result.task_id.to_string(),
-                            "artifact_path": changed_path,
-                            "observed_excerpt_blake3": observation.content_hash,
-                            "complete_file": observation.complete_file,
-                            "excerpt": excerpt,
-                        });
                         changed_file_context.push('\n');
-                        changed_file_context.push_str(&prompt_json(&observation));
+                        changed_file_context.push_str(&observation);
                     }
                 }
                 if listed_entries > 0 {
@@ -164,6 +170,8 @@ impl GenericSpecialistAgent {
                         "considered_file_entries": considered_entries,
                         "observed_unique_paths": observed_paths,
                         "unavailable_file_entries": unavailable_entries,
+                        "not_inlined_file_entries": not_inlined_entries,
+                        "duplicate_file_entries": duplicate_entries,
                         "omitted_file_entries": listed_entries.saturating_sub(considered_entries),
                     });
                     packet.append(
@@ -223,6 +231,41 @@ struct ReviewExcerpt {
     excerpt: String,
     content_hash: String,
     complete_file: bool,
+}
+
+/// Fit each structured observation before hashing its final excerpt, so the
+/// displayed hash never describes text lost to a later context-budget clip.
+fn fit_review_observation(
+    task_id: concerto_core::types::TaskId,
+    path: &camino::Utf8Path,
+    mut observation: ReviewExcerpt,
+    limit: usize,
+) -> Option<String> {
+    if limit < 512 || path.as_str().len() > limit {
+        return None;
+    }
+    loop {
+        let packet = serde_json::json!({
+            "label": format!("Changed file `{path}`"),
+            "source_task_id": task_id.to_string(),
+            "artifact_path": path,
+            "observed_excerpt_blake3": observation.content_hash,
+            "complete_file": observation.complete_file,
+            "excerpt": observation.excerpt,
+        });
+        let wire = prompt_json(&packet);
+        if wire.len() <= limit {
+            return Some(wire);
+        }
+        if observation.excerpt.is_empty() {
+            return None;
+        }
+        let retained = observation.excerpt.len() / 2;
+        observation.excerpt = byte_prefix(&observation.excerpt, retained).to_owned();
+        observation.complete_file = false;
+        observation.content_hash =
+            blake3::hash(observation.excerpt.as_bytes()).to_hex().to_string();
+    }
 }
 
 /// Read at most four bytes per requested character plus an EOF probe. Never
@@ -297,8 +340,13 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_keeps_required_contract_and_handoffs_when_optional_context_overflows() {
-        let task = SubTask::new(concerto_core::ids::Ulid::new(), AgentId::new("custom"), "Continue the same task");
-        let mut context = AgentContext::new(SessionContext::new(task.session_id, "workspace".into()));
+        let task = SubTask::new(
+            concerto_core::ids::Ulid::new(),
+            AgentId::new("custom"),
+            "Continue the same task",
+        );
+        let mut context =
+            AgentContext::new(SessionContext::new(task.session_id, "workspace".into()));
         context.previous_results.push(result(task.id, Vec::new()));
         context.workspace_snapshot_digest = Some("snapshot".repeat(100_000));
         context.environment_manifest_digest = Some("manifest".repeat(100_000));
@@ -314,12 +362,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn review_scope_deduplicates_files_and_reports_unavailable_entries() -> std::io::Result<()> {
+    async fn review_scope_deduplicates_files_and_reports_unavailable_entries() -> std::io::Result<()>
+    {
         let directory = tempfile::tempdir()?;
         std::fs::write(directory.path().join("main.rs"), "fn main() {}")?;
         let task = SubTask::new(concerto_core::ids::Ulid::new(), AgentId::new("custom"), "Review");
-        let mut context = AgentContext::new(SessionContext::new(task.session_id, directory.path().into()));
-        context.previous_results.push(result(TaskId::new(), vec!["main.rs".into(), "missing.rs".into()]));
+        let mut context =
+            AgentContext::new(SessionContext::new(task.session_id, directory.path().into()));
+        context
+            .previous_results
+            .push(result(TaskId::new(), vec!["main.rs".into(), "missing.rs".into()]));
         context.previous_results.push(result(TaskId::new(), vec!["main.rs".into()]));
         let prompt = agent(OutputMode::ReviewReport).build_prompt(&task, &context).await;
         assert_eq!(prompt.matches("Changed file `main.rs`").count(), 1);
@@ -337,7 +389,10 @@ mod tests {
         let observation = read_review_excerpt(&path, 17)?;
         assert_eq!(observation.excerpt, "界".repeat(17));
         assert!(!observation.complete_file);
-        assert_eq!(observation.content_hash, blake3::hash(observation.excerpt.as_bytes()).to_hex().to_string());
+        assert_eq!(
+            observation.content_hash,
+            blake3::hash(observation.excerpt.as_bytes()).to_hex().to_string()
+        );
         Ok(())
     }
 
@@ -349,6 +404,31 @@ mod tests {
         let observation = read_review_excerpt(&path, 100)?;
         assert!(observation.complete_file);
         assert_eq!(observation.content_hash, blake3::hash(b"fn main() {}").to_hex().to_string());
+        Ok(())
+    }
+
+    #[test]
+    fn escaped_review_observation_rehashes_the_final_inline_excerpt(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let excerpt = "<界>".repeat(10_000);
+        let content_hash = blake3::hash(excerpt.as_bytes()).to_hex().to_string();
+        let observation = ReviewExcerpt { excerpt, content_hash, complete_file: true };
+        let wire = fit_review_observation(
+            TaskId::new(),
+            camino::Utf8Path::new("main.rs"),
+            observation,
+            2048,
+        )
+        .ok_or("observation should fit")?;
+        assert!(wire.len() <= 2048);
+        let value: serde_json::Value = serde_json::from_str(&wire)?;
+        let shown = value["excerpt"].as_str().ok_or("missing excerpt")?;
+        assert!(!shown.is_empty());
+        assert_eq!(value["complete_file"], false);
+        assert_eq!(
+            value["observed_excerpt_blake3"],
+            blake3::hash(shown.as_bytes()).to_hex().to_string()
+        );
         Ok(())
     }
 }

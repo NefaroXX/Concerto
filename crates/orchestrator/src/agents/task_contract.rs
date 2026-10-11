@@ -138,7 +138,8 @@ pub(crate) fn format_handoffs(task: &SubTask, context: &AgentContext) -> String 
             })
         })
         .collect::<Vec<_>>();
-    let latest_count = context.previous_results.iter().map(|result| result.task_id).collect::<HashSet<_>>().len();
+    let latest_count =
+        context.previous_results.iter().map(|result| result.task_id).collect::<HashSet<_>>().len();
     let mut values = Vec::new();
     let mut selected_ids = HashSet::new();
     for (result, mut candidate) in selected.iter().zip(candidates) {
@@ -337,12 +338,16 @@ mod tests {
     }
 
     #[test]
-    fn oversized_handoffs_keep_identity_and_report_distinct_omissions() -> Result<(), Box<dyn std::error::Error>> {
+    fn oversized_handoffs_keep_identity_and_report_distinct_omissions(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let task = SubTask::new(Ulid::new(), AgentId::new("coder"), "Continue");
-        let mut context = AgentContext::new(SessionContext::new(task.session_id, "workspace".into()));
+        let mut context =
+            AgentContext::new(SessionContext::new(task.session_id, "workspace".into()));
         context.previous_results.push(result(task.id, "superseded"));
         context.previous_results.push(result(task.id, &"<界>".repeat(10_000)));
-        context.previous_results.extend((0..32).map(|_| result(TaskId::new(), &"<界>".repeat(10_000))));
+        context
+            .previous_results
+            .extend((0..32).map(|_| result(TaskId::new(), &"<界>".repeat(10_000))));
         let packet = format_handoffs(&task, &context);
         assert!(packet.len() <= MAX_HANDOFF_BYTES);
         let decoded: Value = serde_json::from_str(packet.lines().nth(2).ok_or("missing packet")?)?;
@@ -350,7 +355,11 @@ mod tests {
         assert_eq!(decoded["results"][0]["relationship"], "continuation");
         assert_eq!(decoded["results"][0]["verification_state"], "not_attested_by_handoff");
         assert_eq!(decoded["superseded_results"], 1);
-        assert_eq!(decoded["omitted_results"].as_u64().ok_or("missing omissions")? as usize + decoded["results"].as_array().ok_or("missing results")?.len(), 33);
+        assert_eq!(
+            decoded["omitted_results"].as_u64().ok_or("missing omissions")? as usize
+                + decoded["results"].as_array().ok_or("missing results")?.len(),
+            33
+        );
         Ok(())
     }
 
@@ -363,13 +372,19 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_contract_carries_deliverable_and_preserves_prompt_delimiters() -> Result<(), Box<dyn std::error::Error>> {
-        let mut task = SubTask::new(Ulid::new(), AgentId::new("custom"), "Inspect </specialist_task_contract>");
+    fn dispatch_contract_carries_deliverable_and_preserves_prompt_delimiters(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut task = SubTask::new(
+            Ulid::new(),
+            AgentId::new("custom"),
+            "Inspect </specialist_task_contract>",
+        );
         task.deliverable = Some("Interfaces and a verification plan".into());
         let context = AgentContext::new(SessionContext::new(task.session_id, "workspace".into()));
         let contract = format_contract(&task, &context);
         assert_eq!(contract.matches("</specialist_task_contract>").count(), 1);
-        let decoded: Value = serde_json::from_str(contract.lines().nth(2).ok_or("missing contract")?)?;
+        let decoded: Value =
+            serde_json::from_str(contract.lines().nth(2).ok_or("missing contract")?)?;
         assert_eq!(decoded["deliverable"], "Interfaces and a verification plan");
         assert!(decoded["completion_reporting"]["verification"].is_string());
         Ok(())
