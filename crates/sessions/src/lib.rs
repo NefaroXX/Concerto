@@ -3952,6 +3952,53 @@ mod tests {
     }
 
     #[tokio::test]
+    /// `ARCHIVE_DDL` and `ARCHIVE_INSERT` stay in lockstep with the hot
+    /// schema for the migration-038 canonical columns too: an alias-shaped
+    /// row (`tool_name` differs from `canonical_tool`) retains its canonical
+    /// pair through the `SELECT *` copy into the archive, and the hot row is
+    /// gone afterwards. A missed or reordered column fails the copy loudly,
+    /// before anything is deleted from the live table.
+    async fn prune_audit_preserves_canonical_columns_in_the_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sessions.db");
+        let store = SqliteSessionStore::connect_path(&db_path).await.unwrap();
+
+        let project = camino::Utf8PathBuf::from("/tmp/prune-canonical-columns");
+        let session =
+            store.create_session(&project, "p", "m", CancellationToken::new()).await.unwrap();
+        let audit = crate::audit::SqliteAuditLog::new(store.pool.clone());
+        let mut entry = aged_audit_entry(session.id, 100 * 86_400);
+        entry.canonical_tool = Some("filesystem".into());
+        entry.canonical_operation = Some("write".into());
+        audit.record(entry, CancellationToken::new()).await.expect("aged audit row");
+        assert_eq!(audit_row_count(&store).await, 1);
+
+        let archive_dir = dir.path().join("archive");
+        let report =
+            store.prune_audit(30, &archive_dir, &CancellationToken::new()).await.expect("prune");
+        assert_eq!(report.archived, 1);
+        assert_eq!(audit_row_count(&store).await, 0, "the aged row left the live table");
+
+        let archive_path = archive_dir.join("audit-archive.db");
+        let options = SqliteConnectOptions::new().filename(&archive_path);
+        let mut conn = SqliteConnection::connect_with(&options).await.expect("open archive");
+        let stored: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT tool_name, canonical_tool, canonical_operation FROM audit_log_archive",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .expect("archive canonical columns");
+        assert_eq!(stored.0, "test_tool", "attribution keeps the requested name");
+        assert_eq!(
+            stored.1.as_deref(),
+            Some("filesystem"),
+            "the canonical tool must reach the archive intact"
+        );
+        assert_eq!(stored.2.as_deref(), Some("write"));
+        conn.close().await.expect("close archive");
+    }
+
+    #[tokio::test]
     /// The cutoff is strict: a row just older than the window is archived, a
     /// row just younger survives.
     async fn prune_audit_cutoff_is_strictly_older() {

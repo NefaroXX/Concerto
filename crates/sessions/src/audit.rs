@@ -18,53 +18,6 @@ impl SqliteAuditLog {
     }
 }
 
-/// Fold the ADR-82 slice-1 canonical accounting identity into a row's
-/// `user_response` value as a compact JSON envelope (`{canonical_tool,
-/// canonical_operation}`).
-///
-/// Total and lossless: a row without canonical fields keeps its
-/// `user_response` exactly as the writer set it; a row with canonical fields
-/// and no existing response stores the envelope alone; a row with both merges
-/// the canonical keys into an existing JSON object, or wraps a non-JSON
-/// response under a `detail` key — no recorded text is ever dropped.
-///
-/// `None` for both inputs is the common case (synthetic rows — acks, plan
-/// decisions, infra failures — and every row written before the canonical
-/// fields existed).
-fn encode_canonical_effect(
-    canonical_tool: Option<String>,
-    canonical_operation: Option<String>,
-    user_response: Option<String>,
-) -> Option<String> {
-    if canonical_tool.is_none() && canonical_operation.is_none() {
-        return user_response;
-    }
-    // Retain the original response for the (practically unreachable) case where
-    // serializing the envelope fails: never drop recorded text.
-    let fallback = user_response.clone();
-    let mut envelope = match user_response {
-        None => serde_json::Map::new(),
-        Some(text) => match serde_json::from_str::<serde_json::Value>(&text) {
-            Ok(serde_json::Value::Object(map)) => map,
-            _ => {
-                // A human-readable (non-JSON) response: preserve it verbatim
-                // under `detail` rather than dropping it. No current row
-                // builder sets both, so this arm is defensive totality.
-                let mut map = serde_json::Map::new();
-                map.insert("detail".to_owned(), serde_json::Value::String(text));
-                map
-            }
-        },
-    };
-    if let Some(tool) = canonical_tool {
-        envelope.insert("canonical_tool".to_owned(), serde_json::Value::String(tool));
-    }
-    if let Some(operation) = canonical_operation {
-        envelope.insert("canonical_operation".to_owned(), serde_json::Value::String(operation));
-    }
-    serde_json::to_string(&serde_json::Value::Object(envelope)).ok().or(fallback)
-}
-
 #[async_trait::async_trait]
 impl AuditLog for SqliteAuditLog {
     async fn record(
@@ -102,19 +55,14 @@ impl AuditLog for SqliteAuditLog {
         // from the typed carrier, or NULL when the operation was mutating,
         // failed, or names no read-only result. Never file content.
         let result_facts = entry.result_facts.map(|facts| facts.to_string());
-        // ADR-82 slice 1: the canonical accounting identity rides a compact
-        // JSON envelope in the existing free-form `user_response` column.
-        // The audit schema keeps its column set (the next migration number
-        // is earmarked by ADR-82 for the checkpoint sidecar, and session
-        // migrations are out of this slice's scope), so the envelope follows
-        // the precedent the coordinator-shape / plan-decision rows already
-        // set. `tool_name` still records the requested (registered) name —
-        // attribution by the former, accounting by the latter.
-        let user_response = encode_canonical_effect(
-            entry.canonical_tool,
-            entry.canonical_operation,
-            entry.user_response,
-        );
+        // ADR-82 slice 1 → migration 038: the canonical accounting identity
+        // lands in dedicated `canonical_tool` / `canonical_operation` columns
+        // (backfilled from the slice-1 `user_response` envelope by the
+        // migration). The envelope is gone from the write path:
+        // `user_response` carries only what its writer recorded (approval
+        // responses, plan decisions, …). `tool_name` still records the
+        // requested (registered) name — attribution by the former, accounting
+        // by the latter.
 
         sqlx::query(
             "INSERT INTO audit_log (\
@@ -124,8 +72,9 @@ impl AuditLog for SqliteAuditLog {
                 network_requested, filesystem_scope, destructive_classification, \
                 exit_code, duration_ms, toolchain_version, plan_id, source_revision, \
                 path_operation, attempted_path, resolved_path, \
-                attempted_destination, resolved_destination, result_facts) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                attempted_destination, resolved_destination, result_facts, \
+                canonical_tool, canonical_operation) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(Ulid::new().to_string())
         .bind(entry.session_id.to_string())
@@ -134,7 +83,7 @@ impl AuditLog for SqliteAuditLog {
         .bind(&entry.verdict)
         .bind(&entry.input_hash)
         .bind(&entry.rule_matched)
-        .bind(&user_response)
+        .bind(entry.user_response)
         .bind(created_at_unix)
         .bind(entry.profile_id)
         .bind(entry.resolved_executable)
@@ -154,6 +103,8 @@ impl AuditLog for SqliteAuditLog {
         .bind(attempted_destination)
         .bind(resolved_destination)
         .bind(result_facts)
+        .bind(entry.canonical_tool)
+        .bind(entry.canonical_operation)
         .execute(&self.pool)
         .await
         .map_err(|e| {
@@ -385,6 +336,10 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query(include_str!("../migrations/038_audit_canonical_columns.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
 
         // Insert a session row for FK.
         let session_id = Ulid::new();
@@ -456,6 +411,10 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::query(include_str!("../migrations/038_audit_canonical_columns.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
 
         // Insert a dummy session row for FK.
         let session_id = Ulid::new();
@@ -524,6 +483,10 @@ mod tests {
             .await
             .unwrap();
         sqlx::query(include_str!("../migrations/035_audit_result_facts.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(include_str!("../migrations/038_audit_canonical_columns.sql"))
             .execute(&pool)
             .await
             .unwrap();
@@ -1118,6 +1081,10 @@ mod tests {
     type PathFactsRow =
         (Option<String>, Option<String>, Option<String>, Option<String>, Option<String>);
 
+    /// Attribution (`tool_name`) plus the migration-038 canonical pair and
+    /// `user_response`, fetched as one row in the canonical-column tests.
+    type CanonicalColumnsRow = (String, Option<String>, Option<String>, Option<String>);
+
     /// Every path-facts column round-trips through SQLite unchanged.
     #[tokio::test]
     async fn sqlite_audit_log_round_trips_path_facts() {
@@ -1381,9 +1348,14 @@ mod tests {
         assert_eq!(legacy.1, None);
         assert_eq!(legacy.2, None);
 
-        // Migration 035 completes the writer's column set; it too must apply
-        // cleanly over those rows before a post-034 write can land.
+        // Migration 035 completes the path/result column set and 038 the
+        // canonical pair; both must apply cleanly over those rows before a
+        // post-034 write can land.
         sqlx::query(include_str!("../migrations/035_audit_result_facts.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(include_str!("../migrations/038_audit_canonical_columns.sql"))
             .execute(&pool)
             .await
             .unwrap();
@@ -1463,6 +1435,23 @@ mod tests {
         assert_eq!(legacy.1.as_deref(), Some("read"), "pre-035 path facts stay");
         assert_eq!(legacy.2, None, "pre-035 rows simply have no result facts");
 
+        // Migration 038 (canonical columns) too: the envelope-less legacy row
+        // must keep NULL canonical columns, and its `user_response` must not
+        // be rewritten by the backfill.
+        sqlx::query(include_str!("../migrations/038_audit_canonical_columns.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let legacy: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT canonical_tool, canonical_operation, user_response FROM audit_log",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(legacy.0, None, "pre-038 rows have no canonical tool");
+        assert_eq!(legacy.1, None, "pre-038 rows have no canonical operation");
+        assert_eq!(legacy.2, None, "the backfill never invents a user_response");
+
         // And a post-035 write lands.
         let audit = SqliteAuditLog::new(pool.clone());
         let entry = AuditEntry {
@@ -1489,6 +1478,172 @@ mod tests {
         .map(|(value,)| value)
         .collect();
         assert_eq!(stored, vec![None, Some("entries=0".to_owned())]);
+    }
+
+    #[tokio::test]
+    /// Migration 038 write path: the canonical accounting identity lands in
+    /// the dedicated columns — including the canonicalized-alias shape where
+    /// `tool_name` (the requested name, for attribution) and `canonical_tool`
+    /// (the accounting key) differ — and `user_response` carries only what
+    /// its writer recorded: no JSON envelope is folded into it anymore.
+    async fn sqlite_audit_log_records_canonical_columns_not_an_envelope() {
+        let (pool, session_id) = setup_audit_pool().await;
+        let audit = SqliteAuditLog::new(pool.clone());
+
+        // Alias-shaped row: the caller asked for `write`, the canonical
+        // effect policy evaluated was a `filesystem` write. A human
+        // approval response rides `user_response` verbatim.
+        let alias_row = AuditEntry {
+            user_response: Some("user approved".into()),
+            canonical_tool: Some("filesystem".into()),
+            canonical_operation: Some("write".into()),
+            ..entry_with_path_facts(session_id, "write", "Allow", None)
+        };
+        audit.record(alias_row, CancellationToken::new()).await.unwrap();
+
+        // Synthetic row (acks, plan decisions, …) names no canonical pair.
+        let plain_row = entry_with_path_facts(session_id, "intent:plan", "apply", None);
+        audit.record(plain_row, CancellationToken::new()).await.unwrap();
+
+        let rows: Vec<CanonicalColumnsRow> = sqlx::query_as(
+            "SELECT tool_name, canonical_tool, canonical_operation, user_response \
+             FROM audit_log ORDER BY rowid",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        let (tool, canonical_tool, canonical_operation, response) = &rows[0];
+        assert_eq!(tool, "write", "attribution keeps the requested name");
+        assert_eq!(canonical_tool.as_deref(), Some("filesystem"), "accounting keys canonical");
+        assert_eq!(canonical_operation.as_deref(), Some("write"));
+        assert_eq!(
+            response.as_deref(),
+            Some("user approved"),
+            "user_response holds only the writer's text — never an envelope"
+        );
+        let (tool, canonical_tool, canonical_operation, response) = &rows[1];
+        assert_eq!(tool, "intent:plan");
+        assert_eq!(canonical_tool.as_deref(), None, "rows without a canonical pair stay NULL");
+        assert_eq!(canonical_operation.as_deref(), None);
+        assert_eq!(response.as_deref(), None);
+    }
+
+    #[tokio::test]
+    /// Migration 038 applies over a database that already holds slice-1
+    /// envelope rows: the canonical pair is promoted into the new columns,
+    /// non-envelope rows (plain text, other JSON shapes, NULL) keep NULL
+    /// columns, the envelope text itself is left untouched, and a post-038
+    /// write lands its pair in the columns.
+    async fn migration_038_backfills_canonical_columns_from_the_envelope() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        for migration in [
+            include_str!("../migrations/001_initial_schema.sql"),
+            include_str!("../migrations/002_audit_log.sql"),
+            include_str!("../migrations/016_audit_command_facts.sql"),
+            include_str!("../migrations/024_audit_intent_columns.sql"),
+            include_str!("../migrations/032_audit_infra_columns.sql"),
+            include_str!("../migrations/034_audit_path_facts.sql"),
+            include_str!("../migrations/035_audit_result_facts.sql"),
+        ] {
+            sqlx::query(migration).execute(&pool).await.unwrap();
+        }
+        let session_id = Ulid::new();
+        sqlx::query(
+            "INSERT INTO sessions (id, created_at, project_dir, provider, model) \
+             VALUES (?, 0, '/tmp', 'test', 'test')",
+        )
+        .bind(session_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // 1. A slice-1 envelope row (alias-shaped: the pair differs from the
+        //    registered tool name). Extra keys in the envelope survive.
+        let envelope = serde_json::json!({
+            "decision": "allow",
+            "canonical_tool": "filesystem",
+            "canonical_operation": "write",
+        })
+        .to_string();
+        // 2. A writer-set response that is not an envelope: no promotion.
+        // 3. A JSON object without canonical keys (plan-decision shape).
+        // 4. A legacy row with no `user_response` at all.
+        for (tool, response) in [
+            ("write", Some(envelope.as_str())),
+            ("filesystem", Some("user approved")),
+            (
+                "intent:plan",
+                Some(r#"{"plan_id":"01J4V6Q8X0000000000000000a1","source_revision":"f00dcafe"}"#),
+            ),
+            ("test_tool", None),
+        ] {
+            sqlx::query(
+                "INSERT INTO audit_log (id, session_id, correlation_id, tool_name, verdict, \
+                 input_hash, created_at, user_response) \
+                 VALUES (?, ?, ?, ?, 'Allow', 'legacyhash', 0, ?)",
+            )
+            .bind(Ulid::new().to_string())
+            .bind(session_id.to_string())
+            .bind(Ulid::new().to_string())
+            .bind(tool)
+            .bind(response)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // Applying 038 promotes the envelope row and leaves the rest alone.
+        sqlx::query(include_str!("../migrations/038_audit_canonical_columns.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let rows: Vec<CanonicalColumnsRow> = sqlx::query_as(
+            "SELECT tool_name, canonical_tool, canonical_operation, user_response \
+             FROM audit_log ORDER BY rowid",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 4);
+        // Envelope row: both columns promoted, response text untouched.
+        assert_eq!(rows[0].0, "write");
+        assert_eq!(rows[0].1.as_deref(), Some("filesystem"), "canonical tool promoted");
+        assert_eq!(rows[0].2.as_deref(), Some("write"), "canonical operation promoted");
+        assert_eq!(
+            rows[0].3.as_deref(),
+            Some(envelope.as_str()),
+            "the envelope text is preserved, never rewritten"
+        );
+        // Non-envelope rows: NULL columns, responses untouched.
+        assert_eq!(rows[1].1, None, "plain-text responses are not parsed");
+        assert_eq!(rows[1].2, None);
+        assert_eq!(rows[1].3.as_deref(), Some("user approved"));
+        assert_eq!(rows[2].1, None, "JSON without canonical keys stays NULL");
+        assert_eq!(rows[2].2, None);
+        assert_eq!(rows[3].1, None, "NULL responses stay NULL");
+        assert_eq!(rows[3].2, None);
+        assert_eq!(rows[3].3, None);
+
+        // A post-038 write lands its pair in the columns, not the envelope.
+        let audit = SqliteAuditLog::new(pool.clone());
+        let entry = AuditEntry {
+            canonical_tool: Some("shell".into()),
+            canonical_operation: None,
+            ..entry_with_path_facts(session_id, "run", "Allow", None)
+        };
+        audit.record(entry, CancellationToken::new()).await.unwrap();
+        let fresh: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT canonical_tool, canonical_operation, user_response \
+             FROM audit_log WHERE tool_name = 'run'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(fresh.0.as_deref(), Some("shell"));
+        assert_eq!(fresh.1, None);
+        assert_eq!(fresh.2, None, "the write path no longer builds an envelope");
     }
 
     // -----------------------------------------------------------------------
