@@ -1150,6 +1150,70 @@ async fn create_session_and_recorder(
     Ok((resolved_session_id, session_store, event_recorder, transcript_recorder))
 }
 
+/// ADR-82 slice 6 + single-agent parity: the run's environment-manifest
+/// barrier, shared by the coordinator and single-agent paths.
+///
+/// Collects one probe set per run from the executor's registry (both tool
+/// identities via the slice-1 canonical-effect service), the session pool, and
+/// the workspace paths — or, on resume, restores the stored manifest from its
+/// `EnvironmentObserved` whiteboard row with zero probes — then hands the
+/// result to the shared `environment.describe` cache
+/// ([`crate::environment_describe::populate_from_barrier`]) so later describe
+/// calls serve it with zero further probes. Returns the manifest for prompt
+/// injection (`None` only when the barrier produced none — fail-soft, the run
+/// proceeds without the block).
+///
+/// The SAME barrier/persist/restore functions and the SAME cache serve both
+/// paths: one cache, one collection, one probe set per run. Descriptive only —
+/// the manifest never authorizes anything; no gate reads it.
+#[allow(clippy::too_many_arguments)]
+async fn run_environment_manifest_barrier(
+    executor: &ToolExecutor,
+    config: &AppConfig,
+    project_dir: &Path,
+    session_id: Ulid,
+    memory_enabled: bool,
+    pool: Option<&sqlx::SqlitePool>,
+    resume: bool,
+    prober: &dyn crate::environment_manifest::VersionProber,
+    cancel: &CancellationToken,
+    describe_state: &crate::environment_describe::SharedDescribeState,
+) -> Option<concerto_core::environment_manifest::EnvironmentManifest> {
+    use crate::environment_manifest::{
+        inventory_from_executor, run_manifest_barrier, ManifestInputs,
+    };
+    use concerto_core::environment_manifest::{ManifestExecutionBackend, PersistenceClass};
+    let mut persistence = vec![PersistenceClass::WorkspaceFiles];
+    if pool.is_some() {
+        persistence.push(PersistenceClass::SessionDatabase);
+    }
+    let manifest_inputs = ManifestInputs {
+        run_id: Ulid::new().to_string(),
+        session_id: session_id.to_string(),
+        project_root: project_dir,
+        backend: ManifestExecutionBackend::InProcess,
+        sandbox_profile: None,
+        container_routing: concerto_core::types::CommandRouting::Direct,
+        inventory: inventory_from_executor(executor),
+        // H03: the descriptive policy scope is derived by the shared
+        // helper so the barrier and `environment.describe` label the run
+        // identically (their fingerprints must agree on a fresh run).
+        policy_scope: crate::environment_describe::policy_scope_from_config(config),
+        persistence,
+        memory_enabled,
+        previous_revision: None,
+        candidates: None,
+        path_dirs: None,
+    };
+    let manifest = run_manifest_barrier(pool, manifest_inputs, resume, prober, cancel).await?;
+    // H03: hand the barrier's manifest to the describe cache (freshly
+    // collected or resume-restored — populate fingerprints the stored
+    // row, so a restore across a config change reads stale on the
+    // first describe call and refreshes exactly once).
+    crate::environment_describe::populate_from_barrier(describe_state, &manifest);
+    Some(manifest)
+}
+
 /// Build the overflow strategy, undo manager, eval engine, and AgentLoop, then
 /// execute the single-agent task.
 ///
@@ -1192,6 +1256,11 @@ async fn execute_agent_loop(
     // environment card via `PromptBuilder::with_project_context`. Refreshed
     // once at run start by `run_shared_agent` (fail-soft).
     project_context: Arc<crate::project_context::ProjectContext>,
+    // ADR-82 single-agent manifest injection: the run's cached digest from
+    // `run_environment_manifest_barrier` (the same barrier the coordinator
+    // path uses). Renders in the shared `<environment_manifest>` block shape
+    // beside the environment card; `None` renders no block (fail-soft).
+    environment_manifest_digest: Option<String>,
 ) -> Result<AgentOutput, OrchestratorError> {
     // ADR-67 M-01 (audit C-03 gate): the in-run overflow-strategy slot is
     // removed from `AgentLoop`. Context overflow is bounded deterministically
@@ -1269,7 +1338,10 @@ async fn execute_agent_loop(
     .with_strict_verification_gate(services.config.strict_verification_gate())
     .with_tool_facts(fact_pool.map(|pool| {
         crate::tool_facts::ToolFactContext::new(Some(pool), crate::tool_facts::SINGLE_AGENT_FACT_ID)
-    }));
+    }))
+    // ADR-82 single-agent manifest injection: the barrier-collected digest
+    // rides the system prompt in the shared block shape (descriptive only).
+    .with_environment_manifest(environment_manifest_digest);
 
     // `task` is moved into the loop below; Ulid is Copy so the task id is
     // captured up front for spend attribution (Phase 3, issue #93).
@@ -1877,8 +1949,12 @@ struct SharedTooling {
     model: String,
     provider_config_id: Option<String>,
     /// H03: the run's shared `environment.describe` cache. Registered into
-    /// the registry below; the coordinator-path manifest barrier populates it
-    /// (the single-agent path lazily collects on first call instead).
+    /// the registry below; the manifest barrier
+    /// (`run_environment_manifest_barrier`) populates it on BOTH the
+    /// coordinator and single-agent paths, so describe calls serve the run's
+    /// manifest with zero further probes (a first call with no barrier
+    /// manifest lazily collects exactly one probe set instead — the fallback
+    /// the single-agent path used before it gained its barrier).
     describe_state: crate::environment_describe::SharedDescribeState,
 }
 
@@ -1929,8 +2005,9 @@ async fn setup_shared_tooling(
     // ADR-82 H03: register `environment.describe` LAST so its tool-names
     // snapshot covers every other tool (filesystem, shell, git, LSP, plugin,
     // MCP). One shared registry feeds both the single-agent loop and the
-    // coordinator, so the operation is reachable on both paths; prompt
-    // injection of the digest stays coordinator-only (the barrier below).
+    // coordinator, so the operation is reachable on both paths; the manifest
+    // digest is prompt-injected on both paths too (each path's
+    // `run_environment_manifest_barrier` populates this cache).
     let describe_state = crate::environment_describe::register_describe_tool(
         &mut registry,
         &req.project_dir,
@@ -2627,6 +2704,30 @@ pub async fn run_shared_agent(
     // ADR-65 §3: this pool clone backs the single-agent loop's tool-evidence
     // writer (recorded via `.with_tool_facts` in `execute_agent_loop`).
     let d7_event_pool = gate_log_pool.clone();
+    // ADR-82 single-agent manifest injection: collect the run's manifest
+    // through the SAME barrier the coordinator path uses (one probe set per
+    // run, resume restores with zero probes) and populate the SAME shared
+    // describe cache, so `environment.describe` serves it with zero further
+    // probes. The digest rides the single-agent system prompt in the shared
+    // `<environment_manifest>` block shape; fail-soft (`None`) prompts
+    // exactly as before.
+    let single_agent_manifest_digest = {
+        let prober = crate::environment_manifest::SystemVersionProber::default();
+        run_environment_manifest_barrier(
+            &executor,
+            &services.config,
+            &req.project_dir,
+            session_id,
+            req.memory_enabled,
+            gate_log_pool.as_ref(),
+            req.resume_checkpoint_json.is_some(),
+            &prober,
+            &req.cancel_token,
+            &describe_state,
+        )
+        .await
+        .map(|manifest| manifest.summary())
+    };
     // ADR-60 D5: give the in-process single-agent loop the same always-on
     // write-gate protection the supervised agent-process path enforces. The
     // gate reuses the run's own policy/executor pair and the session-DB pool
@@ -2676,6 +2777,7 @@ pub async fn run_shared_agent(
         &stage_tracker,
         d7_event_pool.clone(),
         project_context,
+        single_agent_manifest_digest,
     )
     .await?;
 
@@ -2736,10 +2838,9 @@ async fn run_multi_agent(
     // environment card; its refresh cadence also gates the coordinator's
     // maintenance nudge. Refreshed once at run start by `run_shared_agent`.
     project_context: Arc<crate::project_context::ProjectContext>,
-    // ADR-82 H03: the shared `environment.describe` cache. The manifest
-    // barrier below populates it so describe calls serve the run's manifest
-    // with zero further probes (the single-agent path never reaches here and
-    // lazily collects on first call instead).
+    // ADR-82 H03: the shared `environment.describe` cache. The shared
+    // manifest barrier (`run_environment_manifest_barrier`) populates it so
+    // describe calls serve the run's manifest with zero further probes.
     describe_state: &crate::environment_describe::SharedDescribeState,
 ) -> Result<AgentOutput, OrchestratorError> {
     let project_dir = req.project_dir.clone();
@@ -3417,49 +3518,24 @@ async fn run_multi_agent(
     // re-probing; the summary rides into every dispatched agent's context
     // beside the snapshot digest. Fail-soft by contract: collection and
     // persistence never fail the run, and the manifest never authorizes
-    // anything — no gate reads it.
+    // anything — no gate reads it. Shared with the single-agent path via
+    // `run_environment_manifest_barrier` (one cache, one collection).
     {
-        use crate::environment_manifest::{
-            inventory_from_executor, run_manifest_barrier, ManifestInputs, SystemVersionProber,
-        };
-        use concerto_core::environment_manifest::{ManifestExecutionBackend, PersistenceClass};
-        let mut persistence = vec![PersistenceClass::WorkspaceFiles];
-        if gate_log_pool.is_some() {
-            persistence.push(PersistenceClass::SessionDatabase);
-        }
-        let manifest_inputs = ManifestInputs {
-            run_id: concerto_core::ids::Ulid::new().to_string(),
-            session_id: session_id.to_string(),
-            project_root: &project_dir,
-            backend: ManifestExecutionBackend::InProcess,
-            sandbox_profile: None,
-            container_routing: concerto_core::types::CommandRouting::Direct,
-            inventory: inventory_from_executor(&executor),
-            // H03: the descriptive policy scope is derived by the shared
-            // helper so the barrier and `environment.describe` label the run
-            // identically (their fingerprints must agree on a fresh run).
-            policy_scope: crate::environment_describe::policy_scope_from_config(&services.config),
-            persistence,
-            memory_enabled: req.memory_enabled,
-            previous_revision: None,
-            candidates: None,
-            path_dirs: None,
-        };
-        let prober = SystemVersionProber::default();
-        if let Some(manifest) = run_manifest_barrier(
+        let prober = crate::environment_manifest::SystemVersionProber::default();
+        if let Some(manifest) = run_environment_manifest_barrier(
+            &executor,
+            &services.config,
+            &project_dir,
+            session_id,
+            req.memory_enabled,
             gate_log_pool.as_ref(),
-            manifest_inputs,
             req.resume_checkpoint_json.is_some(),
             &prober,
             &req.cancel_token,
+            describe_state,
         )
         .await
         {
-            // H03: hand the barrier's manifest to the describe cache (freshly
-            // collected or resume-restored — populate fingerprints the stored
-            // row, so a restore across a config change reads stale on the
-            // first describe call and refreshes exactly once).
-            crate::environment_describe::populate_from_barrier(describe_state, &manifest);
             coordinator = coordinator.with_environment_manifest(manifest);
         }
     }

@@ -16,21 +16,24 @@
 //! plugin/MCP tools), so it is reachable from **both** the single-agent loop
 //! and the coordinator: both consume the same registry/executor pair, and a
 //! per-path registry fork would split the tool surface for no benefit.
-//! Prompt *injection* of the manifest digest stays coordinator-only (the
-//! slice-6 scope — the single-agent loop has no snapshot-digest precedent and
-//! gains none here); `environment.describe` is on-demand only.
+//! Prompt injection of the manifest digest runs on **both** paths through the
+//! shared [`crate::environment_manifest::format_manifest_block`] shape (the
+//! slice-6 coordinator block plus the single-agent `PromptBuilder` injection);
+//! `environment.describe` remains the on-demand read of the same cached
+//! manifest.
 //!
 //! # Probe discipline: one set per run, never per call
 //!
 //! The tool reuses the slice-6 collector/cache and never probes per call:
 //!
-//! - **Coordinator path:** the manifest barrier collects one probe set at run
+//! - **Both paths:** the shared manifest barrier collects one probe set at run
 //!   start (or restores the stored row on resume) and hands the result to
 //!   [`populate_from_barrier`]; every describe call after that is a pure cache
 //!   read with zero probes.
-//! - **Single-agent path:** no barrier runs there, so the first describe call
-//!   lazily collects exactly one probe set and caches it; every later call is
-//!   a cache read.
+//! - **Fallback (no barrier manifest):** the first describe call lazily
+//!   collects exactly one probe set and caches it; every later call is a
+//!   cache read. This covers runs whose barrier produced no manifest —
+//!   including every pre-barrier single-agent run — never the steady state.
 //!
 //! # Revision invalidation on config change (approach (b): lazy detect +
 //! explicit re-collect)
