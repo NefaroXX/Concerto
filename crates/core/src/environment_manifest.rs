@@ -381,10 +381,14 @@ impl EnvironmentManifest {
     /// registry. Contains no credentials by construction — only names,
     /// labels, paths, hashes, counts, and version strings.
     pub fn summary(&self) -> String {
+        self.summary_with(true)
+    }
+
+    fn summary_with(&self, run_scoped: bool) -> String {
         let mut lines = vec![format!(
-            "environment-manifest schema={} revision={} backend={} os={} arch={}",
+            "environment-manifest schema={} {}backend={} os={} arch={}",
             self.schema_version,
-            self.revision,
+            if run_scoped { format!("revision={} ", self.revision) } else { String::new() },
             self.backend.map_or("unknown", |backend| backend.as_str()),
             self.os,
             self.arch,
@@ -449,8 +453,32 @@ impl EnvironmentManifest {
                 .collect();
             lines.push(format!("executables: {}", observed.join(", ")));
         }
-        lines.push(format!("collected_at_ms={} revision={}", self.collected_at_ms, self.revision));
+        if run_scoped {
+            lines.push(format!(
+                "collected_at_ms={} revision={}",
+                self.collected_at_ms, self.revision
+            ));
+        }
         lines.join("\n")
+    }
+
+    /// The byte-stable projection of [`Self::summary`] for a prompt's cached
+    /// prefix head.
+    ///
+    /// [`Self::summary`] ends with a `collected_at_ms=<timestamp>` line, and a
+    /// fresh manifest is collected per run, so that line differs every run. The
+    /// environment *declaration* — what the run can do — is what a model needs
+    /// in the stable head, and it is stable while the environment is. Dropping
+    /// the timestamp (and the run-scoped revision counter) is therefore what
+    /// keeps ADR-48's "byte-identical head across runs" promise intact for
+    /// `[context].cache_stable_prefix`.
+    ///
+    /// Freshness is not lost: `environment.describe` reports it, and the
+    /// manifest itself carries `collected_at_ms`/`revision` for any consumer
+    /// that needs the exact collection.
+    #[must_use]
+    pub fn summary_stable(&self) -> String {
+        self.summary_with(false)
     }
 }
 
@@ -613,6 +641,34 @@ mod tests {
             "git-stash omits -u: untracked restore is not claimed"
         );
         assert!(restore.binary_restore, "the chunked store banks within-budget binary byte-exact");
+    }
+
+    /// ADR-48 stable-prefix discipline: two manifests collected in separate
+    /// runs of the SAME environment differ only by their collection
+    /// timestamp/revision, so the timestamp-free projection injected into a
+    /// cached prompt head must be byte-identical.
+    #[test]
+    fn summary_stable_is_byte_identical_across_runs_of_one_environment() {
+        let first = sample_manifest();
+        let mut second = first.clone();
+        second.collected_at_ms = first.collected_at_ms + 60_000;
+        second.revision = first.revision + 3;
+
+        // The full summary legitimately differs (it carries the timestamp).
+        assert_ne!(first.summary(), second.summary(), "full summary carries run-scoped fields");
+        // The stable projection does not — this is what keeps the prompt head
+        // byte-identical across runs for provider prompt caching.
+        assert_eq!(
+            first.summary_stable(),
+            second.summary_stable(),
+            "stable projection must not vary with collection time"
+        );
+        assert!(
+            !first.summary_stable().contains("collected_at_ms"),
+            "the timestamp is exactly what the stable projection drops"
+        );
+        // Freshness stays reachable through the full summary / describe.
+        assert!(first.summary().contains("collected_at_ms="));
     }
 
     #[test]

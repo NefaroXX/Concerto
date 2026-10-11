@@ -2726,7 +2726,12 @@ pub async fn run_shared_agent(
             &describe_state,
         )
         .await
-        .map(|manifest| manifest.summary())
+        // ADR-48 stable-prefix discipline: the prompt head must stay
+        // byte-identical across runs, so inject the timestamp-free projection.
+        // `collected_at_ms` changes every run and would otherwise defeat the
+        // provider prompt cache on every turn. Freshness remains available via
+        // `environment.describe`.
+        .map(|manifest| manifest.summary_stable())
     };
     // ADR-60 D5: give the in-process single-agent loop the same always-on
     // write-gate protection the supervised agent-process path enforces. The
