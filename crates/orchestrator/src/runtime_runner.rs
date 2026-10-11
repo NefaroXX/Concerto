@@ -1261,6 +1261,11 @@ async fn execute_agent_loop(
     // path uses). Renders in the shared `<environment_manifest>` block shape
     // beside the environment card; `None` renders no block (fail-soft).
     environment_manifest_digest: Option<String>,
+    // ADR-82 H05: the run's shared verification service. Its harness engine
+    // upgrades to the governed executor-backed engine built below, so
+    // `verify.run` project-tests travel the same policy path as the loop's
+    // own evaluation.
+    verify_service: Arc<crate::verify::VerifierService>,
 ) -> Result<AgentOutput, OrchestratorError> {
     // ADR-67 M-01 (audit C-03 gate): the in-run overflow-strategy slot is
     // removed from `AgentLoop`. Context overflow is bounded deterministically
@@ -1277,6 +1282,10 @@ async fn execute_agent_loop(
             orchestrator_authority: true,
         },
     ));
+    // ADR-82 H05: the shared verification service runs its harness through
+    // the same governed engine the loop evaluates with (one implementation,
+    // one policy path).
+    verify_service.set_eval(eval.clone());
     // Full local agency: the unified loop always gets the tool-capable Build
     // prompt (writes stay policy-gated and approval-sinked). No keyword can
     // select a tool-less path; the model decides tool use from its own output.
@@ -1956,6 +1965,11 @@ struct SharedTooling {
     /// manifest lazily collects exactly one probe set instead — the fallback
     /// the single-agent path used before it gained its barrier).
     describe_state: crate::environment_describe::SharedDescribeState,
+    /// H05: the run's shared verification service. Registered into the
+    /// registry below as `verify.run` (reachable on both paths through the
+    /// normal policy/audit gate); the harness engine upgrades to the
+    /// governed executor-backed engine once each path builds one.
+    verify_service: Arc<crate::verify::VerifierService>,
 }
 
 /// W2d (P1-P3b): build the tool registry, audit sink, plugin/MCP tools, and
@@ -2002,6 +2016,18 @@ async fn setup_shared_tooling(
     if let Err(error) = services.mcp.register_tools(&mut registry).await {
         tracing::warn!(%error, "mcp registration failed; continuing without mcp tools");
     }
+    // ADR-82 H05: register `verify.run` BEFORE `environment.describe` so
+    // the describe tool-names snapshot covers it. One shared registry feeds
+    // both the single-agent loop and the coordinator, so the operation is
+    // reachable on both paths through the normal policy/audit gate. The
+    // harness engine starts direct-spawn; each path upgrades it to its
+    // governed executor-backed engine below, so harness commands travel the
+    // same policy path the loop's own evaluation uses.
+    let verify_service = crate::verify::register_verify_tool(
+        &mut registry,
+        &req.project_dir,
+        EvalEngine::new(&req.project_dir),
+    );
     // ADR-82 H03: register `environment.describe` LAST so its tool-names
     // snapshot covers every other tool (filesystem, shell, git, LSP, plugin,
     // MCP). One shared registry feeds both the single-agent loop and the
@@ -2040,6 +2066,7 @@ async fn setup_shared_tooling(
         model,
         provider_config_id,
         describe_state,
+        verify_service,
     })
 }
 
@@ -2087,6 +2114,7 @@ pub async fn run_shared_agent(
         model,
         provider_config_id,
         describe_state,
+        verify_service,
     } = setup_shared_tooling(&req, &services).await?;
 
     // 4. Policy engine, audit log, spend tracker, tool executor.
@@ -2696,6 +2724,7 @@ pub async fn run_shared_agent(
             headless_resume,
             project_context.clone(),
             &describe_state,
+            verify_service.clone(),
         )
         .await;
     }
@@ -2783,6 +2812,7 @@ pub async fn run_shared_agent(
         d7_event_pool.clone(),
         project_context,
         single_agent_manifest_digest,
+        verify_service.clone(),
     )
     .await?;
 
@@ -2847,6 +2877,10 @@ async fn run_multi_agent(
     // manifest barrier (`run_environment_manifest_barrier`) populates it so
     // describe calls serve the run's manifest with zero further probes.
     describe_state: &crate::environment_describe::SharedDescribeState,
+    // ADR-82 H05: the run's shared verification service (`verify.run`). Its
+    // harness engine upgrades to the governed executor-backed engine below,
+    // so coordinator-path verification travels the same policy path.
+    verify_service: Arc<crate::verify::VerifierService>,
 ) -> Result<AgentOutput, OrchestratorError> {
     let project_dir = req.project_dir.clone();
     if let Some(store) = &session_store {
@@ -3276,28 +3310,34 @@ async fn run_multi_agent(
     // ADR-35 §8: the shared executor backs coordinator self-execution when a
     // lifecycle stage has no registered agent. Attached unconditionally; the
     // coordinator only uses it when it actually self-executes.
-    .with_executor(executor.clone())
+    .with_executor(executor.clone());
     // ADR-35 §5 Phase 5 C-06 amendment: the coordinator's eval engine backs
     // coordinator self-verification when no validation-stage agent is
     // registered. Uses the same governed native executor as the single-agent
     // path; attached unconditionally — the coordinator
     // only uses it when a validate-stage agent is absent.
-    .with_eval_engine(Arc::new(EvalEngine::new(&req.project_dir).with_process_executor(Arc::new(
+    // ADR-82 H05: the shared verification service upgrades to the same
+    // governed engine, so `verify.run` and coordinator self-verification
+    // never drift.
+    let coordinator_eval = EvalEngine::new(&req.project_dir).with_process_executor(Arc::new(
         crate::exec_backend::NativeEvalExecutor {
             backend: executor.clone(),
             session: SessionContext::new(session_id, req.project_dir.clone()),
             orchestrator_authority: true,
         },
-    ))))
-    // Model-first serving pipe: an unassigned role's effective serving pipe
-    // is the run's default provider. Without this the fallback ladder could
-    // never resolve a serving pipe for unassigned roles, so tier 1 would be
-    // skipped (or, worse, dispatch across pipes).
-    .with_default_provider_config_id(Some(ProviderFactory::config_id(default_provider_config)))
-    // ADR-35 amendment (2026-09-05): the run's policy engine gates every
-    // `call_specialist` decision exactly like any tool call — the same
-    // engine the shared executor enforces, never bypassed.
-    .with_policy_engine(intent_policy.clone());
+    ));
+    verify_service.set_eval(coordinator_eval.clone());
+    coordinator = coordinator
+        .with_eval_engine(Arc::new(coordinator_eval))
+        // Model-first serving pipe: an unassigned role's effective serving pipe
+        // is the run's default provider. Without this the fallback ladder could
+        // never resolve a serving pipe for unassigned roles, so tier 1 would be
+        // skipped (or, worse, dispatch across pipes).
+        .with_default_provider_config_id(Some(ProviderFactory::config_id(default_provider_config)))
+        // ADR-35 amendment (2026-09-05): the run's policy engine gates every
+        // `call_specialist` decision exactly like any tool call — the same
+        // engine the shared executor enforces, never bypassed.
+        .with_policy_engine(intent_policy.clone());
     // Run-continuity Phase 1: the coordinator persists resumable checkpoints
     // (and reads them back on `continue`) through the session store. Without
     // this the store stays `None`, `persist_checkpoint` silently no-ops, and

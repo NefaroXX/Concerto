@@ -18,7 +18,7 @@ use concerto_core::traits::provider::LlmProvider;
 use concerto_core::types::{
     AgentOutput, AgentRunExit, AgentTask, CapabilitySet, CompletionRequest, CompletionUsage,
     Message, PolicyAction, ProviderMetrics, Role, SessionContext, TaskExecutionMode, ToolCall,
-    ToolExecutionSummary, VerificationOutcome, VerificationSummary,
+    ToolExecutionSummary, VerificationSummary,
 };
 use concerto_core::{CancellationToken, OrchestratorError, TaskId};
 use concerto_eval::EvalEngine;
@@ -38,6 +38,7 @@ use crate::state::AgentState;
 use crate::tool_driver::{self, TextToolDriver};
 use crate::tool_facts::{tool_outcome_for_error, ToolExecutedFact, ToolFactContext};
 use crate::tool_guard;
+use crate::verify::VerificationStamp;
 
 mod output_progress;
 use output_progress::{
@@ -171,7 +172,7 @@ pub struct AgentLoop {
     /// file-affecting mutations (the existing audited-write path,
     /// [`Self::record_tool_fact`]). The current generation stamped on checks
     /// is `{base}#{epoch}`; at the gate a differing base reports
-    /// [`FreshnessFailure::Generation`] (F-GENERATION), while a differing
+    /// [`crate::verify::FreshnessFailure::Generation`] (F-GENERATION), while a differing
     /// epoch under the same base is the supersession axis, decided
     /// positionally per record scope: a file-scope record stales only when
     /// its own canonical path's last-write epoch ([`Self::path_write_epoch`])
@@ -319,235 +320,9 @@ fn latest_assistant_text(messages: &[Message]) -> Option<&str> {
         .map(|message| message.content.as_str())
 }
 
-/// ADR-82 H04: why one typed-`Passed` record does not count as fresh passing
-/// evidence. Each cause cites the rule that fires it; the gate reports these
-/// per record (bounded) so an operator can tell "your check is out of date"
-/// from "you never ran it".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FreshnessFailure {
-    /// The record is a typed `Passed` but its R2 freshness set is incomplete
-    /// (missing verifier/scope/generation/fingerprint/`checked_at`/evidence
-    /// — e.g. a pre-H04 sweep record whose `generation`/`evidence_ids` were
-    /// never wired). ADR-82 §3 R2: any axis missing degrades to display-grade.
-    MissingAxes,
-    /// The record's generation base differs from the run's current base (or
-    /// no current generation is known): the workspace moved on as a whole.
-    /// ADR-65 F-GENERATION (conservative reset) / A-GENERATION-ROW.
-    Generation,
-    /// Same generation base, but the run's mutation epoch advanced past the
-    /// check: a relevant audited mutation landed after the check ran. Which
-    /// mutations count is decided per record scope — a file-scope record is
-    /// superseded only by a re-write of its OWN path (ADR-65 F-SUPERSEDE,
-    /// positional), a workspace/project/run-scope record by any executed
-    /// write (ADR-65 F-WORKSPACE-SUPERSEDE) — as projected by the run clock.
-    Superseded,
-    /// The checked bytes on disk no longer hash to the recorded fingerprint:
-    /// the file changed (or vanished) outside the audited write path — the
-    /// documented known limit of the F-supersede arms, closed here by the
-    /// ADR-65 F3-style live re-stat over the existing fingerprint axis.
-    Fingerprint,
-}
-
-impl FreshnessFailure {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::MissingAxes => "missing-axes",
-            Self::Generation => "generation",
-            Self::Superseded => "superseded",
-            Self::Fingerprint => "fingerprint",
-        }
-    }
-}
-
-/// ADR-82 H04 freshness mode of a gated ledger: the `Blocked` reason carries
-/// exactly one of these so the failure reads as "stale" (a check ran but is
-/// out of date), "absent" (no check ever ran), or "not-passed" (checks ran
-/// and none passed).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GateFreshness {
-    Absent,
-    NotPassed,
-    Stale,
-}
-
-impl GateFreshness {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Absent => "absent",
-            Self::NotPassed => "not-passed",
-            Self::Stale => "stale",
-        }
-    }
-}
-
-/// One stale typed-`Passed` record as reported in the `Blocked` reason
-/// (bounded by [`STRICT_GATE_REASON_DETAIL_LIMIT`]).
-#[derive(Debug, Clone)]
-struct StaleRecord {
-    path: String,
-    command: String,
-    cause: FreshnessFailure,
-}
-
-/// Split an H04 run generation (`{base}#{epoch}`) into its base and epoch.
-/// `None` for generations no H04 clock stamped (legacy or foreign shapes) —
-/// those can never equal a current generation and report as `Generation`.
-fn split_run_generation(generation: &str) -> Option<(&str, u64)> {
-    let (base, epoch) = generation.rsplit_once('#')?;
-    Some((base, epoch.parse::<u64>().ok()?))
-}
-
-/// Resolve a verification record's path exactly the way the sweep hashed it
-/// ([`sweep_record`]): absolute spellings stand alone, relative spellings
-/// resolve under the loop's project root. Sharing this helper keeps the
-/// stamp-time hash and the gate-time re-stat on the same bytes.
-fn resolve_verification_path(
-    project_root: &std::path::Path,
-    path: &Utf8PathBuf,
-) -> std::path::PathBuf {
-    if path.is_absolute() {
-        std::path::PathBuf::from(path.as_str())
-    } else {
-        project_root.join(path.as_std_path())
-    }
-}
-
-/// ADR-82 H04 run-scoped freshness context stamped onto verification records
-/// at check time (the axis wiring slice 3 deferred): the current run
-/// generation plus the run's audited write evidence. A default (empty) stamp
-/// leaves records exactly as the pre-H04 sweep produced them (display-grade).
-#[derive(Debug, Clone, Default)]
-struct VerificationStamp {
-    generation: String,
-    /// `(tool-reported path spelling, whiteboard event id)` of every executed
-    /// file-affecting write this run, in order.
-    writes: Vec<(String, String)>,
-}
-
-impl VerificationStamp {
-    /// Backing evidence for one checked path: the whiteboard event ids of
-    /// this run's audited writes whose canonical project-relative key matches
-    /// the checked path (ADR-65 F5d key space — the same keys the derived
-    /// `resource_facts` rows live under). Every returned id references an
-    /// existing whiteboard event (ADR-65 §1); unmatchable or out-of-root paths
-    /// yield no evidence, keeping the record display-grade.
-    fn evidence_for(
-        &self,
-        project_root: &std::path::Path,
-        record_path: &Utf8PathBuf,
-    ) -> Vec<String> {
-        let Some(canonical) =
-            crate::tool_facts::canonical_project_path(project_root, record_path.as_str())
-        else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        for (raw, event_id) in &self.writes {
-            if crate::tool_facts::canonical_project_path(project_root, raw).as_deref()
-                == Some(canonical.as_str())
-                && !out.iter().any(|seen| seen == event_id)
-            {
-                out.push(event_id.clone());
-            }
-        }
-        out
-    }
-
-    /// Backing evidence for a workspace-scope check (the eval harness): every
-    /// audited write is relevant to the workspace as a whole
-    /// (F-WORKSPACE-SUPERSEDE), so the record cites all of them, deduplicated.
-    fn workspace_evidence(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        for (_, event_id) in &self.writes {
-            if !out.iter().any(|seen| seen == event_id) {
-                out.push(event_id.clone());
-            }
-        }
-        out
-    }
-}
-
-/// Machine-checkable ledger label for one verification record: the typed
-/// outcome where present, else the legacy display resolution marked as such —
-/// so a legacy `passed: true` can never be mistaken for typed evidence.
-fn verification_ledger_label(record: &VerificationSummary) -> &'static str {
-    match record.outcome {
-        Some(outcome) => outcome.as_str(),
-        None if record.passed => "legacy-passed",
-        None => "legacy-failed",
-    }
-}
-
-/// Maximum ledger records itemized in a strict-gate `Blocked` reason; the
-/// per-outcome counts cover the whole ledger, so the bound drops prose only,
-/// never signal.
-const STRICT_GATE_REASON_DETAIL_LIMIT: usize = 8;
-
-/// Build the machine-checkable `Blocked` reason for the strict verification
-/// gate (ADR-82 slice 4, R5; freshness modes by H04).
-///
-/// "Task finished" (`task_finished`) and "required verification passed"
-/// (`verification_passed=false` — the caller only builds this when no *fresh*
-/// pass exists) are reported as distinct states, followed by the structured
-/// ledger state: the record count plus per-outcome counts, with the first few
-/// `path:command:outcome` entries itemized. H04 adds the `freshness=` mode
-/// (`absent` = no check ever ran, `not-passed` = checks ran and none passed,
-/// `stale` = a check passed but is out of date) plus the bounded
-/// `stale_detail=[path:command:cause; ...]` per-record causes, so an operator
-/// can tell "your check is out of date" from "you never ran it".
-fn strict_gate_blocked_reason(
-    output: &AgentOutput,
-    task_finished: bool,
-    freshness: GateFreshness,
-    stale: &[StaleRecord],
-) -> String {
-    let mut counts: std::collections::BTreeMap<&'static str, usize> =
-        std::collections::BTreeMap::new();
-    for record in &output.verification {
-        *counts.entry(verification_ledger_label(record)).or_default() += 1;
-    }
-    let outcomes = if counts.is_empty() {
-        "absent".to_owned()
-    } else {
-        counts.iter().map(|(label, count)| format!("{label}:{count}")).collect::<Vec<_>>().join(",")
-    };
-    let mut reason = format!(
-        "strict_verification_gate: action-required task ended without required verification \
-         (task_finished={task_finished} verification_passed=false require_verification=true \
-         records={} outcomes=[{outcomes}] freshness={})",
-        output.verification.len(),
-        freshness.as_str(),
-    );
-    let detail: Vec<String> = output
-        .verification
-        .iter()
-        .take(STRICT_GATE_REASON_DETAIL_LIMIT)
-        .map(|record| {
-            format!("{}:{}:{}", record.path, record.command, verification_ledger_label(record))
-        })
-        .collect();
-    if !detail.is_empty() {
-        reason.push_str(&format!(" detail=[{}]", detail.join("; ")));
-        let rest = output.verification.len().saturating_sub(detail.len());
-        if rest > 0 {
-            reason.push_str(&format!(" +{rest} more"));
-        }
-    }
-    if !stale.is_empty() {
-        let causes: Vec<String> = stale
-            .iter()
-            .take(STRICT_GATE_REASON_DETAIL_LIMIT)
-            .map(|stale| format!("{}:{}:{}", stale.path, stale.command, stale.cause.as_str()))
-            .collect();
-        reason.push_str(&format!(" stale_detail=[{}]", causes.join("; ")));
-        let rest = stale.len().saturating_sub(causes.len());
-        if rest > 0 {
-            reason.push_str(&format!(" +{rest} more"));
-        }
-    }
-    reason
-}
-
+// ADR-82 H04 freshness evaluation lives in `crate::verify` — the reusable
+// verification service owns it and the loop delegates (H05). The loop keeps
+// only its run-scoped clock fields (see below).
 impl AgentLoop {
     /// Create a new agent loop.
     #[allow(clippy::too_many_arguments)]
@@ -1376,10 +1151,14 @@ impl AgentLoop {
         let (eval_result, eval_verification) =
             self.run_evaluation(&files_modified, cancel.clone()).await;
 
-        // Lightweight verification for file changes
-        verification =
-            verify_file_changes(&files_modified, &self.project_root, &self.verification_stamp())
-                .await;
+        // Lightweight verification for file changes (H05: the shared sweep
+        // implementation in `crate::verify`, stamped with this run's clock).
+        verification = crate::verify::verify_file_changes(
+            &files_modified,
+            &self.project_root,
+            &self.verification_stamp(),
+        )
+        .await;
         verification.extend(eval_verification);
 
         // Phase 9: Build agent output
@@ -1947,57 +1726,25 @@ impl AgentLoop {
         Ok(())
     }
 
-    /// Phase 8: Run evaluation (test suite) on modified files. The harness
-    /// root is resolved from the run's own write evidence — nearest
-    /// manifest-bearing ancestor of the modified files under the project
-    /// root — so a project built in a subdirectory validates there, with the
-    /// session root as the fallback when nothing better exists.
-    ///
-    /// ADR-82 §3: the harness error is mapped into typed verification records
-    /// instead of collapsing to an absent value. `Cancelled` maps to a
-    /// `Cancelled` record and every other [`concerto_eval::EvalError`] to an
-    /// `Error` record carrying the error text; a finished harness run (pass or
-    /// fail) maps to a `Passed`/`Failed` record whose `detail` carries the full
-    /// [`concerto_core::types::EvalResult`] (including Harness|Fallback
-    /// provenance). `AgentOutput.eval_result` semantics are UNCHANGED: `Some`
-    /// only for an actually-finished harness run, so the existing
-    /// `eval_result.is_none()` check and the completion downgrade behave
-    /// identically — no run-outcome change.
-    ///
-    /// ADR-82 H04: harness records carry the run's current generation and the
-    /// workspace-scope write evidence (every audited write is relevant to the
-    /// workspace as a whole, F-WORKSPACE-SUPERSEDE). The content-fingerprint
-    /// axis stays empty with reason — a workspace check has no single checked
-    /// file — so harness records remain display-grade and the file-scope sweep
-    /// is the satisfiable freshness path.
+    /// Phase 8: Run evaluation (test suite) on modified files. Delegates to
+    /// the verification service's shared harness entry point
+    /// ([`crate::verify::run_project_tests`], H05 single-implementation
+    /// rule), stamped with this run's clock. `AgentOutput.eval_result`
+    /// semantics are UNCHANGED: `Some` only for an actually-finished harness
+    /// run — no run-outcome change.
     async fn run_evaluation(
         &self,
         files_modified: &[Utf8PathBuf],
         cancel: CancellationToken,
     ) -> (Option<concerto_core::types::EvalResult>, Vec<VerificationSummary>) {
-        let eval_dir = EvalEngine::resolve_manifest_root(&self.project_root, files_modified);
-        let eval_path = Utf8PathBuf::from_path_buf(eval_dir.clone())
-            .unwrap_or_else(|_| Utf8PathBuf::from("eval"));
-        let stamp = self.verification_stamp();
-        let stamp_harness = |mut record: VerificationSummary| {
-            record.generation = stamp.generation.clone();
-            record.evidence_ids = stamp.workspace_evidence();
-            record
-        };
-        match self.eval.run_scoped_in_dir(&eval_dir, files_modified, cancel).await {
-            Ok(result) => {
-                let record = stamp_harness(eval_result_record(&eval_path, &result));
-                (Some(result), vec![record])
-            }
-            Err(concerto_eval::EvalError::Cancelled) => (
-                None,
-                vec![stamp_harness(eval_error_record(
-                    &eval_path,
-                    &concerto_eval::EvalError::Cancelled,
-                ))],
-            ),
-            Err(error) => (None, vec![stamp_harness(eval_error_record(&eval_path, &error))]),
-        }
+        crate::verify::run_project_tests(
+            &self.eval,
+            &self.project_root,
+            files_modified,
+            &self.verification_stamp(),
+            cancel,
+        )
+        .await
     }
 
     /// Phase 9: Build an `AgentOutput` summarising the current progress
@@ -2117,7 +1864,7 @@ impl AgentLoop {
                 if ledger.fresh == 0 {
                     let freshness = ledger.freshness(output.verification.len());
                     return Ok(Some(AgentRunExit::Blocked {
-                        reason: strict_gate_blocked_reason(
+                        reason: crate::verify::strict_gate_blocked_reason(
                             output,
                             completed,
                             freshness,
@@ -3510,20 +3257,16 @@ impl AgentLoop {
             && file_affecting
             && !matches!(outcome, ToolOutcome::Denied)
         {
-            self.verification_epoch = self.verification_epoch.saturating_add(1);
-            let epoch = self.verification_epoch;
-            for path in &paths {
-                if let Some(canonical) =
-                    crate::tool_facts::canonical_project_path(&self.project_root, path)
-                {
-                    self.path_write_epoch.insert(canonical, epoch);
-                }
-            }
-            if let Some(event_id) = &event_id {
-                for path in &paths {
-                    self.run_write_evidence.push((path.clone(), event_id.clone()));
-                }
-            }
+            // H05: the clock advance lives in the verification service; the
+            // loop only holds the run-scoped state it evaluates against.
+            self.verification_epoch = crate::verify::advance_for_write(
+                &self.project_root,
+                &paths,
+                event_id.as_deref(),
+                self.verification_epoch,
+                &mut self.path_write_epoch,
+                &mut self.run_write_evidence,
+            );
         }
         event_id
     }
@@ -3578,15 +3321,13 @@ impl AgentLoop {
     }
 
     /// ADR-82 H04: the run's current verification generation (`{base}#{epoch}`,
-    /// `""` when the clock was never armed). Stamped on checks at check time
-    /// and compared at the gate: equality means no audited mutation landed
-    /// after the check within the same workspace base.
+    /// `""` when the clock was never armed). Delegates to the verification
+    /// service's implementation (H05 single-implementation rule).
     fn current_verification_generation(&self) -> String {
-        if self.verification_base_generation.is_empty() {
-            String::new()
-        } else {
-            format!("{}#{}", self.verification_base_generation, self.verification_epoch)
-        }
+        crate::verify::current_generation_for(
+            &self.verification_base_generation,
+            self.verification_epoch,
+        )
     }
 
     /// ADR-82 H04: the freshness context the next sweep/harness check stamps.
@@ -3617,9 +3358,7 @@ impl AgentLoop {
         }
         let project_dir = self.project_root.clone();
         let captured = tokio::task::spawn_blocking(move || {
-            let entries =
-                crate::workspace_snapshot::capture_workspace_snapshot(&project_dir, &cancel);
-            crate::workspace_snapshot::generation_for(&entries)
+            crate::verify::capture_base_generation(&project_dir, &cancel)
         })
         .await
         .unwrap_or_default();
@@ -3633,573 +3372,35 @@ impl AgentLoop {
         self.verification_base_generation = captured;
     }
 
-    /// ADR-82 H04: is this record *fresh-passing evidence* for the task right
-    /// now? The clauses, each with its cited rule:
-    ///
-    /// - (a) typed `Some(Passed)` with raw-value agreement, (b) current
-    ///   schema version, (c) the full freshness set — all three via
-    ///   [`VerificationSummary::is_passing_evidence`] (ADR-82 §3 R2); anything
-    ///   short of that (legacy `None`-outcome rows included) reports
-    ///   [`FreshnessFailure::MissingAxes`], never a pass.
-    /// - (d+e) the record's generation equals the run's current generation;
-    ///   the two ways they can differ report distinctly:
-    ///   - a differing base means the workspace generation moved on
-    ///     ([`FreshnessFailure::Generation`], ADR-65 F-GENERATION).
-    ///   - the same base with an advanced epoch is the supersession axis
-    ///     ([`FreshnessFailure::Superseded`], ADR-65 F-SUPERSEDE /
-    ///     F-WORKSPACE-SUPERSEDE as projected by the run clock, fed by the
-    ///     existing `resource_facts` dirty/supersession writes on the audited
-    ///     path). Supersession is positional, not sticky: a FILE-SCOPE record
-    ///     (the sweep — its `scope` names the single checked file) is
-    ///     superseded only when its own canonical path was written again
-    ///     after the check ([`Self::superseded_at_epoch`]); an epoch advance
-    ///     that landed on OTHER paths leaves it describing what it checked,
-    ///     so it falls through to the fingerprint re-stat below. A
-    ///     WORKSPACE-SCOPE record (the eval harness — its scope names no
-    ///     single file) has no path to key on and stales on any executed
-    ///     write.
-    /// - (d, out-of-band) the checked bytes still hash to the recorded
-    ///   fingerprint ([`FreshnessFailure::Fingerprint`]): the ADR-65 F3-style
-    ///   live re-stat over the existing fingerprint axis, closing the
-    ///   documented known limit of the F-supersede arms (mutations outside
-    ///   the audited path).
-    ///
-    /// Pure and synchronous: it reads the run clock and re-stats at most one
-    /// file, so `decide_exit` needs no store access. A freshness verdict is a
-    /// fact evaluation, not a dispatch rule (ADR-65/ADR-71 boundaries intact).
-    fn record_freshness(&self, record: &VerificationSummary) -> Result<(), FreshnessFailure> {
-        if !record.is_passing_evidence() {
-            return Err(FreshnessFailure::MissingAxes);
-        }
-        let current = self.current_verification_generation();
-        if record.generation != current {
-            match (split_run_generation(&record.generation), split_run_generation(&current)) {
-                (Some((record_base, record_epoch)), Some((current_base, _)))
-                    if record_base == current_base =>
-                {
-                    // Same workspace base with an advanced epoch: the
-                    // supersession axis. Positional per record scope — see
-                    // the (d+e) clause above; a record that survived its own
-                    // path keeps standing and falls through to the
-                    // fingerprint re-stat.
-                    if self.superseded_at_epoch(record, record_epoch) {
-                        return Err(FreshnessFailure::Superseded);
-                    }
-                }
-                _ => return Err(FreshnessFailure::Generation),
-            }
-        }
-        if !self.fingerprint_matches(record) {
-            return Err(FreshnessFailure::Fingerprint);
-        }
-        Ok(())
-    }
-
-    /// ADR-65 scope split over the run clock: has an audited write superseded
-    /// this record, given the epoch (`record_epoch`) the record was stamped
-    /// at?
-    ///
-    /// A file-scope record ([`Self::is_file_scope_record`]) answers
-    /// positionally — superseded only when its own canonical path's
-    /// last-write epoch ([`Self::path_write_epoch`], ADR-65 F5d keys)
-    /// advanced past the record's epoch (F-SUPERSEDE). A workspace/project/
-    /// run-scope record names no single artifact, so any executed write past
-    /// its epoch supersedes it (F-WORKSPACE-SUPERSEDE). A path with no
-    /// canonical in-root key has nothing to compare positionally, so it
-    /// conservatively takes the workspace rule — never the fail-open one.
-    fn superseded_at_epoch(&self, record: &VerificationSummary, record_epoch: u64) -> bool {
-        if !self.is_file_scope_record(record) {
-            return true;
-        }
-        let Some(canonical) =
-            crate::tool_facts::canonical_project_path(&self.project_root, record.path.as_str())
-        else {
-            return true;
-        };
-        self.path_write_epoch.get(&canonical).is_some_and(|last_write| *last_write > record_epoch)
-    }
-
-    /// Whether `record` is file-scope for supersession (ADR-65 F-SUPERSEDE):
-    /// its `scope` names the single checked file — resolved the same way the
-    /// sweep hashes it ([`resolve_verification_path`]). A scope that names
-    /// anything else (the eval harness's workspace/eval-root scope — a
-    /// project, run, or directory — or a path that is not an existing file)
-    /// names no single artifact to key staleness on, so the record is
-    /// workspace-scope (F-WORKSPACE-SUPERSEDE). The check runs only when the
-    /// supersession axis is reached, keeping the common fresh path I/O-free.
-    fn is_file_scope_record(&self, record: &VerificationSummary) -> bool {
-        let scope = Utf8PathBuf::from(record.scope.as_str());
-        resolve_verification_path(&self.project_root, &scope).is_file()
-    }
-
-    /// Re-stat the checked file and compare its blake3 against the recorded
-    /// fingerprint, resolving the path exactly as the sweep hashed it. Any
-    /// doubt (unreadable, deleted, hash mismatch) is stale — never fresh.
-    fn fingerprint_matches(&self, record: &VerificationSummary) -> bool {
-        let resolved = resolve_verification_path(&self.project_root, &record.path);
-        match std::fs::read(&resolved) {
-            Ok(bytes) => blake3::hash(&bytes).to_hex().to_string() == record.content_fingerprint,
-            Err(_) => false,
-        }
-    }
-
     /// ADR-82 H04: evaluate the run-scoped verification ledger for the gated
-    /// arm of [`Self::decide_exit`]. Counts fresh-passing records, typed
-    /// passes, and collects the bounded per-record stale causes the `Blocked`
-    /// reason reports.
-    fn evaluate_gate_ledger(&self, output: &AgentOutput) -> GateLedger {
-        let mut ledger = GateLedger::default();
-        for record in &output.verification {
-            if !matches!(record.outcome, Some(VerificationOutcome::Passed)) {
-                continue;
-            }
-            ledger.typed_passes += 1;
-            match self.record_freshness(record) {
-                Ok(()) => ledger.fresh += 1,
-                Err(cause) => ledger.stale.push(StaleRecord {
-                    path: record.path.to_string(),
-                    command: record.command.clone(),
-                    cause,
-                }),
-            }
-        }
-        ledger
-    }
-}
-
-/// ADR-82 H04: the gated arm's verdict over a verification ledger.
-#[derive(Debug, Clone, Default)]
-struct GateLedger {
-    /// Records that are fresh-passing evidence right now.
-    fresh: usize,
-    /// Records with typed `Some(Passed)` (fresh or stale).
-    typed_passes: usize,
-    /// Per-record staleness causes for the `Blocked` reason.
-    stale: Vec<StaleRecord>,
-}
-
-impl GateLedger {
-    /// The reason's `freshness=` mode: `absent` when no check ever ran,
-    /// `not-passed` when checks ran and none passed, `stale` when a check
-    /// passed but every pass is out of date.
-    fn freshness(&self, record_count: usize) -> GateFreshness {
-        if self.typed_passes > 0 {
-            GateFreshness::Stale
-        } else if record_count > 0 {
-            GateFreshness::NotPassed
-        } else {
-            GateFreshness::Absent
-        }
+    /// arm of [`Self::decide_exit`]. Delegates to
+    /// [`crate::verify::evaluate_gate_ledger`].
+    fn evaluate_gate_ledger(&self, output: &AgentOutput) -> crate::verify::GateLedger {
+        crate::verify::evaluate_gate_ledger(
+            &self.project_root,
+            &self.verification_base_generation,
+            self.verification_epoch,
+            &self.path_write_epoch,
+            &output.verification,
+        )
     }
 }
 
 // ---------------------------------------------------------------------------
 // Lightweight file-level verification helpers
 // ---------------------------------------------------------------------------
-
-/// Verifier identity stamped on every sweep record (ADR-82 §3 R2 verifier axis).
-const VERIFY_SWEEP_VERIFIER: &str = "concerto-verify-sweep";
-
-/// Verifier identity stamped on every eval-harness record (ADR-82 §3 R2 verifier axis).
-const EVAL_HARNESS_VERIFIER: &str = "concerto-eval-harness";
-
-/// Build one sweep record with the freshness basis available in this context.
-///
-/// Scope and the blake3 content fingerprint come from the checked file (the
-/// fingerprint is best-effort: empty when the bytes are unreadable);
-/// `checked_at` is stamped by the constructor. `generation` and
-/// `evidence_ids` are wired by the caller ([`verify_file_changes`] applies
-/// the run's [`VerificationStamp`] over every record): with a disarmed stamp
-/// both stay empty and the record is display-grade, exactly as before H04
-/// (see [`VerificationSummary::is_passing_evidence`]).
-/// `duration_ms`/`exit_code` are set only when the check measured/spawned them.
-async fn sweep_record(
-    project_root: &std::path::Path,
-    path: &Utf8PathBuf,
-    command: &str,
-    outcome: VerificationOutcome,
-    output: String,
-    duration_ms: Option<u64>,
-    exit_code: Option<i32>,
-) -> VerificationSummary {
-    let full = resolve_verification_path(project_root, path);
-    let content_fingerprint = match tokio::fs::read(&full).await {
-        Ok(bytes) => blake3::hash(&bytes).to_hex().to_string(),
-        Err(_) => String::new(),
-    };
-    let mut record = VerificationSummary::new(path.clone(), command, outcome, output)
-        .with_verifier(VERIFY_SWEEP_VERIFIER)
-        .with_scope(path.as_str())
-        .with_content_fingerprint(content_fingerprint);
-    if let Some(duration_ms) = duration_ms {
-        record = record.with_duration_ms(duration_ms);
-    }
-    if let Some(exit_code) = exit_code {
-        record = record.with_exit_code(exit_code);
-    }
-    record
-}
-
-/// Elapsed milliseconds since `start`, saturating instead of wrapping.
-fn elapsed_ms(start: std::time::Instant) -> u64 {
-    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
-}
-
-/// Map a finished harness run (pass or fail) into its typed verification
-/// record. The `detail` carries the full [`concerto_core::types::EvalResult`]
-/// including Harness|Fallback provenance.
-fn eval_result_record(
-    eval_path: &Utf8PathBuf,
-    result: &concerto_core::types::EvalResult,
-) -> VerificationSummary {
-    let outcome =
-        if result.passed { VerificationOutcome::Passed } else { VerificationOutcome::Failed };
-    let summary = format!(
-        "eval {} {} in {}ms (exit {})",
-        result.runner,
-        if result.passed { "passed" } else { "failed" },
-        result.duration_ms,
-        result.exit_code,
-    );
-    VerificationSummary::new(eval_path.clone(), "eval", outcome, summary)
-        .with_verifier(EVAL_HARNESS_VERIFIER)
-        .with_scope(eval_path.as_str())
-        .with_duration_ms(result.duration_ms)
-        .with_exit_code(result.exit_code)
-        .with_detail(result.clone())
-}
-
-/// Map a harness error into its typed verification record — the total
-/// [`concerto_eval::EvalError`] mapping that replaces the old `.ok()`
-/// collapse: `Cancelled` maps to `Cancelled`, every other variant to `Error`
-/// carrying the error text. The wildcard arm keeps the mapping total over the
-/// `#[non_exhaustive]` error enum (unknown future variants degrade to `Error`,
-/// never to an absent value).
-fn eval_error_record(
-    eval_path: &Utf8PathBuf,
-    error: &concerto_eval::EvalError,
-) -> VerificationSummary {
-    match error {
-        concerto_eval::EvalError::Cancelled => {
-            VerificationSummary::cancelled(eval_path.clone(), "eval", "eval cancelled")
-        }
-        other => {
-            VerificationSummary::error(eval_path.clone(), "eval", format!("eval error: {other}"))
-        }
-    }
-    .with_verifier(EVAL_HARNESS_VERIFIER)
-    .with_scope(eval_path.as_str())
-}
-
-/// Run after each tool call iteration: perform extension-based verification
-/// (py_compile, cargo check, npm test, HTML/CSS reference checks) on each
-/// modified file and return structured results.
-///
-/// ADR-82 §3: every gap records an honest outcome with the same spawned
-/// commands and the same pass/fail detection as before — only the record
-/// vocabulary changes. A missing npm `test` script records `Skipped` (never
-/// `passed: true`); a missing `Cargo.toml`/`package.json` records
-/// `Unavailable` instead of no record; spawn errors record `Error`.
-///
-/// ADR-82 H04: `stamp` wires the deferred axes at the source — every record
-/// gets the run's current generation, and each file-scope record cites the
-/// run's audited write evidence for its own canonical path (existing
-/// whiteboard event ids, ADR-65 §1). A default (empty) stamp reproduces the
-/// pre-H04 display-grade records byte-identically.
-async fn verify_file_changes(
-    files: &[camino::Utf8PathBuf],
-    project_root: &std::path::Path,
-    stamp: &VerificationStamp,
-) -> Vec<VerificationSummary> {
-    let mut results = Vec::new();
-    for path in files {
-        let ext = path.extension().unwrap_or_default();
-        match ext {
-            "py" => {
-                let start = std::time::Instant::now();
-                let output = tokio::process::Command::new("python")
-                    .args(["-m", "py_compile", path.as_str()])
-                    .current_dir(project_root)
-                    .output()
-                    .await;
-                match output {
-                    Ok(out) if out.status.success() => {
-                        results.push(
-                            sweep_record(
-                                project_root,
-                                path,
-                                "py_compile",
-                                VerificationOutcome::Passed,
-                                "py_compile passed".into(),
-                                Some(elapsed_ms(start)),
-                                out.status.code(),
-                            )
-                            .await,
-                        );
-                    }
-                    Ok(out) => {
-                        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                        results.push(
-                            sweep_record(
-                                project_root,
-                                path,
-                                "py_compile",
-                                VerificationOutcome::Failed,
-                                stderr,
-                                Some(elapsed_ms(start)),
-                                out.status.code(),
-                            )
-                            .await,
-                        );
-                    }
-                    Err(e) => {
-                        results.push(
-                            sweep_record(
-                                project_root,
-                                path,
-                                "py_compile",
-                                VerificationOutcome::Error,
-                                format!("py_compile error: {e}"),
-                                Some(elapsed_ms(start)),
-                                None,
-                            )
-                            .await,
-                        );
-                    }
-                }
-            }
-            "rs" => {
-                let cargo_toml = project_root.join("Cargo.toml");
-                if cargo_toml.exists() {
-                    let start = std::time::Instant::now();
-                    let output = tokio::process::Command::new("cargo")
-                        .args(["check"])
-                        .current_dir(project_root)
-                        .output()
-                        .await;
-                    match output {
-                        Ok(out) if out.status.success() => {
-                            results.push(
-                                sweep_record(
-                                    project_root,
-                                    path,
-                                    "cargo check",
-                                    VerificationOutcome::Passed,
-                                    "cargo check passed".into(),
-                                    Some(elapsed_ms(start)),
-                                    out.status.code(),
-                                )
-                                .await,
-                            );
-                        }
-                        Ok(out) => {
-                            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                            results.push(
-                                sweep_record(
-                                    project_root,
-                                    path,
-                                    "cargo check",
-                                    VerificationOutcome::Failed,
-                                    stderr,
-                                    Some(elapsed_ms(start)),
-                                    out.status.code(),
-                                )
-                                .await,
-                            );
-                        }
-                        Err(e) => {
-                            results.push(
-                                sweep_record(
-                                    project_root,
-                                    path,
-                                    "cargo check",
-                                    VerificationOutcome::Error,
-                                    format!("cargo check error: {e}"),
-                                    Some(elapsed_ms(start)),
-                                    None,
-                                )
-                                .await,
-                            );
-                        }
-                    }
-                } else {
-                    results.push(
-                        sweep_record(
-                            project_root,
-                            path,
-                            "cargo check",
-                            VerificationOutcome::Unavailable,
-                            "unavailable: no Cargo.toml under project root; cargo check not run"
-                                .into(),
-                            None,
-                            None,
-                        )
-                        .await,
-                    );
-                }
-            }
-            "js" | "ts" | "jsx" | "tsx" => {
-                let package_json = project_root.join("package.json");
-                if package_json.exists() {
-                    let content =
-                        tokio::fs::read_to_string(&package_json).await.unwrap_or_default();
-                    if content.contains("\"test\"") {
-                        let start = std::time::Instant::now();
-                        let output = tokio::process::Command::new("npm")
-                            .args(["test"])
-                            .current_dir(project_root)
-                            .output()
-                            .await;
-                        match output {
-                            Ok(out) if out.status.success() => {
-                                results.push(
-                                    sweep_record(
-                                        project_root,
-                                        path,
-                                        "npm test",
-                                        VerificationOutcome::Passed,
-                                        "npm test passed".into(),
-                                        Some(elapsed_ms(start)),
-                                        out.status.code(),
-                                    )
-                                    .await,
-                                );
-                            }
-                            Ok(out) => {
-                                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                                results.push(
-                                    sweep_record(
-                                        project_root,
-                                        path,
-                                        "npm test",
-                                        VerificationOutcome::Failed,
-                                        stderr,
-                                        Some(elapsed_ms(start)),
-                                        out.status.code(),
-                                    )
-                                    .await,
-                                );
-                            }
-                            Err(e) => {
-                                results.push(
-                                    sweep_record(
-                                        project_root,
-                                        path,
-                                        "npm test",
-                                        VerificationOutcome::Error,
-                                        format!("npm test error: {e}"),
-                                        Some(elapsed_ms(start)),
-                                        None,
-                                    )
-                                    .await,
-                                );
-                            }
-                        }
-                    } else {
-                        results.push(
-                            sweep_record(
-                                project_root,
-                                path,
-                                "npm test",
-                                VerificationOutcome::Skipped,
-                                "skipped (no test script in package.json)".into(),
-                                None,
-                                None,
-                            )
-                            .await,
-                        );
-                    }
-                } else {
-                    results.push(
-                        sweep_record(
-                            project_root,
-                            path,
-                            "npm test",
-                            VerificationOutcome::Unavailable,
-                            "unavailable: no package.json under project root; npm test not run"
-                                .into(),
-                            None,
-                            None,
-                        )
-                        .await,
-                    );
-                }
-            }
-            "html" | "css" => {
-                let file_content = tokio::fs::read_to_string(path).await.unwrap_or_default();
-                let mut missing = Vec::new();
-                for line in file_content.lines() {
-                    if let Some(start) = line.find("href=\"") {
-                        if let Some(end) = line[start + 6..].find("\"") {
-                            let href = &line[start + 6..start + 6 + end];
-                            if !href.starts_with("http")
-                                && !href.starts_with("#")
-                                && !href.is_empty()
-                            {
-                                let referenced = project_root.join(href);
-                                if !referenced.exists() {
-                                    missing.push(href.to_string());
-                                }
-                            }
-                        }
-                    }
-                    if let Some(start) = line.find("src=\"") {
-                        if let Some(end) = line[start + 5..].find("\"") {
-                            let src = &line[start + 5..start + 5 + end];
-                            if !src.starts_with("http") && !src.is_empty() {
-                                let referenced = project_root.join(src);
-                                if !referenced.exists() {
-                                    missing.push(src.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-                if missing.is_empty() {
-                    results.push(
-                        sweep_record(
-                            project_root,
-                            path,
-                            "reference check",
-                            VerificationOutcome::Passed,
-                            "all referenced local files exist".into(),
-                            None,
-                            None,
-                        )
-                        .await,
-                    );
-                } else {
-                    results.push(
-                        sweep_record(
-                            project_root,
-                            path,
-                            "reference check",
-                            VerificationOutcome::Failed,
-                            format!("missing referenced files: {missing:?}"),
-                            None,
-                            None,
-                        )
-                        .await,
-                    );
-                }
-            }
-            _ => {}
-        }
-    }
-    // ADR-82 H04: wire the deferred axes at the source. Generation is the
-    // run's current generation (empty when the clock is disarmed — the record
-    // then stays display-grade, exactly as before); evidence is the run's
-    // audited write evidence for the record's own canonical path.
-    for record in &mut results {
-        record.generation = stamp.generation.clone();
-        record.evidence_ids = stamp.evidence_for(project_root, &record.path);
-    }
-    results
-}
+//
+// The sweep, its record builders, and the harness mapping live in
+// [`crate::verify`] (H05 single-implementation rule); the loop calls them.
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::verify::{
+        eval_error_record, eval_result_record, verify_file_changes, EVAL_HARNESS_VERIFIER,
+        VERIFY_SWEEP_VERIFIER,
+    };
+    use concerto_core::types::VerificationOutcome;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -10059,7 +9260,13 @@ mod tests {
         let decision = loop_.decide_exit(&task, &output, 1, 1, 0, &None, true, Vec::new()).unwrap();
         assert!(decision.is_none(), "an unrelated write must not supersede the page_a pass");
         assert_eq!(
-            loop_.record_freshness(&records[0]),
+            crate::verify::record_freshness(
+                root.path(),
+                &loop_.verification_base_generation,
+                loop_.verification_epoch,
+                &loop_.path_write_epoch,
+                &records[0],
+            ),
             Ok(()),
             "the page_a pass must still evaluate fresh after the page_b write"
         );
