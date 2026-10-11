@@ -24,15 +24,13 @@ use std::fmt;
 
 use zeroize::Zeroize;
 
-/// Count of buffers wiped on this test thread; test builds only.
-///
-/// `Drop` for [`SecretString`] is one line, but "the value was wiped" is a
-/// behavioral contract, not something a reader should have to trace by eye.
-/// The counter lets the drop test assert that the wipe path actually ran for
-/// a value that went out of scope, without reading freed memory. Thread-local
-/// observation keeps unrelated parallel tests from changing that count.
 #[cfg(test)]
 std::thread_local! {
+    /// Count of buffers wiped on this test thread; test builds only.
+    ///
+    /// The counter lets the drop test assert that the wipe path actually ran
+    /// without reading freed memory. Thread-local observation keeps unrelated
+    /// parallel tests from changing that count.
     static SECRET_WIPES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
