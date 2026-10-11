@@ -18,11 +18,20 @@ Started reopens it. Completion replaces the current graph summary with the actua
 completion outcome. The graph details show the current summary so an unfinished
 reason is visible before opening logs.
 
-At the desktop dispatch boundary, multi-agent runs carrying a resume checkpoint
-retain their existing graph and chat cards, including if provider validation
-blocks the attempt. Fresh runs and single-agent runs clear these views as
-before. This uses the same checkpoint option already passed to the request
-builder and does not inspect, modify or accept the checkpoint on the UI's behalf.
+At the desktop dispatch boundary, a local multi-agent checkpoint is a candidate.
+Keep the existing graph/cards until the backend publishes ResumeRequested for
+the active session during the active run. That event confirms retention before
+specialist work. If the backend discards the checkpoint for a new objective,
+invalid scope or malformed data, clear the old views before the first Created
+or Started event. A run that settles without specialists clears an unconfirmed
+candidate at completion. Provider validation failures leave the held views
+available for retry. Fresh runs without a checkpoint and single-agent runs
+keep their existing immediate reset behavior.
+
+This presentation state does not interpret the checkpoint, classify the user's
+message, or decide whether the backend resumes. The request builder and
+checkpoint payload are unchanged. Stale resume signals from another session or
+outside an active run cannot confirm candidate retention.
 
 Graph persistence already carries stable task IDs, states, and logs. A restored
 held row reactivates in place; if no creation or saved graph exists, Started
@@ -32,7 +41,7 @@ historical ownership for a transcript restored after restart.
 
 ## Scope and validation
 
-Only desktop event translation/routing, the view reset at dispatch, graph/chat
+Only desktop event translation/routing, application presentation state, graph/chat
 views and regression tests change, plus this documentation. Backend events, shared harness schemas, checkpoint/resume
 wiring, runtime construction, verification policy and CLI are unchanged.
 The change is independent of PRs #312 and #315 and branches from pinned dev
@@ -41,5 +50,6 @@ The change is independent of PRs #312 and #315 and branches from pinned dev
 Regression coverage exercises backend lifecycle translation through both views,
 held and blocked continuation without another creation, retargeting, graph
 save/load, history and card-anchor retention, resume versus fresh dispatch
-boundaries, distinct same-role tasks, and Started without saved creation. Rust CI is required because the editing
+boundaries, session-scoped resume confirmation, fresh completion without
+specialists, distinct same-role tasks, and Started without saved creation. Rust CI is required because the editing
 environment has no Rust toolchain.

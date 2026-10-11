@@ -82,6 +82,10 @@ pub enum DesktopEvent {
         tool_name: String,
         approved: bool,
     },
+    /// The backend retained a checkpoint for the active orchestration run.
+    ResumeRequested {
+        session_id: Ulid,
+    },
     /// Sub-task created in multi-agent mode.
     SubTaskCreated {
         task_id: TaskId,
@@ -304,6 +308,9 @@ fn translate_approval_event(event: &BackendEvent) -> Option<DesktopEvent> {
 /// messages or structured subtask events.
 fn translate_coordinator_event(event: &BackendEvent) -> Option<DesktopEvent> {
     match &event.kind {
+        EventKind::ResumeRequested { session_id, .. } => {
+            Some(DesktopEvent::ResumeRequested { session_id: *session_id })
+        }
         EventKind::MultiAgentModeStarted { task_id, subtask_count, .. } => activity(
             "Coordinator",
             format!("Decomposed task {task_id} into {subtask_count} specialist subtasks."),
@@ -734,6 +741,9 @@ pub fn route_event(
                 tool_name: tool_name.clone(),
                 approved: *approved,
             });
+        }
+        DesktopEvent::ResumeRequested { .. } => {
+            // Confirms continuation at App level before specialist events arrive.
         }
         DesktopEvent::SessionSaved => {
             // Status bar refresh is handled at App level

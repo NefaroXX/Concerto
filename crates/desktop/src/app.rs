@@ -576,6 +576,9 @@ pub struct App {
     /// Passed to `AgentRunRequest` on the next submit so the coordinator can
     /// resume the graph without re-architecting.
     pub resume_checkpoint_json: Option<String>,
+    /// Keep candidate continuation views until the backend confirms resume or
+    /// begins fresh specialist work. This is transient presentation state.
+    pending_task_view_reset: bool,
 
     /// ADR-60 D7 (interrupt-safe resume): bumped every time an in-flight run
     /// settles (completion, failure, or the unwind after cancellation). The
@@ -884,6 +887,7 @@ impl App {
             multi_agent: initial_multi_agent,
             fast: false,
             resume_checkpoint_json: None,
+            pending_task_view_reset: false,
             run_settle_epoch: Arc::new(AtomicU64::new(0)),
             project_orchestration_keys: Vec::new(),
             orchestration_banner_dismissed: false,

@@ -2,13 +2,22 @@
 //! provider/assignment validation, and run submission.
 //!
 //! Fresh runs clear graph rows and chat cards at the dispatch boundary.
-//! Multi-agent checkpoint continuations retain those views so specialist
-//! Started events can reactivate the existing task and its history. The
+//! Candidate multi-agent continuations retain those views until the backend
+//! confirms resume or starts fresh work. Specialist Started events reactivate
+//! the existing task and its history on confirmed resumes. The
 //! request builder, checkpoint payload and async submission remain unchanged.
 
 use super::*;
 
 impl App {
+    pub(super) fn reset_pending_task_views(&mut self) {
+        if self.pending_task_view_reset {
+            self.agent_graph = views::agent_graph::State::new();
+            self.chat.begin_run();
+            self.pending_task_view_reset = false;
+        }
+    }
+
     /// Validate that the active provider/model and (in multi-agent mode) every
     /// agent assignment resolves to a ready, complete provider. Returns a
     /// human-readable reason when something is incomplete; `None` when ready.
@@ -109,10 +118,11 @@ impl App {
         if self.run_status != RunStatus::Idle {
             return iced::Task::none();
         }
-        // A checkpoint continuation belongs to the same orchestration run.
-        // Keep its task rows, cards and history so Started can reactivate them.
-        // Fresh runs still clear these views even if validation rejects dispatch.
-        if !self.multi_agent || self.resume_checkpoint_json.is_none() {
+        // A local checkpoint is only a candidate: the backend may discard it
+        // for a new objective or invalid scope. ResumeRequested confirms it;
+        // otherwise the first specialist event (or completion) resets the views.
+        self.pending_task_view_reset = self.multi_agent && self.resume_checkpoint_json.is_some();
+        if !self.pending_task_view_reset {
             self.agent_graph = views::agent_graph::State::new();
             self.chat.begin_run();
         }
