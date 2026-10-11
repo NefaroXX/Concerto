@@ -153,9 +153,12 @@ impl GenericSpecialistAgent {
                         let wire_limit = review_byte_limit
                             .saturating_sub(changed_file_context.len())
                             .saturating_sub(1);
-                        let Some(observation) =
-                            fit_review_observation(result.task_id, changed_path, observation, wire_limit)
-                        else {
+                        let Some(observation) = fit_review_observation(
+                            result.task_id,
+                            changed_path,
+                            observation,
+                            wire_limit,
+                        ) else {
                             not_inlined_entries = not_inlined_entries.saturating_add(1);
                             continue;
                         };
