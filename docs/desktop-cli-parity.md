@@ -76,15 +76,18 @@ These are real gaps, not GUI-only exclusions.
 | P2 | Editor operations | File/context selection, search, diagnostics, patch/review, attachments and external-editor integration |
 | P2 | Terminal workflow | Launch selected profile with the same toolchain/environment; only terminal-page layout is exempt |
 
-### Runtime inspection validation (2026-10-10)
+### Runtime inspection validation (2026-10-11)
 
 Focused coverage exercises checkpoint projection, malformed/missing state,
 cancellation, immutable database reads (including encrypted storage), command
-routing/JSON/filtering while another frontend holds the instance lock, stale
-TUI result disposal, keyboard navigation and rendering at 24×8–120×40.
-The implementation environment lacks Rust; build/test/lint results must be
-confirmed by PR CI before merging. Earlier validation below applies only to
-the October 3 branch, not to this change.
+routing/JSON/filtering while another frontend holds the instance lock, missing
+databases without creating data/config directories, stale TUI result disposal,
+keyboard navigation and rendering at 24×8–120×40.
+Build/test/lint validation runs in PR CI because the implementation environment
+lacks Rust. Results are recorded in [PR #298](https://github.com/NefaroXX/Concerto/pull/298),
+including formatting, workspace tests/Clippy, frontend build combinations and
+native-shell platform checks. Earlier validation below applies only to the
+October 3 branch.
 
 ### Regression checks
 

@@ -223,7 +223,10 @@ fn shell_help_states_the_protected_paths_scope_limit() {
 fn runtime_inspection_reads_saved_state_while_another_frontend_holds_the_lock() {
     let fixture = Fixture::new();
     assert!(fixture.success(&["sessions", "runtime", "--help"]).contains("--view"));
-    assert!(!fixture.dir.path().join("data/concerto/sessions.db").exists());
+    let missing = ulid::Ulid::new().to_string();
+    assert!(!fixture.command(&["sessions", "runtime", &missing, "--json"]).status.success());
+    assert!(!fixture.dir.path().join("data").exists());
+    assert!(!fixture.dir.path().join("config").exists());
     fixture.success(&["sessions", "list"]);
     let id = ulid::Ulid::new().to_string();
     let state = serde_json::json!({

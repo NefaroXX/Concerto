@@ -135,6 +135,13 @@ fn run_cli_inner(
     if remaining.first().map(String::as_str) == Some("logs") {
         return run_logs_subcommand(&remaining[1..]);
     }
+    // Saved runtime inspection is session-scoped. Avoid selecting/saving a
+    // project just to read it (including help and missing-database errors).
+    if remaining.first().map(String::as_str) == Some("sessions")
+        && remaining.get(1).map(String::as_str) == Some("runtime")
+    {
+        return dispatch::runtime::run(&remaining[2..]);
+    }
     if explicit_project.is_none() && remaining.first().map(String::as_str) == Some("projects") {
         return run_projects_subcommand(&remaining[1..]);
     }
@@ -1449,7 +1456,7 @@ fn parse_session_id(value: &str) -> anyhow::Result<concerto_core::ids::Ulid> {
         .map_err(|error| anyhow::anyhow!("invalid session id '{value}': {error}"))
 }
 
-/// Shell and session commands own their operands, including subcommand help.
+/// Shell and runtime inspection commands own their operands and subcommand help.
 /// Project/theme option values are skipped so a directory named shell or sessions
 /// stays a value rather than ending startup flag parsing.
 pub fn startup_arguments(args: &[String]) -> &[String] {
@@ -1457,7 +1464,10 @@ pub fn startup_arguments(args: &[String]) -> &[String] {
     while index < args.len() {
         match args[index].as_str() {
             "--project" | "-p" | "--theme" => index += 2,
-            "shell" | "sessions" => return &args[..index],
+            "shell" => return &args[..index],
+            "sessions" if args.get(index + 1).map(String::as_str) == Some("runtime") => {
+                return &args[..index];
+            }
             value if value.starts_with('-') => index += 1,
             _ => break,
         }
@@ -1653,17 +1663,17 @@ mod tests {
         assert!(project.is_none());
     }
 
-    // verifies: native operands survive all startup parsing, including program-specific project/theme flags.
     #[test]
     fn runtime_help_belongs_to_the_session_command_in_both_launchers() {
-        let args = ["--fast", "--project", "sessions", "sessions", "runtime", "--help"]
-            .map(str::to_owned);
+        let args =
+            ["--fast", "--project", "sessions", "sessions", "runtime", "--help"].map(str::to_owned);
         assert_eq!(startup_arguments(&args), &args[..3]);
         let (_, fast, _, _, remaining) = parse_cli_args(args.iter());
         assert!(fast);
         assert_eq!(remaining, args[1..]);
     }
 
+    // verifies: native operands survive all startup parsing, including program-specific project/theme flags.
     #[test]
     fn native_shell_preserves_program_flags() {
         let args = [

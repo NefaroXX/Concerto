@@ -795,7 +795,9 @@ impl SqliteSessionStore {
         if cancel.is_cancelled() {
             return Err(SessionError::Storage("session inspection cancelled".into()));
         }
-        let path = crate::app_data_dir()?.join("sessions.db");
+        let path = dirs::data_dir()
+            .map(|dir| dir.join("concerto/sessions.db"))
+            .ok_or_else(|| SessionError::Storage("unable to determine data directory".into()))?;
         let settings = AuditSettings::from_global_config()?;
         let key = if settings.encrypt_at_rest {
             if !is_at_rest_encrypted(&path) {
