@@ -18,6 +18,7 @@ pub mod agents;
 mod bypass_decision;
 pub mod capsule;
 pub mod checkpoint;
+mod completion_evidence;
 pub mod conflict;
 pub mod consolidation;
 mod consultation;

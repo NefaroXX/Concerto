@@ -36,6 +36,20 @@ pub(crate) async fn record_decision_row(
     decision: &str,
     reason: &str,
 ) {
+    record_scoped_decision_row(executor, pool, session_id, None, decision, reason).await;
+}
+
+/// Record a decision attributed to one orchestration run. Unscoped bypass
+/// callers keep their historical payload; completion exemptions use this
+/// seam so another run cannot inherit the exemption.
+pub(crate) async fn record_scoped_decision_row(
+    executor: Option<&ToolExecutor>,
+    pool: Option<&sqlx::SqlitePool>,
+    session_id: Ulid,
+    run_id: Option<&str>,
+    decision: &str,
+    reason: &str,
+) {
     if let Some(executor) = executor {
         executor
             .record_coordinator_decision(
@@ -61,6 +75,7 @@ pub(crate) async fn record_decision_row(
                 "reason": reason,
                 "required_output": decision,
                 "supporting_evidence_ids": [],
+                "run_id": run_id,
             }),
             pre_image_hash: None,
             created_at: crate::tool_facts::unix_ms(),
