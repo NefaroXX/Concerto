@@ -1516,7 +1516,6 @@ fn fresh_and_single_agent_dispatches_clear_previous_task_views() {
     }
 }
 
-
 fn push_provider(app: &mut App, id: &str, provider: &str, model: &str) {
     app.settings.providers.push(ProviderConfig {
         id: id.into(),
