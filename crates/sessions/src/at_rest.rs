@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 
 use concerto_config::credentials::CredentialStore;
 use concerto_config::AppConfig;
+use concerto_core::CancellationToken;
 use sqlx::pool::PoolOptions;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 use sqlx::{AssertSqlSafe, ConnectOptions as _, Connection, SqliteConnection, SqlitePool};
@@ -315,7 +316,10 @@ pub(crate) fn plain_options(db_path: &Path) -> SqliteConnectOptions {
 
 /// Open an existing database without schema, retention, encryption or recovery
 /// mutations. SQLite's read-only flag is authoritative for every pooled handle.
-async fn read_only_pool(db_path: &Path, key: Option<&AtRestKey>) -> Result<SqlitePool, SessionError> {
+async fn read_only_pool(
+    db_path: &Path,
+    key: Option<&AtRestKey>,
+) -> Result<SqlitePool, SessionError> {
     let mut options = SqliteConnectOptions::new()
         .filename(db_path)
         .read_only(true)
@@ -787,7 +791,10 @@ impl SqliteSessionStore {
     /// Does not acquire the instance lock, initialize/migrate/recover the DB,
     /// run retention, or generate encryption keys. Pending encryption setup
     /// must be completed by a normal application startup first.
-    pub async fn connect_read_only() -> Result<Self, SessionError> {
+    pub async fn connect_read_only(cancel: CancellationToken) -> Result<Self, SessionError> {
+        if cancel.is_cancelled() {
+            return Err(SessionError::Storage("session inspection cancelled".into()));
+        }
         let path = crate::app_data_dir()?.join("sessions.db");
         let settings = AuditSettings::from_global_config()?;
         let key = if settings.encrypt_at_rest {
@@ -801,13 +808,21 @@ impl SqliteSessionStore {
                 .ok()
                 .filter(|value| !value.trim().is_empty())
                 .or_else(|| CredentialStore::new().get(AT_REST_KEY_ACCOUNT).ok())
-                .ok_or_else(|| SessionError::Storage("existing at-rest key is unavailable".into()))?;
+                .ok_or_else(|| {
+                    SessionError::Storage("existing at-rest key is unavailable".into())
+                })?;
             Some(AtRestKey::parse_hex(&raw)?)
         } else {
             ensure_not_at_rest_encrypted(&path)?;
             None
         };
-        let pool = read_only_pool(&path, key.as_ref()).await?;
+        let pool = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return Err(SessionError::Storage("session inspection cancelled".into()));
+            }
+            result = read_only_pool(&path, key.as_ref()) => result?,
+        };
         Ok(Self { pool, _data_dir_lock: None, at_rest_key: key })
     }
 
@@ -853,6 +868,15 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn cancelled_inspection_does_not_open_storage() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = SqliteSessionStore::connect_read_only(cancel).await;
+        let message = result.err().map(|error| error.to_string()).unwrap_or_default();
+        assert!(message.contains("session inspection cancelled"));
+    }
+
+    #[tokio::test]
     async fn read_only_inspection_never_initializes_or_changes_schema() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("inspection.db");
@@ -860,15 +884,21 @@ mod tests {
         assert!(!path.exists());
         let writer = PoolOptions::new()
             .connect_with(SqliteConnectOptions::new().filename(&path).create_if_missing(true))
-            .await.unwrap();
+            .await
+            .unwrap();
         sqlx::query("CREATE TABLE fixture (value TEXT)").execute(&writer).await.unwrap();
         sqlx::query("INSERT INTO fixture VALUES ('unchanged')").execute(&writer).await.unwrap();
         let reader = read_only_pool(&path, None).await.unwrap();
-        let value: String = sqlx::query_scalar("SELECT value FROM fixture").fetch_one(&reader).await.unwrap();
+        let value: String =
+            sqlx::query_scalar("SELECT value FROM fixture").fetch_one(&reader).await.unwrap();
         assert_eq!(value, "unchanged");
         assert!(sqlx::query("DELETE FROM fixture").execute(&reader).await.is_err());
         assert!(sqlx::query("CREATE TABLE unwanted (value TEXT)").execute(&reader).await.is_err());
-        let tables: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type = 'table'").fetch_one(&reader).await.unwrap();
+        let tables: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type = 'table'")
+                .fetch_one(&reader)
+                .await
+                .unwrap();
         assert_eq!(tables, 1, "inspection must not run Concerto migrations");
         reader.close().await;
         writer.close().await;
@@ -882,7 +912,8 @@ mod tests {
         let key = AtRestKey::parse_hex(&"12".repeat(32)).unwrap();
         let store = SqliteSessionStore::connect_with_at_rest(&path, &key).await.unwrap();
         let reader = read_only_pool(&path, Some(&key)).await.unwrap();
-        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions").fetch_one(&reader).await.unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM sessions").fetch_one(&reader).await.unwrap();
         assert_eq!(count, 0);
         assert!(sqlx::query("DELETE FROM sessions").execute(&reader).await.is_err());
         reader.close().await;

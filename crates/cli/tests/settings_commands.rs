@@ -219,7 +219,6 @@ fn shell_help_states_the_protected_paths_scope_limit() {
     assert!(shown.contains(note), "security show is missing the scope note: {shown}");
 }
 
-
 #[test]
 fn runtime_inspection_reads_saved_state_while_another_frontend_holds_the_lock() {
     let fixture = Fixture::new();
@@ -234,7 +233,8 @@ fn runtime_inspection_reads_saved_state_while_another_frontend_holds_the_lock() 
         "total_cost": 0.0, "total_tool_calls": 0, "provider_metrics": [],
         "all_files": [], "subtask_attempts": {}, "retry_feedback": {},
         "world_model": {"objective": "portable runtime inspection"}
-    }).to_string();
+    })
+    .to_string();
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let pool = sqlx::SqlitePool::connect_with(
@@ -251,7 +251,8 @@ fn runtime_inspection_reads_saved_state_while_another_frontend_holds_the_lock() 
         &fixture.dir.path().join("data/concerto"),
         Some(std::time::Duration::from_secs(1)),
         None,
-    ).unwrap();
+    )
+    .unwrap();
     let output = fixture.success(&["sessions", "runtime", &id, "--json"]);
     let value: serde_json::Value = serde_json::from_str(&output).unwrap();
     assert_eq!(value["session_id"], id);

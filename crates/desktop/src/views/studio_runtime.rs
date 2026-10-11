@@ -13,12 +13,9 @@
 //! crash and never a blocking wait.
 
 pub use concerto_orchestrator::studio_runtime::{
-    CheckpointStudioRuntimeReader, StudioRuntimeReader, StudioRuntimeSnapshot,
-    TaskClassSuitability,
+    CheckpointStudioRuntimeReader, StudioRuntimeReader, StudioRuntimeSnapshot, TaskClassSuitability,
 };
 
-#[cfg(test)]
-use std::sync::Arc;
 #[cfg(test)]
 use concerto_core::{ids::Ulid, CancellationToken};
 #[cfg(test)]
@@ -27,6 +24,8 @@ use concerto_orchestrator::studio_runtime::{suitability_rankings, StudioRuntimeE
 use concerto_orchestrator::suitability::{SuitabilityState, TaskClass};
 #[cfg(test)]
 use concerto_orchestrator::world_model::WorldModel;
+#[cfg(test)]
+use std::sync::Arc;
 #[cfg(test)]
 use time::OffsetDateTime;
 

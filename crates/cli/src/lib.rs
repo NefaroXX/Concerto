@@ -1449,14 +1449,15 @@ fn parse_session_id(value: &str) -> anyhow::Result<concerto_core::ids::Ulid> {
         .map_err(|error| anyhow::anyhow!("invalid session id '{value}': {error}"))
 }
 
-/// Concerto flags end before native command operands, which may contain any flag.
-/// Project/theme option values are skipped so a directory named shell stays a value.
+/// Shell and session commands own their operands, including subcommand help.
+/// Project/theme option values are skipped so a directory named shell or sessions
+/// stays a value rather than ending startup flag parsing.
 pub fn startup_arguments(args: &[String]) -> &[String] {
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--project" | "-p" | "--theme" => index += 2,
-            "shell" => return &args[..index],
+            "shell" | "sessions" => return &args[..index],
             value if value.starts_with('-') => index += 1,
             _ => break,
         }
@@ -1528,7 +1529,9 @@ pub fn parse_cli_args<'a>(
     let mut reconfigure = false;
     let mut reduced_motion: Option<bool> = None;
     let mut remaining = Vec::new();
-    for arg in args {
+    let args: Vec<String> = args.cloned().collect();
+    let startup_count = startup_arguments(&args).len();
+    for arg in &args[..startup_count] {
         match arg.as_str() {
             "--multi-agent" | "-m" => multi_agent = true,
             "--fast" | "-f" => fast = true,
@@ -1555,6 +1558,7 @@ pub fn parse_cli_args<'a>(
             _ => remaining.push(arg.clone()),
         }
     }
+    remaining.extend_from_slice(&args[startup_count..]);
     (multi_agent, fast, reconfigure, reduced_motion, remaining)
 }
 
@@ -1650,6 +1654,16 @@ mod tests {
     }
 
     // verifies: native operands survive all startup parsing, including program-specific project/theme flags.
+    #[test]
+    fn runtime_help_belongs_to_the_session_command_in_both_launchers() {
+        let args = ["--fast", "--project", "sessions", "sessions", "runtime", "--help"]
+            .map(str::to_owned);
+        assert_eq!(startup_arguments(&args), &args[..3]);
+        let (_, fast, _, _, remaining) = parse_cli_args(args.iter());
+        assert!(fast);
+        assert_eq!(remaining, args[1..]);
+    }
+
     #[test]
     fn native_shell_preserves_program_flags() {
         let args = [

@@ -201,7 +201,15 @@ mod tests {
     #[tokio::test]
     async fn reader_loads_checkpoint_without_changing_stored_state() {
         let store = Arc::new(SqliteSessionStore::connect_in_memory().await.unwrap());
-        let session = store.create_session(&camino::Utf8PathBuf::from("/project"), "test", "test", CancellationToken::new()).await.unwrap();
+        let session = store
+            .create_session(
+                &camino::Utf8PathBuf::from("/project"),
+                "test",
+                "test",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
         let record = OrchestrationCheckpointRecord {
             session_id: session.id,
             run_id: Ulid::new(),
@@ -218,19 +226,31 @@ mod tests {
                 "total_cost": 0.0, "total_tool_calls": 0, "provider_metrics": [],
                 "all_files": [], "subtask_attempts": {}, "retry_feedback": {},
                 "world_model": {"objective": "inspect this saved objective"}
-            }).to_string(),
+            })
+            .to_string(),
             completed: false,
             updated_at: OffsetDateTime::now_utc(),
         };
         store.save_orchestration_checkpoint(&record).await.unwrap();
         let reader = CheckpointStudioRuntimeReader::new(store.clone());
         let snapshot = reader.load(session.id, CancellationToken::new()).await.unwrap();
-        assert_eq!(snapshot.world_model.unwrap().objective.as_deref(), Some("inspect this saved objective"));
-        assert_eq!(store.load_orchestration_checkpoint(session.id).await.unwrap().unwrap().state_json, record.state_json);
+        assert_eq!(
+            snapshot.world_model.unwrap().objective.as_deref(),
+            Some("inspect this saved objective")
+        );
+        assert_eq!(
+            store.load_orchestration_checkpoint(session.id).await.unwrap().unwrap().state_json,
+            record.state_json
+        );
 
         let malformed = OrchestrationCheckpointRecord { state_json: "broken".into(), ..record };
         store.save_orchestration_checkpoint(&malformed).await.unwrap();
-        assert!(reader.load(session.id, CancellationToken::new()).await.unwrap_err().to_string().contains("parse failed"));
+        assert!(reader
+            .load(session.id, CancellationToken::new())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("parse failed"));
         let cancel = CancellationToken::new();
         cancel.cancel();
         assert!(reader.load(session.id, cancel).await.unwrap().is_empty());

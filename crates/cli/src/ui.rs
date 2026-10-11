@@ -1466,7 +1466,9 @@ mod tests {
         for (width, height) in [(24, 8), (40, 12), (80, 24), (120, 40)] {
             let mut app = App::new();
             app.screen = Screen::RuntimeInspector;
-            app.runtime_inspector.text = "Saved checkpoint\nDecision journal\nWorld model\nFailure diagnoses\nSuitability".into();
+            app.runtime_inspector.text =
+                "Saved checkpoint\nDecision journal\nWorld model\nFailure diagnoses\nSuitability"
+                    .into();
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal.draw(|frame| super::draw(frame, &app)).unwrap();
             let text = buffer_text(&terminal);

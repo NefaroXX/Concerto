@@ -31,7 +31,8 @@ struct Options {
 
 fn parse_args(args: &[String]) -> anyhow::Result<Options> {
     let id = args.first().ok_or_else(|| anyhow::anyhow!(USAGE))?;
-    let session_id = id.parse().map_err(|_| anyhow::anyhow!("invalid session id '{id}'; {USAGE}"))?;
+    let session_id =
+        id.parse().map_err(|_| anyhow::anyhow!("invalid session id '{id}'; {USAGE}"))?;
     let mut options = Options { session_id, view: View::All, limit: DEFAULT_LIMIT, json: false };
     let mut index = 1;
     while index < args.len() {
@@ -53,9 +54,8 @@ fn parse_args(args: &[String]) -> anyhow::Result<Options> {
                         _ => anyhow::bail!("unknown runtime view '{value}'; {USAGE}"),
                     };
                 } else {
-                    options.limit = value
-                        .parse()
-                        .map_err(|_| anyhow::anyhow!("invalid limit; {USAGE}"))?;
+                    options.limit =
+                        value.parse().map_err(|_| anyhow::anyhow!("invalid limit; {USAGE}"))?;
                     if !(1..=1000).contains(&options.limit) {
                         anyhow::bail!("limit must be between 1 and 1000; {USAGE}");
                     }
@@ -79,7 +79,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<()> {
         let cancel = CancellationToken::new();
         tokio::select! {
             result = async {
-                let store = Arc::new(concerto_sessions::SqliteSessionStore::connect_read_only().await?);
+                let store = Arc::new(concerto_sessions::SqliteSessionStore::connect_read_only(cancel.clone()).await?);
                 if store.load_session(options.session_id, cancel.clone()).await?.is_none() {
                     anyhow::bail!("session {} not found", options.session_id);
                 }
@@ -147,10 +147,8 @@ fn report(snapshot: &StudioRuntimeSnapshot, options: &Options) -> Value {
 }
 
 fn render_text(report: &Value) -> anyhow::Result<String> {
-    let mut text = format!(
-        "Session {}\n{SOURCE_NOTE}\n",
-        report["session_id"].as_str().unwrap_or("unknown")
-    );
+    let mut text =
+        format!("Session {}\n{SOURCE_NOTE}\n", report["session_id"].as_str().unwrap_or("unknown"));
     if report["empty"] == true {
         text.push_str("\nNo Coordinator inspection data in the available checkpoint.\n");
     }
@@ -211,12 +209,8 @@ impl RuntimeInspector {
             let reader = CheckpointStudioRuntimeReader::new(store);
             let result = async {
                 let snapshot = reader.load(id, cancel.clone()).await?;
-                let options = Options {
-                    session_id: id,
-                    view: View::All,
-                    limit: DEFAULT_LIMIT,
-                    json: false,
-                };
+                let options =
+                    Options { session_id: id, view: View::All, limit: DEFAULT_LIMIT, json: false };
                 render_text(&report(&snapshot, &options))
             }
             .await;
@@ -294,16 +288,16 @@ mod tests {
         let diagnoses = ["old", "new"]
             .into_iter()
             .map(|code| FailureDiagnosis {
-            kind: FailureKind::Tool,
-            code: code.into(),
-            transient: true,
-            retryable: true,
-            same_agent_viable: true,
-            alternate_agent_viable: false,
-            replan_required: false,
-            evidence: "evidence-123".into(),
-            decision_id: Some("decision-456".into()),
-            artifact_path: None,
+                kind: FailureKind::Tool,
+                code: code.into(),
+                transient: true,
+                retryable: true,
+                same_agent_viable: true,
+                alternate_agent_viable: false,
+                replan_required: false,
+                evidence: "evidence-123".into(),
+                decision_id: Some("decision-456".into()),
+                artifact_path: None,
             })
             .collect();
         let snapshot = StudioRuntimeSnapshot {
@@ -314,7 +308,8 @@ mod tests {
             }),
             ..StudioRuntimeSnapshot::default()
         };
-        let options = Options { session_id: Ulid::new(), view: View::Diagnoses, limit: 1, json: true };
+        let options =
+            Options { session_id: Ulid::new(), view: View::Diagnoses, limit: 1, json: true };
         let value = report(&snapshot, &options);
         assert_eq!(value["totals"]["diagnoses"], 2);
         assert_eq!(value["data"]["diagnoses"].as_array().unwrap().len(), 1);
