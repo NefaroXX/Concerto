@@ -126,13 +126,19 @@ impl ToolFactContext {
     /// Record a completed tool execution as a `ToolExecuted` whiteboard event
     /// and sync the derived `resource_facts` store. **Never fails the caller**:
     /// every persistence error degrades to a warning.
+    ///
+    /// Returns the appended whiteboard `event_id` when the event landed, so
+    /// run-scoped consumers (ADR-82 H04 freshness stamping) can cite the
+    /// existing event id as backing evidence; `None` when the writer is
+    /// disabled or the append failed. Ignoring the return is source-compatible
+    /// for existing callers.
     pub async fn record_tool_executed(
         &self,
         fact: &ToolExecutedFact<'_>,
         cancel: &CancellationToken,
-    ) {
+    ) -> Option<String> {
         let Some(pool) = &self.pool else {
-            return;
+            return None;
         };
 
         // Fresh post-execution observation of the affected paths, so the event
@@ -192,7 +198,7 @@ impl ToolFactContext {
                 %err,
                 "tool fact: whiteboard append failed; fact dropped"
             );
-            return;
+            return None;
         }
 
         // Derive the store from the log entry (log remains the source of truth).
@@ -243,6 +249,7 @@ impl ToolFactContext {
                 );
             }
         }
+        Some(event_id)
     }
 
     /// ADR-65 §4: record that a read was **served from cache** rather than
