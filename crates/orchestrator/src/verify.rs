@@ -131,12 +131,14 @@ pub const VERIFY_HONESTY_NOTE: &str =
     "command success proves only the command's declared assertion (see adapters[].proves); \
      a passing record is evidence for exactly that assertion, nothing more";
 
-/// Notice carried on the envelope when the caller reported uncommitted
-/// overlay state: the records describe on-disk bytes, never the claimed
-/// overlay state.
+/// Notice carried on the envelope when the run cannot claim clean-disk
+/// state: the caller reported uncommitted overlay changes, live overlay state
+/// was detected, or the overlay state is simply unknown (an omitted flag with
+/// no reachable overlay source). The records describe on-disk bytes, never
+/// the claimed overlay state.
 pub const OVERLAY_PENDING_NOTICE: &str =
-    "overlay-pending: the caller reported uncommitted overlay changes that were NOT materialized \
-     before this run; records below describe on-disk bytes and may not reflect the claimed state";
+    "overlay-pending: uncommitted overlay state was reported, detected, or could not be ruled out; \
+     records below describe on-disk bytes and may not reflect the claimed state";
 
 // ---------------------------------------------------------------------------
 // Freshness (H04 logic, owned here; the loop delegates)
@@ -647,6 +649,33 @@ pub async fn sweep_record_with_verifier(
     record
 }
 
+/// One denial record for a build-check spawn the policy refused: a typed
+/// `Error` naming the denial (never a pass, never silent, never retried
+/// ungoverned). The caller never chose the command — `command` is the
+/// adapter's own label — so the denial matches the equivalent `shell` tool
+/// call for that command.
+pub async fn denied_spawn_record(
+    project_root: &Path,
+    path: &Utf8PathBuf,
+    command: &str,
+    detail: &str,
+    duration_ms: Option<u64>,
+) -> VerificationSummary {
+    sweep_record(
+        project_root,
+        path,
+        command,
+        VerificationOutcome::Error,
+        format!(
+            "policy denied: {detail} ({command} not run; \
+             the policy decision matches the equivalent shell tool call)"
+        ),
+        duration_ms,
+        None,
+    )
+    .await
+}
+
 /// Map a finished harness run (pass or fail) into its typed verification
 /// record. The `detail` carries the full [`EvalResult`] including
 /// Harness|Fallback provenance.
@@ -669,12 +698,22 @@ pub fn eval_result_record(eval_path: &Utf8PathBuf, result: &EvalResult) -> Verif
 }
 
 /// Map a harness error into its typed verification record: `Cancelled` maps
-/// to `Cancelled`, every other variant to `Error` carrying the error text.
+/// to `Cancelled`, a policy denial maps to `Error` naming the denial (the
+/// check never ran — never a pass, never silent), every other variant to
+/// `Error` carrying the error text.
 pub fn eval_error_record(eval_path: &Utf8PathBuf, error: &EvalError) -> VerificationSummary {
     match error {
         EvalError::Cancelled => {
             VerificationSummary::cancelled(eval_path.clone(), "eval", "eval cancelled")
         }
+        EvalError::Denied(detail) => VerificationSummary::error(
+            eval_path.clone(),
+            "eval",
+            format!(
+                "policy denied: {detail} (eval harness not run; \
+                 the policy decision matches the equivalent shell tool call)"
+            ),
+        ),
         other => {
             VerificationSummary::error(eval_path.clone(), "eval", format!("eval error: {other}"))
         }
@@ -739,11 +778,34 @@ pub async fn run_project_tests(
 
 /// One language-server record over `path`: empty diagnostics pass, reported
 /// diagnostics fail, both labeled editor-diagnostics-only.
+///
+/// `analyzed` names whether the server published diagnostics for this file at
+/// least once this session. A never-analyzed file yields empty diagnostics
+/// that must not read as "clean", so it records `Unavailable` instead of a
+/// pass — an unanalyzed file proves nothing either way.
 pub async fn lsp_record(
     project_root: &Path,
     path: &Utf8PathBuf,
     diagnostics: &[serde_json::Value],
+    analyzed: bool,
 ) -> VerificationSummary {
+    if !analyzed {
+        return sweep_record_with_verifier(
+            project_root,
+            path,
+            "lsp diagnostics",
+            VerificationOutcome::Unavailable,
+            format!(
+                "lsp diagnostics unavailable: {path} was never analyzed in this session \
+                 (the language server published no diagnostics for it); \
+                 empty diagnostics prove nothing. {LSP_PROVES}"
+            ),
+            None,
+            None,
+            VERIFY_LSP_VERIFIER,
+        )
+        .await;
+    }
     let rendered: Vec<String> = diagnostics
         .iter()
         .take(8)
@@ -759,7 +821,10 @@ pub async fn lsp_record(
     let (outcome, output) = if diagnostics.is_empty() {
         (
             VerificationOutcome::Passed,
-            format!("lsp diagnostics: no diagnostics reported for {path}. {LSP_PROVES}"),
+            format!(
+                "lsp diagnostics: no diagnostics reported for {path} \
+                 (analyzed in this session). {LSP_PROVES}"
+            ),
         )
     } else {
         (
@@ -866,12 +931,24 @@ pub struct SpawnOutput {
 
 /// Why a spawn did not produce output. `Cancelled` stays distinct so
 /// cancellation maps to `Cancelled` records instead of collapsing into
-/// `Error` (the total mapping the harness path already uses).
+/// `Error` (the total mapping the harness path already uses). `Denied` stays
+/// distinct so a policy refusal maps to an honestly-labeled denial record —
+/// a denied check never ran and must never fall back to an ungoverned spawn.
 #[derive(Debug, Clone)]
 pub enum SpawnError {
     Cancelled,
     Timeout(String),
     Failed(String),
+    Denied(String),
+}
+
+/// Language-server diagnostics plus whether the file was actually analyzed in
+/// this session (the server published diagnostics for it at least once — see
+/// [`concerto_lsp::LspClient::has_seen_file`]).
+#[derive(Debug, Clone)]
+pub struct LspDiagnostics {
+    pub diagnostics: Vec<serde_json::Value>,
+    pub analyzed: bool,
 }
 
 /// Language-server query failure. `Cancelled` stays distinct for the same
@@ -885,9 +962,18 @@ pub enum LspQueryError {
 /// Process execution behind the verification adapters. The production
 /// implementation spawns real check commands; tests inject a stub and count
 /// invocations through [`CountingSpawner`].
+///
+/// ADR-62 single-chokepoint rule: once a run installs its governed engine
+/// (via [`VerifySpawner::set_governed_eval`], fed by
+/// [`VerifierService::set_eval`]), spawns travel the same policy-gated
+/// `shell` path the eval harness uses — a policy decision applies exactly as
+/// it would for the equivalent `shell` tool call, the caller never chooses
+/// the command (adapters pick it), and a denial surfaces as
+/// [`SpawnError::Denied`] (reported honestly, never retried ungoverned).
 #[async_trait]
 pub trait VerifySpawner: Send + Sync {
     /// Run `program args...` in `cwd`, bounded by `timeout` and `cancel`.
+    /// `program`/`args` are adapter-chosen (never caller input).
     async fn spawn(
         &self,
         program: &str,
@@ -906,23 +992,38 @@ pub trait VerifySpawner: Send + Sync {
         cancel: &CancellationToken,
     ) -> Result<EvalResult, EvalError>;
 
-    /// Read cached language-server diagnostics for `file`.
+    /// Read cached language-server diagnostics for `file`, plus whether the
+    /// file was actually analyzed in this session.
     async fn lsp_diagnostics(
         &self,
         project_root: &Path,
         file: &Path,
         cancel: &CancellationToken,
-    ) -> Result<Vec<serde_json::Value>, LspQueryError>;
+    ) -> Result<LspDiagnostics, LspQueryError>;
+
+    /// Install the run's governed engine for [`Self::spawn`]. The default
+    /// keeps direct spawning (test/legacy contexts with no executor); the
+    /// service calls this from [`VerifierService::set_eval`] so production
+    /// runs route through the policy path.
+    fn set_governed_eval(&self, _eval: EvalEngine) {}
 }
 
 /// Production spawner: real check commands, the real harness, the real
 /// language-server cache. Every spawn is bounded by the caller's timeout and
 /// racing cancellation (`kill_on_drop` reaps on either).
-pub struct SystemSpawner;
+///
+/// Without a governed engine (no [`VerifySpawner::set_governed_eval`] call)
+/// spawns run directly, preserving the legacy sweep behavior for contexts
+/// with no executor. With one installed, [`Self::spawn`] delegates to the
+/// engine's governed command path — the exact path the harness uses when its
+/// `process_executor` is set — and a denial is reported, never bypassed.
+pub struct SystemSpawner {
+    governed_eval: Mutex<Option<EvalEngine>>,
+}
 
 impl SystemSpawner {
     pub fn new() -> Self {
-        Self
+        Self { governed_eval: Mutex::new(None) }
     }
 }
 
@@ -944,6 +1045,31 @@ impl VerifySpawner for SystemSpawner {
     ) -> Result<SpawnOutput, SpawnError> {
         if cancel.is_cancelled() {
             return Err(SpawnError::Cancelled);
+        }
+        // Governed path (ADR-62): the run's own engine — the same object the
+        // harness routes through — so build checks and test runs share one
+        // policy chokepoint. Denials and failures report honestly; there is
+        // no fallback to a direct spawn once this path is installed.
+        // (The snapshot clones out from under the lock before any `.await`.)
+        let governed = self.governed_eval.lock().unwrap_or_else(|error| error.into_inner()).clone();
+        if let Some(eval) = governed {
+            return match eval.run_command(program, args, cwd, timeout, cancel.clone()).await {
+                Ok(out) => Ok(SpawnOutput {
+                    success: out.success(),
+                    stdout: out.stdout,
+                    stderr: out.stderr,
+                    code: Some(out.exit_code),
+                }),
+                Err(EvalError::Cancelled) => Err(SpawnError::Cancelled),
+                Err(EvalError::Denied(detail)) => Err(SpawnError::Denied(detail)),
+                Err(EvalError::Timeout(_)) => Err(SpawnError::Timeout(format!(
+                    "{program} timed out after {}ms",
+                    timeout.as_millis()
+                ))),
+                Err(error) => {
+                    Err(SpawnError::Failed(format!("{program} governed spawn failed: {error}")))
+                }
+            };
         }
         let mut command = tokio::process::Command::new(program);
         command
@@ -991,7 +1117,7 @@ impl VerifySpawner for SystemSpawner {
         project_root: &Path,
         file: &Path,
         cancel: &CancellationToken,
-    ) -> Result<Vec<serde_json::Value>, LspQueryError> {
+    ) -> Result<LspDiagnostics, LspQueryError> {
         if cancel.is_cancelled() {
             return Err(LspQueryError::Cancelled);
         }
@@ -1015,7 +1141,14 @@ impl VerifySpawner for SystemSpawner {
         }
         let key = file.to_string_lossy().to_string();
         let locked = client.lock().await;
-        Ok(locked.get_diagnostics(&key).await)
+        Ok(LspDiagnostics {
+            diagnostics: locked.get_diagnostics(&key).await,
+            analyzed: locked.has_seen_file(&key).await,
+        })
+    }
+
+    fn set_governed_eval(&self, eval: EvalEngine) {
+        *self.governed_eval.lock().unwrap_or_else(|error| error.into_inner()) = Some(eval);
     }
 }
 
@@ -1086,9 +1219,13 @@ impl VerifySpawner for CountingSpawner {
         project_root: &Path,
         file: &Path,
         cancel: &CancellationToken,
-    ) -> Result<Vec<serde_json::Value>, LspQueryError> {
+    ) -> Result<LspDiagnostics, LspQueryError> {
         self.lsp_queries.fetch_add(1, Ordering::SeqCst);
         self.inner.lsp_diagnostics(project_root, file, cancel).await
+    }
+
+    fn set_governed_eval(&self, eval: EvalEngine) {
+        self.inner.set_governed_eval(eval);
     }
 }
 
@@ -1166,6 +1303,16 @@ async fn sweep_one_file(
                     )
                     .await,
                 ),
+                Err(SpawnError::Denied(detail)) => Some(
+                    denied_spawn_record(
+                        project_root,
+                        path,
+                        "py_compile",
+                        &detail,
+                        Some(elapsed_ms(start)),
+                    )
+                    .await,
+                ),
                 Err(SpawnError::Timeout(message) | SpawnError::Failed(message)) => Some(
                     sweep_record(
                         project_root,
@@ -1220,6 +1367,18 @@ async fn sweep_one_file(
                                 "cargo check cancelled".to_string(),
                                 Some(elapsed_ms(start)),
                                 None,
+                            )
+                            .await,
+                        );
+                    }
+                    Err(SpawnError::Denied(detail)) => {
+                        return Some(
+                            denied_spawn_record(
+                                project_root,
+                                path,
+                                "cargo check",
+                                &detail,
+                                Some(elapsed_ms(start)),
                             )
                             .await,
                         );
@@ -1327,6 +1486,18 @@ async fn sweep_one_file(
                                 .await,
                             );
                         }
+                        Err(SpawnError::Denied(detail)) => {
+                            return Some(
+                                denied_spawn_record(
+                                    project_root,
+                                    path,
+                                    "npm test",
+                                    &detail,
+                                    Some(elapsed_ms(start)),
+                                )
+                                .await,
+                            );
+                        }
                         Err(SpawnError::Timeout(message) | SpawnError::Failed(message)) => {
                             return Some(
                                 sweep_record(
@@ -1385,6 +1556,12 @@ async fn sweep_one_file(
 /// directly; the service's file-scope path calls
 /// [`verify_file_changes_with`] with its own spawner so both share one
 /// implementation.
+///
+/// Direct-spawn legacy: this builds its own [`SystemSpawner`] with no
+/// governed engine, so build checks spawn directly. Contexts with an executor
+/// (the loop's run path, the service) install it via
+/// [`VerifySpawner::set_governed_eval`] and call [`verify_file_changes_with`]
+/// instead.
 ///
 /// `stamp` wires the deferred H04 axes at the source — every record gets the
 /// run's current generation plus the run's audited write evidence for its
@@ -1559,7 +1736,11 @@ pub struct VerifyRequest {
 }
 
 impl VerifyRequest {
-    /// Project-wide run with the default budget.
+    /// Project-wide run with the default budget. The `overlay_pending: false`
+    /// is an explicit clean-disk attestation by the constructing caller
+    /// (service-direct callers, tests) — the `verify.run` tool surface never
+    /// defaults here; it resolves through
+    /// [`VerifierService::effective_overlay_pending`].
     pub fn project() -> Self {
         Self {
             scope: VerifyScope::Project,
@@ -1569,7 +1750,8 @@ impl VerifyRequest {
         }
     }
 
-    /// Single-file run with the default budget.
+    /// Single-file run with the default budget (same explicit clean-disk
+    /// attestation as [`Self::project`]).
     pub fn file(path: Utf8PathBuf) -> Self {
         Self {
             scope: VerifyScope::File(path),
@@ -1586,7 +1768,18 @@ pub enum VerifyError {
     Cancelled,
     Timeout(String),
     InvalidInput(String),
+    /// A build-check spawn the policy refused. Handled per-adapter as a
+    /// denial record (never a silent pass, never an ungoverned retry); it
+    /// only reaches the tool surface as a safety net.
+    Denied(String),
 }
+
+/// Live overlay-pending source: returns `true` while uncommitted overlay
+/// state exists. Installed from the run's overlay handle at registration
+/// (desktop `VirtualFs.changed_paths`); `None` (CLI, tests) means the overlay
+/// state is unreachable, and an omitted input flag then reports pending
+/// (fail-safe: unknown is never clean-disk).
+pub type OverlayPendingSource = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// The reusable verification service. Owns a per-run [`FreshnessClock`], the
 /// harness engine (upgradable to the governed executor-backed engine once
@@ -1600,6 +1793,8 @@ pub struct VerifierService {
     eval: Mutex<EvalEngine>,
     spawner: Arc<dyn VerifySpawner>,
     clock: Mutex<FreshnessClock>,
+    /// Live overlay-pending source (`None` when unreachable — CLI/tests).
+    overlay_source: Mutex<Option<OverlayPendingSource>>,
     /// Coalesced workspace-wide spawns keyed `{adapter}:{generation}`.
     /// `tokio::sync::Mutex` (not `std`) because the file-scope path holds
     /// the map across `.await` while per-file records build; the guard is
@@ -1623,20 +1818,63 @@ impl VerifierService {
         eval: EvalEngine,
         spawner: Arc<dyn VerifySpawner>,
     ) -> Self {
+        // The harness engine and the build-check spawns share one policy
+        // chokepoint: installing the governed engine here (not just for the
+        // harness) is what closes the second spawn path (ADR-62).
+        spawner.set_governed_eval(eval.clone());
         Self {
             project_root,
             eval: Mutex::new(eval),
             spawner,
             clock: Mutex::new(FreshnessClock::new()),
+            overlay_source: Mutex::new(None),
             build_cache: tokio::sync::Mutex::new(HashMap::new()),
             eval_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Install the live overlay-pending source (the run's overlay handle).
+    /// Until this is set, an omitted input flag reports pending (fail-safe).
+    pub fn set_overlay_source(&self, source: OverlayPendingSource) {
+        *self.overlay_source.lock().unwrap_or_else(|error| error.into_inner()) = Some(source);
+    }
+
+    /// Whether live overlay state is currently pending, `None` when the
+    /// overlay is unreachable (a poisoned lock reads as unreachable — the
+    /// caller then falls back to the fail-safe default, never to clean).
+    fn overlay_pending_now(&self) -> Option<bool> {
+        let guard = self.overlay_source.lock().ok()?;
+        guard.as_ref().map(|source| source())
+    }
+
+    /// Resolve the envelope's overlay-pending flag from the caller's
+    /// attestation plus live state, honest by construction:
+    /// - an explicit `true` always wins (the caller attests pending);
+    /// - live pending state overrides an explicit `false` (real state beats a
+    ///   clean claim — the overlay may hold unflushed writes the caller
+    ///   forgot);
+    /// - an omitted flag derives from live state when reachable;
+    /// - an omitted flag with no reachable state reports pending (fail-safe:
+    ///   an unknown overlay state is never reported as clean-disk).
+    pub fn effective_overlay_pending(&self, input: Option<bool>) -> bool {
+        let live = self.overlay_pending_now();
+        match (input, live) {
+            (Some(true), _) | (_, Some(true)) => true,
+            (Some(false), _) => false,
+            (None, Some(false)) => false,
+            (None, None) => true,
         }
     }
 
     /// Upgrade the harness engine (e.g. to the run's governed,
     /// executor-backed engine). The tool remains usable before the upgrade;
     /// it then spawns directly like the loop's sweep does.
+    ///
+    /// The upgrade also governs build-check spawns: the same engine object
+    /// feeds the spawner, so `cargo check` / `py_compile` / `npm test` travel
+    /// the policy path the harness uses (ADR-62 single chokepoint).
     pub fn set_eval(&self, eval: EvalEngine) {
+        self.spawner.set_governed_eval(eval.clone());
         let mut guarded = self.eval.lock().unwrap_or_else(|error| error.into_inner());
         *guarded = eval;
     }
@@ -1662,6 +1900,11 @@ impl VerifierService {
 
     /// Re-capture the workspace base (fail-soft: a failed capture keeps the
     /// previous base and every gated check then reports stale).
+    ///
+    /// When the base moved, the coalescing caches are dropped with it: they
+    /// are keyed by generation, so a moved base makes every entry
+    /// stale-but-unreachable — clearing bounds memory in a long-lived
+    /// process instead of accumulating one dead entry per workspace state.
     async fn refresh_base(&self, cancel: &CancellationToken) {
         if cancel.is_cancelled() {
             return;
@@ -1681,7 +1924,19 @@ impl VerifierService {
             );
             return;
         }
-        self.clock.lock().unwrap_or_else(|error| error.into_inner()).set_base(captured);
+        let base_changed = {
+            let mut clock = self.clock.lock().unwrap_or_else(|error| error.into_inner());
+            if clock.base == captured {
+                false
+            } else {
+                clock.set_base(captured);
+                true
+            }
+        };
+        if base_changed {
+            self.build_cache.lock().await.clear();
+            self.eval_cache.lock().unwrap_or_else(|error| error.into_inner()).clear();
+        }
     }
 
     /// Snapshot the clock fields one run needs (cloned out from under the
@@ -1919,7 +2174,9 @@ impl VerifierService {
     }
 
     /// Project-scope build adapter: one coalesced spawn per manifest kind
-    /// present (never one `cargo check` per changed file).
+    /// present (never one `cargo check` per changed file). A policy denial
+    /// becomes a denial record for that adapter (the run continues with the
+    /// other adapters) — never a silent pass, never an ungoverned retry.
     async fn project_build_records(
         &self,
         generation: &str,
@@ -1934,31 +2191,39 @@ impl VerifierService {
                 return Err(VerifyError::Cancelled);
             }
             let key = format!("build:cargo-check:{generation}");
-            let outcome =
-                self.cached_spawn(&key, "cargo", &["check"], spawn_timeout, cancel).await?;
-            let (result, output) = if outcome.success {
-                (VerificationOutcome::Passed, format!("cargo check passed. {BUILD_PROVES}"))
-            } else {
-                let detail = if outcome.stderr.is_empty() {
-                    outcome.stdout.clone()
-                } else {
-                    outcome.stderr.clone()
-                };
-                (VerificationOutcome::Failed, format!("{detail} {BUILD_PROVES}"))
-            };
-            let mut record = sweep_record(
-                &self.project_root,
-                &root_label,
-                "cargo check",
-                result,
-                output,
-                Some(outcome.duration_ms),
-                outcome.code,
-            )
-            .await;
-            record.generation = generation.to_string();
-            record.evidence_ids = stamp.workspace_evidence();
-            records.push(record);
+            match self.cached_spawn(&key, "cargo", &["check"], spawn_timeout, cancel).await {
+                Ok(outcome) => {
+                    let (result, output) = if outcome.success {
+                        (VerificationOutcome::Passed, format!("cargo check passed. {BUILD_PROVES}"))
+                    } else {
+                        let detail = if outcome.stderr.is_empty() {
+                            outcome.stdout.clone()
+                        } else {
+                            outcome.stderr.clone()
+                        };
+                        (VerificationOutcome::Failed, format!("{detail} {BUILD_PROVES}"))
+                    };
+                    let mut record = sweep_record(
+                        &self.project_root,
+                        &root_label,
+                        "cargo check",
+                        result,
+                        output,
+                        Some(outcome.duration_ms),
+                        outcome.code,
+                    )
+                    .await;
+                    record.generation = generation.to_string();
+                    record.evidence_ids = stamp.workspace_evidence();
+                    records.push(record);
+                }
+                Err(VerifyError::Denied(detail)) => {
+                    records.push(
+                        self.denied_build_record("cargo check", &detail, generation, stamp).await,
+                    );
+                }
+                Err(other) => return Err(other),
+            }
         }
         if self.project_root.join("package.json").exists() {
             if cancel.is_cancelled() {
@@ -1969,34 +2234,62 @@ impl VerifierService {
                 .unwrap_or_default();
             if content.contains("\"test\"") {
                 let key = format!("build:npm-test:{generation}");
-                let outcome =
-                    self.cached_spawn(&key, "npm", &["test"], spawn_timeout, cancel).await?;
-                let (result, output) = if outcome.success {
-                    (VerificationOutcome::Passed, format!("npm test passed. {BUILD_PROVES}"))
-                } else {
-                    let detail = if outcome.stderr.is_empty() {
-                        outcome.stdout.clone()
-                    } else {
-                        outcome.stderr.clone()
-                    };
-                    (VerificationOutcome::Failed, format!("{detail} {BUILD_PROVES}"))
-                };
-                let mut record = sweep_record(
-                    &self.project_root,
-                    &root_label,
-                    "npm test",
-                    result,
-                    output,
-                    Some(outcome.duration_ms),
-                    outcome.code,
-                )
-                .await;
-                record.generation = generation.to_string();
-                record.evidence_ids = stamp.workspace_evidence();
-                records.push(record);
+                match self.cached_spawn(&key, "npm", &["test"], spawn_timeout, cancel).await {
+                    Ok(outcome) => {
+                        let (result, output) = if outcome.success {
+                            (
+                                VerificationOutcome::Passed,
+                                format!("npm test passed. {BUILD_PROVES}"),
+                            )
+                        } else {
+                            let detail = if outcome.stderr.is_empty() {
+                                outcome.stdout.clone()
+                            } else {
+                                outcome.stderr.clone()
+                            };
+                            (VerificationOutcome::Failed, format!("{detail} {BUILD_PROVES}"))
+                        };
+                        let mut record = sweep_record(
+                            &self.project_root,
+                            &root_label,
+                            "npm test",
+                            result,
+                            output,
+                            Some(outcome.duration_ms),
+                            outcome.code,
+                        )
+                        .await;
+                        record.generation = generation.to_string();
+                        record.evidence_ids = stamp.workspace_evidence();
+                        records.push(record);
+                    }
+                    Err(VerifyError::Denied(detail)) => {
+                        records.push(
+                            self.denied_build_record("npm test", &detail, generation, stamp).await,
+                        );
+                    }
+                    Err(other) => return Err(other),
+                }
             }
         }
         Ok(records)
+    }
+
+    /// One project-scope denial record: the file-scope denial shape
+    /// re-stamped workspace-scope (same generation, workspace evidence).
+    async fn denied_build_record(
+        &self,
+        command: &str,
+        detail: &str,
+        generation: &str,
+        stamp: &VerificationStamp,
+    ) -> VerificationSummary {
+        let root_label = Utf8PathBuf::from(self.project_root.to_string_lossy().as_ref());
+        let mut record =
+            denied_spawn_record(&self.project_root, &root_label, command, detail, None).await;
+        record.generation = generation.to_string();
+        record.evidence_ids = stamp.workspace_evidence();
+        record
     }
 
     /// One coalesced workspace-wide spawn: the cache key already carries the
@@ -2044,6 +2337,7 @@ impl VerifierService {
                 Ok(timed)
             }
             Err(SpawnError::Cancelled) => Err(VerifyError::Cancelled),
+            Err(SpawnError::Denied(detail)) => Err(VerifyError::Denied(detail)),
             Err(SpawnError::Timeout(message) | SpawnError::Failed(message)) => {
                 Err(VerifyError::InvalidInput(message))
             }
@@ -2062,8 +2356,9 @@ impl VerifierService {
         }
         let full = resolve_verification_path(&self.project_root, path);
         match self.spawner.lsp_diagnostics(&self.project_root, &full, cancel).await {
-            Ok(diagnostics) => {
-                let mut record = lsp_record(&self.project_root, path, &diagnostics).await;
+            Ok(found) => {
+                let mut record =
+                    lsp_record(&self.project_root, path, &found.diagnostics, found.analyzed).await;
                 record.generation = stamp.generation.clone();
                 record.evidence_ids = stamp.evidence_for(&self.project_root, &record.path);
                 Ok(vec![record])
@@ -2219,7 +2514,9 @@ fn adapter_proves_table() -> serde_json::Value {
 
 /// Input for the `verify.run` operation. Every field is
 /// `#[serde(default)]`-tolerant: `{}` means "project scope, all adapters,
-/// default budget, clean overlay".
+/// default budget, unknown overlay" — and unknown overlay reports
+/// overlay-pending (fail-safe: only an explicit `overlay_pending: false`
+/// attests clean-disk state, and live pending state still overrides it).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct VerifyRunInput {
     /// Scope: `"project"` (default) or one workspace-relative file path.
@@ -2235,8 +2532,10 @@ pub struct VerifyRunInput {
     #[serde(default)]
     pub timeout_ms: Option<u64>,
     /// Set when the caller holds uncommitted overlay state that was NOT
-    /// materialized: the envelope then reports overlay-pending instead of
-    /// claiming clean-disk state.
+    /// materialized. Omit it only when the overlay state is unknown (the
+    /// envelope then reports overlay-pending instead of claiming clean-disk
+    /// state); pass explicit `false` only to attest that no uncommitted
+    /// overlay state exists.
     #[serde(default)]
     pub overlay_pending: Option<bool>,
 }
@@ -2259,8 +2558,11 @@ impl VerifyRunTool {
     }
 
     /// Parse a raw tool input into a [`VerifyRequest`]. The project root
-    /// comes from the session, never from the input.
+    /// comes from the session, never from the input. The overlay flag
+    /// resolves through the service (live state plus the fail-safe default),
+    /// so an omitted flag never claims clean-disk state.
     fn parse_request(
+        &self,
         input: &VerifyRunInput,
         session: &SessionContext,
     ) -> Result<VerifyRequest, ToolError> {
@@ -2307,7 +2609,7 @@ impl VerifyRunTool {
             scope,
             selector,
             timeout: Duration::from_millis(timeout_ms),
-            overlay_pending: input.overlay_pending.unwrap_or(false),
+            overlay_pending: self.service.effective_overlay_pending(input.overlay_pending),
         })
     }
 }
@@ -2322,7 +2624,9 @@ impl concerto_core::traits::tool::Tool for VerifyRunTool {
         "Run verification checks (project tests, build/syntax, LSP diagnostics, existence checks) \
          against the current workspace state and return bounded evidence records. Descriptive only: \
          a passing record proves only its adapter's declared assertion (see adapters[].proves) and \
-         never authorizes further work. Materialize any overlay state before invoking."
+         never authorizes further work. Materialize any overlay state before invoking: pass \
+         overlay_pending:false only when no uncommitted overlay state exists (an omitted flag is \
+         treated as pending, never as clean-disk)."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -2377,10 +2681,17 @@ impl concerto_core::traits::tool::Tool for VerifyRunTool {
         let parsed: VerifyRunInput = serde_json::from_value(input).map_err(|error| {
             ToolError::ExecutionFailed { message: format!("invalid verify.run input: {error}") }
         })?;
-        let request = Self::parse_request(&parsed, session)?;
+        let request = self.parse_request(&parsed, session)?;
         let records = match self.service.verify(&request, &cancel).await {
             Ok(records) => records,
             Err(VerifyError::Cancelled) => return Err(ToolError::Cancelled),
+            Err(VerifyError::Denied(detail)) => {
+                return Err(ToolError::ExecutionFailed {
+                    message: format!(
+                        "policy denied: {detail} (verify.run sub-spawn denied; no ungoverned fallback)"
+                    ),
+                });
+            }
             Err(VerifyError::Timeout(message) | VerifyError::InvalidInput(message)) => {
                 return Err(ToolError::ExecutionFailed { message });
             }
@@ -2431,12 +2742,20 @@ impl concerto_core::traits::tool::Tool for VerifyRunTool {
 /// registration so the describe tool-names snapshot covers `verify.run`.
 /// Returns the shared handle for the run wiring (the run upgrades the
 /// harness engine to the governed one once the executor exists).
+///
+/// `overlay_source` feeds the envelope's overlay-pending flag (live overlay
+/// state when reachable); `None` means unknown, and an omitted input flag
+/// then reports pending instead of claiming clean-disk state.
 pub fn register_verify_tool(
     registry: &mut ToolRegistry,
     project_root: &Path,
     eval: EvalEngine,
+    overlay_source: Option<OverlayPendingSource>,
 ) -> Arc<VerifierService> {
     let service = Arc::new(VerifierService::new(project_root.to_path_buf(), eval));
+    if let Some(source) = overlay_source {
+        service.set_overlay_source(source);
+    }
     registry.register(Box::new(VerifyRunTool::with_service(service.clone())));
     service
 }
@@ -2500,6 +2819,10 @@ mod tests {
         eval_result: StdMutex<Option<EvalResult>>,
         eval_error: StdMutex<Option<String>>,
         diagnostics: StdMutex<Vec<serde_json::Value>>,
+        /// Whether the stub reports the file as analyzed in this session
+        /// (`true` preserves the passing-LSP shape; `false` exercises the
+        /// never-analyzed `Unavailable` record).
+        analyzed: bool,
         hang_ms: AtomicU64,
     }
 
@@ -2524,6 +2847,7 @@ mod tests {
                 })),
                 eval_error: StdMutex::new(None),
                 diagnostics: StdMutex::new(Vec::new()),
+                analyzed: true,
                 hang_ms: AtomicU64::new(0),
             }
         }
@@ -2595,11 +2919,14 @@ mod tests {
             _project_root: &Path,
             _file: &Path,
             cancel: &CancellationToken,
-        ) -> Result<Vec<serde_json::Value>, LspQueryError> {
+        ) -> Result<LspDiagnostics, LspQueryError> {
             if cancel.is_cancelled() {
                 return Err(LspQueryError::Cancelled);
             }
-            Ok(self.diagnostics.lock().unwrap_or_else(|e| e.into_inner()).clone())
+            Ok(LspDiagnostics {
+                diagnostics: self.diagnostics.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+                analyzed: self.analyzed,
+            })
         }
     }
 
@@ -3070,5 +3397,265 @@ mod tests {
             .await
             .expect_err("cancelled spawn fails without launching");
         assert!(matches!(error, SpawnError::Cancelled));
+    }
+
+    /// ADR-62 (Blocker 1): a denying governed executor refuses the spawn and
+    /// the adapters report a denial record — never a silent pass, never an
+    /// ungoverned retry. The executor observes the adapter-chosen argv (the
+    /// caller never chooses the command).
+    struct DenyingExecutor {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl concerto_eval::EvalProcessExecutor for DenyingExecutor {
+        async fn execute(
+            &self,
+            program: &str,
+            args: &[&str],
+            _cwd: &Path,
+            _cancel: CancellationToken,
+        ) -> Result<ToolOutput, EvalError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            // The caller never chooses the command: adapters pick it, and the
+            // governed path sees exactly what the sweep would have spawned.
+            assert_eq!(program, "cargo");
+            assert_eq!(args, &["check"]);
+            Err(EvalError::Denied("cargo denied by policy".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn governed_spawn_denial_reports_denied_record() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        write_fixture(dir.path(), "Cargo.toml", "[package]\nname = \"demo\"\n");
+        write_fixture(dir.path(), "src/a.rs", "pub fn a() {}\n");
+        let denying = Arc::new(DenyingExecutor { calls: AtomicUsize::new(0) });
+        let engine = EvalEngine::new(dir.path())
+            .with_process_executor(denying.clone() as Arc<dyn concerto_eval::EvalProcessExecutor>);
+        let service = Arc::new(VerifierService::with_spawner(
+            dir.path().to_path_buf(),
+            engine,
+            Arc::new(SystemSpawner::new()),
+        ));
+        let cancel = CancellationToken::new();
+
+        // File-scope build check: one denial record, typed Error.
+        let records = service
+            .verify(
+                &VerifyRequest {
+                    scope: VerifyScope::File(Utf8PathBuf::from("src/a.rs")),
+                    selector: VerifySelector::BuildCheck,
+                    timeout: Duration::from_secs(30),
+                    overlay_pending: false,
+                },
+                &cancel,
+            )
+            .await
+            .expect("denial is a record");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, Some(VerificationOutcome::Error));
+        assert!(
+            records[0].output.contains("policy denied"),
+            "denial is reported honestly: {}",
+            records[0].output
+        );
+        assert!(!records[0].is_passing_evidence(), "a denied check is never passing evidence");
+        assert_eq!(
+            denying.calls.load(Ordering::SeqCst),
+            1,
+            "the governed path ran exactly once (no silent ungoverned retry)"
+        );
+
+        // Project-scope build check: the same denial through the coalesced
+        // path (a denial record for the adapter, not an aborted run).
+        let records = service
+            .verify(
+                &VerifyRequest {
+                    scope: VerifyScope::Project,
+                    selector: VerifySelector::BuildCheck,
+                    timeout: Duration::from_secs(30),
+                    overlay_pending: false,
+                },
+                &cancel,
+            )
+            .await
+            .expect("project denial is a record");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, Some(VerificationOutcome::Error));
+        assert!(records[0].output.contains("policy denied"), "{}", records[0].output);
+        assert_eq!(
+            denying.calls.load(Ordering::SeqCst),
+            2,
+            "file and project scopes each consult the governed path once"
+        );
+    }
+
+    /// Blocker 2: an omitted overlay flag never claims clean-disk state, and
+    /// live pending state overrides an explicit clean claim.
+    #[tokio::test]
+    async fn overlay_pending_omitted_is_fail_safe_and_live_state_wins() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        write_fixture(dir.path(), "page.html", "<html><body>plain</body></html>\n");
+        let policy = SimplePolicyEngine::new(vec![], Arc::new(TestAudit));
+        let session = test_session(dir.path().to_path_buf());
+
+        // No reachable overlay source + omitted flag: pending (fail-safe).
+        let (service, _counting) = stub_service(dir.path(), StubSpawner::passing());
+        let tool = VerifyRunTool::with_service(service);
+        let output = tool
+            .execute(
+                serde_json::json!({"scope": "page.html", "verifier": "existence"}),
+                &policy,
+                &session,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("verify.run executes");
+        assert!(
+            output.data["checked_state"]
+                .as_str()
+                .is_some_and(|state| state.contains("overlay-pending")),
+            "omitted flag with unreachable overlay reports pending: {}",
+            output.data["checked_state"]
+        );
+        assert_eq!(output.data["overlay_materialized"].as_bool(), Some(false));
+
+        // Live pending state overrides an explicit clean claim.
+        let (service, _counting) = stub_service(dir.path(), StubSpawner::passing());
+        service.set_overlay_source(Arc::new(|| true));
+        let tool = VerifyRunTool::with_service(service);
+        let output = tool
+            .execute(
+                serde_json::json!({"scope": "page.html", "verifier": "existence", "overlay_pending": false}),
+                &policy,
+                &session,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("verify.run executes");
+        assert!(
+            output.data["checked_state"]
+                .as_str()
+                .is_some_and(|state| state.contains("overlay-pending")),
+            "live pending state beats a clean claim: {}",
+            output.data["checked_state"]
+        );
+
+        // Live clean state + explicit clean claim: disk bytes claimed.
+        let (service, _counting) = stub_service(dir.path(), StubSpawner::passing());
+        service.set_overlay_source(Arc::new(|| false));
+        let tool = VerifyRunTool::with_service(service);
+        let output = tool
+            .execute(
+                serde_json::json!({"scope": "page.html", "verifier": "existence", "overlay_pending": false}),
+                &policy,
+                &session,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("verify.run executes");
+        assert!(
+            output.data["checked_state"].as_str().is_some_and(|state| state.starts_with("disk")),
+            "attested clean with no live pending claims disk bytes: {}",
+            output.data["checked_state"]
+        );
+        assert_eq!(output.data["overlay_materialized"].as_bool(), Some(true));
+    }
+
+    /// Blocker 3: `note_write` advances the service epoch, so a write after a
+    /// check supersedes it positionally within the run (same base).
+    #[tokio::test]
+    async fn note_write_advances_service_epoch_within_run() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        write_fixture(dir.path(), "page.html", "<html><body>plain</body></html>\n");
+        let (service, _counting) = stub_service(dir.path(), StubSpawner::passing());
+        let cancel = CancellationToken::new();
+        let request = VerifyRequest {
+            scope: VerifyScope::File(Utf8PathBuf::from("page.html")),
+            selector: VerifySelector::Existence,
+            timeout: Duration::from_secs(30),
+            overlay_pending: false,
+        };
+
+        service.note_write(&["page.html".to_string()], Some("evt-1"));
+        let records = service.verify(&request, &cancel).await.expect("verify runs");
+        assert_eq!(records.len(), 1);
+        let checked = &records[0];
+        assert_eq!(checked.outcome, Some(VerificationOutcome::Passed));
+        let (_, epoch) =
+            split_run_generation(&checked.generation).expect("the run stamps a generation");
+        assert_eq!(epoch, 1, "one noted write advances the epoch: {}", checked.generation);
+        service.check_freshness(checked, &cancel).await.expect("the just-run check is fresh");
+
+        // An intervening write (no disk change, so the base is identical)
+        // supersedes the earlier check positionally.
+        service.note_write(&["page.html".to_string()], Some("evt-2"));
+        let cause = service
+            .check_freshness(checked, &cancel)
+            .await
+            .expect_err("the intervening write must supersede the prior check");
+        assert_eq!(cause, FreshnessFailure::Superseded, "got: {}", cause.as_str());
+
+        let records = service.verify(&request, &cancel).await.expect("verify runs");
+        let (_, epoch) =
+            split_run_generation(&records[0].generation).expect("the run stamps a generation");
+        assert_eq!(epoch, 2, "the second noted write advances the epoch again");
+    }
+
+    /// LSP honesty: a never-analyzed file records `Unavailable` (its empty
+    /// diagnostics prove nothing), never a pass.
+    #[tokio::test]
+    async fn lsp_never_analyzed_file_is_not_clean() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        write_fixture(dir.path(), "a.py", "x = 1\n");
+        let mut stub = StubSpawner::passing();
+        stub.analyzed = false;
+        let (service, _counting) = stub_service(dir.path(), stub);
+        let records = service
+            .verify(
+                &VerifyRequest {
+                    scope: VerifyScope::File(Utf8PathBuf::from("a.py")),
+                    selector: VerifySelector::LspDiagnostics,
+                    timeout: Duration::from_secs(30),
+                    overlay_pending: false,
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("lsp runs");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, Some(VerificationOutcome::Unavailable));
+        assert!(
+            records[0].output.contains("never analyzed"),
+            "the record says the file was not analyzed: {}",
+            records[0].output
+        );
+        assert!(!records[0].is_passing_evidence(), "an unanalyzed file is never evidence");
+    }
+
+    /// `refresh_base` drops the coalescing caches when the base moves: they
+    /// are keyed by generation, so a moved base leaves stale-but-unreachable
+    /// entries (bounded memory in a long-lived process).
+    #[tokio::test]
+    async fn base_change_drops_coalesced_caches() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        write_fixture(dir.path(), "Cargo.toml", "[package]\nname = \"demo\"\n");
+        write_fixture(dir.path(), "src/a.rs", "pub fn a() {}\n");
+        let (service, counting) = stub_service(dir.path(), StubSpawner::passing());
+        let cancel = CancellationToken::new();
+        let project = VerifyRequest::project();
+
+        service.verify(&project, &cancel).await.expect("first runs");
+        service.verify(&project, &cancel).await.expect("second runs");
+        assert_eq!(counting.spawn_count(), 1, "same base reuses the coalesced spawn");
+        assert_eq!(counting.eval_count(), 1, "same base reuses the coalesced harness run");
+
+        // A disk change moves the content-addressed base: the next run must
+        // re-invoke instead of serving the dead generation's cache.
+        write_fixture(dir.path(), "src/b.rs", "pub fn b() {}\n");
+        service.verify(&project, &cancel).await.expect("third runs");
+        assert_eq!(counting.spawn_count(), 2, "a moved base drops the build cache");
+        assert_eq!(counting.eval_count(), 2, "a moved base drops the eval cache");
     }
 }

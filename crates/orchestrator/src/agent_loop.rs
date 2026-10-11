@@ -39,6 +39,7 @@ use crate::tool_driver::{self, TextToolDriver};
 use crate::tool_facts::{tool_outcome_for_error, ToolExecutedFact, ToolFactContext};
 use crate::tool_guard;
 use crate::verify::VerificationStamp;
+use crate::verify::{VerifierService, VerifySpawner};
 
 mod output_progress;
 use output_progress::{
@@ -201,6 +202,13 @@ pub struct AgentLoop {
     /// existing whiteboard event (ADR-65 §1). Empty when the evidence writer
     /// is disabled or no write ran — records then stay display-grade.
     run_write_evidence: Vec<(String, String)>,
+    /// ADR-82 H05: the run's shared verification service. The loop advances
+    /// the service clock on the same audited writes it advances its own clock
+    /// for (see [`Self::record_tool_fact`]), so service-side checks observe
+    /// positional supersession within the run instead of relying solely on
+    /// base-generation re-capture. `None` in unit tests and paths that never
+    /// attach a service.
+    verify_service: Option<Arc<VerifierService>>,
 }
 
 /// Maximum number of auto-continuation rounds before escalating a run to a
@@ -409,6 +417,7 @@ impl AgentLoop {
             verification_epoch: 0,
             path_write_epoch: HashMap::new(),
             run_write_evidence: Vec::new(),
+            verify_service: None,
         }
     }
 
@@ -474,6 +483,16 @@ impl AgentLoop {
     /// next-run semantics (read at run start, like every other config knob).
     pub fn with_strict_verification_gate(mut self, enabled: bool) -> Self {
         self.strict_verification_gate = enabled;
+        self
+    }
+
+    /// Attach the run's shared verification service (ADR-82 H05). The loop
+    /// advances the service clock on the audited-write path so service-side
+    /// freshness observes the same writes the loop clock sees; the service
+    /// stays usable without it (base-generation re-capture still
+    /// invalidates). Wired from `run_shared_agent` (`runtime_runner.rs`).
+    pub fn with_verifier_service(mut self, service: Arc<VerifierService>) -> Self {
+        self.verify_service = Some(service);
         self
     }
 
@@ -1153,10 +1172,21 @@ impl AgentLoop {
 
         // Lightweight verification for file changes (H05: the shared sweep
         // implementation in `crate::verify`, stamped with this run's clock).
-        verification = crate::verify::verify_file_changes(
+        // ADR-62: the sweep's build-check spawns run through the run's
+        // governed engine when one is installed (the same engine the harness
+        // uses), so a `cargo check` spawned here faces the exact policy
+        // decision the equivalent `shell` tool call would face.
+        let sweep_spawner = crate::verify::SystemSpawner::new();
+        sweep_spawner.set_governed_eval(self.eval.clone());
+        let mut sweep_coalesce = HashMap::new();
+        verification = crate::verify::verify_file_changes_with(
             &files_modified,
             &self.project_root,
             &self.verification_stamp(),
+            &sweep_spawner,
+            crate::verify::VERIFY_SPAWN_TIMEOUT,
+            &mut sweep_coalesce,
+            &cancel,
         )
         .await;
         verification.extend(eval_verification);
@@ -3267,6 +3297,19 @@ impl AgentLoop {
                 &mut self.path_write_epoch,
                 &mut self.run_write_evidence,
             );
+        }
+        // H05 Blocker 3: advance the shared service clock on the same writes
+        // the loop clock sees, so service-side checks observe positional
+        // supersession within the run (not just base-generation re-capture).
+        // Deliberately independent of the strict gate: the service clock
+        // serves `verify.run` consumers whether or not the completion gate is
+        // armed. Same conservative rule as above — executed writes advance
+        // (even failed ones, which may have mutated unpredictably); a
+        // `Denied` refusal never executed and advances nothing.
+        if file_affecting && !matches!(outcome, ToolOutcome::Denied) {
+            if let Some(service) = &self.verify_service {
+                service.note_write(&paths, event_id.as_deref());
+            }
         }
         event_id
     }
@@ -8759,6 +8802,49 @@ mod tests {
                 &CancellationToken::new(),
             )
             .await;
+    }
+
+    /// H05 Blocker 3: the audited-write path advances the shared verification
+    /// service clock, so the next service-side check stamps the new epoch
+    /// (positional supersession within the run, not just base re-capture).
+    #[tokio::test]
+    async fn audited_write_advances_shared_verify_service_clock() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        std::fs::write(dir.path().join("page.html"), "<html><body>plain</body></html>\n")
+            .expect("fixture written");
+        let project_dir = dir.path().to_string_lossy().to_string();
+        let service = Arc::new(crate::verify::VerifierService::new(
+            dir.path().to_path_buf(),
+            EvalEngine::new(dir.path()),
+        ));
+        let mut loop_ = make_loop_with_dir(
+            Arc::new(ScriptedProvider::new(vec![])),
+            Arc::new(ApprovalTestHarness::always_approve()),
+            4,
+            &project_dir,
+        )
+        .with_verifier_service(service.clone());
+        let task = AgentTask::new_action_required(Ulid::new(), "write code to file");
+        record_test_write(&mut loop_, dir.path(), &task, "page.html").await;
+
+        let records = service
+            .verify(
+                &crate::verify::VerifyRequest {
+                    scope: crate::verify::VerifyScope::File("page.html".into()),
+                    selector: crate::verify::VerifySelector::Existence,
+                    timeout: std::time::Duration::from_secs(30),
+                    overlay_pending: false,
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("verify runs");
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0].generation.ends_with("#1"),
+            "the loop-observed write advanced the service epoch: {}",
+            records[0].generation
+        );
     }
 
     /// Flag off (the default): an unmet `require_verification` contract keeps

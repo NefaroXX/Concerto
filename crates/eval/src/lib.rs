@@ -47,12 +47,35 @@ pub enum EvalError {
     HarnessSetupFailed(String),
     #[error("test runner failed: {0}")]
     TestRunnerFailed(String),
+    /// The governed process executor refused the spawn under policy. Stays
+    /// distinct from [`Self::TestRunnerFailed`] so verification adapters can
+    /// report a denial honestly instead of as a command failure — a denied
+    /// check never ran and must never fall back to an ungoverned spawn.
+    #[error("policy denied: {0}")]
+    Denied(String),
     #[error("timed out after {0:?}")]
     Timeout(Duration),
     #[error("cancelled")]
     Cancelled,
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+/// One finished governed-or-direct command: exit code plus captured streams.
+/// Adapters map this to their records; denial/timeout/cancellation travel as
+/// [`EvalError`] so they stay distinguishable from a command failure.
+#[derive(Debug, Clone)]
+pub struct CommandOutput {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl CommandOutput {
+    /// True only for exit code 0 (the command's own success signal).
+    pub fn success(&self) -> bool {
+        self.exit_code == 0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +120,93 @@ impl EvalEngine {
     ) -> Self {
         self.process_executor = Some(executor);
         self
+    }
+
+    /// The governed process executor, when one is installed: the same object
+    /// the harness routes test runs through (the run's policy-gated `shell`
+    /// tool path). Verification build-check spawns reuse it so a policy
+    /// decision applies exactly as it would for the equivalent `shell` tool
+    /// call — one execution chokepoint, no second path (ADR-62).
+    pub fn process_executor(&self) -> Option<std::sync::Arc<dyn EvalProcessExecutor>> {
+        self.process_executor.clone()
+    }
+
+    /// Run one adapter-chosen command (`program args...` in `cwd`), bounded by
+    /// `timeout` and `cancel`.
+    ///
+    /// With a [`Self::with_process_executor`] executor installed the command
+    /// travels the governed policy path (denials surface as
+    /// [`EvalError::Denied`] and are never retried ungoverned); without one it
+    /// spawns directly, preserving the legacy sweep behavior for contexts
+    /// with no executor. The caller never chooses the command — adapters pick
+    /// it; only the working directory varies per run.
+    pub async fn run_command(
+        &self,
+        program: &str,
+        args: &[&str],
+        cwd: &Path,
+        timeout: Duration,
+        cancel: CancellationToken,
+    ) -> Result<CommandOutput, EvalError> {
+        if cancel.is_cancelled() {
+            return Err(EvalError::Cancelled);
+        }
+        if let Some(executor) = &self.process_executor {
+            let execution_cancel = cancel.child_token();
+            let execution = executor.execute(program, args, cwd, execution_cancel.clone());
+            tokio::pin!(execution);
+            let output = tokio::select! {
+                result = &mut execution => result?,
+                () = cancel.cancelled() => {
+                    execution_cancel.cancel();
+                    let _ = execution.await;
+                    return Err(EvalError::Cancelled);
+                }
+                () = tokio::time::sleep(timeout) => {
+                    execution_cancel.cancel();
+                    let _ = execution.await;
+                    return Err(EvalError::Timeout(timeout));
+                }
+            };
+            let exit_code = output
+                .data
+                .get("exit_code")
+                .and_then(serde_json::Value::as_i64)
+                .and_then(|code| i32::try_from(code).ok())
+                .ok_or_else(|| {
+                    EvalError::TestRunnerFailed("native executor returned no exit code".into())
+                })?;
+            let stdout =
+                output.data.get("stdout").and_then(serde_json::Value::as_str).unwrap_or_default();
+            let stderr =
+                output.data.get("stderr").and_then(serde_json::Value::as_str).unwrap_or_default();
+            return Ok(CommandOutput {
+                exit_code,
+                stdout: stdout.to_string(),
+                stderr: stderr.to_string(),
+            });
+        }
+        let mut command = Command::new(program);
+        command.args(args);
+        let child = command
+            .current_dir(cwd)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        let output = tokio::select! {
+            output = tokio::time::timeout(timeout, child.wait_with_output()) => output,
+            () = cancel.cancelled() => return Err(EvalError::Cancelled),
+        };
+        match output {
+            Ok(Ok(out)) => Ok(CommandOutput {
+                exit_code: out.status.code().unwrap_or(-1),
+                stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+            }),
+            Ok(Err(error)) => Err(EvalError::Io(error)),
+            Err(_elapsed) => Err(EvalError::Timeout(timeout)),
+        }
     }
 
     /// Run validation commands through a configured build/validation profile.

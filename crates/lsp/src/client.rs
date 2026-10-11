@@ -225,6 +225,17 @@ impl LspClient {
         let map = self.diagnostics.lock().await;
         map.get(file_path).cloned().unwrap_or_default()
     }
+
+    /// Whether the server published diagnostics for `file_path` at least once
+    /// this session (including an empty diagnostic set for a clean open
+    /// file). A file the server never published for was never analyzed in
+    /// this session: its empty diagnostics must not read as "clean". This
+    /// answers only "did the server speak about this file" — not whether the
+    /// diagnostics are current.
+    pub async fn has_seen_file(&self, file_path: &str) -> bool {
+        let map = self.diagnostics.lock().await;
+        map.contains_key(file_path)
+    }
 }
 
 /// Read framed LSP messages from the server's stdout until the stream ends,

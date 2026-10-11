@@ -1345,6 +1345,10 @@ async fn execute_agent_loop(
     // semantics). Single-agent path only: `run_multi_agent` (the Coordinator
     // path) never reads this key, so multi-agent runs cannot observe it.
     .with_strict_verification_gate(services.config.strict_verification_gate())
+    // ADR-82 H05: the loop advances the shared service clock on the
+    // audited-write path, so service-side freshness observes the same writes
+    // the loop clock sees (positional supersession within the run).
+    .with_verifier_service(verify_service.clone())
     .with_tool_facts(fact_pool.map(|pool| {
         crate::tool_facts::ToolFactContext::new(Some(pool), crate::tool_facts::SINGLE_AGENT_FACT_ID)
     }))
@@ -2022,11 +2026,20 @@ async fn setup_shared_tooling(
     // reachable on both paths through the normal policy/audit gate. The
     // harness engine starts direct-spawn; each path upgrades it to its
     // governed executor-backed engine below, so harness commands travel the
-    // same policy path the loop's own evaluation uses.
+    // same policy path the loop's own evaluation uses. The overlay source
+    // feeds the envelope's overlay-pending flag from live `VirtualFs` state
+    // (desktop); without it an omitted flag reports pending (fail-safe).
+    let overlay_source: Option<crate::verify::OverlayPendingSource> =
+        services.vfs.clone().map(|vfs| {
+            std::sync::Arc::new(move || {
+                vfs.lock().map(|guard| !guard.changed_paths().is_empty()).unwrap_or(true)
+            }) as crate::verify::OverlayPendingSource
+        });
     let verify_service = crate::verify::register_verify_tool(
         &mut registry,
         &req.project_dir,
         EvalEngine::new(&req.project_dir),
+        overlay_source,
     );
     // ADR-82 H03: register `environment.describe` LAST so its tool-names
     // snapshot covers every other tool (filesystem, shell, git, LSP, plugin,
