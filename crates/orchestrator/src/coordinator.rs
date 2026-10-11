@@ -24050,9 +24050,7 @@ mod tests {
             task.session_id,
             root.clone(),
         ));
-        let output = coordinator
-            .run(task, context, CancellationToken::new(), None)
-            .await?;
+        let output = coordinator.run(task, context, CancellationToken::new(), None).await?;
         assert_eq!(
             output.completion_status,
             concerto_core::types::AgentCompletionStatus::Completed,
@@ -24150,9 +24148,7 @@ mod tests {
             task.session_id,
             root.clone(),
         ));
-        let output = coordinator
-            .run(task, context, CancellationToken::new(), None)
-            .await?;
+        let output = coordinator.run(task, context, CancellationToken::new(), None).await?;
         assert_eq!(
             output.completion_status,
             concerto_core::types::AgentCompletionStatus::Completed,
@@ -31877,7 +31873,10 @@ mod tests {
         let graph = graph_with_status(session, "reviewer", SubTaskStatus::Completed);
         let output =
             run_action_required_graph_for_test(&mut coordinator, session, graph, Vec::new()).await;
-        assert_eq!(output.completion_status, concerto_core::types::AgentCompletionStatus::Completed);
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed
+        );
         assert_eq!(coordinator.run_id.as_deref(), Some(restored_run.as_str()));
     }
 
