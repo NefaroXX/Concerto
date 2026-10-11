@@ -731,6 +731,11 @@ impl concerto_core::traits::approval::ApprovalSink for ApprovalProxySink {
 
 /// Map a proxy failure onto the loop's tool error taxonomy. Shared with the
 /// in-process backend parity test, which asserts the two paths cannot drift.
+///
+/// H02: supervisor rejections map through [`crate::ipc::IpcError::to_tool_error`],
+/// so the typed wire code — not the message prose — decides the variant. A
+/// gate denial arrives as `PolicyDenied`, a conflict as `VirtualFsConflict`,
+/// and only the unstructured codes stay stringly `ExecutionFailed` envelopes.
 pub(crate) fn gate_proxy_to_tool_error(error: GateProxyError) -> ToolError {
     match error {
         GateProxyError::Closed => ToolError::ExecutionFailed {
@@ -738,22 +743,10 @@ pub(crate) fn gate_proxy_to_tool_error(error: GateProxyError) -> ToolError {
         },
         GateProxyError::Cancelled => ToolError::Cancelled,
         GateProxyError::Supervisor { code, message } => {
-            ToolError::ExecutionFailed { message: gate_rejection_message(code, &message) }
+            ipc::IpcError::new(code, message).to_tool_error()
         }
         other => ToolError::ExecutionFailed { message: other.to_string() },
     }
-}
-
-/// Render a supervisor gate rejection the way the loop's tool error surface
-/// presents it.
-///
-/// Shared by the supervised backend (which receives the flattened
-/// `(code, message)` over the wire) and the in-process backend (which maps a
-/// local [`GateError`] through [`crate::ipc::IpcError::from_gate`] first), so
-/// agents see a byte-identical error string no matter which path they run
-/// under.
-pub(crate) fn gate_rejection_message(code: IpcErrorCode, message: &str) -> String {
-    format!("gate rejected the write ({code:?}): {message}")
 }
 #[cfg(test)]
 mod tests {

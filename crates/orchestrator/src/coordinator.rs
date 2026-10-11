@@ -17779,8 +17779,13 @@ impl CoordinatorAgent {
                 // Issue #54: the tool fault is normalized into the
                 // structured diagnosis (Tool/Environment dimension) so the
                 // Coordinator's next decision is diagnosis-informed; the
-                // audit trail records it too.
-                let diagnosis = crate::failure_diagnosis::diagnose_tool(&error);
+                // audit trail records it too. H02: the diagnosis classifies
+                // from the typed envelope (disposition/code/category) built
+                // for this error, and the envelope rides the tool result
+                // additively — the Coordinator acts on the typed code
+                // without parsing the message.
+                let failure = crate::failure_diagnosis::tool_envelope(tool_name, &error);
+                let diagnosis = crate::failure_diagnosis::diagnose_failure(&error, Some(&failure));
                 self.record_failure_diagnosis(
                     base_ctx.session.session_id,
                     None,
@@ -17793,6 +17798,7 @@ impl CoordinatorAgent {
                     "message": error.to_string(),
                     "retryable": diagnosis.retryable,
                     "diagnosis": diagnosis.tool_summary(),
+                    "failure": failure,
                 })
             }
         }
