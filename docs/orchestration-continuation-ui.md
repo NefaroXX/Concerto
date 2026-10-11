@@ -18,6 +18,12 @@ Started reopens it. Completion replaces the current graph summary with the actua
 completion outcome. The graph details show the current summary so an unfinished
 reason is visible before opening logs.
 
+At the desktop dispatch boundary, multi-agent runs carrying a resume checkpoint
+retain their existing graph and chat cards, including if provider validation
+blocks the attempt. Fresh runs and single-agent runs clear these views as
+before. This uses the same checkpoint option already passed to the request
+builder and does not inspect, modify or accept the checkpoint on the UI's behalf.
+
 Graph persistence already carries stable task IDs, states, and logs. A restored
 held row reactivates in place; if no creation or saved graph exists, Started
 creates an addressable placeholder row/card for subsequent lifecycle events.
@@ -26,14 +32,14 @@ historical ownership for a transcript restored after restart.
 
 ## Scope and validation
 
-Only desktop event translation/routing and the graph/chat views change, plus
-this documentation. Backend events, shared harness schemas, checkpoint/resume
+Only desktop event translation/routing, the view reset at dispatch, graph/chat
+views and regression tests change, plus this documentation. Backend events, shared harness schemas, checkpoint/resume
 wiring, runtime construction, verification policy and CLI are unchanged.
 The change is independent of PRs #312 and #315 and branches from pinned dev
 `0d13b6aa9a9ecf5f73cd9c9f7a485ba7ecf41e63`.
 
 Regression coverage exercises backend lifecycle translation through both views,
 held and blocked continuation without another creation, retargeting, graph
-save/load, history and card-anchor retention, distinct same-role tasks, and
-Started without saved creation. Rust CI is required because the editing
+save/load, history and card-anchor retention, resume versus fresh dispatch
+boundaries, distinct same-role tasks, and Started without saved creation. Rust CI is required because the editing
 environment has no Rust toolchain.

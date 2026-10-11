@@ -238,7 +238,8 @@ impl State {
                 let compact_description: String = description.chars().take(40).collect();
                 let label = format!("{role_label}: {compact_description}");
                 let node_id = if let Some(node_id) = self.task_nodes.get(&task_id).copied() {
-                    if let Some(node) = self.model.nodes.iter_mut().find(|node| node.id == node_id) {
+                    if let Some(node) = self.model.nodes.iter_mut().find(|node| node.id == node_id)
+                    {
                         node.label = label;
                         node.role = role;
                         node.state = NodeState::Active;
@@ -512,10 +513,8 @@ mod tests {
         std::fs::remove_file(&path)?;
         assert_eq!(restored.model.nodes[0].state, NodeState::NeedsRevision);
 
-        restored.on_subtask_created(SubtaskEvent::Started {
-            task_id,
-            role: AgentId::new("repairer"),
-        });
+        restored
+            .on_subtask_created(SubtaskEvent::Started { task_id, role: AgentId::new("repairer") });
         assert_eq!(restored.model.nodes.len(), 1);
         assert_eq!(restored.model.nodes[0].state, NodeState::Active);
         assert_eq!(restored.model.nodes[0].role, AgentId::new("repairer"));
@@ -564,10 +563,8 @@ mod tests {
         let mut state = State::new();
         let task_id = TaskId::new();
         for _ in 0..2 {
-            state.on_subtask_created(SubtaskEvent::Started {
-                task_id,
-                role: AgentId::new("coder"),
-            });
+            state
+                .on_subtask_created(SubtaskEvent::Started { task_id, role: AgentId::new("coder") });
         }
         assert_eq!(state.model.nodes.len(), 1);
         state.on_subtask_created(SubtaskEvent::Failed {

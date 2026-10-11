@@ -1,23 +1,10 @@
-//! Run/dispatch helpers for [`App`] — NORM slice S49.
+//! Run/dispatch helpers for [`App`]: runtime configuration projections,
+//! provider/assignment validation, and run submission.
 //!
-//! This module owns the run-boundary helpers moved verbatim from `app.rs`:
-//! the config-backed runtime projections (`runtime_providers`,
-//! `runtime_assignments`, `runtime_model_names`), the dispatch-boundary
-//! validator (`dispatch_validation_error`), and the run submitter
-//! (`submit_to_agent`) with its async `iced::Task::perform` that captures the
-//! bus/config/memory/VFS/session handles. Every body is line-for-line with
-//! its origin at the same 4-space `impl` indent; the only structural edit is
-//! each method becoming `pub(super)`, which keeps the existing callers — the
-//! `App::new` boot batch, the sibling submodule groups (`update_routing`,
-//! `settings_updates`, `event_model_updates`, `sync_config`), and the tests
-//! in `app.rs`'s `mod tests` — resolving through `self.*` / `app.*` unchanged
-//! (the same visibility pattern as the sibling group modules). No `Message` /
-//! `App` shape change and no behavior change: the async `Task::perform`
-//! timing and ordering inside `submit_to_agent` are preserved exactly.
-//!
-//! Left in `app.rs` deliberately: the sync VFS diff reload
-//! (`load_diff_from_vfs`) and the Settings-save plugin re-collect
-//! (`refresh_plugin_providers`) — neither is a run/dispatch seam.
+//! Fresh runs clear graph rows and chat cards at the dispatch boundary.
+//! Multi-agent checkpoint continuations retain those views so specialist
+//! Started events can reactivate the existing task and its history. The
+//! request builder, checkpoint payload and async submission remain unchanged.
 
 use super::*;
 
@@ -122,13 +109,13 @@ impl App {
         if self.run_status != RunStatus::Idle {
             return iced::Task::none();
         }
-        // The graph describes one orchestration run, not the lifetime of the
-        // conversation. Reset it at the run boundary even when dispatch
-        // validation fails, so an old phase cannot attach to a newer prompt.
-        self.agent_graph = views::agent_graph::State::new();
-        // Drop the previous run's per-subagent progress cards for the same
-        // reason: a stale card must never attach to the new prompt.
-        self.chat.begin_run();
+        // A checkpoint continuation belongs to the same orchestration run.
+        // Keep its task rows, cards and history so Started can reactivate them.
+        // Fresh runs still clear these views even if validation rejects dispatch.
+        if !self.multi_agent || self.resume_checkpoint_json.is_none() {
+            self.agent_graph = views::agent_graph::State::new();
+            self.chat.begin_run();
+        }
         // Dispatch-boundary validation: block the run with a clear message if
         // the active provider/model or any agent assignment is incomplete,
         // rather than failing deep inside the orchestrator.

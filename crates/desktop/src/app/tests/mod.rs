@@ -1442,6 +1442,81 @@ fn agent_run_completed_clears_run_stage() {
 
 // ── Dispatch-boundary validation (plan §13 Runtime selection) ──────────
 
+#[test]
+fn resume_dispatch_preserves_held_views_when_provider_validation_blocks_start() {
+    use crate::runtime::DesktopEvent;
+    use crate::widgets::agent_graph::NodeState;
+    use concerto_core::AgentId;
+
+    let (mut app, _) = App::new();
+    app.config = None;
+    app.settings.providers.clear();
+    app.multi_agent = true;
+    let task_id = TaskId::new();
+    for event in [
+        DesktopEvent::SubTaskCreated {
+            task_id,
+            role: AgentId::new("coder"),
+            description: "Repair a.rs".into(),
+        },
+        DesktopEvent::SubTaskNeedsRevision {
+            task_id,
+            role: "coder".into(),
+            reason: "Execution limit reached".into(),
+        },
+    ] {
+        let _ = app.update(Message::DesktopEvent(event));
+    }
+    let checkpoint = serde_json::json!({
+        "subtasks": [], "edges": [], "completed_results": {},
+        "total_cost": 0.0, "total_tool_calls": 0, "provider_metrics": [],
+        "all_files": [], "subtask_attempts": {}, "retry_feedback": {}
+    })
+    .to_string();
+    assert!(concerto_orchestrator::checkpoint::GraphCheckpoint::from_json(&checkpoint).is_ok());
+    app.resume_checkpoint_json = Some(checkpoint.clone());
+
+    let _ = app.submit_to_agent("Continue".into());
+    assert_eq!(app.run_status, RunStatus::Idle, "validation must still block dispatch");
+    assert_eq!(app.resume_checkpoint_json.as_deref(), Some(checkpoint.as_str()));
+    assert_eq!(app.agent_graph.model.nodes.len(), 1);
+    assert_eq!(app.agent_graph.model.nodes[0].state, NodeState::NeedsRevision);
+
+    // Once execution begins, the same task row and card reopen without Created.
+    let _ = app.update(Message::DesktopEvent(DesktopEvent::SubTaskStarted {
+        task_id,
+        role: AgentId::new("coder"),
+    }));
+    assert_eq!(app.agent_graph.model.nodes.len(), 1);
+    assert_eq!(app.agent_graph.model.nodes[0].state, NodeState::Active);
+    assert!(app.chat.agent_running("coder"));
+}
+
+#[test]
+fn fresh_and_single_agent_dispatches_clear_previous_task_views() {
+    use crate::runtime::DesktopEvent;
+    use concerto_core::AgentId;
+
+    for (multi_agent, checkpoint) in [(true, None), (false, Some("old checkpoint".into()))] {
+        let (mut app, _) = App::new();
+        app.config = None;
+        app.settings.providers.clear();
+        app.multi_agent = multi_agent;
+        app.resume_checkpoint_json = checkpoint;
+        let _ = app.update(Message::DesktopEvent(DesktopEvent::SubTaskCreated {
+            task_id: TaskId::new(),
+            role: AgentId::new("coder"),
+            description: "Previous work".into(),
+        }));
+        assert!(app.chat.has_running_subagent());
+        let _ = app.submit_to_agent("New task".into());
+        assert_eq!(app.run_status, RunStatus::Idle);
+        assert!(app.agent_graph.model.nodes.is_empty());
+        assert!(!app.chat.has_running_subagent());
+    }
+}
+
+
 fn push_provider(app: &mut App, id: &str, provider: &str, model: &str) {
     app.settings.providers.push(ProviderConfig {
         id: id.into(),

@@ -693,10 +693,8 @@ pub fn route_event(
                 role: role.clone(),
                 on: on.clone(),
             });
-            chat_state.record_subtask_finished(
-                &task_id.to_string(),
-                Some(format!("Blocked on {on:?}")),
-            );
+            chat_state
+                .record_subtask_finished(&task_id.to_string(), Some(format!("Blocked on {on:?}")));
             chat_state.add_thinking(role, format!("Blocked on {on:?}"), ThinkingKind::Detail);
         }
         DesktopEvent::SubTaskCancelled { task_id, role, reason } => {
@@ -845,20 +843,32 @@ mod tests {
             assert_eq!(graph.model.nodes.len(), 1);
             match index {
                 1 => {
-                    assert_eq!(graph.model.nodes[0].state, crate::widgets::agent_graph::NodeState::NeedsRevision);
+                    assert_eq!(
+                        graph.model.nodes[0].state,
+                        crate::widgets::agent_graph::NodeState::NeedsRevision
+                    );
                     assert!(!chat.has_running_subagent());
                 }
                 2 | 4 => {
-                    assert_eq!(graph.model.nodes[0].state, crate::widgets::agent_graph::NodeState::Active);
+                    assert_eq!(
+                        graph.model.nodes[0].state,
+                        crate::widgets::agent_graph::NodeState::Active
+                    );
                     assert!(chat.agent_running("repairer"));
                     assert!(!chat.agent_running("coder"));
                 }
                 3 => {
-                    assert_eq!(graph.model.nodes[0].state, crate::widgets::agent_graph::NodeState::Blocked);
+                    assert_eq!(
+                        graph.model.nodes[0].state,
+                        crate::widgets::agent_graph::NodeState::Blocked
+                    );
                     assert!(!chat.has_running_subagent());
                 }
                 5 => {
-                    assert_eq!(graph.model.nodes[0].state, crate::widgets::agent_graph::NodeState::Completed);
+                    assert_eq!(
+                        graph.model.nodes[0].state,
+                        crate::widgets::agent_graph::NodeState::Completed
+                    );
                     assert_eq!(graph.model.nodes[0].task_summary, "Repair complete");
                     assert!(!chat.has_running_subagent());
                 }
