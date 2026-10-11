@@ -618,7 +618,7 @@ impl IpcError {
     ///   (`RequireApproval` inside a `GateDenied`) denies rather than parks
     ///   — the live approval flow parks via the approval bridge and never
     ///   reaches this surface, so nothing here can coach a retry around a
-    /// gate.
+    ///   gate.
     ///
     /// NOTE (H02 review): if a future change routes the supervised path
     /// through the approval bridge (so a `RequireApproval` can park here),

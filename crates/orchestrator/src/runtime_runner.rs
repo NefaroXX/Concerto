@@ -1876,6 +1876,10 @@ struct SharedTooling {
     provider: Arc<dyn LlmProvider>,
     model: String,
     provider_config_id: Option<String>,
+    /// H03: the run's shared `environment.describe` cache. Registered into
+    /// the registry below; the coordinator-path manifest barrier populates it
+    /// (the single-agent path lazily collects on first call instead).
+    describe_state: crate::environment_describe::SharedDescribeState,
 }
 
 /// W2d (P1-P3b): build the tool registry, audit sink, plugin/MCP tools, and
@@ -1922,6 +1926,19 @@ async fn setup_shared_tooling(
     if let Err(error) = services.mcp.register_tools(&mut registry).await {
         tracing::warn!(%error, "mcp registration failed; continuing without mcp tools");
     }
+    // ADR-82 H03: register `environment.describe` LAST so its tool-names
+    // snapshot covers every other tool (filesystem, shell, git, LSP, plugin,
+    // MCP). One shared registry feeds both the single-agent loop and the
+    // coordinator, so the operation is reachable on both paths; prompt
+    // injection of the digest stays coordinator-only (the barrier below).
+    let describe_state = crate::environment_describe::register_describe_tool(
+        &mut registry,
+        &req.project_dir,
+        &services.config,
+        gate_pool.is_some(),
+        req.memory_enabled,
+        gate_pool.clone(),
+    );
     let registry = Arc::new(registry);
 
     // 3. Resolve provider and final effective model
@@ -1945,6 +1962,7 @@ async fn setup_shared_tooling(
         provider,
         model,
         provider_config_id,
+        describe_state,
     })
 }
 
@@ -1991,6 +2009,7 @@ pub async fn run_shared_agent(
         provider,
         model,
         provider_config_id,
+        describe_state,
     } = setup_shared_tooling(&req, &services).await?;
 
     // 4. Policy engine, audit log, spend tracker, tool executor.
@@ -2599,6 +2618,7 @@ pub async fn run_shared_agent(
             resume_updated_at_ms,
             headless_resume,
             project_context.clone(),
+            &describe_state,
         )
         .await;
     }
@@ -2716,6 +2736,11 @@ async fn run_multi_agent(
     // environment card; its refresh cadence also gates the coordinator's
     // maintenance nudge. Refreshed once at run start by `run_shared_agent`.
     project_context: Arc<crate::project_context::ProjectContext>,
+    // ADR-82 H03: the shared `environment.describe` cache. The manifest
+    // barrier below populates it so describe calls serve the run's manifest
+    // with zero further probes (the single-agent path never reaches here and
+    // lazily collects on first call instead).
+    describe_state: &crate::environment_describe::SharedDescribeState,
 ) -> Result<AgentOutput, OrchestratorError> {
     let project_dir = req.project_dir.clone();
     if let Some(store) = &session_store {
@@ -3397,18 +3422,7 @@ async fn run_multi_agent(
         use crate::environment_manifest::{
             inventory_from_executor, run_manifest_barrier, ManifestInputs, SystemVersionProber,
         };
-        use concerto_core::environment_manifest::{
-            ManifestExecutionBackend, PersistenceClass, PolicyScopeDescription,
-        };
-        let configured_rules: Option<usize> = services
-            .config
-            .policy
-            .as_ref()
-            .map(|policy| policy.to_rules())
-            .filter(|rules| !rules.is_empty())
-            .map(|rules| rules.len());
-        let default_rule_count =
-            concerto_core::policy_presets::PolicyPresets::default_rules().len();
+        use concerto_core::environment_manifest::{ManifestExecutionBackend, PersistenceClass};
         let mut persistence = vec![PersistenceClass::WorkspaceFiles];
         if gate_log_pool.is_some() {
             persistence.push(PersistenceClass::SessionDatabase);
@@ -3421,11 +3435,10 @@ async fn run_multi_agent(
             sandbox_profile: None,
             container_routing: concerto_core::types::CommandRouting::Direct,
             inventory: inventory_from_executor(&executor),
-            policy_scope: PolicyScopeDescription::for_run(
-                configured_rules,
-                default_rule_count,
-                None,
-            ),
+            // H03: the descriptive policy scope is derived by the shared
+            // helper so the barrier and `environment.describe` label the run
+            // identically (their fingerprints must agree on a fresh run).
+            policy_scope: crate::environment_describe::policy_scope_from_config(&services.config),
             persistence,
             memory_enabled: req.memory_enabled,
             previous_revision: None,
@@ -3442,6 +3455,11 @@ async fn run_multi_agent(
         )
         .await
         {
+            // H03: hand the barrier's manifest to the describe cache (freshly
+            // collected or resume-restored — populate fingerprints the stored
+            // row, so a restore across a config change reads stale on the
+            // first describe call and refreshes exactly once).
+            crate::environment_describe::populate_from_barrier(describe_state, &manifest);
             coordinator = coordinator.with_environment_manifest(manifest);
         }
     }
