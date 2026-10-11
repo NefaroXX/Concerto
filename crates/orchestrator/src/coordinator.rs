@@ -2245,11 +2245,14 @@ pub struct CoordinatorAgent {
     /// re-dispatch that never settles can attach the diff to its Partial note.
     /// Cleared as soon as it is read; `None` on a run without confirmed drift.
     plan_drift_redispatch: Option<crate::external_change::PlanDriftRedispatch>,
-    /// ADR-65 §3: the run id (fresh per `execute_graph`, matching the
+    /// ADR-65 §3: the run id (shared by dispatch and graph execution, matching the
     /// checkpoint scope) stamped into every dispatched agent's tool-evidence
     /// facts, so a run's tool commands are attributable across task
     /// boundaries. `None` only when no run has started yet.
     run_id: Option<String>,
+    /// Last checkpoint coordinate for the current run. Carry its sequence
+    /// across the dispatch-to-graph boundary and seed it on resume.
+    last_checkpoint_sequence: Option<(Ulid, u64)>,
     /// Phase 6 M3b: the shared decision store — the SAME `Arc` the memory
     /// system wraps — backing outcome write-back on subtask settlement
     /// (`Decision` records) and the run-scoped Phase-0 retrieval (M3a).
@@ -3886,6 +3889,7 @@ impl CoordinatorAgent {
             environment_manifest: None,
             plan_drift_redispatch: None,
             run_id: None,
+            last_checkpoint_sequence: None,
             memory_decision_store: None,
             memory_task_tree: None,
             last_doc_resolution: None,
@@ -5404,6 +5408,7 @@ impl CoordinatorAgent {
         checkpoint: &mut checkpoint::GraphCheckpoint,
         model_assignments: &HashMap<TaskId, String>,
     ) {
+        self.last_checkpoint_sequence = Some((checkpoint.run_id, checkpoint.sequence_num));
         // ADR-65 §7: stamp the whiteboard cursor at PERSIST time — the log
         // head is the consistent cut this checkpoint is consistent with, so
         // a resume reads only facts appended after it. Fail-soft: without a
@@ -8653,15 +8658,19 @@ impl CoordinatorAgent {
         // revision subtasks get fresh `TaskId`s, so `subtask_attempts` cannot
         // limit them, and `max_total_iterations` defaults to `None`.
         let mut zero_file_revision_queued_roots: HashSet<TaskId> = HashSet::new();
+        // Decision-loop facts and graph execution belong to the same run.
+        // A resumed run keeps both its identity and checkpoint coordinate.
+        let execution_run_id = self
+            .run_id
+            .as_deref()
+            .and_then(|id| id.parse().ok())
+            .unwrap_or_else(concerto_core::ids::new_id);
+        let sequence_num = self
+            .last_checkpoint_sequence
+            .filter(|(run_id, _)| *run_id == execution_run_id)
+            .map_or(0, |(_, sequence)| sequence);
         let mut checkpoint_scope = checkpoint::CheckpointScope {
-            // Decision-loop facts and graph execution belong to the same run.
-            // A resumed run keeps the restored id; a direct graph caller without
-            // an established scope receives a fresh one.
-            run_id: self
-                .run_id
-                .as_deref()
-                .and_then(|id| id.parse().ok())
-                .unwrap_or_else(concerto_core::ids::new_id),
+            run_id: execution_run_id,
             session_id: task.session_id,
             root_task_id: task.id,
             project_id: context.session.project_id.0.clone(),
@@ -8671,7 +8680,7 @@ impl CoordinatorAgent {
             objective: run_objective,
             objective_hash: run_objective_hash,
             source_revision: self.source_revision.clone(),
-            sequence_num: 0,
+            sequence_num,
         };
         // ADR-65 §3: stamp the run id (matching the checkpoint scope) so
         // every dispatched agent records its tool evidence under this run.
@@ -10013,6 +10022,10 @@ impl CoordinatorAgent {
         // checkpoint when no decision-loop re-entry is needed. Fresh/replanned
         // decision sessions establish their own scope before executing tools.
         self.run_id = checkpoint_run_id.clone();
+        self.last_checkpoint_sequence = resume_checkpoint_json
+            .as_deref()
+            .and_then(|json| checkpoint::GraphCheckpoint::from_json(json).ok())
+            .map(|checkpoint| (checkpoint.run_id, checkpoint.sequence_num));
 
         // Phase 1: Decompose or restore
         let DecomposeResult {
@@ -31868,8 +31881,10 @@ mod tests {
         )]));
         let mut coordinator = coordinator_with_turns(bus, registry, Vec::new());
         let session = Ulid::new();
-        let restored_run = Ulid::new().to_string();
+        let restored_id = Ulid::new();
+        let restored_run = restored_id.to_string();
         coordinator.run_id = Some(restored_run.clone());
+        coordinator.last_checkpoint_sequence = Some((restored_id, 41));
         let graph = graph_with_status(session, "reviewer", SubTaskStatus::Completed);
         let output =
             run_action_required_graph_for_test(&mut coordinator, session, graph, Vec::new()).await;
@@ -31878,6 +31893,9 @@ mod tests {
             concerto_core::types::AgentCompletionStatus::Completed
         );
         assert_eq!(coordinator.run_id.as_deref(), Some(restored_run.as_str()));
+        assert!(coordinator.last_checkpoint_sequence.is_some_and(|(run_id, sequence)| {
+            run_id.to_string() == restored_run && sequence > 41
+        }));
     }
 
     /// Whether a completion-guard Decision with `reason` landed on the log.

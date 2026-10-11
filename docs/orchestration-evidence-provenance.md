@@ -1,7 +1,8 @@
 # Completion evidence provenance
 
 The Coordinator now keeps its decision-session run ID through graph execution
-and the completion gate. Resume seeds the ID from the existing checkpoint;
+and the completion gate. Its checkpoint sequence also continues across that
+boundary. Resume seeds both from the existing checkpoint;
 a fresh invocation clears the previous attribution before planning. No session
 or checkpoint schema changes are required.
 
