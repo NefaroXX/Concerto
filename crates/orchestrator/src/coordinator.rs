@@ -23868,22 +23868,27 @@ mod tests {
     /// file — the shape of a real specialist that actually did work (so the
     /// zero-work/vacuous guards stay out of the way of the C-06 assertions).
     fn coder_with_tool_work() -> MockExpertAgent {
+        coder_with_tool_work_for_runs(1)
+    }
+
+    fn coder_with_tool_work_for_runs(count: usize) -> MockExpertAgent {
+        let result = AgentRunResult {
+            task_id: TaskId::new(),
+            role: AgentId::new("coder"),
+            outcome: AgentOutcome::Success,
+            summary: "implemented".to_owned(),
+            files_modified: vec![camino::Utf8PathBuf::from("src/a.rs")],
+            tool_call_count: 1,
+            cost_usd: 0.0,
+            latency_ms: 0,
+            provider: "mock".to_owned(),
+            model: "mock".to_owned(),
+            tokens_in: 0,
+            tokens_out: 0,
+        };
         MockExpertAgent::sequence(
             AgentId::new("coder"),
-            vec![Ok(AgentRunResult {
-                task_id: TaskId::new(),
-                role: AgentId::new("coder"),
-                outcome: AgentOutcome::Success,
-                summary: "implemented".to_owned(),
-                files_modified: vec![camino::Utf8PathBuf::from("src/a.rs")],
-                tool_call_count: 1,
-                cost_usd: 0.0,
-                latency_ms: 0,
-                provider: "mock".to_owned(),
-                model: "mock".to_owned(),
-                tokens_in: 0,
-                tokens_out: 0,
-            })],
+            (0..count).map(|_| Ok(result.clone())).collect(),
         )
     }
 
@@ -24318,7 +24323,7 @@ mod tests {
             CoordinatorTurn::Calls(vec![call_specialist("coder", "implement again")]),
             CoordinatorTurn::Text("second done".into()),
         ];
-        let registry = Arc::new(AgentRegistry::from_mocks(vec![coder_with_tool_work()]));
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![coder_with_tool_work_for_runs(2)]));
         let mut coordinator =
             coordinator_with_turns(bus, registry, turns).with_review_store(Some(pool.clone()));
         let session = Ulid::new();
@@ -24333,7 +24338,11 @@ mod tests {
             .await?;
         assert_ne!(coordinator.run_id, first_run_id);
         assert_eq!(second.completion_status, concerto_core::types::AgentCompletionStatus::Partial);
-        assert!(second.final_message.contains("Acceptance gate C-06"));
+        assert!(
+            second.final_message.contains("Acceptance gate C-06"),
+            "the second run must reach acceptance: {}",
+            second.final_message
+        );
         Ok(())
     }
 
