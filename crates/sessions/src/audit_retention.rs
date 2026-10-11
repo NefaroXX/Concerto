@@ -69,6 +69,8 @@ CREATE TABLE IF NOT EXISTS archive.audit_log_archive (
     attempted_destination   TEXT,
     resolved_destination    TEXT,
     result_facts            TEXT,
+    canonical_tool          TEXT,
+    canonical_operation     TEXT,
     archived_at             INTEGER NOT NULL
 )";
 
@@ -84,7 +86,8 @@ INSERT OR IGNORE INTO archive.audit_log_archive (
     destructive_classification, exit_code, duration_ms, toolchain_version,
     plan_id, source_revision, error_kind, server_id, plugin_id,
     path_operation, attempted_path, resolved_path, attempted_destination,
-    resolved_destination, result_facts, archived_at
+    resolved_destination, result_facts, canonical_tool, canonical_operation,
+    archived_at
 )
 SELECT *, ? FROM audit_log WHERE created_at < ?";
 
