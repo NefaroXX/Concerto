@@ -618,7 +618,13 @@ impl IpcError {
     ///   (`RequireApproval` inside a `GateDenied`) denies rather than parks
     ///   — the live approval flow parks via the approval bridge and never
     ///   reaches this surface, so nothing here can coach a retry around a
-    ///   gate.
+    /// gate.
+    ///
+    /// NOTE (H02 review): if a future change routes the supervised path
+    /// through the approval bridge (so a `RequireApproval` can park here),
+    /// this mapping must be revisited — a parked approval arriving as a
+    /// denial would fail closed and cost the user their prompt. Today the
+    /// bridge handles parks upstream of this conversion.
     /// - `Cancelled` → [`ToolError::Cancelled`] (the loop must break, not
     ///   retry).
     /// - `Conflict` → [`ToolError::VirtualFsConflict`], with the wire

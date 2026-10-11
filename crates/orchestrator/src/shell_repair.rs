@@ -1050,6 +1050,39 @@ mod tests {
         );
     }
 
+    /// A missing executable is deterministic and earns NO repair turn. This
+    /// locks the shared marker's lowercase invariant: the fold lowercases the
+    /// message (`"...on PATH"` → `"...on path"`) but not the marker, so a
+    /// marker left in mixed case would silently never match and the failure
+    /// would be classified `Unknown` — earning a pointless repair attempt for
+    /// a provably impossible action.
+    #[test]
+    fn missing_shell_executable_is_deterministic_on_the_typed_path() {
+        let error = ToolError::ExecutionFailed {
+            message: "shell executable not found on PATH: fruitloop".into(),
+        };
+        let envelope = envelope_for(&error);
+        assert_eq!(
+            envelope.disposition,
+            ToolDisposition::DoNotReIssue,
+            "the shared marker must match the lowercased message"
+        );
+        assert_eq!(
+            repair_verdict(SHELL_TOOL_NAME, &error, Some(&envelope)),
+            RepairVerdict::DoNotRepair,
+            "a missing executable cannot succeed on an identical re-issue"
+        );
+        // The marker table is lowercase by contract, so no marker may carry
+        // an uppercase byte (the exact defect that made the PATH marker dead).
+        for marker in concerto_core::error::deterministic_failure_markers_for_test() {
+            assert_eq!(
+                marker.to_lowercase(),
+                *marker,
+                "deterministic failure markers must be lowercase: {marker:?}"
+            );
+        }
+    }
+
     /// Shell-derived envelopes keep their verbatim codes through the repair
     /// turn: the timeout code earns the timeout shape, the non-zero-exit
     /// code keeps its diagnostic, and the program-not-found code derives
