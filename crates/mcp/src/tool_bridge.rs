@@ -209,11 +209,6 @@ mod tests {
         assert_eq!(tool.server_id(), "srv");
         assert_eq!(tool.description(), "A fixture tool");
         assert_eq!(tool.capability_requirements(), CapabilitySet::default());
-        // ADR-82 §4: `rollback_support` is deprecated (zero overrides); this
-        // assertion pins the default until removal.
-        #[allow(deprecated)]
-        let supported = tool.rollback_support();
-        assert!(!supported);
         assert!(tool.command_facts(&json!({}), &session).is_none());
     }
 

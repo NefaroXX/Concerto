@@ -1,11 +1,7 @@
 use crate::error::ToolError;
 use crate::traits::PolicyEngine;
-// `RollbackSnapshot` names the deprecated seam below; the `#[allow]` keeps
-// the deprecation declaration itself warning-free under `-D warnings`.
-#[allow(deprecated)]
 use crate::types::{
-    CapabilitySet, CommandPolicyFacts, PathPolicyFacts, RollbackSnapshot, SessionContext,
-    ToolOutput,
+    CapabilitySet, CommandPolicyFacts, PathPolicyFacts, SessionContext, ToolOutput,
 };
 use crate::CancellationToken;
 use async_trait::async_trait;
@@ -85,18 +81,6 @@ pub trait Tool: Send + Sync {
         (self.name().to_string(), input.clone())
     }
 
-    /// ADR-82 §4 (slice 5): deprecated, zero overrides in-tree. Rollback is
-    /// expressed as [`crate::checkpoint::CheckpointRecord`] plus
-    /// [`crate::executor::ToolExecutor::restore_checkpoint`]. Kept (not
-    /// removed) so the deprecation is breaking-change-free.
-    #[deprecated(
-        since = "0.1.0",
-        note = "ADR-82 §4: unwired seam, superseded by CheckpointRecord + ToolExecutor::restore_checkpoint"
-    )]
-    fn rollback_support(&self) -> bool {
-        false
-    }
-
     async fn execute(
         &self,
         input: serde_json::Value,
@@ -104,19 +88,4 @@ pub trait Tool: Send + Sync {
         session: &SessionContext,
         cancel: CancellationToken,
     ) -> Result<ToolOutput, ToolError>;
-
-    /// ADR-82 §4 (slice 5): deprecated, zero overrides and zero call sites
-    /// in-tree. See [`Self::rollback_support`].
-    #[deprecated(
-        since = "0.1.0",
-        note = "ADR-82 §4: unwired seam, superseded by CheckpointRecord + ToolExecutor::restore_checkpoint"
-    )]
-    #[allow(deprecated)]
-    async fn rollback(
-        &self,
-        _snapshot: RollbackSnapshot,
-        _cancel: CancellationToken,
-    ) -> Result<(), ToolError> {
-        Err(ToolError::RollbackNotSupported)
-    }
 }
