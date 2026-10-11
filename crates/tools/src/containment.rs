@@ -274,12 +274,21 @@ const INTERPOLATION_TARGET_CHARS: &[char] = &['$', '`'];
 /// Canonical form of the containment trust anchor.
 ///
 /// H02 construction-site typing: root canonicalization fails only on OS
-/// grounds — typed `Io`, classified by `ErrorKind`. FINDING: the previous
-/// message named the root and stated the fail-closed refusal ("refusing to
-/// run an unconfined shell command"); the `Io` Display carries the OS cause
-/// only. The refusal itself is unchanged (still an `Err`, never executed).
+/// grounds — typed `Io`, classified by `ErrorKind`. The pre-typing operator
+/// context (root path + the fail-closed refusal) rides the io payload; the
+/// kind is preserved exactly, so classification is identical to the
+/// bare-kind conversion. The refusal itself is unchanged (still an `Err`,
+/// never executed).
 fn canonical_root(root: &Utf8Path) -> Result<Utf8PathBuf, ToolError> {
-    root.canonicalize_utf8().map_err(ToolError::Io)
+    root.canonicalize_utf8().map_err(|error| {
+        ToolError::Io(std::io::Error::new(
+            error.kind(),
+            format!(
+                "containment: cannot canonicalize project root '{root}': {error}; \
+                 refusing to run an unconfined shell command"
+            ),
+        ))
+    })
 }
 
 /// Escape rejection: a path resolved outside the project root.
@@ -1023,6 +1032,67 @@ mod tests {
 
     fn session(root: &Utf8Path) -> SessionContext {
         SessionContext::new(Ulid::new(), root.as_std_path().to_path_buf())
+    }
+
+    // -----------------------------------------------------------------------
+    // H02 construction-site typing: root canonicalization.
+    // -----------------------------------------------------------------------
+
+    /// A project root the OS cannot reach surfaces as the structural
+    /// `ToolError::Io` (classified by `ErrorKind::NotFound`), and the
+    /// pre-typing operator context (root path + fail-closed refusal) rides
+    /// the io payload. Context presence never flips classification: the
+    /// same kind with only the bare OS text yields the identical ledger +
+    /// envelope disposition.
+    #[test]
+    fn missing_containment_root_yields_typed_io_with_context() {
+        let missing = Utf8Path::new("/concerto_no_such_root_for_containment_test");
+        assert!(!missing.exists(), "the root must genuinely be absent");
+        let error = canonical_root(missing).expect_err("missing root must fail");
+        let kind = match &error {
+            ToolError::Io(io) => io.kind(),
+            other => panic!("expected typed ToolError::Io, got {other:?}"),
+        };
+        assert_eq!(kind, std::io::ErrorKind::NotFound, "the OS verdict is preserved");
+        let display = error.to_string();
+        assert!(
+            display.contains("containment: cannot canonicalize project root"),
+            "missing op context: {display}"
+        );
+        assert!(display.contains(missing.as_str()), "missing root path: {display}");
+        assert!(
+            display.contains("refusing to run an unconfined shell command"),
+            "missing fail-closed refusal: {display}"
+        );
+        assert!(error.is_deterministic_failure(), "the kind classifies structurally");
+        let failure = concerto_core::tool_failure::ToolFailure::from_error(
+            &error,
+            concerto_core::tool_failure::ToolFailureContext::builtin(),
+        );
+        assert_eq!(failure.code, "exec.io_error", "the envelope is typed");
+        assert_eq!(
+            failure.disposition,
+            concerto_core::tool_failure::ToolDisposition::DoNotReIssue,
+            "the disposition derives from the kind"
+        );
+        let bare = ToolError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No such file or directory (os error 2)",
+        ));
+        assert_eq!(
+            error.is_deterministic_failure(),
+            bare.is_deterministic_failure(),
+            "classification is kind-for-kind, context text is inert"
+        );
+        let bare_failure = concerto_core::tool_failure::ToolFailure::from_error(
+            &bare,
+            concerto_core::tool_failure::ToolFailureContext::builtin(),
+        );
+        assert_eq!(failure.code, bare_failure.code, "same envelope code");
+        assert_eq!(
+            failure.disposition, bare_failure.disposition,
+            "same disposition with and without context text"
+        );
     }
 
     // -----------------------------------------------------------------------
