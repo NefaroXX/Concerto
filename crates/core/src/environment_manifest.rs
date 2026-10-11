@@ -30,7 +30,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::checkpoint::CHECKPOINT_BLOB_LIMIT_BYTES;
+use crate::checkpoint::CHECKPOINT_TOTAL_LIMIT_BYTES;
 use crate::types::{CommandRouting, SandboxProfile};
 
 /// Current [`EnvironmentManifest`] envelope schema version (ADR-82 §2).
@@ -213,16 +213,19 @@ impl PolicyScopeDescription {
 ///
 /// Every field states a harness ceiling honestly: what restore *can* do, and
 /// — just as importantly — what it degrades (`Manual`) on. In particular
-/// `binary_restore` and `untracked_file_restore` are `false` until the
-/// streaming store lands and the git-stash `-u` gap closes; the byte bound
-/// below is the sidecar's own budget, never reconstructed from a hash.
+/// `untracked_file_restore` stays `false` until the git-stash `-u` gap
+/// closes; the byte bound below is the sidecar's own total budget, never
+/// reconstructed from a hash. Binary restore is claimed since the chunked
+/// pre-image store (migration 039) banks arbitrary bytes within budget.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestoreCapabilities {
-    /// Whether ≤ bound text pre-images restore from sidecar bytes (slice 5).
+    /// Whether within-budget pre-images (binary included) restore from
+    /// sidecar bytes.
     #[serde(default)]
     pub file_pre_image_bytes: bool,
-    /// The sidecar byte budget
-    /// ([`CHECKPOINT_BLOB_LIMIT_BYTES`], not the evidence-path cache bound).
+    /// The sidecar byte budget per checkpoint
+    /// ([`CHECKPOINT_TOTAL_LIMIT_BYTES`], not the evidence-path cache bound;
+    /// banked as `CHECKPOINT_BLOB_LIMIT_BYTES`-capped chunks).
     #[serde(default)]
     pub max_pre_image_bytes: u64,
     /// Whether git-stash undo is available behind `RestoreMethod::GitStash`.
@@ -231,8 +234,9 @@ pub struct RestoreCapabilities {
     /// Whether untracked-file restore works (false: the stash omits `-u`).
     #[serde(default)]
     pub untracked_file_restore: bool,
-    /// Whether binary restore works (false: oversized/binary targets are
-    /// hash-only — drift-detectable, never reconstructible).
+    /// Whether binary restore works (true: the chunked store replays
+    /// within-budget bytes byte-exact; over-budget targets stay hash-only —
+    /// drift-detectable, never reconstructible).
     #[serde(default)]
     pub binary_restore: bool,
 }
@@ -243,10 +247,10 @@ impl RestoreCapabilities {
     pub fn current() -> Self {
         Self {
             file_pre_image_bytes: true,
-            max_pre_image_bytes: CHECKPOINT_BLOB_LIMIT_BYTES as u64,
+            max_pre_image_bytes: CHECKPOINT_TOTAL_LIMIT_BYTES as u64,
             git_stash_undo: true,
             untracked_file_restore: false,
-            binary_restore: false,
+            binary_restore: true,
         }
     }
 }
@@ -599,16 +603,16 @@ mod tests {
     }
 
     #[test]
-    fn restore_capabilities_match_the_slice5_ceilings() {
+    fn restore_capabilities_match_the_chunked_store_ceilings() {
         let restore = RestoreCapabilities::current();
         assert!(restore.file_pre_image_bytes);
-        assert_eq!(restore.max_pre_image_bytes, CHECKPOINT_BLOB_LIMIT_BYTES as u64);
+        assert_eq!(restore.max_pre_image_bytes, CHECKPOINT_TOTAL_LIMIT_BYTES as u64);
         assert!(restore.git_stash_undo);
         assert!(
             !restore.untracked_file_restore,
             "git-stash omits -u: untracked restore is not claimed"
         );
-        assert!(!restore.binary_restore, "oversized/binary targets stay hash-only");
+        assert!(restore.binary_restore, "the chunked store banks within-budget binary byte-exact");
     }
 
     #[test]

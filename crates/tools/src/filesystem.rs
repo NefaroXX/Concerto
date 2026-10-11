@@ -34,6 +34,20 @@ pub struct FilesystemInput {
     #[serde(default)]
     #[schemars(description = "Content to write (required for write operation).")]
     pub content: Option<String>,
+    /// Standard-base64-encoded bytes to write (alternative to `content` for
+    /// the "write" operation only).
+    ///
+    /// The byte-replay channel: checkpoint restore replays banked bytes
+    /// verbatim through this field because JSON strings are Unicode and
+    /// cannot carry arbitrary bytes. Exactly one of `content`/`content_b64`
+    /// must be present on a write; `content_b64` bytes are written to disk
+    /// and staged **without** typographic normalization (byte-exact replay),
+    /// while `content` keeps the model-output hygiene.
+    #[serde(default)]
+    #[schemars(
+        description = "Base64-encoded bytes to write (alternative to content for write operation; written verbatim without normalization)."
+    )]
+    pub content_b64: Option<String>,
     /// Destination path (required for "move" and "copy" operations).
     #[serde(default)]
     #[schemars(description = "Destination path (required for move/copy operations).")]
@@ -234,6 +248,65 @@ impl FilesystemTool {
     pub fn vfs(&self) -> &Arc<Mutex<VirtualFs>> {
         &self.vfs
     }
+
+    /// Byte-verbatim write for the `content_b64` channel (see the write arm).
+    ///
+    /// Parents are materialized, `bytes` land on disk exactly, and the VFS
+    /// stages them via [`VirtualFs::write_bytes`] — no typographic
+    /// normalization, so checkpoint byte-restore replays banked bytes
+    /// exactly. An unstaged on-disk file is loaded first (like the text
+    /// path) so an existing file stages `ModifiedBytes` rather than
+    /// `CreatedBytes`. H02: OS failures are typed `Io`, mirroring the text
+    /// path's classification exactly.
+    fn execute_bytes_write(
+        path: &Utf8Path,
+        path_str: &str,
+        root: &Utf8Path,
+        vfs: &mut VirtualFs,
+        bytes: Vec<u8>,
+    ) -> Result<ToolOutput, ToolError> {
+        // Capture the original contents before materializing the write
+        // (same classification rule as the text path).
+        if !vfs.exists(path) && path.as_std_path().is_file() {
+            vfs.read_disk(path)?;
+        }
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent.as_std_path()).map_err(|e| {
+                ToolError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to create parent directory for '{path_str}' \
+                         in workspace '{root}': {e}"
+                    ),
+                ))
+            })?;
+        }
+
+        let content_len = bytes.len();
+        std::fs::write(path.as_std_path(), bytes.as_slice()).map_err(|e| {
+            ToolError::Io(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "failed to write '{path_str}' at '{path}' in workspace '{root}': \
+                     {e}. Check that the selected project folder is writable and is not \
+                     blocked by Windows Controlled Folder Access"
+                ),
+            ))
+        })?;
+
+        vfs.write_bytes(path, bytes)?;
+
+        Ok(ToolOutput {
+            summary: format!("Wrote {content_len} bytes to {path_str}"),
+            data: serde_json::json!({
+                "path": path_str,
+                "absolute_path": path.to_string(),
+                "size": content_len,
+                "materialized": true
+            }),
+        })
+    }
 }
 
 /// Return `ToolError::Cancelled` if the token has been cancelled.
@@ -417,6 +490,41 @@ impl concerto_core::traits::tool::Tool for FilesystemTool {
                 // reserved-name check, so `std::fs::write` to `<root>\nul`
                 // would create a literal 0-byte file instead of erroring.
                 reject_reserved_device_name(&path)?;
+                // Byte-replay channel (`content_b64`) vs model-text channel
+                // (`content`): exactly one must be present. Bytes are
+                // decoded and written verbatim (no typographic
+                // normalization — the caller replays banked bytes); text
+                // keeps the normalization hygiene below.
+                let replay_bytes: Option<Vec<u8>> = match (
+                    fs_input.content.as_deref(),
+                    fs_input.content_b64.as_deref(),
+                ) {
+                    (Some(_), Some(_)) => {
+                        return Err(ToolError::ExecutionFailed {
+                            message: "write accepts exactly one of 'content' or 'content_b64'"
+                                .into(),
+                        });
+                    }
+                    (None, Some(b64)) => {
+                        use base64::Engine;
+                        Some(
+                            base64::engine::general_purpose::STANDARD.decode(b64).map_err(
+                                |error| ToolError::ExecutionFailed {
+                                    message: format!("invalid 'content_b64': {error}"),
+                                },
+                            )?,
+                        )
+                    }
+                    (Some(_), None) => None,
+                    (None, None) => {
+                        return Err(ToolError::ExecutionFailed {
+                            message: "missing 'content' field for write operation".into(),
+                        });
+                    }
+                };
+                if let Some(bytes) = replay_bytes {
+                    return Self::execute_bytes_write(&path, path_str, root, &mut vfs, bytes);
+                }
                 let raw_content =
                     fs_input.content.as_deref().ok_or_else(|| ToolError::ExecutionFailed {
                         message: "missing 'content' field for write operation".into(),
@@ -1556,6 +1664,66 @@ mod tests {
         // Should succeed (empty files are valid)
         let result = tool.execute(input, &policy, &session_for(dir.path()), cancel).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn write_b64_round_trips_binary_bytes_verbatim() {
+        use base64::Engine as _;
+        let (tool, dir) = tool_and_dir();
+        let policy = test_policy();
+        // Non-UTF-8 bytes that can never ride the `content` field.
+        let bytes = vec![0x00, 0xFF, 0xFE, 0x01, 0x02, b'h', b'i'];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        tool.execute(
+            serde_json::json!({"operation": "write", "path": "bin.dat", "content_b64": b64}),
+            &policy,
+            &session_for(dir.path()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("b64 write succeeds");
+        // Disk holds the exact bytes (no normalization, no text guessing).
+        assert_eq!(std::fs::read(dir.path().join("bin.dat")).unwrap(), bytes);
+        // The overlay stages them too: commit re-applies the same bytes.
+        let absolute = camino::Utf8PathBuf::from_path_buf(dir.path().join("bin.dat")).unwrap();
+        let vfs = tool.vfs().lock().unwrap();
+        assert_eq!(vfs.read_bytes(&absolute).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn write_b64_rejects_ambiguous_and_invalid_inputs() {
+        let (tool, dir) = tool_and_dir();
+        let policy = test_policy();
+        // Both channels at once: refused (exactly one must be present).
+        let both = tool
+            .execute(
+                serde_json::json!({
+                    "operation": "write",
+                    "path": "a.bin",
+                    "content": "text",
+                    "content_b64": "aGk=",
+                }),
+                &policy,
+                &session_for(dir.path()),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(both.is_err(), "content + content_b64 must be refused");
+        // Invalid base64: refused loudly, nothing written.
+        let bad = tool
+            .execute(
+                serde_json::json!({
+                    "operation": "write",
+                    "path": "b.bin",
+                    "content_b64": "!!!not-base64!!!",
+                }),
+                &policy,
+                &session_for(dir.path()),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(bad.is_err(), "invalid base64 must be refused");
+        assert!(!dir.path().join("b.bin").exists(), "refused write writes nothing");
     }
 
     #[tokio::test]

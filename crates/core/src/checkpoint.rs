@@ -3,8 +3,9 @@
 //! A [`CheckpointRecord`] anchors the checkpoint-time state of a set of file
 //! paths so a later [`ToolExecutor`](crate::executor::ToolExecutor) restore
 //! can return byte-exact content. The durable pre-image **bytes** live in the
-//! `concerto-sessions` sidecar table (migration 037); this module owns the
-//! record envelope, the budget rule, and the collaborator traits the executor
+//! `concerto-sessions` sidecar chunk table (migration 039; migration 037's
+//! single-BLOB table stays readable for older checkpoints); this module owns
+//! the record envelope, the budget rule, and the collaborator traits the executor
 //! restores through — never the storage itself (layering: core names no
 //! downstream crate).
 //!
@@ -18,15 +19,17 @@
 //! deleted (a no-op when still absent). Deletion restores are exact; only
 //! byte-carrying restores need the sidecar.
 //!
-//! Partial-milestone honesty (ADR-82 Accepted Limitations §1-3): byte-exact
-//! restore covers small (≤ [`CHECKPOINT_BLOB_LIMIT_BYTES`]) UTF-8 text
-//! pre-images only. Oversized and binary targets stay hash-only: the blake3
-//! hash is a verifier, never a reconstruction source. Shell side-effects,
+//! Partial-milestone honesty (ADR-82 Accepted Limitations §1-3, as completed
+//! by the chunked pre-image store): byte-exact restore covers files within
+//! the per-checkpoint total budget ([`CHECKPOINT_TOTAL_LIMIT_BYTES`]),
+//! banked as [`CHECKPOINT_BLOB_LIMIT_BYTES`]-sized chunks of arbitrary bytes
+//! (binary included — the sidecar and the restore path are byte-oriented,
+//! never text). Files over the total budget stay hash-only: the blake3 hash
+//! is a verifier, never a reconstruction source. Shell side-effects,
 //! network, database, and process effects are never reversed (`excluded`
-//! covers those classes). The streaming/block-based pre-image store that
-//! completes binary restore is deferred, as is untracked-file restore beyond
-//! the git-stash gap (`RestoreMethod::GitStash` inherits `undo.rs`'s missing
-//! `-u`).
+//! covers those classes), and symlink/permission/xattr metadata is not
+//! captured. Untracked-file restore beyond the git-stash gap
+//! (`RestoreMethod::GitStash` inherits `undo.rs`'s missing `-u`) is unchanged.
 
 use std::collections::BTreeMap;
 
@@ -49,7 +52,8 @@ use crate::CancellationToken;
 /// slice — so the supported set is exactly `{1}`.
 pub const CHECKPOINT_RECORD_SCHEMA_VERSION: u32 = 1;
 
-/// Own byte budget for the checkpoint sidecar's `content` BLOB column.
+/// Own byte budget for one chunk of the checkpoint sidecar's chunked
+/// pre-image store (migration 039).
 ///
 /// Deliberately **not** an alias of the evidence-path `CACHE_LIMIT_BYTES`
 /// (`concerto-sessions` `resource_facts`): that bound scopes the read-dedupe
@@ -57,9 +61,24 @@ pub const CHECKPOINT_RECORD_SCHEMA_VERSION: u32 = 1;
 /// bounded side table"), while this one scopes a restoration store. Same
 /// numeric value today (64 KiB), but the two must evolve independently — an
 /// evidence-path tuning must never silently change restore guarantees, and a
-/// restore-ceiling change must never resize the read cache. The column is a
-/// BLOB and this limit is a byte bound on it, never a text bound.
+/// restore-ceiling change must never resize the read cache. Chunks are BLOBs
+/// and this limit is a byte bound on each chunk row, never a text bound.
 pub const CHECKPOINT_BLOB_LIMIT_BYTES: usize = 64 * 1024;
+
+/// Own total budget for one checkpoint's banked pre-image bytes, across all
+/// of its chunk rows (migration 039).
+///
+/// A single file banks its bytes exactly when `len <=
+/// CHECKPOINT_TOTAL_LIMIT_BYTES` — binary included — no matter how many
+/// [`CHECKPOINT_BLOB_LIMIT_BYTES`]-sized chunks that takes; files over this
+/// budget stay hash-only (`byte_ref: None` + an `OversizedFile` exclusion
+/// naming this ceiling). The creation seam additionally enforces the budget
+/// as a running total across the checkpoint's files (first-fit with honest
+/// downgrade), so the sidecar never holds more than this per checkpoint.
+/// 4 MiB matches the gate's in-memory pre-image entry cap
+/// (`PRE_IMAGE_CACHE_MAX_ENTRY_BYTES`), so creation snapshots and seam
+/// backfills agree on what is bankable.
+pub const CHECKPOINT_TOTAL_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 
 /// Bound on `CheckpointRecord.metadata` entries (operator-supplied annotations only).
 pub const CHECKPOINT_METADATA_MAX_ENTRIES: usize = 16;
@@ -74,9 +93,9 @@ pub const CHECKPOINT_LIMITATION_MAX_BYTES: usize = 512;
 /// Sanity bound on a canonical checkpoint path, in bytes.
 pub const CHECKPOINT_PATH_MAX_BYTES: usize = 4096;
 
-/// Standard limitation recording the slice-5 partial scope on any checkpoint
+/// Standard limitation recording the byte-scope ceiling on any checkpoint
 /// that carries hash-only (unrestorable-bytes) resources.
-pub const PARTIAL_SCOPE_LIMITATION: &str = "partial milestone (ADR-82 slice 5): byte-exact restore covers small (≤ 64 KiB) UTF-8 text pre-images only; binary and larger files are hash-only (the hash verifies drift but cannot reconstruct bytes) and restore as Manual; the streaming/block-based pre-image store is deferred";
+pub const PARTIAL_SCOPE_LIMITATION: &str = "byte-exact restore covers files within the per-checkpoint total budget (CHECKPOINT_TOTAL_LIMIT_BYTES, banked as 64 KiB chunks); files over the budget are hash-only (the hash verifies drift but cannot reconstruct bytes) and restore as Manual; symlink/permission/xattr metadata is not captured";
 
 // ---------------------------------------------------------------------------
 // Record envelope
@@ -140,8 +159,8 @@ pub struct CheckpointResource {
     #[serde(default)]
     pub post_hash: Option<String>,
     /// Sidecar locator for the checkpoint-time bytes (`None` for hash-only
-    /// resources: absent-at-checkpoint paths need no bytes, oversized/binary
-    /// paths cannot bank them in this slice).
+    /// resources: absent-at-checkpoint paths need no bytes, over-budget
+    /// paths cannot bank them).
     #[serde(default)]
     pub byte_ref: Option<CheckpointByteRef>,
     /// Checkpoint-time byte size (`None` when absent then).
@@ -162,8 +181,9 @@ pub enum CheckpointExclusionClass {
     Database,
     /// Process effects (daemons started, signals sent).
     Process,
-    /// Byte restore unavailable in this slice: oversized (> budget) or binary
-    /// (non-UTF-8) content is hash-only. The `reason` names which.
+    /// Byte restore unavailable: content over the per-checkpoint total
+    /// budget ([`CHECKPOINT_TOTAL_LIMIT_BYTES`]) is hash-only. The `reason`
+    /// names the ceiling hit.
     OversizedFile,
 }
 
@@ -425,11 +445,16 @@ pub struct PlannedCapture {
 /// Apply the byte-budget rule to one path's checkpoint-time observation.
 ///
 /// * `post_bytes` `Some` (file present): banked when `len <=
-///   CHECKPOINT_BLOB_LIMIT_BYTES` **and** valid UTF-8 (this slice restores
-///   text through the `filesystem` write tool); otherwise hash-only +
-///   `OversizedFile` exclusion with a reason naming which ceiling hit.
+///   CHECKPOINT_TOTAL_LIMIT_BYTES`, as [`CHECKPOINT_BLOB_LIMIT_BYTES`]-sized
+///   chunks of arbitrary bytes (binary included — capture and restore are
+///   byte-oriented, never text); otherwise hash-only + `OversizedFile`
+///   exclusion with a reason naming the ceiling hit.
 /// * `post_bytes` `None` (absent): included as-is — ensuring deletion needs
 ///   no bytes, so absence restores exactly.
+///
+/// The per-checkpoint running total is enforced one layer up (the creation
+/// seam downgrades honestly when the next file would overflow it); this rule
+/// is the per-path feasibility half: a file over the total can never fit.
 ///
 /// `pre_hash` is provenance only (the last write-gate pre-image known for the
 /// path); it never decides restorability. Kind follows the (pre, post) pair
@@ -460,7 +485,7 @@ pub fn plan_capture(
         Some(_) => CheckpointResourceKind::FileOverwrite,
         None => CheckpointResourceKind::FileCreate,
     };
-    if bytes.len() > CHECKPOINT_BLOB_LIMIT_BYTES {
+    if bytes.len() > CHECKPOINT_TOTAL_LIMIT_BYTES {
         return PlannedCapture {
             included: Some(CheckpointResource {
                 kind,
@@ -474,26 +499,9 @@ pub fn plan_capture(
                 class: CheckpointExclusionClass::OversizedFile,
                 path: Some(canonical_path.to_owned()),
                 reason: format!(
-                    "{} bytes exceeds CHECKPOINT_BLOB_LIMIT_BYTES ({CHECKPOINT_BLOB_LIMIT_BYTES}): hash-only; byte restore unavailable in this slice",
+                    "{} bytes exceeds CHECKPOINT_TOTAL_LIMIT_BYTES ({CHECKPOINT_TOTAL_LIMIT_BYTES}): hash-only; byte restore unavailable above the per-checkpoint total budget",
                     bytes.len()
                 ),
-            }),
-        };
-    }
-    if std::str::from_utf8(bytes).is_err() {
-        return PlannedCapture {
-            included: Some(CheckpointResource {
-                kind,
-                canonical_path: canonical_path.to_owned(),
-                pre_hash,
-                post_hash: Some(post_hash),
-                byte_ref: None,
-                size_bytes,
-            }),
-            excluded: Some(CheckpointExclusion {
-                class: CheckpointExclusionClass::OversizedFile,
-                path: Some(canonical_path.to_owned()),
-                reason: "binary (non-UTF-8) content: hash-only; byte restore deferred to the streaming store".to_string(),
             }),
         };
     }
@@ -896,30 +904,36 @@ mod tests {
     #[test]
     fn plan_capture_oversized_is_hash_only_with_reason() {
         let id = Ulid::new();
-        let big = vec![b'x'; CHECKPOINT_BLOB_LIMIT_BYTES + 1];
-        let planned = plan_capture(&id, "big.txt", None, Some(&big));
+        let big = vec![b'x'; CHECKPOINT_TOTAL_LIMIT_BYTES + 1];
+        let planned = plan_capture(&id, "big.bin", None, Some(&big));
         let included = planned.included.expect("still anchored for drift detection");
-        assert!(included.byte_ref.is_none(), "no bytes banked above budget");
+        assert!(included.byte_ref.is_none(), "no bytes banked above the total budget");
         assert!(included.post_hash.is_some(), "hash stays as the verifier");
         let excluded = planned.excluded.expect("honesty entry");
         assert_eq!(excluded.class, CheckpointExclusionClass::OversizedFile);
-        assert!(excluded.reason.contains("CHECKPOINT_BLOB_LIMIT_BYTES"));
-        // Exactly at budget still banks.
-        let exact = vec![b'y'; CHECKPOINT_BLOB_LIMIT_BYTES];
-        let planned = plan_capture(&id, "edge.txt", None, Some(&exact));
+        assert!(excluded.reason.contains("CHECKPOINT_TOTAL_LIMIT_BYTES"));
+        // Exactly at the total budget still banks (chunking is storage detail).
+        let exact = vec![b'y'; CHECKPOINT_TOTAL_LIMIT_BYTES];
+        let planned = plan_capture(&id, "edge.bin", None, Some(&exact));
         assert!(planned.excluded.is_none());
         assert!(planned.included.expect("edge banks").byte_ref.is_some());
+        // Above the per-chunk size but within the total banks too.
+        let chunked = vec![b'z'; CHECKPOINT_BLOB_LIMIT_BYTES + 1];
+        let planned = plan_capture(&id, "chunked.bin", None, Some(&chunked));
+        assert!(planned.excluded.is_none());
+        assert!(planned.included.expect("multi-chunk banks").byte_ref.is_some());
     }
 
     #[test]
-    fn plan_capture_binary_is_hash_only_with_reason() {
+    fn plan_capture_binary_banks_bytes() {
+        // Binary is no longer a ceiling: the store and restore are
+        // byte-oriented, so non-UTF-8 content banks exactly like text.
         let id = Ulid::new();
         let planned = plan_capture(&id, "bin.dat", None, Some(&[0xff, 0xfe, 0x00, 0x01]));
-        let included = planned.included.expect("anchored");
-        assert!(included.byte_ref.is_none(), "binary never banks in this slice");
-        let excluded = planned.excluded.expect("honesty entry");
-        assert_eq!(excluded.class, CheckpointExclusionClass::OversizedFile);
-        assert!(excluded.reason.contains("binary"), "reason names the real ceiling");
+        let included = planned.included.expect("banked");
+        assert!(included.byte_ref.is_some(), "binary banks in the chunked store");
+        assert!(planned.excluded.is_none(), "no honesty entry needed for bankable bytes");
+        assert_eq!(included.size_bytes, Some(4));
     }
 
     #[test]

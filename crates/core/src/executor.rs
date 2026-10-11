@@ -1403,20 +1403,15 @@ impl ToolExecutor {
                         ));
                         continue;
                     }
-                    let content = match String::from_utf8(bytes) {
-                        Ok(content) => content,
-                        Err(_) => {
-                            missing.push(path.clone());
-                            limitations.push(format!(
-                                "{path}: sidecar bytes are not UTF-8; binary restore is deferred to the streaming store"
-                            ));
-                            continue;
-                        }
-                    };
+                    // Byte-exact replay (binary included): the bytes ride
+                    // `content_b64` through the normal gated `filesystem`
+                    // write — same policy gate, same ownership checks, no
+                    // text normalization — so what lands on disk is exactly
+                    // what the checkpoint banked.
                     let existed = std::fs::metadata(session.project_dir.join(&path)).is_ok();
-                    self.execute_filesystem_write(
+                    self.execute_filesystem_write_bytes(
                         &path,
-                        &content,
+                        &bytes,
                         ownership,
                         by_agent,
                         session,
@@ -1473,8 +1468,8 @@ impl ToolExecutor {
         }
     }
 
-    /// One gated `filesystem` write for restore: policy + `VirtualFs` apply
-    /// exactly as for any other write (never a bypass).
+    /// One gated byte-exact `filesystem` write for restore: policy +
+    /// `VirtualFs` apply exactly as for any other write (never a bypass).
     ///
     /// The ownership oracle is re-consulted immediately before the write: a
     /// sibling that acquired the path after the Phase-1 pre-check aborts
@@ -1482,19 +1477,29 @@ impl ToolExecutor {
     /// current owner named, read from the gate's typed ownership surface —
     /// never string-matched denial prose, per ADR-82) and no write runs.
     /// Non-ownership denials keep their `PolicyDenied` mapping.
-    async fn execute_filesystem_write(
+    ///
+    /// The banked bytes ride `content_b64` (JSON strings are Unicode and
+    /// cannot carry arbitrary bytes) and land verbatim — no text
+    /// normalization, binary included. This is the only restore write path
+    /// for byte-carrying resources.
+    async fn execute_filesystem_write_bytes(
         &self,
         path: &str,
-        content: &str,
+        bytes: &[u8],
         ownership: &dyn OwnershipOracle,
         by_agent: &str,
         session: &SessionContext,
         cancel: CancellationToken,
     ) -> Result<(), RestoreError> {
+        use base64::Engine as _;
         if let Some(conflict) = ownership_conflict(ownership, path, by_agent) {
             return Err(RestoreError::OwnershipConflict(vec![conflict]));
         }
-        let input = serde_json::json!({"operation": "write", "path": path, "content": content});
+        let input = serde_json::json!({
+            "operation": "write",
+            "path": path,
+            "content_b64": base64::engine::general_purpose::STANDARD.encode(bytes),
+        });
         self.execute("filesystem", input, session, cancel).await.map(|_| ()).map_err(|error| {
             match error {
                 ToolError::PolicyDenied { rule } => RestoreError::PolicyDenied(rule),
@@ -1505,7 +1510,7 @@ impl ToolExecutor {
     }
 
     /// One gated `filesystem` delete for restore (absent-at-checkpoint paths).
-    /// Same Phase-2 ownership re-check as [`Self::execute_filesystem_write`].
+    /// Same Phase-2 ownership re-check as the byte-write path above.
     async fn execute_filesystem_delete(
         &self,
         path: &str,
@@ -3511,19 +3516,34 @@ mod restore_tests {
     /// In-memory `filesystem` tool: `write`/`delete` mutate the map, every
     /// call is counted so tests prove what did (and did not) execute.
     /// Clonable around shared state so the registered box and the test
-    /// observe the same files.
+    /// observe the same files. Stores bytes (like the real tool's overlay)
+    /// and accepts the restore path's `content_b64` as well as text
+    /// `content`.
     #[derive(Clone)]
     struct FakeFsTool {
-        files: Arc<Mutex<HashMap<String, String>>>,
+        files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         calls: Arc<AtomicUsize>,
     }
 
     impl FakeFsTool {
         fn new(files: HashMap<String, String>) -> Self {
-            Self { files: Arc::new(Mutex::new(files)), calls: Arc::new(AtomicUsize::new(0)) }
+            Self {
+                files: Arc::new(Mutex::new(
+                    files.into_iter().map(|(k, v)| (k, v.into_bytes())).collect(),
+                )),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
         }
 
         fn content(&self, path: &str) -> Option<String> {
+            self.files
+                .lock()
+                .expect("fake fs lock")
+                .get(path)
+                .and_then(|bytes| String::from_utf8(bytes.clone()).ok())
+        }
+
+        fn bytes(&self, path: &str) -> Option<Vec<u8>> {
             self.files.lock().expect("fake fs lock").get(path).cloned()
         }
 
@@ -3563,14 +3583,24 @@ mod restore_tests {
                 input.get("path").and_then(serde_json::Value::as_str).unwrap_or("").to_owned();
             match operation {
                 Some("write") => {
-                    let content = input
-                        .get("content")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("")
-                        .to_owned();
-                    self.files.lock().expect("fake fs lock").insert(path.clone(), content.clone());
+                    use base64::Engine as _;
+                    let bytes = if let Some(b64) =
+                        input.get("content_b64").and_then(serde_json::Value::as_str)
+                    {
+                        base64::engine::general_purpose::STANDARD
+                            .decode(b64)
+                            .expect("test content_b64 is valid base64")
+                    } else {
+                        input
+                            .get("content")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                            .as_bytes()
+                            .to_vec()
+                    };
+                    self.files.lock().expect("fake fs lock").insert(path.clone(), bytes.clone());
                     Ok(ToolOutput {
-                        summary: format!("Wrote {} bytes", content.len()),
+                        summary: format!("Wrote {} bytes", bytes.len()),
                         data: serde_json::json!({"path": path}),
                     })
                 }
@@ -3847,6 +3877,43 @@ mod restore_tests {
             other => panic!("expected Restored, got {other:?}"),
         }
         assert_eq!(fs.content("a.txt").as_deref(), Some("original"));
+        assert!(matches!(store.status(), CheckpointStatus::Restored { .. }));
+    }
+
+    #[tokio::test]
+    async fn binary_bytes_restore_byte_exact_through_gated_write() {
+        // Non-UTF-8 banked bytes restore byte-exact through the same gated
+        // write path — no UTF-8 gate, no Partial/Manual diversion. The
+        // bytes (0xFF/0x00) could never ride the text `content` field, so
+        // byte equality proves the `content_b64` channel carried them.
+        let (executor, fs, session, stash) =
+            harness(HashMap::from([("a.bin".to_string(), "mutated".to_string())]));
+        let (record, id) =
+            active_record(vec![overwrite_resource("a.bin", None)], RestoreMethod::PreImageStore);
+        let banked: Vec<u8> = vec![0x00, 0xFF, 0xFE, 0x01, 0x02, b'h', b'i'];
+        let store = FakeStore::new(record).with_bytes("a.bin", &banked, CaptureKind::Snapshot);
+
+        match executor
+            .restore_checkpoint(
+                &id,
+                &store,
+                &FakeOracle::default(),
+                &*stash,
+                &session,
+                "agent-a",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("binary restore succeeds")
+        {
+            RestoreOutcome::Restored { restored, recreated, .. } => {
+                // The harness seeds no disk file, so the write recreates.
+                assert!(restored.is_empty());
+                assert_eq!(recreated, vec!["a.bin"]);
+            }
+            other => panic!("expected Restored, got {other:?}"),
+        }
+        assert_eq!(fs.bytes("a.bin").as_deref(), Some(banked.as_slice()));
         assert!(matches!(store.status(), CheckpointStatus::Restored { .. }));
     }
 

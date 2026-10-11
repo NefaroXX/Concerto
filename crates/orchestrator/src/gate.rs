@@ -1666,14 +1666,16 @@ impl WriteGate {
         Ok(hashes)
     }
 
-    /// ADR-82 slice 5 (a): bank this write's pre-image bytes for every active
-    /// checkpoint covering an attributed path, beside the `WriteApplied`
-    /// append. The bytes come from the in-memory text cache (populated by
-    /// [`Self::pre_image_hashes`] just above) — no second disk read. `INSERT
-    /// OR IGNORE` in the store keeps a checkpoint-creation snapshot
-    /// authoritative; oversized captures are skipped at the store boundary.
-    /// Fail-soft: every failure path debug-logs and returns, never failing
-    /// the write (capture failure downgrades the resource, per the slice).
+    /// ADR-82 slice 5 (a) + chunked completion: bank this write's pre-image
+    /// bytes for every active checkpoint covering an attributed path, beside
+    /// the `WriteApplied` append. The bytes come from the in-memory
+    /// pre-image cache (populated by [`Self::pre_image_hashes`] just above —
+    /// raw bytes, binary included) — no second disk read. First bytes win at
+    /// path granularity in the store, so a checkpoint-creation snapshot stays
+    /// authoritative; over-total-budget captures are skipped at the store
+    /// boundary. Fail-soft: every failure path debug-logs and returns, never
+    /// failing the write (capture failure downgrades the resource, per the
+    /// slice).
     async fn backfill_checkpoint_pre_images(
         &self,
         req: &GateRequest,

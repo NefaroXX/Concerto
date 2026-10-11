@@ -9,7 +9,7 @@ re-run and must not be edited once they have shipped.
 ## Numbering convention
 
 - `NNN_description.sql`, zero-padded to three digits.
-- New migrations take the next free number — currently **039**.
+- New migrations take the next free number — currently **040**.
 - Do not renumber existing files: gaps are permanent and harmless.
 
 ## Known gaps (005, 006, 009, 010, 011)
