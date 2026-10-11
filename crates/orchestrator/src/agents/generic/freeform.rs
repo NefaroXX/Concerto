@@ -1,7 +1,7 @@
 //! Specialist tool execution and completion; evaluator integration stays in the parent.
 
 use super::*;
-use crate::agents::execution_state::{display_reason, tool_failure_payload, ExecutionState};
+use crate::agents::execution_state::{display_reason, tool_failure_payload_with, ExecutionState};
 
 impl GenericSpecialistAgent {
     /// Execute through the existing executor, retaining observed progress when
@@ -470,7 +470,10 @@ impl GenericSpecialistAgent {
                         {
                             return Err(OrchestratorError::Tool(error));
                         }
-                        let payload = tool_failure_payload(&error);
+                        let payload = tool_failure_payload_with(
+                            &error,
+                            Some(&crate::failure_diagnosis::tool_envelope(&tool_call.name, &error)),
+                        );
                         let code = payload
                             .get("code")
                             .and_then(serde_json::Value::as_str)

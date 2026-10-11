@@ -207,10 +207,24 @@ impl ExecutionState {
     }
 }
 
-/// Consume the existing diagnosis; do not create a competing ToolFailure
-/// schema or classify native failures from their formatted Display text here.
-pub(crate) fn tool_failure_payload(error: &ToolError) -> Value {
-    let diagnosis = crate::failure_diagnosis::diagnose_tool(error);
+/// H02: the typed [`ToolFailure`][concerto_core::tool_failure::ToolFailure]
+/// envelope rides the payload additively (`failure` key) when the caller
+/// holds one, so the model and the Coordinator act on the typed
+/// disposition/code without parsing `message`. The recovery hint derives
+/// from the diagnosis flags — which [`diagnose_failure`] derives from the
+/// envelope when present — so the hint stays consistent with the coordinator
+/// routing for the same failure.
+///
+/// A present, non-opaque envelope classifies from its disposition/code/
+/// category; an absent envelope takes the bounded prose fallback and the
+/// payload carries no `failure` key. An opaque envelope still rides (marked
+/// `opaque: true`, code `exec.opaque`), so consumers can see the failure was
+/// unclassifiable without mistaking it for a native code.
+pub(crate) fn tool_failure_payload_with(
+    error: &ToolError,
+    failure: Option<&concerto_core::tool_failure::ToolFailure>,
+) -> Value {
+    let diagnosis = crate::failure_diagnosis::diagnose_failure(error, failure);
     let recovery = if diagnosis.retryable && diagnosis.same_agent_viable {
         "correct_and_retry"
     } else if diagnosis.replan_required || diagnosis.same_agent_viable {
@@ -218,14 +232,20 @@ pub(crate) fn tool_failure_payload(error: &ToolError) -> Value {
     } else {
         "return_to_coordinator"
     };
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "error": "tool_execution_failed",
         "code": diagnosis.code,
         "message": diagnosis.evidence,
         "retryable": diagnosis.retryable,
         "recovery": recovery,
         "diagnosis": diagnosis.tool_summary(),
-    })
+    });
+    if let Some(envelope) = failure {
+        if let Ok(value) = serde_json::to_value(envelope) {
+            payload["failure"] = value;
+        }
+    }
+    payload
 }
 
 /// A retry repairs only the same native operation on the same resource. File
@@ -359,10 +379,84 @@ mod tests {
 
     #[test]
     fn policy_denial_has_no_unconditional_retry_instruction() {
-        let payload = tool_failure_payload(&ToolError::PolicyDenied { rule: "read-only".into() });
+        let payload =
+            tool_failure_payload_with(&ToolError::PolicyDenied { rule: "read-only".into() }, None);
         assert_eq!(payload["code"], "policy-denied");
         assert_eq!(payload["retryable"], false);
         assert_eq!(payload["recovery"], "change_action");
+        assert!(payload.get("failure").is_none(), "no envelope — no key");
+    }
+
+    /// H02: the typed envelope rides the payload additively, and the
+    /// recovery hint follows the typed disposition — a cancelled call is
+    /// returned to the coordinator (never silently re-issued), an
+    /// approval-park likewise, a rebase conflict changes the action
+    /// (reconcile first), and only the retry family retries.
+    #[test]
+    fn typed_envelope_rides_the_payload_with_disposition_recovery() {
+        use concerto_core::tool_failure::{ToolFailure, ToolFailureContext};
+
+        fn payload_for(error: &ToolError) -> serde_json::Value {
+            let failure = ToolFailure::from_error(error, ToolFailureContext::builtin());
+            tool_failure_payload_with(error, Some(&failure))
+        }
+
+        let timeout = payload_for(&ToolError::Timeout { timeout_secs: 30 });
+        assert_eq!(timeout["failure"]["code"], "exec.timeout");
+        assert_eq!(timeout["failure"]["disposition"], "bounded-retry-with-backoff");
+        assert_eq!(timeout["code"], "tool-failed");
+        assert_eq!(timeout["recovery"], "correct_and_retry");
+
+        let cancelled = payload_for(&ToolError::Cancelled);
+        assert_eq!(cancelled["failure"]["disposition"], "do-not-re-issue-same-intent");
+        assert_eq!(cancelled["code"], "cancelled");
+        assert_eq!(cancelled["recovery"], "return_to_coordinator");
+
+        let approval = payload_for(&ToolError::PausedAwaitingApproval {
+            tool_name: "shell".into(),
+            detail: "rm -rf /".into(),
+            input_hash: "hash".into(),
+            correlation_id: Ulid::new(),
+            timeout_secs: 30,
+        });
+        assert_eq!(approval["failure"]["disposition"], "awaiting-decision");
+        assert_eq!(approval["code"], "awaiting-decision");
+        assert_eq!(approval["recovery"], "return_to_coordinator");
+
+        let conflict = payload_for(&ToolError::VirtualFsConflict {
+            path: "a.txt".into(),
+            reason: "the file changed since it was read".into(),
+        });
+        assert_eq!(conflict["failure"]["disposition"], "retryable-after-rebase");
+        assert_eq!(conflict["code"], "tool-rebase-required");
+        assert_eq!(conflict["recovery"], "change_action");
+
+        let denied = payload_for(&ToolError::PolicyDenied { rule: "deny".into() });
+        assert_eq!(denied["failure"]["code"], "policy.denied");
+        assert_eq!(denied["recovery"], "change_action");
+    }
+
+    /// H02: an opaque envelope still rides the payload — marked opaque with
+    /// the `exec.opaque` code — so consumers see the failure was
+    /// unclassifiable without mistaking it for a native code.
+    #[test]
+    fn opaque_envelope_rides_marked_opaque() {
+        use concerto_core::tool_failure::{ToolFailure, ToolFailureContext, ToolOrigin};
+
+        let error = ToolError::Timeout { timeout_secs: 5 };
+        let failure = ToolFailure::from_error(
+            &error,
+            ToolFailureContext::with_origin(ToolOrigin::Mcp {
+                server: "github".into(),
+                tool: "list_repos".into(),
+            }),
+        );
+        assert!(failure.opaque);
+        let payload = tool_failure_payload_with(&error, Some(&failure));
+        assert_eq!(payload["failure"]["code"], "exec.opaque");
+        assert_eq!(payload["failure"]["opaque"], true);
+        // The diagnosis falls back to prose for opaque envelopes.
+        assert_eq!(payload["code"], "tool-failed");
     }
 
     #[test]

@@ -62,6 +62,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use concerto_core::tool_failure::{ToolDisposition, ToolFailure, ToolFailureContext, ToolOrigin};
+
 /// Upper bound on the evidence excerpt carried by one diagnosis. Errors are
 /// untrusted model/tool output; the diagnosis stays bounded so checkpoints
 /// and whiteboard rows cannot balloon.
@@ -571,7 +573,205 @@ pub fn diagnose_agent_message(message: &str) -> FailureDiagnosis {
 /// Normalize a tool error (issue #54). A policy denial is permanent and
 /// absolute — the same dispatch would be denied again — so it escalates
 /// instead of burning the attempt budget.
+///
+/// H02: the classification derives from the typed [`ToolFailure`] envelope
+/// (code / category / disposition) via [`diagnose_failure`], never from
+/// parsing `Display` text. The envelope is built from the in-process error
+/// value with a builtin origin — this classifies Concerto's own error, not
+/// a wire envelope, so no trust boundary is crossed (see the trust rule on
+/// [`ToolFailure::from_error`]). Callers that already hold an envelope
+/// (e.g. one carried on a tool result) pass it to [`diagnose_failure`]
+/// directly. Agent-reported outcome text stays on the prose path
+/// ([`diagnose_outcome_failure`]) — model text is definitionally opaque.
 pub fn diagnose_tool(error: &concerto_core::ToolError) -> FailureDiagnosis {
+    let failure = ToolFailure::from_error(error, ToolFailureContext::builtin());
+    diagnose_failure(error, Some(&failure))
+}
+
+/// Build the typed envelope for a tool error seen in-process, with the
+/// origin derived from the registered tool name: bridge tools (`mcp:*`,
+/// `plugin:*`) degrade to the opaque envelope per the [`ToolFailure`]
+/// trust rule, so repair and diagnosis refuse to route on them.
+pub fn tool_envelope(tool_name: &str, error: &concerto_core::ToolError) -> ToolFailure {
+    ToolFailure::from_error(
+        error,
+        ToolFailureContext {
+            origin: ToolOrigin::for_tool_name(tool_name),
+            ..ToolFailureContext::builtin()
+        },
+    )
+}
+
+/// Normalize a tool error from its typed [`ToolFailure`] envelope (H02).
+///
+/// A present, non-opaque envelope is the derivation source: the diagnosis
+/// (kind, code, and every recovery flag) comes from its disposition,
+/// category, and code. A missing envelope — or an `opaque` one, i.e.
+/// genuinely opaque third-party/plugin/model text with no native code —
+/// takes the bounded prose fallback ([`diagnose_tool_prose`]), which keeps
+/// the historical substring grammar in that demoted role only. The typed
+/// path takes precedence wherever both exist; opaque text never masquerades
+/// as a native diagnosis.
+///
+/// Per-disposition behavior map (each disposition maps differently, so a
+/// cancelled call is never retried like a timeout and an approval-park is
+/// never re-planned like a conflict):
+///
+/// - `DoNotReIssue` + policy → `policy-denied` (permanent, reconsider);
+/// - `DoNotReIssue` + environment → `environment-not-a-repo` (or
+///   `rollback-unsupported` for the rollback codes);
+/// - `DoNotReIssue` + execution/workspace → `tool-precondition`
+///   (same-agent correction viable, reconsider);
+/// - `DoNotReIssueSameIntent` (cancelled) → `cancelled` (a deliberate stop,
+///   never a retry);
+/// - `AwaitingDecision` (approval) → `awaiting-decision` (parked awaiting
+///   the operator; resolution is the answer, not a retry or a replan);
+/// - `BoundedRetryWithBackoff` (timeout, transient faults) →
+///   `tool-failed` transient (retry same while the budget holds);
+/// - `RetryableAfterRebase` (genuine overlay conflict) →
+///   `tool-rebase-required` (reconcile first: same-agent re-dispatch is not
+///   viable until the workspace is reconciled, so no attempt burns);
+/// - `Unknown` (unclassified native fault) → `tool-failed` with
+///   `transient: false` — the bounded retry stays allowed exactly as before,
+///   but the envelope no longer claims the fault will resolve on its own.
+pub fn diagnose_failure(
+    error: &concerto_core::ToolError,
+    failure: Option<&ToolFailure>,
+) -> FailureDiagnosis {
+    match failure {
+        Some(envelope) if !envelope.opaque => diagnose_typed(envelope),
+        _ => diagnose_tool_prose(error),
+    }
+}
+
+/// Classify a non-opaque typed envelope. Pure on code / category /
+/// disposition — no `Display` text is read (the evidence excerpt is the
+/// envelope's own sanitized message). The trailing wildcard is defensive:
+/// the disposition enum is `#[non_exhaustive]`, so a future disposition
+/// degrades to the unclassified diagnosis instead of a fabricated claim.
+fn diagnose_typed(failure: &ToolFailure) -> FailureDiagnosis {
+    let evidence = &failure.message;
+    match (failure.disposition, failure.category) {
+        (ToolDisposition::DoNotReIssueSameIntent, _) => FailureDiagnosis::new(
+            FailureKind::Unknown,
+            "cancelled",
+            false,
+            false,
+            false,
+            false,
+            false,
+            evidence,
+        ),
+        (ToolDisposition::AwaitingDecision, _) => FailureDiagnosis::new(
+            FailureKind::Tool,
+            "awaiting-decision",
+            false,
+            false,
+            false,
+            false,
+            false,
+            evidence,
+        ),
+        (
+            ToolDisposition::DoNotReIssue,
+            concerto_core::tool_failure::ToolFailureCategory::Policy,
+        ) => FailureDiagnosis::new(
+            FailureKind::Tool,
+            "policy-denied",
+            false,
+            false,
+            false,
+            false,
+            true,
+            evidence,
+        ),
+        (
+            ToolDisposition::DoNotReIssue,
+            concerto_core::tool_failure::ToolFailureCategory::Environment,
+        ) if is_rollback_code(&failure.code) => FailureDiagnosis::new(
+            FailureKind::Tool,
+            "rollback-unsupported",
+            false,
+            false,
+            false,
+            false,
+            true,
+            evidence,
+        ),
+        (
+            ToolDisposition::DoNotReIssue,
+            concerto_core::tool_failure::ToolFailureCategory::Environment,
+        ) => FailureDiagnosis::new(
+            FailureKind::Environment,
+            "environment-not-a-repo",
+            false,
+            false,
+            false,
+            false,
+            true,
+            evidence,
+        ),
+        (ToolDisposition::DoNotReIssue, _) => FailureDiagnosis::new(
+            FailureKind::Tool,
+            "tool-precondition",
+            false,
+            false,
+            true,
+            false,
+            true,
+            evidence,
+        ),
+        (ToolDisposition::BoundedRetryWithBackoff, _) => FailureDiagnosis::new(
+            FailureKind::Tool,
+            "tool-failed",
+            true,
+            true,
+            true,
+            true,
+            false,
+            evidence,
+        ),
+        (ToolDisposition::RetryableAfterRebase, _) => FailureDiagnosis::new(
+            FailureKind::Tool,
+            "tool-rebase-required",
+            false,
+            true,
+            false,
+            false,
+            true,
+            evidence,
+        ),
+        // Unclassified native fault: the bounded retry stays allowed exactly
+        // as before, but `transient` no longer claims the fault will resolve
+        // on its own.
+        _ => FailureDiagnosis::new(
+            FailureKind::Tool,
+            "tool-failed",
+            false,
+            true,
+            true,
+            true,
+            false,
+            evidence,
+        ),
+    }
+}
+
+/// Whether a failure code is a rollback-unsupported code: the core envelope
+/// code or the verbatim-adopted shell code (referenced, never re-minted).
+fn is_rollback_code(code: &str) -> bool {
+    matches!(code, "env.rollback_unsupported" | "shell.execution.rollback-unsupported")
+}
+
+/// Normalize a tool error from its prose (H02: the bounded opaque fallback).
+///
+/// This is the historical [`diagnose_tool`] grammar — variant matching plus
+/// the shared deterministic-failure substring predicate — demoted to the
+/// fallback role: it runs only for opaque envelopes and envelope-less
+/// errors, i.e. genuinely opaque third-party/plugin/model text. Native
+/// failures never reach it when their envelope is present (see
+/// [`diagnose_failure`], whose typed path takes precedence).
+fn diagnose_tool_prose(error: &concerto_core::ToolError) -> FailureDiagnosis {
     use concerto_core::ToolError;
     if matches!(error, ToolError::Cancelled) {
         return cancelled_diagnosis(&error.to_string());
@@ -687,6 +887,14 @@ const MALFORMED_OUTPUT_MARKERS: &[&str] = &[
 /// contract). The recovery flags line up with the coordinator's existing
 /// outcome handling: corrective-feedback retries, then the replan/ladder
 /// fallbacks.
+///
+/// H02 opaque role: the settled outcome carries model/agent-reported TEXT,
+/// never a typed envelope, so this classifier is definitionally the opaque
+/// path — its deterministic arm parses the shared marker grammar via
+/// [`concerto_core::error::is_deterministic_failure_message`] (kept: the
+/// ledger predicate still uses it). It is the sanctioned fallback for
+/// genuinely opaque text, not a second derivation source for native
+/// failures (those route through [`diagnose_failure`]).
 pub fn diagnose_outcome_failure(error: &str) -> FailureDiagnosis {
     let lower = error.to_lowercase();
     if ARTIFACT_CONTRACT_MARKERS.iter().any(|marker| lower.contains(marker)) {
@@ -970,13 +1178,18 @@ mod tests {
         }));
         assert_eq!(diagnosis.kind, FailureKind::Tool);
         assert_eq!(diagnosis.code, "tool-failed");
-        assert!(diagnosis.transient && diagnosis.retryable && diagnosis.same_agent_viable);
+        // H02 honesty delta: an unclassified native fault (`Unknown`
+        // disposition) keeps the bounded retry — the recovery below is
+        // unchanged — but no longer claims `transient`, i.e. the envelope no
+        // longer promises the fault will resolve on its own.
+        assert!(!diagnosis.transient, "{diagnosis:?}");
+        assert!(diagnosis.retryable && diagnosis.same_agent_viable, "{diagnosis:?}");
         assert_eq!(recovery_action(&diagnosis, 0, 3), RecoveryAction::RetrySame);
 
         // A timed-out tool is the same family.
         let timeout = diagnose(&OrchestratorError::Tool(ToolError::Timeout { timeout_secs: 30 }));
         assert_eq!(timeout.code, "tool-failed");
-        assert!(timeout.retryable);
+        assert!(timeout.transient && timeout.retryable);
     }
 
     #[test]
@@ -1379,6 +1592,192 @@ mod tests {
         let summary = linked.tool_summary();
         assert_eq!(summary["decision_id"], "d-9");
         assert_eq!(summary["artifact_path"], "src/a.rs");
+    }
+
+    // ── H02: typed diagnosis — every disposition maps distinctly, the typed
+    // path takes precedence, and the opaque fallback is preserved. ─────────
+
+    /// The native envelope for a tool error, exactly as `diagnose_tool`
+    /// builds it.
+    fn envelope_for(error: &concerto_core::ToolError) -> ToolFailure {
+        ToolFailure::from_error(error, ToolFailureContext::builtin())
+    }
+
+    /// Every disposition maps to a distinct diagnosis: cancelled is never
+    /// retried like a timeout, an approval-park is never re-planned like a
+    /// conflict, and a rebase conflict never burns a same-agent retry.
+    #[test]
+    fn typed_dispositions_map_to_distinct_diagnoses() {
+        // DoNotReIssue (policy): permanent, reconsider — never a retry.
+        let policy = ToolError::PolicyDenied { rule: "deny_shell".into() };
+        let diagnosis = diagnose_failure(&policy, Some(&envelope_for(&policy)));
+        assert_eq!(diagnosis.code, "policy-denied");
+        assert!(!diagnosis.retryable && !diagnosis.same_agent_viable);
+        assert!(diagnosis.replan_required);
+        assert_eq!(recovery_action(&diagnosis, 0, 3), RecoveryAction::Reconsider);
+
+        // DoNotReIssue (deterministic execution fault): same-agent correction
+        // stays viable, the identical re-issue does not.
+        let missing = ToolError::ExecutionFailed { message: "file not found: src/main.rs".into() };
+        let diagnosis = diagnose_failure(&missing, Some(&envelope_for(&missing)));
+        assert_eq!(diagnosis.code, "tool-precondition");
+        assert!(!diagnosis.retryable && diagnosis.same_agent_viable);
+        assert_eq!(recovery_action(&diagnosis, 0, 3), RecoveryAction::Reconsider);
+
+        // DoNotReIssue (environment): the repo fact, not a fault.
+        let repo = ToolError::NotARepository { message: "no .git".into() };
+        let diagnosis = diagnose_failure(&repo, Some(&envelope_for(&repo)));
+        assert_eq!(diagnosis.code, "environment-not-a-repo");
+        assert_eq!(diagnosis.kind, FailureKind::Environment);
+        assert!(!diagnosis.retryable);
+
+        // DoNotReIssue (rollback): its own pre-existing code is kept.
+        let rollback = ToolError::RollbackNotSupported;
+        let diagnosis = diagnose_failure(&rollback, Some(&envelope_for(&rollback)));
+        assert_eq!(diagnosis.code, "rollback-unsupported");
+
+        // DoNotReIssueSameIntent (cancelled): a deliberate stop.
+        let cancelled = ToolError::Cancelled;
+        let diagnosis = diagnose_failure(&cancelled, Some(&envelope_for(&cancelled)));
+        assert_eq!(diagnosis.code, "cancelled");
+        assert!(diagnosis.is_cancellation());
+        assert_eq!(recovery_action(&diagnosis, 0, 3), RecoveryAction::Escalate);
+
+        // AwaitingDecision (approval): parked — neither retried nor replanned.
+        let approval = ToolError::PausedAwaitingApproval {
+            tool_name: "shell".into(),
+            detail: "rm -rf /".into(),
+            input_hash: "hash".into(),
+            correlation_id: concerto_core::ids::Ulid::new(),
+            timeout_secs: 30,
+        };
+        let diagnosis = diagnose_failure(&approval, Some(&envelope_for(&approval)));
+        assert_eq!(diagnosis.code, "awaiting-decision");
+        assert!(!diagnosis.retryable && !diagnosis.same_agent_viable);
+        assert!(!diagnosis.replan_required, "a park needs an answer, not a replan");
+        assert_eq!(recovery_action(&diagnosis, 0, 3), RecoveryAction::Escalate);
+
+        // BoundedRetryWithBackoff (timeout): transient, retry same.
+        let timeout = ToolError::Timeout { timeout_secs: 30 };
+        let diagnosis = diagnose_failure(&timeout, Some(&envelope_for(&timeout)));
+        assert_eq!(diagnosis.code, "tool-failed");
+        assert!(diagnosis.transient && diagnosis.retryable && diagnosis.same_agent_viable);
+        assert_eq!(recovery_action(&diagnosis, 0, 3), RecoveryAction::RetrySame);
+
+        // RetryableAfterRebase (genuine overlay conflict): reconcile first —
+        // no same-agent re-dispatch burns, and the verdict reconsiders.
+        let conflict = ToolError::VirtualFsConflict {
+            path: "a.txt".into(),
+            reason: "the file changed since it was read".into(),
+        };
+        let diagnosis = diagnose_failure(&conflict, Some(&envelope_for(&conflict)));
+        assert_eq!(diagnosis.code, "tool-rebase-required");
+        assert!(diagnosis.retryable, "re-dispatch is meaningful after a reconcile");
+        assert!(!diagnosis.same_agent_viable, "not before it");
+        assert!(diagnosis.replan_required);
+        assert_eq!(recovery_action(&diagnosis, 0, 3), RecoveryAction::Reconsider);
+
+        // Unknown (unclassified native fault): the bounded retry stays
+        // allowed, but transient no longer over-claims.
+        let blip =
+            ToolError::ExecutionFailed { message: "the model produced malformed JSON".into() };
+        let diagnosis = diagnose_failure(&blip, Some(&envelope_for(&blip)));
+        assert_eq!(diagnosis.code, "tool-failed");
+        assert!(!diagnosis.transient, "unclassified faults are not transient");
+        assert!(diagnosis.retryable && diagnosis.same_agent_viable);
+        assert_eq!(recovery_action(&diagnosis, 0, 3), RecoveryAction::RetrySame);
+    }
+
+    /// The typed path takes precedence over the prose grammar: when the
+    /// envelope disagrees with the message text, the envelope wins.
+    #[test]
+    fn typed_path_takes_precedence_over_prose() {
+        // Deterministic prose with an Unknown envelope: the envelope wins —
+        // the failure stays retryable.
+        let missing = ToolError::ExecutionFailed { message: "file not found: src/main.rs".into() };
+        assert_eq!(
+            diagnose_tool_prose(&missing).code,
+            "tool-precondition",
+            "the prose fallback still sees the deterministic text"
+        );
+        let mut unknown = envelope_for(&missing);
+        unknown.disposition = ToolDisposition::Unknown;
+        let diagnosis = diagnose_failure(&missing, Some(&unknown));
+        assert_eq!(diagnosis.code, "tool-failed");
+        assert!(diagnosis.retryable, "typed Unknown wins over deterministic prose");
+
+        // A timeout variant with a typed policy refusal: the envelope wins.
+        let timeout = ToolError::Timeout { timeout_secs: 5 };
+        let policy = ToolError::PolicyDenied { rule: "deny".into() };
+        let diagnosis = diagnose_failure(&timeout, Some(&envelope_for(&policy)));
+        assert_eq!(diagnosis.code, "policy-denied", "typed refusal wins over the variant");
+        assert!(!diagnosis.retryable);
+    }
+
+    /// Opaque envelopes — and absent ones — take the bounded prose fallback:
+    /// genuinely opaque third-party text still classifies, and never
+    /// masquerades as a native diagnosis.
+    #[test]
+    fn opaque_envelopes_fall_back_to_prose() {
+        fn opaque(error: &concerto_core::ToolError) -> ToolFailure {
+            let failure = ToolFailure::from_error(
+                error,
+                ToolFailureContext::with_origin(ToolOrigin::Plugin("third-party".into())),
+            );
+            assert!(failure.opaque, "bridge origins are opaque");
+            assert_eq!(failure.code, "exec.opaque");
+            failure
+        }
+        let deterministic = ToolError::ExecutionFailed { message: "file not found: x".into() };
+        let fallback = diagnose_failure(&deterministic, Some(&opaque(&deterministic)));
+        assert_eq!(fallback, diagnose_tool_prose(&deterministic));
+        assert_eq!(fallback.code, "tool-precondition");
+
+        // Absent envelopes take the same fallback.
+        assert_eq!(diagnose_failure(&deterministic, None), diagnose_tool_prose(&deterministic));
+
+        // Opaque unparseable text stays on the historical prose arm — the
+        // same transient-retryable verdict a native unmarked fault always
+        // had, with no native code claimed.
+        let blip = ToolError::ExecutionFailed { message: "a third-party mystery".into() };
+        let fallback = diagnose_failure(&blip, Some(&opaque(&blip)));
+        assert_eq!(fallback.code, "tool-failed");
+        assert!(fallback.retryable && fallback.same_agent_viable);
+    }
+
+    /// EACCES classifies without substring exemptions on the typed path:
+    /// the structural `PermissionDenied` kind is the signal — no
+    /// "permission denied (os error …)" text is ever read.
+    #[test]
+    fn eacces_classifies_without_substring_exemptions() {
+        let denied = ToolError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Permission denied (os error 13)",
+        ));
+        let diagnosis = diagnose_failure(&denied, Some(&envelope_for(&denied)));
+        assert_eq!(diagnosis.code, "tool-precondition");
+        assert!(!diagnosis.retryable && diagnosis.same_agent_viable);
+    }
+
+    /// Bridge tools degrade to opaque envelopes, so repair and diagnosis
+    /// refuse to route on them — while the disposition fallback still
+    /// classifies deterministic bridge text.
+    #[test]
+    fn tool_envelope_marks_bridge_tools_opaque() {
+        let timeout = ToolError::Timeout { timeout_secs: 5 };
+        for tool in ["mcp:github:list_repos", "plugin:my-plugin"] {
+            let failure = tool_envelope(tool, &timeout);
+            assert!(failure.opaque, "{tool} is opaque");
+            assert_eq!(failure.code, "exec.opaque");
+            let diagnosis = diagnose_failure(&timeout, Some(&failure));
+            assert_eq!(
+                diagnosis,
+                diagnose_tool_prose(&timeout),
+                "opaque envelopes route to the prose fallback"
+            );
+        }
+        let builtin = tool_envelope("shell", &timeout);
+        assert!(!builtin.opaque, "native tools stay native");
     }
 
     // ── Identical-failure repetition guard (smoke: clap-derive 101) ─────

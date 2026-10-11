@@ -2857,6 +2857,20 @@ impl AgentLoop {
                 // record the preserved request and let `run_once` stop the
                 // loop AwaitingApproval — no model retry, no second identical
                 // call, no burned subtask retry.
+                // H02: the park carries its typed envelope
+                // (policy.awaiting_approval / awaiting-decision) on the
+                // summary, so consumers never infer the park from prose.
+                let mut approval_failure = crate::failure_diagnosis::tool_envelope(
+                    &tc.name,
+                    &ToolError::PausedAwaitingApproval {
+                        tool_name: tool_name.clone(),
+                        detail: detail.clone(),
+                        input_hash: input_hash.clone(),
+                        correlation_id,
+                        timeout_secs,
+                    },
+                );
+                approval_failure.correlation_id = Some(correlation_id.to_string());
                 tool_events.push(ToolExecutionSummary {
                     tool_name: tc.name.clone(),
                     operation: filesystem_operation.map(|s| s.to_string()),
@@ -2867,7 +2881,7 @@ impl AgentLoop {
                     ),
                     canonical_tool: canonical_tool.clone(),
                     canonical_operation: canonical_operation.clone(),
-                    failure: None,
+                    failure: Some(approval_failure),
                 });
                 let _ = self.bus.publish_for_session(
                     task.session_id,
@@ -2903,6 +2917,14 @@ impl AgentLoop {
                         CancellationToken::new(),
                     )
                     .await;
+                // H02: the denial carries its typed envelope (policy-denied /
+                // do-not-re-issue) on the summary and the tool result, so
+                // every downstream consumer classifies from the code — never
+                // from parsing the denial text.
+                let denial_failure = crate::failure_diagnosis::tool_envelope(
+                    &tc.name,
+                    &ToolError::PolicyDenied { rule: rule.clone() },
+                );
                 tool_events.push(ToolExecutionSummary {
                     tool_name: tc.name.clone(),
                     operation: filesystem_operation.map(|s| s.to_string()),
@@ -2911,7 +2933,7 @@ impl AgentLoop {
                     summary: format!("policy denied: {}", rule),
                     canonical_tool: canonical_tool.clone(),
                     canonical_operation: canonical_operation.clone(),
-                    failure: None,
+                    failure: Some(denial_failure.clone()),
                 });
                 let _ = self.bus.publish_for_session(
                     task.session_id,
@@ -2934,7 +2956,7 @@ impl AgentLoop {
                     tool_results: Some(vec![concerto_core::types::ToolResult {
                         id: tc.id.clone(),
                         name: tc.name.clone(),
-                        content: serde_json::json!({ "error": "policy_denied", "rule": rule }),
+                        content: serde_json::json!({ "error": "policy_denied", "rule": rule, "failure": denial_failure }),
                     }]),
                     reasoning_content: None,
                     tokens_in: None,
@@ -2955,7 +2977,7 @@ impl AgentLoop {
                     pre_image_hashes.clone(),
                     canonical_tool.as_deref(),
                     canonical_operation.as_deref(),
-                    None,
+                    Some(&denial_failure),
                     &cancel,
                 )
                 .await;
@@ -3065,13 +3087,22 @@ impl AgentLoop {
                 // Bounded execution-failure repair (custom-ai-shell plan,
                 // Phase C subset): process-level shell failures (timeout,
                 // spawn failure) earn a corrective user turn the same way a
-                // non-zero exit does. `repairable_error_failure` refuses
-                // policy outcomes — denials, approval outcomes, containment
-                // blocks, and cancellation always surface unchanged.
-                if let Some(failure) = shell_repair::repairable_error_failure(&tc.name, &e) {
-                    if let Some(repair) =
-                        self.shell_repair_turn(task.session_id, tc, &arguments, failure, &cancel)
-                    {
+                // non-zero exit does. H02: the verdict classifies from the
+                // typed envelope (disposition/code/category) — never from
+                // parsing the message — with the opaque prose fallback when
+                // the envelope is missing or opaque. Policy outcomes,
+                // approval parks, containment blocks, and cancellation
+                // surface unchanged.
+                if let shell_repair::RepairVerdict::Repair(shell_failure) =
+                    shell_repair::repair_verdict(&tc.name, &e, Some(&failure))
+                {
+                    if let Some(repair) = self.shell_repair_turn(
+                        task.session_id,
+                        tc,
+                        &arguments,
+                        shell_failure,
+                        &cancel,
+                    ) {
                         messages.push(repair);
                     }
                 }
@@ -8280,11 +8311,26 @@ mod tests {
         assert!(repairs[0].content.contains("Failed command: long-build"));
     }
 
+    /// H02: a deterministic spawn failure (missing executable) surfaces
+    /// unchanged through the typed path — the envelope says `do-not-re-issue`
+    /// and the identical action cannot succeed, so no repair turn is spent
+    /// coaching a retry. The not-found coaching text survives only in the
+    /// opaque fallback (see `shell_repair` unit tests); here the typed
+    /// verdict takes precedence over the prose heuristic. The coaching
+    /// reaches the model through the deterministic-refusal record and the
+    /// envelope on the tool result instead.
+    ///
+    /// H02 observation (not changed here): the shared marker
+    /// `shell executable not found on PATH` never matches — the grammars
+    /// lowercase the message but not the marker — so that exact casing
+    /// classifies `Unknown` in the envelope, the ledger, and the diagnosis
+    /// alike. Consistent, but the marker is dead weight until the fold is
+    /// fixed.
     #[tokio::test]
-    async fn shell_spawn_failure_queues_repair_turn_with_not_found_category() {
+    async fn shell_deterministic_spawn_failure_surfaces_unchanged_through_the_typed_path() {
         let (mut loop_, task, session, _calls) =
             shell_repair_harness(ScriptedShellOutcome::SpawnFailed(
-                "shell executable not found on PATH: fruitloop".into(),
+                "failed to spawn process: file not found: /usr/bin/fruitloop".into(),
             ));
         let mut tool_call_count = 0;
         let mut file_changing_tool_count = 0;
@@ -8316,10 +8362,128 @@ mod tests {
             .unwrap();
 
         let repairs = repair_turns(&messages);
-        assert_eq!(repairs.len(), 1, "spawn failure earns one repair turn: {messages:?}");
-        assert!(repairs[0].content.contains("diagnostic: shell.execution.failed"));
-        assert!(repairs[0].content.contains("check the executable name for this shell"));
-        assert!(repairs[0].content.contains("Failed command: fruitloop --help"));
+        assert!(
+            repairs.is_empty(),
+            "a deterministic spawn failure earns no repair turn on the typed path: {messages:?}"
+        );
+        // The failure still reaches the model as a typed envelope, and the
+        // ledger records the code so the identical repeat is refused.
+        let tool_message = messages.iter().find(|m| m.role == Role::Tool).expect("tool result");
+        let content = tool_message
+            .tool_results
+            .as_ref()
+            .expect("tool results")
+            .first()
+            .expect("one result")
+            .content
+            .clone();
+        assert_eq!(content["failure"]["disposition"], "do-not-re-issue", "{content}");
+        assert_eq!(
+            loop_.deterministic_failures.values().next().map(String::as_str),
+            Some("exec.execution_failed"),
+            "the ledger records the typed code"
+        );
+    }
+
+    /// H02: the denial arm carries the typed envelope (`policy.denied` /
+    /// `do-not-re-issue`) on the tool result and the summary, so downstream
+    /// consumers classify from the code — never from parsing the denial text.
+    #[tokio::test]
+    async fn shell_denial_tool_result_carries_the_typed_failure() {
+        let (mut loop_, task, session, _calls) =
+            shell_repair_harness(ScriptedShellOutcome::Deny("shell_danger".into()));
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+        let tc = ToolCall {
+            id: "call_denied_typed".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({ "command": "rm -rf /", "args": [] }),
+
+            ..Default::default()
+        };
+        execute_one_tool_call(&mut loop_, &tc, &task, &session, &mut messages, &mut tool_events)
+            .await;
+
+        let content = messages
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("denial tool result")
+            .tool_results
+            .as_ref()
+            .expect("tool results")
+            .first()
+            .expect("one result")
+            .content
+            .clone();
+        assert_eq!(content["error"], "policy_denied", "legacy key stays");
+        assert_eq!(content["failure"]["code"], "policy.denied", "{content}");
+        assert_eq!(content["failure"]["category"], "policy");
+        assert_eq!(content["failure"]["disposition"], "do-not-re-issue");
+        assert_eq!(content["failure"]["opaque"], false);
+        let envelope = tool_events[0].failure.as_ref().expect("summary carries the envelope");
+        assert_eq!(envelope.code, "policy.denied");
+        assert!(repair_turns(&messages).is_empty(), "denials never repair: {messages:?}");
+    }
+
+    /// H02: the approval park carries its typed envelope
+    /// (`policy.awaiting_approval` / `awaiting-decision`) on the summary —
+    /// an approval-park is never retried like a timeout.
+    #[tokio::test]
+    async fn shell_approval_park_summary_carries_the_typed_failure() {
+        let (mut loop_, task, session, _calls) = shell_repair_harness(ScriptedShellOutcome::Paused);
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+        let tc = ToolCall {
+            id: "call_parked".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({ "command": "rm -rf build", "args": [] }),
+
+            ..Default::default()
+        };
+        execute_one_tool_call(&mut loop_, &tc, &task, &session, &mut messages, &mut tool_events)
+            .await;
+
+        let envelope = tool_events[0].failure.as_ref().expect("park carries the envelope");
+        assert_eq!(envelope.code, "policy.awaiting_approval");
+        assert_eq!(
+            envelope.disposition,
+            concerto_core::tool_failure::ToolDisposition::AwaitingDecision
+        );
+        assert!(repair_turns(&messages).is_empty(), "parks never repair: {messages:?}");
+    }
+
+    /// H02: a genuine EACCES spawn fault needs no substring exemption on the
+    /// typed path — the structural `PermissionDenied` kind maps to
+    /// `do-not-re-issue`, so no repair turn is spent despite the "denied"
+    /// text. The old exemption survives only in the opaque fallback.
+    #[tokio::test]
+    async fn shell_eacces_spawn_fault_earns_no_repair_turn_through_the_typed_path() {
+        let (mut loop_, task, session, calls) =
+            shell_repair_harness(ScriptedShellOutcome::SpawnFailed(
+                "failed to spawn process: Permission denied (os error 13)".into(),
+            ));
+        let mut tool_events = Vec::new();
+        let mut messages = Vec::new();
+        let tc = ToolCall {
+            id: "call_eacces".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({ "command": "protected-bin", "args": [] }),
+
+            ..Default::default()
+        };
+        execute_one_tool_call(&mut loop_, &tc, &task, &session, &mut messages, &mut tool_events)
+            .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            repair_turns(&messages).is_empty(),
+            "EACCES is deterministic on the typed path — no repair turn: {messages:?}"
+        );
+        let envelope = tool_events[0].failure.as_ref().expect("summary carries the envelope");
+        assert_eq!(
+            envelope.disposition,
+            concerto_core::tool_failure::ToolDisposition::DoNotReIssue
+        );
     }
 
     #[tokio::test]

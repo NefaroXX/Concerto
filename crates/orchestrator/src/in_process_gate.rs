@@ -27,7 +27,6 @@ use concerto_core::CancellationToken;
 
 use crate::exec_backend::ToolExecutionBackend;
 use crate::gate::{stamp_base_versions, GateError, GateRequest, WriteGate};
-use crate::gate_proxy::gate_rejection_message;
 use crate::ipc::IpcError;
 
 /// The in-process twin of [`crate::gate_proxy::GateProxyBackend`]: every loop
@@ -289,18 +288,16 @@ impl InProcessGateBackend {
 
 /// Map a gate failure onto the loop's tool error taxonomy, byte-identical to
 /// what the supervised child receives over the wire: the supervisor renders
-/// the error via [`IpcError::from_gate`], and the child surfaces the flattened
-/// `(code, message)` through [`gate_rejection_message`].
+/// the error via [`IpcError::from_gate`], and the child surfaces the typed
+/// [`IpcError::to_tool_error`] mapping — so both paths share one code-keyed
+/// conversion (see [`crate::ipc::IpcError::to_tool_error`]).
 fn gate_error_to_tool_error(error: GateError) -> ToolError {
     match error {
         // The gate returns `Cancelled` only under the shared token, which the
         // backend's post-submit check would also observe; surface it as a
         // cancellation (the loop must break, not retry).
         GateError::Cancelled => ToolError::Cancelled,
-        other => {
-            let ipc = IpcError::from_gate(&other);
-            ToolError::ExecutionFailed { message: gate_rejection_message(ipc.code, &ipc.message) }
-        }
+        other => IpcError::from_gate(&other).to_tool_error(),
     }
 }
 

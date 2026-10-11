@@ -602,6 +602,67 @@ impl IpcError {
             other => Self::new(IpcErrorCode::GateError, other.to_string()),
         }
     }
+
+    /// Map this wire error onto the loop's tool error taxonomy (H02
+    /// construction-site typing at the gate-proxy/IPC boundary).
+    ///
+    /// The mapping keys on the typed [`IpcErrorCode`] — never on the message
+    /// text — so a gate denial, cancellation, or optimistic-concurrency
+    /// conflict survives the supervisor/child boundary with its structure
+    /// intact instead of arriving as an `ExecutionFailed` prose envelope the
+    /// repair and diagnosis paths would have to re-parse:
+    ///
+    /// - `GateDenied` → [`ToolError::PolicyDenied`], with the wire message
+    ///   as the rule text (preserved verbatim for audit continuity).
+    ///   Fail-closed approximation: a wrapped approval-shaped denial
+    ///   (`RequireApproval` inside a `GateDenied`) denies rather than parks
+    ///   — the live approval flow parks via the approval bridge and never
+    ///   reaches this surface, so nothing here can coach a retry around a
+    /// gate.
+    ///
+    /// NOTE (H02 review): if a future change routes the supervised path
+    /// through the approval bridge (so a `RequireApproval` can park here),
+    /// this mapping must be revisited — a parked approval arriving as a
+    /// denial would fail closed and cost the user their prompt. Today the
+    /// bridge handles parks upstream of this conversion.
+    /// - `Cancelled` → [`ToolError::Cancelled`] (the loop must break, not
+    ///   retry).
+    /// - `Conflict` → [`ToolError::VirtualFsConflict`], with the wire
+    ///   message as the reason. The wire carries no structured path, so the
+    ///   path is empty by construction — never parsed out of the prose — and
+    ///   the reason (a non-containment mismatch) classifies as
+    ///   `RetryableAfterRebase`.
+    /// - every other code → [`ToolError::ExecutionFailed`] carrying the
+    ///   legacy [`gate_rejection_message`] text, byte-identical to the
+    ///   pre-H02 surface.
+    pub fn to_tool_error(&self) -> concerto_core::ToolError {
+        match self.code {
+            IpcErrorCode::GateDenied => {
+                concerto_core::ToolError::PolicyDenied { rule: self.message.clone() }
+            }
+            IpcErrorCode::Cancelled => concerto_core::ToolError::Cancelled,
+            IpcErrorCode::Conflict => concerto_core::ToolError::VirtualFsConflict {
+                path: camino::Utf8PathBuf::new(),
+                reason: self.message.clone(),
+            },
+            _ => concerto_core::ToolError::ExecutionFailed {
+                message: gate_rejection_message(self.code, &self.message),
+            },
+        }
+    }
+}
+
+/// Render a supervisor gate rejection the way the loop's tool error surface
+/// presents it.
+///
+/// Shared by the supervised backend (which receives the flattened
+/// `(code, message)` over the wire) and the in-process backend (which maps a
+/// local [`GateError`] through [`IpcError::from_gate`] first), so agents see
+/// a byte-identical error string no matter which path they run under. Lives
+/// here (not in `gate_proxy`) because it renders the wire format this module
+/// owns.
+pub(crate) fn gate_rejection_message(code: IpcErrorCode, message: &str) -> String {
+    format!("gate rejected the write ({code:?}): {message}")
 }
 
 /// Closed error-code set for the supervisor/agent protocol: the standard
@@ -1635,5 +1696,68 @@ mod tests {
         assert_eq!(value["value"]["protocol_version"], json!(PROTOCOL_VERSION));
         assert_eq!(value["value"]["accepted"], json!(false));
         assert_eq!(value["value"]["supervisor_version"], json!(PROTOCOL_VERSION));
+    }
+
+    // --- H02: construction-site typing at the IPC boundary ---
+
+    /// The wire code — never the message prose — decides the tool error
+    /// variant: denials stay denials, cancellations stay cancellations, and
+    /// conflicts stay conflicts across the supervisor/child boundary.
+    #[test]
+    fn wire_code_decides_the_tool_error_variant() {
+        use concerto_core::ToolError;
+
+        let denied = IpcError::new(IpcErrorCode::GateDenied, "shell_danger");
+        assert_eq!(
+            denied.to_tool_error().to_string(),
+            ToolError::PolicyDenied { rule: "shell_danger".into() }.to_string()
+        );
+
+        let cancelled = IpcError::new(IpcErrorCode::Cancelled, "gate cancelled");
+        assert_eq!(cancelled.to_tool_error().to_string(), ToolError::Cancelled.to_string());
+
+        let conflict = IpcError::new(IpcErrorCode::Conflict, "base_version mismatch on a.txt");
+        match conflict.to_tool_error() {
+            ToolError::VirtualFsConflict { path, reason } => {
+                assert_eq!(reason, "base_version mismatch on a.txt");
+                assert!(path.as_str().is_empty(), "no path rides the wire: {path}");
+            }
+            other => panic!("conflict must stay a conflict, got {other:?}"),
+        }
+
+        // Unstructured codes keep the legacy byte-identical envelope.
+        let gate_error = IpcError::new(IpcErrorCode::GateError, "policy evaluation failed");
+        match gate_error.to_tool_error() {
+            ToolError::ExecutionFailed { message } => assert_eq!(
+                message, "gate rejected the write (GateError): policy evaluation failed",
+                "legacy text preserved for audit continuity"
+            ),
+            other => panic!("gate errors stay stringly, got {other:?}"),
+        }
+    }
+
+    /// The typed variants classify without prose parsing once across the
+    /// boundary: a denial is deterministic, a conflict is rebase-retryable.
+    #[test]
+    fn typed_wire_errors_classify_without_prose_parsing() {
+        use concerto_core::tool_failure::{ToolDisposition, ToolFailure, ToolFailureContext};
+
+        let denied = IpcError::new(IpcErrorCode::GateDenied, "shell_danger").to_tool_error();
+        assert!(denied.is_deterministic_failure(), "denials refuse identical re-issues");
+        let envelope = ToolFailure::from_error(&denied, ToolFailureContext::builtin());
+        assert_eq!(envelope.code, "policy.denied");
+        assert_eq!(envelope.disposition, ToolDisposition::DoNotReIssue);
+        assert!(!envelope.opaque);
+
+        let conflict =
+            IpcError::new(IpcErrorCode::Conflict, "base_version mismatch on a.txt").to_tool_error();
+        assert!(!conflict.is_deterministic_failure(), "genuine conflicts may resolve");
+        let envelope = ToolFailure::from_error(&conflict, ToolFailureContext::builtin());
+        assert_eq!(envelope.code, "workspace.conflict");
+        assert_eq!(envelope.disposition, ToolDisposition::RetryableAfterRebase);
+
+        let cancelled = IpcError::new(IpcErrorCode::Cancelled, "gate cancelled").to_tool_error();
+        let envelope = ToolFailure::from_error(&cancelled, ToolFailureContext::builtin());
+        assert_eq!(envelope.disposition, ToolDisposition::DoNotReIssueSameIntent);
     }
 }

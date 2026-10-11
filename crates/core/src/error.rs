@@ -486,6 +486,10 @@ pub enum ToolError {
 /// timeout, 429/5xx) and anything unrecognized return `false`, because a
 /// false "impossible" blocks a retry that could have succeeded, while a
 /// false "transient" merely costs one extra attempt.
+///
+/// Every marker here MUST be lowercase: the match folds the *message*
+/// (lowercased) but not the markers, so an uppercase marker like `"...on
+/// PATH"` silently never matches. See `shell executable not found on path`.
 pub(crate) const DETERMINISTIC_FAILURE_MARKERS: &[&str] = &[
     // Missing source/target — the action's precondition is absent.
     "file not found",
@@ -493,7 +497,7 @@ pub(crate) const DETERMINISTIC_FAILURE_MARKERS: &[&str] = &[
     "file already deleted",
     "file has been deleted",
     "does not exist",
-    "shell executable not found on PATH",
+    "shell executable not found on path",
     // Permissions — the same identity re-running hits the same wall.
     "permission denied",
     "read-only file system",
@@ -586,6 +590,18 @@ impl ToolError {
             _ => false,
         }
     }
+}
+
+/// The shared deterministic-failure markers, for the crate-external
+/// invariant test in `shell_repair` (the list itself stays `pub(crate)`).
+///
+/// Exists so the **lowercase-by-contract** rule on
+/// [`DETERMINISTIC_FAILURE_MARKERS`] is enforceable from outside this crate:
+/// the marker fold lowercases the message but never the markers, so a
+/// mixed-case marker would silently stop matching.
+#[must_use]
+pub fn deterministic_failure_markers_for_test() -> &'static [&'static str] {
+    DETERMINISTIC_FAILURE_MARKERS
 }
 
 /// Policy evaluation and enforcement errors.
