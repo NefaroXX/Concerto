@@ -277,6 +277,16 @@ claimed. Untracked-file restore inherits the git-stash gap (`undo.rs:56-57`)
 until the streaming/block-based store lands. The plan's "exact restore
 including binary files" goal is **not** met by this ADR.
 
+> **Completion note (2026-10-11, chunked pre-image store, migration 039):**
+> the binary half of the above is now met — the sidecar banks
+> `CHECKPOINT_BLOB_LIMIT_BYTES`-capped chunks of arbitrary bytes
+> (binary included) up to a per-checkpoint `CHECKPOINT_TOTAL_LIMIT_BYTES`
+> budget, and restore replays them byte-exact through the gated
+> `filesystem` byte channel. The hash stays the durable reference (chunks
+> are the restorable cache). What remains honestly ceilinged: files over
+> the total budget (hash-only + `Manual`), symlink/permission/xattr
+> metadata (never captured), and the untracked-file git-stash gap.
+
 **Retention is coupled to checkpoint lifecycle — this is an invariant of this
 decision.** Retention must **preserve the bytes needed by active checkpoints,
 or explicitly expire those checkpoints**; it must never delete the bytes while
@@ -407,21 +417,24 @@ the child sends.
 
 These are real ceilings of this decision, not hedges:
 
-1. **Exact byte restore is not guaranteed above 64 KiB.** The sidecar's own
-   planned budget constant (`CHECKPOINT_BLOB_LIMIT_BYTES`) defaults to 64 KiB
-   and is **not** an alias of the evidence-path `CACHE_LIMIT_BYTES`
-   (`crates/sessions/src/resource_facts.rs:47-53`). Oversized and binary
-   targets are hash-only: the blake3 hash is a verifier, never a
-   reconstruction source — restoring a deleted before-image from its hash
-   alone is not possible and not claimed. Restore degrades to `Manual`, and
-   hash verification **detects drift but does not recover bytes**. The
-   in-memory gate pre-image cache holds more per entry
-   (`PRE_IMAGE_CACHE_MAX_ENTRY_BYTES = 4 MiB`,
-   `crates/orchestrator/src/gate.rs:444-446`) than the durable sidecar, so a
-   crash-recovered restore can restore *less* than the live gate could stage.
-   The ≤ 64 KiB text slice is a **partial milestone**; the streaming/block-based
-   pre-image store that completes binary restore is deferred. **The plan's
-   "exact restore including binary files" goal is NOT met by this ADR.**
+1. **Exact byte restore is not guaranteed above the per-checkpoint total
+   budget.** The sidecar's total budget constant
+   (`CHECKPOINT_TOTAL_LIMIT_BYTES`, 4 MiB) is **not** an alias of the
+   evidence-path `CACHE_LIMIT_BYTES`
+   (`crates/sessions/src/resource_facts.rs:47-53`); bytes are banked as
+   `CHECKPOINT_BLOB_LIMIT_BYTES` (64 KiB) chunks, a per-chunk cap, not a
+   restore ceiling. Over-budget targets are hash-only: the blake3 hash is a
+   verifier, never a reconstruction source — restoring a deleted
+   before-image from its hash alone is not possible and not claimed.
+   Restore degrades to `Manual`, and hash verification **detects drift but
+   does not recover bytes**. Symlink/permission/xattr metadata is never
+   captured. (Supersedes the slice-5 text: the ≤ 64 KiB UTF-8-only
+   limitation ended with the chunked pre-image store, migration 039, which
+   completed the plan's "exact restore including binary files" goal for
+   files within the total budget. The in-memory gate pre-image cache holds
+   up to 4 MiB per entry (`PRE_IMAGE_CACHE_MAX_ENTRY_BYTES`,
+   `crates/orchestrator/src/gate.rs`), matching the durable total, so the
+   live gate and a crash-recovered restore agree on what is bankable.)
 2. **DB / network / process effects are never reversed.** A file checkpoint
    makes no such claim (`excluded` covers these classes).
 3. **Git-stash restore inherits the untracked-file gap** — `undo.rs:56-57`
@@ -640,7 +653,11 @@ corresponding upgrades (see the milestone note in Consequences).
    JSON-parse a free-text column permanently. **Partial milestone**: the
    ≤ 64 KiB text slice does not complete binary/untracked-file restoration;
    the streaming/block-based pre-image store is the completing step and is
-   planned separately.
+   planned separately. **Completed 2026-10-11**: the chunked pre-image store
+   (migration 039, `CHECKPOINT_TOTAL_LIMIT_BYTES` total budget) closed the
+   binary half — binary and multi-chunk files within budget restore
+   byte-exact; only over-budget files, uncaptured metadata, and the
+   untracked-file git-stash gap remain ceilinged.
 6. **`EnvironmentManifest`**. Verify: collected once per run with freshness
    stamps; no authorization branch reads it; persisted as
    `WhiteboardKind::EnvironmentObserved`; **compatibility test**: round-trip,
@@ -709,15 +726,18 @@ upgrades:
 
 - The **≤ 64 KiB checkpoint slice** (slice 5) restores small text pre-images
   only; it does **not** satisfy the binary/untracked-file restoration goal.
-  The completing future work is the **streaming/block-based pre-image store**
-  for binary restore (deferred, tracked as a gap).
+  The completing work for binary restore was the **streaming/block-based
+  pre-image store — completed 2026-10-11** by the chunked pre-image store
+  (migration 039): binary and multi-chunk files within the per-checkpoint
+  total budget restore byte-exact. The untracked-file half remains a gap
+  (git-stash without `-u`).
 - The **default-off verification gate** (slice 4) is a migration posture; H04
   is **incomplete until required checks demand fresh passing evidence**. The
   completing future work is **enforced fresh-passing-evidence** at the gate
   (the `outcome` + freshness fields of §3 feeding `decide_exit`), planned as a
   separate step.
 
-Costs / risks: a 64 KiB restore ceiling (limitation 1); a retention extension
+Costs / risks: a per-checkpoint total-budget restore ceiling (limitation 1); a retention extension
 that can slip; `Confidence` discipline that remains backed by boundary
 enforcement rather than a proof (limitation 5); and per-contract compatibility
 tests that must each be written and kept green (Compatibility section).

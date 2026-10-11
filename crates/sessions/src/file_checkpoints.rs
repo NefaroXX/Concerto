@@ -1,35 +1,47 @@
-//! Durable file-checkpoint sidecar (ADR-82 §4, slice 5): migration 037.
+//! Durable file-checkpoint sidecar (ADR-82 §4, slice 5 + chunked completion):
+//! migrations 037 (record envelope + single-BLOB pre-images) and 039
+//! (chunked pre-image store).
 //!
-//! [`FileCheckpointStore`] owns the two sidecar tables — `file_checkpoints`
+//! [`FileCheckpointStore`] owns the sidecar tables — `file_checkpoints`
 //! (the [`CheckpointRecord`](concerto_core::checkpoint::CheckpointRecord)
-//! envelope per checkpoint) and `checkpoint_pre_images` (the restorable bytes,
-//! keyed by `(checkpoint_id, canonical_path)`). It implements the core
-//! [`CheckpointStore`](concerto_core::checkpoint::CheckpointStore) trait the
-//! executor restores through and the core
+//! envelope per checkpoint), `checkpoint_pre_image_chunks` (the restorable
+//! bytes, keyed by `(checkpoint_id, canonical_path, chunk_index)`), and the
+//! legacy `checkpoint_pre_images` single-BLOB table (read-only back-compat
+//! for pre-039 checkpoints; new captures write chunks only). It implements
+//! the core [`CheckpointStore`](concerto_core::checkpoint::CheckpointStore)
+//! trait the executor restores through and the core
 //! [`MutationCaptureSink`](concerto_core::checkpoint::MutationCaptureSink)
 //! trait the executor's pre-execution hook captures through, so neither the
 //! gate seam nor the direct path names SQL.
 //!
 //! Design rules enforced here:
 //!
-//! * **Own byte budget.** Every stored BLOB is bounded by
+//! * **Own byte budgets.** Every stored chunk is bounded by
 //!   [`CHECKPOINT_BLOB_LIMIT_BYTES`](concerto_core::checkpoint::CHECKPOINT_BLOB_LIMIT_BYTES),
-//!   never by the evidence-path `CACHE_LIMIT_BYTES`. Oversized bytes are
+//!   and every checkpoint's banked total by
+//!   [`CHECKPOINT_TOTAL_LIMIT_BYTES`](concerto_core::checkpoint::CHECKPOINT_TOTAL_LIMIT_BYTES) —
+//!   never by the evidence-path `CACHE_LIMIT_BYTES`. Over-budget bytes are
 //!   refused at the store boundary (creation fails loudly — a record claiming
 //!   bytes the store will not hold is a caller bug); the capture seams only
 //!   ever backfill within budget.
+//! * **Reassembly is verified, never trusted.** Chunks for one path must form
+//!   a dense `0..=max` index run whose concatenated bytes reproduce the
+//!   recorded whole-file size and hash — a gap, size mismatch, or hash
+//!   mismatch reads as hash-only/missing (restore reports `Partial`, never a
+//!   success claim over corrupt bytes).
 //! * **Derived data** (migration-030 precedent): the hashes on the
 //!   never-pruned whiteboard log are the durable reference; these rows are
 //!   repudiable bytes. [`ResourceFacts::rebuild_from_log`](crate::resource_facts::ResourceFacts::rebuild_from_log)
 //!   deliberately neither repopulates nor deletes them.
 //! * **Retention invariant:** prune-eligibility is gated on checkpoint status.
-//!   [`FileCheckpointStore::prune_checkpoints`] deletes sidecar rows whose
-//!   checkpoint is no longer `Active` OR older than `retention_days`
-//!   (delete-only, no archive — hashes stay on the never-pruned log) and
-//!   transitions pruned-bytes checkpoints to `Expired`, withdrawing the
-//!   restorable claim from that instant. A checkpoint advertised as restorable
-//!   is never prune-eligible. Cancellable at statement boundaries, fail-soft
-//!   at the `connect()` call site (a failed prune leaves rows in place).
+//!   [`FileCheckpointStore::prune_checkpoints`] deletes sidecar rows (chunks
+//!   and legacy single-BLOB rows) whose checkpoint is no longer `Active` OR
+//!   older than `retention_days` (delete-only, no archive — hashes stay on
+//!   the never-pruned log) and transitions pruned-bytes checkpoints to
+//!   `Expired`, withdrawing the restorable claim from that instant. A
+//!   checkpoint advertised as restorable is never prune-eligible. Cancellable
+//!   at statement boundaries, fail-soft at the `connect()` call site (a
+//!   failed prune leaves rows in place).
 //! * **Encryption is conditional** (ADR-73 interaction): these tables live
 //!   inside `sessions.db`, so they are encrypted WHEN the operator enables
 //!   `encrypt_at_rest` — the same guarantee and operator control as every
@@ -40,7 +52,7 @@ use std::collections::BTreeMap;
 use concerto_core::checkpoint::{
     now_millis, plan_capture, CaptureKind, CheckpointRecord, CheckpointResource, CheckpointScope,
     CheckpointStatus, CheckpointStoreError, PreImageBytes, RestoreMethod,
-    CHECKPOINT_BLOB_LIMIT_BYTES,
+    CHECKPOINT_BLOB_LIMIT_BYTES, CHECKPOINT_TOTAL_LIMIT_BYTES,
 };
 use concerto_core::ids::Ulid;
 use concerto_core::types::SessionContext;
@@ -101,13 +113,19 @@ impl FileCheckpointStore {
     /// Persist a checkpoint record plus its snapshotted blobs.
     ///
     /// `blobs` maps canonical paths to their checkpoint-time bytes (the
-    /// creation snapshot). Every `included` resource carrying a `byte_ref`
-    /// must have an entry here within [`CHECKPOINT_BLOB_LIMIT_BYTES`];
-    /// disagreement fails loudly ([`SessionError::Storage`]) — a record
-    /// claiming bytes the store will not hold is a caller bug, and failing
-    /// here keeps the retention invariant ("never advertise restorable
-    /// without bytes") from ever going stale. Hash-only resources (no
-    /// `byte_ref`) bank no row: absence restores exactly without bytes.
+    /// creation snapshot, arbitrary bytes — binary included). Every
+    /// `included` resource carrying a `byte_ref` must have an entry here
+    /// within [`CHECKPOINT_TOTAL_LIMIT_BYTES`], and the entries' combined
+    /// total must fit that same budget (the creation seam enforces it
+    /// first-fit; this is the backstop); disagreement fails loudly
+    /// ([`SessionError::Storage`]) — a record claiming bytes the store will
+    /// not hold is a caller bug, and failing here keeps the retention
+    /// invariant ("never advertise restorable without bytes") from ever
+    /// going stale. Hash-only resources (no `byte_ref`) bank no row:
+    /// absence restores exactly without bytes.
+    ///
+    /// Each blob is stored as [`CHECKPOINT_BLOB_LIMIT_BYTES`]-capped chunk
+    /// rows (migration 039); reassembly verifies size and hash on read.
     pub async fn create_checkpoint(
         &self,
         record: &CheckpointRecord,
@@ -121,13 +139,16 @@ impl FileCheckpointStore {
 
         // Strict agreement first: the store never persists a record whose
         // byte claims it will not honor.
+        let mut banked_total: usize = 0;
         for resource in &record.included {
             if resource.byte_ref.is_some() {
                 match blobs.get(&resource.canonical_path) {
-                    Some(bytes) if bytes.len() <= CHECKPOINT_BLOB_LIMIT_BYTES => {}
+                    Some(bytes) if bytes.len() <= CHECKPOINT_TOTAL_LIMIT_BYTES => {
+                        banked_total = banked_total.saturating_add(bytes.len());
+                    }
                     Some(bytes) => {
                         return Err(SessionError::Storage(format!(
-                            "checkpoint {} path {} banks {} bytes, over CHECKPOINT_BLOB_LIMIT_BYTES ({CHECKPOINT_BLOB_LIMIT_BYTES})",
+                            "checkpoint {} path {} banks {} bytes, over CHECKPOINT_TOTAL_LIMIT_BYTES ({CHECKPOINT_TOTAL_LIMIT_BYTES})",
                             checkpoint_id,
                             resource.canonical_path,
                             bytes.len()
@@ -141,6 +162,11 @@ impl FileCheckpointStore {
                     }
                 }
             }
+        }
+        if banked_total > CHECKPOINT_TOTAL_LIMIT_BYTES {
+            return Err(SessionError::Storage(format!(
+                "checkpoint {checkpoint_id} banks {banked_total} bytes total, over CHECKPOINT_TOTAL_LIMIT_BYTES ({CHECKPOINT_TOTAL_LIMIT_BYTES})"
+            )));
         }
 
         sqlx::query(
@@ -172,21 +198,17 @@ impl FileCheckpointStore {
                 )));
             };
             let hash = blake3::hash(bytes).to_hex().to_string();
-            sqlx::query(
-                "INSERT OR IGNORE INTO checkpoint_pre_images \
-                 (checkpoint_id, canonical_path, content_hash, content, size_bytes, capture_kind, captured_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            insert_byte_chunks(
+                &self.pool,
+                &byte_ref.checkpoint_id,
+                &byte_ref.canonical_path,
+                &hash,
+                bytes,
+                CaptureKind::Snapshot,
+                record.created_at_ms,
+                cancel,
             )
-            .bind(&byte_ref.checkpoint_id)
-            .bind(&byte_ref.canonical_path)
-            .bind(&hash)
-            .bind(bytes.as_slice())
-            .bind(bytes.len() as i64)
-            .bind(CaptureKind::Snapshot.as_str())
-            .bind(record.created_at_ms)
-            .execute(&self.pool)
-            .await
-            .map_err(SessionError::from)?;
+            .await?;
             report.stored += 1;
         }
         Ok(report)
@@ -196,11 +218,13 @@ impl FileCheckpointStore {
     ///
     /// Both capture seams (the gate beside the `WriteApplied` append, the
     /// executor's pre-execution hook on the direct path) funnel here:
-    /// `INSERT OR IGNORE` keeps the checkpoint-creation snapshot authoritative
-    /// (first bytes win), oversized captures are skipped (the budget is a
-    /// store boundary, never exceeded), and only paths the checkpoint's own
-    /// record banks (`byte_ref` present) gain rows — hash-only resources stay
-    /// hash-only. Returns the rows newly banked.
+    /// first bytes win at path granularity (a path that already holds chunk
+    /// rows — or a legacy snapshot row — keeps them, so the
+    /// checkpoint-creation snapshot stays authoritative), over-budget
+    /// captures are skipped (the total budget is a store boundary, never
+    /// exceeded), and only paths the checkpoint's own record banks
+    /// (`byte_ref` present) gain rows — hash-only resources stay hash-only.
+    /// Returns the paths newly banked.
     ///
     /// Fail-soft contract: callers on the write hot path ignore the `Err`
     /// (capture failure downgrades the resource, never fails the write); the
@@ -234,11 +258,11 @@ impl FileCheckpointStore {
         .map_err(SessionError::from)?;
         let mut banked = 0usize;
         for (path, hash, bytes) in captures {
-            if bytes.len() > CHECKPOINT_BLOB_LIMIT_BYTES {
+            if bytes.len() > CHECKPOINT_TOTAL_LIMIT_BYTES {
                 tracing::debug!(
                     path = %path,
                     bytes = bytes.len(),
-                    "checkpoint backfill skips oversized pre-image (budget boundary)"
+                    "checkpoint backfill skips over-budget pre-image (total-budget boundary)"
                 );
                 continue;
             }
@@ -261,23 +285,21 @@ impl FileCheckpointStore {
                 {
                     continue;
                 }
-                let inserted = sqlx::query(
-                    "INSERT OR IGNORE INTO checkpoint_pre_images \
-                     (checkpoint_id, canonical_path, content_hash, content, size_bytes, capture_kind, captured_at) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?)",
+                if path_has_banked_bytes(&self.pool, checkpoint_id, path).await? {
+                    continue;
+                }
+                insert_byte_chunks(
+                    &self.pool,
+                    checkpoint_id,
+                    path,
+                    hash,
+                    bytes,
+                    CaptureKind::PreImage,
+                    now_millis(),
+                    cancel,
                 )
-                .bind(checkpoint_id)
-                .bind(path)
-                .bind(hash)
-                .bind(bytes.as_slice())
-                .bind(bytes.len() as i64)
-                .bind(CaptureKind::PreImage.as_str())
-                .bind(now_millis())
-                .execute(&self.pool)
-                .await
-                .map_err(SessionError::from)?
-                .rows_affected();
-                banked += inserted as usize;
+                .await?;
+                banked += 1;
             }
         }
         Ok(banked)
@@ -537,7 +559,7 @@ async fn delete_and_expire(
 ) -> Result<(u64, u64), SessionError> {
     exec_sql(conn, "BEGIN IMMEDIATE;").await?;
     check_cancel(cancel)?;
-    let deleted = sqlx::query(
+    let legacy_deleted = sqlx::query(
         "DELETE FROM checkpoint_pre_images WHERE checkpoint_id IN (\
            SELECT checkpoint_id FROM file_checkpoints \
            WHERE status != 'active' OR created_at < ?)",
@@ -547,6 +569,17 @@ async fn delete_and_expire(
     .await
     .map_err(SessionError::from)?
     .rows_affected();
+    let chunks_deleted = sqlx::query(
+        "DELETE FROM checkpoint_pre_image_chunks WHERE checkpoint_id IN (\
+           SELECT checkpoint_id FROM file_checkpoints \
+           WHERE status != 'active' OR created_at < ?)",
+    )
+    .bind(cutoff)
+    .execute(&mut *conn)
+    .await
+    .map_err(SessionError::from)?
+    .rows_affected();
+    let deleted = legacy_deleted + chunks_deleted;
     let mut expired = 0u64;
     for (checkpoint_id,) in to_expire {
         check_cancel(cancel)?;
@@ -575,6 +608,155 @@ async fn delete_and_expire(
         expired += 1;
     }
     Ok((expired, deleted))
+}
+
+/// Store one path's bytes as [`CHECKPOINT_BLOB_LIMIT_BYTES`]-capped chunk
+/// rows (migration 039). Every chunk repeats the whole-file `hash`,
+/// whole-file `size_bytes`, `kind`, and `captured_at` so a chunk subset
+/// alone still names its file for the reassembly verifier. `INSERT OR
+/// IGNORE` per chunk keeps a racing first writer's bytes (creation snapshot
+/// vs seam backfill); callers that need path-granularity first-wins check
+/// [`path_has_banked_bytes`] first.
+#[allow(clippy::too_many_arguments)]
+async fn insert_byte_chunks(
+    pool: &SqlitePool,
+    checkpoint_id: &str,
+    canonical_path: &str,
+    hash: &str,
+    bytes: &[u8],
+    kind: CaptureKind,
+    captured_at_ms: i64,
+    cancel: &CancellationToken,
+) -> Result<(), SessionError> {
+    let size_bytes = bytes.len() as i64;
+    let kind_str = kind.as_str();
+    for (index, chunk) in bytes.chunks(CHECKPOINT_BLOB_LIMIT_BYTES).enumerate() {
+        crate::check_cancel(cancel)?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO checkpoint_pre_image_chunks \
+             (checkpoint_id, canonical_path, chunk_index, content_hash, content, chunk_size, size_bytes, capture_kind, captured_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(checkpoint_id)
+        .bind(canonical_path)
+        .bind(index as i64)
+        .bind(hash)
+        .bind(chunk)
+        .bind(chunk.len() as i64)
+        .bind(size_bytes)
+        .bind(kind_str)
+        .bind(captured_at_ms)
+        .execute(pool)
+        .await
+        .map_err(SessionError::from)?;
+    }
+    // An empty file banks zero chunks: record the emptiness explicitly with
+    // one zero-length chunk so "banked empty" stays distinguishable from
+    // "no row" (Absent) on read.
+    if bytes.is_empty() {
+        crate::check_cancel(cancel)?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO checkpoint_pre_image_chunks \
+             (checkpoint_id, canonical_path, chunk_index, content_hash, content, chunk_size, size_bytes, capture_kind, captured_at) \
+             VALUES (?, ?, 0, ?, ?, 0, 0, ?, ?)",
+        )
+        .bind(checkpoint_id)
+        .bind(canonical_path)
+        .bind(hash)
+        .bind(bytes)
+        .bind(kind_str)
+        .bind(captured_at_ms)
+        .execute(pool)
+        .await
+        .map_err(SessionError::from)?;
+    }
+    Ok(())
+}
+
+/// Whether `checkpoint_id`+`path` already holds banked bytes — chunk rows
+/// (migration 039) or a legacy single-BLOB row (migration 037). Backfill
+/// consults this so the first bytes win at path granularity.
+async fn path_has_banked_bytes(
+    pool: &SqlitePool,
+    checkpoint_id: &str,
+    canonical_path: &str,
+) -> Result<bool, SessionError> {
+    let chunks: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM checkpoint_pre_image_chunks \
+         WHERE checkpoint_id = ? AND canonical_path = ?",
+    )
+    .bind(checkpoint_id)
+    .bind(canonical_path)
+    .fetch_one(pool)
+    .await
+    .map_err(SessionError::from)?;
+    if chunks > 0 {
+        return Ok(true);
+    }
+    let legacy: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM checkpoint_pre_images \
+         WHERE checkpoint_id = ? AND canonical_path = ?",
+    )
+    .bind(checkpoint_id)
+    .bind(canonical_path)
+    .fetch_one(pool)
+    .await
+    .map_err(SessionError::from)?;
+    Ok(legacy > 0)
+}
+
+/// One chunk row as read for reassembly: index, bytes, whole-file hash,
+/// whole-file size, provenance, capture time.
+type ChunkRow = (i64, Vec<u8>, String, i64, String, i64);
+
+/// Reassemble ordered chunk rows into sidecar bytes (pure: unit-testable
+/// without a database).
+///
+/// Returns `Stored` only for a dense `0..=max` index run whose concatenated
+/// bytes reproduce the recorded whole-file size with one unanimous hash and
+/// one unanimous provenance; anything else (gap, size mismatch, hash or
+/// provenance disagreement, empty input) reads as `HashOnly`/`Absent` —
+/// restore then reports the path `missing` (Partial), never a success claim
+/// over corrupt bytes. The hash re-verification at restore time is the
+/// second line of defense; this structural check is the first.
+fn reassemble_chunks(rows: Vec<ChunkRow>) -> PreImageBytes {
+    if rows.is_empty() {
+        return PreImageBytes::Absent;
+    }
+    let (hash, size_bytes, kind_raw, captured_at_ms) = {
+        let (_, _, hash, size_bytes, kind_raw, captured_at_ms) = &rows[0];
+        (hash.clone(), *size_bytes, kind_raw.clone(), *captured_at_ms)
+    };
+    for (expected, row) in rows.iter().enumerate() {
+        let (index, _, row_hash, row_size, row_kind, _) = row;
+        if *index != expected as i64
+            || *row_hash != hash
+            || *row_size != size_bytes
+            || *row_kind != kind_raw
+        {
+            tracing::warn!(
+                expected_index = expected,
+                "checkpoint chunk set is structurally corrupt (gap or disagreement); reading hash-only"
+            );
+            return PreImageBytes::HashOnly { hash: Some(hash) };
+        }
+    }
+    let mut bytes = Vec::new();
+    for (_, chunk, _, _, _, _) in &rows {
+        bytes.extend_from_slice(chunk);
+    }
+    if bytes.len() as i64 != size_bytes {
+        tracing::warn!(
+            expected = size_bytes,
+            actual = bytes.len(),
+            "checkpoint chunk set size mismatch; reading hash-only"
+        );
+        return PreImageBytes::HashOnly { hash: Some(hash) };
+    }
+    // Unknown provenance spells read as the WEAKER claim (pre-image, with
+    // its caveat note) — never over-claim exactness.
+    let capture_kind = CaptureKind::parse(&kind_raw).unwrap_or(CaptureKind::PreImage);
+    PreImageBytes::Stored { bytes, hash, captured_at_ms, capture_kind }
 }
 
 /// Close a dedicated prune connection, surfacing close failures (a leaked
@@ -655,6 +837,21 @@ impl concerto_core::checkpoint::CheckpointStore for FileCheckpointStore {
         cancel: CancellationToken,
     ) -> Result<PreImageBytes, CheckpointStoreError> {
         check_cancel(&cancel).map_err(|_| CheckpointStoreError::Cancelled)?;
+        // Chunked rows first (migration 039); the legacy single-BLOB table
+        // stays as the fallback for pre-039 checkpoints.
+        let chunks: Vec<(i64, Vec<u8>, String, i64, String, i64)> = sqlx::query_as(
+            "SELECT chunk_index, content, content_hash, size_bytes, capture_kind, captured_at \
+             FROM checkpoint_pre_image_chunks \
+             WHERE checkpoint_id = ? AND canonical_path = ? ORDER BY chunk_index",
+        )
+        .bind(checkpoint_id)
+        .bind(canonical_path)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CheckpointStoreError::Storage(e.to_string()))?;
+        if !chunks.is_empty() {
+            return Ok(reassemble_chunks(chunks));
+        }
         let row: Option<(Option<Vec<u8>>, String, String, i64)> = sqlx::query_as(
             "SELECT content, content_hash, capture_kind, captured_at \
              FROM checkpoint_pre_images WHERE checkpoint_id = ? AND canonical_path = ?",
@@ -709,13 +906,36 @@ impl concerto_core::checkpoint::MutationCaptureSink for FileCheckpointStore {
         }
         // Read-before-materialize per path, fail-soft per path: a missing
         // file is a fresh create (no pre-image); any other read failure only
-        // degrades that path (hash-only), never the write.
+        // degrades that path (hash-only), never the write. Over-budget files
+        // are skipped before reading (the backfill would refuse them — no
+        // point materializing megabytes that can never bank).
         let mut captures = Vec::new();
         for path in &canonical_paths {
             if cancel.is_cancelled() {
                 return;
             }
-            match tokio::fs::read(session.project_dir.join(path)).await {
+            let absolute = session.project_dir.join(path);
+            match tokio::fs::metadata(&absolute).await {
+                Ok(meta) if meta.len() > CHECKPOINT_TOTAL_LIMIT_BYTES as u64 => {
+                    tracing::debug!(
+                        path = %path,
+                        bytes = meta.len(),
+                        "checkpoint capture skips an over-budget pre-image before reading (fail-soft)"
+                    );
+                    continue;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::debug!(
+                        path = %path,
+                        %error,
+                        "checkpoint capture skipped an unreadable pre-image (fail-soft)"
+                    );
+                    continue;
+                }
+            }
+            match tokio::fs::read(&absolute).await {
                 Ok(bytes) => {
                     captures.push((path.clone(), blake3::hash(&bytes).to_hex().to_string(), bytes));
                 }
@@ -757,7 +977,7 @@ fn store_error(error: SessionError) -> CheckpointStoreError {
 }
 
 /// Plan one path's capture the way the creation seam does: the orchestrator's
-/// create path and tests share this exact rule application (budget + UTF-8 +
+/// create path and tests share this exact rule application (total budget +
 /// kind provenance from [`plan_capture`]).
 pub fn plan_checkpoint_resource(
     checkpoint_id: &Ulid,
@@ -886,29 +1106,325 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_refuses_oversized_blobs_at_the_boundary() {
+    async fn store_refuses_over_total_blobs_at_the_boundary() {
         let (_dir, store) = test_store().await;
         let cid = Ulid::new();
-        // A record claiming bytes for an oversized blob fails loudly: the
-        // store never persists a restorable claim it will not honor.
+        // A record claiming bytes over the per-checkpoint total fails
+        // loudly: the store never persists a restorable claim it will not
+        // honor. (Multi-chunk sizes within the total are fine — chunking is
+        // storage detail.)
         let record = record_with(
             CheckpointStatus::Active,
-            vec![banked("big.txt", &cid)],
+            vec![banked("big.bin", &cid)],
             RestoreMethod::PreImageStore,
         );
-        let big = vec![b'x'; CHECKPOINT_BLOB_LIMIT_BYTES + 1];
-        let blobs = BTreeMap::from([("big.txt".to_owned(), big)]);
+        let big = vec![b'x'; CHECKPOINT_TOTAL_LIMIT_BYTES + 1];
+        let blobs = BTreeMap::from([("big.bin".to_owned(), big)]);
         match store.create_checkpoint(&record, &blobs, &token()).await {
             Err(SessionError::Storage(message)) => {
-                assert!(message.contains("CHECKPOINT_BLOB_LIMIT_BYTES"));
+                assert!(message.contains("CHECKPOINT_TOTAL_LIMIT_BYTES"));
             }
-            other => panic!("oversized blob must fail creation, got {other:?}"),
+            other => panic!("over-total blob must fail creation, got {other:?}"),
         }
         // And a missing blob for a byte-claiming resource fails too.
         match store.create_checkpoint(&record, &BTreeMap::new(), &token()).await {
             Err(SessionError::Storage(_)) => {}
             other => panic!("missing blob must fail creation, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn store_refuses_a_running_total_over_budget() {
+        let (_dir, store) = test_store().await;
+        let cid = Ulid::new();
+        // Each blob fits alone, but together they overflow the
+        // per-checkpoint total: the store backstop refuses (the creation
+        // seam normally downgrades first-fit before reaching here).
+        let half = CHECKPOINT_TOTAL_LIMIT_BYTES / 2 + 1;
+        let record = record_with(
+            CheckpointStatus::Active,
+            vec![banked("a.bin", &cid), banked("b.bin", &cid)],
+            RestoreMethod::PreImageStore,
+        );
+        let blobs = BTreeMap::from([
+            ("a.bin".to_owned(), vec![b'a'; half]),
+            ("b.bin".to_owned(), vec![b'b'; half]),
+        ]);
+        match store.create_checkpoint(&record, &blobs, &token()).await {
+            Err(SessionError::Storage(message)) => {
+                assert!(message.contains("total"), "names the running total: {message}");
+            }
+            other => panic!("over-total checkpoint must fail creation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chunked_round_trip_reassembles_multi_chunk_binary() {
+        use concerto_core::checkpoint::CHECKPOINT_BLOB_LIMIT_BYTES;
+        let (_dir, store) = test_store().await;
+        let cid = Ulid::new();
+        // Non-UTF-8 bytes spanning several chunks: the reassembly must be
+        // byte-exact, with the snapshot provenance intact.
+        let bytes: Vec<u8> =
+            (0..CHECKPOINT_BLOB_LIMIT_BYTES * 2 + 12345).map(|i| (i % 251) as u8).collect();
+        assert!(bytes.len() > CHECKPOINT_BLOB_LIMIT_BYTES);
+        assert!(std::str::from_utf8(&bytes).is_err(), "test bytes must be binary");
+        let mut record = record_with(
+            CheckpointStatus::Active,
+            vec![banked("bin.dat", &cid)],
+            RestoreMethod::PreImageStore,
+        );
+        record.checkpoint_id = cid;
+        let report = store
+            .create_checkpoint(
+                &record,
+                &BTreeMap::from([("bin.dat".to_owned(), bytes.clone())]),
+                &token(),
+            )
+            .await
+            .expect("create");
+        assert_eq!(report, CheckpointCreateReport { stored: 1, hash_only: 0 });
+
+        let chunk_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM checkpoint_pre_image_chunks WHERE checkpoint_id = ?",
+        )
+        .bind(cid.to_string())
+        .fetch_one(&store.pool)
+        .await
+        .expect("count chunks");
+        assert_eq!(
+            chunk_rows,
+            bytes.len().div_ceil(CHECKPOINT_BLOB_LIMIT_BYTES) as i64,
+            "one row per chunk"
+        );
+
+        match load_bytes_via_trait(&store, &cid.to_string(), "bin.dat").await {
+            PreImageBytes::Stored { bytes: back, hash, capture_kind, .. } => {
+                assert_eq!(back, bytes, "byte-exact reassembly");
+                assert_eq!(hash, blake3::hash(&bytes).to_hex().to_string());
+                assert_eq!(capture_kind, CaptureKind::Snapshot);
+            }
+            other => panic!("expected Stored bytes, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_file_banks_an_explicit_empty_row() {
+        let (_dir, store) = test_store().await;
+        let cid = Ulid::new();
+        let mut record = record_with(
+            CheckpointStatus::Active,
+            vec![banked("empty.txt", &cid)],
+            RestoreMethod::PreImageStore,
+        );
+        record.checkpoint_id = cid;
+        store
+            .create_checkpoint(
+                &record,
+                &BTreeMap::from([("empty.txt".to_owned(), Vec::new())]),
+                &token(),
+            )
+            .await
+            .expect("create");
+        // Banked-empty reads Stored(empty) — distinguishable from Absent, so
+        // restore recreates the empty file instead of reporting it missing.
+        match load_bytes_via_trait(&store, &cid.to_string(), "empty.txt").await {
+            PreImageBytes::Stored { bytes, .. } => assert!(bytes.is_empty()),
+            other => panic!("expected Stored empty bytes, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_single_blob_rows_still_restore() {
+        let (_dir, store) = test_store().await;
+        let cid = Ulid::new();
+        // A pre-039 checkpoint wrote the single-BLOB table only: the legacy
+        // read path still serves it (back-compat for older checkpoints).
+        sqlx::query(
+            "INSERT INTO checkpoint_pre_images \
+             (checkpoint_id, canonical_path, content_hash, content, size_bytes, capture_kind, captured_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(cid.to_string())
+        .bind("old.txt")
+        .bind(blake3::hash(b"legacy").to_hex().to_string())
+        .bind(b"legacy".as_slice())
+        .bind(6_i64)
+        .bind(CaptureKind::Snapshot.as_str())
+        .bind(now_millis())
+        .execute(&store.pool)
+        .await
+        .expect("legacy row");
+        match load_bytes_via_trait(&store, &cid.to_string(), "old.txt").await {
+            PreImageBytes::Stored { bytes, .. } => assert_eq!(bytes, b"legacy"),
+            other => panic!("expected legacy Stored bytes, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn gapped_chunk_set_reads_hash_only_never_bytes() {
+        let (_dir, store) = test_store().await;
+        let cid = Ulid::new();
+        let bytes: Vec<u8> =
+            (0..CHECKPOINT_BLOB_LIMIT_BYTES * 3).map(|i| (i % 251) as u8).collect();
+        let mut record = record_with(
+            CheckpointStatus::Active,
+            vec![banked("gap.dat", &cid)],
+            RestoreMethod::PreImageStore,
+        );
+        record.checkpoint_id = cid;
+        store
+            .create_checkpoint(
+                &record,
+                &BTreeMap::from([("gap.dat".to_owned(), bytes.clone())]),
+                &token(),
+            )
+            .await
+            .expect("create");
+        // Corrupt the set the way a crash or tamper would: drop the middle
+        // chunk. Reassembly must refuse bytes (restore reports Partial),
+        // keeping the recorded hash for the honesty trail.
+        sqlx::query(
+            "DELETE FROM checkpoint_pre_image_chunks \
+             WHERE checkpoint_id = ? AND canonical_path = ? AND chunk_index = 1",
+        )
+        .bind(cid.to_string())
+        .bind("gap.dat")
+        .execute(&store.pool)
+        .await
+        .expect("drop a chunk");
+        match load_bytes_via_trait(&store, &cid.to_string(), "gap.dat").await {
+            PreImageBytes::HashOnly { hash } => {
+                assert_eq!(hash, Some(blake3::hash(&bytes).to_hex().to_string()));
+            }
+            other => panic!("gapped chunks must read hash-only, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tampered_chunk_bytes_stay_verifiable_against_the_recorded_hash() {
+        let (_dir, store) = test_store().await;
+        let cid = Ulid::new();
+        let bytes: Vec<u8> =
+            (0..CHECKPOINT_BLOB_LIMIT_BYTES + 100).map(|i| (i % 251) as u8).collect();
+        let mut record = record_with(
+            CheckpointStatus::Active,
+            vec![banked("tamper.dat", &cid)],
+            RestoreMethod::PreImageStore,
+        );
+        record.checkpoint_id = cid;
+        store
+            .create_checkpoint(
+                &record,
+                &BTreeMap::from([("tamper.dat".to_owned(), bytes.clone())]),
+                &token(),
+            )
+            .await
+            .expect("create");
+        // Tamper that preserves structure (dense indices, same sizes): the
+        // chunk read still returns Stored, but against the RECORDED hash —
+        // so the restore-time re-verification catches it (never written).
+        sqlx::query(
+            "UPDATE checkpoint_pre_image_chunks SET content = ? \
+             WHERE checkpoint_id = ? AND canonical_path = ? AND chunk_index = 0",
+        )
+        .bind(vec![0xAA_u8; CHECKPOINT_BLOB_LIMIT_BYTES])
+        .bind(cid.to_string())
+        .bind("tamper.dat")
+        .execute(&store.pool)
+        .await
+        .expect("tamper a chunk");
+        match load_bytes_via_trait(&store, &cid.to_string(), "tamper.dat").await {
+            PreImageBytes::Stored { bytes: back, hash, .. } => {
+                assert_ne!(back, bytes, "tamper took effect");
+                assert_eq!(hash, blake3::hash(&bytes).to_hex().to_string());
+                assert_ne!(
+                    blake3::hash(&back).to_hex().to_string(),
+                    hash,
+                    "restore-time verification must fail on these bytes"
+                );
+            }
+            other => panic!("structurally dense tamper still reads Stored, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reassemble_chunks_rejects_structural_corruption() {
+        use concerto_core::checkpoint::CHECKPOINT_BLOB_LIMIT_BYTES;
+        let hash = blake3::hash(b"ab").to_hex().to_string();
+        let good = vec![
+            (0_i64, b"a".to_vec(), hash.clone(), 2_i64, "snapshot".to_string(), 7_i64),
+            (1_i64, b"b".to_vec(), hash.clone(), 2_i64, "snapshot".to_string(), 7_i64),
+        ];
+        match reassemble_chunks(good) {
+            PreImageBytes::Stored { bytes, .. } => assert_eq!(bytes, b"ab"),
+            other => panic!("dense run reassembles, got {other:?}"),
+        }
+        // Gap.
+        let gapped = vec![
+            (0_i64, b"a".to_vec(), hash.clone(), 2_i64, "snapshot".to_string(), 7_i64),
+            (2_i64, b"b".to_vec(), hash.clone(), 2_i64, "snapshot".to_string(), 7_i64),
+        ];
+        assert!(matches!(reassemble_chunks(gapped), PreImageBytes::HashOnly { .. }));
+        // Size disagreement.
+        let sized = vec![
+            (0_i64, b"a".to_vec(), hash.clone(), 99_i64, "snapshot".to_string(), 7_i64),
+            (1_i64, b"b".to_vec(), hash.clone(), 99_i64, "snapshot".to_string(), 7_i64),
+        ];
+        assert!(matches!(reassemble_chunks(sized), PreImageBytes::HashOnly { .. }));
+        // Hash disagreement across chunks.
+        let split = vec![
+            (0_i64, b"a".to_vec(), hash.clone(), 2_i64, "snapshot".to_string(), 7_i64),
+            (1_i64, b"b".to_vec(), "other".to_string(), 2_i64, "snapshot".to_string(), 7_i64),
+        ];
+        assert!(matches!(reassemble_chunks(split), PreImageBytes::HashOnly { .. }));
+        // Empty input reads Absent.
+        assert!(matches!(reassemble_chunks(Vec::new()), PreImageBytes::Absent));
+        let _ = CHECKPOINT_BLOB_LIMIT_BYTES;
+    }
+
+    #[tokio::test]
+    async fn prune_collects_multi_chunk_rows_and_expires() {
+        let (_dir, store) = test_store().await;
+        let old_ms = now_millis() - 30 * 86_400 * 1000;
+        let cid = Ulid::new();
+        let bytes: Vec<u8> =
+            (0..CHECKPOINT_BLOB_LIMIT_BYTES * 2 + 10).map(|i| (i % 251) as u8).collect();
+        let mut record = record_with(
+            CheckpointStatus::Active,
+            vec![banked("aged.bin", &cid)],
+            RestoreMethod::PreImageStore,
+        );
+        record.checkpoint_id = cid;
+        record.created_at_ms = old_ms;
+        store
+            .create_checkpoint(&record, &BTreeMap::from([("aged.bin".to_owned(), bytes)]), &token())
+            .await
+            .expect("aged create");
+        let report = store.prune_checkpoints(7, &token()).await.expect("prune");
+        assert_eq!(report.expired, 1);
+        let chunks_left: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM checkpoint_pre_image_chunks WHERE checkpoint_id = ?",
+        )
+        .bind(cid.to_string())
+        .fetch_one(&store.pool)
+        .await
+        .expect("count chunks");
+        assert_eq!(chunks_left, 0, "every chunk row collected");
+        match load_bytes_via_trait(&store, &cid.to_string(), "aged.bin").await {
+            PreImageBytes::Absent => {}
+            other => panic!("pruned bytes must read Absent, got {other:?}"),
+        }
+        let back = store
+            .load_checkpoint_record(&cid.to_string(), &token())
+            .await
+            .expect("load")
+            .expect("envelope survives for audit");
+        assert!(
+            matches!(back.status, CheckpointStatus::Expired { .. }),
+            "pruned-bytes checkpoint must read Expired, got {:?}",
+            back.status
+        );
     }
 
     #[tokio::test]
@@ -1073,13 +1589,15 @@ mod tests {
     async fn backfill_banks_first_mutation_bytes_for_covered_paths() {
         let (_dir, store) = test_store().await;
         let cid = Ulid::new();
-        // Record banks only "a.txt" (snapshot present); "b.txt" is scoped but
-        // hash-only (no byte_ref) — backfill must not invent bytes for it.
-        let mut record = CheckpointRecord::new(
+        // Record banks "a.txt" (snapshot present) and "huge.bin"
+        // (byte_ref'd but over the total budget — backfill must refuse it);
+        // "b.txt" is scoped but hash-only (no byte_ref) — backfill must not
+        // invent bytes for it.
+        let record = CheckpointRecord::new(
             cid,
             Ulid::new(),
             CheckpointScope::FilesystemWrites {
-                paths: vec!["a.txt".to_string(), "b.txt".to_string()],
+                paths: vec!["a.txt".to_string(), "b.txt".to_string(), "huge.bin".to_string()],
             },
             vec![
                 banked("a.txt", &cid),
@@ -1091,6 +1609,7 @@ mod tests {
                     byte_ref: None,
                     size_bytes: None,
                 },
+                banked("huge.bin", &cid),
             ],
             Vec::new(),
             BTreeMap::new(),
@@ -1102,22 +1621,23 @@ mod tests {
             None,
         )
         .expect("test record builds");
-        // Snapshot only "a.txt"... then delete its row to simulate a missed
-        // creation capture (the seam's reason to exist).
-        store
-            .create_checkpoint(
-                &record,
-                &BTreeMap::from([("a.txt".to_owned(), b"v1".to_vec())]),
-                &token(),
-            )
-            .await
-            .expect("create");
-        sqlx::query("DELETE FROM checkpoint_pre_images WHERE checkpoint_id = ?")
-            .bind(cid.to_string())
-            .execute(&store.pool)
-            .await
-            .expect("simulate missed snapshot");
-        record.checkpoint_id = cid;
+        // No creation snapshot at all (every path simulates a missed
+        // capture): insert the record row directly so the test controls
+        // exactly which paths hold rows.
+        let mut record_json = record;
+        record_json.checkpoint_id = cid;
+        sqlx::query(
+            "INSERT INTO file_checkpoints \
+             (checkpoint_id, session_id, status, record_json, created_at) \
+             VALUES (?, ?, 'active', ?, ?)",
+        )
+        .bind(cid.to_string())
+        .bind(Ulid::new().to_string())
+        .bind(record_json.to_json().expect("record json"))
+        .bind(now_millis())
+        .execute(&store.pool)
+        .await
+        .expect("record row");
 
         let session = Ulid::new().to_string();
         let banked_count = store
@@ -1126,9 +1646,9 @@ mod tests {
                     ("a.txt".to_owned(), blake3::hash(b"v0").to_hex().to_string(), b"v0".to_vec()),
                     ("b.txt".to_owned(), blake3::hash(b"vb").to_hex().to_string(), b"vb".to_vec()),
                     (
-                        "huge.txt".to_owned(),
+                        "huge.bin".to_owned(),
                         "h".to_string(),
-                        vec![0u8; CHECKPOINT_BLOB_LIMIT_BYTES + 1],
+                        vec![0u8; CHECKPOINT_TOTAL_LIMIT_BYTES + 1],
                     ),
                 ],
                 Some(session.as_str()),
@@ -1137,7 +1657,7 @@ mod tests {
             .await
             .expect("backfill");
         // "a.txt" is covered and byte-banked; "b.txt" stays hash-only (no
-        // byte_ref); "huge.txt" is out of scope AND over budget.
+        // byte_ref); "huge.bin" is covered but over the total budget.
         assert_eq!(banked_count, 1);
         match load_bytes_via_trait(&store, &cid.to_string(), "a.txt").await {
             PreImageBytes::Stored { bytes, capture_kind, .. } => {
@@ -1150,7 +1670,11 @@ mod tests {
             PreImageBytes::Absent => {}
             other => panic!("hash-only paths gain no rows, got {other:?}"),
         }
-        // Second backfill is a no-op (INSERT OR IGNORE keeps first bytes).
+        match load_bytes_via_trait(&store, &cid.to_string(), "huge.bin").await {
+            PreImageBytes::Absent => {}
+            other => panic!("over-budget paths gain no rows, got {other:?}"),
+        }
+        // Second backfill is a no-op (first bytes win at path granularity).
         let again = store
             .backfill_pre_images(
                 &[("a.txt".to_owned(), blake3::hash(b"v9").to_hex().to_string(), b"v9".to_vec())],
@@ -1163,17 +1687,91 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_plan_marks_manual_with_partial_scope_limitation() {
-        // The creation-time rule behind oversized→Manual: no bankable bytes
+    async fn backfill_keeps_legacy_snapshot_rows_authoritative() {
+        let (_dir, store) = test_store().await;
+        let cid = Ulid::new();
+        // A pre-039 checkpoint holds a legacy single-BLOB row: backfill
+        // must not bank chunk rows beside it (first bytes win across both
+        // tables, so the creation snapshot stays authoritative).
+        sqlx::query(
+            "INSERT INTO checkpoint_pre_images \
+             (checkpoint_id, canonical_path, content_hash, content, size_bytes, capture_kind, captured_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(cid.to_string())
+        .bind("old.txt")
+        .bind(blake3::hash(b"snap").to_hex().to_string())
+        .bind(b"snap".as_slice())
+        .bind(4_i64)
+        .bind(CaptureKind::Snapshot.as_str())
+        .bind(now_millis())
+        .execute(&store.pool)
+        .await
+        .expect("legacy row");
+        let mut record = CheckpointRecord::new(
+            cid,
+            Ulid::new(),
+            CheckpointScope::FilesystemWrites { paths: vec!["old.txt".to_string()] },
+            vec![banked("old.txt", &cid)],
+            Vec::new(),
+            BTreeMap::new(),
+            CheckpointStatus::Active,
+            RestoreMethod::PreImageStore,
+            Vec::new(),
+            "agent-a".to_string(),
+            now_millis(),
+            None,
+        )
+        .expect("test record builds");
+        record.checkpoint_id = cid;
+        sqlx::query(
+            "INSERT INTO file_checkpoints \
+             (checkpoint_id, session_id, status, record_json, created_at) \
+             VALUES (?, ?, 'active', ?, ?)",
+        )
+        .bind(cid.to_string())
+        .bind(Ulid::new().to_string())
+        .bind(record.to_json().expect("record json"))
+        .bind(now_millis())
+        .execute(&store.pool)
+        .await
+        .expect("record row");
+
+        let session = Ulid::new().to_string();
+        let banked_count = store
+            .backfill_pre_images(
+                &[(
+                    "old.txt".to_owned(),
+                    blake3::hash(b"new").to_hex().to_string(),
+                    b"new".to_vec(),
+                )],
+                Some(session.as_str()),
+                &token(),
+            )
+            .await
+            .expect("backfill");
+        assert_eq!(banked_count, 0, "legacy snapshot wins");
+        match load_bytes_via_trait(&store, &cid.to_string(), "old.txt").await {
+            PreImageBytes::Stored { bytes, capture_kind, .. } => {
+                assert_eq!(bytes, b"snap");
+                assert_eq!(capture_kind, CaptureKind::Snapshot);
+            }
+            other => panic!("legacy bytes must survive, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn over_total_plan_marks_manual_with_partial_scope_limitation() {
+        // The creation-time rule behind over-total→Manual: no bankable bytes
         // means the Manual method plus the partial-scope limitation.
         let cid = Ulid::new();
-        let big = vec![b'x'; CHECKPOINT_BLOB_LIMIT_BYTES + 1];
+        let big = vec![b'x'; CHECKPOINT_TOTAL_LIMIT_BYTES + 1];
         let planned = plan_capture(&cid, "big.bin", None, Some(&big));
         assert!(planned.included.expect("anchored").byte_ref.is_none());
         let excluded = planned.excluded.expect("honesty entry");
         assert_eq!(excluded.class, CheckpointExclusionClass::OversizedFile);
         assert_eq!(default_method_for_plan(&[]), RestoreMethod::Manual);
-        assert!(PARTIAL_SCOPE_LIMITATION.contains("64 KiB"));
+        assert!(PARTIAL_SCOPE_LIMITATION.contains("CHECKPOINT_TOTAL_LIMIT_BYTES"));
     }
 
     #[test]

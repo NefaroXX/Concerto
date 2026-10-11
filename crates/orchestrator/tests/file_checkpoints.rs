@@ -1,20 +1,26 @@
-//! ADR-82 slice 5: durable file checkpoints with honest restore, end-to-end.
+//! ADR-82 slice 5 + chunked completion: durable file checkpoints with honest
+//! restore, end-to-end.
 //!
 //! Drives the *real* [`WriteGate`] (with the checkpoint sidecar attached) and
 //! the *real* `FilesystemTool` through the specified verification flow:
 //!
-//! - write → checkpoint → mutate → restore returns byte-exact content;
+//! - write → checkpoint → mutate → restore returns byte-exact content (text,
+//!   multi-chunk text, and binary alike — the sidecar banks
+//!   `CHECKPOINT_BLOB_LIMIT_BYTES`-capped chunks of arbitrary bytes up to
+//!   the per-checkpoint `CHECKPOINT_TOTAL_LIMIT_BYTES` budget);
 //! - ownership-conflict restore is refused and surfaced (no silent overwrite);
 //! - double restore is a recorded no-op;
-//! - oversized content degrades to `Manual` + `Partial` with limitations;
+//! - over-total-budget content degrades to `Manual` + `Partial` with
+//!   limitations (hash-only, never a silent skip);
 //! - the gate seam backfills a missed creation snapshot;
 //! - the executor's direct-path hook captures without the gate;
-//! - retention prunes sidecar bytes and transitions the checkpoint to
-//!   `Expired` (restorable claim withdrawn; restore refuses).
+//! - corrupt/missing/tampered chunk sets restore `Partial` (never a success
+//!   claim over unverified bytes);
+//! - retention prunes sidecar bytes (chunks included) and transitions the
+//!   checkpoint to `Expired` (restorable claim withdrawn; restore refuses).
 //!
-//! Partial-milestone honesty: binary/large-file exact restore is NOT
-//! delivered here (streaming store deferred) — the oversized test pins the
-//! degradation instead of the capability.
+//! Honest ceilings that remain: the per-checkpoint total budget and
+//! symlink/permission/xattr metadata (never captured).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -22,7 +28,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use concerto_core::checkpoint::{
-    CheckpointExclusion, CheckpointExclusionClass, CheckpointScope, CheckpointStatus, RestoreMethod,
+    CheckpointExclusion, CheckpointExclusionClass, CheckpointScope, CheckpointStatus,
+    RestoreMethod, CHECKPOINT_BLOB_LIMIT_BYTES, CHECKPOINT_TOTAL_LIMIT_BYTES,
 };
 use concerto_core::error::PolicyError;
 use concerto_core::executor::ToolExecutor;
@@ -149,8 +156,37 @@ impl Harness {
             .unwrap_or_else(|error| panic!("gated write {call_id} must succeed: {error:?}"));
     }
 
+    /// Gated binary write through the `content_b64` channel: exercises the
+    /// gate (ownership, conflict checks, pre-image cache) with arbitrary
+    /// bytes, exactly as checkpoint restore replays them.
+    async fn gated_write_bytes(&self, call_id: &str, agent: &str, path: &str, bytes: &[u8]) {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let request = GateRequest {
+            call_id: call_id.to_owned(),
+            agent_id: agent.to_owned(),
+            tool: "filesystem".to_owned(),
+            input: json!({"operation": "write", "path": path, "content_b64": b64}),
+            registered_as: None,
+            session_id: Some(self.session_id.to_string()),
+            scope: "fs".to_owned(),
+            plan_id: None,
+            causation: None,
+            base_versions: BTreeMap::new(),
+            orchestrator_authority: false,
+        };
+        self.gate
+            .submit(request, CancellationToken::new())
+            .await
+            .unwrap_or_else(|error| panic!("gated bytes write {call_id} must succeed: {error:?}"));
+    }
+
     fn disk(&self, path: &str) -> String {
         std::fs::read_to_string(self.root.join(path)).expect("read disk file")
+    }
+
+    fn disk_bytes(&self, path: &str) -> Vec<u8> {
+        std::fs::read(self.root.join(path)).expect("read disk bytes")
     }
 }
 
@@ -273,21 +309,25 @@ async fn ownership_conflict_restore_is_refused_and_surfaces() {
     assert_eq!(h.disk("shared.txt"), "b-content", "refused restore writes nothing");
 }
 
-/// Oversized content degrades honestly: hash-only + excluded + Manual when
-/// nothing banked; Partial restore of the bankable subset otherwise.
+/// Over-total-budget content degrades honestly: hash-only + excluded +
+/// `Manual` when nothing banked; `Partial` restore of the bankable subset
+/// otherwise. Files within the budget (even multi-chunk ones) restore —
+/// only the per-checkpoint TOTAL is a ceiling.
 #[tokio::test]
-async fn oversized_file_degrades_to_manual_with_limitations() {
+async fn over_total_file_degrades_to_manual_with_limitations() {
     let h = Harness::new().await;
-    let big_content = "x".repeat(70_000);
-    h.gated_write("w-big", "agent-a", "big.txt", &big_content).await;
+    // Genuinely over budget: one byte more than the per-checkpoint total.
+    // Seeded directly (no gate payload bloat for megabytes of test data).
+    let big_bytes = vec![b'x'; CHECKPOINT_TOTAL_LIMIT_BYTES + 1];
+    std::fs::write(h.root.join("big.bin"), &big_bytes).expect("seed over-total file");
 
-    // Pure-oversized checkpoint: nothing bankable → Manual.
+    // Pure over-budget checkpoint: nothing bankable → Manual.
     let record = create_file_checkpoint(
         &h.store,
         &h.root,
         h.session_id,
-        fs_scope(&["big.txt"]),
-        vec!["big.txt".to_string()],
+        fs_scope(&["big.bin"]),
+        vec!["big.bin".to_string()],
         "agent-a",
         BTreeMap::new(),
         Vec::new(),
@@ -305,7 +345,11 @@ async fn oversized_file_degrades_to_manual_with_limitations() {
     );
     assert_eq!(record.excluded.len(), 1);
     assert_eq!(record.excluded[0].class, CheckpointExclusionClass::OversizedFile);
-    assert!(record.limitations.iter().any(|l| l.contains("64 KiB")));
+    assert!(
+        record.limitations.iter().any(|l| l.contains("CHECKPOINT_TOTAL_LIMIT_BYTES")),
+        "the limitation names the real ceiling, got {:?}",
+        record.limitations
+    );
 
     match restore_file_checkpoint(
         &h.executor,
@@ -325,7 +369,7 @@ async fn oversized_file_degrades_to_manual_with_limitations() {
         }
         other => panic!("expected RequiresOperator, got {other:?}"),
     }
-    assert_eq!(h.disk("big.txt"), big_content, "Manual writes nothing");
+    assert_eq!(h.disk_bytes("big.bin"), big_bytes, "Manual writes nothing");
 
     // Mixed checkpoint: the small file restores, the big one reports missing.
     h.gated_write("w-small", "agent-a", "small.txt", "small-v1").await;
@@ -333,8 +377,8 @@ async fn oversized_file_degrades_to_manual_with_limitations() {
         &h.store,
         &h.root,
         h.session_id,
-        fs_scope(&["small.txt", "big.txt"]),
-        vec!["small.txt".to_string(), "big.txt".to_string()],
+        fs_scope(&["small.txt", "big.bin"]),
+        vec!["small.txt".to_string(), "big.bin".to_string()],
         "agent-a",
         BTreeMap::new(),
         Vec::new(),
@@ -362,8 +406,8 @@ async fn oversized_file_degrades_to_manual_with_limitations() {
     {
         concerto_core::checkpoint::RestoreOutcome::Partial { restored, missing, limitations } => {
             assert_eq!(restored, vec!["small.txt".to_string()]);
-            assert_eq!(missing, vec!["big.txt".to_string()]);
-            assert!(limitations.iter().any(|l| l.contains("big.txt")));
+            assert_eq!(missing, vec!["big.bin".to_string()]);
+            assert!(limitations.iter().any(|l| l.contains("big.bin")));
         }
         other => panic!("expected Partial, got {other:?}"),
     }
@@ -392,12 +436,14 @@ async fn gate_seam_backfills_a_missed_creation_snapshot() {
     )
     .await
     .expect("checkpoint creation");
-    // Simulate the missed snapshot: drop the banked row.
-    sqlx::query("DELETE FROM checkpoint_pre_images WHERE checkpoint_id = ?")
+    // Simulate the missed snapshot: drop the banked chunk rows (new
+    // checkpoints bank chunks only — the legacy single-BLOB table holds no
+    // row for them).
+    sqlx::query("DELETE FROM checkpoint_pre_image_chunks WHERE checkpoint_id = ?")
         .bind(record.checkpoint_id.to_string())
         .execute(&h.pool)
         .await
-        .expect("drop snapshot row");
+        .expect("drop snapshot chunks");
 
     // The next gated mutation backfills its pre-image (== checkpoint content).
     h.gated_write("w-2", "agent-a", "seam.txt", "seam-v2").await;
@@ -449,12 +495,12 @@ async fn direct_path_hook_captures_without_the_gate() {
     )
     .await
     .expect("checkpoint creation");
-    // Drop the snapshot so only the hook can supply bytes.
-    sqlx::query("DELETE FROM checkpoint_pre_images WHERE checkpoint_id = ?")
+    // Drop the snapshot chunk rows so only the hook can supply bytes.
+    sqlx::query("DELETE FROM checkpoint_pre_image_chunks WHERE checkpoint_id = ?")
         .bind(record.checkpoint_id.to_string())
         .execute(&h.pool)
         .await
-        .expect("drop snapshot row");
+        .expect("drop snapshot chunks");
 
     // Ungated write through the executor: the hook backfills pre-image bytes.
     h.executor
@@ -522,6 +568,16 @@ async fn retention_expires_aged_checkpoints_and_restore_refuses() {
     let report = h.store.prune_checkpoints(7, &CancellationToken::new()).await.expect("prune");
     assert_eq!(report.expired, 1);
     assert_eq!(report.sidecar_rows_deleted, 1);
+
+    // (e) Retention covers the chunk table too: no chunk row survives.
+    let chunks_left: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM checkpoint_pre_image_chunks WHERE checkpoint_id = ?",
+    )
+    .bind(record.checkpoint_id.to_string())
+    .fetch_one(&h.pool)
+    .await
+    .expect("count chunks");
+    assert_eq!(chunks_left, 0, "pruned chunks withdraw the restorable claim");
 
     let back = h
         .store
@@ -832,23 +888,27 @@ async fn policy_denial_aborts_restore_loudly() {
     assert!(matches!(back.status, CheckpointStatus::Active), "denial is retriable");
 }
 
-/// Binary (≤budget, non-UTF-8) content degrades honestly: hash-only +
-/// excluded at creation, and the mixed restore is `Partial` with the binary
-/// limitation — nothing is written for the binary path and no success is
-/// claimed. (The streaming store that would restore bytes is deferred.)
+/// (a) Binary above the per-chunk size, within the total budget:
+/// checkpoint → mutate → restore is BYTE-EXACT (bytes compared, not text).
+/// Binary is no longer a limitation — it banks chunks like text and restores
+/// through the same gated byte-write path, never `Partial`/`Manual`.
 #[tokio::test]
-async fn binary_file_degrades_to_partial_with_limitation() {
+async fn binary_checkpoint_mutate_restore_is_byte_exact() {
     let h = Harness::new().await;
-    let binary = [0x00u8, 0x01, 0xfe, 0xff, 0x7f, 0x80];
-    std::fs::write(h.root.join("bin.dat"), binary).expect("seed binary");
-    h.gated_write("w-small", "agent-a", "small.txt", "small-v1").await;
+    // Multi-chunk non-UTF-8 bytes: every 251st byte keeps 0x00-0xFA alive
+    // (NULs and high bytes throughout — no valid UTF-8 interpretation).
+    let original: Vec<u8> =
+        (0..CHECKPOINT_BLOB_LIMIT_BYTES * 2 + 12345).map(|i| (i % 251) as u8).collect();
+    assert!(original.len() > CHECKPOINT_BLOB_LIMIT_BYTES);
+    assert!(std::str::from_utf8(&original).is_err(), "test bytes must be binary");
+    std::fs::write(h.root.join("bin.dat"), &original).expect("seed binary");
 
     let record = create_file_checkpoint(
         &h.store,
         &h.root,
         h.session_id,
-        fs_scope(&["bin.dat", "small.txt"]),
-        vec!["bin.dat".to_string(), "small.txt".to_string()],
+        fs_scope(&["bin.dat"]),
+        vec!["bin.dat".to_string()],
         "agent-a",
         BTreeMap::new(),
         Vec::new(),
@@ -858,29 +918,128 @@ async fn binary_file_degrades_to_partial_with_limitation() {
     )
     .await
     .expect("checkpoint creation");
-    assert_eq!(
-        record.restore_method,
-        RestoreMethod::PreImageStore,
-        "the small text file banks bytes"
-    );
-    assert!(
-        matches!(record.status, CheckpointStatus::Partial { .. }),
-        "hash-only binary path makes the checkpoint Partial, got {:?}",
-        record.status
-    );
-    assert!(
-        record
-            .excluded
-            .iter()
-            .any(|e| { e.path.as_deref() == Some("bin.dat") && e.reason.contains("binary") }),
-        "the binary exclusion names the path, got {:?}",
-        record.excluded
-    );
+    assert!(matches!(record.status, CheckpointStatus::Active), "binary banks: no Partial");
+    assert!(record.excluded.is_empty(), "binary banks: no honesty entry");
+    assert_eq!(record.restore_method, RestoreMethod::PreImageStore);
 
-    // Mutate both paths after the checkpoint.
-    let mutated = [0xdeu8, 0xad, 0xbe, 0xef];
-    std::fs::write(h.root.join("bin.dat"), mutated).expect("mutate binary");
-    h.gated_write("w-small-2", "agent-a", "small.txt", "small-v2").await;
+    // Mutate through the GATE's byte channel (ownership + conflict checks
+    // included), then restore.
+    let mutated: Vec<u8> = original.iter().rev().cloned().collect();
+    h.gated_write_bytes("w-bin-2", "agent-a", "bin.dat", &mutated).await;
+    assert_eq!(h.disk_bytes("bin.dat"), mutated);
+
+    match restore_file_checkpoint(
+        &h.executor,
+        &h.store,
+        &h.gate,
+        None,
+        &h.session(),
+        &record.checkpoint_id.to_string(),
+        "agent-a",
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("binary restore succeeds")
+    {
+        concerto_core::checkpoint::RestoreOutcome::Restored { restored, .. } => {
+            assert_eq!(restored, vec!["bin.dat".to_string()]);
+        }
+        other => panic!("expected Restored (never Partial/Manual), got {other:?}"),
+    }
+    assert_eq!(h.disk_bytes("bin.dat"), original, "byte-exact binary restore");
+}
+
+/// (c) Multi-chunk TEXT round-trips byte-exact through chunks + reassembly:
+/// the chunked store changes nothing for text above the old per-blob cap.
+#[tokio::test]
+async fn multi_chunk_text_file_round_trips_byte_exact() {
+    let h = Harness::new().await;
+    let line = "the quick brown fox jumps over the lazy dog 0123456789\n";
+    let original: String = line.repeat(4000);
+    assert!(original.len() > CHECKPOINT_BLOB_LIMIT_BYTES);
+    h.gated_write("w-big-1", "agent-a", "novel.txt", &original).await;
+
+    let record = create_file_checkpoint(
+        &h.store,
+        &h.root,
+        h.session_id,
+        fs_scope(&["novel.txt"]),
+        vec!["novel.txt".to_string()],
+        "agent-a",
+        BTreeMap::new(),
+        Vec::new(),
+        None,
+        None,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("checkpoint creation");
+    assert!(matches!(record.status, CheckpointStatus::Active));
+
+    h.gated_write("w-big-2", "agent-a", "novel.txt", "rewritten entirely").await;
+    match restore_file_checkpoint(
+        &h.executor,
+        &h.store,
+        &h.gate,
+        None,
+        &h.session(),
+        &record.checkpoint_id.to_string(),
+        "agent-a",
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("restore succeeds")
+    {
+        concerto_core::checkpoint::RestoreOutcome::Restored { restored, .. } => {
+            assert_eq!(restored, vec!["novel.txt".to_string()]);
+        }
+        other => panic!("expected Restored, got {other:?}"),
+    }
+    assert_eq!(h.disk("novel.txt"), original, "chunk reassembly is byte-exact");
+}
+
+/// (d) A corrupt/missing chunk set restores `Partial` with the path
+/// `missing` — never a success claim, and the mutated disk content is
+/// untouched for the missing path.
+#[tokio::test]
+async fn corrupt_chunk_set_restores_partial_without_success_claim() {
+    let h = Harness::new().await;
+    let original: Vec<u8> =
+        (0..CHECKPOINT_BLOB_LIMIT_BYTES * 2 + 999).map(|i| (i % 251) as u8).collect();
+    std::fs::write(h.root.join("frag.dat"), &original).expect("seed");
+    h.gated_write("w-ok", "agent-a", "ok.txt", "ok-v1").await;
+    let record = create_file_checkpoint(
+        &h.store,
+        &h.root,
+        h.session_id,
+        fs_scope(&["frag.dat", "ok.txt"]),
+        vec!["frag.dat".to_string(), "ok.txt".to_string()],
+        "agent-a",
+        BTreeMap::new(),
+        Vec::new(),
+        None,
+        None,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("checkpoint creation");
+
+    // Corrupt the chunk set the way a crash would: drop a middle chunk.
+    let deleted: u64 = sqlx::query(
+        "DELETE FROM checkpoint_pre_image_chunks \
+         WHERE checkpoint_id = ? AND canonical_path = ? AND chunk_index = 1",
+    )
+    .bind(record.checkpoint_id.to_string())
+    .bind("frag.dat")
+    .execute(&h.pool)
+    .await
+    .expect("drop a chunk")
+    .rows_affected();
+    assert_eq!(deleted, 1);
+
+    let mutated: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    std::fs::write(h.root.join("frag.dat"), &mutated).expect("mutate");
+    h.gated_write("w-ok-2", "agent-a", "ok.txt", "ok-v2").await;
 
     match restore_file_checkpoint(
         &h.executor,
@@ -896,21 +1055,81 @@ async fn binary_file_degrades_to_partial_with_limitation() {
     .expect("partial restore surfaces, never fails")
     {
         concerto_core::checkpoint::RestoreOutcome::Partial { restored, missing, limitations } => {
-            assert_eq!(restored, vec!["small.txt".to_string()]);
-            assert_eq!(missing, vec!["bin.dat".to_string()]);
+            assert_eq!(restored, vec!["ok.txt".to_string()]);
+            assert_eq!(missing, vec!["frag.dat".to_string()]);
+            assert!(limitations.iter().any(|l| l.contains("frag.dat")));
+        }
+        other => panic!("expected Partial (never a success claim), got {other:?}"),
+    }
+    assert_eq!(h.disk_bytes("frag.dat"), mutated, "missing path is never written");
+    assert_eq!(h.disk("ok.txt"), "ok-v1", "the intact subset still restored");
+}
+
+/// (f) A tampered chunk set is caught by hash re-verification: structurally
+/// dense (so it reads `Stored`) but byte-divergent, the pre-write blake3
+/// check refuses it → `Partial`, nothing written for the path.
+#[tokio::test]
+async fn tampered_chunk_set_fails_hash_verification() {
+    let h = Harness::new().await;
+    let original: Vec<u8> =
+        (0..CHECKPOINT_BLOB_LIMIT_BYTES + 500).map(|i| (i % 251) as u8).collect();
+    std::fs::write(h.root.join("sealed.dat"), &original).expect("seed");
+    let record = create_file_checkpoint(
+        &h.store,
+        &h.root,
+        h.session_id,
+        fs_scope(&["sealed.dat"]),
+        vec!["sealed.dat".to_string()],
+        "agent-a",
+        BTreeMap::new(),
+        Vec::new(),
+        None,
+        None,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("checkpoint creation");
+
+    // Tamper preserving structure (same chunk count and sizes): flip every
+    // byte of the first chunk.
+    sqlx::query(
+        "UPDATE checkpoint_pre_image_chunks SET content = ? \
+         WHERE checkpoint_id = ? AND canonical_path = ? AND chunk_index = 0",
+    )
+    .bind(vec![0xAA_u8; CHECKPOINT_BLOB_LIMIT_BYTES])
+    .bind(record.checkpoint_id.to_string())
+    .bind("sealed.dat")
+    .execute(&h.pool)
+    .await
+    .expect("tamper a chunk");
+
+    let mutated: Vec<u8> = vec![9, 9, 9];
+    std::fs::write(h.root.join("sealed.dat"), &mutated).expect("mutate");
+
+    match restore_file_checkpoint(
+        &h.executor,
+        &h.store,
+        &h.gate,
+        None,
+        &h.session(),
+        &record.checkpoint_id.to_string(),
+        "agent-a",
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("partial restore surfaces, never fails")
+    {
+        concerto_core::checkpoint::RestoreOutcome::Partial { restored, missing, limitations } => {
+            assert!(restored.is_empty());
+            assert_eq!(missing, vec!["sealed.dat".to_string()]);
             assert!(
-                limitations.iter().any(|l| l.contains("bin.dat") && l.contains("binary")),
-                "the binary limitation names the path, got {limitations:?}"
+                limitations.iter().any(|l| l.contains("hash verification")),
+                "the limitation names the failed verification, got {limitations:?}"
             );
         }
         other => panic!("expected Partial (never a success claim), got {other:?}"),
     }
-    assert_eq!(
-        std::fs::read(h.root.join("bin.dat")).expect("binary survives on disk"),
-        mutated,
-        "no write was attempted for the binary path"
-    );
-    assert_eq!(h.disk("small.txt"), "small-v1", "the bankable subset restored");
+    assert_eq!(h.disk_bytes("sealed.dat"), mutated, "unverified bytes are never written");
 }
 
 /// TOCTOU race (locks the Phase-2 ownership re-check): Phase 1 passes while

@@ -48,6 +48,16 @@ pub(crate) fn reject_reserved_device_name(path: &Utf8Path) -> Result<(), ToolErr
 }
 
 /// A single entry in the virtual filesystem.
+///
+/// Text entries (`Original`/`Modified`/`Deleted`/`Created`) hold UTF-8
+/// content staged through [`VirtualFs::write`]; byte entries
+/// (`CreatedBytes`/`ModifiedBytes`/`DeletedBytes`) hold arbitrary bytes
+/// staged through [`VirtualFs::write_bytes`] (checkpoint byte-restore replays
+/// banked bytes verbatim, including non-UTF-8 content the text overlay
+/// cannot represent). Byte entries round-trip through commit/materialize
+/// exactly; text-oriented views (`read`, diffs, hunks) treat them the way
+/// `read_disk` treats binary files on disk — an informative placeholder,
+/// never a guess.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum VirtualFsEntry {
@@ -59,36 +69,57 @@ pub enum VirtualFsEntry {
     Deleted { path: Utf8PathBuf, original: String },
     /// File did not exist on disk and has been created in-memory.
     Created { path: Utf8PathBuf, current: String },
+    /// File did not exist on disk and has been created with arbitrary bytes.
+    CreatedBytes { path: Utf8PathBuf, current: Vec<u8> },
+    /// File exists on disk and has been modified with arbitrary bytes.
+    ModifiedBytes { path: Utf8PathBuf, original: Vec<u8>, current: Vec<u8> },
+    /// File existed on disk but has been deleted; its staged original bytes.
+    DeletedBytes { path: Utf8PathBuf, original: Vec<u8> },
 }
 
 impl VirtualFsEntry {
     /// Returns the path associated with this entry.
     pub fn path(&self) -> &Utf8Path {
         match self {
-            VirtualFsEntry::Original { path, .. } => path,
-            VirtualFsEntry::Modified { path, .. } => path,
-            VirtualFsEntry::Deleted { path, .. } => path,
-            VirtualFsEntry::Created { path, .. } => path,
+            VirtualFsEntry::Original { path, .. }
+            | VirtualFsEntry::Modified { path, .. }
+            | VirtualFsEntry::Deleted { path, .. }
+            | VirtualFsEntry::Created { path, .. }
+            | VirtualFsEntry::CreatedBytes { path, .. }
+            | VirtualFsEntry::ModifiedBytes { path, .. }
+            | VirtualFsEntry::DeletedBytes { path, .. } => path,
         }
     }
 
     /// Returns the current content of this entry, if any.
+    ///
+    /// Byte entries have no text view (`None` — use [`VirtualFs::read_bytes`]
+    /// for the bytes); see [`VirtualFs::read`] for the placeholder contract.
     pub fn current_content(&self) -> Option<&str> {
         match self {
             VirtualFsEntry::Original { content, .. } => Some(content),
             VirtualFsEntry::Modified { current, .. } => Some(current),
             VirtualFsEntry::Deleted { .. } => None,
             VirtualFsEntry::Created { current, .. } => Some(current),
+            VirtualFsEntry::CreatedBytes { .. }
+            | VirtualFsEntry::ModifiedBytes { .. }
+            | VirtualFsEntry::DeletedBytes { .. } => None,
         }
     }
 
     /// Returns the original content of this entry, if it existed on disk.
+    ///
+    /// Byte entries have no text view (`None`); the staged original bytes
+    /// are only observable through byte-oriented operations.
     pub fn original_content(&self) -> Option<&str> {
         match self {
             VirtualFsEntry::Original { content, .. } => Some(content),
             VirtualFsEntry::Modified { original, .. } => Some(original),
             VirtualFsEntry::Deleted { original, .. } => Some(original),
             VirtualFsEntry::Created { .. } => None,
+            VirtualFsEntry::CreatedBytes { .. }
+            | VirtualFsEntry::ModifiedBytes { .. }
+            | VirtualFsEntry::DeletedBytes { .. } => None,
         }
     }
 }
@@ -125,6 +156,12 @@ pub struct VirtualFs {
     entries: HashMap<Utf8PathBuf, VirtualFsEntry>,
 }
 
+/// Placeholder text for staged byte entries, mirroring [`read_disk_text`]:
+/// byte content is never guessed at as text — readers see the byte count.
+fn binary_placeholder(byte_len: usize) -> String {
+    format!("[binary file: {byte_len} bytes — contents not decoded]")
+}
+
 /// Reads a file from disk as text, tolerating binary content.
 ///
 /// Files are read as raw bytes and decoded as UTF-8: valid text comes back
@@ -136,10 +173,7 @@ fn read_disk_text(path: &std::path::Path) -> Result<String, ToolError> {
     let bytes = std::fs::read(path).map_err(ToolError::Io)?;
     match String::from_utf8(bytes) {
         Ok(text) => Ok(text),
-        Err(decoded) => Ok(format!(
-            "[binary file: {} bytes — contents not decoded]",
-            decoded.into_bytes().len()
-        )),
+        Err(decoded) => Ok(binary_placeholder(decoded.into_bytes().len())),
     }
 }
 
@@ -160,6 +194,9 @@ impl VirtualFs {
     /// Reads the content of a file at the given path.
     ///
     /// Returns an error if the file does not exist or has been deleted.
+    /// Byte entries read as the binary placeholder (same contract as
+    /// [`read_disk_text` for binary files on disk); use [`VirtualFs::read_bytes`]
+    /// for the exact bytes.
     pub fn read(&self, path: &Utf8Path) -> Result<String, ToolError> {
         reject_reserved_device_name(path)?;
         let entry = self.entries.get(path).ok_or_else(|| ToolError::ExecutionFailed {
@@ -167,13 +204,49 @@ impl VirtualFs {
         })?;
 
         match entry {
-            VirtualFsEntry::Deleted { .. } => Err(ToolError::ExecutionFailed {
-                message: format!("file has been deleted: {path}"),
-            }),
+            VirtualFsEntry::Deleted { .. } | VirtualFsEntry::DeletedBytes { .. } => {
+                Err(ToolError::ExecutionFailed {
+                    message: format!("file has been deleted: {path}"),
+                })
+            }
             VirtualFsEntry::Original { content, .. } => Ok(content.clone()),
             VirtualFsEntry::Modified { current, .. } => Ok(current.clone()),
             VirtualFsEntry::Created { current, .. } => Ok(current.clone()),
+            VirtualFsEntry::CreatedBytes { current, .. }
+            | VirtualFsEntry::ModifiedBytes { current, .. } => {
+                Ok(binary_placeholder(current.len()))
+            }
         }
+    }
+
+    /// Reads the exact staged or on-disk bytes of a file at the given path.
+    ///
+    /// Staged entries win over disk (text entries contribute their UTF-8
+    /// bytes); an unstaged path reads raw disk bytes, binary included.
+    /// Returns an error if the file does not exist or has been deleted.
+    pub fn read_bytes(&self, path: &Utf8Path) -> Result<Vec<u8>, ToolError> {
+        reject_reserved_device_name(path)?;
+        if let Some(entry) = self.entries.get(path) {
+            return match entry {
+                VirtualFsEntry::Deleted { .. } | VirtualFsEntry::DeletedBytes { .. } => {
+                    Err(ToolError::ExecutionFailed {
+                        message: format!("file has been deleted: {path}"),
+                    })
+                }
+                VirtualFsEntry::Original { content, .. } => Ok(content.as_bytes().to_vec()),
+                VirtualFsEntry::Modified { current, .. } => Ok(current.as_bytes().to_vec()),
+                VirtualFsEntry::Created { current, .. } => Ok(current.as_bytes().to_vec()),
+                VirtualFsEntry::CreatedBytes { current, .. }
+                | VirtualFsEntry::ModifiedBytes { current, .. } => Ok(current.clone()),
+            };
+        }
+        std::fs::read(path.as_std_path()).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ToolError::ExecutionFailed { message: format!("file not found: {path}") }
+            } else {
+                ToolError::Io(error)
+            }
+        })
     }
 
     /// Read staged or disk content with an allocation bound before cloning or reading.
@@ -188,7 +261,14 @@ impl VirtualFs {
                 VirtualFsEntry::Original { content, .. } => content,
                 VirtualFsEntry::Modified { current, .. }
                 | VirtualFsEntry::Created { current, .. } => current,
-                VirtualFsEntry::Deleted { .. } => {
+                VirtualFsEntry::CreatedBytes { current, .. }
+                | VirtualFsEntry::ModifiedBytes { current, .. } => {
+                    if current.len() > max_bytes {
+                        return Err(fail());
+                    }
+                    return Ok(binary_placeholder(current.len()));
+                }
+                VirtualFsEntry::Deleted { .. } | VirtualFsEntry::DeletedBytes { .. } => {
                     return Err(ToolError::ExecutionFailed {
                         message: "file is staged for deletion".into(),
                     })
@@ -213,7 +293,8 @@ impl VirtualFs {
     /// Writes content to a file at the given path.
     ///
     /// If the file exists, it becomes `Modified`. If it does not exist, it
-    /// becomes `Created`.
+    /// becomes `Created`. Model-produced text is normalized (see below);
+    /// byte replay ([`VirtualFs::write_bytes`]) stages verbatim instead.
     pub fn write(&mut self, path: &Utf8Path, content: String) -> Result<(), ToolError> {
         // Normalize typographic Unicode at the VFS write boundary (defense in
         // depth on top of the filesystem tool): any caller that stages text
@@ -223,15 +304,117 @@ impl VirtualFs {
         // already clean, so plain content is zero-allocation. Only file
         // content is normalized, never the path.
         let content = normalize_typographic(&content).into_owned();
-        let path_buf = path.to_path_buf();
+        self.stage_text(path, content)
+    }
 
-        match self.entries.get_mut(&path_buf) {
+    /// Writes arbitrary bytes to a file at the given path.
+    ///
+    /// The byte-replay boundary (checkpoint restore replays banked bytes
+    /// verbatim): unlike [`VirtualFs::write`], the bytes are staged **without**
+    /// typographic normalization, so a restore is byte-exact even for text
+    /// carrying smart quotes. UTF-8 bytes stage as text entries (reads,
+    /// diffs, and appends keep working); non-UTF-8 bytes stage as byte
+    /// entries (reads show the binary placeholder, commits write the exact
+    /// bytes). If the file exists, it becomes `Modified`/`ModifiedBytes`;
+    /// if it does not exist, it becomes `Created`/`CreatedBytes`.
+    pub fn write_bytes(&mut self, path: &Utf8Path, bytes: Vec<u8>) -> Result<(), ToolError> {
+        let path_buf = path.to_path_buf();
+        match std::str::from_utf8(&bytes) {
+            Ok(text) => self.stage_text(&path_buf, text.to_owned()),
+            Err(_) => {
+                match self.entries.get(&path_buf) {
+                    Some(VirtualFsEntry::Original { content, .. }) => {
+                        let original = content.as_bytes().to_vec();
+                        self.entries.insert(
+                            path_buf,
+                            VirtualFsEntry::ModifiedBytes {
+                                path: path.to_path_buf(),
+                                original,
+                                current: bytes,
+                            },
+                        );
+                    }
+                    Some(VirtualFsEntry::Modified { original, .. }) => {
+                        let original = original.as_bytes().to_vec();
+                        self.entries.insert(
+                            path_buf,
+                            VirtualFsEntry::ModifiedBytes {
+                                path: path.to_path_buf(),
+                                original,
+                                current: bytes,
+                            },
+                        );
+                    }
+                    Some(VirtualFsEntry::Deleted { original, .. }) => {
+                        let original = original.as_bytes().to_vec();
+                        self.entries.insert(
+                            path_buf,
+                            VirtualFsEntry::ModifiedBytes {
+                                path: path.to_path_buf(),
+                                original,
+                                current: bytes,
+                            },
+                        );
+                    }
+                    Some(VirtualFsEntry::Created { .. })
+                    | Some(VirtualFsEntry::CreatedBytes { .. })
+                    | None => {
+                        self.entries.insert(
+                            path_buf,
+                            VirtualFsEntry::CreatedBytes {
+                                path: path.to_path_buf(),
+                                current: bytes,
+                            },
+                        );
+                    }
+                    Some(VirtualFsEntry::ModifiedBytes { original, .. }) => {
+                        let original = original.clone();
+                        self.entries.insert(
+                            path_buf,
+                            VirtualFsEntry::ModifiedBytes {
+                                path: path.to_path_buf(),
+                                original,
+                                current: bytes,
+                            },
+                        );
+                    }
+                    Some(VirtualFsEntry::DeletedBytes { original, .. }) => {
+                        let original = original.clone();
+                        self.entries.insert(
+                            path_buf,
+                            VirtualFsEntry::ModifiedBytes {
+                                path: path.to_path_buf(),
+                                original,
+                                current: bytes,
+                            },
+                        );
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Stage text exactly as given, without typographic normalization.
+    ///
+    /// Shared transitions for [`VirtualFs::write`] (normalized model text)
+    /// and the [`VirtualFs::write_bytes`] UTF-8 path (verbatim byte replay
+    /// for byte-exact restore). Byte predecessors convert losslessly when
+    /// their staged bytes are UTF-8, else the standard binary placeholder
+    /// stands in as the original — text hunks can never address raw bytes,
+    /// so the placeholder is the honest original there.
+    fn stage_text(&mut self, path: &Utf8Path, content: String) -> Result<(), ToolError> {
+        let path_buf = path.to_path_buf();
+        match self.entries.get(&path_buf) {
             Some(VirtualFsEntry::Original { content: orig_content, .. }) => {
                 let original = orig_content.clone();
-                let current = content; // use the method parameter
                 self.entries.insert(
                     path_buf,
-                    VirtualFsEntry::Modified { path: path.to_path_buf(), original, current },
+                    VirtualFsEntry::Modified {
+                        path: path.to_path_buf(),
+                        original,
+                        current: content,
+                    },
                 );
             }
             Some(VirtualFsEntry::Modified { original, .. }) => {
@@ -256,27 +439,66 @@ impl VirtualFs {
                     },
                 );
             }
-            Some(VirtualFsEntry::Created { .. }) => {
+            Some(VirtualFsEntry::Created { .. }) | None => {
                 self.entries.insert(
                     path_buf,
                     VirtualFsEntry::Created { path: path.to_path_buf(), current: content },
                 );
             }
-            None => {
+            // Byte predecessors holding valid UTF-8 (checked by the caller):
+            // creations stay original-less; modifications keep a text
+            // original decoded losslessly from the staged bytes.
+            Some(VirtualFsEntry::CreatedBytes { .. }) => {
                 self.entries.insert(
                     path_buf,
                     VirtualFsEntry::Created { path: path.to_path_buf(), current: content },
+                );
+            }
+            Some(VirtualFsEntry::ModifiedBytes { original, .. }) => {
+                let original = String::from_utf8(original.clone())
+                    .unwrap_or_else(|_| binary_placeholder(original.len()));
+                self.entries.insert(
+                    path_buf,
+                    VirtualFsEntry::Modified {
+                        path: path.to_path_buf(),
+                        original,
+                        current: content,
+                    },
+                );
+            }
+            Some(VirtualFsEntry::DeletedBytes { original, .. }) => {
+                let original = String::from_utf8(original.clone())
+                    .unwrap_or_else(|_| binary_placeholder(original.len()));
+                self.entries.insert(
+                    path_buf,
+                    VirtualFsEntry::Modified {
+                        path: path.to_path_buf(),
+                        original,
+                        current: content,
+                    },
                 );
             }
         }
-
         Ok(())
     }
-
     /// Appends content to a file at the given path.
     ///
-    /// Returns an error if the file does not exist or has been deleted.
+    /// Returns an error if the file does not exist, has been deleted, or
+    /// holds staged bytes (appending text to binary would corrupt it through
+    /// the placeholder — rewrite the file instead).
     pub fn append(&mut self, path: &Utf8Path, content: &str) -> Result<(), ToolError> {
+        if matches!(
+            self.entries.get(path),
+            Some(
+                VirtualFsEntry::CreatedBytes { .. }
+                    | VirtualFsEntry::ModifiedBytes { .. }
+                    | VirtualFsEntry::DeletedBytes { .. }
+            )
+        ) {
+            return Err(ToolError::ExecutionFailed {
+                message: format!("cannot append text to binary-staged file: {path}"),
+            });
+        }
         let existing = self.read(path)?;
         // Normalize appended content as well. `write` normalizes too
         // (idempotent, zero-cost for clean input), but normalizing here keeps
@@ -292,7 +514,7 @@ impl VirtualFs {
     /// Checks if a path exists in the virtual filesystem (staged state).
     pub fn exists(&self, path: &Utf8Path) -> bool {
         match self.entries.get(path) {
-            Some(VirtualFsEntry::Deleted { .. }) => false,
+            Some(VirtualFsEntry::Deleted { .. } | VirtualFsEntry::DeletedBytes { .. }) => false,
             Some(_) => true,
             None => false,
         }
@@ -313,11 +535,34 @@ impl VirtualFs {
         let path_buf = path.to_path_buf();
 
         // Read the entry's original content (if any) then remove it.
-        let original = match self.entries.get(path) {
-            Some(VirtualFsEntry::Original { content, .. }) => Some(content.clone()),
-            Some(VirtualFsEntry::Modified { original, .. }) => Some(original.clone()),
-            Some(VirtualFsEntry::Created { .. }) => None,
-            Some(VirtualFsEntry::Deleted { .. }) => {
+        // Text and byte originals stay in their own representation: a
+        // byte-staged deletion becomes `DeletedBytes`, never a lossy decode.
+        match self.entries.get(path) {
+            Some(VirtualFsEntry::Original { content, .. }) => {
+                let original = content.clone();
+                self.entries.insert(
+                    path_buf,
+                    VirtualFsEntry::Deleted { path: path.to_path_buf(), original },
+                );
+            }
+            Some(VirtualFsEntry::Modified { original, .. }) => {
+                let original = original.clone();
+                self.entries.insert(
+                    path_buf,
+                    VirtualFsEntry::Deleted { path: path.to_path_buf(), original },
+                );
+            }
+            Some(VirtualFsEntry::ModifiedBytes { original, .. }) => {
+                let original = original.clone();
+                self.entries.insert(
+                    path_buf,
+                    VirtualFsEntry::DeletedBytes { path: path.to_path_buf(), original },
+                );
+            }
+            Some(VirtualFsEntry::Created { .. }) | Some(VirtualFsEntry::CreatedBytes { .. }) => {
+                self.entries.remove(&path_buf);
+            }
+            Some(VirtualFsEntry::Deleted { .. } | VirtualFsEntry::DeletedBytes { .. }) => {
                 return Err(ToolError::ExecutionFailed {
                     message: format!("file already deleted: {path}"),
                 });
@@ -328,18 +573,6 @@ impl VirtualFs {
                 });
             }
         };
-
-        match original {
-            Some(original) => {
-                self.entries.insert(
-                    path_buf,
-                    VirtualFsEntry::Deleted { path: path.to_path_buf(), original },
-                );
-            }
-            None => {
-                self.entries.remove(&path_buf);
-            }
-        }
 
         Ok(())
     }
@@ -399,10 +632,12 @@ impl VirtualFs {
             return match entry {
                 VirtualFsEntry::Original { .. }
                 | VirtualFsEntry::Modified { .. }
-                | VirtualFsEntry::Created { .. } => Err(ToolError::ExecutionFailed {
+                | VirtualFsEntry::Created { .. }
+                | VirtualFsEntry::CreatedBytes { .. }
+                | VirtualFsEntry::ModifiedBytes { .. } => Err(ToolError::ExecutionFailed {
                     message: format!("path is a file, not a directory: {path}"),
                 }),
-                VirtualFsEntry::Deleted { .. } => {
+                VirtualFsEntry::Deleted { .. } | VirtualFsEntry::DeletedBytes { .. } => {
                     // A deleted file at this path is fine; the directory can be created.
                     Ok(())
                 }
@@ -437,7 +672,10 @@ impl VirtualFs {
             }
             Some(VirtualFsEntry::Modified { .. })
             | Some(VirtualFsEntry::Created { .. })
-            | Some(VirtualFsEntry::Deleted { .. }) => {
+            | Some(VirtualFsEntry::Deleted { .. })
+            | Some(VirtualFsEntry::CreatedBytes { .. })
+            | Some(VirtualFsEntry::ModifiedBytes { .. })
+            | Some(VirtualFsEntry::DeletedBytes { .. }) => {
                 // Staged change present: keep it; do not overwrite it.
             }
         }
@@ -451,10 +689,11 @@ impl VirtualFs {
     ///
     /// The source is resolved through the overlay onto disk (ADR-62 §4): a
     /// staged entry wins, otherwise an existing on-disk file is loaded and
-    /// moved. Only a source absent from both is "file not found".
+    /// moved. Only a source absent from both is "file not found". Bytes
+    /// transfer byte-exact (never through the text placeholder).
     pub fn move_file(&mut self, from: &Utf8Path, to: &Utf8Path) -> Result<(), ToolError> {
         let source_key = self.resolve_transfer_source(from)?;
-        let content = self.read(&source_key)?;
+        let content = self.read_bytes(&source_key)?;
 
         if self.entries.contains_key(to) || self.exists_on_disk(to) {
             return Err(ToolError::ExecutionFailed {
@@ -463,7 +702,7 @@ impl VirtualFs {
         }
 
         self.delete(&source_key)?;
-        self.write(to, content)?;
+        self.write_bytes(to, content)?;
 
         Ok(())
     }
@@ -474,10 +713,11 @@ impl VirtualFs {
     /// already exists.
     ///
     /// Like [`VirtualFs::move_file`], the source is resolved through the
-    /// overlay onto disk so an existing unstaged file can be copied.
+    /// overlay onto disk so an existing unstaged file can be copied. Bytes
+    /// transfer byte-exact (never through the text placeholder).
     pub fn copy_file(&mut self, from: &Utf8Path, to: &Utf8Path) -> Result<(), ToolError> {
         let source_key = self.resolve_transfer_source(from)?;
-        let content = self.read(&source_key)?;
+        let content = self.read_bytes(&source_key)?;
 
         if self.entries.contains_key(to) || self.exists_on_disk(to) {
             return Err(ToolError::ExecutionFailed {
@@ -485,7 +725,7 @@ impl VirtualFs {
             });
         }
 
-        self.write(to, content)?;
+        self.write_bytes(to, content)?;
         Ok(())
     }
 
@@ -581,7 +821,18 @@ impl VirtualFs {
                             .push(CommitFailure { path: path.clone(), reason: error.to_string() }),
                     }
                 }
-                VirtualFsEntry::Deleted { path, .. } => {
+                VirtualFsEntry::ModifiedBytes { path, current, .. } => {
+                    match std::fs::write(path.as_std_path(), current.as_slice()) {
+                        Ok(()) => {
+                            applied.push(path.clone());
+                            modified += 1;
+                        }
+                        Err(error) => failed
+                            .push(CommitFailure { path: path.clone(), reason: error.to_string() }),
+                    }
+                }
+                VirtualFsEntry::Deleted { path, .. }
+                | VirtualFsEntry::DeletedBytes { path, .. } => {
                     match std::fs::remove_file(path.as_std_path()) {
                         Ok(()) => {
                             applied.push(path.clone());
@@ -612,6 +863,27 @@ impl VirtualFs {
                             .push(CommitFailure { path: path.clone(), reason: error.to_string() }),
                     }
                 }
+                VirtualFsEntry::CreatedBytes { path, current, .. } => {
+                    let parent_result = match path.parent() {
+                        Some(parent) if !parent.as_str().is_empty() => {
+                            std::fs::create_dir_all(parent.as_std_path())
+                        }
+                        _ => Ok(()),
+                    };
+                    if let Err(error) = parent_result {
+                        failed
+                            .push(CommitFailure { path: path.clone(), reason: error.to_string() });
+                        continue;
+                    }
+                    match std::fs::write(path.as_std_path(), current.as_slice()) {
+                        Ok(()) => {
+                            applied.push(path.clone());
+                            created += 1;
+                        }
+                        Err(error) => failed
+                            .push(CommitFailure { path: path.clone(), reason: error.to_string() }),
+                    }
+                }
             }
         }
 
@@ -632,7 +904,8 @@ impl VirtualFs {
 
     /// Re-evaluate all rejected change hunks from the entry's original and
     /// current content in one pass. This avoids hunk indexes shifting after an
-    /// earlier rejection.
+    /// earlier rejection. Byte entries are not hunk-diffable (text hunks
+    /// cannot address raw bytes) and refuse loudly.
     pub fn reject_hunks(
         &mut self,
         path: &Utf8Path,
@@ -647,6 +920,13 @@ impl VirtualFs {
             VirtualFsEntry::Modified { original, .. } => original.clone(),
             VirtualFsEntry::Deleted { original, .. } => original.clone(),
             VirtualFsEntry::Created { .. } => String::new(),
+            VirtualFsEntry::CreatedBytes { .. }
+            | VirtualFsEntry::ModifiedBytes { .. }
+            | VirtualFsEntry::DeletedBytes { .. } => {
+                return Err(ToolError::ExecutionFailed {
+                    message: format!("binary-staged file is not hunk-diffable: {path}"),
+                });
+            }
         };
 
         let current = match entry {
@@ -654,6 +934,13 @@ impl VirtualFs {
             VirtualFsEntry::Modified { current, .. } => current.clone(),
             VirtualFsEntry::Deleted { .. } => String::new(),
             VirtualFsEntry::Created { current, .. } => current.clone(),
+            VirtualFsEntry::CreatedBytes { .. }
+            | VirtualFsEntry::ModifiedBytes { .. }
+            | VirtualFsEntry::DeletedBytes { .. } => {
+                return Err(ToolError::ExecutionFailed {
+                    message: format!("binary-staged file is not hunk-diffable: {path}"),
+                });
+            }
         };
         let rejected = hunk_indices.iter().copied().collect::<HashSet<_>>();
         let new_content = crate::diff::reject_change_hunks(&original, &current, &rejected)?;
@@ -723,13 +1010,23 @@ impl VirtualFs {
                     }
                     std::fs::write(path.as_std_path(), current).map_err(ToolError::Io)?;
                 }
-                Some(VirtualFsEntry::Deleted { .. }) | None => {
-                    match std::fs::remove_file(path.as_std_path()) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(ToolError::Io(error)),
+                Some(VirtualFsEntry::ModifiedBytes { current, .. })
+                | Some(VirtualFsEntry::CreatedBytes { current, .. }) => {
+                    if let Some(parent) = path.parent() {
+                        if !parent.as_str().is_empty() {
+                            std::fs::create_dir_all(parent.as_std_path()).map_err(ToolError::Io)?;
+                        }
                     }
+                    std::fs::write(path.as_std_path(), current.as_slice())
+                        .map_err(ToolError::Io)?;
                 }
+                Some(VirtualFsEntry::Deleted { .. })
+                | Some(VirtualFsEntry::DeletedBytes { .. })
+                | None => match std::fs::remove_file(path.as_std_path()) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(ToolError::Io(error)),
+                },
             }
         }
         Ok(())
@@ -953,7 +1250,10 @@ fn preflight_paths(
             });
             continue;
         }
-        let is_deletion = matches!(entries.get(path), Some(VirtualFsEntry::Deleted { .. }) | None);
+        let is_deletion = matches!(
+            entries.get(path),
+            Some(VirtualFsEntry::Deleted { .. } | VirtualFsEntry::DeletedBytes { .. }) | None
+        );
         if let Some(reason) = disk_state_failure(path, is_deletion) {
             failures.push(CommitFailure { path: path.clone(), reason });
         }
@@ -1015,6 +1315,112 @@ mod tests {
         let mut fs = VirtualFs::new();
         fs.write(Utf8Path::new("test.txt"), "prose \u{2014} keep".to_string()).unwrap();
         assert_eq!(fs.read(Utf8Path::new("test.txt")).unwrap(), "prose \u{2014} keep");
+    }
+
+    #[test]
+    fn write_bytes_binary_stages_bytes_and_reads_placeholder() {
+        let mut fs = VirtualFs::new();
+        let path = Utf8Path::new("bin.dat");
+        let bytes = vec![0x00, 0xFF, 0xFE, 0x01, 0x02];
+        fs.write_bytes(path, bytes.clone()).unwrap();
+        assert!(matches!(fs.get(path), Some(VirtualFsEntry::CreatedBytes { .. })));
+        assert_eq!(fs.read(path).unwrap(), binary_placeholder(bytes.len()));
+        assert_eq!(fs.read_bytes(path).unwrap(), bytes);
+        // No text view for byte entries.
+        assert_eq!(fs.get(path).unwrap().current_content(), None);
+        assert_eq!(fs.get(path).unwrap().original_content(), None);
+    }
+
+    #[test]
+    fn write_bytes_utf8_stages_verbatim_text() {
+        // Byte replay skips typographic normalization: banked smart quotes
+        // stage exactly (byte-exact restore), unlike model-produced writes.
+        let mut fs = VirtualFs::new();
+        let path = Utf8Path::new("quotes.txt");
+        let text = "say \u{201C}hi\u{201D}";
+        fs.write_bytes(path, text.as_bytes().to_vec()).unwrap();
+        assert!(matches!(fs.get(path), Some(VirtualFsEntry::Created { .. })));
+        assert_eq!(fs.read(path).unwrap(), text);
+        assert_eq!(fs.read_bytes(path).unwrap(), text.as_bytes());
+    }
+
+    #[test]
+    fn write_bytes_over_existing_file_stages_modified_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("f.bin")).unwrap();
+        std::fs::write(&path, b"old-text").unwrap();
+        let mut fs = VirtualFs::new();
+        fs.read_disk(&path).unwrap();
+        let bytes = vec![0xFF, 0x00, 0x01];
+        fs.write_bytes(&path, bytes.clone()).unwrap();
+        assert!(matches!(fs.get(&path), Some(VirtualFsEntry::ModifiedBytes { .. })));
+        // Commit round-trips the exact bytes to disk.
+        fs.commit_to_disk().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn delete_of_binary_staged_file_keeps_byte_original() {
+        // Fresh binary creations delete to "removed" (no original to keep,
+        // mirroring text `Created`).
+        let mut fs = VirtualFs::new();
+        let fresh = Utf8Path::new("fresh.bin");
+        fs.write_bytes(fresh, vec![0xFF, 0x00]).unwrap();
+        fs.delete(fresh).unwrap();
+        assert!(fs.get(fresh).is_none());
+
+        // A binary modification stages `DeletedBytes` with the exact
+        // original bytes (never a lossy decode).
+        let dir = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("f.bin")).unwrap();
+        std::fs::write(&path, b"old-text").unwrap();
+        fs.read_disk(&path).unwrap();
+        fs.write_bytes(&path, vec![0xFF, 0x00]).unwrap();
+        fs.delete(&path).unwrap();
+        assert!(!fs.exists(&path), "deleted paths do not exist");
+        assert!(matches!(fs.get(&path), Some(VirtualFsEntry::DeletedBytes { .. })));
+        assert!(fs.read(&path).is_err());
+        assert!(fs.read_bytes(&path).is_err());
+        // A text write over the byte deletion recovers with an honest
+        // (lossless-here) original.
+        fs.write(&path, "recovered".to_string()).unwrap();
+        assert_eq!(fs.read(&path).unwrap(), "recovered");
+    }
+
+    #[test]
+    fn move_and_copy_transfer_binary_byte_exact() {
+        let mut fs = VirtualFs::new();
+        let src = Utf8Path::new("a.bin");
+        let bytes = vec![0x00, 0xFF, 0x01, 0x02, 0x03];
+        fs.write_bytes(src, bytes.clone()).unwrap();
+        let dst = Utf8Path::new("b.bin");
+        fs.copy_file(src, dst).unwrap();
+        assert_eq!(fs.read_bytes(dst).unwrap(), bytes);
+        let moved = Utf8Path::new("c.bin");
+        fs.move_file(src, moved).unwrap();
+        assert_eq!(fs.read_bytes(moved).unwrap(), bytes);
+    }
+
+    #[test]
+    fn append_and_hunk_reject_refuse_binary_staged_files() {
+        let mut fs = VirtualFs::new();
+        let path = Utf8Path::new("bin.dat");
+        fs.write_bytes(path, vec![0xFF, 0x00]).unwrap();
+        assert!(fs.append(path, "text").is_err(), "append must not corrupt binary");
+        assert!(fs.reject_hunks(path, &[0]).is_err(), "hunks cannot address bytes");
+        // The bytes are untouched by the refusals.
+        assert_eq!(fs.read_bytes(path).unwrap(), vec![0xFF, 0x00]);
+    }
+
+    #[test]
+    fn materialize_paths_writes_byte_entries_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("m.bin")).unwrap();
+        let mut fs = VirtualFs::new();
+        let bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        fs.write_bytes(&path, bytes.clone()).unwrap();
+        fs.materialize_paths(std::slice::from_ref(&path)).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 
     #[test]

@@ -15,11 +15,12 @@
 //! * [`GateOwnershipOracle`] adapts the gate's table to the core oracle trait;
 //!   [`UndoStashRestorer`] adapts the git-stash manager to the core stash trait.
 //!
-//! Partial-milestone honesty: binary and over-budget content is hash-only and
-//! surfaces `Manual` + [`PARTIAL_SCOPE_LIMITATION`](concerto_core::checkpoint::PARTIAL_SCOPE_LIMITATION);
+//! Partial-milestone honesty: over-budget content is hash-only and surfaces
+//! `Manual` + [`PARTIAL_SCOPE_LIMITATION`](concerto_core::checkpoint::PARTIAL_SCOPE_LIMITATION);
 //! shell/network/database/process effects are caller-declared exclusions and
-//! are never reversed. The streaming/block-based store completing
-//! binary/large-file restore is deferred.
+//! are never reversed. Symlink/permission/xattr metadata is not captured.
+//! Binary files within the per-checkpoint total budget restore byte-exact
+//! through the chunked pre-image store.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -27,7 +28,7 @@ use std::sync::{Arc, Mutex};
 
 use concerto_core::checkpoint::{
     CheckpointExclusion, CheckpointRecord, CheckpointResource, CheckpointScope, CheckpointStatus,
-    RestoreMethod, CHECKPOINT_BLOB_LIMIT_BYTES, PARTIAL_SCOPE_LIMITATION,
+    RestoreMethod, CHECKPOINT_TOTAL_LIMIT_BYTES, PARTIAL_SCOPE_LIMITATION,
 };
 use concerto_core::ids::Ulid;
 use concerto_core::types::SessionContext;
@@ -148,10 +149,10 @@ impl concerto_core::checkpoint::StashRestorer for RefusingStashRestorer {
 /// + blobs.
 ///
 /// * `paths` are canonical project-relative paths. Present files snapshot
-///   their bytes (banked when small UTF-8 text, hash-only + excluded when
-///   oversized/binary); absent files anchor as exact deletions; unreadable
-///   files degrade to hash-only + excluded (fail-soft per path — creation
-///   continues).
+///   their bytes (banked — binary included — when within the per-checkpoint
+///   total budget, hash-only + excluded when over it); absent files anchor
+///   as exact deletions; unreadable files degrade to hash-only + excluded
+///   (fail-soft per path — creation continues).
 /// * `extra_excluded` carries caller-declared non-file effects (shell side
 ///   effects, network, database, process) — always excluded, never reversed.
 ///   **Contract:** the capture loop covers filesystem paths only and never
@@ -201,6 +202,11 @@ pub async fn create_file_checkpoint(
     let mut excluded: Vec<CheckpointExclusion> = Vec::new();
     let mut blobs: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let mut limitations: Vec<String> = Vec::new();
+    // Running banked total: the per-checkpoint budget half of the rule (the
+    // per-path half lives in `plan_capture`). First-fit with honest
+    // downgrade — a file that would overflow the total degrades to
+    // hash-only + excluded, never a silent skip.
+    let mut banked_total: usize = 0;
 
     for path in &ordered {
         check_cancel(cancel)?;
@@ -246,15 +252,45 @@ pub async fn create_file_checkpoint(
         };
         let (planned_included, planned_excluded) =
             plan_checkpoint_resource(&checkpoint_id, path, pre_hash, post_bytes.as_deref());
-        if let Some(resource) = planned_included {
+        if let Some(mut resource) = planned_included {
             if resource.byte_ref.is_some() {
-                // Planned bytes exist exactly when the snapshot is bankable;
-                // the lookup cannot miss (same `post_bytes` just planned).
-                if let Some(bytes) = post_bytes {
-                    if bytes.len() <= CHECKPOINT_BLOB_LIMIT_BYTES
-                        && std::str::from_utf8(&bytes).is_ok()
+                // Per-path bankable; apply the running-total half.
+                match post_bytes {
+                    Some(bytes)
+                        if banked_total.saturating_add(bytes.len())
+                            <= CHECKPOINT_TOTAL_LIMIT_BYTES =>
                     {
+                        banked_total = banked_total.saturating_add(bytes.len());
                         blobs.insert(path.clone(), bytes);
+                    }
+                    Some(bytes) => {
+                        // Overflow: honest downgrade to hash-only (the hash
+                        // stays as the drift verifier; the exclusion names
+                        // the real ceiling).
+                        let size = bytes.len();
+                        resource.post_hash = Some(blake3::hash(&bytes).to_hex().to_string());
+                        resource.size_bytes = Some(size as u64);
+                        resource.byte_ref = None;
+                        excluded.push(CheckpointExclusion {
+                            class: concerto_core::checkpoint::CheckpointExclusionClass::OversizedFile,
+                            path: Some(path.clone()),
+                            reason: format!(
+                                "{path}: {banked_total} bytes already banked + {size} bytes exceeds CHECKPOINT_TOTAL_LIMIT_BYTES ({CHECKPOINT_TOTAL_LIMIT_BYTES}): hash-only; byte restore unavailable above the per-checkpoint total budget"
+                            ),
+                        });
+                    }
+                    None => {
+                        // Unreachable by construction (`plan_capture` banks
+                        // only for present files); defend by downgrading
+                        // rather than claiming bytes that do not exist.
+                        resource.byte_ref = None;
+                        excluded.push(CheckpointExclusion {
+                            class: concerto_core::checkpoint::CheckpointExclusionClass::OversizedFile,
+                            path: Some(path.clone()),
+                            reason: format!(
+                                "{path}: planned bytes vanished before snapshotting: hash-only; byte restore unavailable"
+                            ),
+                        });
                     }
                 }
             }
@@ -280,7 +316,9 @@ pub async fn create_file_checkpoint(
     let has_unrestorable_bytes = excluded.iter().any(|e| {
         matches!(e.class, concerto_core::checkpoint::CheckpointExclusionClass::OversizedFile)
     });
-    if has_unrestorable_bytes && !limitations.iter().any(|l| l.contains("64 KiB")) {
+    if has_unrestorable_bytes
+        && !limitations.iter().any(|l| l.contains("CHECKPOINT_TOTAL_LIMIT_BYTES"))
+    {
         limitations.push(PARTIAL_SCOPE_LIMITATION.to_string());
     }
 

@@ -112,6 +112,14 @@ chrono-tz = "0.10"
 # ---- Input hashing for audit log (Phase 2) ----
 blake3 = "1"
 
+# ---- Byte-oriented checkpoint restore (chunked pre-image store) ----
+# Already transitive in the graph at 0.22.1 (see Cargo.lock), so promoting it
+# to a direct dependency adds no new package. Carries checkpoint/restore
+# bytes through the JSON tool-call boundary (`content_b64` on the filesystem
+# write input): JSON strings are Unicode, so arbitrary bytes ride base64 and
+# are decoded at the tool boundary — never normalized, never text-guessed.
+base64 = "0.22"
+
 # ---- Secret material held in RAM (threat model §6 gap #9) ----
 # Already a transitive dependency of the credential stack (keyring, rustls,
 # aws-lc-rs) at 1.9.0 in Cargo.lock, so promoting it to a direct dependency

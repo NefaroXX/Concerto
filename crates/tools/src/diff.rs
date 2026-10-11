@@ -313,7 +313,9 @@ pub fn compute_all_virtual_diffs(
 ///
 /// Iterates over every non-Original entry, converts it to a
 /// [`VirtualFsEntryRef`], and delegates to [`compute_all_virtual_diffs`].
-/// Entries whose content has not actually changed produce no diff.
+/// Entries whose content has not actually changed produce no diff. Byte
+/// entries produce no diff either (text hunks cannot address raw bytes —
+/// the review surfaces treat a diff-less changed path as a file operation).
 ///
 /// Secret-pattern line content is redacted at compute time by
 /// [`compute_diff`], so every consumer of these results (CLI and desktop
@@ -336,7 +338,10 @@ pub fn compute_diffs_from_virtual_fs(vfs: &crate::virtual_fs::VirtualFs) -> Vec<
                 VirtualFsEntry::Created { current, .. } => {
                     Some((path.to_path_buf(), VirtualFsEntryRef::Created { current }))
                 }
-                VirtualFsEntry::Original { .. } => None,
+                VirtualFsEntry::Original { .. }
+                | VirtualFsEntry::CreatedBytes { .. }
+                | VirtualFsEntry::ModifiedBytes { .. }
+                | VirtualFsEntry::DeletedBytes { .. } => None,
             }
         })
         .collect();
