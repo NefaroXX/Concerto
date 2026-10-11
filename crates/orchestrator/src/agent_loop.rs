@@ -159,6 +159,32 @@ pub struct AgentLoop {
     /// `[agent] strict_verification_gate` via `run_shared_agent`
     /// (`runtime_runner.rs`); the multi-agent Coordinator path never sets it.
     strict_verification_gate: bool,
+
+    /// ADR-82 H04 run-scoped freshness clock (consulted only when
+    /// [`Self::strict_verification_gate`] is armed; untouched otherwise, so
+    /// the default-off path keeps byte-identical behavior at zero cost).
+    ///
+    /// `verification_base_generation` is the content-addressed workspace
+    /// generation captured once per top-level [`Self::run`] from the existing
+    /// ADR-65 §2 source (`workspace_snapshot::capture_workspace_snapshot` +
+    /// `generation_for`); `verification_epoch` counts the run's audited
+    /// file-affecting mutations (the existing audited-write path,
+    /// [`Self::record_tool_fact`]). The current generation stamped on checks
+    /// and compared at the gate is `{base}#{epoch}`: any executed mutation
+    /// after a check advances the epoch and stales the check, which is the
+    /// run-scoped projection of ADR-65 F-SUPERSEDE / F-WORKSPACE-SUPERSEDE /
+    /// F-GENERATION over the existing invalidation data — not a second
+    /// invalidation mechanism. A freshness evaluation is a fact evaluation,
+    /// never a dispatch rule (ADR-65 authority boundary, ADR-71 intact).
+    verification_base_generation: String,
+    /// See [`Self::verification_base_generation`]: audited mutations this run.
+    verification_epoch: u64,
+    /// `(tool-reported path spelling, whiteboard event id)` of every executed
+    /// file-affecting write this run, in order. The sweep stamps the matching
+    /// subset as a record's `evidence_ids`, so every cited id references an
+    /// existing whiteboard event (ADR-65 §1). Empty when the evidence writer
+    /// is disabled or no write ran — records then stay display-grade.
+    run_write_evidence: Vec<(String, String)>,
 }
 
 /// Maximum number of auto-continuation rounds before escalating a run to a
@@ -278,19 +304,149 @@ fn latest_assistant_text(messages: &[Message]) -> Option<&str> {
         .map(|message| message.content.as_str())
 }
 
-/// ADR-82 slice 4: does the run-scoped verification ledger contain a typed
-/// `Passed` record?
-///
-/// Only `outcome == Some(Passed)` counts. Legacy records (`outcome: None`)
-/// never count — they are display data, not evidence (§3: a missing `outcome`
-/// never counts as passing evidence). Slice 4 is deliberately this coarse
-/// outcome check; demanding *fresh* passing evidence (the §3 freshness basis
-/// feeding the gate) is the planned H04 completing step, not this slice.
-fn has_passed_verification(output: &AgentOutput) -> bool {
-    output
-        .verification
-        .iter()
-        .any(|record| matches!(record.outcome, Some(VerificationOutcome::Passed)))
+/// ADR-82 H04: why one typed-`Passed` record does not count as fresh passing
+/// evidence. Each cause cites the rule that fires it; the gate reports these
+/// per record (bounded) so an operator can tell "your check is out of date"
+/// from "you never ran it".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FreshnessFailure {
+    /// The record is a typed `Passed` but its R2 freshness set is incomplete
+    /// (missing verifier/scope/generation/fingerprint/`checked_at`/evidence
+    /// — e.g. a pre-H04 sweep record whose `generation`/`evidence_ids` were
+    /// never wired). ADR-82 §3 R2: any axis missing degrades to display-grade.
+    MissingAxes,
+    /// The record's generation base differs from the run's current base (or
+    /// no current generation is known): the workspace moved on as a whole.
+    /// ADR-65 F-GENERATION (conservative reset) / A-GENERATION-ROW.
+    Generation,
+    /// Same generation base, but the run's mutation epoch advanced past the
+    /// check: a relevant audited mutation landed after the check ran. ADR-65
+    /// F-SUPERSEDE / F-WORKSPACE-SUPERSEDE as projected by the run clock.
+    Superseded,
+    /// The checked bytes on disk no longer hash to the recorded fingerprint:
+    /// the file changed (or vanished) outside the audited write path — the
+    /// documented known limit of the F-supersede arms, closed here by the
+    /// ADR-65 F3-style live re-stat over the existing fingerprint axis.
+    Fingerprint,
+}
+
+impl FreshnessFailure {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingAxes => "missing-axes",
+            Self::Generation => "generation",
+            Self::Superseded => "superseded",
+            Self::Fingerprint => "fingerprint",
+        }
+    }
+}
+
+/// ADR-82 H04 freshness mode of a gated ledger: the `Blocked` reason carries
+/// exactly one of these so the failure reads as "stale" (a check ran but is
+/// out of date), "absent" (no check ever ran), or "not-passed" (checks ran
+/// and none passed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateFreshness {
+    Absent,
+    NotPassed,
+    Stale,
+}
+
+impl GateFreshness {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::NotPassed => "not-passed",
+            Self::Stale => "stale",
+        }
+    }
+}
+
+/// One stale typed-`Passed` record as reported in the `Blocked` reason
+/// (bounded by [`STRICT_GATE_REASON_DETAIL_LIMIT`]).
+#[derive(Debug, Clone)]
+struct StaleRecord {
+    path: String,
+    command: String,
+    cause: FreshnessFailure,
+}
+
+/// Split an H04 run generation (`{base}#{epoch}`) into its base and epoch.
+/// `None` for generations no H04 clock stamped (legacy or foreign shapes) —
+/// those can never equal a current generation and report as `Generation`.
+fn split_run_generation(generation: &str) -> Option<(&str, u64)> {
+    let (base, epoch) = generation.rsplit_once('#')?;
+    Some((base, epoch.parse::<u64>().ok()?))
+}
+
+/// Resolve a verification record's path exactly the way the sweep hashed it
+/// ([`sweep_record`]): absolute spellings stand alone, relative spellings
+/// resolve under the loop's project root. Sharing this helper keeps the
+/// stamp-time hash and the gate-time re-stat on the same bytes.
+fn resolve_verification_path(
+    project_root: &std::path::Path,
+    path: &Utf8PathBuf,
+) -> std::path::PathBuf {
+    if path.is_absolute() {
+        std::path::PathBuf::from(path.as_str())
+    } else {
+        project_root.join(path.as_std_path())
+    }
+}
+
+/// ADR-82 H04 run-scoped freshness context stamped onto verification records
+/// at check time (the axis wiring slice 3 deferred): the current run
+/// generation plus the run's audited write evidence. A default (empty) stamp
+/// leaves records exactly as the pre-H04 sweep produced them (display-grade).
+#[derive(Debug, Clone, Default)]
+struct VerificationStamp {
+    generation: String,
+    /// `(tool-reported path spelling, whiteboard event id)` of every executed
+    /// file-affecting write this run, in order.
+    writes: Vec<(String, String)>,
+}
+
+impl VerificationStamp {
+    /// Backing evidence for one checked path: the whiteboard event ids of
+    /// this run's audited writes whose canonical project-relative key matches
+    /// the checked path (ADR-65 F5d key space — the same keys the derived
+    /// `resource_facts` rows live under). Every returned id references an
+    /// existing whiteboard event (ADR-65 §1); unmatchable or out-of-root paths
+    /// yield no evidence, keeping the record display-grade.
+    fn evidence_for(
+        &self,
+        project_root: &std::path::Path,
+        record_path: &Utf8PathBuf,
+    ) -> Vec<String> {
+        let Some(canonical) =
+            crate::tool_facts::canonical_project_path(project_root, record_path.as_str())
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (raw, event_id) in &self.writes {
+            if crate::tool_facts::canonical_project_path(project_root, raw).as_deref()
+                == Some(canonical.as_str())
+                && !out.iter().any(|seen| seen == event_id)
+            {
+                out.push(event_id.clone());
+            }
+        }
+        out
+    }
+
+    /// Backing evidence for a workspace-scope check (the eval harness): every
+    /// audited write is relevant to the workspace as a whole
+    /// (F-WORKSPACE-SUPERSEDE), so the record cites all of them, deduplicated.
+    fn workspace_evidence(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (_, event_id) in &self.writes {
+            if !out.iter().any(|seen| seen == event_id) {
+                out.push(event_id.clone());
+            }
+        }
+        out
+    }
 }
 
 /// Machine-checkable ledger label for one verification record: the typed
@@ -310,14 +466,23 @@ fn verification_ledger_label(record: &VerificationSummary) -> &'static str {
 const STRICT_GATE_REASON_DETAIL_LIMIT: usize = 8;
 
 /// Build the machine-checkable `Blocked` reason for the strict verification
-/// gate (ADR-82 slice 4, R5).
+/// gate (ADR-82 slice 4, R5; freshness modes by H04).
 ///
 /// "Task finished" (`task_finished`) and "required verification passed"
-/// (`verification_passed=false` — the caller only builds this when no typed
+/// (`verification_passed=false` — the caller only builds this when no *fresh*
 /// pass exists) are reported as distinct states, followed by the structured
 /// ledger state: the record count plus per-outcome counts, with the first few
-/// `path:command:outcome` entries itemized.
-fn strict_gate_blocked_reason(output: &AgentOutput, task_finished: bool) -> String {
+/// `path:command:outcome` entries itemized. H04 adds the `freshness=` mode
+/// (`absent` = no check ever ran, `not-passed` = checks ran and none passed,
+/// `stale` = a check passed but is out of date) plus the bounded
+/// `stale_detail=[path:command:cause; ...]` per-record causes, so an operator
+/// can tell "your check is out of date" from "you never ran it".
+fn strict_gate_blocked_reason(
+    output: &AgentOutput,
+    task_finished: bool,
+    freshness: GateFreshness,
+    stale: &[StaleRecord],
+) -> String {
     let mut counts: std::collections::BTreeMap<&'static str, usize> =
         std::collections::BTreeMap::new();
     for record in &output.verification {
@@ -331,8 +496,9 @@ fn strict_gate_blocked_reason(output: &AgentOutput, task_finished: bool) -> Stri
     let mut reason = format!(
         "strict_verification_gate: action-required task ended without required verification \
          (task_finished={task_finished} verification_passed=false require_verification=true \
-         records={} outcomes=[{outcomes}])",
+         records={} outcomes=[{outcomes}] freshness={})",
         output.verification.len(),
+        freshness.as_str(),
     );
     let detail: Vec<String> = output
         .verification
@@ -345,6 +511,18 @@ fn strict_gate_blocked_reason(output: &AgentOutput, task_finished: bool) -> Stri
     if !detail.is_empty() {
         reason.push_str(&format!(" detail=[{}]", detail.join("; ")));
         let rest = output.verification.len().saturating_sub(detail.len());
+        if rest > 0 {
+            reason.push_str(&format!(" +{rest} more"));
+        }
+    }
+    if !stale.is_empty() {
+        let causes: Vec<String> = stale
+            .iter()
+            .take(STRICT_GATE_REASON_DETAIL_LIMIT)
+            .map(|stale| format!("{}:{}:{}", stale.path, stale.command, stale.cause.as_str()))
+            .collect();
+        reason.push_str(&format!(" stale_detail=[{}]", causes.join("; ")));
+        let rest = stale.len().saturating_sub(causes.len());
         if rest > 0 {
             reason.push_str(&format!(" +{rest} more"));
         }
@@ -434,6 +612,9 @@ impl AgentLoop {
             pending_approval: None,
             degraded: AtomicBool::new(false),
             strict_verification_gate: false,
+            verification_base_generation: String::new(),
+            verification_epoch: 0,
+            run_write_evidence: Vec::new(),
         }
     }
 
@@ -522,6 +703,16 @@ impl AgentLoop {
         self.deterministic_failures.clear();
         self.pending_approval = None;
         self.degraded.store(false, Ordering::Relaxed);
+        // ADR-82 H04: reset the run freshness clock every run (never leaks
+        // across runs or continuation rounds) and arm it when the strict gate
+        // is armed. Gate off: the clock stays disarmed — no walk, no state,
+        // byte-identical behavior.
+        self.verification_base_generation.clear();
+        self.verification_epoch = 0;
+        self.run_write_evidence.clear();
+        if self.strict_verification_gate {
+            self.arm_verification_clock(cancel.clone()).await;
+        }
         self.persist_run_start(&task, cancel.clone()).await;
 
         let mut history: Vec<Message> = self.initial_messages.clone();
@@ -1151,7 +1342,9 @@ impl AgentLoop {
             self.run_evaluation(&files_modified, cancel.clone()).await;
 
         // Lightweight verification for file changes
-        verification = verify_file_changes(&files_modified, &self.project_root).await;
+        verification =
+            verify_file_changes(&files_modified, &self.project_root, &self.verification_stamp())
+                .await;
         verification.extend(eval_verification);
 
         // Phase 9: Build agent output
@@ -1735,6 +1928,13 @@ impl AgentLoop {
     /// only for an actually-finished harness run, so the existing
     /// `eval_result.is_none()` check and the completion downgrade behave
     /// identically — no run-outcome change.
+    ///
+    /// ADR-82 H04: harness records carry the run's current generation and the
+    /// workspace-scope write evidence (every audited write is relevant to the
+    /// workspace as a whole, F-WORKSPACE-SUPERSEDE). The content-fingerprint
+    /// axis stays empty with reason — a workspace check has no single checked
+    /// file — so harness records remain display-grade and the file-scope sweep
+    /// is the satisfiable freshness path.
     async fn run_evaluation(
         &self,
         files_modified: &[Utf8PathBuf],
@@ -1743,15 +1943,25 @@ impl AgentLoop {
         let eval_dir = EvalEngine::resolve_manifest_root(&self.project_root, files_modified);
         let eval_path = Utf8PathBuf::from_path_buf(eval_dir.clone())
             .unwrap_or_else(|_| Utf8PathBuf::from("eval"));
+        let stamp = self.verification_stamp();
+        let stamp_harness = |mut record: VerificationSummary| {
+            record.generation = stamp.generation.clone();
+            record.evidence_ids = stamp.workspace_evidence();
+            record
+        };
         match self.eval.run_scoped_in_dir(&eval_dir, files_modified, cancel).await {
             Ok(result) => {
-                let record = eval_result_record(&eval_path, &result);
+                let record = stamp_harness(eval_result_record(&eval_path, &result));
                 (Some(result), vec![record])
             }
-            Err(concerto_eval::EvalError::Cancelled) => {
-                (None, vec![eval_error_record(&eval_path, &concerto_eval::EvalError::Cancelled)])
-            }
-            Err(error) => (None, vec![eval_error_record(&eval_path, &error)]),
+            Err(concerto_eval::EvalError::Cancelled) => (
+                None,
+                vec![stamp_harness(eval_error_record(
+                    &eval_path,
+                    &concerto_eval::EvalError::Cancelled,
+                ))],
+            ),
+            Err(error) => (None, vec![stamp_harness(eval_error_record(&eval_path, &error))]),
         }
     }
 
@@ -1796,16 +2006,18 @@ impl AgentLoop {
     /// return. Returns `Ok(Some(exit))` for non-Done exits, `Ok(None)` when the
     /// caller should proceed to `finalize_completion`.
     ///
-    /// ADR-82 slice 4 (R5): with [`Self::strict_verification_gate`] armed, an
-    /// `ActionRequired { require_verification: true }` task whose run-scoped
-    /// verification ledger holds no typed `Passed` record exits `Blocked`
-    /// here instead of warn-and-complete. "Task finished" (`completed`) and
-    /// "required verification passed" (ledger state) are reported as distinct
-    /// states in the `Blocked` reason; the reason carries the machine-checkable
+    /// ADR-82 slice 4 (R5) as completed by H04: with
+    /// [`Self::strict_verification_gate`] armed, an `ActionRequired {
+    /// require_verification: true }` task whose run-scoped verification ledger
+    /// holds no *fresh-passing* record exits `Blocked` here instead of
+    /// warn-and-complete. "Task finished" (`completed`) and "required
+    /// verification passed" (ledger state) are reported as distinct states in
+    /// the `Blocked` reason; the reason carries the machine-checkable
     /// `strict_verification_gate`, `task_finished=`, `verification_passed=`,
-    /// `require_verification=`, `records=`, and per-record `outcomes=[..]`
-    /// ledger tokens. Flag off (the default) preserves the warn-and-continue
-    /// below byte-identically.
+    /// `require_verification=`, `records=`, per-record `outcomes=[..]`,
+    /// `freshness=`, and (for stale passes) `stale_detail=[..]` ledger tokens.
+    /// Flag off (the default) preserves the warn-and-continue below
+    /// byte-identically.
     #[allow(clippy::too_many_arguments)]
     fn decide_exit(
         &mut self,
@@ -1855,22 +2067,30 @@ impl AgentLoop {
                     "action-required task completed without verification result"
                 );
             }
-            // ADR-82 slice 4 (opt-in only): the warn above is preserved
-            // verbatim on every path, flag on or off. With the gate armed, an
-            // unmet `require_verification` contract additionally refuses the
-            // completion claim: no typed `Passed` record in the run-scoped
-            // ledger means the required verification never passed, so the run
-            // exits `Blocked` with the ledger state in the reason instead of
-            // proceeding to `finalize_completion`. Flag off (default) falls
-            // through exactly as before.
-            if require_verification
-                && self.strict_verification_gate
-                && !has_passed_verification(output)
-            {
-                return Ok(Some(AgentRunExit::Blocked {
-                    reason: strict_gate_blocked_reason(output, completed),
-                    partial: output.clone(),
-                }));
+            // ADR-82 slice 4 (opt-in only) as completed by H04: the warn above
+            // is preserved verbatim on every path, flag on or off. With the
+            // gate armed, an unmet `require_verification` contract additionally
+            // refuses the completion claim: no *fresh-passing* record in the
+            // run-scoped ledger means the required verification never passed
+            // on the current workspace state, so the run exits `Blocked` with
+            // the ledger state in the reason instead of proceeding to
+            // `finalize_completion`. A stale typed pass (superseded check,
+            // moved generation, changed bytes) does NOT satisfy the contract.
+            // Flag off (default) falls through exactly as before.
+            if require_verification && self.strict_verification_gate {
+                let ledger = self.evaluate_gate_ledger(output);
+                if ledger.fresh == 0 {
+                    let freshness = ledger.freshness(output.verification.len());
+                    return Ok(Some(AgentRunExit::Blocked {
+                        reason: strict_gate_blocked_reason(
+                            output,
+                            completed,
+                            freshness,
+                            &ledger.stale,
+                        ),
+                        partial: output.clone(),
+                    }));
+                }
             }
         }
 
@@ -3188,9 +3408,21 @@ impl AgentLoop {
     /// stays the raw pass flag the loop already decided on. ADR-82 slice 2:
     /// a failed execution additionally carries its typed failure envelope
     /// (`None` for successes and refusals without one).
+    ///
+    /// Returns the appended whiteboard `event_id` (`None` when the writer is
+    /// disabled or the append failed).
+    ///
+    /// ADR-82 H04: when the strict gate is armed, every EXECUTED
+    /// file-affecting command advances the run freshness clock and files its
+    /// event id as write evidence — the audited-write path driving the
+    /// supersession signal (a failed or interrupted write still advances: it
+    /// ran and may have mutated unpredictably, the same conservative rule the
+    /// derived store applies in `invalidate_on_write`; a `Denied` refusal
+    /// never executed and advances nothing). Gate off: no clock movement at
+    /// all, so the default path stays byte-identical.
     #[allow(clippy::too_many_arguments)]
     async fn record_tool_fact(
-        &self,
+        &mut self,
         session: &SessionContext,
         task: &AgentTask,
         tool: &str,
@@ -3205,35 +3437,49 @@ impl AgentLoop {
         canonical_operation: Option<&str>,
         failure: Option<&concerto_core::tool_failure::ToolFailure>,
         cancel: &CancellationToken,
-    ) {
-        let Some(facts) = &self.tool_facts else {
-            return;
+    ) -> Option<String> {
+        let event_id = match &self.tool_facts {
+            Some(facts) => {
+                let session_id = session.session_id.to_string();
+                let task_id = task.id.0.to_string();
+                facts
+                    .record_tool_executed(
+                        &ToolExecutedFact {
+                            session_id: &session_id,
+                            task_id: Some(&task_id),
+                            run_id: None,
+                            generation: "",
+                            project_root: &self.project_root,
+                            tool,
+                            args,
+                            success,
+                            outcome,
+                            exit_code,
+                            paths: &paths,
+                            file_affecting,
+                            pre_image_hashes,
+                            canonical_tool,
+                            canonical_operation,
+                            failure,
+                        },
+                        cancel,
+                    )
+                    .await
+            }
+            None => None,
         };
-        let session_id = session.session_id.to_string();
-        let task_id = task.id.0.to_string();
-        facts
-            .record_tool_executed(
-                &ToolExecutedFact {
-                    session_id: &session_id,
-                    task_id: Some(&task_id),
-                    run_id: None,
-                    generation: "",
-                    project_root: &self.project_root,
-                    tool,
-                    args,
-                    success,
-                    outcome,
-                    exit_code,
-                    paths: &paths,
-                    file_affecting,
-                    pre_image_hashes,
-                    canonical_tool,
-                    canonical_operation,
-                    failure,
-                },
-                cancel,
-            )
-            .await;
+        if self.strict_verification_gate
+            && file_affecting
+            && !matches!(outcome, ToolOutcome::Denied)
+        {
+            self.verification_epoch = self.verification_epoch.saturating_add(1);
+            if let Some(event_id) = &event_id {
+                for path in &paths {
+                    self.run_write_evidence.push((path.clone(), event_id.clone()));
+                }
+            }
+        }
+        event_id
     }
 
     /// ADR-65 §4: record a cache-served read as a `ToolExecuted` fact carrying
@@ -3284,6 +3530,171 @@ impl AgentLoop {
             )
             .await;
     }
+
+    /// ADR-82 H04: the run's current verification generation (`{base}#{epoch}`,
+    /// `""` when the clock was never armed). Stamped on checks at check time
+    /// and compared at the gate: equality means no audited mutation landed
+    /// after the check within the same workspace base.
+    fn current_verification_generation(&self) -> String {
+        if self.verification_base_generation.is_empty() {
+            String::new()
+        } else {
+            format!("{}#{}", self.verification_base_generation, self.verification_epoch)
+        }
+    }
+
+    /// ADR-82 H04: the freshness context the next sweep/harness check stamps.
+    /// Built from the live clock, so records always cite the generation they
+    /// actually ran against and the write evidence observed so far.
+    fn verification_stamp(&self) -> VerificationStamp {
+        VerificationStamp {
+            generation: self.current_verification_generation(),
+            writes: self.run_write_evidence.clone(),
+        }
+    }
+
+    /// ADR-82 H04: arm the run freshness clock (called once per top-level
+    /// [`Self::run`] when the strict gate is armed; the reset half lives in
+    /// `run` so a re-armed clock never leaks across runs).
+    ///
+    /// The base is the content-addressed workspace generation from the
+    /// existing ADR-65 §2 source — no snapshot event is appended (that barrier
+    /// belongs to the Coordinator path; the single-agent loop only reads the
+    /// inventory hash) and nothing is persisted. The walk runs off the async
+    /// executor and fails soft: a cancelled token or a failed capture leaves
+    /// the base empty, and every gated check then reports stale `generation`
+    /// instead of passing on an unknown workspace (fail-closed, never
+    /// fail-open).
+    async fn arm_verification_clock(&mut self, cancel: CancellationToken) {
+        if cancel.is_cancelled() {
+            return;
+        }
+        let project_dir = self.project_root.clone();
+        let captured = tokio::task::spawn_blocking(move || {
+            let entries =
+                crate::workspace_snapshot::capture_workspace_snapshot(&project_dir, &cancel);
+            crate::workspace_snapshot::generation_for(&entries)
+        })
+        .await
+        .unwrap_or_default();
+        if captured.is_empty() {
+            tracing::warn!(
+                "verification freshness clock disarmed: workspace generation capture failed; \
+                 gated checks will report stale until a run captures one"
+            );
+            return;
+        }
+        self.verification_base_generation = captured;
+    }
+
+    /// ADR-82 H04: is this record *fresh-passing evidence* for the task right
+    /// now? The clauses, each with its cited rule:
+    ///
+    /// - (a) typed `Some(Passed)` with raw-value agreement, (b) current
+    ///   schema version, (c) the full freshness set — all three via
+    ///   [`VerificationSummary::is_passing_evidence`] (ADR-82 §3 R2); anything
+    ///   short of that (legacy `None`-outcome rows included) reports
+    ///   [`FreshnessFailure::MissingAxes`], never a pass.
+    /// - (d+e) the record's generation equals the run's current generation:
+    ///   same base with an advanced epoch means a relevant audited mutation
+    ///   landed after the check ([`FreshnessFailure::Superseded`], ADR-65
+    ///   F-SUPERSEDE / F-WORKSPACE-SUPERSEDE as projected by the run clock,
+    ///   fed by the existing `resource_facts` dirty/supersession writes on the
+    ///   audited path); a differing base means the workspace generation moved
+    ///   on ([`FreshnessFailure::Generation`], ADR-65 F-GENERATION).
+    /// - (d, out-of-band) the checked bytes still hash to the recorded
+    ///   fingerprint ([`FreshnessFailure::Fingerprint`]): the ADR-65 F3-style
+    ///   live re-stat over the existing fingerprint axis, closing the
+    ///   documented known limit of the F-supersede arms (mutations outside
+    ///   the audited path).
+    ///
+    /// Pure and synchronous: it reads the run clock and re-stats at most one
+    /// file, so `decide_exit` needs no store access. A freshness verdict is a
+    /// fact evaluation, not a dispatch rule (ADR-65/ADR-71 boundaries intact).
+    fn record_freshness(&self, record: &VerificationSummary) -> Result<(), FreshnessFailure> {
+        if !record.is_passing_evidence() {
+            return Err(FreshnessFailure::MissingAxes);
+        }
+        let current = self.current_verification_generation();
+        if record.generation != current {
+            let stale_by_epoch =
+                match (split_run_generation(&record.generation), split_run_generation(&current)) {
+                    (Some((record_base, _)), Some((current_base, _))) => {
+                        record_base == current_base
+                    }
+                    _ => false,
+                };
+            return Err(if stale_by_epoch {
+                FreshnessFailure::Superseded
+            } else {
+                FreshnessFailure::Generation
+            });
+        }
+        if !self.fingerprint_matches(record) {
+            return Err(FreshnessFailure::Fingerprint);
+        }
+        Ok(())
+    }
+
+    /// Re-stat the checked file and compare its blake3 against the recorded
+    /// fingerprint, resolving the path exactly as the sweep hashed it. Any
+    /// doubt (unreadable, deleted, hash mismatch) is stale — never fresh.
+    fn fingerprint_matches(&self, record: &VerificationSummary) -> bool {
+        let resolved = resolve_verification_path(&self.project_root, &record.path);
+        match std::fs::read(&resolved) {
+            Ok(bytes) => blake3::hash(&bytes).to_hex().to_string() == record.content_fingerprint,
+            Err(_) => false,
+        }
+    }
+
+    /// ADR-82 H04: evaluate the run-scoped verification ledger for the gated
+    /// arm of [`Self::decide_exit`]. Counts fresh-passing records, typed
+    /// passes, and collects the bounded per-record stale causes the `Blocked`
+    /// reason reports.
+    fn evaluate_gate_ledger(&self, output: &AgentOutput) -> GateLedger {
+        let mut ledger = GateLedger::default();
+        for record in &output.verification {
+            if !matches!(record.outcome, Some(VerificationOutcome::Passed)) {
+                continue;
+            }
+            ledger.typed_passes += 1;
+            match self.record_freshness(record) {
+                Ok(()) => ledger.fresh += 1,
+                Err(cause) => ledger.stale.push(StaleRecord {
+                    path: record.path.to_string(),
+                    command: record.command.clone(),
+                    cause,
+                }),
+            }
+        }
+        ledger
+    }
+}
+
+/// ADR-82 H04: the gated arm's verdict over a verification ledger.
+#[derive(Debug, Clone, Default)]
+struct GateLedger {
+    /// Records that are fresh-passing evidence right now.
+    fresh: usize,
+    /// Records with typed `Some(Passed)` (fresh or stale).
+    typed_passes: usize,
+    /// Per-record staleness causes for the `Blocked` reason.
+    stale: Vec<StaleRecord>,
+}
+
+impl GateLedger {
+    /// The reason's `freshness=` mode: `absent` when no check ever ran,
+    /// `not-passed` when checks ran and none passed, `stale` when a check
+    /// passed but every pass is out of date.
+    fn freshness(&self, record_count: usize) -> GateFreshness {
+        if self.typed_passes > 0 {
+            GateFreshness::Stale
+        } else if record_count > 0 {
+            GateFreshness::NotPassed
+        } else {
+            GateFreshness::Absent
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3300,11 +3711,11 @@ const EVAL_HARNESS_VERIFIER: &str = "concerto-eval-harness";
 ///
 /// Scope and the blake3 content fingerprint come from the checked file (the
 /// fingerprint is best-effort: empty when the bytes are unreadable);
-/// `checked_at` is stamped by the constructor. `generation` stays empty and
-/// `evidence_ids` stay empty **with reason**: the sweep runs outside the
-/// workspace-snapshot and whiteboard contexts, so it can cite neither a
-/// generation nor event ids — its records are display-grade until slice 4
-/// wires those axes (see [`VerificationSummary::is_passing_evidence`]).
+/// `checked_at` is stamped by the constructor. `generation` and
+/// `evidence_ids` are wired by the caller ([`verify_file_changes`] applies
+/// the run's [`VerificationStamp`] over every record): with a disarmed stamp
+/// both stay empty and the record is display-grade, exactly as before H04
+/// (see [`VerificationSummary::is_passing_evidence`]).
 /// `duration_ms`/`exit_code` are set only when the check measured/spawned them.
 async fn sweep_record(
     project_root: &std::path::Path,
@@ -3315,11 +3726,7 @@ async fn sweep_record(
     duration_ms: Option<u64>,
     exit_code: Option<i32>,
 ) -> VerificationSummary {
-    let full = if path.is_absolute() {
-        std::path::PathBuf::from(path.as_str())
-    } else {
-        project_root.join(path.as_std_path())
-    };
+    let full = resolve_verification_path(project_root, path);
     let content_fingerprint = match tokio::fs::read(&full).await {
         Ok(bytes) => blake3::hash(&bytes).to_hex().to_string(),
         Err(_) => String::new(),
@@ -3397,9 +3804,16 @@ fn eval_error_record(
 /// vocabulary changes. A missing npm `test` script records `Skipped` (never
 /// `passed: true`); a missing `Cargo.toml`/`package.json` records
 /// `Unavailable` instead of no record; spawn errors record `Error`.
+///
+/// ADR-82 H04: `stamp` wires the deferred axes at the source — every record
+/// gets the run's current generation, and each file-scope record cites the
+/// run's audited write evidence for its own canonical path (existing
+/// whiteboard event ids, ADR-65 §1). A default (empty) stamp reproduces the
+/// pre-H04 display-grade records byte-identically.
 async fn verify_file_changes(
     files: &[camino::Utf8PathBuf],
     project_root: &std::path::Path,
+    stamp: &VerificationStamp,
 ) -> Vec<VerificationSummary> {
     let mut results = Vec::new();
     for path in files {
@@ -3675,6 +4089,14 @@ async fn verify_file_changes(
             }
             _ => {}
         }
+    }
+    // ADR-82 H04: wire the deferred axes at the source. Generation is the
+    // run's current generation (empty when the clock is disarmed — the record
+    // then stays display-grade, exactly as before); evidence is the run's
+    // audited write evidence for the record's own canonical path.
+    for record in &mut results {
+        record.generation = stamp.generation.clone();
+        record.evidence_ids = stamp.evidence_for(project_root, &record.path);
     }
     results
 }
@@ -6333,7 +6755,7 @@ mod tests {
         std::fs::write(dir.path().join("package.json"), "{\"name\": \"demo\"}\n")
             .expect("package.json");
         let files = vec![Utf8PathBuf::from("app.js")];
-        let records = verify_file_changes(&files, dir.path()).await;
+        let records = verify_file_changes(&files, dir.path(), &VerificationStamp::default()).await;
         assert_eq!(records.len(), 1, "the gap must record, not vanish: {records:?}");
         let record = &records[0];
         assert_eq!(record.command, "npm test");
@@ -6351,7 +6773,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").expect("main.rs");
         let files = vec![Utf8PathBuf::from("main.rs")];
-        let records = verify_file_changes(&files, dir.path()).await;
+        let records = verify_file_changes(&files, dir.path(), &VerificationStamp::default()).await;
         assert_eq!(records.len(), 1, "the gap must record, not vanish: {records:?}");
         let record = &records[0];
         assert_eq!(record.command, "cargo check");
@@ -6371,7 +6793,7 @@ mod tests {
     async fn sweep_js_without_package_json_records_unavailable() {
         let dir = tempfile::tempdir().expect("tempdir");
         let files = vec![Utf8PathBuf::from("app.js")];
-        let records = verify_file_changes(&files, dir.path()).await;
+        let records = verify_file_changes(&files, dir.path(), &VerificationStamp::default()).await;
         assert_eq!(records.len(), 1, "the gap must record, not vanish: {records:?}");
         let record = &records[0];
         assert_eq!(record.command, "npm test");
@@ -8917,6 +9339,79 @@ mod tests {
         }
     }
 
+    /// Arm the loop's H04 clock on a fixed test base (deterministic; the
+    /// production arming path `arm_verification_clock` is covered end to end
+    /// by `fresh_sweep_record_satisfies_gate_end_to_end`).
+    fn arm_test_clock(loop_: &mut AgentLoop, base: &str) {
+        loop_.verification_base_generation = base.to_owned();
+        loop_.verification_epoch = 0;
+        loop_.run_write_evidence.clear();
+    }
+
+    /// Build a full-R2 `Passed` record over a real temp file: verifier,
+    /// scope, generation, live blake3 fingerprint, `checked_at` (stamped by
+    /// the constructor), and backing evidence ids.
+    fn fresh_test_record(
+        dir: &std::path::Path,
+        rel: &str,
+        generation: &str,
+        evidence_ids: Vec<String>,
+    ) -> VerificationSummary {
+        let bytes = std::fs::read(dir.join(rel)).expect("fixture readable");
+        VerificationSummary::passed(rel, "reference check", "ok")
+            .with_verifier("concerto-verify-sweep")
+            .with_scope(rel)
+            .with_content_fingerprint(blake3::hash(&bytes).to_hex().to_string())
+            .with_generation(generation)
+            .with_evidence_ids(evidence_ids)
+    }
+
+    /// Build an `AgentOutput` over a real temp-dir file for the H04 gate
+    /// tests. The file-changing requirement is discharged by the round counter
+    /// (`file_changing_tool_count=1` at the `decide_exit` call), so the ledger
+    /// alone decides the gate verdict.
+    fn fresh_gate_output(rel: &str, verification: Vec<VerificationSummary>) -> AgentOutput {
+        AgentOutput {
+            tool_call_count: 1,
+            final_message: "done".to_owned(),
+            files_modified: vec![rel.into()],
+            verification,
+            ..agent_output_base()
+        }
+    }
+
+    /// Record one executed file-affecting write through the loop's existing
+    /// audited-write path ([`AgentLoop::record_tool_fact`]): the whiteboard
+    /// append is best-effort (no pool here, so no event id), but the armed
+    /// H04 clock always advances — exactly the supersession signal the gate
+    /// consults.
+    async fn record_test_write(
+        loop_: &mut AgentLoop,
+        project_dir: &std::path::Path,
+        task: &AgentTask,
+        rel: &str,
+    ) {
+        let session = SessionContext::new(Ulid::new(), project_dir.to_path_buf());
+        loop_
+            .record_tool_fact(
+                &session,
+                task,
+                "filesystem",
+                &serde_json::json!({"operation": "write", "path": rel}),
+                true,
+                ToolOutcome::Ok,
+                None,
+                vec![rel.to_owned()],
+                true,
+                HashMap::new(),
+                Some("filesystem"),
+                Some("write"),
+                None,
+                &CancellationToken::new(),
+            )
+            .await;
+    }
+
     /// Flag off (the default): an unmet `require_verification` contract keeps
     /// today's warn-and-continue byte-identically — `decide_exit` proceeds to
     /// `finalize_completion` (`None`) with no ledger inspection.
@@ -8959,6 +9454,7 @@ mod tests {
             "require_verification=true",
             "records=0",
             "outcomes=[absent]",
+            "freshness=absent",
         ] {
             assert!(reason.contains(token), "Blocked reason must carry `{token}`: {reason}");
         }
@@ -8985,27 +9481,237 @@ mod tests {
             assert!(reason.contains(token), "Blocked reason must carry `{token}`: {reason}");
         }
         assert!(
+            reason.contains("freshness=not-passed"),
+            "checks ran and none passed, so the mode must be not-passed: {reason}"
+        );
+        assert!(
             !reason.contains("verification_passed=true"),
             "the reason must never claim verification passed: {reason}"
         );
     }
 
-    /// Flag on: a single typed `Passed` record satisfies the contract — the
-    /// run proceeds to `finalize_completion` (`None`).
+    /// Flag on (H04): a bare typed `Passed` record — the slice-4 shape with
+    /// no freshness axes wired — does NOT satisfy the contract. The ledger
+    /// holds a pass, but no pass is fresh, so the run exits `Blocked` with
+    /// the `stale` mode and the `missing-axes` cause: "your check is out of
+    /// date" (here: never dated at all), not "you never ran it".
     #[tokio::test]
-    async fn strict_gate_on_passes_with_typed_pass() {
+    async fn strict_gate_on_rejects_bare_typed_pass_without_freshness() {
         let provider = Arc::new(ScriptedProvider::new(vec![]));
         let approval = Arc::new(ApprovalTestHarness::always_approve());
         let mut loop_ = make_loop(provider, approval, 4).with_strict_verification_gate(true);
+        arm_test_clock(&mut loop_, "test-base");
         let task = AgentTask::new_action_required(Ulid::new(), "write code to file");
         let output = strict_gate_output(vec![
             VerificationSummary::skipped("b.js", "npm test", "no test script"),
             VerificationSummary::passed("a.rs", "cargo check", "ok"),
         ]);
         let decision = loop_.decide_exit(&task, &output, 1, 1, 0, &None, true, Vec::new()).unwrap();
+        let reason = match decision {
+            Some(AgentRunExit::Blocked { reason, .. }) => reason,
+            other => panic!("a pass without freshness axes must exit Blocked, got {other:?}"),
+        };
+        for token in ["freshness=stale", "missing-axes"] {
+            assert!(reason.contains(token), "Blocked reason must carry `{token}`: {reason}");
+        }
+    }
+
+    /// Flag on (H04): a fresh-passing record satisfies the contract — the run
+    /// proceeds to `finalize_completion` (`None`). Fresh means the full R2
+    /// set, the run's current generation, live-matching bytes, and backing
+    /// evidence.
+    #[tokio::test]
+    async fn strict_gate_on_passes_with_fresh_evidence() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        std::fs::write(dir.path().join("hello.html"), "<html><body>hi</body></html>\n")
+            .expect("fixture written");
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_dir(
+            provider,
+            approval,
+            4,
+            dir.path().to_str().expect("tempdir path is UTF-8"),
+        )
+        .with_strict_verification_gate(true);
+        arm_test_clock(&mut loop_, "test-base");
+        let task = AgentTask::new_action_required(Ulid::new(), "write the page");
+        let record =
+            fresh_test_record(dir.path(), "hello.html", "test-base#0", vec!["ev-1".to_owned()]);
+        assert!(
+            record.is_passing_evidence(),
+            "premise: the record carries the full R2 freshness set"
+        );
+        let output = fresh_gate_output("hello.html", vec![record]);
+        let decision = loop_.decide_exit(&task, &output, 1, 1, 0, &None, true, Vec::new()).unwrap();
         assert!(
             decision.is_none(),
-            "a typed Passed record satisfies the contract and must proceed"
+            "a fresh-passing record satisfies the contract and must proceed"
+        );
+    }
+
+    /// Flag on (H04): a record that was fresh when checked goes stale after a
+    /// later audited mutation — the mutation advances the run clock through
+    /// the existing audited-write path, so the check no longer describes the
+    /// current workspace (ADR-65 F-SUPERSEDE family). The reason reports the
+    /// `stale` mode with the `superseded` cause.
+    #[tokio::test]
+    async fn strict_gate_on_rejects_stale_after_audited_mutation() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        std::fs::write(dir.path().join("hello.html"), "<html><body>hi</body></html>\n")
+            .expect("fixture written");
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_dir(
+            provider,
+            approval,
+            4,
+            dir.path().to_str().expect("tempdir path is UTF-8"),
+        )
+        .with_strict_verification_gate(true);
+        arm_test_clock(&mut loop_, "test-base");
+        let task = AgentTask::new_action_required(Ulid::new(), "write the page");
+        let record =
+            fresh_test_record(dir.path(), "hello.html", "test-base#0", vec!["ev-1".to_owned()]);
+        // Premise: fresh before the mutation.
+        let output = fresh_gate_output("hello.html", vec![record]);
+        let premise = loop_.decide_exit(&task, &output, 1, 1, 0, &None, true, Vec::new()).unwrap();
+        assert!(premise.is_none(), "premise: the record is fresh before the mutation");
+        // A later audited file-affecting write advances the run clock — the
+        // file bytes are untouched, so only the supersession signal fires.
+        record_test_write(&mut loop_, dir.path(), &task, "hello.html").await;
+        let decision = loop_.decide_exit(&task, &output, 1, 1, 0, &None, true, Vec::new()).unwrap();
+        let reason = match decision {
+            Some(AgentRunExit::Blocked { reason, .. }) => reason,
+            other => panic!("a superseded pass must exit Blocked, got {other:?}"),
+        };
+        for token in ["freshness=stale", "superseded"] {
+            assert!(reason.contains(token), "Blocked reason must carry `{token}`: {reason}");
+        }
+    }
+
+    /// Flag on (H04): a typed `Passed` record missing the generation axis
+    /// (the pre-H04 sweep shape) never satisfies — `missing-axes` under the
+    /// `stale` mode.
+    #[tokio::test]
+    async fn strict_gate_on_rejects_missing_generation_record() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        std::fs::write(dir.path().join("hello.html"), "<html><body>hi</body></html>\n")
+            .expect("fixture written");
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_dir(
+            provider,
+            approval,
+            4,
+            dir.path().to_str().expect("tempdir path is UTF-8"),
+        )
+        .with_strict_verification_gate(true);
+        arm_test_clock(&mut loop_, "test-base");
+        let task = AgentTask::new_action_required(Ulid::new(), "write the page");
+        let bytes = std::fs::read(dir.path().join("hello.html")).expect("fixture readable");
+        let record = VerificationSummary::passed("hello.html", "reference check", "ok")
+            .with_verifier("concerto-verify-sweep")
+            .with_scope("hello.html")
+            .with_content_fingerprint(blake3::hash(&bytes).to_hex().to_string())
+            .with_evidence_ids(vec!["ev-1".to_owned()]);
+        assert!(
+            !record.is_passing_evidence(),
+            "premise: without generation the record is display-grade"
+        );
+        let output = fresh_gate_output("hello.html", vec![record]);
+        let decision = loop_.decide_exit(&task, &output, 1, 1, 0, &None, true, Vec::new()).unwrap();
+        let reason = match decision {
+            Some(AgentRunExit::Blocked { reason, .. }) => reason,
+            other => panic!("a generation-less pass must exit Blocked, got {other:?}"),
+        };
+        for token in ["freshness=stale", "missing-axes"] {
+            assert!(reason.contains(token), "Blocked reason must carry `{token}`: {reason}");
+        }
+    }
+
+    /// Flag on (H04): a record stamped for a different workspace generation
+    /// (the F-GENERATION conservative reset — e.g. a check from before a
+    /// workspace change) never satisfies, with the `generation` cause.
+    #[tokio::test]
+    async fn strict_gate_on_rejects_foreign_generation_record() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        std::fs::write(dir.path().join("hello.html"), "<html><body>hi</body></html>\n")
+            .expect("fixture written");
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_dir(
+            provider,
+            approval,
+            4,
+            dir.path().to_str().expect("tempdir path is UTF-8"),
+        )
+        .with_strict_verification_gate(true);
+        arm_test_clock(&mut loop_, "test-base");
+        let task = AgentTask::new_action_required(Ulid::new(), "write the page");
+        let record =
+            fresh_test_record(dir.path(), "hello.html", "other-base#0", vec!["ev-1".to_owned()]);
+        let output = fresh_gate_output("hello.html", vec![record]);
+        let decision = loop_.decide_exit(&task, &output, 1, 1, 0, &None, true, Vec::new()).unwrap();
+        let reason = match decision {
+            Some(AgentRunExit::Blocked { reason, .. }) => reason,
+            other => panic!("a foreign-generation pass must exit Blocked, got {other:?}"),
+        };
+        for token in ["freshness=stale", ":generation"] {
+            assert!(reason.contains(token), "Blocked reason must carry `{token}`: {reason}");
+        }
+    }
+
+    /// Flag on (H04): the checked bytes changed outside the audited write
+    /// path (the documented known limit of the F-supersede arms) — the live
+    /// fingerprint re-stat still reports stale, with the `fingerprint` cause.
+    #[tokio::test]
+    async fn strict_gate_on_rejects_externally_changed_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        std::fs::write(dir.path().join("hello.html"), "<html><body>hi</body></html>\n")
+            .expect("fixture written");
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_dir(
+            provider,
+            approval,
+            4,
+            dir.path().to_str().expect("tempdir path is UTF-8"),
+        )
+        .with_strict_verification_gate(true);
+        arm_test_clock(&mut loop_, "test-base");
+        let task = AgentTask::new_action_required(Ulid::new(), "write the page");
+        let record =
+            fresh_test_record(dir.path(), "hello.html", "test-base#0", vec!["ev-1".to_owned()]);
+        let output = fresh_gate_output("hello.html", vec![record]);
+        // External edit: no audited write, so the run clock does not move —
+        // only the bytes disagree with the recorded fingerprint.
+        std::fs::write(dir.path().join("hello.html"), "<html><body>changed</body></html>\n")
+            .expect("external edit written");
+        let decision = loop_.decide_exit(&task, &output, 1, 1, 0, &None, true, Vec::new()).unwrap();
+        let reason = match decision {
+            Some(AgentRunExit::Blocked { reason, .. }) => reason,
+            other => panic!("a fingerprint-mismatched pass must exit Blocked, got {other:?}"),
+        };
+        for token in ["freshness=stale", "fingerprint"] {
+            assert!(reason.contains(token), "Blocked reason must carry `{token}`: {reason}");
+        }
+    }
+
+    /// Flag off (H04): a stale ledger is ignored exactly like any unmet
+    /// contract — warn-and-continue with no ledger inspection.
+    #[tokio::test]
+    async fn strict_gate_off_ignores_stale_ledger() {
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop(provider, approval, 4);
+        let task = AgentTask::new_action_required(Ulid::new(), "write code to file");
+        let output =
+            strict_gate_output(vec![VerificationSummary::passed("a.rs", "cargo check", "ok")]);
+        let decision = loop_.decide_exit(&task, &output, 1, 1, 0, &None, true, Vec::new()).unwrap();
+        assert!(
+            decision.is_none(),
+            "flag off: even a stale ledger still proceeds (warn-and-continue)"
         );
     }
 
@@ -9033,6 +9739,124 @@ mod tests {
             reason.contains("legacy-passed:1"),
             "the reason must mark the legacy state distinctly: {reason}"
         );
+        assert!(
+            reason.contains("freshness=not-passed"),
+            "a legacy-only ledger holds no typed pass at all: {reason}"
+        );
+    }
+
+    /// Flag on (H04 satisfiability): a genuinely fresh sweep-produced record
+    /// CAN satisfy the gate end to end — proving the gate is satisfiable, not
+    /// a permanent block. The full production chain runs here: the real clock
+    /// arming (workspace inventory walk), a real audited write through the
+    /// existing audited-write path (landing a real whiteboard event whose id
+    /// the record cites), the real sweep stamping generation + evidence, and
+    /// the gate decision. A later audited mutation then stales the same
+    /// record, proving the staleness half on the same ledger.
+    #[tokio::test]
+    async fn fresh_sweep_record_satisfies_gate_end_to_end() {
+        let (_db_dir, pool) = test_pool().await;
+        let root = tempfile::tempdir().expect("root tempdir created");
+        std::fs::write(root.path().join("hello.html"), "<html><body>hi</body></html>\n")
+            .expect("fixture written");
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_dir(
+            provider,
+            approval,
+            4,
+            root.path().to_str().expect("tempdir path is UTF-8"),
+        )
+        .with_strict_verification_gate(true)
+        .with_tool_facts(Some(ToolFactContext::new(Some(pool.clone()), "single-agent".to_owned())));
+        // Production arming: content-addressed base from the live workspace.
+        loop_.arm_verification_clock(CancellationToken::new()).await;
+        assert!(
+            !loop_.verification_base_generation.is_empty(),
+            "the clock must arm on a readable project"
+        );
+        let task = AgentTask::new_action_required(Ulid::new(), "write the page");
+        // Audited write through the existing audited-write path.
+        let session = SessionContext::new(Ulid::new(), root.path().to_path_buf());
+        let event_id = loop_
+            .record_tool_fact(
+                &session,
+                &task,
+                "filesystem",
+                &serde_json::json!({"operation": "write", "path": "hello.html"}),
+                true,
+                ToolOutcome::Ok,
+                None,
+                vec!["hello.html".to_owned()],
+                true,
+                HashMap::new(),
+                Some("filesystem"),
+                Some("write"),
+                None,
+                &CancellationToken::new(),
+            )
+            .await;
+        let event_id = event_id.expect("the write must land a real whiteboard event");
+        // Genuine sweep over the written file with the run's live stamp.
+        let records = verify_file_changes(
+            &[Utf8PathBuf::from("hello.html")],
+            root.path(),
+            &loop_.verification_stamp(),
+        )
+        .await;
+        assert_eq!(records.len(), 1, "the sweep must check the written file");
+        let record = &records[0];
+        assert_eq!(record.outcome, Some(VerificationOutcome::Passed));
+        assert!(
+            record.is_passing_evidence(),
+            "a genuine fresh sweep record must BE passing evidence: {record:?}"
+        );
+        assert_eq!(
+            record.evidence_ids,
+            vec![event_id],
+            "evidence must cite the existing write event id (ADR-65 §1)"
+        );
+        assert_eq!(
+            record.generation,
+            loop_.current_verification_generation(),
+            "the record must stamp the generation it ran against"
+        );
+        // The gate is satisfiable: this ledger proceeds.
+        let output = fresh_gate_output("hello.html", records.clone());
+        let decision = loop_.decide_exit(&task, &output, 1, 1, 0, &None, true, Vec::new()).unwrap();
+        assert!(
+            decision.is_none(),
+            "a genuinely fresh sweep record must satisfy the gate end to end"
+        );
+        // And the same ledger stales after a later audited mutation.
+        std::fs::write(root.path().join("hello.html"), "<html><body>changed</body></html>\n")
+            .expect("mutation written");
+        loop_
+            .record_tool_fact(
+                &session,
+                &task,
+                "filesystem",
+                &serde_json::json!({"operation": "write", "path": "hello.html"}),
+                true,
+                ToolOutcome::Ok,
+                None,
+                vec!["hello.html".to_owned()],
+                true,
+                HashMap::new(),
+                Some("filesystem"),
+                Some("write"),
+                None,
+                &CancellationToken::new(),
+            )
+            .await;
+        let decision = loop_.decide_exit(&task, &output, 1, 1, 0, &None, true, Vec::new()).unwrap();
+        let reason = match decision {
+            Some(AgentRunExit::Blocked { reason, .. }) => reason,
+            other => panic!("the mutated ledger must exit Blocked, got {other:?}"),
+        };
+        for token in ["freshness=stale", "superseded"] {
+            assert!(reason.contains(token), "Blocked reason must carry `{token}`: {reason}");
+        }
     }
 
     /// Flag on: non-action-required tasks are unaffected — an answer-only
