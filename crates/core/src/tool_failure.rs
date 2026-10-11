@@ -345,9 +345,11 @@ impl ToolFailure {
     ///
     /// The substring predicate ([`is_deterministic_failure_message`]) is used
     /// ONLY in the opaque-fallback arms below — never as the derivation
-    /// source for native variants. The one native arm that must read message
-    /// text (`ExecutionFailed`, stringly until H02) derives from the shared
-    /// marker constants instead, so envelope and ledger key on one grammar.
+    /// source for native variants. The one native arm that reads message
+    /// text (`ExecutionFailed`, validation prose only since H02 retired the
+    /// io-backed construction sites to `ToolError::Io`) derives from the
+    /// shared marker constants instead, so envelope and ledger key on one
+    /// grammar.
     #[must_use]
     pub fn from_error(error: &ToolError, ctx: ToolFailureContext) -> Self {
         if !ctx.origin.is_builtin() {
@@ -452,13 +454,25 @@ impl ToolFailure {
             // most common native failure shape: marker match →
             // `DoNotReIssue`, no match → `Unknown` (never a fabricated retry
             // claim). The grammar is referenced, never copied.
-            // INTERIM pending H02 construction-site typing: tools should
-            // construct a typed `ToolError::Io` instead of the stringly
-            // `ExecutionFailed`, which would retire message matching on this
-            // native path entirely. Until then the prose predicate remains
-            // the fallback for OPAQUE origins only (non-builtin origins and
-            // unknown future variants — unchanged path, see
-            // `opaque_envelope`).
+            //
+            // H02 construction-site typing (retired INTERIM, ADR-82 §1
+            // table): no built-in construction site wraps a real
+            // `std::io::Error` in this variant anymore — every io-backed
+            // site (`common::resolve_path`, `containment::canonical_root`,
+            // filesystem fs ops, `ProcessHandle`/`run_git`/undo spawns,
+            // `NativeProcessTool` probes) now constructs the structural
+            // `ToolError::Io`, which classifies by `ErrorKind` without
+            // reading any message. The marker grammar on this native arm
+            // therefore covers ONLY validation-prose preconditions that
+            // carry no underlying error value: "does not exist" /
+            // "file not found" (overlay-state misses), "is a directory" /
+            // "is not a directory" / "destination already exists" (path-shape
+            // guards), "invalid …" / "missing …" / "unknown …" /
+            // "non-utf-8" (unsatisfiable input), and "shell executable not
+            // found on path" (PATH lookup with no OS error value). The
+            // prose predicate remains the derivation source for OPAQUE
+            // origins only (non-builtin origins and unknown future
+            // variants — unchanged path, see `opaque_envelope`).
             ToolError::ExecutionFailed { message } => Some((
                 "exec.execution_failed",
                 ToolFailureCategory::Execution,

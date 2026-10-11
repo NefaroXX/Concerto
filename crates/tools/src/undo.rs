@@ -35,16 +35,16 @@ impl UndoManager {
 
     /// Create a git stash for the given session/task.
     ///
-    /// Returns `ToolError::ExecutionFailed` if the git commands fail.
+    /// Returns [`ToolError::Io`] when the `git` binary itself cannot be
+    /// spawned (H02 construction-site typing); a failing-but-spawned `git`
+    /// (non-zero exit) still surfaces its stderr as `ExecutionFailed`.
     pub fn commit(&mut self, session_id: Ulid, task_id: TaskId) -> Result<(), ToolError> {
         // Ensure we are inside a git repository.
         let rev_parse = Command::new("git")
             .args(["rev-parse", "--git-dir"])
             .current_dir(&self.project_dir)
             .output();
-        let rev_output = rev_parse.map_err(|e| ToolError::ExecutionFailed {
-            message: format!("git rev-parse failed: {e}"),
-        })?;
+        let rev_output = rev_parse.map_err(ToolError::Io)?;
         if !rev_output.status.success() {
             return Err(ToolError::ExecutionFailed {
                 message: String::from_utf8_lossy(&rev_output.stderr).into_owned(),
@@ -57,9 +57,7 @@ impl UndoManager {
             .args(["stash", "push", "-m", &stash_msg])
             .current_dir(&self.project_dir)
             .output()
-            .map_err(|e| ToolError::ExecutionFailed {
-                message: format!("git stash push failed: {e}"),
-            })?;
+            .map_err(ToolError::Io)?;
         if !stash.status.success() {
             return Err(ToolError::ExecutionFailed {
                 message: String::from_utf8_lossy(&stash.stderr).into_owned(),

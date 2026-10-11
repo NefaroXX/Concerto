@@ -124,7 +124,7 @@ falls back to `Opaque`. The mapping:
 |---|---|---|---|
 | `PolicyDenied { rule }` | `policy_denied` | policy | `do-not-re-issue` |
 | `PausedAwaitingApproval { .. }` | `awaiting_approval` | policy | `awaiting-decision` |
-| `ExecutionFailed { message }` | `execution_failed` | execution | shared marker grammar (`DETERMINISTIC_FAILURE_MARKERS`, same constants the ledger parses): match → `do-not-re-issue`, else `unknown` — INTERIM pending H02 construction-site typing |
+| `ExecutionFailed { message }` | `execution_failed` | execution | shared marker grammar (`DETERMINISTIC_FAILURE_MARKERS`, same constants the ledger parses): match → `do-not-re-issue`, else `unknown` — H02 construction-site typing RETIRED the INTERIM (2026-10-11, `feat/construction-site-error-typing`): every io-backed built-in site now constructs the structural `ToolError::Io`, so the native marker grammar covers only validation-prose preconditions (overlay-state misses, path-shape guards, unsatisfiable input — all carrying no underlying error value); the prose predicate survives only for opaque third-party text (plugin/MCP bridges, agent-reported prose) |
 | `NotARepository { .. }` | `not_a_repository` | environment | `do-not-re-issue` |
 | `Timeout { .. }` | `timeout` | execution | `bounded-retry-with-backoff` |
 | `Cancelled` | `cancelled` | control | `do-not-re-issue-same-intent` |

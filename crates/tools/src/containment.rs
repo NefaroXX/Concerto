@@ -272,13 +272,14 @@ pub(crate) fn msys_drive_to_windows(target: &str) -> Option<String> {
 const INTERPOLATION_TARGET_CHARS: &[char] = &['$', '`'];
 
 /// Canonical form of the containment trust anchor.
+///
+/// H02 construction-site typing: root canonicalization fails only on OS
+/// grounds — typed `Io`, classified by `ErrorKind`. FINDING: the previous
+/// message named the root and stated the fail-closed refusal ("refusing to
+/// run an unconfined shell command"); the `Io` Display carries the OS cause
+/// only. The refusal itself is unchanged (still an `Err`, never executed).
 fn canonical_root(root: &Utf8Path) -> Result<Utf8PathBuf, ToolError> {
-    root.canonicalize_utf8().map_err(|error| ToolError::ExecutionFailed {
-        message: format!(
-            "containment: cannot canonicalize project root '{}': {error}; refusing to run an unconfined shell command",
-            root
-        ),
-    })
+    root.canonicalize_utf8().map_err(ToolError::Io)
 }
 
 /// Escape rejection: a path resolved outside the project root.

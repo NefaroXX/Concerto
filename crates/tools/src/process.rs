@@ -209,9 +209,12 @@ impl ProcessHandle {
             command.process_group(0);
         }
 
-        let mut child = command.spawn().map_err(|e| ToolError::ExecutionFailed {
-            message: format!("failed to spawn process: {e}"),
-        })?;
+        // H02: spawn failure is an OS verdict (`NotFound` when the program
+        // is missing — the deterministic case — else a transient fault) —
+        // typed `Io`, classified by kind. FINDING: the "failed to spawn
+        // process" verb no longer rides the Display; the tool result still
+        // names the tool, and the command facts ride the audit row.
+        let mut child = command.spawn().map_err(ToolError::Io)?;
 
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();

@@ -115,12 +115,15 @@ pub fn resolve_path(root: &Utf8Path, user_path: &Utf8Path) -> Result<Utf8PathBuf
             return resolve_lexically(root, user_path);
         }
         Err(error) => {
-            return Err(ToolError::ExecutionFailed {
-                message: format!(
-                    "cannot access workspace root '{}': {error}. Choose an existing folder that Concerto can read and write",
-                    root
-                ),
-            })
+            // H02 construction-site typing: the workspace root could not be
+            // reached by the OS (`NotFound`, `PermissionDenied`, …) — a
+            // structural `ToolError::Io` classified by `ErrorKind`, never by
+            // message markers. FINDING (F-root): the previous message named
+            // the root and coached ("Choose an existing folder that Concerto
+            // can read and write"); the `Io` Display carries the OS cause
+            // only. The attempted root still rides the audit `path_facts`
+            // (`resolved_path: None`), but the operator-facing hint is gone.
+            return Err(ToolError::Io(error));
         }
     };
     let root_canonical = Utf8PathBuf::from_path_buf(root_canonical_buf).map_err(|_| {
@@ -176,12 +179,12 @@ fn resolve_lexically(root: &Utf8Path, user_path: &Utf8Path) -> Result<Utf8PathBu
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
             Err(error) => {
-                return Err(ToolError::ExecutionFailed {
-                    message: format!(
-                        "cannot inspect workspace path '{}': {error}",
-                        current.display()
-                    ),
-                })
+                // H02: `symlink_metadata` failure is an OS verdict
+                // (`NotFound` when the component vanished mid-walk, …) —
+                // typed `Io`, classified by kind. FINDING: the inspected
+                // path (`current`) no longer rides the error Display; it
+                // remains visible in the audit `path_facts` only.
+                return Err(ToolError::Io(error));
             }
         }
     }
@@ -192,9 +195,10 @@ fn resolve_lexically(root: &Utf8Path, user_path: &Utf8Path) -> Result<Utf8PathBu
 }
 
 fn lexical_normalize(path: &std::path::Path) -> Result<std::path::PathBuf, ToolError> {
-    let absolute = std::path::absolute(path).map_err(|error| ToolError::ExecutionFailed {
-        message: format!("cannot make workspace path '{}' absolute: {error}", path.display()),
-    })?;
+    // H02: `std::path::absolute` fails only on OS-level grounds — typed
+    // `Io`. FINDING: the workload path no longer rides the Display; audit
+    // `path_facts` still attributes the attempted path.
+    let absolute = std::path::absolute(path).map_err(ToolError::Io)?;
     let mut normalized = std::path::PathBuf::new();
     for component in absolute.components() {
         match component {
@@ -396,6 +400,45 @@ mod tests {
         let result = resolve_lexically(&root, Utf8Path::new("../outside.txt"));
         assert!(matches!(result, Err(ToolError::VirtualFsConflict { .. })));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// H02 construction-site typing: a workspace root the OS cannot reach
+    /// surfaces as the structural `ToolError::Io` (classified by
+    /// `ErrorKind::NotFound`), never as marker-shaped prose — and the typed
+    /// envelope derives `exec.io_error` / `do-not-re-issue` from the kind.
+    #[test]
+    fn missing_workspace_root_yields_typed_io_not_prose() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let missing = Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
+            "concerto_no_such_root_{}_{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )))
+        .expect("temp path is valid UTF-8");
+        assert!(!missing.as_std_path().exists(), "the root must genuinely be absent");
+        let error =
+            resolve_path(&missing, Utf8Path::new("x.txt")).expect_err("missing root must fail");
+        let kind = match &error {
+            ToolError::Io(io) => io.kind(),
+            other => panic!("expected typed ToolError::Io, got {other:?}"),
+        };
+        assert_eq!(kind, std::io::ErrorKind::NotFound, "the OS verdict is preserved");
+        assert!(
+            error.is_deterministic_failure(),
+            "NotFound classifies structurally, with no marker read"
+        );
+        let failure = concerto_core::tool_failure::ToolFailure::from_error(
+            &error,
+            concerto_core::tool_failure::ToolFailureContext::builtin(),
+        );
+        assert_eq!(failure.code, "exec.io_error", "the envelope is typed");
+        assert_eq!(
+            failure.disposition,
+            concerto_core::tool_failure::ToolDisposition::DoNotReIssue,
+            "the disposition derives from the kind"
+        );
+        assert!(!failure.opaque, "a builtin failure is never opaque");
     }
 
     // -----------------------------------------------------------------------

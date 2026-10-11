@@ -625,9 +625,11 @@ mod cli_fallback {
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
 
-        let mut child = command.spawn().map_err(|e| ToolError::ExecutionFailed {
-            message: format!("failed to execute git: {e}"),
-        })?;
+        // H02: `git` spawn failure (missing binary, OS refusal) is an OS
+        // verdict — typed `Io`. A non-zero `git` exit stays `ExecutionFailed`
+        // (it carries git's stderr, not an OS error). FINDING: the "failed
+        // to execute git" verb no longer rides the Display.
+        let mut child = command.spawn().map_err(ToolError::Io)?;
 
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
