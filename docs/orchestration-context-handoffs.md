@@ -38,7 +38,10 @@ verification-outcome, environment-manifest and chunked-file-checkpoint work.
 Codex owns `agents/context_packet.rs`, `agents/task_contract.rs` and
 `agents/generic/prompt.rs` for this slice. The only module-registration change
 is in `agents/mod.rs`. Shared core types, configuration, sessions, executor/IPC,
-runtime construction, CLI resume and Studio files are untouched.
+runtime construction, CLI resume and Studio files are untouched. A test-only
+correction in `crates/core/src/secret.rs` makes the wipe observation thread-local:
+the existing global counter raced with other core tests and blocked workspace CI.
+Production secret handling is unchanged, and the exactly-once assertion remains.
 
 OpenCode can continue harness schemas and services independently. Coordinate
 before changing these prompt consumers. The existing environment-manifest block

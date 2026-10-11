@@ -24,14 +24,17 @@ use std::fmt;
 
 use zeroize::Zeroize;
 
-/// Count of buffers wiped so far; test builds only.
+/// Count of buffers wiped on this test thread; test builds only.
 ///
 /// `Drop` for [`SecretString`] is one line, but "the value was wiped" is a
 /// behavioral contract, not something a reader should have to trace by eye.
 /// The counter lets the drop test assert that the wipe path actually ran for
-/// a value that went out of scope, without reading freed memory.
+/// a value that went out of scope, without reading freed memory. Thread-local
+/// observation keeps unrelated parallel tests from changing that count.
 #[cfg(test)]
-static SECRET_WIPES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+std::thread_local! {
+    static SECRET_WIPES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// A secret string that is zeroed on drop and never rendered.
 ///
@@ -81,7 +84,7 @@ impl SecretString {
     fn wipe(&mut self) {
         self.inner.zeroize();
         #[cfg(test)]
-        SECRET_WIPES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        SECRET_WIPES.with(|count| count.set(count.get().saturating_add(1)));
     }
 }
 
@@ -157,19 +160,36 @@ mod tests {
     /// memory.
     #[test]
     fn drop_runs_the_wipe() {
-        let before = SECRET_WIPES.load(std::sync::atomic::Ordering::SeqCst);
+        let before = SECRET_WIPES.with(std::cell::Cell::get);
         {
             let secret = SecretString::new(SYNTHETIC_SECRET);
             assert_eq!(secret.expose(), SYNTHETIC_SECRET);
             // Drop explicitly so the assertion below is about this value.
             drop(secret);
         }
-        let after = SECRET_WIPES.load(std::sync::atomic::Ordering::SeqCst);
+        let after = SECRET_WIPES.with(std::cell::Cell::get);
         assert_eq!(
             after,
             before + 1,
             "dropping a SecretString must run the zeroing wipe exactly once"
         );
+    }
+
+    #[test]
+    fn other_test_threads_do_not_change_this_threads_wipe_observation(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let before = SECRET_WIPES.with(std::cell::Cell::get);
+        std::thread::spawn(|| {
+            for _ in 0..32 {
+                drop(SecretString::new(SYNTHETIC_SECRET));
+            }
+        })
+        .join()
+        .map_err(|_| "wipe observation fixture thread panicked")?;
+        assert_eq!(SECRET_WIPES.with(std::cell::Cell::get), before);
+        drop(SecretString::new(SYNTHETIC_SECRET));
+        assert_eq!(SECRET_WIPES.with(std::cell::Cell::get), before + 1);
+        Ok(())
     }
 
     /// The wipe zeroes the buffer in place (capacity is retained rather than
