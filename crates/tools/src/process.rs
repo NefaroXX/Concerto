@@ -209,8 +209,13 @@ impl ProcessHandle {
             command.process_group(0);
         }
 
-        let mut child = command.spawn().map_err(|e| ToolError::ExecutionFailed {
-            message: format!("failed to spawn process: {e}"),
+        // H02: spawn failure is an OS verdict (`NotFound` when the program
+        // is missing — the deterministic case — else a transient fault) —
+        // typed `Io`, classified by kind. The "failed to spawn process"
+        // verb rides the io payload, restored from the pre-typing message;
+        // kind preserved exactly.
+        let mut child = command.spawn().map_err(|e| {
+            ToolError::Io(std::io::Error::new(e.kind(), format!("failed to spawn process: {e}")))
         })?;
 
         let stdout = child.stdout.take();
@@ -470,6 +475,62 @@ mod tests {
             assert_eq!(std::env::var("CONCERTO_NATIVE_ALLOWED").expect("allowed"), "visible");
             println!("native-environment-ok");
         }
+    }
+
+    // verifies: H02 construction-site typing — spawn failure is typed Io.
+    /// Spawning a program that does not exist surfaces as the structural
+    /// `ToolError::Io` (`ErrorKind::NotFound`), never as marker-shaped
+    /// prose, and the pre-typing "failed to spawn process" verb rides the
+    /// io payload. Context presence never flips classification: the same
+    /// kind with only the bare OS text yields the identical ledger +
+    /// envelope disposition.
+    #[tokio::test]
+    async fn spawn_missing_binary_yields_typed_io_with_context() {
+        let directory = tempfile::tempdir().expect("project");
+        let root = Utf8Path::from_path(directory.path()).expect("UTF-8");
+        let error = ProcessHandle::run(
+            "/concerto_no_such_binary_for_spawn_test",
+            &[],
+            root,
+            Duration::from_secs(5),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("a missing binary must fail to spawn");
+        let kind = match &error {
+            ToolError::Io(io) => io.kind(),
+            other => panic!("expected typed ToolError::Io, got {other:?}"),
+        };
+        assert_eq!(kind, std::io::ErrorKind::NotFound, "the OS verdict is preserved");
+        let display = error.to_string();
+        assert!(display.contains("failed to spawn process"), "missing spawn verb: {display}");
+        assert!(error.is_deterministic_failure(), "the kind classifies structurally");
+        let failure = concerto_core::tool_failure::ToolFailure::from_error(
+            &error,
+            concerto_core::tool_failure::ToolFailureContext::builtin(),
+        );
+        assert_eq!(failure.code, "exec.io_error", "the envelope is typed");
+        assert_eq!(
+            failure.disposition,
+            concerto_core::tool_failure::ToolDisposition::DoNotReIssue,
+            "the disposition derives from the kind"
+        );
+        let bare =
+            ToolError::Io(std::io::Error::new(kind, "No such file or directory (os error 2)"));
+        assert_eq!(
+            error.is_deterministic_failure(),
+            bare.is_deterministic_failure(),
+            "classification is kind-for-kind, context text is inert"
+        );
+        let bare_failure = concerto_core::tool_failure::ToolFailure::from_error(
+            &bare,
+            concerto_core::tool_failure::ToolFailureContext::builtin(),
+        );
+        assert_eq!(failure.code, bare_failure.code, "same envelope code");
+        assert_eq!(
+            failure.disposition, bare_failure.disposition,
+            "same disposition with and without context text"
+        );
     }
 
     #[tokio::test]

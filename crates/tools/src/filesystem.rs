@@ -438,21 +438,32 @@ impl concerto_core::traits::tool::Tool for FilesystemTool {
                 }
 
                 if let Some(parent) = path.parent() {
+                    // H02: parent-dir creation is an OS verdict — typed `Io`
+                    // (`NotFound`/`PermissionDenied`/… classify
+                    // structurally). The pre-typing context (path +
+                    // workspace) rides the io payload; kind preserved
+                    // exactly, so classification is identical to the
+                    // bare-kind conversion.
                     std::fs::create_dir_all(parent.as_std_path()).map_err(|e| {
-                        ToolError::ExecutionFailed {
-                            message: format!(
-                                "failed to create parent directory for '{path_str}' in workspace '{root}': {e}"
+                        ToolError::Io(std::io::Error::new(
+                            e.kind(),
+                            format!(
+                                "failed to create parent directory for '{path_str}' \
+                                 in workspace '{root}': {e}"
                             ),
-                        }
+                        ))
                     })?;
                 }
 
                 std::fs::write(path.as_std_path(), content.as_ref()).map_err(|e| {
-                    ToolError::ExecutionFailed {
-                        message: format!(
-                            "failed to write '{path_str}' at '{path}' in workspace '{root}': {e}. Check that the selected project folder is writable and is not blocked by Windows Controlled Folder Access"
+                    ToolError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "failed to write '{path_str}' at '{path}' in workspace '{root}': \
+                             {e}. Check that the selected project folder is writable and is not \
+                             blocked by Windows Controlled Folder Access"
                         ),
-                    }
+                    ))
                 })?;
 
                 vfs.write(&path, content.into_owned())?;
@@ -475,10 +486,14 @@ impl concerto_core::traits::tool::Tool for FilesystemTool {
                 vfs.stage_delete(&path)?;
 
                 if path.as_std_path().exists() {
+                    // H02: disk delete is an OS verdict — typed `Io`. The
+                    // deleted path rides the io payload, restored from the
+                    // pre-typing message; kind preserved exactly.
                     std::fs::remove_file(path.as_std_path()).map_err(|e| {
-                        ToolError::ExecutionFailed {
-                            message: format!("failed to delete {path_str} from disk: {e}"),
-                        }
+                        ToolError::Io(std::io::Error::new(
+                            e.kind(),
+                            format!("failed to delete {path_str} from disk: {e}"),
+                        ))
                     })?;
                 }
 
@@ -514,11 +529,17 @@ impl concerto_core::traits::tool::Tool for FilesystemTool {
                 }
 
                 check_cancel(&cancel)?;
+                // H02: directory listing is an OS verdict — typed `Io`.
+                // The listed path + workspace ride the io payload, restored
+                // from the pre-typing message; kind preserved exactly.
                 let mut entries = std::fs::read_dir(path.as_std_path())
-                    .map_err(|error| ToolError::ExecutionFailed {
-                        message: format!(
-                            "failed to list '{path_str}' in workspace '{root}': {error}"
-                        ),
+                    .map_err(|error| {
+                        ToolError::Io(std::io::Error::new(
+                            error.kind(),
+                            format!(
+                                "failed to list '{path_str}' in workspace '{root}': {error}"
+                            ),
+                        ))
                     })?
                     .filter_map(Result::ok)
                     .map(|entry| {
@@ -570,12 +591,16 @@ impl concerto_core::traits::tool::Tool for FilesystemTool {
                 check_cancel(&cancel)?;
                 let dest_path = crate::common::resolve_path(root, Utf8Path::new(dest))?;
                 vfs.move_file(&path, &dest_path)?;
-                // Also perform the real filesystem rename
+                // Also perform the real filesystem rename.
+                // H02: typed `Io`. The source/destination ride the io
+                // payload, restored from the pre-typing message; kind
+                // preserved exactly.
                 if path.as_std_path().exists() {
                     std::fs::rename(path.as_std_path(), dest_path.as_std_path()).map_err(|e| {
-                        ToolError::ExecutionFailed {
-                            message: format!("failed to move '{path_str}' to '{dest}': {e}"),
-                        }
+                        ToolError::Io(std::io::Error::new(
+                            e.kind(),
+                            format!("failed to move '{path_str}' to '{dest}': {e}"),
+                        ))
                     })?;
                 }
                 Ok(ToolOutput {
@@ -595,12 +620,16 @@ impl concerto_core::traits::tool::Tool for FilesystemTool {
                 check_cancel(&cancel)?;
                 let dest_path = crate::common::resolve_path(root, Utf8Path::new(dest))?;
                 vfs.copy_file(&path, &dest_path)?;
-                // Also perform the real filesystem copy
+                // Also perform the real filesystem copy.
+                // H02: typed `Io`. The source/destination ride the io
+                // payload, restored from the pre-typing message; kind
+                // preserved exactly.
                 if path.as_std_path().exists() {
                     std::fs::copy(path.as_std_path(), dest_path.as_std_path()).map_err(|e| {
-                        ToolError::ExecutionFailed {
-                            message: format!("failed to copy '{path_str}' to '{dest}': {e}"),
-                        }
+                        ToolError::Io(std::io::Error::new(
+                            e.kind(),
+                            format!("failed to copy '{path_str}' to '{dest}': {e}"),
+                        ))
                     })?;
                 }
                 Ok(ToolOutput {
@@ -894,6 +923,157 @@ mod tests {
         assert!(message.contains("read"), "unexpected message: {message}");
         assert!(message.contains("write"), "unexpected message: {message}");
         assert!(message.contains("copy"), "unexpected message: {message}");
+    }
+
+    /// H02 construction-site typing: a write whose parent directory cannot
+    /// be created (a regular file blocks the path) surfaces as the
+    /// structural `ToolError::Io` — `is_deterministic_failure` holds by
+    /// `ErrorKind`, and the envelope derives `exec.io_error` /
+    /// `do-not-re-issue` without reading any message.
+    #[tokio::test]
+    async fn write_beneath_a_regular_file_yields_typed_io() {
+        let (tool, dir) = tool_and_dir();
+        std::fs::write(dir.path().join("blocker"), "x").unwrap();
+        let error = tool
+            .execute(
+                serde_json::json!({
+                    "operation": "write",
+                    "path": "blocker/child.txt",
+                    "content": "y"
+                }),
+                &test_policy(),
+                &session_for(dir.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        match &error {
+            ToolError::Io(io) => assert!(
+                matches!(
+                    io.kind(),
+                    std::io::ErrorKind::NotADirectory
+                        | std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::AlreadyExists
+                ),
+                "the OS verdict is preserved, got {:?}",
+                io.kind()
+            ),
+            other => panic!("expected typed ToolError::Io, got {other:?}"),
+        }
+        // Context restoration (H02 follow-up): the pre-typing operator
+        // context (target path + workspace) rides the io payload's Display.
+        let display = error.to_string();
+        assert!(
+            display.contains("failed to create parent directory"),
+            "missing op context: {display}"
+        );
+        assert!(display.contains("blocker/child.txt"), "missing path: {display}");
+        assert!(display.contains("in workspace"), "missing workspace: {display}");
+        assert!(error.is_deterministic_failure(), "the kind classifies structurally");
+        let failure = concerto_core::tool_failure::ToolFailure::from_error(
+            &error,
+            concerto_core::tool_failure::ToolFailureContext::builtin(),
+        );
+        assert_eq!(failure.code, "exec.io_error", "the envelope is typed: {failure:?}");
+        assert_eq!(
+            failure.disposition,
+            concerto_core::tool_failure::ToolDisposition::DoNotReIssue,
+            "the disposition derives from the kind"
+        );
+        assert!(!failure.opaque, "a builtin failure is never opaque");
+        // Context presence never flips classification: same kind, bare OS
+        // text only → identical ledger + envelope.
+        let kind = match &error {
+            ToolError::Io(io) => io.kind(),
+            other => panic!("expected typed ToolError::Io, got {other:?}"),
+        };
+        let bare = ToolError::Io(std::io::Error::new(kind, "os verdict"));
+        assert_eq!(
+            error.is_deterministic_failure(),
+            bare.is_deterministic_failure(),
+            "classification is kind-for-kind, context text is inert"
+        );
+        let bare_failure = concerto_core::tool_failure::ToolFailure::from_error(
+            &bare,
+            concerto_core::tool_failure::ToolFailureContext::builtin(),
+        );
+        assert_eq!(failure.code, bare_failure.code, "same envelope code");
+        assert_eq!(
+            failure.disposition, bare_failure.disposition,
+            "same disposition with and without context text"
+        );
+    }
+
+    /// H02 construction-site typing: a write targeting an existing directory
+    /// (the `std::fs::write` site) surfaces as the structural `ToolError::Io`
+    /// — classified by `ErrorKind` — and the pre-typing context (path +
+    /// workspace + writability/CFA coaching) rides the io payload. Context
+    /// presence never flips classification.
+    #[tokio::test]
+    async fn write_into_a_directory_path_yields_typed_io_with_context() {
+        let (tool, dir) = tool_and_dir();
+        std::fs::create_dir(dir.path().join("subdir")).unwrap();
+        let error = tool
+            .execute(
+                serde_json::json!({
+                    "operation": "write",
+                    "path": "subdir",
+                    "content": "y"
+                }),
+                &test_policy(),
+                &session_for(dir.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        let kind = match &error {
+            ToolError::Io(io) => {
+                let kind = io.kind();
+                assert!(
+                    matches!(
+                        kind,
+                        std::io::ErrorKind::IsADirectory | std::io::ErrorKind::PermissionDenied
+                    ),
+                    "the OS verdict is preserved, got {kind:?}"
+                );
+                kind
+            }
+            other => panic!("expected typed ToolError::Io, got {other:?}"),
+        };
+        let display = error.to_string();
+        assert!(display.contains("failed to write"), "missing op context: {display}");
+        assert!(display.contains("subdir"), "missing path: {display}");
+        assert!(display.contains("in workspace"), "missing workspace: {display}");
+        assert!(
+            display.contains("Windows Controlled Folder Access"),
+            "missing writability coaching: {display}"
+        );
+        assert!(error.is_deterministic_failure(), "the kind classifies structurally");
+        let failure = concerto_core::tool_failure::ToolFailure::from_error(
+            &error,
+            concerto_core::tool_failure::ToolFailureContext::builtin(),
+        );
+        assert_eq!(failure.code, "exec.io_error", "the envelope is typed: {failure:?}");
+        assert_eq!(
+            failure.disposition,
+            concerto_core::tool_failure::ToolDisposition::DoNotReIssue,
+            "the disposition derives from the kind"
+        );
+        let bare = ToolError::Io(std::io::Error::new(kind, "os verdict"));
+        assert_eq!(
+            error.is_deterministic_failure(),
+            bare.is_deterministic_failure(),
+            "classification is kind-for-kind, context text is inert"
+        );
+        let bare_failure = concerto_core::tool_failure::ToolFailure::from_error(
+            &bare,
+            concerto_core::tool_failure::ToolFailureContext::builtin(),
+        );
+        assert_eq!(failure.code, bare_failure.code, "same envelope code");
+        assert_eq!(
+            failure.disposition, bare_failure.disposition,
+            "same disposition with and without context text"
+        );
     }
 
     #[tokio::test]

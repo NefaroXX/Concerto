@@ -482,6 +482,14 @@ pub enum ToolError {
 /// `pub(crate)` so the envelope derives from the shared list instead of a
 /// copy.
 ///
+/// H02 construction-site typing (ADR-82 §1 INTERIM retired): no built-in
+/// construction site wraps a real `std::io::Error` in a message anymore —
+/// io-backed failures construct `ToolError::Io` and classify structurally by
+/// `ErrorKind`. These markers therefore match only validation-prose
+/// preconditions (which carry no underlying error value) and opaque
+/// third-party text (plugin/MCP bridges, agent-reported prose) — never an
+/// OS verdict.
+///
 /// Deliberately conservative: transport-shaped faults (connection reset,
 /// timeout, 429/5xx) and anything unrecognized return `false`, because a
 /// false "impossible" blocks a retry that could have succeeded, while a
@@ -564,6 +572,12 @@ impl ToolError {
     /// Policy denials, approvals, cancellations, timeouts, LSP faults and
     /// ordinary execution faults return `false`: they are either not failures
     /// at all or may resolve on a re-run.
+    ///
+    /// H02 note: the [`ToolError::ExecutionFailed`] message arm below covers
+    /// only validation prose (no underlying error value) and opaque
+    /// third-party text — every io-backed built-in site constructs
+    /// [`ToolError::Io`] and classifies structurally by `ErrorKind`, so no
+    /// OS verdict reaches a message match on the native path.
     pub fn is_deterministic_failure(&self) -> bool {
         match self {
             // Structural facts of the environment or of the request: the

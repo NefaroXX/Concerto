@@ -71,9 +71,14 @@ impl NativeProcessTool {
         if timeout == 0 || timeout > self.security.timeout_secs {
             return Err(denied("shell_timeout_limit"));
         }
-        let root = session.project_dir.canonicalize().map_err(|e| invalid(e.to_string()))?;
+        // H02: workspace-root / cwd canonicalization fails only on OS
+        // grounds — typed `Io`, classified by kind. No context restoration
+        // needed: the pre-typing site was `invalid(e.to_string())` — a bare
+        // `ExecutionFailed` carrying only the OS text, so the `Io` Display
+        // is message-identical to what shipped before typing.
+        let root = session.project_dir.canonicalize().map_err(ToolError::Io)?;
         let cwd = input.cwd.as_ref().map_or_else(|| root.clone(), |p| root.join(p));
-        let cwd = cwd.canonicalize().map_err(|e| invalid(e.to_string()))?;
+        let cwd = cwd.canonicalize().map_err(ToolError::Io)?;
         if !cwd.starts_with(&root) || !cwd.is_dir() {
             return Err(denied("shell_cwd_outside_project"));
         }
@@ -205,8 +210,9 @@ fn is_interpreter(path: &Path) -> bool {
 fn is_script(path: &Path) -> Result<bool, ToolError> {
     use std::io::Read;
     let mut header = [0; 2];
-    let mut file = std::fs::File::open(path).map_err(|e| invalid(e.to_string()))?;
-    let count = file.read(&mut header).map_err(|e| invalid(e.to_string()))?;
+    // H02: probing the executable header is an OS verdict — typed `Io`.
+    let mut file = std::fs::File::open(path).map_err(ToolError::Io)?;
+    let count = file.read(&mut header).map_err(ToolError::Io)?;
     Ok(count == 2 && header == *b"#!")
 }
 

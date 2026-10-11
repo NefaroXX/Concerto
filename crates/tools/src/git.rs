@@ -625,8 +625,13 @@ mod cli_fallback {
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
 
-        let mut child = command.spawn().map_err(|e| ToolError::ExecutionFailed {
-            message: format!("failed to execute git: {e}"),
+        // H02: `git` spawn failure (missing binary, OS refusal) is an OS
+        // verdict — typed `Io`. A non-zero `git` exit stays `ExecutionFailed`
+        // (it carries git's stderr, not an OS error). The "failed to execute
+        // git" verb rides the io payload, restored from the pre-typing
+        // message; kind preserved exactly.
+        let mut child = command.spawn().map_err(|e| {
+            ToolError::Io(std::io::Error::new(e.kind(), format!("failed to execute git: {e}")))
         })?;
 
         let stdout = child.stdout.take();
@@ -1042,6 +1047,62 @@ mod tests {
         let facts = GitTool.path_facts(&input, &session).expect("facts are produced");
         assert_eq!(facts.attempted_path.as_deref(), outside.path().to_str());
         assert!(facts.resolved_path.is_none(), "an out-of-root repo_path must not resolve");
+    }
+
+    // ---- H02 construction-site typing: git CLI spawn ----------------------
+
+    /// A `git` spawn failure (here: the repo directory does not exist, so
+    /// the child fails before exec) surfaces as the structural
+    /// `ToolError::Io` — classified by `ErrorKind`, never by message
+    /// markers — and the pre-typing "failed to execute git" verb rides the
+    /// io payload. Context presence never flips classification: the same
+    /// kind with only the bare OS text yields the identical ledger +
+    /// envelope disposition.
+    #[tokio::test]
+    async fn git_spawn_failure_yields_typed_io_with_context() {
+        let cancel = CancellationToken::new();
+        let error = cli_fallback::run_git(
+            "/concerto_no_such_repo_dir_for_git_spawn_test",
+            &["status"],
+            &cancel,
+            Duration::from_secs(GIT_TIMEOUT_SECS),
+        )
+        .await
+        .expect_err("spawn in a missing repo dir must fail");
+        let kind = match &error {
+            ToolError::Io(io) => io.kind(),
+            other => panic!("expected typed ToolError::Io, got {other:?}"),
+        };
+        assert_eq!(kind, std::io::ErrorKind::NotFound, "the OS verdict is preserved");
+        let display = error.to_string();
+        assert!(display.contains("failed to execute git"), "missing spawn verb: {display}");
+        assert!(error.is_deterministic_failure(), "the kind classifies structurally");
+        let failure = concerto_core::tool_failure::ToolFailure::from_error(
+            &error,
+            concerto_core::tool_failure::ToolFailureContext::builtin(),
+        );
+        assert_eq!(failure.code, "exec.io_error", "the envelope is typed");
+        assert_eq!(
+            failure.disposition,
+            concerto_core::tool_failure::ToolDisposition::DoNotReIssue,
+            "the disposition derives from the kind"
+        );
+        let bare =
+            ToolError::Io(std::io::Error::new(kind, "No such file or directory (os error 2)"));
+        assert_eq!(
+            error.is_deterministic_failure(),
+            bare.is_deterministic_failure(),
+            "classification is kind-for-kind, context text is inert"
+        );
+        let bare_failure = concerto_core::tool_failure::ToolFailure::from_error(
+            &bare,
+            concerto_core::tool_failure::ToolFailureContext::builtin(),
+        );
+        assert_eq!(failure.code, bare_failure.code, "same envelope code");
+        assert_eq!(
+            failure.disposition, bare_failure.disposition,
+            "same disposition with and without context text"
+        );
     }
 
     /// Stage worktree changes via the system `git` binary (used only in tests,

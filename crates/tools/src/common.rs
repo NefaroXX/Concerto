@@ -115,12 +115,20 @@ pub fn resolve_path(root: &Utf8Path, user_path: &Utf8Path) -> Result<Utf8PathBuf
             return resolve_lexically(root, user_path);
         }
         Err(error) => {
-            return Err(ToolError::ExecutionFailed {
-                message: format!(
-                    "cannot access workspace root '{}': {error}. Choose an existing folder that Concerto can read and write",
-                    root
+            // H02 construction-site typing: the workspace root could not be
+            // reached by the OS (`NotFound`, `PermissionDenied`, …) — a
+            // structural `ToolError::Io` classified by `ErrorKind`, never by
+            // message markers. F-root resolution: the pre-typing operator
+            // context (root path + folder-choice coaching) rides the io
+            // payload; the kind is preserved exactly, so classification is
+            // identical to the bare-kind conversion.
+            return Err(ToolError::Io(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot access workspace root '{root}': {error}. \
+                     Choose an existing folder that Concerto can read and write"
                 ),
-            })
+            )));
         }
     };
     let root_canonical = Utf8PathBuf::from_path_buf(root_canonical_buf).map_err(|_| {
@@ -176,12 +184,15 @@ fn resolve_lexically(root: &Utf8Path, user_path: &Utf8Path) -> Result<Utf8PathBu
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
             Err(error) => {
-                return Err(ToolError::ExecutionFailed {
-                    message: format!(
-                        "cannot inspect workspace path '{}': {error}",
-                        current.display()
-                    ),
-                })
+                // H02: `symlink_metadata` failure is an OS verdict
+                // (`NotFound` when the component vanished mid-walk, …) —
+                // typed `Io`, classified by kind. The inspected path
+                // (`current`) rides the io payload, restored from the
+                // pre-typing message; kind preserved exactly.
+                return Err(ToolError::Io(std::io::Error::new(
+                    error.kind(),
+                    format!("cannot inspect workspace path '{}': {error}", current.display()),
+                )));
             }
         }
     }
@@ -192,8 +203,14 @@ fn resolve_lexically(root: &Utf8Path, user_path: &Utf8Path) -> Result<Utf8PathBu
 }
 
 fn lexical_normalize(path: &std::path::Path) -> Result<std::path::PathBuf, ToolError> {
-    let absolute = std::path::absolute(path).map_err(|error| ToolError::ExecutionFailed {
-        message: format!("cannot make workspace path '{}' absolute: {error}", path.display()),
+    // H02: `std::path::absolute` fails only on OS-level grounds — typed
+    // `Io`. The workload path rides the io payload, restored from the
+    // pre-typing message; kind preserved exactly.
+    let absolute = std::path::absolute(path).map_err(|error| {
+        ToolError::Io(std::io::Error::new(
+            error.kind(),
+            format!("cannot make workspace path '{}' absolute: {error}", path.display()),
+        ))
     })?;
     let mut normalized = std::path::PathBuf::new();
     for component in absolute.components() {
@@ -396,6 +413,75 @@ mod tests {
         let result = resolve_lexically(&root, Utf8Path::new("../outside.txt"));
         assert!(matches!(result, Err(ToolError::VirtualFsConflict { .. })));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// H02 construction-site typing: a workspace root the OS cannot reach
+    /// surfaces as the structural `ToolError::Io` (classified by
+    /// `ErrorKind::NotFound`), never as marker-shaped prose — and the typed
+    /// envelope derives `exec.io_error` / `do-not-re-issue` from the kind.
+    #[test]
+    fn missing_workspace_root_yields_typed_io_not_prose() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let missing = Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
+            "concerto_no_such_root_{}_{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )))
+        .expect("temp path is valid UTF-8");
+        assert!(!missing.as_std_path().exists(), "the root must genuinely be absent");
+        let error =
+            resolve_path(&missing, Utf8Path::new("x.txt")).expect_err("missing root must fail");
+        let kind = match &error {
+            ToolError::Io(io) => io.kind(),
+            other => panic!("expected typed ToolError::Io, got {other:?}"),
+        };
+        assert_eq!(kind, std::io::ErrorKind::NotFound, "the OS verdict is preserved");
+        // Context restoration (H02 follow-up): the pre-typing operator
+        // context — root path + folder-choice coaching — rides the io
+        // payload's Display.
+        let display = error.to_string();
+        assert!(display.contains("cannot access workspace root"), "missing op context: {display}");
+        assert!(display.contains(missing.as_str()), "missing root path: {display}");
+        assert!(
+            display.contains("Choose an existing folder that Concerto can read and write"),
+            "missing coaching hint: {display}"
+        );
+        assert!(
+            error.is_deterministic_failure(),
+            "NotFound classifies structurally, with no marker read"
+        );
+        let failure = concerto_core::tool_failure::ToolFailure::from_error(
+            &error,
+            concerto_core::tool_failure::ToolFailureContext::builtin(),
+        );
+        assert_eq!(failure.code, "exec.io_error", "the envelope is typed");
+        assert_eq!(
+            failure.disposition,
+            concerto_core::tool_failure::ToolDisposition::DoNotReIssue,
+            "the disposition derives from the kind"
+        );
+        assert!(!failure.opaque, "a builtin failure is never opaque");
+        // Context presence never flips classification: the same kind with
+        // only the bare OS text yields the identical ledger + envelope.
+        let bare = ToolError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No such file or directory (os error 2)",
+        ));
+        assert_eq!(
+            error.is_deterministic_failure(),
+            bare.is_deterministic_failure(),
+            "classification is kind-for-kind, context text is inert"
+        );
+        let bare_failure = concerto_core::tool_failure::ToolFailure::from_error(
+            &bare,
+            concerto_core::tool_failure::ToolFailureContext::builtin(),
+        );
+        assert_eq!(failure.code, bare_failure.code, "same envelope code");
+        assert_eq!(
+            failure.disposition, bare_failure.disposition,
+            "same disposition with and without context text"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -35,15 +35,17 @@ impl UndoManager {
 
     /// Create a git stash for the given session/task.
     ///
-    /// Returns `ToolError::ExecutionFailed` if the git commands fail.
+    /// Returns [`ToolError::Io`] when the `git` binary itself cannot be
+    /// spawned (H02 construction-site typing); a failing-but-spawned `git`
+    /// (non-zero exit) still surfaces its stderr as `ExecutionFailed`.
     pub fn commit(&mut self, session_id: Ulid, task_id: TaskId) -> Result<(), ToolError> {
         // Ensure we are inside a git repository.
         let rev_parse = Command::new("git")
             .args(["rev-parse", "--git-dir"])
             .current_dir(&self.project_dir)
             .output();
-        let rev_output = rev_parse.map_err(|e| ToolError::ExecutionFailed {
-            message: format!("git rev-parse failed: {e}"),
+        let rev_output = rev_parse.map_err(|e| {
+            ToolError::Io(std::io::Error::new(e.kind(), format!("git rev-parse failed: {e}")))
         })?;
         if !rev_output.status.success() {
             return Err(ToolError::ExecutionFailed {
@@ -57,8 +59,8 @@ impl UndoManager {
             .args(["stash", "push", "-m", &stash_msg])
             .current_dir(&self.project_dir)
             .output()
-            .map_err(|e| ToolError::ExecutionFailed {
-                message: format!("git stash push failed: {e}"),
+            .map_err(|e| {
+                ToolError::Io(std::io::Error::new(e.kind(), format!("git stash push failed: {e}")))
             })?;
         if !stash.status.success() {
             return Err(ToolError::ExecutionFailed {
@@ -176,6 +178,56 @@ mod tests {
         init_git_repo(tmp.path());
         let mgr = UndoManager::new(tmp.path());
         assert!(mgr.list().is_empty());
+    }
+
+    /// H02 construction-site typing: a `git` spawn failure (here: the
+    /// project directory does not exist, so the child fails before exec)
+    /// surfaces as the structural `ToolError::Io` — classified by
+    /// `ErrorKind`, never by message markers — with the pre-typing
+    /// "git rev-parse failed" verb riding the io payload. Context presence
+    /// never flips classification: the same kind with only the bare OS text
+    /// yields the identical ledger + envelope disposition.
+    #[test]
+    fn commit_spawn_failure_yields_typed_io_with_context() {
+        let mut mgr = UndoManager::new("/concerto_no_such_project_dir_for_undo_test");
+        let error =
+            mgr.commit(Ulid::new(), TaskId::new()).expect_err("missing project dir must fail");
+        let kind = match &error {
+            ToolError::Io(io) => io.kind(),
+            other => panic!("expected typed ToolError::Io, got {other:?}"),
+        };
+        assert_eq!(kind, std::io::ErrorKind::NotFound, "the OS verdict is preserved");
+        let display = error.to_string();
+        assert!(display.contains("git rev-parse failed"), "missing spawn verb: {display}");
+        assert!(error.is_deterministic_failure(), "the kind classifies structurally");
+        let failure = concerto_core::tool_failure::ToolFailure::from_error(
+            &error,
+            concerto_core::tool_failure::ToolFailureContext::builtin(),
+        );
+        assert_eq!(failure.code, "exec.io_error", "the envelope is typed");
+        assert_eq!(
+            failure.disposition,
+            concerto_core::tool_failure::ToolDisposition::DoNotReIssue,
+            "the disposition derives from the kind"
+        );
+        let bare = ToolError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No such file or directory (os error 2)",
+        ));
+        assert_eq!(
+            error.is_deterministic_failure(),
+            bare.is_deterministic_failure(),
+            "classification is kind-for-kind, context text is inert"
+        );
+        let bare_failure = concerto_core::tool_failure::ToolFailure::from_error(
+            &bare,
+            concerto_core::tool_failure::ToolFailureContext::builtin(),
+        );
+        assert_eq!(failure.code, bare_failure.code, "same envelope code");
+        assert_eq!(
+            failure.disposition, bare_failure.disposition,
+            "same disposition with and without context text"
+        );
     }
 
     #[test]
