@@ -170,15 +170,30 @@ pub struct AgentLoop {
     /// `generation_for`); `verification_epoch` counts the run's audited
     /// file-affecting mutations (the existing audited-write path,
     /// [`Self::record_tool_fact`]). The current generation stamped on checks
-    /// and compared at the gate is `{base}#{epoch}`: any executed mutation
-    /// after a check advances the epoch and stales the check, which is the
-    /// run-scoped projection of ADR-65 F-SUPERSEDE / F-WORKSPACE-SUPERSEDE /
-    /// F-GENERATION over the existing invalidation data — not a second
-    /// invalidation mechanism. A freshness evaluation is a fact evaluation,
-    /// never a dispatch rule (ADR-65 authority boundary, ADR-71 intact).
+    /// is `{base}#{epoch}`; at the gate a differing base reports
+    /// [`FreshnessFailure::Generation`] (F-GENERATION), while a differing
+    /// epoch under the same base is the supersession axis, decided
+    /// positionally per record scope: a file-scope record stales only when
+    /// its own canonical path's last-write epoch ([`Self::path_write_epoch`])
+    /// advanced past the epoch it was stamped at (ADR-65 F-SUPERSEDE), and a
+    /// workspace/project/run-scope record — naming no single artifact —
+    /// stales on any executed mutation (ADR-65 F-WORKSPACE-SUPERSEDE). This
+    /// is the run-scoped projection of ADR-65 over the existing invalidation
+    /// data — not a second invalidation mechanism. A freshness evaluation is
+    /// a fact evaluation, never a dispatch rule (ADR-65 authority boundary,
+    /// ADR-71 intact).
     verification_base_generation: String,
     /// See [`Self::verification_base_generation`]: audited mutations this run.
     verification_epoch: u64,
+    /// ADR-82 H04: the run epoch of the last executed file-affecting write to
+    /// each canonical project path (ADR-65 F5d key space — the same canonical
+    /// keys [`Self::run_write_evidence`] evidence matching uses), advanced
+    /// together with [`Self::verification_epoch`] on the audited-write path.
+    /// It answers the ADR-65 F-SUPERSEDE question positionally — "was THIS
+    /// record's own path re-written after its check?" — so a pass on one
+    /// file survives later writes to other files in the same run. Empty when
+    /// the gate is off or no write ran.
+    path_write_epoch: HashMap<String, u64>,
     /// `(tool-reported path spelling, whiteboard event id)` of every executed
     /// file-affecting write this run, in order. The sweep stamps the matching
     /// subset as a record's `evidence_ids`, so every cited id references an
@@ -320,8 +335,11 @@ enum FreshnessFailure {
     /// ADR-65 F-GENERATION (conservative reset) / A-GENERATION-ROW.
     Generation,
     /// Same generation base, but the run's mutation epoch advanced past the
-    /// check: a relevant audited mutation landed after the check ran. ADR-65
-    /// F-SUPERSEDE / F-WORKSPACE-SUPERSEDE as projected by the run clock.
+    /// check: a relevant audited mutation landed after the check ran. Which
+    /// mutations count is decided per record scope — a file-scope record is
+    /// superseded only by a re-write of its OWN path (ADR-65 F-SUPERSEDE,
+    /// positional), a workspace/project/run-scope record by any executed
+    /// write (ADR-65 F-WORKSPACE-SUPERSEDE) — as projected by the run clock.
     Superseded,
     /// The checked bytes on disk no longer hash to the recorded fingerprint:
     /// the file changed (or vanished) outside the audited write path — the
@@ -614,6 +632,7 @@ impl AgentLoop {
             strict_verification_gate: false,
             verification_base_generation: String::new(),
             verification_epoch: 0,
+            path_write_epoch: HashMap::new(),
             run_write_evidence: Vec::new(),
         }
     }
@@ -709,6 +728,7 @@ impl AgentLoop {
         // byte-identical behavior.
         self.verification_base_generation.clear();
         self.verification_epoch = 0;
+        self.path_write_epoch.clear();
         self.run_write_evidence.clear();
         if self.strict_verification_gate {
             self.arm_verification_clock(cancel.clone()).await;
@@ -3418,8 +3438,11 @@ impl AgentLoop {
     /// supersession signal (a failed or interrupted write still advances: it
     /// ran and may have mutated unpredictably, the same conservative rule the
     /// derived store applies in `invalidate_on_write`; a `Denied` refusal
-    /// never executed and advances nothing). Gate off: no clock movement at
-    /// all, so the default path stays byte-identical.
+    /// never executed and advances nothing). Each written path's canonical
+    /// key additionally records the epoch it was last written at, so the
+    /// gate's F-SUPERSEDE arm can ask positionally whether a record's OWN
+    /// path moved after its check. Gate off: no clock movement at all, so
+    /// the default path stays byte-identical.
     #[allow(clippy::too_many_arguments)]
     async fn record_tool_fact(
         &mut self,
@@ -3473,6 +3496,14 @@ impl AgentLoop {
             && !matches!(outcome, ToolOutcome::Denied)
         {
             self.verification_epoch = self.verification_epoch.saturating_add(1);
+            let epoch = self.verification_epoch;
+            for path in &paths {
+                if let Some(canonical) =
+                    crate::tool_facts::canonical_project_path(&self.project_root, path)
+                {
+                    self.path_write_epoch.insert(canonical, epoch);
+                }
+            }
             if let Some(event_id) = &event_id {
                 for path in &paths {
                     self.run_write_evidence.push((path.clone(), event_id.clone()));
@@ -3595,13 +3626,23 @@ impl AgentLoop {
     ///   [`VerificationSummary::is_passing_evidence`] (ADR-82 §3 R2); anything
     ///   short of that (legacy `None`-outcome rows included) reports
     ///   [`FreshnessFailure::MissingAxes`], never a pass.
-    /// - (d+e) the record's generation equals the run's current generation:
-    ///   same base with an advanced epoch means a relevant audited mutation
-    ///   landed after the check ([`FreshnessFailure::Superseded`], ADR-65
-    ///   F-SUPERSEDE / F-WORKSPACE-SUPERSEDE as projected by the run clock,
-    ///   fed by the existing `resource_facts` dirty/supersession writes on the
-    ///   audited path); a differing base means the workspace generation moved
-    ///   on ([`FreshnessFailure::Generation`], ADR-65 F-GENERATION).
+    /// - (d+e) the record's generation equals the run's current generation;
+    ///   the two ways they can differ report distinctly:
+    ///   - a differing base means the workspace generation moved on
+    ///     ([`FreshnessFailure::Generation`], ADR-65 F-GENERATION).
+    ///   - the same base with an advanced epoch is the supersession axis
+    ///     ([`FreshnessFailure::Superseded`], ADR-65 F-SUPERSEDE /
+    ///     F-WORKSPACE-SUPERSEDE as projected by the run clock, fed by the
+    ///     existing `resource_facts` dirty/supersession writes on the audited
+    ///     path). Supersession is positional, not sticky: a FILE-SCOPE record
+    ///     (the sweep — its `scope` names the single checked file) is
+    ///     superseded only when its own canonical path was written again
+    ///     after the check ([`Self::superseded_at_epoch`]); an epoch advance
+    ///     that landed on OTHER paths leaves it describing what it checked,
+    ///     so it falls through to the fingerprint re-stat below. A
+    ///     WORKSPACE-SCOPE record (the eval harness — its scope names no
+    ///     single file) has no path to key on and stales on any executed
+    ///     write.
     /// - (d, out-of-band) the checked bytes still hash to the recorded
     ///   fingerprint ([`FreshnessFailure::Fingerprint`]): the ADR-65 F3-style
     ///   live re-stat over the existing fingerprint axis, closing the
@@ -3617,23 +3658,63 @@ impl AgentLoop {
         }
         let current = self.current_verification_generation();
         if record.generation != current {
-            let stale_by_epoch =
-                match (split_run_generation(&record.generation), split_run_generation(&current)) {
-                    (Some((record_base, _)), Some((current_base, _))) => {
-                        record_base == current_base
+            match (split_run_generation(&record.generation), split_run_generation(&current)) {
+                (Some((record_base, record_epoch)), Some((current_base, _)))
+                    if record_base == current_base =>
+                {
+                    // Same workspace base with an advanced epoch: the
+                    // supersession axis. Positional per record scope — see
+                    // the (d+e) clause above; a record that survived its own
+                    // path keeps standing and falls through to the
+                    // fingerprint re-stat.
+                    if self.superseded_at_epoch(record, record_epoch) {
+                        return Err(FreshnessFailure::Superseded);
                     }
-                    _ => false,
-                };
-            return Err(if stale_by_epoch {
-                FreshnessFailure::Superseded
-            } else {
-                FreshnessFailure::Generation
-            });
+                }
+                _ => return Err(FreshnessFailure::Generation),
+            }
         }
         if !self.fingerprint_matches(record) {
             return Err(FreshnessFailure::Fingerprint);
         }
         Ok(())
+    }
+
+    /// ADR-65 scope split over the run clock: has an audited write superseded
+    /// this record, given the epoch (`record_epoch`) the record was stamped
+    /// at?
+    ///
+    /// A file-scope record ([`Self::is_file_scope_record`]) answers
+    /// positionally — superseded only when its own canonical path's
+    /// last-write epoch ([`Self::path_write_epoch`], ADR-65 F5d keys)
+    /// advanced past the record's epoch (F-SUPERSEDE). A workspace/project/
+    /// run-scope record names no single artifact, so any executed write past
+    /// its epoch supersedes it (F-WORKSPACE-SUPERSEDE). A path with no
+    /// canonical in-root key has nothing to compare positionally, so it
+    /// conservatively takes the workspace rule — never the fail-open one.
+    fn superseded_at_epoch(&self, record: &VerificationSummary, record_epoch: u64) -> bool {
+        if !self.is_file_scope_record(record) {
+            return true;
+        }
+        let Some(canonical) =
+            crate::tool_facts::canonical_project_path(&self.project_root, record.path.as_str())
+        else {
+            return true;
+        };
+        self.path_write_epoch.get(&canonical).is_some_and(|last_write| *last_write > record_epoch)
+    }
+
+    /// Whether `record` is file-scope for supersession (ADR-65 F-SUPERSEDE):
+    /// its `scope` names the single checked file — resolved the same way the
+    /// sweep hashes it ([`resolve_verification_path`]). A scope that names
+    /// anything else (the eval harness's workspace/eval-root scope — a
+    /// project, run, or directory — or a path that is not an existing file)
+    /// names no single artifact to key staleness on, so the record is
+    /// workspace-scope (F-WORKSPACE-SUPERSEDE). The check runs only when the
+    /// supersession axis is reached, keeping the common fresh path I/O-free.
+    fn is_file_scope_record(&self, record: &VerificationSummary) -> bool {
+        let scope = Utf8PathBuf::from(record.scope.as_str());
+        resolve_verification_path(&self.project_root, &scope).is_file()
     }
 
     /// Re-stat the checked file and compare its blake3 against the recorded
@@ -9345,6 +9426,7 @@ mod tests {
     fn arm_test_clock(loop_: &mut AgentLoop, base: &str) {
         loop_.verification_base_generation = base.to_owned();
         loop_.verification_epoch = 0;
+        loop_.path_write_epoch.clear();
         loop_.run_write_evidence.clear();
     }
 
@@ -9857,6 +9939,228 @@ mod tests {
         for token in ["freshness=stale", "superseded"] {
             assert!(reason.contains(token), "Blocked reason must carry `{token}`: {reason}");
         }
+    }
+
+    /// Flag on (H04 F-SUPERSEDE, positional): a fresh sweep pass on
+    /// `page_a.html` SURVIVES a later audited write to an unrelated
+    /// `page_b.html` in the same run — the cross-file false-staleness
+    /// regression: the global-epoch clock used to stale every earlier pass
+    /// on any later write, making multi-file tasks unsatisfiable. Only a
+    /// re-write of the record's OWN path supersedes it (see
+    /// `strict_gate_on_supersedes_file_pass_after_same_file_rewrite`); the
+    /// gate stays satisfied with the `page_a` pass still fresh.
+    #[tokio::test]
+    async fn strict_gate_on_keeps_file_pass_fresh_after_unrelated_file_write() {
+        let (_db_dir, pool) = test_pool().await;
+        let root = tempfile::tempdir().expect("root tempdir created");
+        std::fs::write(root.path().join("page_a.html"), "<html><body>a</body></html>\n")
+            .expect("fixture a written");
+        std::fs::write(root.path().join("page_b.html"), "<html><body>b</body></html>\n")
+            .expect("fixture b written");
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_dir(
+            provider,
+            approval,
+            4,
+            root.path().to_str().expect("tempdir path is UTF-8"),
+        )
+        .with_strict_verification_gate(true)
+        .with_tool_facts(Some(ToolFactContext::new(Some(pool.clone()), "single-agent".to_owned())));
+        // Production arming: content-addressed base from the live workspace.
+        loop_.arm_verification_clock(CancellationToken::new()).await;
+        let task = AgentTask::new_action_required(Ulid::new(), "write two pages");
+        // The page_a write and its sweep (the record cites the write event).
+        record_test_write(&mut loop_, root.path(), &task, "page_a.html").await;
+        let records = verify_file_changes(
+            &[Utf8PathBuf::from("page_a.html")],
+            root.path(),
+            &loop_.verification_stamp(),
+        )
+        .await;
+        assert_eq!(records.len(), 1, "the sweep must check the written file");
+        assert!(
+            records[0].is_passing_evidence(),
+            "premise: the fresh sweep record is passing evidence: {:?}",
+            records[0]
+        );
+        let output = fresh_gate_output("page_a.html", records.clone());
+        let premise = loop_.decide_exit(&task, &output, 1, 1, 0, &None, true, Vec::new()).unwrap();
+        assert!(premise.is_none(), "premise: the fresh pass satisfies the gate");
+        // A later audited write to a DIFFERENT file must not stale the
+        // page_a pass (the regression this test pins).
+        record_test_write(&mut loop_, root.path(), &task, "page_b.html").await;
+        let decision = loop_.decide_exit(&task, &output, 1, 1, 0, &None, true, Vec::new()).unwrap();
+        assert!(decision.is_none(), "an unrelated write must not supersede the page_a pass");
+        assert_eq!(
+            loop_.record_freshness(&records[0]),
+            Ok(()),
+            "the page_a pass must still evaluate fresh after the page_b write"
+        );
+        let ledger = loop_.evaluate_gate_ledger(&output);
+        assert_eq!(ledger.fresh, 1, "the fresh pass must still count at the gate");
+    }
+
+    /// Flag on (H04 F-SUPERSEDE, same-file half): a fresh sweep pass IS
+    /// superseded when its OWN file is written again later in the run — the
+    /// positional rule still fires, no regression from the cross-file fix.
+    /// The file bytes are untouched, so only the supersession signal fires.
+    #[tokio::test]
+    async fn strict_gate_on_supersedes_file_pass_after_same_file_rewrite() {
+        let (_db_dir, pool) = test_pool().await;
+        let root = tempfile::tempdir().expect("root tempdir created");
+        std::fs::write(root.path().join("page_a.html"), "<html><body>a</body></html>\n")
+            .expect("fixture written");
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_dir(
+            provider,
+            approval,
+            4,
+            root.path().to_str().expect("tempdir path is UTF-8"),
+        )
+        .with_strict_verification_gate(true)
+        .with_tool_facts(Some(ToolFactContext::new(Some(pool.clone()), "single-agent".to_owned())));
+        loop_.arm_verification_clock(CancellationToken::new()).await;
+        let task = AgentTask::new_action_required(Ulid::new(), "write the page");
+        record_test_write(&mut loop_, root.path(), &task, "page_a.html").await;
+        let records = verify_file_changes(
+            &[Utf8PathBuf::from("page_a.html")],
+            root.path(),
+            &loop_.verification_stamp(),
+        )
+        .await;
+        assert_eq!(records.len(), 1, "the sweep must check the written file");
+        let output = fresh_gate_output("page_a.html", records);
+        let premise = loop_.decide_exit(&task, &output, 1, 1, 0, &None, true, Vec::new()).unwrap();
+        assert!(premise.is_none(), "premise: the fresh pass satisfies the gate");
+        // A re-write of the SAME file supersedes the earlier pass.
+        record_test_write(&mut loop_, root.path(), &task, "page_a.html").await;
+        let decision = loop_.decide_exit(&task, &output, 1, 1, 0, &None, true, Vec::new()).unwrap();
+        let reason = match decision {
+            Some(AgentRunExit::Blocked { reason, .. }) => reason,
+            other => panic!("a same-file rewrite must supersede the pass, got {other:?}"),
+        };
+        for token in ["freshness=stale", "superseded"] {
+            assert!(reason.contains(token), "Blocked reason must carry `{token}`: {reason}");
+        }
+    }
+
+    /// Flag on (H04 F-WORKSPACE-SUPERSEDE): a workspace/run-scope record —
+    /// the eval harness's shape, whose scope names no single checked file —
+    /// stays keyed on the GLOBAL epoch: an unrelated `page_b.html` write
+    /// supersedes it. Guards the path-aware fix did not leak file-scope
+    /// semantics onto the harness path. Production harness records stay
+    /// display-grade on the fingerprint axis; this record carries the full
+    /// R2 set so the supersession rule itself is what decides.
+    #[tokio::test]
+    async fn strict_gate_on_supersedes_workspace_scope_record_on_unrelated_write() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        std::fs::write(dir.path().join("hello.html"), "<html><body>hi</body></html>\n")
+            .expect("fixture written");
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_dir(
+            provider,
+            approval,
+            4,
+            dir.path().to_str().expect("tempdir path is UTF-8"),
+        )
+        .with_strict_verification_gate(true);
+        arm_test_clock(&mut loop_, "test-base");
+        let task = AgentTask::new_action_required(Ulid::new(), "write the page");
+        let bytes = std::fs::read(dir.path().join("hello.html")).expect("fixture readable");
+        let record = VerificationSummary::passed("eval", "eval", "ok")
+            .with_verifier(EVAL_HARNESS_VERIFIER)
+            .with_scope("eval")
+            .with_content_fingerprint(blake3::hash(&bytes).to_hex().to_string())
+            .with_generation("test-base#0")
+            .with_evidence_ids(vec!["ev-1".to_owned()]);
+        assert!(
+            record.is_passing_evidence(),
+            "premise: the workspace-scope record carries the full R2 freshness set"
+        );
+        let output = fresh_gate_output("hello.html", vec![record]);
+        // An executed write to an unrelated path advances the run clock; a
+        // workspace-scope record has no single path to survive behind.
+        record_test_write(&mut loop_, dir.path(), &task, "page_b.html").await;
+        let decision = loop_.decide_exit(&task, &output, 1, 1, 0, &None, true, Vec::new()).unwrap();
+        let reason = match decision {
+            Some(AgentRunExit::Blocked { reason, .. }) => reason,
+            other => {
+                panic!("a workspace-scope pass superseded by any write must exit Blocked, got {other:?}")
+            }
+        };
+        for token in ["freshness=stale", "superseded"] {
+            assert!(reason.contains(token), "Blocked reason must carry `{token}`: {reason}");
+        }
+    }
+
+    /// Flag on (H04 satisfiability, multi-file/rounded): writing `page_a` and
+    /// `page_b` across two rounds and sweeping each leaves BOTH passes fresh
+    /// at exit — the cross-round accumulated ledger (merged by path+command
+    /// exactly as [`merge_run_progress`] does) is satisfiable. This is the
+    /// multi-file case the global-epoch clock made unsatisfiable: round 2's
+    /// write to `page_b` used to stale round 1's `page_a` pass.
+    #[tokio::test]
+    async fn fresh_sweep_passes_on_two_files_across_rounds_satisfy_gate() {
+        let (_db_dir, pool) = test_pool().await;
+        let root = tempfile::tempdir().expect("root tempdir created");
+        std::fs::write(root.path().join("page_a.html"), "<html><body>a</body></html>\n")
+            .expect("fixture a written");
+        std::fs::write(root.path().join("page_b.html"), "<html><body>b</body></html>\n")
+            .expect("fixture b written");
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop_with_dir(
+            provider,
+            approval,
+            4,
+            root.path().to_str().expect("tempdir path is UTF-8"),
+        )
+        .with_strict_verification_gate(true)
+        .with_tool_facts(Some(ToolFactContext::new(Some(pool.clone()), "single-agent".to_owned())));
+        loop_.arm_verification_clock(CancellationToken::new()).await;
+        let task = AgentTask::new_action_required(Ulid::new(), "write two pages");
+        // Round 1: audited write + sweep of page_a.
+        record_test_write(&mut loop_, root.path(), &task, "page_a.html").await;
+        let round_a = verify_file_changes(
+            &[Utf8PathBuf::from("page_a.html")],
+            root.path(),
+            &loop_.verification_stamp(),
+        )
+        .await;
+        // Round 2: audited write + sweep of page_b.
+        record_test_write(&mut loop_, root.path(), &task, "page_b.html").await;
+        let round_b = verify_file_changes(
+            &[Utf8PathBuf::from("page_b.html")],
+            root.path(),
+            &loop_.verification_stamp(),
+        )
+        .await;
+        // Accumulate the two round outputs exactly as the run does.
+        let output_a = fresh_gate_output("page_a.html", round_a);
+        let output_b = fresh_gate_output("page_b.html", round_b);
+        let mut accumulated = output_a;
+        merge_run_progress(&mut accumulated, &output_b);
+        assert_eq!(
+            accumulated.verification.len(),
+            2,
+            "premise: one latest record per swept file accumulates across rounds"
+        );
+        assert!(
+            accumulated.verification.iter().all(|record| record.is_passing_evidence()),
+            "premise: both sweep records carry the full R2 freshness set: {:?}",
+            accumulated.verification
+        );
+        let decision =
+            loop_.decide_exit(&task, &accumulated, 1, 1, 0, &None, true, Vec::new()).unwrap();
+        assert!(decision.is_none(), "the multi-file ledger must be satisfiable at exit");
+        let ledger = loop_.evaluate_gate_ledger(&accumulated);
+        assert_eq!(
+            ledger.fresh, 2,
+            "both passes must stand at the gate — page_a's pass survives page_b's write"
+        );
     }
 
     /// Flag on: non-action-required tasks are unaffected — an answer-only
