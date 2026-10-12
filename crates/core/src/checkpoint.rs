@@ -1092,6 +1092,360 @@ pub enum RestoreError {
     Store(#[from] CheckpointStoreError),
 }
 
+// ---------------------------------------------------------------------------
+// Restore-coverage model (H09): what a rollback can actually reverse
+// ---------------------------------------------------------------------------
+//
+// The file checkpoint above answers "what can THIS checkpoint reverse" for
+// files only. A rollback guarantee for an experiment must answer the same
+// question across EVERY effect kind the run may have produced — files,
+// database rows, processes, shell side-effects, network effects — BEFORE any
+// restore executes. Discovering mid-restore that an effect is unrecoverable
+// is the failure this model exists to prevent.
+//
+// The contract: the caller passes the FULL observed effect list as
+// `requested` (every kind the experiment may have touched — an unlisted kind
+// is out of the guarantee by construction, exactly like an undeclared file
+// exclusion), plus the `offered` coverage assembled from each adapter that
+// claims part of the restore (file checkpoints via
+// [`file_checkpoint_coverage`], the H09 database/process adapters via their
+// own coverage constructors, shell/network always unsupported). The pure
+// [`preflight_rollback_guarantee`] then reports one of three verdicts:
+//
+// * `Guaranteed` — every requested kind is `Supported`: the rollback may run.
+// * `Qualified` — some kind is `Qualified` (restorable with a stated limit,
+//   e.g. restart-only processes): the rollback may run ONLY with the
+//   qualification recorded and acknowledged — never silently.
+// * `Refused` — some kind is `Unsupported`, or NO adapter claims it (a
+//   missing offer is unrecoverable by construction, never assumed): the
+//   rollback must not run under the requested guarantee.
+//
+// This function performs no I/O and mutates nothing: it is the
+// before-execution gate, imitating the experiment promotion's conflict matrix
+// (pure classify-then-report) rather than the restore pipeline.
+
+/// Effect classes a rollback guarantee may be asked to reverse.
+///
+/// `File` is the file-checkpoint domain (byte-exact within budget).
+/// `Database`/`Process` are the H09 adapter domains (scoped + restart-only).
+/// `Shell`/`Network` have no restoring adapter: they are always
+/// [`EffectSupport::Unsupported`], and any requested guarantee covering them
+/// is refused, never partially executed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectKind {
+    /// File content under a checkpoint scope.
+    File,
+    /// Database rows under a declared adapter scope.
+    Database,
+    /// Concerto-owned processes under a managed-process registry.
+    Process,
+    /// Shell side-effects (commands run, files touched outside scope).
+    Shell,
+    /// Network effects (requests sent, remote state changed).
+    Network,
+}
+
+impl EffectKind {
+    /// The durable single-word spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Database => "database",
+            Self::Process => "process",
+            Self::Shell => "shell",
+            Self::Network => "network",
+        }
+    }
+
+    /// Parse the durable spelling; unknown values read `None` (never a guess).
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "file" => Some(Self::File),
+            "database" => Some(Self::Database),
+            "process" => Some(Self::Process),
+            "shell" => Some(Self::Shell),
+            "network" => Some(Self::Network),
+            _ => None,
+        }
+    }
+
+    /// Every effect kind, in deterministic order: the "ALL effect types" set
+    /// a preflight caller iterates when it has no narrower observation.
+    #[must_use]
+    pub fn all() -> &'static [Self] {
+        &[Self::File, Self::Database, Self::Process, Self::Shell, Self::Network]
+    }
+}
+
+/// What one adapter claims about one effect kind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectSupport {
+    /// Fully reversible by the named method (e.g. byte-exact pre-image replay).
+    Supported {
+        /// How the effect is reversed (operator-readable).
+        method: String,
+    },
+    /// Reversible with a stated limit (e.g. process restart without memory
+    /// state): the rollback may proceed only with the limitation recorded.
+    Qualified {
+        /// How the effect is reversed (operator-readable).
+        method: String,
+        /// The limit the rollback inherits (operator-readable).
+        limitation: String,
+    },
+    /// Not reversed by this adapter (or by any adapter): a requested
+    /// guarantee covering the kind is refused.
+    Unsupported {
+        /// Why nothing reverses this (operator-readable).
+        reason: String,
+    },
+}
+
+impl EffectSupport {
+    /// Whether the kind counts as `covered` for a full guarantee (only
+    /// `Supported`; `Qualified` needs acknowledgement, `Unsupported` refuses).
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        matches!(self, Self::Supported { .. })
+    }
+}
+
+/// One adapter's claim about one effect kind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectCoverage {
+    /// The effect kind claimed.
+    pub kind: EffectKind,
+    /// What the adapter promises for it.
+    pub support: EffectSupport,
+}
+
+/// The preflight verdict for a requested rollback guarantee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreflightVerdict {
+    /// Every requested kind is `Supported`: the rollback may run.
+    Guaranteed,
+    /// Some kind is `Qualified`: the rollback may run ONLY with each
+    /// limitation recorded and explicitly acknowledged — never silently.
+    Qualified,
+    /// Some kind is `Unsupported` or unclaimed: the rollback must NOT run
+    /// under the requested guarantee.
+    Refused,
+}
+
+impl PreflightVerdict {
+    /// The durable single-word spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Guaranteed => "guaranteed",
+            Self::Qualified => "qualified",
+            Self::Refused => "refused",
+        }
+    }
+}
+
+/// One requested kind that blocks a full guarantee: qualified or
+/// unsupported/unclaimed, with the operator-readable reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoverageGap {
+    /// The blocking effect kind.
+    pub kind: EffectKind,
+    /// Why it blocks the guarantee (the adapter's limitation/reason, or the
+    /// unclaimed-effect refusal when no adapter covers it).
+    pub reason: String,
+    /// Whether the kind is restorable-with-limits (`true` for `Qualified`) or
+    /// not restorable at all (`false` for `Unsupported`/unclaimed).
+    pub qualified: bool,
+}
+
+/// The before-execution report of [`preflight_rollback_guarantee`].
+///
+/// Returned by value and embedded by callers (the orchestrator rollback
+/// facade) in the durable effects record — the honest-coverage artifact,
+/// mirroring the experiment promotion-report shape (machine record +
+/// operator reasons, never a silent skip). The cross-reference is by name
+/// only (core owns no orchestrator type).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollbackPreflight {
+    /// The verdict: run, run-only-acknowledged, or do-not-run.
+    pub verdict: PreflightVerdict,
+    /// Requested kinds fully covered (`Supported`).
+    #[serde(default)]
+    pub covered: Vec<EffectKind>,
+    /// Requested kinds blocking a full guarantee (qualified first, then
+    /// refused — each in [`EffectKind`] order, deterministic).
+    #[serde(default)]
+    pub gaps: Vec<CoverageGap>,
+    /// Provenance notes (e.g. empty-request or unrequested-adapter remarks).
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+impl RollbackPreflight {
+    /// Whether the rollback may run as requested (no acknowledgement needed).
+    #[must_use]
+    pub fn is_guaranteed(&self) -> bool {
+        self.verdict == PreflightVerdict::Guaranteed
+    }
+}
+
+/// Preflight a requested rollback guarantee against all offered coverage.
+///
+/// Pure (no I/O, no mutation): call BEFORE executing anything. `requested`
+/// must be the FULL observed effect list — every kind the experiment may
+/// have touched. A kind with no offer is `Refused` ("no adapter claims …"),
+/// never assumed recoverable: incomplete coverage is reported here, not
+/// discovered mid-restore.
+///
+/// Verdict rule: any unsupported/unclaimed gap → `Refused`; else any
+/// qualified gap → `Qualified`; else `Guaranteed`. An empty request is
+/// `Guaranteed` with a note (nothing to reverse — vacuously covered).
+pub fn preflight_rollback_guarantee(
+    requested: &[EffectKind],
+    offered: &[EffectCoverage],
+) -> RollbackPreflight {
+    let mut kinds: Vec<EffectKind> = requested.to_vec();
+    kinds.sort();
+    kinds.dedup();
+    if kinds.is_empty() {
+        return RollbackPreflight {
+            verdict: PreflightVerdict::Guaranteed,
+            covered: Vec::new(),
+            gaps: Vec::new(),
+            notes: vec!["no effects observed: nothing to reverse (vacuously covered)".to_string()],
+        };
+    }
+    let mut covered = Vec::new();
+    let mut gaps = Vec::new();
+    for kind in kinds {
+        let offer = offered.iter().find(|entry| entry.kind == kind);
+        match offer.map(|entry| &entry.support) {
+            Some(EffectSupport::Supported { .. }) => covered.push(kind),
+            Some(EffectSupport::Qualified { limitation, .. }) => gaps.push(CoverageGap {
+                kind,
+                reason: limitation.clone(),
+                qualified: true,
+            }),
+            Some(EffectSupport::Unsupported { reason }) => {
+                gaps.push(CoverageGap { kind, reason: reason.clone(), qualified: false });
+            }
+            None => gaps.push(CoverageGap {
+                kind,
+                reason: format!(
+                    "no adapter claims {} effects: unrecoverable by construction (refusing rather than discovering mid-restore)",
+                    kind.as_str()
+                ),
+                qualified: false,
+            }),
+        }
+    }
+    // Deterministic gap order: qualified before refused is NOT needed —
+    // `kinds` is already sorted, and gaps follow it. Keep construction order.
+    let verdict = if gaps.iter().any(|gap| !gap.qualified) {
+        PreflightVerdict::Refused
+    } else if gaps.is_empty() {
+        PreflightVerdict::Guaranteed
+    } else {
+        PreflightVerdict::Qualified
+    };
+    RollbackPreflight { verdict, covered, gaps, notes: Vec::new() }
+}
+
+/// The file checkpoint's share of a preflight's `offered` list: what one
+/// [`CheckpointRecord`] can actually reverse, generalized from its own
+/// exclusions and method so the rollback facade never re-derives it.
+///
+/// * `File`: `Supported` (byte-exact pre-image replay) when the record is
+///   `Active` under `PreImageStore` with no hash-only paths; `Qualified`
+///   naming the real ceiling otherwise (`Partial` hash-only paths, `Manual`
+///   method, or the `GitStash` untracked-file gap).
+/// * `Database`/`Process`/`Shell`/`Network`: `Unsupported` — a file
+///   checkpoint never reverses these (the H09 adapters claim their own kinds;
+///   shell/network stay unclaimed).
+pub fn file_checkpoint_coverage(record: &CheckpointRecord) -> Vec<EffectCoverage> {
+    let file_support = match (&record.status, record.restore_method) {
+        (CheckpointStatus::Active, RestoreMethod::PreImageStore) => {
+            let hash_only: Vec<&str> = record
+                .excluded
+                .iter()
+                .filter(|exclusion| {
+                    matches!(exclusion.class, CheckpointExclusionClass::OversizedFile)
+                })
+                .filter_map(|exclusion| exclusion.path.as_deref())
+                .collect();
+            if hash_only.is_empty() {
+                EffectSupport::Supported {
+                    method: "byte-exact pre-image replay through gated filesystem writes"
+                        .to_string(),
+                }
+            } else {
+                EffectSupport::Qualified {
+                    method: "byte-exact pre-image replay where banked".to_string(),
+                    limitation: format!(
+                        "hash-only paths without restorable bytes ({}): {}",
+                        hash_only.join(", "),
+                        PARTIAL_SCOPE_LIMITATION
+                    ),
+                }
+            }
+        }
+        (CheckpointStatus::Partial { missing }, _) => EffectSupport::Qualified {
+            method: "byte-exact pre-image replay where banked".to_string(),
+            limitation: format!(
+                "hash-only paths without restorable bytes ({}): {}",
+                missing.join(", "),
+                PARTIAL_SCOPE_LIMITATION
+            ),
+        },
+        (_, RestoreMethod::GitStash) => EffectSupport::Qualified {
+            method: "git stash pop".to_string(),
+            limitation: "git-stash restore inherits the untracked-file gap (stash without -u)"
+                .to_string(),
+        },
+        (_, RestoreMethod::Manual) => EffectSupport::Qualified {
+            method: "operator follows the record limitations".to_string(),
+            limitation: record.limitations.first().cloned().unwrap_or_else(|| {
+                "checkpoint restores as Manual: follow the record's excluded entries".to_string()
+            }),
+        },
+        (status, _) => EffectSupport::Unsupported {
+            reason: format!("checkpoint status {} advertises no restorability", status.state_str()),
+        },
+    };
+    vec![
+        EffectCoverage { kind: EffectKind::File, support: file_support },
+        EffectCoverage {
+            kind: EffectKind::Database,
+            support: EffectSupport::Unsupported {
+                reason: "file checkpoints never reverse database effects (rows written outside the file scope)".to_string(),
+            },
+        },
+        EffectCoverage {
+            kind: EffectKind::Process,
+            support: EffectSupport::Unsupported {
+                reason: "file checkpoints never reverse process effects (daemons started, signals sent)".to_string(),
+            },
+        },
+        EffectCoverage {
+            kind: EffectKind::Shell,
+            support: EffectSupport::Unsupported {
+                reason: "shell side-effects are never reversed".to_string(),
+            },
+        },
+        EffectCoverage {
+            kind: EffectKind::Network,
+            support: EffectSupport::Unsupported {
+                reason: "network effects are never reversed".to_string(),
+            },
+        },
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1358,5 +1712,183 @@ mod tests {
             !verify_bytes_on_disk(dir.path(), "a.txt", &hash, None),
             "drifted content never verifies, even without a length bound"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Restore-coverage model (H09)
+    // -------------------------------------------------------------------
+
+    fn supported(kind: EffectKind) -> EffectCoverage {
+        EffectCoverage {
+            kind,
+            support: EffectSupport::Supported { method: "test method".to_string() },
+        }
+    }
+
+    #[test]
+    fn effect_kind_spellings_round_trip() {
+        for kind in EffectKind::all() {
+            assert_eq!(EffectKind::parse(kind.as_str()), Some(*kind), "{}", kind.as_str());
+        }
+        assert_eq!(EffectKind::parse("memory-restore"), None, "unknown kinds never guessed");
+        assert_eq!(PreflightVerdict::Guaranteed.as_str(), "guaranteed");
+    }
+
+    #[test]
+    fn preflight_guarantees_fully_supported_requests() {
+        let offered = vec![supported(EffectKind::File), supported(EffectKind::Database)];
+        let report =
+            preflight_rollback_guarantee(&[EffectKind::File, EffectKind::Database], &offered);
+        assert_eq!(report.verdict, PreflightVerdict::Guaranteed);
+        assert!(report.is_guaranteed());
+        assert_eq!(report.covered, vec![EffectKind::File, EffectKind::Database]);
+        assert!(report.gaps.is_empty());
+        // Request order never leaks into the report: deterministic sort.
+        let report =
+            preflight_rollback_guarantee(&[EffectKind::Database, EffectKind::File], &offered);
+        assert_eq!(report.covered, vec![EffectKind::File, EffectKind::Database]);
+    }
+
+    #[test]
+    fn preflight_qualifies_but_never_silently_covers_limits() {
+        let offered = vec![
+            supported(EffectKind::File),
+            EffectCoverage {
+                kind: EffectKind::Process,
+                support: EffectSupport::Qualified {
+                    method: "restart".to_string(),
+                    limitation: "memory state not restored".to_string(),
+                },
+            },
+        ];
+        let report =
+            preflight_rollback_guarantee(&[EffectKind::File, EffectKind::Process], &offered);
+        assert_eq!(report.verdict, PreflightVerdict::Qualified);
+        assert!(!report.is_guaranteed());
+        assert_eq!(report.covered, vec![EffectKind::File]);
+        assert_eq!(report.gaps.len(), 1);
+        assert_eq!(report.gaps[0].kind, EffectKind::Process);
+        assert!(report.gaps[0].qualified);
+        assert!(report.gaps[0].reason.contains("memory state"));
+    }
+
+    #[test]
+    fn preflight_refuses_unsupported_before_any_execution() {
+        // Unsupported dominates qualified: one unrecoverable kind refuses the
+        // whole guarantee even when every other kind is covered.
+        let offered = vec![
+            supported(EffectKind::File),
+            EffectCoverage {
+                kind: EffectKind::Process,
+                support: EffectSupport::Qualified {
+                    method: "restart".to_string(),
+                    limitation: "memory state not restored".to_string(),
+                },
+            },
+            EffectCoverage {
+                kind: EffectKind::Shell,
+                support: EffectSupport::Unsupported {
+                    reason: "shell side-effects are never reversed".to_string(),
+                },
+            },
+        ];
+        let report = preflight_rollback_guarantee(
+            &[EffectKind::File, EffectKind::Process, EffectKind::Shell],
+            &offered,
+        );
+        assert_eq!(report.verdict, PreflightVerdict::Refused);
+        assert_eq!(report.covered, vec![EffectKind::File]);
+        assert_eq!(report.gaps.len(), 2);
+        let shell_gap =
+            report.gaps.iter().find(|gap| gap.kind == EffectKind::Shell).expect("shell gap");
+        assert!(!shell_gap.qualified);
+    }
+
+    #[test]
+    fn preflight_refuses_unclaimed_effects_never_assumes() {
+        // No offer for Database: the preflight refuses rather than assuming
+        // the file checkpoint (or anything else) covers it. This is the
+        // never-discover-mid-restore rule.
+        let offered = vec![supported(EffectKind::File)];
+        let report =
+            preflight_rollback_guarantee(&[EffectKind::File, EffectKind::Database], &offered);
+        assert_eq!(report.verdict, PreflightVerdict::Refused);
+        assert_eq!(report.covered, vec![EffectKind::File]);
+        let gap = report.gaps.iter().find(|gap| gap.kind == EffectKind::Database).expect("db gap");
+        assert!(!gap.qualified);
+        assert!(gap.reason.contains("no adapter claims"));
+    }
+
+    #[test]
+    fn preflight_empty_request_is_vacuously_guaranteed() {
+        let report = preflight_rollback_guarantee(&[], &[supported(EffectKind::File)]);
+        assert_eq!(report.verdict, PreflightVerdict::Guaranteed);
+        assert!(!report.notes.is_empty());
+    }
+
+    #[test]
+    fn preflight_report_round_trips() {
+        let offered = vec![supported(EffectKind::File)];
+        let report =
+            preflight_rollback_guarantee(&[EffectKind::File, EffectKind::Network], &offered);
+        let json = serde_json::to_string(&report).expect("serialize");
+        let back: RollbackPreflight = serde_json::from_str(&json).expect("decode");
+        assert_eq!(report, back);
+        assert_eq!(report.verdict, PreflightVerdict::Refused);
+    }
+
+    #[test]
+    fn file_checkpoint_coverage_is_supported_when_fully_banked() {
+        let record = minimal_record();
+        let offered = file_checkpoint_coverage(&record);
+        assert_eq!(offered.len(), EffectKind::all().len());
+        let file = offered.iter().find(|entry| entry.kind == EffectKind::File).expect("file");
+        assert!(file.support.is_full(), "active pre-image record covers files: {file:?}");
+        for kind in
+            [EffectKind::Database, EffectKind::Process, EffectKind::Shell, EffectKind::Network]
+        {
+            let entry = offered.iter().find(|entry| entry.kind == kind).expect("entry");
+            assert!(
+                matches!(entry.support, EffectSupport::Unsupported { .. }),
+                "file checkpoints never claim {kind:?}"
+            );
+        }
+        // …and a full preflight over file-only effects is guaranteed.
+        let report = preflight_rollback_guarantee(&[EffectKind::File], &offered);
+        assert_eq!(report.verdict, PreflightVerdict::Guaranteed);
+    }
+
+    #[test]
+    fn file_checkpoint_coverage_qualifies_partial_and_stash() {
+        let (checkpoint_id, session_id) = test_ids();
+        let partial = CheckpointRecord::new(
+            checkpoint_id,
+            session_id,
+            CheckpointScope::FilesystemWrites { paths: vec!["big.bin".to_string()] },
+            Vec::new(),
+            vec![CheckpointExclusion {
+                class: CheckpointExclusionClass::OversizedFile,
+                path: Some("big.bin".to_string()),
+                reason: "over budget".to_string(),
+            }],
+            BTreeMap::new(),
+            CheckpointStatus::Partial { missing: vec!["big.bin".to_string()] },
+            RestoreMethod::PreImageStore,
+            Vec::new(),
+            "agent-a".to_string(),
+            1_700_000_000_000,
+            None,
+        )
+        .expect("partial record builds");
+        let offered = file_checkpoint_coverage(&partial);
+        let file = offered.iter().find(|entry| entry.kind == EffectKind::File).expect("file");
+        match &file.support {
+            EffectSupport::Qualified { limitation, .. } => {
+                assert!(limitation.contains("big.bin"), "{limitation}");
+            }
+            other => panic!("partial must qualify, got {other:?}"),
+        }
+        let report = preflight_rollback_guarantee(&[EffectKind::File], &offered);
+        assert_eq!(report.verdict, PreflightVerdict::Qualified);
     }
 }

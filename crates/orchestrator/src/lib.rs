@@ -46,6 +46,8 @@ pub mod hunk;
 pub mod in_process_gate;
 pub mod intent_grants;
 pub mod ipc;
+pub mod managed_process;
+pub mod managed_rollback;
 mod memory_prompt;
 pub mod memory_serial;
 pub mod obligations;

@@ -96,13 +96,15 @@ pub use traits::vector_store::{RowIndexFact, VectorStore};
 /// sidecar byte budget, the capture grammar, and the restore collaborator
 /// traits the executor restores through.
 pub use checkpoint::{
-    plan_capture, verify_absent_on_disk, verify_bytes_on_disk, versioned_fs_targets, CaptureKind,
-    CheckpointByteRef, CheckpointExclusion, CheckpointExclusionClass, CheckpointRecord,
-    CheckpointRecordError, CheckpointResource, CheckpointResourceKind, CheckpointScope,
-    CheckpointStatus, CheckpointStore, CheckpointStoreError, MutationCaptureSink,
-    OwnershipConflictInfo, OwnershipOracle, PlannedCapture, PreImageBytes, RestoreAttemptInfo,
-    RestoreAttemptOutcome, RestoreError, RestoreMethod, RestoreOutcome, RestoreProgressEntry,
-    RestoreProgressItem, RestoreResourceState, StashRestorer, CHECKPOINT_BLOB_LIMIT_BYTES,
+    file_checkpoint_coverage, plan_capture, preflight_rollback_guarantee, verify_absent_on_disk,
+    verify_bytes_on_disk, versioned_fs_targets, CaptureKind, CheckpointByteRef,
+    CheckpointExclusion, CheckpointExclusionClass, CheckpointRecord, CheckpointRecordError,
+    CheckpointResource, CheckpointResourceKind, CheckpointScope, CheckpointStatus, CheckpointStore,
+    CheckpointStoreError, CoverageGap, EffectCoverage, EffectKind, EffectSupport,
+    MutationCaptureSink, OwnershipConflictInfo, OwnershipOracle, PlannedCapture, PreImageBytes,
+    PreflightVerdict, RestoreAttemptInfo, RestoreAttemptOutcome, RestoreError, RestoreMethod,
+    RestoreOutcome, RestoreProgressEntry, RestoreProgressItem, RestoreResourceState,
+    RollbackPreflight, StashRestorer, CHECKPOINT_BLOB_LIMIT_BYTES,
     CHECKPOINT_LIMITATIONS_MAX_ENTRIES, CHECKPOINT_LIMITATION_MAX_BYTES,
     CHECKPOINT_METADATA_MAX_ENTRIES, CHECKPOINT_METADATA_MAX_KEY_BYTES,
     CHECKPOINT_METADATA_MAX_VALUE_BYTES, CHECKPOINT_PATH_MAX_BYTES,
