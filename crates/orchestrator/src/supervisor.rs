@@ -2151,20 +2151,52 @@ async fn handle_retrieve_memory(
         top_k,
         filters: Vec::new(),
     };
-    match services.memory.retrieve(&query, cancel.clone()).await {
-        Ok(chunks) => {
+    match services.memory.retrieve_with_evidence(&query, cancel.clone()).await {
+        Ok(evident) => {
+            // H11: the spine recalls evidence-bearing results. The wire
+            // shape is unchanged (text + kind + rank score), so status
+            // travels as observability here, not as new wire fields.
+            let mut contradicted = 0usize;
+            let mut superseded = 0usize;
+            let mut unknown = 0usize;
+            let mut degraded = 0usize;
+            let chunks = evident
+                .into_iter()
+                .map(|item| {
+                    match item.truth {
+                        concerto_core::memory::FactStatusView::Contradicted => contradicted += 1,
+                        concerto_core::memory::FactStatusView::Superseded => superseded += 1,
+                        concerto_core::memory::FactStatusView::Unknown => unknown += 1,
+                        _ => {}
+                    }
+                    if item.degraded {
+                        degraded += 1;
+                    }
+                    tracing::debug!(
+                        chunk_id = %item.chunk.id,
+                        truth = %item.truth,
+                        source = %item.source,
+                        derivation = %item.derivation,
+                        "supervisor: memory recall verdict"
+                    );
+                    crate::ipc::MemoryChunk {
+                        text: item.chunk.content,
+                        kind: format!("{:?}", item.chunk.chunk_type).to_lowercase(),
+                        score: item.chunk.score,
+                        source_event_id: None,
+                    }
+                })
+                .collect();
+            tracing::debug!(
+                contradicted,
+                superseded,
+                unknown,
+                degraded,
+                "supervisor: memory recall status counts"
+            );
             // Wire chunks carry the retrieval score and a kind label; the
             // whiteboard linkage is resolved by the memory layer in a later
             // chunk (ADR-60 D6), so `source_event_id` is unknown here.
-            let chunks = chunks
-                .into_iter()
-                .map(|chunk| crate::ipc::MemoryChunk {
-                    text: chunk.content,
-                    kind: format!("{:?}", chunk.chunk_type).to_lowercase(),
-                    score: chunk.score,
-                    source_event_id: None,
-                })
-                .collect();
             reply_ok(id, IpcResult::RetrieveMemory { chunks })
         }
         Err(error) => reply_error_full(

@@ -15,7 +15,8 @@
 //!   (`[agent] strict_verification_gate` evaluation itself lives behind
 //!   `AgentLoop::run` and is covered by the `strict_gate_on_*` unit tests —
 //!   see the step-5 note)
-//! - `MemoryEvidence` read-time composite over a real memory store
+//! - `MemoryEvidence` read-time composite over a real memory store,
+//!   reached through the wired evidence-bearing recall path
 //!
 //! Per-step verdicts (filled in after the run; see the final report):
 //! 1. DONE — describe serves the current manifest through the executor.
@@ -30,9 +31,13 @@
 //!    the H04 `VerificationStamp` and the strict-gate evaluation are
 //!    private to `agent_loop` and not reachable from a public-API test.
 //! 6. DONE — restore returns the ORIGINAL bytes (byte-compare).
-//! 7. DONE (with an ADR-clarification) — the underlying entry persists and
-//!    recalls across store handles; the `MemoryEvidence` composite itself is
-//!    re-assembled at recall and never persisted, per its storage rule.
+//! 7. DONE — the underlying entry persists and recalls across store handles
+//!    through the wired evidence-bearing path (`retrieve_with_evidence`):
+//!    the recalled item carries source attribution (`model-authored`), status
+//!    (`assumed` — a claim, never verified by recall), and the derivation.
+//!    The `MemoryEvidence` composite itself is re-assembled at recall and
+//!    never persisted, per its storage rule; bare enrichment without chunk
+//!    standing honestly reads `unknown`.
 //! 8. DONE for the in-process supervised-parity backend
 //!    (`InProcessGateBackend`) and the real supervisor loop + mock-agent
 //!    child; BLOCKED for the child-side `GateProxyBackend` (see finding F2).
@@ -786,10 +791,51 @@ async fn step7_persist_evidence_and_recall_in_another_session() {
         .expect("session A persists the evidence entry");
 
     // Session B: a FRESH handle over the same file (another session) recalls
-    // the entry by content — the bytes survived the handle boundary. (The
-    // store matches on substring, so the query names a token the JSON
-    // content actually contains.)
+    // the entry by content through the WIRED evidence-bearing path — the
+    // bytes survived the handle boundary, and the result carries source
+    // attribution and status rather than a bare ranked chunk. (The store
+    // matches on substring, so the query names a token the JSON content
+    // actually contains.)
+    //
+    // H11: agents reach `retrieve_with_evidence`, never a weaker recall.
+    use concerto_core::traits::memory::MemoryStore as _;
     let session_b = GlobalMemoryStore::connect(&db_path).await.expect("session B connects");
+    let evident = session_b
+        .retrieve_with_evidence(
+            &MemoryQuery {
+                text: "py_compile".to_string(),
+                project_id: ProjectId("slice".to_owned()),
+                namespace: MemoryNamespace::Global { user_id_hash: user_hash.clone() },
+                top_k: 5,
+                filters: Vec::new(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect("session B recalls");
+    assert_eq!(evident.len(), 1, "exactly the persisted entry recalls");
+    assert_eq!(evident[0].chunk.id, stored_id.to_string(), "identity survives the recall");
+    assert!(
+        evident[0].chunk.content.contains(&fingerprint_hex),
+        "the recalled content carries the evidence fingerprint"
+    );
+    assert_eq!(
+        evident[0].truth,
+        FactStatusView::Assumed,
+        "a model-authored fact recalls as a claim (G-NOUPGRADE)"
+    );
+    assert_eq!(
+        evident[0].source,
+        concerto_core::memory::RecallSource::ModelAuthored,
+        "source attribution travels with the recall"
+    );
+    assert!(evident[0].derivation.contains("claim"), "recall says why: {}", evident[0].derivation);
+    assert!(!evident[0].degraded);
+    assert_eq!(evident[0].freshness, 1.0, "current-model row: full freshness");
+
+    // The `MemoryEvidence` composite behind the projection is assembled AT
+    // RECALL (never stored): bare enrichment without chunk standing reads
+    // `unknown` — never a default that reads as fine — …
     let chunks = session_b
         .retrieve(
             &MemoryQuery {
@@ -802,16 +848,7 @@ async fn step7_persist_evidence_and_recall_in_another_session() {
             CancellationToken::new(),
         )
         .await
-        .expect("session B recalls");
-    assert_eq!(chunks.len(), 1, "exactly the persisted entry recalls");
-    assert_eq!(chunks[0].id, stored_id.to_string(), "identity survives the recall");
-    assert!(
-        chunks[0].content.contains(&fingerprint_hex),
-        "the recalled content carries the evidence fingerprint"
-    );
-
-    // The `MemoryEvidence` composite is assembled AT RECALL (never stored):
-    // run the real enrichment path over the recalled chunk …
+        .expect("bare recall still serves");
     let fused = vec![FusedResult {
         chunk_id: chunks[0].id.clone(),
         score: chunks[0].score,
@@ -828,7 +865,7 @@ async fn step7_persist_evidence_and_recall_in_another_session() {
     );
     assert_eq!(evidence.len(), 1);
     assert_eq!(evidence[0].chunk_id, chunks[0].id);
-    assert_eq!(evidence[0].truth, FactStatusView::Assumed, "memory cannot verify (G-NOUPGRADE)");
+    assert_eq!(evidence[0].truth, FactStatusView::Unknown, "no standing, no status");
     assert_eq!(evidence[0].freshness.value(), 1.0, "current-model row: full freshness");
     assert_eq!(evidence[0].schema_version, EVIDENCE_SCHEMA_VERSION);
 

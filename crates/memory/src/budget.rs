@@ -9,7 +9,7 @@
 //! + `ContextGuardProvider` in the orchestrator.
 
 use concerto_core::error::MemoryError;
-use concerto_core::memory::MemoryChunk;
+use concerto_core::memory::{EvidentChunk, MemoryChunk};
 use concerto_core::types::TokenBudget;
 
 const CLIPPED_SUFFIX: &str = "\n[Content clipped to fit the context budget.]";
@@ -93,6 +93,35 @@ impl ContextBudgetAllocator {
         }
 
         selected
+    }
+
+    /// Select and, when necessary, clip evidence-bearing recall to the
+    /// aggregate RAG budget (H11).
+    ///
+    /// The same bound as [`Self::truncate_to_rag_limit`] — selection is by
+    /// rank score, clipping touches only chunk content — with each
+    /// surviving chunk's evidence (source, status, derivation) carried
+    /// alongside, re-attached to the possibly clipped chunk. Evidence has
+    /// no content of its own, so clipping never invalidates it.
+    pub fn truncate_evident_to_rag_limit(
+        &self,
+        evident: Vec<EvidentChunk>,
+        budget: &TokenBudget,
+    ) -> Vec<EvidentChunk> {
+        use std::collections::HashMap;
+
+        let mut by_id: HashMap<String, EvidentChunk> =
+            evident.into_iter().map(|item| (item.chunk.id.clone(), item)).collect();
+        let chunks: Vec<MemoryChunk> = by_id.values().map(|item| item.chunk.clone()).collect();
+        self.truncate_to_rag_limit(chunks, budget)
+            .into_iter()
+            .filter_map(|chunk| {
+                by_id.remove(&chunk.id).map(|mut item| {
+                    item.chunk = chunk;
+                    item
+                })
+            })
+            .collect()
     }
 }
 

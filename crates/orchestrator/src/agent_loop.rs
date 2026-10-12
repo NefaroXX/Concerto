@@ -1293,17 +1293,23 @@ impl AgentLoop {
 
     /// Phase 2: Retrieve memory chunks for context unless in fast mode.
     /// Returns a formatted memory block to inject into the prompt.
+    ///
+    /// H11: recall is evidence-bearing — each result carries source
+    /// attribution, status, and the derivation, rendered by
+    /// `format_evident_memory` so the model sees claims as claims and
+    /// unknown as unknown. The RAG budget still bounds by rank score;
+    /// evidence rides along untouched by clipping.
     async fn retrieve_working_memory(
         &self,
         description: &str,
         session: &SessionContext,
         cancel: CancellationToken,
     ) -> String {
-        let mut memory_chunks = if self.fast {
+        let mut evident = if self.fast {
             Vec::new()
         } else {
             self.memory
-                .retrieve(
+                .retrieve_with_evidence(
                     &MemoryQuery {
                         text: description.to_string(),
                         project_id: session.project_id.clone(),
@@ -1322,10 +1328,10 @@ impl AgentLoop {
         // minus the response reservation) — never the raw total capacity.
         if let Some(ref allocator) = self.budget_allocator {
             let budget = self.provider.context_capacity(&self.usage_model);
-            memory_chunks = allocator.truncate_to_rag_limit(memory_chunks, &budget);
+            evident = allocator.truncate_evident_to_rag_limit(evident, &budget);
         }
 
-        crate::memory_prompt::format_retrieved_memory(&memory_chunks)
+        crate::memory_prompt::format_evident_memory(&evident)
     }
 
     /// Phase 3: Build a `CompletionRequest` with working memory, conversation

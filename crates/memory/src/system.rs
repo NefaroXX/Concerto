@@ -756,14 +756,12 @@ impl MemoryStore for MemorySystem {
         query: &MemoryQuery,
         cancel: CancellationToken,
     ) -> Result<Vec<EvidentChunk>, CoreMemoryError> {
-        // Route global namespace queries to the global store. The global
-        // store is not a `MemoryStore`; the shared standing-free
-        // projection applies to its results.
+        // Route global namespace queries to the global store (its default
+        // evidence projection applies there: user-scoped facts recall as
+        // model-authored claims).
         if matches!(query.namespace, MemoryNamespace::Global { .. }) {
             return match self.global_store {
-                Some(ref store) => Ok(concerto_core::project_without_standing(
-                    store.retrieve(query, cancel).await?,
-                )),
+                Some(ref store) => store.retrieve_with_evidence(query, cancel).await,
                 None => Ok(Vec::new()),
             };
         }
