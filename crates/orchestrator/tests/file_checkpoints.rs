@@ -194,6 +194,195 @@ fn fs_scope(paths: &[&str]) -> CheckpointScope {
     CheckpointScope::FilesystemWrites { paths: paths.iter().map(|p| (*p).to_owned()).collect() }
 }
 
+/// Sidecar store failing one path's byte load exactly once (the deterministic
+/// crash: the gated prefix lands, the rest never runs), then delegating every
+/// method — journal included — to the real store. Shared by the interrupt and
+/// crash-restart tests.
+struct FailBytesStore {
+    inner: FileCheckpointStore,
+    fail_path: String,
+    failed: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl concerto_core::checkpoint::CheckpointStore for FailBytesStore {
+    async fn load_record(
+        &self,
+        checkpoint_id: &str,
+        cancel: CancellationToken,
+    ) -> Result<
+        Option<concerto_core::checkpoint::CheckpointRecord>,
+        concerto_core::checkpoint::CheckpointStoreError,
+    > {
+        self.inner.load_record(checkpoint_id, cancel).await
+    }
+
+    async fn load_bytes(
+        &self,
+        checkpoint_id: &str,
+        canonical_path: &str,
+        cancel: CancellationToken,
+    ) -> Result<
+        concerto_core::checkpoint::PreImageBytes,
+        concerto_core::checkpoint::CheckpointStoreError,
+    > {
+        if canonical_path == self.fail_path
+            && !self.failed.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(concerto_core::checkpoint::CheckpointStoreError::Storage(
+                "injected mid-restore byte loss".to_string(),
+            ));
+        }
+        self.inner.load_bytes(checkpoint_id, canonical_path, cancel).await
+    }
+
+    async fn mark_restored(
+        &self,
+        checkpoint_id: &str,
+        at_ms: i64,
+        by: &str,
+        cancel: CancellationToken,
+    ) -> Result<bool, concerto_core::checkpoint::CheckpointStoreError> {
+        self.inner.mark_restored(checkpoint_id, at_ms, by, cancel).await
+    }
+
+    async fn mark_partial(
+        &self,
+        checkpoint_id: &str,
+        missing: Vec<String>,
+        cancel: CancellationToken,
+    ) -> Result<(), concerto_core::checkpoint::CheckpointStoreError> {
+        self.inner.mark_partial(checkpoint_id, missing, cancel).await
+    }
+
+    async fn load_restore_progress(
+        &self,
+        checkpoint_id: &str,
+        cancel: CancellationToken,
+    ) -> Result<
+        Vec<concerto_core::checkpoint::RestoreProgressEntry>,
+        concerto_core::checkpoint::CheckpointStoreError,
+    > {
+        concerto_core::checkpoint::CheckpointStore::load_restore_progress(
+            &self.inner,
+            checkpoint_id,
+            cancel,
+        )
+        .await
+    }
+
+    async fn record_restore_progress(
+        &self,
+        checkpoint_id: &str,
+        entry: &concerto_core::checkpoint::RestoreProgressEntry,
+        cancel: CancellationToken,
+    ) -> Result<(), concerto_core::checkpoint::CheckpointStoreError> {
+        concerto_core::checkpoint::CheckpointStore::record_restore_progress(
+            &self.inner,
+            checkpoint_id,
+            entry,
+            cancel,
+        )
+        .await
+    }
+
+    async fn begin_restore_attempt(
+        &self,
+        attempt: &concerto_core::checkpoint::RestoreAttemptInfo,
+        cancel: CancellationToken,
+    ) -> Result<(), concerto_core::checkpoint::CheckpointStoreError> {
+        concerto_core::checkpoint::CheckpointStore::begin_restore_attempt(
+            &self.inner,
+            attempt,
+            cancel,
+        )
+        .await
+    }
+
+    async fn finish_restore_attempt(
+        &self,
+        attempt_id: &str,
+        outcome: concerto_core::checkpoint::RestoreAttemptOutcome,
+        finished_at_ms: i64,
+        cancel: CancellationToken,
+    ) -> Result<(), concerto_core::checkpoint::CheckpointStoreError> {
+        concerto_core::checkpoint::CheckpointStore::finish_restore_attempt(
+            &self.inner,
+            attempt_id,
+            outcome,
+            finished_at_ms,
+            cancel,
+        )
+        .await
+    }
+}
+
+/// No-op stash restorer (a PreImageStore record never consults it).
+#[derive(Debug)]
+struct NoopStash;
+
+impl concerto_core::checkpoint::StashRestorer for NoopStash {
+    fn restore_stash(
+        &self,
+        _checkpoint: &concerto_core::checkpoint::CheckpointRecord,
+    ) -> Result<String, String> {
+        Err("not a stash checkpoint".to_string())
+    }
+}
+
+/// Write recorder: delegates every `filesystem` call to the real
+/// `FilesystemTool` (same name, schema, capabilities, path facts, policy
+/// view — the executor cannot tell the difference) and records every
+/// MUTATING operation it executes. Register it in place of the plain tool to
+/// prove which paths an executor actually touched — e.g. that a verified
+/// resume skips a resource's WRITE, not merely that its bytes matched.
+struct RecordingFsTool {
+    inner: FilesystemTool,
+    ops: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl concerto_core::traits::tool::Tool for RecordingFsTool {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        self.inner.input_schema()
+    }
+
+    fn capability_requirements(&self) -> concerto_core::types::CapabilitySet {
+        self.inner.capability_requirements()
+    }
+
+    fn path_facts(
+        &self,
+        input: &serde_json::Value,
+        session: &SessionContext,
+    ) -> Option<concerto_core::types::PathPolicyFacts> {
+        self.inner.path_facts(input, session)
+    }
+
+    async fn execute(
+        &self,
+        input: serde_json::Value,
+        policy: &dyn concerto_core::traits::PolicyEngine,
+        session: &SessionContext,
+        cancel: CancellationToken,
+    ) -> Result<concerto_core::types::ToolOutput, concerto_core::error::ToolError> {
+        let op = input.get("operation").and_then(|value| value.as_str()).unwrap_or_default();
+        let path = input.get("path").and_then(|value| value.as_str()).unwrap_or_default();
+        if matches!(op, "write" | "delete" | "move" | "copy") {
+            self.ops.lock().expect("ops lock").push(format!("{op} {path}"));
+        }
+        self.inner.execute(input, policy, session, cancel).await
+    }
+}
+
 /// The specified flow: write → checkpoint → mutate → restore is byte-exact.
 #[tokio::test]
 async fn write_checkpoint_mutate_restore_is_byte_exact() {
@@ -1209,15 +1398,64 @@ async fn toctou_sibling_acquire_between_phases_surfaces_structured_conflict() {
         ) -> Result<(), CheckpointStoreError> {
             self.inner.mark_partial(checkpoint_id, missing, cancel).await
         }
-    }
 
-    /// No-op stash restorer (a PreImageStore record never consults it).
-    #[derive(Debug)]
-    struct NoopStash;
+        async fn load_restore_progress(
+            &self,
+            checkpoint_id: &str,
+            cancel: CancellationToken,
+        ) -> Result<Vec<concerto_core::checkpoint::RestoreProgressEntry>, CheckpointStoreError>
+        {
+            concerto_core::checkpoint::CheckpointStore::load_restore_progress(
+                &self.inner,
+                checkpoint_id,
+                cancel,
+            )
+            .await
+        }
 
-    impl concerto_core::checkpoint::StashRestorer for NoopStash {
-        fn restore_stash(&self, _checkpoint: &CheckpointRecord) -> Result<String, String> {
-            Err("not a stash checkpoint".to_string())
+        async fn record_restore_progress(
+            &self,
+            checkpoint_id: &str,
+            entry: &concerto_core::checkpoint::RestoreProgressEntry,
+            cancel: CancellationToken,
+        ) -> Result<(), CheckpointStoreError> {
+            concerto_core::checkpoint::CheckpointStore::record_restore_progress(
+                &self.inner,
+                checkpoint_id,
+                entry,
+                cancel,
+            )
+            .await
+        }
+
+        async fn begin_restore_attempt(
+            &self,
+            attempt: &concerto_core::checkpoint::RestoreAttemptInfo,
+            cancel: CancellationToken,
+        ) -> Result<(), CheckpointStoreError> {
+            concerto_core::checkpoint::CheckpointStore::begin_restore_attempt(
+                &self.inner,
+                attempt,
+                cancel,
+            )
+            .await
+        }
+
+        async fn finish_restore_attempt(
+            &self,
+            attempt_id: &str,
+            outcome: concerto_core::checkpoint::RestoreAttemptOutcome,
+            finished_at_ms: i64,
+            cancel: CancellationToken,
+        ) -> Result<(), CheckpointStoreError> {
+            concerto_core::checkpoint::CheckpointStore::finish_restore_attempt(
+                &self.inner,
+                attempt_id,
+                outcome,
+                finished_at_ms,
+                cancel,
+            )
+            .await
         }
     }
 
@@ -1384,4 +1622,791 @@ async fn policy_denied_mid_restore_converges_on_retry() {
         matches!(back.status, CheckpointStatus::Restored { .. }),
         "the converged retry records Restored"
     );
+}
+
+/// H07 crash-recovery half, end-to-end: interrupt mid-restore → the journal
+/// shows precise partial progress → resume writes ONLY the remaining
+/// resources (verified skips proven by exactly one sidecar presence-check
+/// load per skipped row and by write counts, never a blind skip) and
+/// converges to `Restored`. Crash-restart (reopening the store from the same
+/// database file) behaves identically: no progress lives in process memory.
+#[tokio::test]
+async fn interrupted_restore_resumes_from_journal_and_converges() {
+    use concerto_core::checkpoint::{
+        CheckpointRecord, CheckpointStore, CheckpointStoreError, PreImageBytes, RestoreError,
+    };
+
+    /// Counting delegate: the verified row's sidecar is touched EXACTLY once
+    /// — the skip's authoritative pre-image presence check — while rows that
+    /// still need their gated write load once each for that write.
+    struct CountingStore {
+        inner: FileCheckpointStore,
+        loads: Arc<std::sync::Mutex<BTreeMap<String, usize>>>,
+    }
+
+    #[async_trait]
+    impl CheckpointStore for CountingStore {
+        async fn load_record(
+            &self,
+            checkpoint_id: &str,
+            cancel: CancellationToken,
+        ) -> Result<Option<CheckpointRecord>, CheckpointStoreError> {
+            self.inner.load_record(checkpoint_id, cancel).await
+        }
+
+        async fn load_bytes(
+            &self,
+            checkpoint_id: &str,
+            canonical_path: &str,
+            cancel: CancellationToken,
+        ) -> Result<PreImageBytes, CheckpointStoreError> {
+            *self
+                .loads
+                .lock()
+                .expect("loads lock")
+                .entry(canonical_path.to_owned())
+                .or_insert(0) += 1;
+            self.inner.load_bytes(checkpoint_id, canonical_path, cancel).await
+        }
+
+        async fn mark_restored(
+            &self,
+            checkpoint_id: &str,
+            at_ms: i64,
+            by: &str,
+            cancel: CancellationToken,
+        ) -> Result<bool, CheckpointStoreError> {
+            self.inner.mark_restored(checkpoint_id, at_ms, by, cancel).await
+        }
+
+        async fn mark_partial(
+            &self,
+            checkpoint_id: &str,
+            missing: Vec<String>,
+            cancel: CancellationToken,
+        ) -> Result<(), CheckpointStoreError> {
+            self.inner.mark_partial(checkpoint_id, missing, cancel).await
+        }
+
+        async fn load_restore_progress(
+            &self,
+            checkpoint_id: &str,
+            cancel: CancellationToken,
+        ) -> Result<Vec<concerto_core::checkpoint::RestoreProgressEntry>, CheckpointStoreError>
+        {
+            concerto_core::checkpoint::CheckpointStore::load_restore_progress(
+                &self.inner,
+                checkpoint_id,
+                cancel,
+            )
+            .await
+        }
+
+        async fn record_restore_progress(
+            &self,
+            checkpoint_id: &str,
+            entry: &concerto_core::checkpoint::RestoreProgressEntry,
+            cancel: CancellationToken,
+        ) -> Result<(), CheckpointStoreError> {
+            concerto_core::checkpoint::CheckpointStore::record_restore_progress(
+                &self.inner,
+                checkpoint_id,
+                entry,
+                cancel,
+            )
+            .await
+        }
+
+        async fn begin_restore_attempt(
+            &self,
+            attempt: &concerto_core::checkpoint::RestoreAttemptInfo,
+            cancel: CancellationToken,
+        ) -> Result<(), CheckpointStoreError> {
+            concerto_core::checkpoint::CheckpointStore::begin_restore_attempt(
+                &self.inner,
+                attempt,
+                cancel,
+            )
+            .await
+        }
+
+        async fn finish_restore_attempt(
+            &self,
+            attempt_id: &str,
+            outcome: concerto_core::checkpoint::RestoreAttemptOutcome,
+            finished_at_ms: i64,
+            cancel: CancellationToken,
+        ) -> Result<(), CheckpointStoreError> {
+            concerto_core::checkpoint::CheckpointStore::finish_restore_attempt(
+                &self.inner,
+                attempt_id,
+                outcome,
+                finished_at_ms,
+                cancel,
+            )
+            .await
+        }
+    }
+
+    let h = Harness::new().await;
+    for (call, path, content) in
+        [("w-1", "a.txt", "a-v1"), ("w-2", "b.txt", "b-v1"), ("w-3", "c.txt", "c-v1")]
+    {
+        h.gated_write(call, "agent-a", path, content).await;
+    }
+    let record = create_file_checkpoint(
+        &h.store,
+        &h.root,
+        h.session_id,
+        fs_scope(&["a.txt", "b.txt", "c.txt"]),
+        vec!["a.txt".to_string(), "b.txt".to_string(), "c.txt".to_string()],
+        "agent-a",
+        BTreeMap::new(),
+        Vec::new(),
+        None,
+        None,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("checkpoint creation");
+    let cid = record.checkpoint_id.to_string();
+    for (call, path, content) in
+        [("w-4", "a.txt", "a-v2"), ("w-5", "b.txt", "b-v2"), ("w-6", "c.txt", "c-v2")]
+    {
+        h.gated_write(call, "agent-a", path, content).await;
+    }
+
+    // Attempt 1: byte loss on b.txt mid-restore (a.txt lands, c.txt never runs).
+    let failing = FailBytesStore {
+        inner: h.store.clone(),
+        fail_path: "b.txt".to_string(),
+        failed: std::sync::atomic::AtomicBool::new(false),
+    };
+    match h
+        .executor
+        .restore_checkpoint(
+            &cid,
+            &failing,
+            &concerto_orchestrator::file_checkpoint::GateOwnershipOracle::new(h.gate.clone()),
+            &NoopStash,
+            &h.session(),
+            "agent-a",
+            CancellationToken::new(),
+        )
+        .await
+    {
+        Err(RestoreError::Store(_)) => {}
+        other => panic!("expected the injected mid-restore store failure, got {other:?}"),
+    }
+    // Precise partial progress, never a success claim.
+    let progress = h
+        .store
+        .load_restore_progress(&cid, &CancellationToken::new())
+        .await
+        .expect("journal reads");
+    let states: BTreeMap<String, String> = progress
+        .iter()
+        .map(|entry| (entry.canonical_path.clone(), entry.state.as_str().to_owned()))
+        .collect();
+    assert_eq!(
+        states,
+        BTreeMap::from([
+            ("a.txt".to_string(), "done".to_string()),
+            ("b.txt".to_string(), "failed".to_string()),
+        ]),
+        "c.txt never ran: no row (unknown progress, never assumed done)"
+    );
+    assert_eq!(h.disk("a.txt"), "a-v1", "the gated prefix landed");
+    assert_eq!(h.disk("b.txt"), "b-v2", "the failed path is untouched");
+    let back = h
+        .store
+        .load_checkpoint_record(&cid, &CancellationToken::new())
+        .await
+        .expect("load")
+        .expect("record survives");
+    assert!(matches!(back.status, CheckpointStatus::Active), "interrupted status stays retriable");
+
+    // The progress query reports the same story with live disk verification.
+    let items = h
+        .executor
+        .restore_progress(&cid, &h.store, &h.session(), CancellationToken::new())
+        .await
+        .expect("progress query reads");
+    let report: BTreeMap<String, (String, bool)> = items
+        .into_iter()
+        .map(|item| (item.canonical_path, (item.state.as_str().to_owned(), item.verified_on_disk)))
+        .collect();
+    assert_eq!(
+        report,
+        BTreeMap::from([
+            ("a.txt".to_string(), ("done".to_string(), true)),
+            ("b.txt".to_string(), ("failed".to_string(), false)),
+            ("c.txt".to_string(), ("pending".to_string(), false)),
+        ]),
+        "done+verified vs failed+drifted vs never-ran must read distinctly"
+    );
+
+    // Attempt 2 (resume through a counting store AND a write-recording
+    // tool): the verified a.txt row performs only its sidecar presence check
+    // and NO write — only b + c are written.
+    let counting = CountingStore {
+        inner: h.store.clone(),
+        loads: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+    };
+    let writes = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let mut resume_registry = ToolRegistry::default();
+    resume_registry.register(Box::new(RecordingFsTool {
+        inner: FilesystemTool::new(
+            camino::Utf8PathBuf::from_path_buf(h.root.clone()).expect("tempdir is utf-8"),
+        ),
+        ops: writes.clone(),
+    }));
+    let resume_executor = ToolExecutor::new(Arc::new(resume_registry), allow_engine())
+        .with_mutation_sink(Arc::new(h.store.clone()));
+    match resume_executor
+        .restore_checkpoint(
+            &cid,
+            &counting,
+            &concerto_orchestrator::file_checkpoint::GateOwnershipOracle::new(h.gate.clone()),
+            &NoopStash,
+            &h.session(),
+            "agent-a",
+            CancellationToken::new(),
+        )
+        .await
+        .expect("resume restores")
+    {
+        concerto_core::checkpoint::RestoreOutcome::Restored { verified_skips, .. } => {
+            assert_eq!(verified_skips, vec!["a.txt".to_string()], "only the verified row skips");
+        }
+        other => panic!("expected Restored on resume, got {other:?}"),
+    }
+    let loads = counting.loads.lock().expect("loads lock").clone();
+    assert_eq!(
+        loads.get("a.txt"),
+        Some(&1),
+        "the skip's ONE authoritative presence check: the recorded pre-image still banks its bytes"
+    );
+    assert_eq!(loads.get("b.txt"), Some(&1), "failed b.txt reloads exactly once");
+    assert_eq!(loads.get("c.txt"), Some(&1), "never-ran c.txt loads exactly once");
+    assert_eq!(
+        writes.lock().expect("ops lock").clone(),
+        vec!["write b.txt".to_string(), "write c.txt".to_string()],
+        "the verified skip performs no WRITE: a.txt is never re-written"
+    );
+    assert_eq!(h.disk("a.txt"), "a-v1");
+    assert_eq!(h.disk("b.txt"), "b-v1", "resume converged b.txt");
+    assert_eq!(h.disk("c.txt"), "c-v1", "resume converged c.txt");
+    let back = h
+        .store
+        .load_checkpoint_record(&cid, &CancellationToken::new())
+        .await
+        .expect("load")
+        .expect("record survives");
+    assert!(matches!(back.status, CheckpointStatus::Restored { .. }), "resume converges");
+    let progress = h
+        .store
+        .load_restore_progress(&cid, &CancellationToken::new())
+        .await
+        .expect("journal reads");
+    assert_eq!(progress.len(), 3, "every resource journaled done");
+    assert!(progress
+        .iter()
+        .all(|entry| { entry.state == concerto_core::checkpoint::RestoreResourceState::Done }));
+}
+
+/// Crash-restart: the service dies mid-restore (every in-memory handle
+/// dropped — a brand-new pool, store, and executor over the same database
+/// file and project dir). The reopened service reads precise journal
+/// progress from disk and resumes to `Restored`.
+#[tokio::test]
+async fn crash_restart_reopens_store_and_resumes_to_restored() {
+    let h = Harness::new().await;
+    h.gated_write("w-1", "agent-a", "a.txt", "a-v1").await;
+    h.gated_write("w-2", "agent-a", "b.txt", "b-v1").await;
+    let record = create_file_checkpoint(
+        &h.store,
+        &h.root,
+        h.session_id,
+        fs_scope(&["a.txt", "b.txt"]),
+        vec!["a.txt".to_string(), "b.txt".to_string()],
+        "agent-a",
+        BTreeMap::new(),
+        Vec::new(),
+        None,
+        None,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("checkpoint creation");
+    let cid = record.checkpoint_id.to_string();
+    h.gated_write("w-3", "agent-a", "a.txt", "a-v2").await;
+    h.gated_write("w-4", "agent-a", "b.txt", "b-v2").await;
+
+    // Attempt 1 under the old service: byte loss on b.txt mid-restore, so
+    // only a.txt lands and journals `done` — then the process dies.
+    let failing = FailBytesStore {
+        inner: h.store.clone(),
+        fail_path: "b.txt".to_string(),
+        failed: std::sync::atomic::AtomicBool::new(false),
+    };
+    match h
+        .executor
+        .restore_checkpoint(
+            &cid,
+            &failing,
+            &concerto_orchestrator::file_checkpoint::GateOwnershipOracle::new(h.gate.clone()),
+            &NoopStash,
+            &h.session(),
+            "agent-a",
+            CancellationToken::new(),
+        )
+        .await
+    {
+        Err(concerto_core::checkpoint::RestoreError::Store(_)) => {}
+        other => panic!("expected the injected mid-restore store failure, got {other:?}"),
+    }
+    assert_eq!(h.disk("a.txt"), "a-v1", "the gated prefix landed before the kill");
+
+    // The kill: close the pool and drop the store, the gate, and the
+    // executor — only the database file and the project dir survive. No
+    // restore progress lives in process memory. (The database TempDir is
+    // moved out first: dropping it would delete the file under the test.)
+    let root = h.root.clone();
+    let session_id = h.session_id;
+    h.pool.close().await;
+    let db_dir = h._db_dir;
+    let db_file = db_dir.path().join("ckpt_test.db");
+
+    // Reopen: brand-new pool over the same file (migrations re-apply
+    // cleanly — 040 included), brand-new store, gate, and executor.
+    let options = SqliteConnectOptions::new()
+        .filename(&db_file)
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .foreign_keys(true)
+        .synchronous(SqliteSynchronous::Normal);
+    let pool = PoolOptions::new()
+        .max_connections(4)
+        .connect_with(options)
+        .await
+        .expect("reopen pool connects");
+    sqlx::migrate!("../sessions/migrations").run(&pool).await.expect("migrations re-apply");
+    let store = FileCheckpointStore::new(pool.clone());
+    let mut registry = ToolRegistry::default();
+    registry.register(Box::new(FilesystemTool::new(
+        camino::Utf8PathBuf::from_path_buf(root.clone()).expect("tempdir is utf-8"),
+    )));
+    let executor = Arc::new(
+        ToolExecutor::new(Arc::new(registry), allow_engine())
+            .with_mutation_sink(Arc::new(store.clone())),
+    );
+    let gate = Arc::new(
+        WriteGate::new(
+            allow_engine(),
+            executor.clone(),
+            pool.clone(),
+            Arc::new(FilePreImageReader::new(root.clone())),
+            root.clone(),
+            1,
+        )
+        .with_checkpoint_store(store.clone()),
+    );
+    let session = SessionContext::new(session_id, root.clone());
+
+    // The reopened service reads precise journal progress from disk (not
+    // memory): a.txt verifies and skips, only b.txt restores.
+    match restore_file_checkpoint(
+        &executor,
+        &store,
+        &gate,
+        None,
+        &session,
+        &cid,
+        "agent-a",
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("post-restart resume converges")
+    {
+        concerto_core::checkpoint::RestoreOutcome::Restored { verified_skips, .. } => {
+            assert_eq!(
+                verified_skips,
+                vec!["a.txt".to_string()],
+                "the pre-kill write is verified, not rewritten"
+            );
+        }
+        other => panic!("expected Restored after restart, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).expect("read a"),
+        "a-v1",
+        "post-restart restore converged a.txt"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("b.txt")).expect("read b"),
+        "b-v1",
+        "post-restart restore converged b.txt"
+    );
+    let progress =
+        store.load_restore_progress(&cid, &CancellationToken::new()).await.expect("journal reads");
+    assert_eq!(progress.len(), 2, "the restarted service journaled every resource");
+    assert!(progress
+        .iter()
+        .all(|entry| entry.state == concerto_core::checkpoint::RestoreResourceState::Done));
+}
+
+/// Concurrent duplicate submission converges without double-apply
+/// corruption: every outcome is `Restored`/`AlreadyRestored`, disk is
+/// byte-exact, and the journal ends all-`done`.
+#[tokio::test]
+async fn concurrent_duplicate_restore_converges_without_corruption() {
+    let h = Harness::new().await;
+    h.gated_write("w-1", "agent-a", "a.txt", "a-v1").await;
+    h.gated_write("w-2", "agent-a", "b.txt", "b-v1").await;
+    let record = create_file_checkpoint(
+        &h.store,
+        &h.root,
+        h.session_id,
+        fs_scope(&["a.txt", "b.txt"]),
+        vec!["a.txt".to_string(), "b.txt".to_string()],
+        "agent-a",
+        BTreeMap::new(),
+        Vec::new(),
+        None,
+        None,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("checkpoint creation");
+    let cid = record.checkpoint_id.to_string();
+    h.gated_write("w-3", "agent-a", "a.txt", "a-v2").await;
+    h.gated_write("w-4", "agent-a", "b.txt", "b-v2").await;
+
+    let session = h.session();
+    let cancel_first = CancellationToken::new();
+    let cancel_second = CancellationToken::new();
+    let (first, second) = tokio::join!(
+        restore_file_checkpoint(
+            &h.executor,
+            &h.store,
+            &h.gate,
+            None,
+            &session,
+            &cid,
+            "agent-a",
+            &cancel_first,
+        ),
+        restore_file_checkpoint(
+            &h.executor,
+            &h.store,
+            &h.gate,
+            None,
+            &session,
+            &cid,
+            "agent-a",
+            &cancel_second,
+        )
+    );
+    for outcome in [&first, &second] {
+        match outcome {
+            Ok(concerto_core::checkpoint::RestoreOutcome::Restored { .. })
+            | Ok(concerto_core::checkpoint::RestoreOutcome::AlreadyRestored { .. }) => {}
+            other => panic!("concurrent duplicates must converge, got {other:?}"),
+        }
+    }
+    assert_eq!(h.disk("a.txt"), "a-v1", "no double-apply corruption on a.txt");
+    assert_eq!(h.disk("b.txt"), "b-v1", "no double-apply corruption on b.txt");
+    let back = h
+        .store
+        .load_checkpoint_record(&cid, &CancellationToken::new())
+        .await
+        .expect("load")
+        .expect("record survives");
+    assert!(matches!(back.status, CheckpointStatus::Restored { .. }));
+}
+
+/// A resource marked `done` by an earlier run but modified since is
+/// re-restored, never blindly skipped.
+#[tokio::test]
+async fn changed_since_done_marker_is_rewritten_not_skipped() {
+    let h = Harness::new().await;
+    h.gated_write("w-1", "agent-a", "a.txt", "a-v1").await;
+    let record = create_file_checkpoint(
+        &h.store,
+        &h.root,
+        h.session_id,
+        fs_scope(&["a.txt"]),
+        vec!["a.txt".to_string()],
+        "agent-a",
+        BTreeMap::new(),
+        Vec::new(),
+        None,
+        None,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("checkpoint creation");
+    let cid = record.checkpoint_id.to_string();
+    h.gated_write("w-2", "agent-a", "a.txt", "a-v2").await;
+
+    // First restore lands a.txt and journals `done`.
+    match restore_file_checkpoint(
+        &h.executor,
+        &h.store,
+        &h.gate,
+        None,
+        &h.session(),
+        &cid,
+        "agent-a",
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("first restore lands")
+    {
+        concerto_core::checkpoint::RestoreOutcome::Restored { .. } => {}
+        other => panic!("expected Restored, got {other:?}"),
+    }
+    assert_eq!(h.disk("a.txt"), "a-v1");
+
+    // A sibling edits the file after the `done` marker; the checkpoint goes
+    // back to Active (simulating a crash between the last write and
+    // `mark_restored`, or a deliberate re-restore request).
+    std::fs::write(h.root.join("a.txt"), b"sibling-edit").expect("sibling edit lands");
+    sqlx::query("UPDATE file_checkpoints SET status = 'active' WHERE checkpoint_id = ?")
+        .bind(&cid)
+        .execute(&h.pool)
+        .await
+        .expect("re-arm Active");
+
+    match restore_file_checkpoint(
+        &h.executor,
+        &h.store,
+        &h.gate,
+        None,
+        &h.session(),
+        &cid,
+        "agent-a",
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("second restore rewrites")
+    {
+        concerto_core::checkpoint::RestoreOutcome::Restored { verified_skips, .. } => {
+            assert!(
+                verified_skips.is_empty(),
+                "drifted content must never skip, got {verified_skips:?}"
+            );
+        }
+        other => panic!("expected Restored, got {other:?}"),
+    }
+    assert_eq!(h.disk("a.txt"), "a-v1", "the drifted path is rewritten byte-exact");
+}
+
+/// Bytes that vanish after checkpointing (retention prune between capture
+/// and restore) never claim `Restored`: the restore reports `Partial`,
+/// journals the byte-less path `missing`, and leaves the landed prefix
+/// resumable.
+#[tokio::test]
+async fn pruned_bytes_mid_restore_never_claim_restored() {
+    let h = Harness::new().await;
+    h.gated_write("w-1", "agent-a", "a.txt", "a-v1").await;
+    h.gated_write("w-2", "agent-a", "b.txt", "b-v1").await;
+    let record = create_file_checkpoint(
+        &h.store,
+        &h.root,
+        h.session_id,
+        fs_scope(&["a.txt", "b.txt"]),
+        vec!["a.txt".to_string(), "b.txt".to_string()],
+        "agent-a",
+        BTreeMap::new(),
+        Vec::new(),
+        None,
+        None,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("checkpoint creation");
+    let cid = record.checkpoint_id.to_string();
+    h.gated_write("w-3", "agent-a", "a.txt", "a-v2").await;
+    h.gated_write("w-4", "agent-a", "b.txt", "b-v2").await;
+
+    // Retention collects b.txt's sidecar rows while the record still claims
+    // Active (the prune/status race the journal must survive honestly).
+    sqlx::query(
+        "DELETE FROM checkpoint_pre_image_chunks WHERE checkpoint_id = ? AND canonical_path = 'b.txt'",
+    )
+    .bind(&cid)
+    .execute(&h.pool)
+    .await
+    .expect("drop b.txt chunks");
+
+    match restore_file_checkpoint(
+        &h.executor,
+        &h.store,
+        &h.gate,
+        None,
+        &h.session(),
+        &cid,
+        "agent-a",
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("partial restore surfaces, never fails")
+    {
+        concerto_core::checkpoint::RestoreOutcome::Partial { restored, missing, .. } => {
+            assert_eq!(restored, vec!["a.txt".to_string()]);
+            assert_eq!(missing, vec!["b.txt".to_string()]);
+        }
+        other => panic!("expected Partial (never Restored without bytes), got {other:?}"),
+    }
+    let back = h
+        .store
+        .load_checkpoint_record(&cid, &CancellationToken::new())
+        .await
+        .expect("load")
+        .expect("record survives");
+    assert!(
+        matches!(back.status, CheckpointStatus::Partial { .. }),
+        "byte-less restore records Partial, never Restored"
+    );
+    let progress = h
+        .store
+        .load_restore_progress(&cid, &CancellationToken::new())
+        .await
+        .expect("journal reads");
+    let states: BTreeMap<String, String> = progress
+        .iter()
+        .map(|entry| (entry.canonical_path.clone(), entry.state.as_str().to_owned()))
+        .collect();
+    assert_eq!(
+        states,
+        BTreeMap::from([
+            ("a.txt".to_string(), "done".to_string()),
+            ("b.txt".to_string(), "missing".to_string()),
+        ])
+    );
+    assert_eq!(h.disk("b.txt"), "b-v2", "no bytes: nothing written");
+}
+
+/// The verified-skip invariant, end-to-end: a prior run journaled a path
+/// `done`, then retention collected its sidecar rows while the live disk
+/// still coincidentally hashes to the record's `post_hash`. Without the
+/// recorded pre-image the skip is refused — nothing is restored — so the
+/// outcome is `Partial` (never `Restored` + `verified_skips`), the status is
+/// `Partial`, the journal keeps `done` (the monotonic guard refuses
+/// `done → missing`), and no write runs.
+#[tokio::test]
+async fn pruned_sidecar_on_done_row_restores_partial_never_a_skip() {
+    let h = Harness::new().await;
+    h.gated_write("w-1", "agent-a", "a.txt", "a-v1").await;
+    let record = create_file_checkpoint(
+        &h.store,
+        &h.root,
+        h.session_id,
+        fs_scope(&["a.txt"]),
+        vec!["a.txt".to_string()],
+        "agent-a",
+        BTreeMap::new(),
+        Vec::new(),
+        None,
+        None,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("checkpoint creation");
+    let cid = record.checkpoint_id.to_string();
+    h.gated_write("w-2", "agent-a", "a.txt", "a-v2").await;
+
+    // First restore lands a.txt and journals `done`.
+    match restore_file_checkpoint(
+        &h.executor,
+        &h.store,
+        &h.gate,
+        None,
+        &h.session(),
+        &cid,
+        "agent-a",
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("first restore lands")
+    {
+        concerto_core::checkpoint::RestoreOutcome::Restored { .. } => {}
+        other => panic!("expected Restored, got {other:?}"),
+    }
+    assert_eq!(h.disk("a.txt"), "a-v1");
+
+    // Re-arm Active, then retention-collect the sidecar rows for a.txt: the
+    // record still claims restorable, the journal still says `done`, and the
+    // disk still hashes to post_hash — but no restorable bytes remain.
+    sqlx::query("UPDATE file_checkpoints SET status = 'active' WHERE checkpoint_id = ?")
+        .bind(&cid)
+        .execute(&h.pool)
+        .await
+        .expect("re-arm Active");
+    sqlx::query(
+        "DELETE FROM checkpoint_pre_image_chunks WHERE checkpoint_id = ? AND canonical_path = 'a.txt'",
+    )
+    .bind(&cid)
+    .execute(&h.pool)
+    .await
+    .expect("drop a.txt chunks");
+
+    // Second restore: disk match alone must not earn a verified skip.
+    match restore_file_checkpoint(
+        &h.executor,
+        &h.store,
+        &h.gate,
+        None,
+        &h.session(),
+        &cid,
+        "agent-a",
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("byte-less restore surfaces, never fails")
+    {
+        concerto_core::checkpoint::RestoreOutcome::Partial { restored, missing, limitations } => {
+            assert!(
+                restored.is_empty(),
+                "a sidecar-less `done` row must never be claimed as restored, got {restored:?}"
+            );
+            assert_eq!(missing, vec!["a.txt".to_string()]);
+            assert!(
+                limitations.iter().any(|l| l.contains("no restorable bytes banked")),
+                "the limitation names the byte loss, got {limitations:?}"
+            );
+        }
+        other => {
+            panic!("expected Partial (disk match without a pre-image is not proof), got {other:?}")
+        }
+    }
+    let back = h
+        .store
+        .load_checkpoint_record(&cid, &CancellationToken::new())
+        .await
+        .expect("load")
+        .expect("record survives");
+    assert!(
+        matches!(back.status, CheckpointStatus::Partial { .. }),
+        "the dishonest Restored claim is recorded as Partial, got {:?}",
+        back.status
+    );
+    let progress = h
+        .store
+        .load_restore_progress(&cid, &CancellationToken::new())
+        .await
+        .expect("journal reads");
+    let states: BTreeMap<String, String> = progress
+        .iter()
+        .map(|entry| (entry.canonical_path.clone(), entry.state.as_str().to_owned()))
+        .collect();
+    assert_eq!(
+        states,
+        BTreeMap::from([("a.txt".to_string(), "done".to_string())]),
+        "the monotonic guard keeps the earlier true `done` (`done → missing` refused)"
+    );
+    assert_eq!(h.disk("a.txt"), "a-v1", "no bytes: nothing written, disk left as found");
 }

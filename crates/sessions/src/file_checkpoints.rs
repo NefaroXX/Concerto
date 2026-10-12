@@ -38,10 +38,14 @@
 //!   and legacy single-BLOB rows) whose checkpoint is no longer `Active` OR
 //!   older than `retention_days` (delete-only, no archive — hashes stay on
 //!   the never-pruned log) and transitions pruned-bytes checkpoints to
-//!   `Expired`, withdrawing the restorable claim from that instant. A
-//!   checkpoint advertised as restorable is never prune-eligible. Cancellable
-//!   at statement boundaries, fail-soft at the `connect()` call site (a
-//!   failed prune leaves rows in place).
+//!   `Expired`, withdrawing the restorable claim from that instant. The
+//!   restore journal and attempt envelopes are collected under the identical
+//!   predicate inside the same transaction — they exist only to resume or
+//!   report a restore of that checkpoint, so they live no longer than the
+//!   restorable bytes they describe; record envelopes always survive for
+//!   audit. A checkpoint advertised as restorable is never prune-eligible.
+//!   Cancellable at statement boundaries, fail-soft at the `connect()` call
+//!   site (a failed prune leaves rows in place).
 //! * **Encryption is conditional** (ADR-73 interaction): these tables live
 //!   inside `sessions.db`, so they are encrypted WHEN the operator enables
 //!   `encrypt_at_rest` — the same guarantee and operator control as every
@@ -51,7 +55,8 @@ use std::collections::BTreeMap;
 
 use concerto_core::checkpoint::{
     now_millis, plan_capture, CaptureKind, CheckpointRecord, CheckpointResource, CheckpointScope,
-    CheckpointStatus, CheckpointStoreError, PreImageBytes, RestoreMethod,
+    CheckpointStatus, CheckpointStoreError, PreImageBytes, RestoreAttemptInfo,
+    RestoreAttemptOutcome, RestoreMethod, RestoreProgressEntry, RestoreResourceState,
     CHECKPOINT_BLOB_LIMIT_BYTES, CHECKPOINT_TOTAL_LIMIT_BYTES,
 };
 use concerto_core::ids::Ulid;
@@ -91,12 +96,18 @@ pub struct CheckpointPruneReport {
     /// Checkpoints transitioned `Active` → `Expired` (restorable claim
     /// withdrawn by this run).
     pub expired: u64,
-    /// Sidecar byte rows deleted.
+    /// Sidecar byte rows deleted (legacy + chunks; the restore journal and
+    /// attempt envelopes deleted alongside under the same predicate are not
+    /// counted — see [`FileCheckpointStore::prune_checkpoints`]).
     pub sidecar_rows_deleted: u64,
     /// Cutoff of this run: active checkpoints with `created_at < cutoff_unix`
     /// were eligible.
     pub cutoff_unix: i64,
 }
+
+/// One journal row as read: path, state word, verified hash, attempt,
+// agent, update time, detail.
+type JournalRow = (String, String, Option<String>, String, String, i64, String);
 
 /// The checkpoint sidecar over one session database pool.
 #[derive(Debug, Clone)]
@@ -451,10 +462,19 @@ impl FileCheckpointStore {
     /// withdrawn from that instant).
     ///
     /// Delete-only, no archive: the hashes stay on the never-pruned
-    /// whiteboard log, and every record envelope survives for audit. Shares
-    /// `prune_audit`'s cutoff arithmetic (including the overflow keeps-all
-    /// behavior) so the two halves of one retention run can never disagree on
-    /// the window.
+    /// whiteboard log, and every record envelope survives for audit. The
+    /// restore journal and attempt envelopes for the SAME predicate-matched
+    /// checkpoints go in the same transaction (they describe a restore of a
+    /// checkpoint that is no longer restorable-within-window; a later attempt
+    /// without them re-verifies from scratch rather than assuming progress).
+    /// Shares `prune_audit`'s cutoff arithmetic (including the overflow
+    /// keeps-all behavior) so the two halves of one retention run can never
+    /// disagree on the window.
+    ///
+    /// [`CheckpointPruneReport::sidecar_rows_deleted`] counts byte rows only
+    /// (legacy + chunks), as before — the bookkeeping deletes are reported
+    /// through `tracing` rather than a new field, keeping the report shape
+    /// stable.
     pub async fn prune_checkpoints(
         &self,
         retention_days: u64,
@@ -542,6 +562,175 @@ impl FileCheckpointStore {
             SessionError::Storage(format!("checkpoint {checkpoint_id} has no record row"))
         })
     }
+
+    /// Open one restore attempt's durable envelope (`INSERT OR IGNORE`: the
+    /// `attempt_id` PRIMARY KEY makes re-submitting the same attempt a replay,
+    /// never a fork — the gate's `call_id` dedup contract at attempt
+    /// granularity).
+    pub async fn begin_restore_attempt(
+        &self,
+        attempt: &RestoreAttemptInfo,
+        cancel: &CancellationToken,
+    ) -> Result<(), SessionError> {
+        check_cancel(cancel)?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO checkpoint_restore_attempts \
+             (attempt_id, checkpoint_id, by_agent, started_at, outcome) \
+             VALUES (?, ?, ?, ?, 'running')",
+        )
+        .bind(&attempt.attempt_id)
+        .bind(&attempt.checkpoint_id)
+        .bind(&attempt.by_agent)
+        .bind(attempt.started_at_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(SessionError::from)?;
+        Ok(())
+    }
+
+    /// Stamp one attempt's terminal outcome. Updating a missing attempt is a
+    /// no-op (the begin row is the authority; a finish without a begin only
+    /// means the begin was lost — the per-resource rows still tell the truth).
+    pub async fn finish_restore_attempt(
+        &self,
+        attempt_id: &str,
+        outcome: RestoreAttemptOutcome,
+        finished_at_ms: i64,
+        cancel: &CancellationToken,
+    ) -> Result<(), SessionError> {
+        check_cancel(cancel)?;
+        sqlx::query(
+            "UPDATE checkpoint_restore_attempts SET outcome = ?, finished_at = ? \
+             WHERE attempt_id = ?",
+        )
+        .bind(outcome.as_str())
+        .bind(finished_at_ms)
+        .bind(attempt_id)
+        .execute(&self.pool)
+        .await
+        .map_err(SessionError::from)?;
+        Ok(())
+    }
+
+    /// Upsert one resource's restore progress, monotonically: `running` never
+    /// overwrites `done` (a concurrent duplicate submission cannot regress a
+    /// landed write), while `done` always wins (a resume's verification
+    /// refreshes the row). Every other transition applies unconditionally —
+    /// `failed`/`missing`/`pending` describe the latest attempt's knowledge,
+    /// and a missing row means "unknown progress", never "assume done".
+    pub async fn record_restore_progress(
+        &self,
+        checkpoint_id: &str,
+        entry: &RestoreProgressEntry,
+        cancel: &CancellationToken,
+    ) -> Result<(), SessionError> {
+        check_cancel(cancel)?;
+        sqlx::query(
+            "INSERT INTO checkpoint_restore_journal \
+             (checkpoint_id, canonical_path, state, content_hash, attempt_id, by_agent, updated_at, detail) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(checkpoint_id, canonical_path) DO UPDATE SET \
+               state = excluded.state, content_hash = excluded.content_hash, \
+               attempt_id = excluded.attempt_id, by_agent = excluded.by_agent, \
+               updated_at = excluded.updated_at, detail = excluded.detail \
+             WHERE checkpoint_restore_journal.state != 'done' OR excluded.state = 'done'",
+        )
+        .bind(checkpoint_id)
+        .bind(&entry.canonical_path)
+        .bind(entry.state.as_str())
+        .bind(entry.content_hash.as_deref())
+        .bind(&entry.attempt_id)
+        .bind(&entry.by_agent)
+        .bind(entry.updated_at_ms)
+        .bind(&entry.detail)
+        .execute(&self.pool)
+        .await
+        .map_err(SessionError::from)?;
+        Ok(())
+    }
+
+    /// Load the durable per-resource restore progress for `checkpoint_id`,
+    /// in canonical-path order. A row carrying an unknown state word reads as
+    /// `failed` (re-verify, never assume done) with a warning — the journal
+    /// must degrade to "unknown progress", never to a fabricated `done`.
+    pub async fn load_restore_progress(
+        &self,
+        checkpoint_id: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<RestoreProgressEntry>, SessionError> {
+        check_cancel(cancel)?;
+        let rows: Vec<JournalRow> = sqlx::query_as(
+            "SELECT canonical_path, state, content_hash, attempt_id, by_agent, updated_at, detail \
+                 FROM checkpoint_restore_journal WHERE checkpoint_id = ? ORDER BY canonical_path",
+        )
+        .bind(checkpoint_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(SessionError::from)?;
+        let mut entries = Vec::with_capacity(rows.len());
+        for (
+            canonical_path,
+            state_raw,
+            content_hash,
+            attempt_id,
+            by_agent,
+            updated_at_ms,
+            detail,
+        ) in rows
+        {
+            let Some(state) = RestoreResourceState::parse(&state_raw) else {
+                tracing::warn!(
+                    checkpoint_id = %checkpoint_id,
+                    canonical_path = %canonical_path,
+                    state = %state_raw,
+                    "restore journal holds an unknown state word; reading as failed (re-verify, never assume done)"
+                );
+                entries.push(RestoreProgressEntry {
+                    canonical_path,
+                    state: RestoreResourceState::Failed,
+                    content_hash,
+                    attempt_id,
+                    by_agent,
+                    updated_at_ms,
+                    detail,
+                });
+                continue;
+            };
+            entries.push(RestoreProgressEntry {
+                canonical_path,
+                state,
+                content_hash,
+                attempt_id,
+                by_agent,
+                updated_at_ms,
+                detail,
+            });
+        }
+        Ok(entries)
+    }
+
+    /// Load one attempt envelope (`None` when the id was never begun).
+    pub async fn load_restore_attempt(
+        &self,
+        attempt_id: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Option<(RestoreAttemptInfo, Option<(String, Option<i64>)>)>, SessionError> {
+        check_cancel(cancel)?;
+        let row: Option<(String, String, String, i64, String, Option<i64>)> = sqlx::query_as(
+            "SELECT attempt_id, checkpoint_id, by_agent, started_at, outcome, finished_at \
+             FROM checkpoint_restore_attempts WHERE attempt_id = ?",
+        )
+        .bind(attempt_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(SessionError::from)?;
+        Ok(row.map(|(attempt_id, checkpoint_id, by_agent, started_at_ms, outcome, finished_at)| {
+            (
+                RestoreAttemptInfo { attempt_id, checkpoint_id, by_agent, started_at_ms },
+                Some((outcome, finished_at)),
+            )
+        }))
+    }
 }
 
 /// The prune transaction proper on a dedicated connection: delete byte rows
@@ -579,6 +768,40 @@ async fn delete_and_expire(
     .await
     .map_err(SessionError::from)?
     .rows_affected();
+    // Restore bookkeeping is collected with the IDENTICAL predicate as the
+    // byte rows: the journal and attempt envelopes exist only to resume or
+    // report a restore OF that checkpoint, so they live exactly as long as
+    // the checkpoint stays restorable within the retention window (at most).
+    // Deleting them is fail-safe, not lossy: no journal row reads as
+    // "unknown progress, re-verify" on any later attempt, never "assume
+    // done". Record envelopes and the never-pruned whiteboard log still
+    // survive for audit — the durable hashes and the attempts' story on the
+    // log are not this transaction's to touch.
+    let journal_deleted = sqlx::query(
+        "DELETE FROM checkpoint_restore_journal WHERE checkpoint_id IN (\
+           SELECT checkpoint_id FROM file_checkpoints \
+           WHERE status != 'active' OR created_at < ?)",
+    )
+    .bind(cutoff)
+    .execute(&mut *conn)
+    .await
+    .map_err(SessionError::from)?
+    .rows_affected();
+    let attempts_deleted = sqlx::query(
+        "DELETE FROM checkpoint_restore_attempts WHERE checkpoint_id IN (\
+           SELECT checkpoint_id FROM file_checkpoints \
+           WHERE status != 'active' OR created_at < ?)",
+    )
+    .bind(cutoff)
+    .execute(&mut *conn)
+    .await
+    .map_err(SessionError::from)?
+    .rows_affected();
+    tracing::debug!(
+        journal_deleted,
+        attempts_deleted,
+        "checkpoint retention collected restore bookkeeping"
+    );
     let deleted = legacy_deleted + chunks_deleted;
     let mut expired = 0u64;
     for (checkpoint_id,) in to_expire {
@@ -890,6 +1113,43 @@ impl concerto_core::checkpoint::CheckpointStore for FileCheckpointStore {
         cancel: CancellationToken,
     ) -> Result<(), CheckpointStoreError> {
         self.transition_to_partial(checkpoint_id, missing, &cancel).await.map_err(store_error)
+    }
+
+    async fn load_restore_progress(
+        &self,
+        checkpoint_id: &str,
+        cancel: CancellationToken,
+    ) -> Result<Vec<RestoreProgressEntry>, CheckpointStoreError> {
+        self.load_restore_progress(checkpoint_id, &cancel).await.map_err(store_error)
+    }
+
+    async fn record_restore_progress(
+        &self,
+        checkpoint_id: &str,
+        entry: &RestoreProgressEntry,
+        cancel: CancellationToken,
+    ) -> Result<(), CheckpointStoreError> {
+        self.record_restore_progress(checkpoint_id, entry, &cancel).await.map_err(store_error)
+    }
+
+    async fn begin_restore_attempt(
+        &self,
+        attempt: &RestoreAttemptInfo,
+        cancel: CancellationToken,
+    ) -> Result<(), CheckpointStoreError> {
+        self.begin_restore_attempt(attempt, &cancel).await.map_err(store_error)
+    }
+
+    async fn finish_restore_attempt(
+        &self,
+        attempt_id: &str,
+        outcome: RestoreAttemptOutcome,
+        finished_at_ms: i64,
+        cancel: CancellationToken,
+    ) -> Result<(), CheckpointStoreError> {
+        self.finish_restore_attempt(attempt_id, outcome, finished_at_ms, &cancel)
+            .await
+            .map_err(store_error)
     }
 }
 
@@ -1550,6 +1810,111 @@ mod tests {
         }
     }
 
+    /// Restore bookkeeping shares the byte rows' retention fate: an aged
+    /// checkpoint's journal + attempt rows are collected by the SAME
+    /// predicate in the same transaction, while a fresh Active checkpoint's
+    /// progress and attempt survive intact (a later resume still finds them).
+    /// The report counts byte rows only — bookkeeping deletes are traced, not
+    /// a new field.
+    #[tokio::test]
+    async fn prune_collects_restore_journal_and_attempts_with_the_byte_predicate() {
+        let (_dir, store) = test_store().await;
+        let old_ms = now_millis() - 30 * 86_400 * 1000;
+
+        // Aged Active: bytes + journal + attempt collected together.
+        let aged_cid = Ulid::new();
+        let mut aged = record_with(
+            CheckpointStatus::Active,
+            vec![banked("aged.txt", &aged_cid)],
+            RestoreMethod::PreImageStore,
+        );
+        aged.checkpoint_id = aged_cid;
+        aged.created_at_ms = old_ms;
+        store
+            .create_checkpoint(
+                &aged,
+                &BTreeMap::from([("aged.txt".to_owned(), b"a".to_vec())]),
+                &token(),
+            )
+            .await
+            .expect("aged create");
+        store
+            .begin_restore_attempt(&restore_attempt("att-aged", &aged_cid.to_string()), &token())
+            .await
+            .expect("begin aged");
+        store
+            .record_restore_progress(
+                &aged_cid.to_string(),
+                &progress_entry("aged.txt", RestoreResourceState::Done, Some("h"), "att-aged"),
+                &token(),
+            )
+            .await
+            .expect("journal aged");
+
+        // Fresh Active: restorable bytes keep their progress and attempt.
+        let fresh_cid = Ulid::new();
+        let mut fresh = record_with(
+            CheckpointStatus::Active,
+            vec![banked("fresh.txt", &fresh_cid)],
+            RestoreMethod::PreImageStore,
+        );
+        fresh.checkpoint_id = fresh_cid;
+        fresh.created_at_ms = now_millis();
+        store
+            .create_checkpoint(
+                &fresh,
+                &BTreeMap::from([("fresh.txt".to_owned(), b"f".to_vec())]),
+                &token(),
+            )
+            .await
+            .expect("fresh create");
+        store
+            .begin_restore_attempt(&restore_attempt("att-fresh", &fresh_cid.to_string()), &token())
+            .await
+            .expect("begin fresh");
+        store
+            .record_restore_progress(
+                &fresh_cid.to_string(),
+                &progress_entry("fresh.txt", RestoreResourceState::Running, None, "att-fresh"),
+                &token(),
+            )
+            .await
+            .expect("journal fresh");
+
+        let report = store.prune_checkpoints(7, &token()).await.expect("prune");
+        assert_eq!(report.expired, 1, "only the aged Active transitions");
+        assert_eq!(
+            report.sidecar_rows_deleted, 1,
+            "byte rows only; the bookkeeping deletes are traced, not counted"
+        );
+
+        assert!(
+            store
+                .load_restore_progress(&aged_cid.to_string(), &token())
+                .await
+                .expect("load")
+                .is_empty(),
+            "aged journal rows collected with their bytes"
+        );
+        assert!(
+            store.load_restore_attempt("att-aged", &token()).await.expect("load").is_none(),
+            "aged attempt envelope collected with its bytes"
+        );
+        assert!(
+            store
+                .load_restore_progress(&fresh_cid.to_string(), &token())
+                .await
+                .expect("load")
+                .len()
+                == 1,
+            "fresh Active progress survives for a later resume"
+        );
+        assert!(
+            store.load_restore_attempt("att-fresh", &token()).await.expect("load").is_some(),
+            "fresh Active attempt envelope survives"
+        );
+    }
+
     #[tokio::test]
     async fn rebuild_from_log_leaves_the_sidecar_alone() {
         use crate::resource_facts::ResourceFacts;
@@ -1851,5 +2216,273 @@ mod tests {
     ) -> PreImageBytes {
         use concerto_core::checkpoint::CheckpointStore as _;
         store.load_bytes(checkpoint_id, canonical_path, token()).await.expect("load bytes")
+    }
+
+    fn restore_attempt(attempt_id: &str, checkpoint_id: &str) -> RestoreAttemptInfo {
+        RestoreAttemptInfo {
+            attempt_id: attempt_id.to_owned(),
+            checkpoint_id: checkpoint_id.to_owned(),
+            by_agent: "agent-a".to_string(),
+            started_at_ms: now_millis(),
+        }
+    }
+
+    fn progress_entry(
+        path: &str,
+        state: RestoreResourceState,
+        hash: Option<&str>,
+        attempt_id: &str,
+    ) -> RestoreProgressEntry {
+        RestoreProgressEntry {
+            canonical_path: path.to_owned(),
+            state,
+            content_hash: hash.map(str::to_owned),
+            attempt_id: attempt_id.to_owned(),
+            by_agent: "agent-a".to_string(),
+            updated_at_ms: now_millis(),
+            detail: String::new(),
+        }
+    }
+
+    async fn reopen_store(dir: &tempfile::TempDir) -> FileCheckpointStore {
+        // Crash-restart topology: a brand-new pool over the same database
+        // file (no in-memory state survives — only what was committed).
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(dir.path().join("ckpt_test.db"))
+            .create_if_missing(true);
+        let pool = sqlx::pool::PoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await
+            .expect("reopen pool");
+        sqlx::migrate!("./migrations").run(&pool).await.expect("migrations re-apply cleanly");
+        FileCheckpointStore::new(pool)
+    }
+
+    /// The journal upsert is monotonic (`running` never regresses `done`;
+    /// `done` always wins) and the attempt envelope replays instead of
+    /// forking on a duplicate begin.
+    #[tokio::test]
+    async fn restore_journal_upserts_are_monotonic_and_attempts_replay() {
+        let (_dir, store) = test_store().await;
+        let cid = Ulid::new().to_string();
+        let hash = blake3::hash(b"v1").to_hex().to_string();
+
+        store
+            .begin_restore_attempt(&restore_attempt("att-1", &cid), &token())
+            .await
+            .expect("begin");
+        // Re-submitting the same attempt id replays (single row, no fork).
+        store
+            .begin_restore_attempt(&restore_attempt("att-1", &cid), &token())
+            .await
+            .expect("re-begin replays");
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM checkpoint_restore_attempts WHERE attempt_id = 'att-1'",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .expect("count attempts");
+        assert_eq!(rows, 1, "duplicate begin is a no-op replay");
+
+        store
+            .record_restore_progress(
+                &cid,
+                &progress_entry("a.txt", RestoreResourceState::Running, None, "att-1"),
+                &token(),
+            )
+            .await
+            .expect("running");
+        store
+            .record_restore_progress(
+                &cid,
+                &progress_entry("a.txt", RestoreResourceState::Done, Some(&hash), "att-1"),
+                &token(),
+            )
+            .await
+            .expect("done");
+        // A concurrent duplicate's `running` must not regress the landed `done`.
+        store
+            .record_restore_progress(
+                &cid,
+                &progress_entry("a.txt", RestoreResourceState::Running, None, "att-2"),
+                &token(),
+            )
+            .await
+            .expect("stale running");
+        let back = store.load_restore_progress(&cid, &token()).await.expect("load");
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].state, RestoreResourceState::Done);
+        assert_eq!(back[0].content_hash.as_deref(), Some(hash.as_str()));
+        assert_eq!(back[0].attempt_id, "att-1", "the stale running row never overwrote done");
+
+        // A resume's fresh `done` refreshes the row (done always wins).
+        store
+            .record_restore_progress(
+                &cid,
+                &progress_entry("a.txt", RestoreResourceState::Done, Some(&hash), "att-3"),
+                &token(),
+            )
+            .await
+            .expect("resume done");
+        let back = store.load_restore_progress(&cid, &token()).await.expect("load");
+        assert_eq!(back[0].attempt_id, "att-3");
+
+        store
+            .finish_restore_attempt(
+                "att-1",
+                RestoreAttemptOutcome::Restored,
+                now_millis(),
+                &token(),
+            )
+            .await
+            .expect("finish");
+        let (info, outcome) = store
+            .load_restore_attempt("att-1", &token())
+            .await
+            .expect("load")
+            .expect("attempt row");
+        assert_eq!(info.checkpoint_id, cid);
+        assert_eq!(outcome.expect("finished").0, RestoreAttemptOutcome::Restored.as_str());
+        // Finishing an unknown attempt is a harmless no-op, never an error.
+        store
+            .finish_restore_attempt(
+                "att-ghost",
+                RestoreAttemptOutcome::Failed,
+                now_millis(),
+                &token(),
+            )
+            .await
+            .expect("ghost finish is silent");
+        assert!(store.load_restore_attempt("att-ghost", &token()).await.expect("load").is_none());
+
+        // Full state matrix: the SQL guard
+        // `WHERE journal.state != 'done' OR excluded.state = 'done'` pinned
+        // for EVERY prior×incoming pair — `done` sticky, every other prior
+        // state replaceable by anything (including `done`). The core test
+        // fake mirrors this same matrix, so the durable path and the in-
+        // memory path can never drift apart silently.
+        let states = [
+            RestoreResourceState::Pending,
+            RestoreResourceState::Running,
+            RestoreResourceState::Done,
+            RestoreResourceState::Failed,
+            RestoreResourceState::Missing,
+        ];
+        for existing in states {
+            for incoming in states {
+                let path = format!("{}--{}.txt", existing.as_str(), incoming.as_str());
+                store
+                    .record_restore_progress(
+                        &cid,
+                        &progress_entry(&path, existing, Some(&hash), "att-m"),
+                        &token(),
+                    )
+                    .await
+                    .expect("seed prior state");
+                store
+                    .record_restore_progress(
+                        &cid,
+                        &progress_entry(&path, incoming, Some(&hash), "att-m"),
+                        &token(),
+                    )
+                    .await
+                    .expect("apply incoming state");
+                let rows = store.load_restore_progress(&cid, &token()).await.expect("load");
+                let got = rows.iter().find(|row| row.canonical_path == path).map(|row| row.state);
+                let expected = if existing == RestoreResourceState::Done
+                    && incoming != RestoreResourceState::Done
+                {
+                    existing
+                } else {
+                    incoming
+                };
+                assert_eq!(
+                    got,
+                    Some(expected),
+                    "existing {existing:?} + incoming {incoming:?} must match the SQL guard"
+                );
+            }
+        }
+    }
+
+    /// Crash durability: progress + attempts committed before the kill are
+    /// all present after reopening the store from the same database file —
+    /// the resume path then has precise progress, never a guess.
+    #[tokio::test]
+    async fn restore_journal_survives_crash_restart() {
+        let (dir, store) = test_store().await;
+        let cid = Ulid::new().to_string();
+        let hash = blake3::hash(b"v1").to_hex().to_string();
+        store
+            .begin_restore_attempt(&restore_attempt("att-crash", &cid), &token())
+            .await
+            .expect("begin");
+        store
+            .record_restore_progress(
+                &cid,
+                &progress_entry("a.txt", RestoreResourceState::Done, Some(&hash), "att-crash"),
+                &token(),
+            )
+            .await
+            .expect("done");
+        store
+            .record_restore_progress(
+                &cid,
+                &progress_entry("b.txt", RestoreResourceState::Failed, None, "att-crash"),
+                &token(),
+            )
+            .await
+            .expect("failed");
+        // The kill: drop every connection without finishing the attempt.
+        drop(store);
+
+        let reopened = reopen_store(&dir).await;
+        let back = reopened.load_restore_progress(&cid, &token()).await.expect("load after reopen");
+        assert_eq!(back.len(), 2, "every committed row survives the kill");
+        assert_eq!(back[0].canonical_path, "a.txt");
+        assert_eq!(back[0].state, RestoreResourceState::Done);
+        assert_eq!(back[0].content_hash.as_deref(), Some(hash.as_str()));
+        assert_eq!(back[1].canonical_path, "b.txt");
+        assert_eq!(back[1].state, RestoreResourceState::Failed);
+        let (info, outcome) = reopened
+            .load_restore_attempt("att-crash", &token())
+            .await
+            .expect("load")
+            .expect("attempt envelope survives");
+        assert_eq!(info.by_agent, "agent-a");
+        assert_eq!(outcome.expect("unfinished").0, RestoreAttemptOutcome::Running.as_str());
+        // Progress for an unknown checkpoint reads empty (unknown, never done).
+        assert!(reopened
+            .load_restore_progress("ckpt-ghost", &token())
+            .await
+            .expect("load")
+            .is_empty());
+    }
+
+    /// A journal row carrying an unknown state word reads as `failed`
+    /// (re-verify), never as `done` — forward-compat without trust.
+    #[tokio::test]
+    async fn unknown_journal_state_reads_failed_never_done() {
+        let (_dir, store) = test_store().await;
+        let cid = Ulid::new().to_string();
+        sqlx::query(
+            "INSERT INTO checkpoint_restore_journal \
+             (checkpoint_id, canonical_path, state, attempt_id, by_agent, updated_at) \
+             VALUES (?, ?, 'done-ish', 'att-x', 'agent-a', ?)",
+        )
+        .bind(&cid)
+        .bind("weird.txt")
+        .bind(now_millis())
+        .execute(&store.pool)
+        .await
+        .expect("raw row");
+        let back = store.load_restore_progress(&cid, &token()).await.expect("load");
+        assert_eq!(back.len(), 1);
+        assert_eq!(
+            back[0].state,
+            RestoreResourceState::Failed,
+            "unknown words degrade to re-verify, never assume done"
+        );
     }
 }
