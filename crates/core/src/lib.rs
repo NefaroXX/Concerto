@@ -89,7 +89,7 @@ pub use memory::{
 // Re-export traits needed by other crates
 pub use traits::approval::{ApprovalDecision, ApprovalSink};
 pub use traits::context_overflow::{ContextOverflowStrategy, NoOpOverflowStrategy, TruncateOldest};
-pub use traits::memory::MemoryStore;
+pub use traits::memory::{project_without_standing, MemoryStore};
 pub use traits::provider::LlmProvider;
 pub use traits::vector_store::{ChunkProvenance, RowIndexFact, VectorStore};
 

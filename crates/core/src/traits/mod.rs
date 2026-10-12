@@ -14,7 +14,7 @@ pub mod vector_store;
 pub use agent::ExpertAgent;
 pub use approval::{ApprovalDecision, ApprovalSink};
 pub use context_overflow::{ContextOverflowStrategy, NoOpOverflowStrategy, TruncateOldest};
-pub use memory::MemoryStore;
+pub use memory::{project_without_standing, MemoryStore};
 pub use policy::{AuditLog, PolicyEngine};
 pub use provider::{CompletionStream, LlmProvider};
 pub use tool::Tool;

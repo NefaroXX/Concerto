@@ -38,43 +38,7 @@ pub trait MemoryStore: Send + Sync {
         query: &MemoryQuery,
         cancel: CancellationToken,
     ) -> Result<Vec<EvidentChunk>, MemoryError> {
-        let chunks = self.retrieve(query, cancel).await?;
-        Ok(chunks
-            .into_iter()
-            .map(|chunk| {
-                let source = RecallSource::for_chunk(
-                    chunk.chunk_type,
-                    chunk.file_path.as_ref().map(|path| path.as_str()),
-                );
-                // Authorship alone establishes claim-ness (a model-authored
-                // chunk is a claim by construction); anything else whose
-                // status no substrate establishes is Unknown.
-                let truth = match (source, chunk.chunk_type) {
-                    (RecallSource::ModelAuthored, ChunkType::Fact | ChunkType::SessionSummary) => {
-                        FactStatusView::Assumed
-                    }
-                    _ => FactStatusView::Unknown,
-                };
-                let derivation = match truth {
-                    FactStatusView::Assumed => {
-                        "model-authored claim; this store holds no supporting evidence".to_string()
-                    }
-                    _ => "status not established by this store (no standing substrate)".to_string(),
-                };
-                // Model freshness from the chunk's own stale flag only —
-                // rank (`chunk.score`) never enters freshness here.
-                let freshness = if chunk.stale { 0.0 } else { 1.0 };
-                EvidentChunk {
-                    chunk,
-                    truth,
-                    source,
-                    confidence: Confidence::Unknown,
-                    freshness,
-                    derivation,
-                    degraded: false,
-                }
-            })
-            .collect())
+        Ok(project_without_standing(self.retrieve(query, cancel).await?))
     }
     /// Browse recent project chunks without requiring a search term.
     async fn browse(
@@ -145,4 +109,53 @@ impl MemoryStore for NullMemoryStore {
     ) -> Result<(), MemoryError> {
         Ok(())
     }
+}
+
+/// Project bare chunks into evidence-bearing results with the honesty a
+/// standing-free store can offer (H11): the source from the
+/// always-knowable kind/path rule, model freshness from each chunk's own
+/// stale flag, and [`FactStatusView::Unknown`] — or `Assumed` for
+/// model-authored chunks, which are claims by construction — never a
+/// default that reads as fine. Shared by the
+/// [`MemoryStore::retrieve_with_evidence`] default impl and stores that
+/// do not implement [`MemoryStore`] (e.g. the global memory store, whose
+/// project-system routing applies it).
+#[must_use]
+pub fn project_without_standing(chunks: Vec<MemoryChunk>) -> Vec<EvidentChunk> {
+    chunks
+        .into_iter()
+        .map(|chunk| {
+            let source = RecallSource::for_chunk(
+                chunk.chunk_type,
+                chunk.file_path.as_ref().map(|path| path.as_str()),
+            );
+            // Authorship alone establishes claim-ness (a model-authored
+            // chunk is a claim by construction); anything else whose
+            // status no substrate establishes is Unknown.
+            let truth = match (source, chunk.chunk_type) {
+                (RecallSource::ModelAuthored, ChunkType::Fact | ChunkType::SessionSummary) => {
+                    FactStatusView::Assumed
+                }
+                _ => FactStatusView::Unknown,
+            };
+            let derivation = match truth {
+                FactStatusView::Assumed => {
+                    "model-authored claim; this store holds no supporting evidence".to_string()
+                }
+                _ => "status not established by this store (no standing substrate)".to_string(),
+            };
+            // Model freshness from the chunk's own stale flag only —
+            // rank (`chunk.score`) never enters freshness here.
+            let freshness = if chunk.stale { 0.0 } else { 1.0 };
+            EvidentChunk {
+                chunk,
+                truth,
+                source,
+                confidence: Confidence::Unknown,
+                freshness,
+                derivation,
+                degraded: false,
+            }
+        })
+        .collect()
 }

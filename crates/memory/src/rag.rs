@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use concerto_core::error::MemoryError;
 use concerto_core::memory::{FtsResult, MemoryChunk, MemoryQuery, ProjectId, VectorResult};
+use concerto_core::ChunkProvenance;
 
 use crate::embedder_health::{EmbedderHealth, EMBEDDER_DEGRADED_NOTICE};
 use crate::evidence::{enrich_fused, EvidenceStamps, MemoryEvidence};
@@ -255,6 +256,10 @@ impl HybridRetriever {
     /// (empty result, counted in [`Self::recalls_skipped`]), and the char
     /// caps are applied across the selected results before they are
     /// returned. `top_k` overrides `query.top_k` if supplied.
+    ///
+    /// H11: this is a projection of [`Self::retrieve_with_evidence`] — the
+    /// same fetch, order, and bounds, with the composites dropped. There is
+    /// one recall implementation, not an evidence-free second path.
     pub async fn retrieve(
         &self,
         query: &MemoryQuery,
@@ -262,17 +267,57 @@ impl HybridRetriever {
         top_k: Option<usize>,
         cancel: CancellationToken,
     ) -> Vec<FusedResult> {
+        self.retrieve_with_evidence(query, embedding, top_k, 0, cancel).await.0
+    }
+
+    /// Retrieve like [`Self::retrieve`], plus one [`MemoryEvidence`] per
+    /// returned result, aligned 1:1.
+    ///
+    /// The retriever sees scores, staleness flags, and degraded notices —
+    /// but no chunk kinds, links, or observations — so these composites
+    /// carry [`FactStatusView::Unknown`] truth until the memory system
+    /// refines them with standing (see
+    /// [`crate::evidence::enrich_with_standing`]. Like [`Self::retrieve`],
+    /// the whole pass runs under the recall cost bounds.
+    pub async fn retrieve_with_evidence(
+        &self,
+        query: &MemoryQuery,
+        embedding: &[f32],
+        top_k: Option<usize>,
+        snapshot_generation: u64,
+        cancel: CancellationToken,
+    ) -> (Vec<FusedResult>, Vec<MemoryEvidence>) {
+        let observed_at = time::OffsetDateTime::now_utc();
         let k = top_k.unwrap_or(query.top_k).max(1);
+        let stamps = EvidenceStamps { snapshot_generation, observed_at };
 
         // When the project's embedder is broken (ADR-39) only the hybrid
         // retriever (which owns both stores) can produce the FTS-only
-        // fallback, so the degraded branch lives here.
+        // fallback, so the degraded branch lives here. Evidence still
+        // assembles on the degraded path (with the reduced capability
+        // marked on every composite), never hidden.
         if EmbedderHealth::for_project(&query.project_id).is_broken(std::time::Instant::now()) {
             let degraded = self.bounded_recall(self.degraded_fts_results(query, k, cancel)).await;
-            return apply_recall_bounds(degraded, &self.bounds);
+            let degraded = apply_recall_bounds(degraded, &self.bounds);
+            let evidence = enrich_fused(&degraded, &HashMap::new(), stamps);
+            return (degraded, evidence);
         }
         let fused = self.bounded_recall(self.fetch_fused(query, embedding, k, 1, cancel)).await;
-        apply_recall_bounds(fused, &self.bounds)
+        let fused = apply_recall_bounds(fused, &self.bounds);
+        let evidence = enrich_fused(&fused, &HashMap::new(), stamps);
+        (fused, evidence)
+    }
+
+    /// Recall-visible provenance for chunk ids (H11 TTL + authorship
+    /// substrate): one bounded lookup through the vector store, fail-open
+    /// to an empty map (unknown provenance, never invented ages).
+    pub async fn chunk_provenance(
+        &self,
+        project_id: &ProjectId,
+        chunk_ids: &[String],
+        cancel: CancellationToken,
+    ) -> HashMap<String, ChunkProvenance> {
+        self.vector_store.chunk_provenance(project_id, chunk_ids, cancel).await.unwrap_or_default()
     }
 
     /// Retrieve like [`Self::retrieve`] but re-rank the fused top-k with
@@ -295,6 +340,9 @@ impl HybridRetriever {
     /// Like [`Self::retrieve`], the whole pass runs under the recall cost
     /// bounds: a timeout breach skips the recall (warning + empty result)
     /// and the char caps are applied across the selected results.
+    ///
+    /// H11: this is a projection of [`Self::retrieve_with_cascade_evidence`]
+    /// — the same fetch, reorder, and bounds, with the composites dropped.
     #[allow(clippy::too_many_arguments)]
     pub async fn retrieve_with_cascade(
         &self,
@@ -306,42 +354,20 @@ impl HybridRetriever {
         config: &LinkCascadeConfig,
         cancel: CancellationToken,
     ) -> Vec<FusedResult> {
-        let k = top_k.unwrap_or(query.top_k).max(1);
-
-        if EmbedderHealth::for_project(&query.project_id).is_broken(std::time::Instant::now()) {
-            let degraded = self.bounded_recall(self.degraded_fts_results(query, k, cancel)).await;
-            return apply_recall_bounds(degraded, &self.bounds);
-        }
-
-        let fused = self
-            .bounded_recall(
-                self.cascade_fetch(query, embedding, k, start_tier, scorer, config, cancel),
-            )
-            .await;
-        apply_recall_bounds(fused, &self.bounds)
+        self.retrieve_with_cascade_evidence(
+            query, embedding, top_k, start_tier, scorer, config, 0, cancel,
+        )
+        .await
+        .0
     }
 
-    /// The cascade body (fetch → escalate → score → reorder); kept separate
-    /// so [`Self::bounded_recall`] can guard the whole pass with one
-    /// timeout instead of one budget per tier fetch.
-    #[allow(clippy::too_many_arguments)]
-    async fn cascade_fetch(
-        &self,
-        query: &MemoryQuery,
-        embedding: &[f32],
-        k: usize,
-        start_tier: CascadeTier,
-        scorer: &dyn LinkScorer,
-        config: &LinkCascadeConfig,
-        cancel: CancellationToken,
-    ) -> Vec<FusedResult> {
-        self.cascade_fetch_scored(query, embedding, k, start_tier, scorer, config, cancel).await.0
-    }
-
-    /// [`Self::cascade_fetch`] plus the link-score map it reordered on, for
-    /// the [`Self::retrieve_with_cascade_evidence`] enrichment path. The
+    /// The cascade body (fetch → escalate → score → reorder) plus the
+    /// link-score map it reordered on, for the
+    /// [`Self::retrieve_with_cascade_evidence`] enrichment path. The
     /// reorder behavior is identical; exposing the scores lets the evidence
-    /// composite cite the same corroboration the order used.
+    /// composite cite the same corroboration the order used. Kept separate
+    /// so [`Self::bounded_recall_with`] can guard the whole pass with one
+    /// timeout instead of one budget per tier fetch.
     #[allow(clippy::too_many_arguments)]
     async fn cascade_fetch_scored(
         &self,

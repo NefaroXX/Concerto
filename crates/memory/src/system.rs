@@ -28,15 +28,22 @@ use crate::decision_store::DecisionStore;
 use crate::embedder::EmbeddingGenerator;
 use crate::embedder_health::EmbedderHealth;
 use crate::entities::{L1Candidate, L1DedupJudge, L1DedupVerdict, L1ExtractedMemory, L1Extractor};
+use crate::evidence::{enrich_with_standing, EvidenceStamps};
 use crate::fts::FullTextStore;
 use crate::global::GlobalMemoryStore;
 use crate::links::{links_from_metadata, LinkStore};
-use crate::rag::{HybridRetriever, LinkCascadeConfig, LinkScorer};
+use crate::rag::{FusedResult, HybridRetriever, LinkCascadeConfig, LinkScorer};
 use crate::recall::{RecallCapabilityEnvelope, RecallCostBounds};
-use crate::scoring::chunk_link_score;
+use crate::recall_status::{
+    ChunkStanding, CitedDecision, DerivationContext, PathObservation, PathObservationSource,
+    STORED_ENTRY_PATH,
+};
+use crate::scoring::{chunk_link_score, TimedLink, DECAY_FLOOR_DAYS};
 use crate::sync::ChunkSyncService;
 use crate::task_tree::TaskTreeStore;
 use crate::vector_store::VectorStore;
+
+use concerto_core::memory::{DecisionId, EvidentChunk};
 
 /// How many vector candidates the L1 dedup judge may compare against.
 ///
@@ -171,6 +178,13 @@ pub struct MemorySystem {
     l1_extractor: Option<L1Extractor>,
     /// L1 typed-extraction outcome counters (see [`L1ExtractCounters`]).
     l1_counters: L1ExtractCounters,
+    /// Optional resource-fact observation seam for evidence-bearing recall
+    /// (H11). When set, [`MemoryStore::retrieve_with_evidence`] consults
+    /// the provider for the recalled chunks' real file paths, so a clean
+    /// runtime observation can verify (and a dirty one stale) an item.
+    /// Unset reads the observation axis as unknown — never as fine. The
+    /// seam is infallible by contract (fail-open inside the provider).
+    path_observations: Option<Arc<dyn PathObservationSource>>,
 }
 
 impl MemorySystem {
@@ -202,6 +216,7 @@ impl MemorySystem {
             link_cascade: None,
             l1_extractor: None,
             l1_counters: L1ExtractCounters::default(),
+            path_observations: None,
         }
     }
     /// Access the decision store.
@@ -309,6 +324,19 @@ impl MemorySystem {
         self
     }
 
+    /// Attach the resource-fact observation seam for evidence-bearing
+    /// recall (H11).
+    ///
+    /// The provider is consulted once per recall for the recalled chunks'
+    /// real file paths (bounded by `top_k`); a clean observation verifies
+    /// an item and a dirty one stales it, both with the observation cited
+    /// in the derivation. Fail-open throughout: provider gaps read as
+    /// unknown. Without a provider the observation axis is always unknown.
+    pub fn with_path_observations(mut self, source: Arc<dyn PathObservationSource>) -> Self {
+        self.path_observations = Some(source);
+        self
+    }
+
     /// The declared recall cost bounds of this system (capability envelope).
     pub fn recall_capability(&self) -> RecallCapabilityEnvelope {
         self.retriever.recall_capability()
@@ -388,6 +416,135 @@ impl MemorySystem {
                 }
             }
         }
+    }
+
+    /// Compute the query embedding for recall, with the ADR-39 degraded
+    /// contract: an embedder failure records the broken window (so the
+    /// retriever's FTS-only fallback and its notice engage) and yields an
+    /// empty vector; a missing embedder means vector-disabled retrieval.
+    async fn embed_query_text(&self, query: &MemoryQuery) -> Vec<f32> {
+        if let Some(ref embedder) = self.embedder {
+            match embedder.embed(&query.text).await {
+                Ok(embedding) => embedding,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "query embedding unavailable; falling back to full-text memory retrieval"
+                    );
+                    // S1 (ADR-39): record the failure on the QUERY path too, so
+                    // a broken embedder is registered even with no concurrent
+                    // indexing. This makes the retriever's degraded (FTS-only)
+                    // fallback and its notice reachable. `record_failure`
+                    // returns `Some` only on the first failure of a (new)
+                    // broken window — exactly one transition per window.
+                    let health = EmbedderHealth::for_project(&query.project_id);
+                    let _ = health.record_failure(std::time::Instant::now());
+                    Vec::new()
+                }
+            }
+        } else {
+            tracing::trace!("vector search disabled: no embedder configured");
+            Vec::new()
+        }
+    }
+
+    /// Assemble one [`ChunkStanding`] per recalled chunk (H11): the TTL +
+    /// authorship substrate from row provenance, the link substrate from
+    /// the link store, decision supersession for cited decisions, and
+    /// resource-fact observations through the seam.
+    ///
+    /// Fail-open throughout: a cancelled token, a missing store, or any
+    /// lookup error yields missing standings, and the enrichment reads
+    /// those chunks as Unknown — recall is advisory and must never fail
+    /// the turn for want of standing. Every lookup is
+    /// bounded by the recalled ids (at most one recall's `top_k`); the
+    /// link read batches internally, and maintenance stays untouched
+    /// (the existing `recall_capability` / `recalls_skipped` surface is
+    /// neither consumed nor altered here).
+    async fn assemble_standings(
+        &self,
+        chunks: &[MemoryChunk],
+        cancel: &CancellationToken,
+    ) -> HashMap<String, ChunkStanding> {
+        let mut standings: HashMap<String, ChunkStanding> = HashMap::new();
+        if chunks.is_empty() || cancel.is_cancelled() {
+            return standings;
+        }
+        let ids: Vec<String> = chunks.iter().map(|chunk| chunk.id.clone()).collect();
+        let provenance =
+            self.retriever.chunk_provenance(&self.project_id, &ids, cancel.clone()).await;
+        let incoming: HashMap<String, Vec<TimedLink>> = match self.link_store.as_ref() {
+            Some(store) => match store.incoming_links(&ids, cancel.clone()).await {
+                Ok(map) => map,
+                Err(error) => {
+                    tracing::debug!(
+                        %error,
+                        "recall standing: link substrate unavailable (fail-open)"
+                    );
+                    HashMap::new()
+                }
+            },
+            None => HashMap::new(),
+        };
+        // The seam is keyed by real file paths: stored entries (the
+        // `STORED_ENTRY_PATH` marker) and pathless chunks are never looked
+        // up — there is no workspace observation for them to match.
+        let mut path_to_ids: HashMap<String, Vec<String>> = HashMap::new();
+        for chunk in chunks {
+            if let Some(path) = chunk.file_path.as_ref() {
+                let path = path.as_str();
+                if !path.is_empty() && path != STORED_ENTRY_PATH {
+                    path_to_ids.entry(path.to_string()).or_default().push(chunk.id.clone());
+                }
+            }
+        }
+        let observations: HashMap<String, PathObservation> = match self.path_observations.as_ref() {
+            Some(source) if !path_to_ids.is_empty() => {
+                let paths: Vec<String> = path_to_ids.keys().cloned().collect();
+                source.observe_paths(&paths, cancel.clone()).await
+            }
+            _ => HashMap::new(),
+        };
+        for chunk in chunks {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let proof = provenance.get(&chunk.id);
+            let metadata = proof.and_then(|proof| proof.metadata.clone());
+            let cited_decision = metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("decision_id"))
+                .and_then(|value| value.as_str())
+                .and_then(|id| self.decision_superseded(id));
+            let path_observation =
+                chunk.file_path.as_ref().and_then(|path| observations.get(path.as_str()).cloned());
+            standings.insert(
+                chunk.id.clone(),
+                ChunkStanding {
+                    chunk_type: chunk.chunk_type,
+                    file_path: chunk.file_path.as_ref().map(|path| path.as_str().to_string()),
+                    stale_model: chunk.stale,
+                    created_at: proof.and_then(|proof| proof.created_at),
+                    metadata,
+                    incoming: incoming.get(&chunk.id).cloned().unwrap_or_default(),
+                    cited_decision,
+                    path_observation,
+                },
+            );
+        }
+        standings
+    }
+
+    /// Resolve a metadata-cited decision id to its supersession flag.
+    /// `None` when the metadata names no parseable, known decision — a
+    /// missing or broken cite changes nothing (fail-open).
+    fn decision_superseded(&self, decision_id: &str) -> Option<CitedDecision> {
+        let ulid = concerto_core::ids::Ulid::from_string(decision_id).ok()?;
+        let decision = self.decision_store.get(DecisionId(ulid)).ok()??;
+        Some(CitedDecision {
+            id: decision_id.to_string(),
+            superseded: decision.superseded_by.is_some(),
+        })
     }
 
     /// Decide how a project-namespace entry relates to already-stored chunks.
@@ -582,92 +739,138 @@ impl MemoryStore for MemorySystem {
         query: &MemoryQuery,
         cancel: CancellationToken,
     ) -> Result<Vec<MemoryChunk>, CoreMemoryError> {
-        // Route global namespace queries to the global store.
+        // Projection of the evidence-bearing path: the same fetch, order,
+        // and bounds — agents that need source attribution and status call
+        // `retrieve_with_evidence` instead. There is one recall
+        // implementation, not an evidence-free second path.
+        Ok(self
+            .retrieve_with_evidence(query, cancel)
+            .await?
+            .into_iter()
+            .map(|evident| evident.chunk)
+            .collect())
+    }
+
+    async fn retrieve_with_evidence(
+        &self,
+        query: &MemoryQuery,
+        cancel: CancellationToken,
+    ) -> Result<Vec<EvidentChunk>, CoreMemoryError> {
+        // Route global namespace queries to the global store. The global
+        // store is not a `MemoryStore`; the shared standing-free
+        // projection applies to its results.
         if matches!(query.namespace, MemoryNamespace::Global { .. }) {
             return match self.global_store {
-                Some(ref store) => store.retrieve(query, cancel).await,
+                Some(ref store) => Ok(concerto_core::project_without_standing(
+                    store.retrieve(query, cancel).await?,
+                )),
                 None => Ok(Vec::new()),
             };
         }
 
         validate_scope(&self.project_id, &query.project_id, &query.namespace)?;
 
-        // Compute query embedding if an embedder is configured; otherwise
-        // fall back to full-text-only retrieval.
-        let embedding = if let Some(ref embedder) = self.embedder {
-            match embedder.embed(&query.text).await {
-                Ok(embedding) => embedding,
-                Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        "query embedding unavailable; falling back to full-text memory retrieval"
-                    );
-                    // S1 (ADR-39): record the failure on the QUERY path too, so
-                    // a broken embedder is registered even with no concurrent
-                    // indexing. This makes the retriever's degraded (FTS-only)
-                    // fallback and its notice reachable. `record_failure`
-                    // returns `Some` only on the first failure of a (new)
-                    // broken window — exactly one transition per window.
-                    let health = EmbedderHealth::for_project(&query.project_id);
-                    let _ = health.record_failure(std::time::Instant::now());
-                    Vec::new()
-                }
-            }
-        } else {
-            tracing::trace!("vector search disabled: no embedder configured");
-            Vec::new()
-        };
-        let results =
+        let embedding = self.embed_query_text(query).await;
+        // One assembly instant for the composites and their derivation
+        // context, so evidence and verdicts can never disagree on "now".
+        // `snapshot_generation` is 0 (unknown): the memory system holds no
+        // workspace generation; consumers track their own for drift
+        // detection against `observed_at`.
+        let observed_at = time::OffsetDateTime::now_utc();
+        let (results, poor) =
             if let (Some(link_store), Some(config)) = (&self.link_store, &self.link_cascade) {
                 let scorer = StoreLinkScorer::new(link_store.clone(), config.decay_days);
                 self.retriever
-                    .retrieve_with_cascade(
+                    .retrieve_with_cascade_evidence(
                         query,
                         &embedding,
                         Some(query.top_k),
                         config.start_tier,
                         &scorer,
                         config,
+                        0,
                         cancel.clone(),
                     )
                     .await
             } else {
-                self.retriever.retrieve(query, &embedding, Some(query.top_k), cancel.clone()).await
+                self.retriever
+                    .retrieve_with_evidence(query, &embedding, Some(query.top_k), 0, cancel.clone())
+                    .await
             };
+        // The corroboration map the reorder cited, recovered from the
+        // aligned composites (clamp-idempotent: re-clamping the clamped
+        // score is exact, so the refined enrichment cites identical
+        // values).
+        let scores: HashMap<String, f64> = poor
+            .iter()
+            .map(|evidence| (evidence.chunk_id.clone(), evidence.evidence_score.value()))
+            .collect();
 
         let ids: Vec<String> = results.iter().map(|result| result.chunk_id.clone()).collect();
+        let fused_by_id: HashMap<String, FusedResult> =
+            results.into_iter().map(|result| (result.chunk_id.clone(), result)).collect();
         let metadata = self.retriever.load_chunks(&query.project_id, &ids, cancel.clone()).await?;
         let metadata_is_authoritative = self.retriever.supports_chunk_metadata();
         let mut metadata_by_id: HashMap<String, MemoryChunk> =
             metadata.into_iter().map(|chunk| (chunk.id.clone(), chunk)).collect();
         let file_patterns = compile_file_patterns(&query.filters)?;
 
-        Ok(results
+        // Overlay + filter exactly like the historical `retrieve`, keeping
+        // each surviving chunk beside its fused result (relevance needs the
+        // fused score; standing needs the chunk).
+        let mut kept: Vec<(MemoryChunk, FusedResult)> = Vec::new();
+        for id in &ids {
+            let Some(result) = fused_by_id.get(id) else {
+                continue;
+            };
+            let mut chunk = match metadata_by_id.remove(id) {
+                Some(chunk) => chunk,
+                None if metadata_is_authoritative => continue,
+                None => MemoryChunk {
+                    id: result.chunk_id.clone(),
+                    project_id: query.project_id.clone(),
+                    namespace: MemoryNamespace::Project(query.project_id.clone()),
+                    content: result.content.clone(),
+                    file_path: None,
+                    start_line: None,
+                    end_line: None,
+                    chunk_type: ChunkType::SlidingWindow,
+                    score: result.score,
+                    model_id: String::new(),
+                    model_version: String::new(),
+                    stale: result.stale,
+                },
+            };
+            chunk.score = result.score;
+            chunk.content.clone_from(&result.content);
+            chunk.stale = result.stale;
+            if matches_filters(&chunk, &query.filters, &file_patterns) {
+                kept.push((chunk, result.clone()));
+            }
+        }
+
+        let chunks: Vec<MemoryChunk> = kept.iter().map(|(chunk, _)| chunk.clone()).collect();
+        let standings = self.assemble_standings(&chunks, &cancel).await;
+        let stamps = EvidenceStamps { snapshot_generation: 0, observed_at };
+        let ctx = DerivationContext {
+            decay_days: match &self.link_cascade {
+                // A configured window — including an explicit `None`
+                // (decay disabled) — is respected as configured.
+                Some(config) => config.decay_days,
+                // Unconfigured: the ADR-69 A5 floor, matching the cascade
+                // default and the retriever-level enrichment.
+                None => Some(DECAY_FLOOR_DAYS as u16),
+            },
+            now_unix: observed_at.unix_timestamp(),
+            // The memory system holds no workspace generation (see above).
+            current_generation: None,
+        };
+        let fused: Vec<FusedResult> = kept.iter().map(|(_, result)| result.clone()).collect();
+        let rich = enrich_with_standing(&fused, &scores, stamps, &standings, &ctx);
+        Ok(chunks
             .into_iter()
-            .filter_map(|result| {
-                let mut chunk = match metadata_by_id.remove(&result.chunk_id) {
-                    Some(chunk) => chunk,
-                    None if metadata_is_authoritative => return None,
-                    None => MemoryChunk {
-                        id: result.chunk_id.clone(),
-                        project_id: query.project_id.clone(),
-                        namespace: MemoryNamespace::Project(query.project_id.clone()),
-                        content: result.content.clone(),
-                        file_path: None,
-                        start_line: None,
-                        end_line: None,
-                        chunk_type: ChunkType::SlidingWindow,
-                        score: result.score,
-                        model_id: String::new(),
-                        model_version: String::new(),
-                        stale: result.stale,
-                    },
-                };
-                chunk.score = result.score;
-                chunk.content = result.content;
-                chunk.stale = result.stale;
-                matches_filters(&chunk, &query.filters, &file_patterns).then_some(chunk)
-            })
+            .zip(rich)
+            .map(|(chunk, evidence)| evidence.to_evident_chunk(chunk))
             .collect())
     }
 
@@ -1925,6 +2128,399 @@ mod tests {
         assert_eq!(records.len(), 1, "a non-summary store must not extract");
         assert_eq!(system.l1_counters().extracted.load(Ordering::Relaxed), 0);
         assert_eq!(system.l1_counters().failures.load(Ordering::Relaxed), 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // H11 evidence-bearing recall (retrieve_with_evidence)
+    // ---------------------------------------------------------------------
+
+    fn evident_system(project: &str) -> MemorySystem {
+        MemorySystem::new(
+            Arc::new(InMemoryVectorStore::new()),
+            Arc::new(InMemoryFullTextStore::new()),
+            Arc::new(DecisionStore::new()),
+            Arc::new(TaskTreeStore::new()),
+            None,
+            ProjectId(project.into()),
+            None,
+        )
+    }
+
+    fn evident_query(project: &str, text: &str) -> MemoryQuery {
+        MemoryQuery {
+            text: text.to_string(),
+            top_k: 5,
+            project_id: ProjectId(project.into()),
+            namespace: MemoryNamespace::Project(ProjectId(project.into())),
+            filters: vec![],
+        }
+    }
+
+    fn fact_entry(project: &str, content: &str) -> MemoryEntry {
+        MemoryEntry {
+            id: MemoryId(ulid::Ulid::new()),
+            project_id: ProjectId(project.into()),
+            namespace: MemoryNamespace::Project(ProjectId(project.into())),
+            content: content.into(),
+            chunk_type: ChunkType::Fact,
+            model_id: None,
+            model_version: None,
+            metadata: serde_json::json!({}),
+            expires_at: None,
+            created_at: OffsetDateTime::now_utc(),
+        }
+    }
+
+    /// H11 wiring: a model-authored `Fact` recalls as a claim — `Assumed`
+    /// truth with `ModelAuthored` source — even at top rank, and the bare
+    /// `retrieve` projection serves the same chunk (one recall, not two).
+    #[tokio::test]
+    async fn evidence_recall_marks_model_authored_fact_a_claim() {
+        use concerto_core::memory::{FactStatusView, RecallSource};
+
+        let project = "h11-claim";
+        let system = evident_system(project);
+        let entry = fact_entry(project, "the widget must stay blue claim marker");
+        let stored = system.store(entry, CancellationToken::new()).await.expect("store fact");
+
+        let query = evident_query(project, "blue claim marker");
+        let evident =
+            system.retrieve_with_evidence(&query, CancellationToken::new()).await.expect("recall");
+        assert_eq!(evident.len(), 1, "the stored fact recalls");
+        let first = &evident[0];
+        assert_eq!(first.chunk.id, stored.to_string(), "identity survives the recall");
+        assert_eq!(first.truth, FactStatusView::Assumed, "a claim stays a claim");
+        assert_eq!(first.source, RecallSource::ModelAuthored);
+        assert!(first.derivation.contains("claim"), "says why: {}", first.derivation);
+        assert!(!first.degraded);
+
+        // The bare projection serves the same chunk from the same recall.
+        let bare = system.retrieve(&query, CancellationToken::new()).await.expect("bare recall");
+        assert_eq!(bare.len(), 1);
+        assert_eq!(bare[0].id, first.chunk.id);
+        assert_eq!(bare[0].content, first.chunk.content);
+    }
+
+    /// H11 wiring: a live `Contradicts` link contradicts the recalled chunk
+    /// and the derivation cites the contradicting source — without any
+    /// cascade configured (standing reads links independently of the
+    /// reorder).
+    #[tokio::test]
+    async fn evidence_recall_contradiction_cites_link() {
+        use concerto_core::memory::{FactStatusView, MemoryLink};
+
+        let project = "h11-contradicted";
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("link pool connects");
+        let link_store = Arc::new(LinkStore::new(pool).await.expect("link store opens"));
+        let system = evident_system(project).with_link_store(link_store.clone());
+
+        let entry = fact_entry(project, "tabs versus spaces contradicted marker");
+        let stored = system.store(entry, CancellationToken::new()).await.expect("store fact");
+        link_store
+            .put(
+                &MemoryLink::new("critic", stored.to_string(), MemoryLinkKind::Contradicts),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("contradiction link persists");
+
+        let query = evident_query(project, "contradicted marker");
+        let evident =
+            system.retrieve_with_evidence(&query, CancellationToken::new()).await.expect("recall");
+        assert_eq!(evident.len(), 1);
+        assert_eq!(evident[0].truth, FactStatusView::Contradicted);
+        assert!(
+            evident[0].derivation.contains("critic"),
+            "cites the source: {}",
+            evident[0].derivation
+        );
+    }
+
+    /// H11 wiring: a row past its TTL window recalls `Stale` with the
+    /// window and age named — freshness never comes from rank.
+    #[tokio::test]
+    async fn evidence_recall_ttl_expiry_stales() {
+        use concerto_core::memory::{ChunkType, EmbeddingRecord, FactStatusView};
+
+        let project = ProjectId("h11-ttl".into());
+        let record = EmbeddingRecord {
+            id: "old-fn".into(),
+            project_id: project.clone(),
+            chunk_hash: "hash".into(),
+            content: "fn old() {} ttl expiry marker".into(),
+            file_path: "src/old.rs".into(),
+            start_line: Some(1),
+            end_line: Some(1),
+            chunk_type: ChunkType::Function,
+            vector: vec![0.1; 8],
+            model_id: "m".into(),
+            model_version: "1".into(),
+            stale: false,
+            created_at: OffsetDateTime::now_utc() - time::Duration::days(200),
+        };
+        let system = MemorySystem::new(
+            Arc::new(InMemoryVectorStore::with_records(vec![(project.clone(), record)])),
+            Arc::new(InMemoryFullTextStore::new()),
+            Arc::new(DecisionStore::new()),
+            Arc::new(TaskTreeStore::new()),
+            Some(Arc::new(MockEmbeddingGenerator::new(8))),
+            project.clone(),
+            None,
+        );
+
+        let query = evident_query("h11-ttl", "ttl expiry marker");
+        let evident =
+            system.retrieve_with_evidence(&query, CancellationToken::new()).await.expect("recall");
+        assert_eq!(evident.len(), 1);
+        assert_eq!(evident[0].truth, FactStatusView::Stale);
+        assert!(
+            evident[0].derivation.contains("90-day"),
+            "names the window: {}",
+            evident[0].derivation
+        );
+    }
+
+    /// H11 wiring: a cancelled token fails open — recall still succeeds,
+    /// with standing-dependent verdicts reading Unknown rather than
+    /// inventing status.
+    #[tokio::test]
+    async fn evidence_recall_cancelled_token_reads_unknown() {
+        use concerto_core::memory::FactStatusView;
+
+        let project = "h11-cancelled";
+        let system = evident_system(project);
+        system
+            .store(fact_entry(project, "cancelled recall marker content"), CancellationToken::new())
+            .await
+            .expect("store fact");
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let query = evident_query(project, "cancelled recall marker");
+        let evident = system.retrieve_with_evidence(&query, cancelled).await.expect("fail-open");
+        assert_eq!(evident.len(), 1, "the recall itself still serves");
+        assert_eq!(evident[0].truth, FactStatusView::Unknown);
+        assert!(
+            evident[0].derivation.contains("unestablished"),
+            "honest: {}",
+            evident[0].derivation
+        );
+    }
+
+    /// H11 wiring: vector-disabled recall still assembles evidence, with
+    /// the reduced capability marked on every composite instead of hidden.
+    #[tokio::test]
+    async fn evidence_recall_degraded_fts_marks_degraded() {
+        let project = "h11-degraded";
+        let system = evident_system(project);
+        system
+            .store(
+                fact_entry(project, "degraded fts-only marker content"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("store fact");
+
+        // Break this project's embedder: the retriever must take the
+        // FTS-only fallback. The project id is unique to this test so the
+        // broken window cannot leak into any other test.
+        let project_id = ProjectId(project.into());
+        let health = crate::embedder_health::EmbedderHealth::for_project(&project_id);
+        health.record_failure(std::time::Instant::now());
+        let query = evident_query(project, "fts-only marker");
+        let evident = system.retrieve_with_evidence(&query, CancellationToken::new()).await;
+        health.record_success();
+        let evident = evident.expect("degraded recall still serves");
+        assert_eq!(evident.len(), 1, "FTS fallback still returns the chunk");
+        assert!(evident[0].degraded, "reduced capability surfaces, never hides");
+    }
+
+    /// H11 wiring: a chunk whose metadata cites a superseded decision
+    /// recalls `Superseded` with the decision cited (decision provenance).
+    #[tokio::test]
+    async fn evidence_recall_cited_superseded_decision_supersedes() {
+        use concerto_core::ids::Ulid;
+        use concerto_core::memory::{
+            ChunkType, Decision, DecisionCategory, DecisionId, EmbeddingRecord, FactStatusView,
+        };
+
+        let project = ProjectId("h11-decision".into());
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("vector pool connects");
+        let vector_store = Arc::new(
+            crate::vector_store::SqliteVectorStore::new(pool.clone()).await.expect("open"),
+        );
+        let fts_store =
+            Arc::new(crate::fts::SqliteFullTextStore::new(pool.clone()).await.expect("open"));
+
+        // Two decisions; the first is superseded by the second.
+        let decision_store = Arc::new(DecisionStore::new());
+        let old = Decision {
+            id: DecisionId(Ulid::new()),
+            session_id: Ulid::nil(),
+            task_id: None,
+            what: "old approach".into(),
+            why: "first try".into(),
+            outcome: None,
+            category: DecisionCategory::Architecture,
+            confidence: 0.6,
+            superseded_by: None,
+            created_at: OffsetDateTime::now_utc(),
+        };
+        let new = Decision { id: DecisionId(Ulid::new()), ..old.clone() };
+        let old_id = old.id;
+        decision_store.insert(old).expect("insert old");
+        decision_store.insert(new.clone()).expect("insert new");
+        decision_store.supersede(old_id, new.id).expect("supersede");
+
+        // A chunk citing the superseded decision in its metadata sidecar.
+        let record = EmbeddingRecord {
+            id: "citing-chunk".into(),
+            project_id: project.clone(),
+            chunk_hash: "hash".into(),
+            content: "old approach notes cited decision marker".into(),
+            file_path: "memory".into(),
+            start_line: None,
+            end_line: None,
+            chunk_type: ChunkType::Fact,
+            vector: vec![0.1; 8],
+            model_id: "m".into(),
+            model_version: "1".into(),
+            stale: false,
+            created_at: OffsetDateTime::now_utc(),
+        };
+        vector_store
+            .store_projection(
+                &record,
+                &serde_json::json!({ "decision_id": old_id.to_string() }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("seed citing chunk");
+
+        let system = MemorySystem::new(
+            vector_store,
+            fts_store,
+            decision_store,
+            Arc::new(TaskTreeStore::new()),
+            Some(Arc::new(MockEmbeddingGenerator::new(8))),
+            project.clone(),
+            None,
+        );
+
+        let query = evident_query("h11-decision", "cited decision marker");
+        let evident =
+            system.retrieve_with_evidence(&query, CancellationToken::new()).await.expect("recall");
+        assert_eq!(evident.len(), 1);
+        assert_eq!(evident[0].truth, FactStatusView::Superseded);
+        assert!(
+            evident[0].derivation.contains(&old_id.to_string()),
+            "cites the decision: {}",
+            evident[0].derivation
+        );
+    }
+
+    /// A seam provider that reports every path dirty.
+    struct DirtySeam;
+
+    #[async_trait::async_trait]
+    impl crate::recall_status::PathObservationSource for DirtySeam {
+        async fn observe_paths(
+            &self,
+            file_paths: &[String],
+            _cancel: CancellationToken,
+        ) -> HashMap<String, PathObservation> {
+            file_paths
+                .iter()
+                .map(|path| {
+                    (
+                        path.clone(),
+                        PathObservation {
+                            dirty: true,
+                            generation: None,
+                            last_event_id: Some("ev-seam".to_string()),
+                        },
+                    )
+                })
+                .collect()
+        }
+    }
+
+    /// H11 wiring: a dirty resource-fact observation stales the recalled
+    /// indexed chunk through the seam, citing the observation.
+    #[tokio::test]
+    async fn evidence_recall_dirty_seam_observation_stales() {
+        use concerto_core::memory::{ChunkType, EmbeddingRecord, FactStatusView, MemoryNamespace};
+
+        let project = ProjectId("h11-seam".into());
+        let record = EmbeddingRecord {
+            id: "indexed-1".into(),
+            project_id: project.clone(),
+            chunk_hash: "hash".into(),
+            content: "fn seam() {} seam observation marker".into(),
+            file_path: "src/seam.rs".into(),
+            start_line: Some(1),
+            end_line: Some(1),
+            chunk_type: ChunkType::Function,
+            vector: vec![0.1; 8],
+            model_id: "m".into(),
+            model_version: "1".into(),
+            stale: false,
+            created_at: OffsetDateTime::now_utc(),
+        };
+        let vector_store =
+            Arc::new(InMemoryVectorStore::with_records(vec![(project.clone(), record)]));
+        let fts_store = Arc::new(InMemoryFullTextStore::new());
+        // The FTS side needs the same content: index it directly.
+        fts_store
+            .insert(
+                &concerto_core::memory::MemoryChunk {
+                    id: "indexed-1".into(),
+                    project_id: project.clone(),
+                    namespace: MemoryNamespace::Project(project.clone()),
+                    content: "fn seam() {} seam observation marker".into(),
+                    file_path: Some("src/seam.rs".into()),
+                    start_line: Some(1),
+                    end_line: Some(1),
+                    chunk_type: ChunkType::Function,
+                    score: 1.0,
+                    model_id: "m".into(),
+                    model_version: "1".into(),
+                    stale: false,
+                },
+                &project,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("fts seed");
+        let system = MemorySystem::new(
+            vector_store,
+            fts_store,
+            Arc::new(DecisionStore::new()),
+            Arc::new(TaskTreeStore::new()),
+            None,
+            project.clone(),
+            None,
+        )
+        .with_path_observations(Arc::new(DirtySeam));
+
+        let query = evident_query("h11-seam", "seam observation marker");
+        let evident =
+            system.retrieve_with_evidence(&query, CancellationToken::new()).await.expect("recall");
+        assert_eq!(evident.len(), 1);
+        assert_eq!(evident[0].truth, FactStatusView::Stale);
+        assert!(
+            evident[0].derivation.contains("ev-seam"),
+            "cites the observation: {}",
+            evident[0].derivation
+        );
     }
 
     #[test]
