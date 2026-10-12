@@ -154,6 +154,37 @@ fn check_cancel(cancel: &CancellationToken) -> Result<(), ManagedProcessError> {
     }
 }
 
+/// Wait out one child's reap with a bound, honoring cancellation.
+///
+/// Shared by [`ManagedProcessRegistry::stop`] and the stop phase of
+/// [`ManagedProcessRegistry::recreate`]: both remove the registry entry
+/// unconditionally once the reap begins (see the call sites), so this reports
+/// the honest outcome — `Ok` when reaped, `StopFailed` on timeout,
+/// `Cancelled` — and never touches the registry itself.
+///
+/// `wait` is the child's `wait()` future, taken as a parameter so the
+/// timeout/cancel arms stay unit-testable with a pending future: no test can
+/// hold a real child past SIGKILL, so the timeout arm is otherwise
+/// unreachable deterministically.
+async fn reap_child(
+    wait: impl std::future::Future<Output = std::io::Result<std::process::ExitStatus>>,
+    bound: Duration,
+    cancel: &CancellationToken,
+    id: &str,
+) -> Result<(), ManagedProcessError> {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(ManagedProcessError::Cancelled),
+        result = tokio::time::timeout(bound, wait) => match result {
+            Ok(_) => Ok(()),
+            Err(_) => Err(ManagedProcessError::StopFailed {
+                id: id.to_string(),
+                message: format!("child did not exit within {bound:?} after kill"),
+            }),
+        },
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Spec, probes, reports
 // ---------------------------------------------------------------------------
@@ -463,29 +494,14 @@ impl ManagedProcessRegistry {
         }
         // Reap with a bound (and honor cancellation while waiting): the
         // child must not linger as a zombie, but the wait must not park
-        // forever either.
+        // forever either. The entry is removed unconditionally once the reap
+        // begins — a started stop never retains an unreaped handle (the
+        // timeout/cancel errors below still report honestly; only the
+        // registry entry is gone, so the id is reusable).
         let wait = entry.child.wait();
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => {
-                return Err(ManagedProcessError::Cancelled);
-            }
-            result = tokio::time::timeout(MANAGED_PROCESS_STOP_WAIT, wait) => {
-                match result {
-                    Ok(_) => {}
-                    Err(_) => {
-                        return Err(ManagedProcessError::StopFailed {
-                            id: id.to_string(),
-                            message: format!(
-                                "child did not exit within {:?} after kill",
-                                MANAGED_PROCESS_STOP_WAIT
-                            ),
-                        });
-                    }
-                }
-            }
-        }
+        let outcome = reap_child(wait, MANAGED_PROCESS_STOP_WAIT, cancel, id).await;
         guard.remove(id);
+        outcome?;
         Ok(StopReport { id: id.to_string(), pid, was_running })
     }
 
@@ -533,24 +549,13 @@ impl ManagedProcessRegistry {
                 })?;
             }
             let wait = entry.child.wait();
-            tokio::select! {
-                biased;
-                () = cancel.cancelled() => {
-                    return Err(ManagedProcessError::Cancelled);
-                }
-                result = tokio::time::timeout(MANAGED_PROCESS_STOP_WAIT, wait) => {
-                    if result.is_err() {
-                        return Err(ManagedProcessError::StopFailed {
-                            id: id.to_string(),
-                            message: format!(
-                                "old child did not exit within {:?} after kill",
-                                MANAGED_PROCESS_STOP_WAIT
-                            ),
-                        });
-                    }
-                }
-            }
+            // Unconditional-on-attempt like `stop` above: once the old child's
+            // reap begins the entry goes regardless of the outcome, so a
+            // timed-out or cancelled recreate never retains an unreaped
+            // handle (the error still reports honestly below).
+            let outcome = reap_child(wait, MANAGED_PROCESS_STOP_WAIT, cancel, id).await;
             guard.remove(id);
+            outcome?;
             pid
         };
         check_cancel(cancel)?;
@@ -940,6 +945,57 @@ mod tests {
                 .await,
             Err(ManagedProcessError::Cancelled)
         ));
+        assert!(!registry.contains("p1").await);
+    }
+
+    #[tokio::test]
+    async fn reap_timeout_reports_stop_failed() {
+        // Failure injection for the reap bound: a wait that never resolves
+        // (no real child can survive SIGKILL, so the timeout arm is
+        // otherwise unreachable deterministically).
+        let pending = std::future::pending::<std::io::Result<std::process::ExitStatus>>();
+        match reap_child(pending, Duration::from_millis(10), &CancellationToken::new(), "p1").await
+        {
+            Err(ManagedProcessError::StopFailed { id, message }) => {
+                assert_eq!(id, "p1");
+                assert!(message.contains("did not exit within"), "{message}");
+            }
+            other => panic!("a reap that never completes must time out, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reap_honors_cancellation() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let pending = std::future::pending::<std::io::Result<std::process::ExitStatus>>();
+        assert!(matches!(
+            reap_child(pending, Duration::from_secs(5), &cancel, "p1").await,
+            Err(ManagedProcessError::Cancelled)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pre_attempt_cancel_keeps_the_entry_for_retry() {
+        // Boundary pin: cancellation BEFORE any signal is not an attempt —
+        // the entry is retained so the owner can retry. Removal is
+        // unconditional only once the reap begins (see `stop`/`recreate`).
+        let registry = ManagedProcessRegistry::new();
+        let live = CancellationToken::new();
+        registry
+            .register_and_spawn(test_spec("p1", "agent-a"), ReadinessProbe::Alive, &live)
+            .await
+            .expect("spawn");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(matches!(
+            registry.stop("p1", "agent-a", &cancel).await,
+            Err(ManagedProcessError::Cancelled)
+        ));
+        assert!(registry.contains("p1").await, "no signal sent: entry retained for retry");
+        let stop = registry.stop("p1", "agent-a", &live).await.expect("owner stop retries");
+        assert!(stop.was_running);
         assert!(!registry.contains("p1").await);
     }
 }
