@@ -747,9 +747,10 @@ pub enum RecallSource {
     /// observed facts). Assigned at retrieval ONLY through the
     /// resource-fact observation seam when it verifies the item (a clean,
     /// generation-matching row) — never by assertion, never from chunk
-    /// authorship. Reachable in production on run paths that attach the
-    /// seam (the CLI run path does; desktop memory-init holds no sessions
-    /// pool, so the source never appears there).
+    /// authorship. Reachable in production on every `run_shared_agent` run
+    /// with a sessions DB pool open (CLI and desktop runs alike); a recall
+    /// from a handle that skipped the attach (e.g. the desktop's
+    /// pre-init-only path) never sees this source.
     RuntimeObserved,
     /// Indexer-observed source chunk (a real file path the indexer read).
     IndexedFile,

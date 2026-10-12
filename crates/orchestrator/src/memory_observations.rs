@@ -8,9 +8,12 @@
 //! handle bound to one project root and translates rows into the honesty
 //! bits recall derives from. Attached post-construction through
 //! [`MemoryStore::attach_path_observations`](concerto_core::traits::memory::MemoryStore::attach_path_observations)
-//! — no constructor signature changes anywhere, so desktop callers compile
-//! unchanged (desktop simply never attaches: its memory-init path holds no
-//! sessions pool, and the observation axis reads unknown there).
+//! — no constructor signature changes anywhere. `run_shared_agent`
+//! attaches it on every run that has a sessions DB pool open, so CLI and
+//! desktop RUNS get the observation axis alike; the desktop's separate
+//! pre-init path (`loaders.rs`) never attaches — it only indexes and
+//! re-indexes, never recalls — and a recall from a handle that skipped the
+//! attach reads the axis as unknown (never as fine).
 //!
 //! Key-space contract (ADR-65 F5c/F5d): lookups are scoped by the blake3
 //! project-root hash ([`crate::tool_facts::project_root_hash`], the same
