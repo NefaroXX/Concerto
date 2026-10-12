@@ -330,6 +330,59 @@ impl concerto_core::checkpoint::StashRestorer for NoopStash {
     }
 }
 
+/// Write recorder: delegates every `filesystem` call to the real
+/// `FilesystemTool` (same name, schema, capabilities, path facts, policy
+/// view — the executor cannot tell the difference) and records every
+/// MUTATING operation it executes. Register it in place of the plain tool to
+/// prove which paths an executor actually touched — e.g. that a verified
+/// resume skips a resource's WRITE, not merely that its bytes matched.
+struct RecordingFsTool {
+    inner: FilesystemTool,
+    ops: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl concerto_core::traits::tool::Tool for RecordingFsTool {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        self.inner.input_schema()
+    }
+
+    fn capability_requirements(&self) -> concerto_core::types::CapabilitySet {
+        self.inner.capability_requirements()
+    }
+
+    fn path_facts(
+        &self,
+        input: &serde_json::Value,
+        session: &SessionContext,
+    ) -> Option<concerto_core::types::PathPolicyFacts> {
+        self.inner.path_facts(input, session)
+    }
+
+    async fn execute(
+        &self,
+        input: serde_json::Value,
+        policy: &dyn concerto_core::traits::PolicyEngine,
+        session: &SessionContext,
+        cancel: CancellationToken,
+    ) -> Result<concerto_core::types::ToolOutput, concerto_core::error::ToolError> {
+        let op = input.get("operation").and_then(|value| value.as_str()).unwrap_or_default();
+        let path = input.get("path").and_then(|value| value.as_str()).unwrap_or_default();
+        if matches!(op, "write" | "delete" | "move" | "copy") {
+            self.ops.lock().expect("ops lock").push(format!("{op} {path}"));
+        }
+        self.inner.execute(input, policy, session, cancel).await
+    }
+}
+
 /// The specified flow: write → checkpoint → mutate → restore is byte-exact.
 #[tokio::test]
 async fn write_checkpoint_mutate_restore_is_byte_exact() {
@@ -1573,17 +1626,19 @@ async fn policy_denied_mid_restore_converges_on_retry() {
 
 /// H07 crash-recovery half, end-to-end: interrupt mid-restore → the journal
 /// shows precise partial progress → resume writes ONLY the remaining
-/// resources (verified skips, proven by sidecar load counts) and converges
-/// to `Restored`. Crash-restart (reopening the store from the same database
-/// file) behaves identically: no progress lives in process memory.
+/// resources (verified skips proven by exactly one sidecar presence-check
+/// load per skipped row and by write counts, never a blind skip) and
+/// converges to `Restored`. Crash-restart (reopening the store from the same
+/// database file) behaves identically: no progress lives in process memory.
 #[tokio::test]
 async fn interrupted_restore_resumes_from_journal_and_converges() {
     use concerto_core::checkpoint::{
         CheckpointRecord, CheckpointStore, CheckpointStoreError, PreImageBytes, RestoreError,
     };
 
-    /// Counting delegate: proves the resume skipped the verified row by
-    /// never touching the sidecar for it.
+    /// Counting delegate: the verified row's sidecar is touched EXACTLY once
+    /// — the skip's authoritative pre-image presence check — while rows that
+    /// still need their gated write load once each for that write.
     struct CountingStore {
         inner: FileCheckpointStore,
         loads: Arc<std::sync::Mutex<BTreeMap<String, usize>>>,
@@ -1791,14 +1846,24 @@ async fn interrupted_restore_resumes_from_journal_and_converges() {
         "done+verified vs failed+drifted vs never-ran must read distinctly"
     );
 
-    // Attempt 2 (resume through a counting store): the verified a.txt row
-    // skips its sidecar load AND its write; only b + c restore.
+    // Attempt 2 (resume through a counting store AND a write-recording
+    // tool): the verified a.txt row performs only its sidecar presence check
+    // and NO write — only b + c are written.
     let counting = CountingStore {
         inner: h.store.clone(),
         loads: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
     };
-    match h
-        .executor
+    let writes = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let mut resume_registry = ToolRegistry::default();
+    resume_registry.register(Box::new(RecordingFsTool {
+        inner: FilesystemTool::new(
+            camino::Utf8PathBuf::from_path_buf(h.root.clone()).expect("tempdir is utf-8"),
+        ),
+        ops: writes.clone(),
+    }));
+    let resume_executor = ToolExecutor::new(Arc::new(resume_registry), allow_engine())
+        .with_mutation_sink(Arc::new(h.store.clone()));
+    match resume_executor
         .restore_checkpoint(
             &cid,
             &counting,
@@ -1817,9 +1882,18 @@ async fn interrupted_restore_resumes_from_journal_and_converges() {
         other => panic!("expected Restored on resume, got {other:?}"),
     }
     let loads = counting.loads.lock().expect("loads lock").clone();
-    assert_eq!(loads.get("a.txt"), None, "verified a.txt never touches the sidecar on resume");
+    assert_eq!(
+        loads.get("a.txt"),
+        Some(&1),
+        "the skip's ONE authoritative presence check: the recorded pre-image still banks its bytes"
+    );
     assert_eq!(loads.get("b.txt"), Some(&1), "failed b.txt reloads exactly once");
     assert_eq!(loads.get("c.txt"), Some(&1), "never-ran c.txt loads exactly once");
+    assert_eq!(
+        writes.lock().expect("ops lock").clone(),
+        vec!["write b.txt".to_string(), "write c.txt".to_string()],
+        "the verified skip performs no WRITE: a.txt is never re-written"
+    );
     assert_eq!(h.disk("a.txt"), "a-v1");
     assert_eq!(h.disk("b.txt"), "b-v1", "resume converged b.txt");
     assert_eq!(h.disk("c.txt"), "c-v1", "resume converged c.txt");
@@ -2214,4 +2288,125 @@ async fn pruned_bytes_mid_restore_never_claim_restored() {
         ])
     );
     assert_eq!(h.disk("b.txt"), "b-v2", "no bytes: nothing written");
+}
+
+/// The verified-skip invariant, end-to-end: a prior run journaled a path
+/// `done`, then retention collected its sidecar rows while the live disk
+/// still coincidentally hashes to the record's `post_hash`. Without the
+/// recorded pre-image the skip is refused — nothing is restored — so the
+/// outcome is `Partial` (never `Restored` + `verified_skips`), the status is
+/// `Partial`, the journal keeps `done` (the monotonic guard refuses
+/// `done → missing`), and no write runs.
+#[tokio::test]
+async fn pruned_sidecar_on_done_row_restores_partial_never_a_skip() {
+    let h = Harness::new().await;
+    h.gated_write("w-1", "agent-a", "a.txt", "a-v1").await;
+    let record = create_file_checkpoint(
+        &h.store,
+        &h.root,
+        h.session_id,
+        fs_scope(&["a.txt"]),
+        vec!["a.txt".to_string()],
+        "agent-a",
+        BTreeMap::new(),
+        Vec::new(),
+        None,
+        None,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("checkpoint creation");
+    let cid = record.checkpoint_id.to_string();
+    h.gated_write("w-2", "agent-a", "a.txt", "a-v2").await;
+
+    // First restore lands a.txt and journals `done`.
+    match restore_file_checkpoint(
+        &h.executor,
+        &h.store,
+        &h.gate,
+        None,
+        &h.session(),
+        &cid,
+        "agent-a",
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("first restore lands")
+    {
+        concerto_core::checkpoint::RestoreOutcome::Restored { .. } => {}
+        other => panic!("expected Restored, got {other:?}"),
+    }
+    assert_eq!(h.disk("a.txt"), "a-v1");
+
+    // Re-arm Active, then retention-collect the sidecar rows for a.txt: the
+    // record still claims restorable, the journal still says `done`, and the
+    // disk still hashes to post_hash — but no restorable bytes remain.
+    sqlx::query("UPDATE file_checkpoints SET status = 'active' WHERE checkpoint_id = ?")
+        .bind(&cid)
+        .execute(&h.pool)
+        .await
+        .expect("re-arm Active");
+    sqlx::query(
+        "DELETE FROM checkpoint_pre_image_chunks WHERE checkpoint_id = ? AND canonical_path = 'a.txt'",
+    )
+    .bind(&cid)
+    .execute(&h.pool)
+    .await
+    .expect("drop a.txt chunks");
+
+    // Second restore: disk match alone must not earn a verified skip.
+    match restore_file_checkpoint(
+        &h.executor,
+        &h.store,
+        &h.gate,
+        None,
+        &h.session(),
+        &cid,
+        "agent-a",
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("byte-less restore surfaces, never fails")
+    {
+        concerto_core::checkpoint::RestoreOutcome::Partial { restored, missing, limitations } => {
+            assert!(
+                restored.is_empty(),
+                "a sidecar-less `done` row must never be claimed as restored, got {restored:?}"
+            );
+            assert_eq!(missing, vec!["a.txt".to_string()]);
+            assert!(
+                limitations.iter().any(|l| l.contains("no restorable bytes banked")),
+                "the limitation names the byte loss, got {limitations:?}"
+            );
+        }
+        other => {
+            panic!("expected Partial (disk match without a pre-image is not proof), got {other:?}")
+        }
+    }
+    let back = h
+        .store
+        .load_checkpoint_record(&cid, &CancellationToken::new())
+        .await
+        .expect("load")
+        .expect("record survives");
+    assert!(
+        matches!(back.status, CheckpointStatus::Partial { .. }),
+        "the dishonest Restored claim is recorded as Partial, got {:?}",
+        back.status
+    );
+    let progress = h
+        .store
+        .load_restore_progress(&cid, &CancellationToken::new())
+        .await
+        .expect("journal reads");
+    let states: BTreeMap<String, String> = progress
+        .iter()
+        .map(|entry| (entry.canonical_path.clone(), entry.state.as_str().to_owned()))
+        .collect();
+    assert_eq!(
+        states,
+        BTreeMap::from([("a.txt".to_string(), "done".to_string())]),
+        "the monotonic guard keeps the earlier true `done` (`done → missing` refused)"
+    );
+    assert_eq!(h.disk("a.txt"), "a-v1", "no bytes: nothing written, disk left as found");
 }

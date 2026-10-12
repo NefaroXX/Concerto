@@ -9,8 +9,10 @@
 -- * `checkpoint_restore_journal` — one row per (checkpoint, path): the
 --   durable per-resource progress of restore (`pending` | `running` |
 --   `done` | `failed` | `missing`) plus the `content_hash` verified when the
---   row moved to `done` (the hash the resume path re-verifies against disk
---   before skipping a write) and the latest `attempt_id`/`by_agent`.
+--   row moved to `done` (one of the two conditions the resume path checks
+--   before skipping a write — alongside the sidecar still yielding the
+--   recorded pre-image; see the honesty rules below) and the latest
+--   `attempt_id`/`by_agent`.
 --   Upserts are monotonic: `running` never overwrites `done` (a concurrent
 --   duplicate submission cannot regress a landed write); `done` always wins.
 --   The executor enforces the guard in SQL (`WHERE journal.state != 'done'
@@ -35,18 +37,27 @@
 --
 -- Honesty rules enforced by the restore path, not the schema:
 --
--- * A `done` row is a *candidate* for skipping, never proof: resume
---   re-reads the file from `project_dir` and skips only when its bytes hash
---   to the recorded `content_hash` AND that hash agrees with the record's
---   `post_hash` (a resource marked done but modified since is re-restored,
---   never blindly skipped).
+-- * A `done` row is a *candidate* for skipping, never proof: resume skips
+--   the write only when BOTH halves hold — the sidecar still yields the
+--   recorded pre-image for the path (restorable bytes, self-consistent —
+--   never absent, hash-only, corrupt, or unreadable) AND the live re-read of
+--   the file from `project_dir` hashes to the recorded `content_hash` with
+--   that hash agreeing with the record's `post_hash` (a resource marked
+--   done but modified since is re-restored; a resource whose sidecar rows
+--   are gone falls through to the gated path and reports `missing` →
+--   `Partial` — disk coincidence alone never earns a skip).
 -- * A lost or unreadable journal degrades to "unknown progress, re-verify"
 --   (full rewrite, every write still gated + ownership-checked), never to
 --   "assume done". Journal write failures are fail-soft (warn, continue);
 --   byte failures stay fail-closed (`Partial`, never `Restored`).
--- * Journal rows are audit-retained like the record envelopes: retention
---   never deletes them (one row per checkpoint+path is bounded by the
---   checkpoint's own cardinality; attempts are one small row per call).
+-- * Journal and attempt rows share the checkpoint's retention fate: the
+--   prune transaction collects them under the same status/age predicate as
+--   the sidecar byte rows (one row per checkpoint+path is bounded by the
+--   checkpoint's own cardinality; attempts are one small row per call), so
+--   bookkeeping for a checkpoint that is no longer restorable-within-window
+--   does not accumulate. Record envelopes and the never-pruned whiteboard
+--   log always survive for audit; losing journal rows is fail-safe (no row
+--   reads as "unknown progress", never as "done").
 --
 -- No foreign keys (ADR-40): journal rows deliberately outlive sessions.
 

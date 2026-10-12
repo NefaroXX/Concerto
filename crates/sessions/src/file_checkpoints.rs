@@ -38,10 +38,14 @@
 //!   and legacy single-BLOB rows) whose checkpoint is no longer `Active` OR
 //!   older than `retention_days` (delete-only, no archive — hashes stay on
 //!   the never-pruned log) and transitions pruned-bytes checkpoints to
-//!   `Expired`, withdrawing the restorable claim from that instant. A
-//!   checkpoint advertised as restorable is never prune-eligible. Cancellable
-//!   at statement boundaries, fail-soft at the `connect()` call site (a
-//!   failed prune leaves rows in place).
+//!   `Expired`, withdrawing the restorable claim from that instant. The
+//!   restore journal and attempt envelopes are collected under the identical
+//!   predicate inside the same transaction — they exist only to resume or
+//!   report a restore of that checkpoint, so they live no longer than the
+//!   restorable bytes they describe; record envelopes always survive for
+//!   audit. A checkpoint advertised as restorable is never prune-eligible.
+//!   Cancellable at statement boundaries, fail-soft at the `connect()` call
+//!   site (a failed prune leaves rows in place).
 //! * **Encryption is conditional** (ADR-73 interaction): these tables live
 //!   inside `sessions.db`, so they are encrypted WHEN the operator enables
 //!   `encrypt_at_rest` — the same guarantee and operator control as every
@@ -92,7 +96,9 @@ pub struct CheckpointPruneReport {
     /// Checkpoints transitioned `Active` → `Expired` (restorable claim
     /// withdrawn by this run).
     pub expired: u64,
-    /// Sidecar byte rows deleted.
+    /// Sidecar byte rows deleted (legacy + chunks; the restore journal and
+    /// attempt envelopes deleted alongside under the same predicate are not
+    /// counted — see [`FileCheckpointStore::prune_checkpoints`]).
     pub sidecar_rows_deleted: u64,
     /// Cutoff of this run: active checkpoints with `created_at < cutoff_unix`
     /// were eligible.
@@ -456,10 +462,19 @@ impl FileCheckpointStore {
     /// withdrawn from that instant).
     ///
     /// Delete-only, no archive: the hashes stay on the never-pruned
-    /// whiteboard log, and every record envelope survives for audit. Shares
-    /// `prune_audit`'s cutoff arithmetic (including the overflow keeps-all
-    /// behavior) so the two halves of one retention run can never disagree on
-    /// the window.
+    /// whiteboard log, and every record envelope survives for audit. The
+    /// restore journal and attempt envelopes for the SAME predicate-matched
+    /// checkpoints go in the same transaction (they describe a restore of a
+    /// checkpoint that is no longer restorable-within-window; a later attempt
+    /// without them re-verifies from scratch rather than assuming progress).
+    /// Shares `prune_audit`'s cutoff arithmetic (including the overflow
+    /// keeps-all behavior) so the two halves of one retention run can never
+    /// disagree on the window.
+    ///
+    /// [`CheckpointPruneReport::sidecar_rows_deleted`] counts byte rows only
+    /// (legacy + chunks), as before — the bookkeeping deletes are reported
+    /// through `tracing` rather than a new field, keeping the report shape
+    /// stable.
     pub async fn prune_checkpoints(
         &self,
         retention_days: u64,
@@ -753,6 +768,40 @@ async fn delete_and_expire(
     .await
     .map_err(SessionError::from)?
     .rows_affected();
+    // Restore bookkeeping is collected with the IDENTICAL predicate as the
+    // byte rows: the journal and attempt envelopes exist only to resume or
+    // report a restore OF that checkpoint, so they live exactly as long as
+    // the checkpoint stays restorable within the retention window (at most).
+    // Deleting them is fail-safe, not lossy: no journal row reads as
+    // "unknown progress, re-verify" on any later attempt, never "assume
+    // done". Record envelopes and the never-pruned whiteboard log still
+    // survive for audit — the durable hashes and the attempts' story on the
+    // log are not this transaction's to touch.
+    let journal_deleted = sqlx::query(
+        "DELETE FROM checkpoint_restore_journal WHERE checkpoint_id IN (\
+           SELECT checkpoint_id FROM file_checkpoints \
+           WHERE status != 'active' OR created_at < ?)",
+    )
+    .bind(cutoff)
+    .execute(&mut *conn)
+    .await
+    .map_err(SessionError::from)?
+    .rows_affected();
+    let attempts_deleted = sqlx::query(
+        "DELETE FROM checkpoint_restore_attempts WHERE checkpoint_id IN (\
+           SELECT checkpoint_id FROM file_checkpoints \
+           WHERE status != 'active' OR created_at < ?)",
+    )
+    .bind(cutoff)
+    .execute(&mut *conn)
+    .await
+    .map_err(SessionError::from)?
+    .rows_affected();
+    tracing::debug!(
+        journal_deleted,
+        attempts_deleted,
+        "checkpoint retention collected restore bookkeeping"
+    );
     let deleted = legacy_deleted + chunks_deleted;
     let mut expired = 0u64;
     for (checkpoint_id,) in to_expire {
@@ -1761,6 +1810,111 @@ mod tests {
         }
     }
 
+    /// Restore bookkeeping shares the byte rows' retention fate: an aged
+    /// checkpoint's journal + attempt rows are collected by the SAME
+    /// predicate in the same transaction, while a fresh Active checkpoint's
+    /// progress and attempt survive intact (a later resume still finds them).
+    /// The report counts byte rows only — bookkeeping deletes are traced, not
+    /// a new field.
+    #[tokio::test]
+    async fn prune_collects_restore_journal_and_attempts_with_the_byte_predicate() {
+        let (_dir, store) = test_store().await;
+        let old_ms = now_millis() - 30 * 86_400 * 1000;
+
+        // Aged Active: bytes + journal + attempt collected together.
+        let aged_cid = Ulid::new();
+        let mut aged = record_with(
+            CheckpointStatus::Active,
+            vec![banked("aged.txt", &aged_cid)],
+            RestoreMethod::PreImageStore,
+        );
+        aged.checkpoint_id = aged_cid;
+        aged.created_at_ms = old_ms;
+        store
+            .create_checkpoint(
+                &aged,
+                &BTreeMap::from([("aged.txt".to_owned(), b"a".to_vec())]),
+                &token(),
+            )
+            .await
+            .expect("aged create");
+        store
+            .begin_restore_attempt(&restore_attempt("att-aged", &aged_cid.to_string()), &token())
+            .await
+            .expect("begin aged");
+        store
+            .record_restore_progress(
+                &aged_cid.to_string(),
+                &progress_entry("aged.txt", RestoreResourceState::Done, Some("h"), "att-aged"),
+                &token(),
+            )
+            .await
+            .expect("journal aged");
+
+        // Fresh Active: restorable bytes keep their progress and attempt.
+        let fresh_cid = Ulid::new();
+        let mut fresh = record_with(
+            CheckpointStatus::Active,
+            vec![banked("fresh.txt", &fresh_cid)],
+            RestoreMethod::PreImageStore,
+        );
+        fresh.checkpoint_id = fresh_cid;
+        fresh.created_at_ms = now_millis();
+        store
+            .create_checkpoint(
+                &fresh,
+                &BTreeMap::from([("fresh.txt".to_owned(), b"f".to_vec())]),
+                &token(),
+            )
+            .await
+            .expect("fresh create");
+        store
+            .begin_restore_attempt(&restore_attempt("att-fresh", &fresh_cid.to_string()), &token())
+            .await
+            .expect("begin fresh");
+        store
+            .record_restore_progress(
+                &fresh_cid.to_string(),
+                &progress_entry("fresh.txt", RestoreResourceState::Running, None, "att-fresh"),
+                &token(),
+            )
+            .await
+            .expect("journal fresh");
+
+        let report = store.prune_checkpoints(7, &token()).await.expect("prune");
+        assert_eq!(report.expired, 1, "only the aged Active transitions");
+        assert_eq!(
+            report.sidecar_rows_deleted, 1,
+            "byte rows only; the bookkeeping deletes are traced, not counted"
+        );
+
+        assert!(
+            store
+                .load_restore_progress(&aged_cid.to_string(), &token())
+                .await
+                .expect("load")
+                .is_empty(),
+            "aged journal rows collected with their bytes"
+        );
+        assert!(
+            store.load_restore_attempt("att-aged", &token()).await.expect("load").is_none(),
+            "aged attempt envelope collected with its bytes"
+        );
+        assert!(
+            store
+                .load_restore_progress(&fresh_cid.to_string(), &token())
+                .await
+                .expect("load")
+                .len()
+                == 1,
+            "fresh Active progress survives for a later resume"
+        );
+        assert!(
+            store.load_restore_attempt("att-fresh", &token()).await.expect("load").is_some(),
+            "fresh Active attempt envelope survives"
+        );
+    }
+
     #[tokio::test]
     async fn rebuild_from_log_leaves_the_sidecar_alone() {
         use crate::resource_facts::ResourceFacts;
@@ -2201,6 +2355,55 @@ mod tests {
             .await
             .expect("ghost finish is silent");
         assert!(store.load_restore_attempt("att-ghost", &token()).await.expect("load").is_none());
+
+        // Full state matrix: the SQL guard
+        // `WHERE journal.state != 'done' OR excluded.state = 'done'` pinned
+        // for EVERY prior×incoming pair — `done` sticky, every other prior
+        // state replaceable by anything (including `done`). The core test
+        // fake mirrors this same matrix, so the durable path and the in-
+        // memory path can never drift apart silently.
+        let states = [
+            RestoreResourceState::Pending,
+            RestoreResourceState::Running,
+            RestoreResourceState::Done,
+            RestoreResourceState::Failed,
+            RestoreResourceState::Missing,
+        ];
+        for existing in states {
+            for incoming in states {
+                let path = format!("{}--{}.txt", existing.as_str(), incoming.as_str());
+                store
+                    .record_restore_progress(
+                        &cid,
+                        &progress_entry(&path, existing, Some(&hash), "att-m"),
+                        &token(),
+                    )
+                    .await
+                    .expect("seed prior state");
+                store
+                    .record_restore_progress(
+                        &cid,
+                        &progress_entry(&path, incoming, Some(&hash), "att-m"),
+                        &token(),
+                    )
+                    .await
+                    .expect("apply incoming state");
+                let rows = store.load_restore_progress(&cid, &token()).await.expect("load");
+                let got = rows.iter().find(|row| row.canonical_path == path).map(|row| row.state);
+                let expected = if existing == RestoreResourceState::Done
+                    && incoming != RestoreResourceState::Done
+                {
+                    existing
+                } else {
+                    incoming
+                };
+                assert_eq!(
+                    got,
+                    Some(expected),
+                    "existing {existing:?} + incoming {incoming:?} must match the SQL guard"
+                );
+            }
+        }
     }
 
     /// Crash durability: progress + attempts committed before the kill are

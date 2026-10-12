@@ -781,12 +781,17 @@ pub trait MutationCaptureSink: Send + Sync + std::fmt::Debug {
 /// Durable per-resource progress of one checkpoint's restore.
 ///
 /// A `done` row is a *candidate* for skipping on resume, never proof: the
-/// resume path re-reads the file from `project_dir` and skips the gated
-/// write only when the bytes hash to `content_hash` AND that hash agrees
-/// with the record's `post_hash` (see [`verify_bytes_on_disk`]). A resource
-/// marked done but modified since is re-restored, never blindly skipped.
-/// A missing row means "unknown progress" — the restore re-verifies from
-/// scratch — never "assume done".
+/// resume path skips the gated write only when BOTH halves of the skip
+/// invariant hold — the sidecar still yields the recorded pre-image for the
+/// path (`PreImageBytes::Stored`, self-consistent — never `Absent`,
+/// `HashOnly`, corrupt, or unreadable) AND the live disk re-reads from
+/// `project_dir` hash to `content_hash` with that hash agreeing with the
+/// record's `post_hash` (see [`verify_bytes_on_disk`]). A resource marked
+/// done but modified since is re-restored, never blindly skipped; a resource
+/// whose sidecar rows are gone falls through to the gated path, which
+/// surfaces `missing` → `Partial` — disk coincidence alone never restores
+/// anything. A missing row means "unknown progress" — the restore
+/// re-verifies from scratch — never "assume done".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestoreProgressEntry {
     /// Canonical (project-relative) path this row tracks.
@@ -924,6 +929,13 @@ pub struct RestoreProgressItem {
     pub expected_hash: Option<String>,
     /// Whether the current disk content matches the restored state right
     /// now (bytes hash to `expected_hash`, or absence for deletions).
+    ///
+    /// A live observation, never a restore claim: this report loads no
+    /// sidecar bytes and gates no write (see
+    /// [`ToolExecutor::restore_progress`](crate::executor::ToolExecutor::restore_progress)),
+    /// so a reader combines it with `state` — `done` + `verified_on_disk`
+    /// means "a prior attempt landed it and disk still matches", nothing
+    /// more.
     pub verified_on_disk: bool,
     /// Latest attempt that touched this row (empty when no row exists).
     pub attempt_id: String,
@@ -934,11 +946,17 @@ pub struct RestoreProgressItem {
 /// recorded length agreeing when `expected_len` is known).
 ///
 /// Returns `false` on ANY read failure or mismatch — a resource that cannot
-/// be proven exact is re-restored, never skipped. This is the check that
-/// keeps the resume skip honest: a `done` marker from an earlier run that no
-/// longer matches disk (sibling or user edit since) falls through to a
-/// gated re-write, and a resource whose bytes are unavailable (pruned sidecar,
-/// missing chunks) can never verify its way into a success claim.
+/// be proven exact is re-restored, never skipped. This is the DISK half of
+/// the resume-skip honesty rule: a `done` marker from an earlier run that no
+/// longer matches disk (sibling or user edit since) falls through to a gated
+/// re-write.
+///
+/// Necessary but NOT sufficient on its own: this function never consults the
+/// sidecar, so a pruned sidecar whose bytes happen to still match on disk
+/// returns `true` here. The resume skip additionally requires the recorded
+/// pre-image to still be banked (see [`RestoreProgressEntry`]) — without it
+/// the resource falls through to the gated path and reports
+/// `missing` → `Partial`.
 #[must_use]
 pub fn verify_bytes_on_disk(
     project_dir: &std::path::Path,
@@ -995,10 +1013,14 @@ pub enum RestoreOutcome {
         /// Paths deleted (absent at checkpoint time).
         deleted: Vec<String>,
         /// Canonical paths NOT rewritten by this call because a journal
-        /// `done` row verified against disk (byte-exact already, re-verified
-        /// hash — never a blind skip). They are in the restored state, so
-        /// they also appear in `restored`/`deleted`; this list names which
-        /// ones skipped their write, so a resume's work is auditable.
+        /// `done` row satisfied BOTH skip conditions: the sidecar still
+        /// yields the recorded pre-image (`Stored`, self-consistent) AND the
+        /// live disk re-verifies byte-exact against the record's `post_hash`
+        /// (absence for deletions) — never a blind skip. They are in the
+        /// restored state, so they also appear in `restored`/`deleted`; this
+        /// list names which ones skipped their write, so a resume's work is
+        /// auditable. A pruned/absent sidecar can never appear here, even
+        /// when disk coincidentally matches.
         verified_skips: Vec<String>,
         /// Provenance notes (e.g. pre-image-captured bytes, verified skips) —
         /// honest packaging, never silently exact.

@@ -1353,14 +1353,19 @@ impl ToolExecutor {
     ///    owner named) instead of overwriting silently.
     /// 3. **Resume from the recovery journal**: every call mints one attempt
     ///    envelope and reads the durable per-resource progress first.
-    ///    Journal-`done` rows that still verify against disk (bytes re-hashed,
-    ///    or absence for deletions) skip their gated write — a resume
-    ///    continues rather than re-writing everything — while drifted,
-    ///    unverifiable, or unrecorded resources fall through to a gated
-    ///    re-write, never a blind skip. An unreadable journal degrades to
-    ///    "unknown progress, re-verify" (full rewrite), never "assume done".
-    ///    Journal writes are fail-soft bookkeeping; byte failures stay
-    ///    fail-closed (`Partial`, never `Restored`).
+    ///    Journal-`done` rows skip their gated write only when BOTH halves of
+    ///    the verified-skip invariant hold: the sidecar still yields the
+    ///    recorded pre-image for the path (`Stored` bytes — never `Absent`,
+    ///    `HashOnly`, corrupt, or unreadable) AND the live disk still matches
+    ///    it (bytes re-hashed against the record's `post_hash`, or absence for
+    ///    deletions). A resume continues rather than re-writing everything;
+    ///    drifted, unverifiable, byte-less, or unrecorded resources fall
+    ///    through to a gated re-write — which surfaces `missing` → `Partial`
+    ///    when no bytes remain, never a blind skip or a "restored" claim that
+    ///    restored nothing. An unreadable journal degrades to "unknown
+    ///    progress, re-verify" (full rewrite), never "assume done". Journal
+    ///    writes are fail-soft bookkeeping; byte failures stay fail-closed
+    ///    (`Partial`, never `Restored`).
     ///
     /// A second restore of the same id is a recorded no-op
     /// ([`RestoreOutcome::AlreadyRestored`]); the first restore's
@@ -1472,12 +1477,24 @@ impl ToolExecutor {
                 }
             };
 
-        // Resume set: journal-`done` rows that still verify against disk.
-        // Verification reads what actually landed (bytes hash to the recorded
-        // hash AND the recorded hash agrees with the record's `post_hash`; or
-        // absence for deletion-kind resources). Anything else — drifted
-        // content, hash disagreement, unreadable file — falls through to a
-        // gated re-write below, never a blind skip.
+        // Resume set: journal-`done` rows that satisfy BOTH halves of the
+        // verified-skip invariant, before a path is allowed to skip its write:
+        //
+        //   (a) the sidecar still yields the recorded pre-image — `Stored`
+        //       bytes that hash to their own recorded hash (not `Absent`,
+        //       `HashOnly`, corrupt, or unreadable) — so the skip rests on
+        //       authoritative bytes that still exist; AND
+        //   (b) the live disk still matches it — bytes re-hash to the journal
+        //       `content_hash`, which must agree with the record's
+        //       `post_hash` (or absence, for deletion-kind resources).
+        //
+        // Neither half alone earns a skip: disk coincidence without the
+        // recorded pre-image is exactly the dishonest case (sidecar pruned or
+        // expired while disk happens to match) — that resource falls through
+        // to the gated path below, which surfaces `missing` → `Partial` (or
+        // the call is refused earlier when the checkpoint is
+        // `Expired`/`Superseded`), never a `restored`/`verified_skips` claim
+        // that restored nothing.
         let mut verified: std::collections::HashSet<String> = std::collections::HashSet::new();
         for resource in &record.included {
             if cancel.is_cancelled() {
@@ -1498,6 +1515,10 @@ impl ToolExecutor {
                 continue;
             }
             if resource.kind == CheckpointResourceKind::FileDelete {
+                // Deletion-kind resources carry no sidecar by construction
+                // (`byte_ref` is `None`), so half (a) has nothing to read:
+                // their authoritative fact IS absence, re-verified live by
+                // half (b) before the skip.
                 if entry.content_hash.is_none()
                     && crate::checkpoint::verify_absent_on_disk(&session.project_dir, path)
                 {
@@ -1513,6 +1534,20 @@ impl ToolExecutor {
             if expected != recorded {
                 continue;
             }
+            // Half (a): the recorded pre-image must still be banked (and
+            // self-consistent — the same condition the byte path below
+            // accepts before writing; an unreadable store error falls
+            // through, where the byte path fails closed instead).
+            let banked = match store.load_bytes(checkpoint_id, path, cancel.clone()).await {
+                Ok(PreImageBytes::Stored { bytes, hash, .. }) => {
+                    blake3::hash(&bytes).to_hex().to_string() == hash
+                }
+                Ok(PreImageBytes::HashOnly { .. }) | Ok(PreImageBytes::Absent) | Err(_) => false,
+            };
+            if !banked {
+                continue;
+            }
+            // Half (b): the live disk must still match that pre-image.
             if crate::checkpoint::verify_bytes_on_disk(
                 &session.project_dir,
                 path,
@@ -1552,9 +1587,9 @@ impl ToolExecutor {
 
         // Phase 2: restore through gated writes, journaling each resource.
         // Verified skips count as restored/deleted (that IS their disk state,
-        // proven by re-verification rather than by this call's writes) and
-        // are named in `verified_skips` + `notes` so a resume's work is
-        // auditable.
+        // proven by BOTH halves of the skip invariant — banked pre-image +
+        // live-disk match — rather than by this call's writes) and are named
+        // in `verified_skips` + `notes` so a resume's work is auditable.
         let mut restored = Vec::new();
         let mut recreated = Vec::new();
         let mut deleted = Vec::new();
@@ -1579,13 +1614,16 @@ impl ToolExecutor {
                     journal.get(&path).map(|entry| entry.attempt_id.clone()).unwrap_or_default();
                 if resource.kind == CheckpointResourceKind::FileDelete {
                     deleted.push(path.clone());
+                    notes.push(format!(
+                        "{path}: already deleted by attempt {prior} (absence re-verified on disk; delete skipped)"
+                    ));
                 } else {
                     restored.push(path.clone());
+                    notes.push(format!(
+                        "{path}: already restored by attempt {prior} (recorded pre-image still banked; bytes re-verified on disk; write skipped)"
+                    ));
                 }
                 verified_skips.push(path.clone());
-                notes.push(format!(
-                    "{path}: already restored by attempt {prior} (bytes re-verified on disk; write skipped)"
-                ));
                 continue;
             }
             record_progress_best_effort(
@@ -1830,6 +1868,17 @@ impl ToolExecutor {
     /// Read-only: no write runs, no lifecycle transition, no journal mutation.
     /// A journal read failure surfaces as [`RestoreError::Store`] — a query
     /// must not fabricate progress it cannot prove.
+    ///
+    /// Deliberately live-disk-only, unlike the resume skip in
+    /// [`Self::restore_checkpoint`]: this query never claims that a restore
+    /// ran or that restorable bytes still exist. It reports two independent
+    /// facts per row — `state` is the journal's durable record of some PRIOR
+    /// attempt, `verified_on_disk` is a live observation of the working tree
+    /// right now — and a caller must read both (`done` + `verified_on_disk`
+    /// means "a previous attempt landed it and disk still matches"; no
+    /// sidecar load happens or is implied). The authoritative-pre-image
+    /// requirement belongs to the path that turns a skip into a success claim;
+    /// nothing here gates a write or a lifecycle transition.
     pub async fn restore_progress(
         &self,
         checkpoint_id: &str,
@@ -4084,6 +4133,14 @@ mod restore_tests {
             self
         }
 
+        /// Keep only the drift verifier for `path` — the hash-only sidecar
+        /// shape produced when a chunk set exists but cannot reconstruct
+        /// bytes (structural corruption / size mismatch).
+        fn with_hash_only(self, path: &str, hash: Option<String>) -> Self {
+            self.hash_only.lock().expect("store lock").insert(path.to_owned(), hash);
+            self
+        }
+
         fn status(&self) -> CheckpointStatus {
             self.record.lock().expect("store lock").status.clone()
         }
@@ -5627,6 +5684,189 @@ mod restore_tests {
         for path in ["a.txt", "b.txt"] {
             let count = disk.writes().iter().filter(|w| w.as_str() == path).count();
             assert!(count <= 2, "{path} written at most once per attempt, got {count}");
+        }
+    }
+
+    /// The verified-skip invariant's sidecar half, end-to-end: a journal
+    /// `done` row whose recorded pre-image no longer exists — `Absent` (rows
+    /// pruned/expired or never banked) or `HashOnly` (verifier-only row,
+    /// bytes unrestorable) — must NEVER earn a verified skip, even when the
+    /// live disk still hashes to the record's `post_hash`. Disk coincidence
+    /// proves nothing about a restore: the gated path finds no bytes, the
+    /// honest outcome is `Partial` with nothing in `restored`, the status is
+    /// `Partial`, and the journal keeps `done` (the monotonic guard refuses
+    /// `done → missing`; the earlier true fact stands). Skipping on disk
+    /// match alone — the pre-fix behaviour — reported `Restored` while
+    /// restoring nothing.
+    #[tokio::test]
+    async fn sidecar_less_done_row_never_earns_a_verified_skip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let disk = DiskFsTool::new(dir.path().to_path_buf());
+        let checkpoint_id = Ulid::new();
+        let record = CheckpointRecord::new(
+            checkpoint_id,
+            Ulid::new(),
+            CheckpointScope::FilesystemWrites {
+                paths: vec!["pruned.txt".to_string(), "hashonly.txt".to_string()],
+            },
+            vec![
+                byte_resource(&checkpoint_id, "pruned.txt", b"p-v1"),
+                byte_resource(&checkpoint_id, "hashonly.txt", b"h-v1"),
+            ],
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+            CheckpointStatus::Active,
+            RestoreMethod::PreImageStore,
+            Vec::new(),
+            "agent-a".to_string(),
+            1_700_000_000_000,
+            None,
+        )
+        .expect("test record builds");
+        // Sidecar shapes: pruned.txt has NO rows; hashonly.txt keeps only the
+        // drift verifier (hash present, no reconstructible bytes).
+        let store = FakeStore::new(record)
+            .with_hash_only("hashonly.txt", Some(blake3::hash(b"h-v1").to_hex().to_string()));
+        // The dishonest coincidence: live disk still matches post_hash for
+        // both paths while no restorable bytes remain in the sidecar.
+        std::fs::write(dir.path().join("pruned.txt"), b"p-v1").expect("plant pruned");
+        std::fs::write(dir.path().join("hashonly.txt"), b"h-v1").expect("plant hashonly");
+        // An earlier run journaled both rows `done` with the matching hashes.
+        for (path, hash) in [
+            ("pruned.txt", blake3::hash(b"p-v1").to_hex().to_string()),
+            ("hashonly.txt", blake3::hash(b"h-v1").to_hex().to_string()),
+        ] {
+            store
+                .record_restore_progress(
+                    &checkpoint_id.to_string(),
+                    &RestoreProgressEntry {
+                        canonical_path: path.to_string(),
+                        state: RestoreResourceState::Done,
+                        content_hash: Some(hash),
+                        attempt_id: "attempt-earlier".to_string(),
+                        by_agent: "agent-a".to_string(),
+                        updated_at_ms: 1_700_000_000_000,
+                        detail: String::new(),
+                    },
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("plant prior done");
+        }
+
+        let (executor, session) = disk_harness(&dir, disk.clone());
+        let stash = Arc::new(FakeStash::default());
+        match executor
+            .restore_checkpoint(
+                &checkpoint_id.to_string(),
+                &store,
+                &FakeOracle::default(),
+                &*stash,
+                &session,
+                "agent-a",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("byte-less restore surfaces, never fails")
+        {
+            RestoreOutcome::Partial { restored, missing, .. } => {
+                assert!(
+                    restored.is_empty(),
+                    "a sidecar-less skip must never be claimed as restored, got {restored:?}"
+                );
+                assert_eq!(
+                    missing,
+                    vec!["pruned.txt".to_string(), "hashonly.txt".to_string()],
+                    "both byte-less paths surface as missing, in record order"
+                );
+            }
+            other => panic!(
+                "expected Partial (disk match without a pre-image is not proof), got {other:?}"
+            ),
+        }
+        assert!(
+            matches!(store.status(), CheckpointStatus::Partial { .. }),
+            "the dishonest Restored claim is recorded as Partial"
+        );
+        assert_eq!(
+            journal_states(&store, &checkpoint_id.to_string()),
+            std::collections::BTreeMap::from([
+                ("pruned.txt".to_string(), RestoreResourceState::Done),
+                ("hashonly.txt".to_string(), RestoreResourceState::Done),
+            ]),
+            "the monotonic guard keeps the earlier true `done` (`done → missing` refused)"
+        );
+        assert!(disk.writes().is_empty(), "no bytes: nothing written");
+        assert_eq!(std::fs::read(dir.path().join("pruned.txt")).expect("read pruned"), b"p-v1");
+        assert_eq!(std::fs::read(dir.path().join("hashonly.txt")).expect("read hashonly"), b"h-v1");
+    }
+
+    /// The in-memory fake's journal guard must behave EXACTLY like the
+    /// durable SQL upsert (`040_checkpoint_restore_journal.sql`:
+    /// `journal.state != 'done' OR excluded.state = 'done'`): `done` is
+    /// sticky, every other prior state is replaceable by anything. Core unit
+    /// tests run against this fake while the real path runs against SQLite —
+    /// a divergence would let one side pass while the other silently
+    /// disagrees, so every prior×incoming pair is pinned to the same rule.
+    #[tokio::test]
+    async fn fake_journal_upsert_mirrors_sql_monotonic_guard() {
+        let states = [
+            RestoreResourceState::Pending,
+            RestoreResourceState::Running,
+            RestoreResourceState::Done,
+            RestoreResourceState::Failed,
+            RestoreResourceState::Missing,
+        ];
+        let checkpoint_id = Ulid::new();
+        let record = CheckpointRecord::new(
+            checkpoint_id,
+            Ulid::new(),
+            CheckpointScope::FilesystemWrites { paths: vec!["a.txt".to_string()] },
+            vec![byte_resource(&checkpoint_id, "a.txt", b"a-v1")],
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+            CheckpointStatus::Active,
+            RestoreMethod::PreImageStore,
+            Vec::new(),
+            "agent-a".to_string(),
+            1_700_000_000_000,
+            None,
+        )
+        .expect("test record builds");
+        for existing in states {
+            for incoming in states {
+                let store = FakeStore::new(record.clone());
+                for state in [existing, incoming] {
+                    store
+                        .record_restore_progress(
+                            &checkpoint_id.to_string(),
+                            &RestoreProgressEntry {
+                                canonical_path: "a.txt".to_string(),
+                                state,
+                                content_hash: None,
+                                attempt_id: "att".to_string(),
+                                by_agent: "agent-a".to_string(),
+                                updated_at_ms: 1_700_000_000_000,
+                                detail: String::new(),
+                            },
+                            CancellationToken::new(),
+                        )
+                        .await
+                        .expect("journal write");
+                }
+                let expected = if existing == RestoreResourceState::Done
+                    && incoming != RestoreResourceState::Done
+                {
+                    existing
+                } else {
+                    incoming
+                };
+                assert_eq!(
+                    journal_states(&store, &checkpoint_id.to_string()).get("a.txt").copied(),
+                    Some(expected),
+                    "existing {existing:?} + incoming {incoming:?} must match the SQL guard"
+                );
+            }
         }
     }
 }
