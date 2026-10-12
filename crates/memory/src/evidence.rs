@@ -57,11 +57,13 @@ use crate::recall_status::{ChunkStanding, DerivationContext};
 /// Named-version policy (per the ADR-82 compatibility section and the
 /// checkpoint precedent): the current version loads as-is; unknown (future)
 /// versions are rejected by [`MemoryEvidence::from_json`], never silently
-/// accepted. v1 never persisted anywhere (the storage rule forbids it), so
-/// v2 — which adds the H11 `source` / `derivation` / `degraded` fields —
-/// supersedes it with no migration path: a v1 payload is rejected like any
-/// other non-current version.
-pub const EVIDENCE_SCHEMA_VERSION: u16 = 2;
+/// accepted. Neither v1 nor v2 ever persisted anywhere (the storage rule
+/// forbids it), so v3 — which adds the `interrupted` recall-interruption
+/// signal — supersedes them with no migration path: an older payload is
+/// rejected like any other non-current version. The bump matters because
+/// an old reader would silently drop `interrupted` — exactly the silent
+/// misread versions exist to catch.
+pub const EVIDENCE_SCHEMA_VERSION: u16 = 3;
 
 /// Retrieval-time freshness projection, `0.0..=1.0` decay multiplier.
 ///
@@ -175,6 +177,13 @@ pub struct MemoryEvidence {
     /// the wire means `false` (additive read-time form).
     #[serde(default)]
     pub degraded: bool,
+    /// `true` when the recall was interrupted (cancelled) before standing
+    /// was fully established: the verdict may rest on incomplete
+    /// substrate. Machine-readable on purpose — a caller distinguishes an
+    /// interrupted recall from a completed recall that genuinely found
+    /// nothing WITHOUT parsing prose. Missing on the wire means `false`.
+    #[serde(default)]
+    pub interrupted: bool,
     /// Generation of the workspace snapshot the retrieval ran against.
     /// A consumer holding an older generation has a drifted composite.
     pub snapshot_generation: u64,
@@ -207,6 +216,7 @@ impl MemoryEvidence {
         freshness: Freshness,
         derivation: String,
         degraded: bool,
+        interrupted: bool,
         snapshot_generation: u64,
         observed_at: OffsetDateTime,
     ) -> Self {
@@ -221,6 +231,7 @@ impl MemoryEvidence {
             freshness,
             derivation,
             degraded,
+            interrupted,
             snapshot_generation,
             observed_at,
         }
@@ -228,7 +239,7 @@ impl MemoryEvidence {
 
     /// Project this composite into the trait-safe [`EvidentChunk`] an agent
     /// receives: the chunk plus source attribution, status, derivation,
-    /// model freshness, and the degraded flag.
+    /// model freshness, and the degraded/interrupted flags.
     #[must_use]
     pub fn to_evident_chunk(&self, chunk: MemoryChunk) -> EvidentChunk {
         // `freshness` left this struct through the validated `Freshness`
@@ -243,6 +254,7 @@ impl MemoryEvidence {
             freshness,
             derivation: self.derivation.clone(),
             degraded: self.degraded,
+            interrupted: self.interrupted,
         }
     }
 
@@ -311,9 +323,26 @@ pub fn enrich_with_standing(
         .iter()
         .map(|result| {
             let degraded = result.notice.is_some();
+            // The interruption signal is per-recall (from the derivation
+            // context), not per-chunk: every composite of an interrupted
+            // recall carries it, so no caller can mistake the recall for
+            // complete. Fail-open philosophy preserved — the recall still
+            // serves — but the interruption is explicit, never silent.
+            let interrupted = ctx.interrupted;
             let (truth, source, freshness, derivation) = match standings.get(&result.chunk_id) {
                 Some(standing) => {
                     let verdict = crate::recall_status::derive_recall_verdict(standing, ctx);
+                    let derivation = if interrupted {
+                        // The verdict describes whatever substrate was
+                        // present, but assembly stopped early — say so on
+                        // the verdict itself, not just beside it.
+                        format!(
+                            "{}; recall interrupted, further substrate unchecked",
+                            verdict.derivation
+                        )
+                    } else {
+                        verdict.derivation
+                    };
                     (
                         verdict.truth,
                         verdict.source,
@@ -322,16 +351,27 @@ pub fn enrich_with_standing(
                         } else {
                             Freshness::fresh()
                         },
-                        verdict.derivation,
+                        derivation,
                     )
                 }
                 None => (
                     FactStatusView::Unknown,
                     RecallSource::Unknown,
                     if result.stale { Freshness::stale_model() } else { Freshness::fresh() },
-                    "standing unavailable for this chunk; status unestablished".to_string(),
+                    if interrupted {
+                        "recall interrupted before standing was established; \
+                         status unestablished"
+                            .to_string()
+                    } else {
+                        "standing unavailable for this chunk; status unestablished".to_string()
+                    },
                 ),
             };
+            let mut derivation = derivation;
+            crate::recall::truncate_to_chars(
+                &mut derivation,
+                crate::recall_status::MAX_DERIVATION_CHARS,
+            );
             MemoryEvidence::assemble(
                 result.chunk_id.clone(),
                 truth,
@@ -342,6 +382,7 @@ pub fn enrich_with_standing(
                 freshness,
                 derivation,
                 degraded,
+                interrupted,
                 stamps.snapshot_generation,
                 stamps.observed_at,
             )
@@ -368,6 +409,10 @@ pub fn enrich_fused(
         decay_days: Some(crate::scoring::DECAY_FLOOR_DAYS as u16),
         now_unix: stamps.observed_at.unix_timestamp(),
         current_generation: None,
+        // A standing-free enrichment is complete by construction (there is
+        // no standing to interrupt) — interruption is set by callers that
+        // assemble standing and get cancelled mid-way.
+        interrupted: false,
     };
     enrich_with_standing(results, scores, stamps, &HashMap::new(), &ctx)
 }
@@ -462,6 +507,7 @@ mod tests {
             decay_days: Some(90),
             now_unix: 1_784_000_000,
             current_generation: None,
+            interrupted: false,
         };
         let scores = HashMap::new();
 
@@ -485,6 +531,65 @@ mod tests {
             top[0].relevance.value(),
             bottom[0].relevance.value()
         );
+    }
+
+    /// Blocking review finding: an interrupted recall must NOT produce
+    /// output indistinguishable from a completed recall that genuinely
+    /// found nothing. The interruption travels machine-readable
+    /// (`interrupted`) AND in prose, on every composite.
+    #[test]
+    fn interrupted_enrichment_is_distinguishable_from_genuine_unknown() {
+        use crate::recall_status::DerivationContext;
+
+        let results = vec![fused("a", 0.5, false)];
+        let scores = HashMap::new();
+        let complete = DerivationContext {
+            decay_days: Some(90),
+            now_unix: 1_784_000_000,
+            current_generation: None,
+            interrupted: false,
+        };
+        let halted = DerivationContext { interrupted: true, ..complete.clone() };
+
+        let done = enrich_with_standing(&results, &scores, stamps(), &HashMap::new(), &complete);
+        let cut = enrich_with_standing(&results, &scores, stamps(), &HashMap::new(), &halted);
+        assert_eq!(done.len(), 1);
+        assert_eq!(cut.len(), 1);
+        // Same shape, same Unknown truth — the completed recall genuinely
+        // established nothing.
+        assert_eq!(done[0].truth, FactStatusView::Unknown);
+        assert_eq!(cut[0].truth, FactStatusView::Unknown);
+        assert!(!done[0].interrupted);
+        // …but the interrupted recall says so, without parsing prose.
+        assert!(cut[0].interrupted);
+        assert_ne!(done[0].derivation, cut[0].derivation);
+        assert!(cut[0].derivation.contains("interrupted"), "visible: {}", cut[0].derivation);
+        // …and the flag survives the wire.
+        let back = MemoryEvidence::from_json(&cut[0].to_json()).expect("round-trips");
+        assert!(back.interrupted);
+        assert_eq!(back, cut[0]);
+    }
+
+    #[test]
+    fn missing_interrupted_key_reads_as_false() {
+        let evidence = MemoryEvidence::assemble(
+            "c".to_string(),
+            FactStatusView::Unknown,
+            RecallSource::Unknown,
+            Relevance::clamped(0.5),
+            EvidenceScore::clamped(5.0),
+            Confidence::Unknown,
+            Freshness::fresh(),
+            "status unestablished".to_string(),
+            false,
+            false,
+            1,
+            stamps().observed_at,
+        );
+        let mut value = serde_json::to_value(&evidence).expect("serializes");
+        value.as_object_mut().expect("object").remove("interrupted");
+        let back = MemoryEvidence::from_json(&value.to_string()).expect("missing key loads");
+        assert!(!back.interrupted);
     }
 
     #[test]
@@ -526,6 +631,7 @@ mod tests {
             Freshness::fresh(),
             "model-authored claim".to_string(),
             false,
+            false,
             3,
             stamps().observed_at,
         );
@@ -552,6 +658,7 @@ mod tests {
             Freshness::fresh(),
             "clean resource-fact observation ev-1".to_string(),
             false,
+            false,
             3,
             stamps().observed_at,
         );
@@ -570,6 +677,7 @@ mod tests {
             Confidence::Unknown,
             Freshness::fresh(),
             "model-authored claim".to_string(),
+            false,
             false,
             1,
             stamps().observed_at,
@@ -591,6 +699,7 @@ mod tests {
             Confidence::Unknown,
             Freshness::fresh(),
             "model-authored claim".to_string(),
+            false,
             false,
             1,
             stamps().observed_at,
@@ -622,6 +731,7 @@ mod tests {
             Freshness::fresh(),
             "model-authored claim".to_string(),
             false,
+            false,
             1,
             stamps().observed_at,
         );
@@ -641,6 +751,7 @@ mod tests {
             Confidence::Unknown,
             Freshness::fresh(),
             "status unestablished".to_string(),
+            false,
             false,
             1,
             stamps().observed_at,
@@ -679,6 +790,7 @@ mod tests {
             Confidence::Unknown,
             Freshness::fresh(),
             "contradicted by critic".to_string(),
+            false,
             false,
             1,
             stamps().observed_at,

@@ -29,11 +29,12 @@
 //! resource-fact seam) verifies; link corroboration never upgrades a
 //! model-authored claim past [`FactStatusView::Assumed`].
 
-use std::collections::HashMap;
-
-use async_trait::async_trait;
 use concerto_core::memory::{ChunkType, FactStatusView, MemoryLinkKind, RecallSource};
-use concerto_core::CancellationToken;
+// Re-exported so existing `crate::recall_status::PathObservation…` paths
+// keep resolving unchanged after the move to core (both must live in core:
+// `MemoryStore::attach_path_observations` names the trait, and the seam
+// hands the struct across the crate boundary).
+pub use concerto_core::memory::{PathObservation, PathObservationSource};
 use time::OffsetDateTime;
 
 use crate::recall::truncate_to_chars;
@@ -48,38 +49,14 @@ pub const MAX_DERIVATION_CHARS: usize = 240;
 /// so it never counts as index observation.
 pub const STORED_ENTRY_PATH: &str = "memory";
 
-/// One resource-fact observation handed to recall through the
-/// [`PathObservationSource`] seam: the honesty bits of a `resource_facts`
-/// row, without the sessions-pool dependency.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PathObservation {
-    /// `true` means the workspace state is uncertain (never served clean).
-    pub dirty: bool,
-    /// Workspace generation of the latest observation, when recorded.
-    pub generation: Option<String>,
-    /// The whiteboard event the observation is attributable to, when known.
-    pub last_event_id: Option<String>,
-}
-
-/// Optional resource-fact feed for recall (service seam).
-///
-/// The memory crate cannot see the sessions pool, so the orchestrator side
-/// implements this over `resource_facts` and attaches it to the memory
-/// system. Every method is cancellation-aware; an error or a missing
-/// provider reads every path as unobserved (unknown), never as verified.
-#[async_trait]
-pub trait PathObservationSource: Send + Sync {
-    /// Look up observations for real file paths (bounded: at most one
-    /// recall's ids). Absent paths simply have no entry.
-    async fn observe_paths(
-        &self,
-        file_paths: &[String],
-        cancel: CancellationToken,
-    ) -> HashMap<String, PathObservation>;
-}
-
 /// A decision this chunk cites (from its metadata sidecar), with whether
 /// the decision journal records it as superseded.
+///
+/// Production reachability: NO current producer writes a `decision_id`
+/// cite into chunk metadata, so this arm fires only in tests and for
+/// future producers — the honest supersession signal in production today
+/// is the link substrate (`Supersedes`/`Merges` incoming links), which is
+/// reachable whenever the link store attached (see below).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CitedDecision {
     /// The cited decision id.
@@ -128,6 +105,11 @@ pub struct DerivationContext {
     /// generation, so this documents exactly what "no current generation
     /// known" means there.
     pub current_generation: Option<String>,
+    /// `true` when the recall was interrupted (cancelled) before standing
+    /// was fully established. The verdict still describes whatever
+    /// substrate is present, but the enrichment marks the composite
+    /// interrupted so no caller can mistake it for a complete recall.
+    pub interrupted: bool,
 }
 
 /// The derived five-way answer for one chunk.
@@ -146,12 +128,12 @@ pub struct RecallVerdict {
 
 /// Derive one chunk's verdict. Pure and deterministic: the same standing
 /// and context always yield the same verdict. Precedence (first match
-/// wins):
+/// wins) — harder findings first, so a softer one can never mask them:
 ///
-/// 1. TTL-expired → `Stale`.
-/// 2. A live (in-window) `Contradicts` link → `Contradicted`.
-/// 3. A `Supersedes`/`Merges` link, or a cited superseded decision →
+/// 1. A live (in-window) `Contradicts` link → `Contradicted`.
+/// 2. A `Supersedes`/`Merges` link, or a cited superseded decision →
 ///    `Superseded`.
+/// 3. TTL-expiry → `Stale`.
 /// 4. Superseded embedding model → `Stale` (a model-generation change).
 /// 5. Resource observation: dirty or generation-mismatched → `Stale`;
 ///    clean and generation-matching → `Verified` (the only upgrade path —
@@ -160,28 +142,40 @@ pub struct RecallVerdict {
 /// 7. Model-authored → `Assumed` (a claim; support never verifies).
 /// 8. Otherwise → `Unknown`, with the derivation citing whatever age or
 ///    corroboration is known (or that nothing speaks at all).
+///
+/// `Stale` renders as "may still be right" while `Contradicted` and
+/// `Superseded` mean known-wrong or known-replaced — hence the harder
+/// findings outrank expiry positionally, never by score.
 #[must_use]
 pub fn derive_recall_verdict(standing: &ChunkStanding, ctx: &DerivationContext) -> RecallVerdict {
-    let source = resolve_source(standing);
+    let mut source = resolve_source(standing);
     let stale_model = standing.stale_model;
     let derivation;
     let truth;
 
-    if let Some(expired) = ttl_expiry(standing, ctx) {
-        derivation = expired;
-        truth = FactStatusView::Stale;
-    } else if let Some(contradicted) = live_contradiction(standing, ctx) {
+    if let Some(contradicted) = live_contradiction(standing, ctx) {
         derivation = contradicted;
         truth = FactStatusView::Contradicted;
     } else if let Some(superseded) = supersession(standing) {
         derivation = superseded;
         truth = FactStatusView::Superseded;
+    } else if let Some(expired) = ttl_expiry(standing, ctx) {
+        derivation = expired;
+        truth = FactStatusView::Stale;
     } else if stale_model {
         derivation = "superseded embedding model (content may still be right)".to_string();
         truth = FactStatusView::Stale;
     } else if let Some(observed) = resource_observation(standing, ctx) {
         derivation = observed.1;
         truth = observed.0;
+        // A clean runtime observation is the one case where the item's
+        // standing rests on an executed observation rather than on how the
+        // chunk was authored — so the source upgrades alongside the truth.
+        // This is the single live path that assigns `RuntimeObserved`;
+        // every other arm keeps the authorship-derived source.
+        if truth == FactStatusView::Verified {
+            source = RecallSource::RuntimeObserved;
+        }
     } else if all_evidence_decayed(standing, ctx) {
         derivation = format!(
             "corroborating evidence decayed beyond the {}-day window",
@@ -270,6 +264,14 @@ fn live_contradiction(standing: &ChunkStanding, ctx: &DerivationContext) -> Opti
 
 /// Supersession derivation: the newest superseding link wins over a cited
 /// superseded decision (chunk-level replacement is the nearer cause).
+///
+/// Production reachability: the link half fires whenever the memory
+/// system carries a link store — the orchestrator bootstrap attaches one
+/// on every path that builds a project memory system unless the memory
+/// DB's own DDL failed (fail-open `None`), so in practice links are the
+/// live supersession signal. The decision half fires only for chunks
+/// whose metadata cites a `decision_id`, which no current producer
+/// writes (test-only until one does).
 fn supersession(standing: &ChunkStanding) -> Option<String> {
     if let Some(newest) = standing
         .incoming
@@ -418,7 +420,12 @@ mod tests {
     const NOW_UNIX: i64 = 1_784_000_000;
 
     fn ctx() -> DerivationContext {
-        DerivationContext { decay_days: Some(90), now_unix: NOW_UNIX, current_generation: None }
+        DerivationContext {
+            decay_days: Some(90),
+            now_unix: NOW_UNIX,
+            current_generation: None,
+            interrupted: false,
+        }
     }
 
     fn standing() -> ChunkStanding {
@@ -622,5 +629,44 @@ mod tests {
         standing.incoming.push(link("critic", MemoryLinkKind::Contradicts, 1));
         let verdict = derive_recall_verdict(&standing, &ctx());
         assert_eq!(verdict.truth, FactStatusView::Contradicted, "precedence is positional");
+    }
+
+    /// Blocking review finding: expiry must never mask a harder finding.
+    /// A chunk that is simultaneously past its retention window AND
+    /// contradicted reports `Contradicted` — an agent must never be told
+    /// a known-wrong thing "may still be right".
+    #[test]
+    fn contradiction_outranks_ttl_expiry() {
+        let mut standing = standing();
+        standing.created_at =
+            Some(OffsetDateTime::from_unix_timestamp(NOW_UNIX - 200 * 86_400).expect("fixed time"));
+        standing.incoming.push(link("critic", MemoryLinkKind::Contradicts, 4));
+        let verdict = derive_recall_verdict(&standing, &ctx());
+        assert_eq!(
+            verdict.truth,
+            FactStatusView::Contradicted,
+            "expiry must not mask contradiction: {}",
+            verdict.derivation
+        );
+        assert!(verdict.derivation.contains("critic"));
+    }
+
+    /// Blocking review finding, supersession half: a chunk that is
+    /// simultaneously past its retention window AND superseded reports
+    /// `Superseded` — a known-replaced thing is not merely stale.
+    #[test]
+    fn supersession_outranks_ttl_expiry() {
+        let mut standing = standing();
+        standing.created_at =
+            Some(OffsetDateTime::from_unix_timestamp(NOW_UNIX - 200 * 86_400).expect("fixed time"));
+        standing.incoming.push(link("v2", MemoryLinkKind::Supersedes, 4));
+        let verdict = derive_recall_verdict(&standing, &ctx());
+        assert_eq!(
+            verdict.truth,
+            FactStatusView::Superseded,
+            "expiry must not mask supersession: {}",
+            verdict.derivation
+        );
+        assert!(verdict.derivation.contains("v2"));
     }
 }

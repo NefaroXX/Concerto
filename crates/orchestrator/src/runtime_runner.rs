@@ -2163,6 +2163,20 @@ pub async fn run_shared_agent(
     let memory: Arc<dyn MemoryStore> =
         resolve_run_memory(&services, &req.project_dir, req.memory_enabled).await;
 
+    // H11 observation seam: the sessions DB pool (`gate_log_pool`, the
+    // same `sessions.db` the gate appends whiteboard rows to) is available
+    // here alongside the freshly resolved store, so attach a
+    // `resource_facts`-backed provider WITHOUT reshaping any constructor:
+    // the trait setter is additive (default no-op) and desktop callers
+    // compile unchanged (desktop never attaches — its memory-init path
+    // holds no sessions pool, and the observation axis reads unknown
+    // there). Fail-open: a missing pool simply leaves the seam detached.
+    if let Some(pool) = gate_log_pool.clone() {
+        memory.attach_path_observations(Arc::new(
+            crate::memory_observations::ResourceFactObservations::new(pool, &req.project_dir),
+        ));
+    }
+
     // 6. Session creation and event recording
     let (session_id, session_store, event_recorder, transcript_recorder) =
         create_session_and_recorder(

@@ -48,6 +48,7 @@ pub mod intent_grants;
 pub mod ipc;
 pub mod managed_process;
 pub mod managed_rollback;
+pub mod memory_observations;
 mod memory_prompt;
 pub mod memory_serial;
 pub mod obligations;

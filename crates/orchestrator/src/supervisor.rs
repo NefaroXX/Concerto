@@ -2160,6 +2160,7 @@ async fn handle_retrieve_memory(
             let mut superseded = 0usize;
             let mut unknown = 0usize;
             let mut degraded = 0usize;
+            let mut interrupted = 0usize;
             let chunks = evident
                 .into_iter()
                 .map(|item| {
@@ -2171,6 +2172,9 @@ async fn handle_retrieve_memory(
                     }
                     if item.degraded {
                         degraded += 1;
+                    }
+                    if item.interrupted {
+                        interrupted += 1;
                     }
                     tracing::debug!(
                         chunk_id = %item.chunk.id,
@@ -2192,6 +2196,7 @@ async fn handle_retrieve_memory(
                 superseded,
                 unknown,
                 degraded,
+                interrupted,
                 "supervisor: memory recall status counts"
             );
             // Wire chunks carry the retrieval score and a kind label; the

@@ -9,10 +9,11 @@ use crate::error::MemoryError;
 use crate::ids::Ulid;
 use crate::memory::{
     ChunkType, Confidence, EvidentChunk, FactStatusView, MemoryChunk, MemoryEntry, MemoryId,
-    MemoryQuery, ProjectId, RecallSource,
+    MemoryQuery, PathObservationSource, ProjectId, RecallSource,
 };
 use crate::CancellationToken;
 use async_trait::async_trait;
+use std::sync::Arc;
 
 #[async_trait]
 pub trait MemoryStore: Send + Sync {
@@ -21,6 +22,20 @@ pub trait MemoryStore: Send + Sync {
         query: &MemoryQuery,
         cancel: CancellationToken,
     ) -> Result<Vec<MemoryChunk>, MemoryError>;
+    /// Attach the resource-fact observation seam for evidence-bearing
+    /// recall (H11): a clean runtime observation verifies an item, a dirty
+    /// one stales it, both cited in the derivation.
+    ///
+    /// Additive by design — the default is a no-op, so every existing
+    /// implementor (null/global/proxy/test doubles) compiles unchanged
+    /// and keeps reading the observation axis as unknown. Only the memory
+    /// system overrides this (interior mutability: safe to call on a
+    /// shared `Arc` at any time, including after construction, so call
+    /// sites that only hold the erased `Arc<dyn MemoryStore>` handle can
+    /// attach without reshaping any constructor signature). Attaching
+    /// twice replaces the provider; detaching is not supported (attach
+    /// the seam or leave it absent — there is no third state).
+    fn attach_path_observations(&self, _source: Arc<dyn PathObservationSource>) {}
     /// Evidence-bearing recall (H11): like [`Self::retrieve`], but every
     /// result carries source attribution and status rather than a bare
     /// ranked chunk.
@@ -155,6 +170,7 @@ pub fn project_without_standing(chunks: Vec<MemoryChunk>) -> Vec<EvidentChunk> {
                 freshness,
                 derivation,
                 degraded: false,
+                interrupted: false,
             }
         })
         .collect()

@@ -9,8 +9,11 @@
 use crate::ids::Ulid;
 // Re-use the canonical ProjectId from types — do not redefine it here.
 pub use crate::types::ProjectId;
+use crate::CancellationToken;
+use async_trait::async_trait;
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::HashMap;
 use time::OffsetDateTime;
 
 // ---------------------------------------------------------------------------
@@ -675,14 +678,14 @@ impl<'de> Deserialize<'de> for EvidenceScore {
 /// superseded decision replaced the item, and `Unknown` when no substrate
 /// establishes a status at all (never a default that reads as fine).
 ///
-/// Deliberately **not** `#[non_exhaustive]`: cross-crate construction is
-/// the point (the orchestrator builds these values), and exhaustive matches
-/// keep a truth-from-score derivation a compile-visible act. There is no
-/// constructor from any score type — truth is never computed from a number
-/// (G-NOUPGRADE preserved by construction: no API takes an `f64` and
-/// returns a `FactStatusView`).
+/// `#[non_exhaustive]` (review hardening): a future variant must be a
+/// compile-visible act at every downstream match — no match may silently
+/// keep meaning what it meant. There is no constructor from any score
+/// type — truth is never computed from a number (G-NOUPGRADE preserved by
+/// construction: no API takes an `f64` and returns a `FactStatusView`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum FactStatusView {
     /// Backed by an executed observation.
     Verified,
@@ -741,9 +744,12 @@ impl std::fmt::Display for FactStatusView {
 #[serde(rename_all = "kebab-case")]
 pub enum RecallSource {
     /// Backed by an executed runtime observation (ADR-65: runtime authors
-    /// observed facts). Reserved: no producer emits this yet, so retrieval
-    /// assigns it only through the resource-fact observation seam carrying
-    /// a clean, generation-matching row — never by assertion.
+    /// observed facts). Assigned at retrieval ONLY through the
+    /// resource-fact observation seam when it verifies the item (a clean,
+    /// generation-matching row) — never by assertion, never from chunk
+    /// authorship. Reachable in production on run paths that attach the
+    /// seam (the CLI run path does; desktop memory-init holds no sessions
+    /// pool, so the source never appears there).
     RuntimeObserved,
     /// Indexer-observed source chunk (a real file path the indexer read).
     IndexedFile,
@@ -823,8 +829,17 @@ pub struct EvidentChunk {
     /// did). Bounded at assembly; never carries scores-as-truth.
     pub derivation: String,
     /// `true` when retrieval ran vector-disabled (FTS-only fallback):
-    /// reduced capability, surfaced — never hidden.
+    /// reduced capability, surfaced — never hidden. Missing on the wire
+    /// means `false` (additive read-time form).
+    #[serde(default)]
     pub degraded: bool,
+    /// `true` when the recall was interrupted (cancelled) before standing
+    /// was fully established: the verdicts below may rest on incomplete
+    /// substrate. Machine-readable on purpose — a caller distinguishes an
+    /// interrupted recall from a completed recall that genuinely found
+    /// nothing WITHOUT parsing prose. Missing on the wire means `false`.
+    #[serde(default)]
+    pub interrupted: bool,
 }
 
 impl EvidentChunk {
@@ -834,6 +849,7 @@ impl EvidentChunk {
     /// and out-of-range values — there is no clamping path that would
     /// invent a freshness the substrate never had.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         chunk: MemoryChunk,
         truth: FactStatusView,
@@ -842,13 +858,65 @@ impl EvidentChunk {
         freshness: f64,
         derivation: String,
         degraded: bool,
+        interrupted: bool,
     ) -> Option<Self> {
         if freshness.is_finite() && (0.0..=1.0).contains(&freshness) {
-            Some(Self { chunk, truth, source, confidence, freshness, derivation, degraded })
+            Some(Self {
+                chunk,
+                truth,
+                source,
+                confidence,
+                freshness,
+                derivation,
+                degraded,
+                interrupted,
+            })
         } else {
             None
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// H11 observation seam — resource-fact honesty bits without the sessions
+// dependency (the memory crate cannot see the sessions pool, so the
+// orchestrator implements this trait over `resource_facts` and attaches
+// it to the memory system).
+// ---------------------------------------------------------------------------
+
+/// One resource-fact observation handed to recall through the
+/// [`PathObservationSource`] seam: the honesty bits of a `resource_facts`
+/// row — whether the workspace state is uncertain, which generation the
+/// observation belongs to, and which event attests it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PathObservation {
+    /// `true` means the workspace state is uncertain (never served clean).
+    pub dirty: bool,
+    /// Workspace generation of the latest observation, when recorded.
+    #[serde(default)]
+    pub generation: Option<String>,
+    /// The whiteboard event the observation is attributable to, when known.
+    #[serde(default)]
+    pub last_event_id: Option<String>,
+}
+
+/// Optional resource-fact feed for recall (service seam).
+///
+/// The orchestrator side implements this over `resource_facts` and
+/// attaches it via [`crate::traits::memory::MemoryStore::attach_path_observations`].
+/// Every method is cancellation-aware; an error, a missing row, or a
+/// missing provider reads the path as unobserved (unknown), never as
+/// verified. The trait is infallible by contract — fail-open lives inside
+/// the provider, never as an error the recall must handle.
+#[async_trait]
+pub trait PathObservationSource: Send + Sync {
+    /// Look up observations for real file paths (bounded: at most one
+    /// recall's ids). Absent paths simply have no entry.
+    async fn observe_paths(
+        &self,
+        file_paths: &[String],
+        cancel: CancellationToken,
+    ) -> HashMap<String, PathObservation>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1249,6 +1317,7 @@ mod tests {
             1.0,
             "claim".into(),
             false,
+            false,
         )
         .is_some());
         for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 1.1] {
@@ -1261,11 +1330,42 @@ mod tests {
                     bad,
                     "unknown".into(),
                     false,
+                    false,
                 )
                 .is_none(),
                 "must refuse freshness {bad}"
             );
         }
+    }
+
+    #[test]
+    fn interrupted_flag_defaults_false_on_the_wire() {
+        // The interruption signal is additive: payloads written before it
+        // existed load as uninterrupted, never as interrupted.
+        let json = serde_json::json!({
+            "chunk": {
+                "id": "c",
+                "project_id": "p",
+                "namespace": {"Project": "p"},
+                "content": "c",
+                "file_path": null,
+                "start_line": null,
+                "end_line": null,
+                "chunk_type": "Fact",
+                "score": 0.0,
+                "model_id": "",
+                "model_version": "",
+                "stale": false,
+            },
+            "truth": "unknown",
+            "source": "unknown",
+            "confidence": "unknown",
+            "freshness": 1.0,
+            "derivation": "unknown",
+            "degraded": false,
+        });
+        let evident: EvidentChunk = serde_json::from_value(json).expect("pre-signal payload loads");
+        assert!(!evident.interrupted);
     }
 
     #[test]

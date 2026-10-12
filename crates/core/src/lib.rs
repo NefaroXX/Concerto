@@ -82,8 +82,8 @@ pub use memory::{
     ChunkType, Confidence, ConfidenceSource, Decision, DecisionCategory, DecisionId,
     EmbeddingRecord, EvidenceScore, EvidentChunk, FactStatusView, FtsResult, MemoryChunk,
     MemoryEntry, MemoryFilter, MemoryId, MemoryLink, MemoryLinkKind, MemoryNamespace, MemoryQuery,
-    RecallSource, Relevance, TaskNode, TaskNodeId, TaskStatus, VectorResult, WorkingMemorySnapshot,
-    EVIDENCE_SCORE_MAX,
+    PathObservation, PathObservationSource, RecallSource, Relevance, TaskNode, TaskNodeId,
+    TaskStatus, VectorResult, WorkingMemorySnapshot, EVIDENCE_SCORE_MAX,
 };
 
 // Re-export traits needed by other crates

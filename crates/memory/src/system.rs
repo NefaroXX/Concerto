@@ -184,7 +184,11 @@ pub struct MemorySystem {
     /// runtime observation can verify (and a dirty one stale) an item.
     /// Unset reads the observation axis as unknown — never as fine. The
     /// seam is infallible by contract (fail-open inside the provider).
-    path_observations: Option<Arc<dyn PathObservationSource>>,
+    /// Behind a lock so the seam can be attached post-construction through
+    /// the erased `Arc<dyn MemoryStore>` handle (see
+    /// [`MemoryStore::attach_path_observations`]) — the critical section
+    /// only swaps an `Arc`, never `.await`s under the guard.
+    path_observations: std::sync::RwLock<Option<Arc<dyn PathObservationSource>>>,
 }
 
 impl MemorySystem {
@@ -216,7 +220,7 @@ impl MemorySystem {
             link_cascade: None,
             l1_extractor: None,
             l1_counters: L1ExtractCounters::default(),
-            path_observations: None,
+            path_observations: std::sync::RwLock::new(None),
         }
     }
     /// Access the decision store.
@@ -295,6 +299,13 @@ impl MemorySystem {
     /// write happens AFTER the chunk is stored and BEFORE the target is
     /// tombstoned, and is fail-open: any link-store error logs a warning and
     /// the memory is kept unchanged.
+    ///
+    /// Production reachability: the orchestrator bootstrap attaches the
+    /// store on every path that builds a project memory system; it stays
+    /// detached ONLY when the memory DB's own link-table DDL failed
+    /// (fail-open `None`). So link-substrate verdicts (`Contradicted`,
+    /// `Superseded`, corroboration) are live in production whenever
+    /// memory init itself succeeded.
     pub fn with_link_store(mut self, link_store: Arc<LinkStore>) -> Self {
         self.link_store = Some(link_store);
         self
@@ -332,8 +343,10 @@ impl MemorySystem {
     /// an item and a dirty one stales it, both with the observation cited
     /// in the derivation. Fail-open throughout: provider gaps read as
     /// unknown. Without a provider the observation axis is always unknown.
-    pub fn with_path_observations(mut self, source: Arc<dyn PathObservationSource>) -> Self {
-        self.path_observations = Some(source);
+    /// Builder form of [`MemoryStore::attach_path_observations`] for call
+    /// sites that still own the concrete system.
+    pub fn with_path_observations(self, source: Arc<dyn PathObservationSource>) -> Self {
+        self.attach_path_observations(source);
         self
     }
 
@@ -498,7 +511,11 @@ impl MemorySystem {
                 }
             }
         }
-        let observations: HashMap<String, PathObservation> = match self.path_observations.as_ref() {
+        // Clone the provider out first: the guard must not be held across
+        // the `.await` below (`RwLockReadGuard` is not `Send`).
+        let source =
+            self.path_observations.read().unwrap_or_else(|poison| poison.into_inner()).clone();
+        let observations: HashMap<String, PathObservation> = match source {
             Some(source) if !path_to_ids.is_empty() => {
                 let paths: Vec<String> = path_to_ids.keys().cloned().collect();
                 source.observe_paths(&paths, cancel.clone()).await
@@ -734,6 +751,10 @@ impl MemoryStore for MemorySystem {
         self.link_store.is_some()
     }
 
+    fn attach_path_observations(&self, source: Arc<dyn PathObservationSource>) {
+        *self.path_observations.write().unwrap_or_else(|poison| poison.into_inner()) = Some(source);
+    }
+
     async fn retrieve(
         &self,
         query: &MemoryQuery,
@@ -862,6 +883,11 @@ impl MemoryStore for MemorySystem {
             now_unix: observed_at.unix_timestamp(),
             // The memory system holds no workspace generation (see above).
             current_generation: None,
+            // Read AFTER standing assembly: a cancellation that landed
+            // mid-assembly leaves partial or empty standing, and the
+            // composites must say so (machine-readable `interrupted`,
+            // never silent Unknown).
+            interrupted: cancel.is_cancelled(),
         };
         let fused: Vec<FusedResult> = kept.iter().map(|(_, result)| result.clone()).collect();
         let rich = enrich_with_standing(&fused, &scores, stamps, &standings, &ctx);
@@ -2284,7 +2310,8 @@ mod tests {
 
     /// H11 wiring: a cancelled token fails open — recall still succeeds,
     /// with standing-dependent verdicts reading Unknown rather than
-    /// inventing status.
+    /// inventing status — but the interruption is explicit
+    /// (`interrupted`), never silent.
     #[tokio::test]
     async fn evidence_recall_cancelled_token_reads_unknown() {
         use concerto_core::memory::FactStatusView;
@@ -2302,11 +2329,94 @@ mod tests {
         let evident = system.retrieve_with_evidence(&query, cancelled).await.expect("fail-open");
         assert_eq!(evident.len(), 1, "the recall itself still serves");
         assert_eq!(evident[0].truth, FactStatusView::Unknown);
+        assert!(evident[0].interrupted, "interruption is machine-readable");
         assert!(
-            evident[0].derivation.contains("unestablished"),
-            "honest: {}",
+            evident[0].derivation.contains("interrupted"),
+            "and prompt-visible: {}",
             evident[0].derivation
         );
+    }
+
+    /// Blocking review finding: an interrupted recall must be
+    /// distinguishable from a completed recall that genuinely established
+    /// nothing — WITHOUT parsing prose. The `interrupted` flag is that
+    /// signal: same shape, same Unknown truth, different flag.
+    #[tokio::test]
+    async fn interrupted_recall_distinguishable_from_genuine_unknown() {
+        use concerto_core::memory::FactStatusView;
+
+        // A bare indexed chunk with no corroboration, links, or
+        // observations anywhere: a completed recall genuinely establishes
+        // no status (truth Unknown, with its known age stated).
+        let project = ProjectId("h11-genuine-unknown".into());
+        let record = concerto_core::memory::EmbeddingRecord {
+            id: "bare".into(),
+            project_id: project.clone(),
+            chunk_hash: "hash".into(),
+            content: "genuine unknown marker content".into(),
+            file_path: "src/bare.rs".into(),
+            start_line: Some(1),
+            end_line: Some(1),
+            chunk_type: concerto_core::memory::ChunkType::Function,
+            vector: vec![0.1; 8],
+            model_id: "m".into(),
+            model_version: "1".into(),
+            stale: false,
+            // No age: the TTL substrate stays silent too.
+            created_at: OffsetDateTime::now_utc(),
+        };
+        let vector_store =
+            Arc::new(InMemoryVectorStore::with_records(vec![(project.clone(), record)]));
+        let fts_store = Arc::new(InMemoryFullTextStore::new());
+        fts_store
+            .insert(
+                &concerto_core::memory::MemoryChunk {
+                    id: "bare".into(),
+                    project_id: project.clone(),
+                    namespace: MemoryNamespace::Project(project.clone()),
+                    content: "genuine unknown marker content".into(),
+                    file_path: Some("src/bare.rs".into()),
+                    start_line: Some(1),
+                    end_line: Some(1),
+                    chunk_type: concerto_core::memory::ChunkType::Function,
+                    score: 1.0,
+                    model_id: "m".into(),
+                    model_version: "1".into(),
+                    stale: false,
+                },
+                &project,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("fts seed");
+        let system = MemorySystem::new(
+            vector_store,
+            fts_store,
+            Arc::new(DecisionStore::new()),
+            Arc::new(TaskTreeStore::new()),
+            None,
+            project.clone(),
+            None,
+        );
+
+        let query = evident_query("h11-genuine-unknown", "genuine unknown marker");
+        let done = system
+            .retrieve_with_evidence(&query, CancellationToken::new())
+            .await
+            .expect("completed recall");
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].truth, FactStatusView::Unknown);
+        assert!(!done[0].interrupted, "a completed recall is not marked interrupted");
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let cut = system.retrieve_with_evidence(&query, cancelled).await.expect("fail-open");
+        assert_eq!(cut.len(), 1);
+        assert!(cut[0].interrupted, "an interrupted recall is marked");
+        // Both may read Unknown truth with an "unestablished" derivation —
+        // the flag, not the prose, tells them apart.
+        assert_eq!(cut[0].truth, FactStatusView::Unknown);
+        assert_ne!(done[0].interrupted, cut[0].interrupted);
     }
 
     /// H11 wiring: vector-disabled recall still assembles evidence, with
