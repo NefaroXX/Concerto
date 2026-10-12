@@ -338,6 +338,11 @@ async fn step1_environment_describe_reports_effective_write_and_restore_scope() 
         ],
         probe_candidates: Some(vec!["probe-missing-xyz".to_string()]),
         probe_path_dirs: Some(vec![harness.root.clone()]),
+        // Hermetic runtime (canned probe result — this integration test never
+        // depends on the host's docker/podman).
+        sandbox_runtime: concerto_core::sandbox::RuntimeAvailability::Unavailable {
+            reason: "test: no container runtime".to_string(),
+        },
     };
     let state = new_shared_state(facts, Arc::new(CountingProber::default()), None);
     let mut registry = ToolRegistry::default();
@@ -403,6 +408,27 @@ async fn step1_environment_describe_reports_effective_write_and_restore_scope() 
     assert_eq!(
         restore["max_pre_image_bytes"], CHECKPOINT_TOTAL_LIMIT_BYTES as u64,
         "the byte bound is the sidecar budget: {restore}"
+    );
+
+    // H10 — sandbox capability: the run profile's descriptor rides the
+    // describe rendering (descriptive only — it offers no restore coverage).
+    let sandbox = &summary.data["sandbox_capability"];
+    assert_eq!(sandbox["schema_version"], 1, "versioned descriptor: {sandbox}");
+    assert_eq!(sandbox["profile"], "None", "this run declares no isolation: {sandbox}");
+    assert_eq!(sandbox["isolation"], "unconfined");
+    assert_eq!(
+        sandbox["windows"]["unsupported_by_decision"]["decision"], "ADR-72 §5",
+        "Windows stays decided: {sandbox}"
+    );
+    let unrestorable: Vec<&str> = sandbox["cannot_restore"]
+        .as_array()
+        .expect("cannot_restore array")
+        .iter()
+        .filter_map(|entry| entry["kind"].as_str())
+        .collect();
+    assert!(
+        unrestorable.contains(&"mounted_host_data") && unrestorable.contains(&"remote_services"),
+        "declared-unsupported resources are named: {unrestorable:?}"
     );
 
     // Bounded full rendering carries truncation flags, not an unbounded dump.

@@ -102,6 +102,23 @@ pub enum RollbackError {
 /// (`Supported` > `Qualified` > `Unsupported`); the result is deterministic
 /// in [`EffectKind`] order.
 pub fn assemble_rollback_offers(file_record: Option<&CheckpointRecord>) -> Vec<EffectCoverage> {
+    assemble_rollback_offers_with_sandbox(file_record, &[])
+}
+
+/// Assemble rollback offers with an extra sandbox capability share (H10).
+///
+/// `sandbox_offers` is a [`SandboxCapabilityDescriptor`](concerto_core::sandbox::SandboxCapabilityDescriptor)'s
+/// [`offers`](concerto_core::sandbox::SandboxCapabilityDescriptor::offers) —
+/// all-`Unsupported` in this milestone, since no container/runtime
+/// checkpoint-restore backend ships (ADR-83). The merge is strongest-wins
+/// per kind, so an all-`Unsupported` share can never upgrade (or downgrade)
+/// another adapter's claim: it composes structurally without changing any
+/// verdict. Additive seam: existing callers keep calling
+/// [`assemble_rollback_offers`].
+pub fn assemble_rollback_offers_with_sandbox(
+    file_record: Option<&CheckpointRecord>,
+    sandbox_offers: &[EffectCoverage],
+) -> Vec<EffectCoverage> {
     let mut sources: Vec<EffectCoverage> = Vec::new();
     match file_record {
         Some(record) => sources.extend(file_checkpoint_coverage(record)),
@@ -118,6 +135,7 @@ pub fn assemble_rollback_offers(file_record: Option<&CheckpointRecord>) -> Vec<E
     }
     sources.extend(memory_db_adapter_coverage());
     sources.extend(process_adapter_coverage());
+    sources.extend(sandbox_offers.iter().cloned());
     fn rank(support: &EffectSupport) -> u8 {
         match support {
             EffectSupport::Supported { .. } => 2,
@@ -642,6 +660,45 @@ mod tests {
         let refusal =
             check_preflight_for_execution(&preflight, true).expect_err("refused never runs");
         assert!(refusal.to_string().contains("refused"), "{refusal}");
+    }
+
+    #[test]
+    fn sandbox_share_never_upgrades_another_adapters_claim() {
+        use concerto_core::sandbox::{sandbox_capability_for, RuntimeAvailability};
+        use concerto_core::types::SandboxProfile;
+        // H10 feed: a sandbox descriptor's offers merge strongest-wins, so
+        // the all-Unsupported sandbox share of this milestone changes no
+        // verdict — it composes structurally without touching preflight.
+        let sandbox_offers = sandbox_capability_for(
+            SandboxProfile::Containerized,
+            &RuntimeAvailability::Unavailable {
+                reason: "no container runtime (docker or podman) found on PATH".to_string(),
+            },
+        )
+        .offers();
+        assert!(
+            sandbox_offers
+                .iter()
+                .all(|offer| matches!(offer.support, EffectSupport::Unsupported { .. })),
+            "this milestone's sandbox share restores nothing"
+        );
+        let record = active_file_record();
+        let plain = assemble_rollback_offers(Some(&record));
+        let merged = assemble_rollback_offers_with_sandbox(Some(&record), &sandbox_offers);
+        assert_eq!(plain, merged, "an all-Unsupported share is verdict-neutral");
+        let file = merged.iter().find(|entry| entry.kind == EffectKind::File).expect("file");
+        assert!(file.support.is_full(), "the file claim survives the sandbox merge");
+        // …and shell/network stay refused through the merged share.
+        let preflight = preflight_rollback_guarantee(
+            &[EffectKind::File, EffectKind::Shell, EffectKind::Network],
+            &merged,
+        );
+        assert_eq!(preflight.verdict, concerto_core::checkpoint::PreflightVerdict::Refused);
+        // Without a file checkpoint the sandbox share alone still refuses.
+        let merged = assemble_rollback_offers_with_sandbox(None, &sandbox_offers);
+        let preflight =
+            preflight_rollback_guarantee(&[EffectKind::File, EffectKind::Shell], &merged);
+        assert_eq!(preflight.verdict, concerto_core::checkpoint::PreflightVerdict::Refused);
     }
 
     #[test]
