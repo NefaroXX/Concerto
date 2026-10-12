@@ -682,6 +682,61 @@ pub trait CheckpointStore: Send + Sync {
         missing: Vec<String>,
         cancel: CancellationToken,
     ) -> Result<(), CheckpointStoreError>;
+
+    /// Load the durable per-resource restore progress for `checkpoint_id`
+    /// (the crash-recovery journal, migration 040 on the sessions sidecar).
+    ///
+    /// The default is "no durable progress" (empty): a store without a
+    /// journal degrades to full re-verify — the restore rewrites every
+    /// resource through the normal gated path — never to "assume done".
+    async fn load_restore_progress(
+        &self,
+        _checkpoint_id: &str,
+        _cancel: CancellationToken,
+    ) -> Result<Vec<RestoreProgressEntry>, CheckpointStoreError> {
+        Ok(Vec::new())
+    }
+
+    /// Upsert one resource's restore progress. The durable implementation is
+    /// monotonic (`running` never overwrites `done`; `done` always wins) so
+    /// concurrent duplicate submissions cannot regress a landed write.
+    ///
+    /// Bookkeeping only: failures here must stay fail-soft at the call site
+    /// (warn and continue with the gated restore), never fail-closed — the
+    /// degraded mode is "unknown progress, re-verify", and every write stays
+    /// policy-gated and ownership-checked regardless.
+    async fn record_restore_progress(
+        &self,
+        _checkpoint_id: &str,
+        _entry: &RestoreProgressEntry,
+        _cancel: CancellationToken,
+    ) -> Result<(), CheckpointStoreError> {
+        Ok(())
+    }
+
+    /// Open one restore attempt (`attempt_id` PRIMARY KEY, `INSERT OR
+    /// IGNORE` semantics: re-submitting the same attempt id replays instead
+    /// of forking — the gate's `call_id` dedup contract at attempt
+    /// granularity).
+    async fn begin_restore_attempt(
+        &self,
+        _attempt: &RestoreAttemptInfo,
+        _cancel: CancellationToken,
+    ) -> Result<(), CheckpointStoreError> {
+        Ok(())
+    }
+
+    /// Stamp one attempt's terminal outcome (`restored` | `partial` |
+    /// `failed` | `cancelled`). Bookkeeping like the progress rows above.
+    async fn finish_restore_attempt(
+        &self,
+        _attempt_id: &str,
+        _outcome: RestoreAttemptOutcome,
+        _finished_at_ms: i64,
+        _cancel: CancellationToken,
+    ) -> Result<(), CheckpointStoreError> {
+        Ok(())
+    }
 }
 
 /// Read side of the ownership table for restore: `None` means unowned (the
@@ -720,6 +775,202 @@ pub trait MutationCaptureSink: Send + Sync + std::fmt::Debug {
 }
 
 // ---------------------------------------------------------------------------
+// Recovery journal (H07 crash-recovery half)
+// ---------------------------------------------------------------------------
+
+/// Durable per-resource progress of one checkpoint's restore.
+///
+/// A `done` row is a *candidate* for skipping on resume, never proof: the
+/// resume path re-reads the file from `project_dir` and skips the gated
+/// write only when the bytes hash to `content_hash` AND that hash agrees
+/// with the record's `post_hash` (see [`verify_bytes_on_disk`]). A resource
+/// marked done but modified since is re-restored, never blindly skipped.
+/// A missing row means "unknown progress" — the restore re-verifies from
+/// scratch — never "assume done".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreProgressEntry {
+    /// Canonical (project-relative) path this row tracks.
+    pub canonical_path: String,
+    /// Where the latest attempt left this resource.
+    pub state: RestoreResourceState,
+    /// Blake3 hex verified when the row moved to `done` (`None` for
+    /// deletion-kind resources, whose restored state is absence).
+    pub content_hash: Option<String>,
+    /// Latest attempt that touched this row (audit trail, not a lock).
+    pub attempt_id: String,
+    /// Agent id of the latest attempt.
+    pub by_agent: String,
+    /// When the row was last written, Unix epoch millis.
+    pub updated_at_ms: i64,
+    /// Human-readable note for `failed`/`missing` rows (why); empty otherwise.
+    pub detail: String,
+}
+
+/// Per-resource restore progress words (durable spellings in parens).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreResourceState {
+    /// Attempted but not yet running (initial row, or reset for retry).
+    Pending,
+    /// A write is in flight (crash here resumes as "unknown, re-verify").
+    Running,
+    /// The gated write landed and its bytes verified.
+    Done,
+    /// The gated write was attempted and failed (retriable, re-verified).
+    Failed,
+    /// No restorable bytes exist (hash-only/absent/corrupt — restores as
+    /// `Partial`, never skipped into a success claim).
+    Missing,
+}
+
+impl RestoreResourceState {
+    /// The durable single-word spelling stored on the journal row.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Missing => "missing",
+        }
+    }
+
+    /// Parse the durable spelling; unknown values read `None` (never a guess —
+    /// an unreadable row degrades to "unknown progress, re-verify").
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "pending" => Some(Self::Pending),
+            "running" => Some(Self::Running),
+            "done" => Some(Self::Done),
+            "failed" => Some(Self::Failed),
+            "missing" => Some(Self::Missing),
+            _ => None,
+        }
+    }
+}
+
+/// One restore attempt's durable envelope (the `checkpoint_restore_attempts`
+/// row): who started which checkpoint's restore when. `attempt_id` is a ULID
+/// minted per `restore_checkpoint` call and is the dedup key — re-submitting
+/// the same id replays instead of forking (the gate's `call_id` contract).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreAttemptInfo {
+    /// Attempt identity + dedup key.
+    pub attempt_id: String,
+    /// The checkpoint under restore.
+    pub checkpoint_id: String,
+    /// Agent id running the restore.
+    pub by_agent: String,
+    /// Attempt start, Unix epoch millis.
+    pub started_at_ms: i64,
+}
+
+/// Terminal words for one restore attempt (durable spellings in parens).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreAttemptOutcome {
+    /// Still in flight.
+    Running,
+    /// Every resource restored (or verified already-restored).
+    Restored,
+    /// Byte-carrying subset restored; the rest reported missing.
+    Partial,
+    /// The attempt errored (policy/ownership/execution/store) — retriable.
+    Failed,
+    /// The attempt was cancelled — retriable.
+    Cancelled,
+}
+
+impl RestoreAttemptOutcome {
+    /// The durable single-word spelling stored on the attempt row.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Restored => "restored",
+            Self::Partial => "partial",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// Parse the durable spelling; unknown values read `None` (never a guess).
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "running" => Some(Self::Running),
+            "restored" => Some(Self::Restored),
+            "partial" => Some(Self::Partial),
+            "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+}
+
+/// One line of an accurate partial-progress report: the journal's durable
+/// state for a checkpointed resource plus whether its CURRENT disk content
+/// verifies (so a reader can tell "done and still exact" from "done but
+/// drifted" without running a restore).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreProgressItem {
+    /// Canonical (project-relative) path.
+    pub canonical_path: String,
+    /// Latest durable journal state (`Pending` when no row exists — unknown
+    /// progress, never assumed done).
+    pub state: RestoreResourceState,
+    /// Expected content hash from the checkpoint record (`None` for
+    /// deletion-kind resources, whose restored state is absence).
+    pub expected_hash: Option<String>,
+    /// Whether the current disk content matches the restored state right
+    /// now (bytes hash to `expected_hash`, or absence for deletions).
+    pub verified_on_disk: bool,
+    /// Latest attempt that touched this row (empty when no row exists).
+    pub attempt_id: String,
+}
+
+/// Re-verify a journal-`done` byte resource against disk: read the file from
+/// `project_dir` and require its bytes to hash to `expected_hash` (with the
+/// recorded length agreeing when `expected_len` is known).
+///
+/// Returns `false` on ANY read failure or mismatch — a resource that cannot
+/// be proven exact is re-restored, never skipped. This is the check that
+/// keeps the resume skip honest: a `done` marker from an earlier run that no
+/// longer matches disk (sibling or user edit since) falls through to a
+/// gated re-write, and a resource whose bytes are unavailable (pruned sidecar,
+/// missing chunks) can never verify its way into a success claim.
+#[must_use]
+pub fn verify_bytes_on_disk(
+    project_dir: &std::path::Path,
+    canonical_path: &str,
+    expected_hash: &str,
+    expected_len: Option<u64>,
+) -> bool {
+    let bytes = match std::fs::read(project_dir.join(canonical_path)) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    if let Some(len) = expected_len {
+        if bytes.len() as u64 != len {
+            return false;
+        }
+    }
+    blake3::hash(&bytes).to_hex().to_string() == expected_hash
+}
+
+/// Re-verify a journal-`done` deletion resource against disk: the restored
+/// state is absence, so only absence verifies. Any presence (or unreadable
+/// metadata) returns `false` — the path is re-deleted through the gate.
+#[must_use]
+pub fn verify_absent_on_disk(project_dir: &std::path::Path, canonical_path: &str) -> bool {
+    match std::fs::symlink_metadata(project_dir.join(canonical_path)) {
+        Ok(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Restore outcome
 // ---------------------------------------------------------------------------
 
@@ -743,8 +994,14 @@ pub enum RestoreOutcome {
         recreated: Vec<String>,
         /// Paths deleted (absent at checkpoint time).
         deleted: Vec<String>,
-        /// Provenance notes (e.g. pre-image-captured bytes) — honest
-        /// packaging, never silently exact.
+        /// Canonical paths NOT rewritten by this call because a journal
+        /// `done` row verified against disk (byte-exact already, re-verified
+        /// hash — never a blind skip). They are in the restored state, so
+        /// they also appear in `restored`/`deleted`; this list names which
+        /// ones skipped their write, so a resume's work is auditable.
+        verified_skips: Vec<String>,
+        /// Provenance notes (e.g. pre-image-captured bytes, verified skips) —
+        /// honest packaging, never silently exact.
         notes: Vec<String>,
     },
     /// The checkpoint was already `Restored`: no write ran (recorded no-op;
@@ -1036,5 +1293,48 @@ mod tests {
         assert!(versioned_fs_targets("shell", &json!({"operation": "write", "path": "a.txt"}))
             .is_empty());
         assert!(versioned_fs_targets("filesystem", &json!({"path": "a.txt"})).is_empty());
+    }
+
+    #[test]
+    fn restore_journal_state_spellings_round_trip() {
+        use RestoreAttemptOutcome as Attempt;
+        use RestoreResourceState as State;
+        for state in [State::Pending, State::Running, State::Done, State::Failed, State::Missing] {
+            assert_eq!(State::parse(state.as_str()), Some(state), "{}", state.as_str());
+        }
+        for outcome in [
+            Attempt::Running,
+            Attempt::Restored,
+            Attempt::Partial,
+            Attempt::Failed,
+            Attempt::Cancelled,
+        ] {
+            assert_eq!(Attempt::parse(outcome.as_str()), Some(outcome), "{}", outcome.as_str());
+        }
+        assert_eq!(State::parse("done-ish"), None, "unknown states never guessed");
+        assert_eq!(Attempt::parse("restored!"), None, "unknown outcomes never guessed");
+    }
+
+    #[test]
+    fn verify_helpers_are_fail_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hash = blake3::hash(b"exact").to_hex().to_string();
+        // Absent file verifies neither bytes nor (trivially) absence-of-write.
+        assert!(!verify_bytes_on_disk(dir.path(), "missing.txt", &hash, Some(5)));
+        assert!(verify_absent_on_disk(dir.path(), "missing.txt"));
+        std::fs::write(dir.path().join("a.txt"), b"exact").expect("write fixture");
+        assert!(verify_bytes_on_disk(dir.path(), "a.txt", &hash, Some(5)));
+        assert!(!verify_bytes_on_disk(dir.path(), "a.txt", &hash, Some(6)), "length must agree");
+        let other_hash = blake3::hash(b"other").to_hex().to_string();
+        assert!(
+            !verify_bytes_on_disk(dir.path(), "a.txt", &other_hash, Some(5)),
+            "hash must agree"
+        );
+        assert!(!verify_absent_on_disk(dir.path(), "a.txt"), "presence never verifies absence");
+        std::fs::write(dir.path().join("a.txt"), b"drifted!").expect("drift fixture");
+        assert!(
+            !verify_bytes_on_disk(dir.path(), "a.txt", &hash, None),
+            "drifted content never verifies, even without a length bound"
+        );
     }
 }
