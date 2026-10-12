@@ -21,6 +21,19 @@ pub struct RowIndexFact {
     pub is_sentinel: bool,
 }
 
+/// Recall-visible provenance of one stored row (H11 TTL + authorship
+/// substrate): when the row was written and what its metadata sidecar
+/// says. Rows whose timestamp cannot be parsed, or backends that do not
+/// track provenance, report `created_at: None` — the recall derivation
+/// then reads TTL as unknown rather than inventing an age.
+#[derive(Debug, Clone)]
+pub struct ChunkProvenance {
+    /// When the row was written (`None` when unknown or unparseable).
+    pub created_at: Option<time::OffsetDateTime>,
+    /// The row's JSON metadata sidecar (`None` when the row carries none).
+    pub metadata: Option<serde_json::Value>,
+}
+
 /// Vector similarity store.
 ///
 /// Implementations must support:
@@ -134,5 +147,22 @@ pub trait VectorStore: Send + Sync {
         _cancel: CancellationToken,
     ) -> Result<Vec<RowIndexFact>, MemoryError> {
         Ok(Vec::new())
+    }
+
+    /// Return recall-visible provenance for the given chunk ids, keyed by
+    /// chunk id (H11 TTL + authorship substrate). Absent ids simply have no
+    /// entry — the recall derivation reads them as unknown provenance.
+    ///
+    /// Backends that do not track provenance return an empty map (the
+    /// default); recall stays honest by reporting unknown rather than
+    /// inventing ages. Callers pass at most one recall's ids (bounded by
+    /// `top_k`), so this is one bounded lookup, never a table scan.
+    async fn chunk_provenance(
+        &self,
+        _project_id: &ProjectId,
+        _chunk_ids: &[String],
+        _cancel: CancellationToken,
+    ) -> Result<std::collections::HashMap<String, ChunkProvenance>, MemoryError> {
+        Ok(std::collections::HashMap::new())
     }
 }

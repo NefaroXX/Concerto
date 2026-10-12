@@ -120,7 +120,10 @@ pub struct MemoryQuery {
 /// The `score` is the combined hybrid score (vector similarity + BM25).
 /// `model_id` and `model_version` identify which embedding model produced
 /// the vector so the staleness checker can detect drift.
-#[derive(Debug, Clone)]
+///
+/// H11: serializable and comparable so the evidence-bearing recall
+/// projection ([`EvidentChunk`]) can carry the chunk itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryChunk {
     pub id: String,
     pub project_id: ProjectId,
@@ -664,10 +667,13 @@ impl<'de> Deserialize<'de> for EvidenceScore {
 /// Core may not name the real `FactStatus` (it lives in the orchestrator,
 /// which sits above core — dependency-layering rule), so this enum mirrors
 /// its *shape* without naming it; the conversion lives in the orchestrator
-/// (`FactStatus::to_view`), the only crate that sees both. `OutsideWindow`
-/// has no orchestrator source: memory assigns it when the corroborating
-/// evidence has decayed beyond the window — the item may once have been
-/// true, but nothing in range corroborates it now.
+/// (`FactStatus::to_view`), the only crate that sees both. `OutsideWindow`,
+/// `Superseded`, and `Unknown` have no orchestrator source: memory assigns
+/// them at retrieval — `OutsideWindow` when the corroborating evidence has
+/// decayed beyond the window (the item may once have been true, but nothing
+/// in range corroborates it now), `Superseded` when a newer chunk or a
+/// superseded decision replaced the item, and `Unknown` when no substrate
+/// establishes a status at all (never a default that reads as fine).
 ///
 /// Deliberately **not** `#[non_exhaustive]`: cross-crate construction is
 /// the point (the orchestrator builds these values), and exhaustive matches
@@ -689,6 +695,14 @@ pub enum FactStatusView {
     /// Corroborating evidence decayed beyond the window. Memory-side only:
     /// assigned at retrieval, never by the orchestrator conversion.
     OutsideWindow,
+    /// A newer chunk (or a superseded decision the item cites) replaced
+    /// this item. Memory-side only: assigned at retrieval from link and
+    /// decision-provenance substrate, never by the orchestrator conversion.
+    Superseded,
+    /// No substrate establishes a status for this item. Memory-side only:
+    /// assigned at retrieval when nothing — links, TTL, observations,
+    /// authorship — speaks. Never a default that reads as fine.
+    Unknown,
 }
 
 impl FactStatusView {
@@ -701,6 +715,8 @@ impl FactStatusView {
             Self::Stale => "stale",
             Self::Contradicted => "contradicted",
             Self::OutsideWindow => "outside-window",
+            Self::Superseded => "superseded",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -708,6 +724,130 @@ impl FactStatusView {
 impl std::fmt::Display for FactStatusView {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// H11 evidence-bearing recall — source attribution + trait-safe projection
+// ---------------------------------------------------------------------------
+
+/// Where a recalled memory item comes from (H11 source attribution).
+///
+/// Assigned at retrieval from recall-visible substrate only — chunk kind,
+/// file path, and stored metadata sidecars — never from rank or score.
+/// Like [`FactStatusView`], deliberately **not** `#[non_exhaustive]` so a
+/// new source is a compile-visible act at every match site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecallSource {
+    /// Backed by an executed runtime observation (ADR-65: runtime authors
+    /// observed facts). Reserved: no producer emits this yet, so retrieval
+    /// assigns it only through the resource-fact observation seam carrying
+    /// a clean, generation-matching row — never by assertion.
+    RuntimeObserved,
+    /// Indexer-observed source chunk (a real file path the indexer read).
+    IndexedFile,
+    /// LLM-produced claim (`Fact` / `SessionSummary` chunk kinds, L1
+    /// extraction metadata): a claim until relevant evidence supports it
+    /// (ADR-65), so its truth stays [`FactStatusView::Assumed`].
+    ModelAuthored,
+    /// Consolidation projection carrying a provenance sidecar
+    /// (`source_event_ids`): derived, never directly observed.
+    Derived,
+    /// No substrate establishes a source for this item.
+    Unknown,
+}
+
+impl RecallSource {
+    /// The stable string form used in serialized evidence.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::RuntimeObserved => "runtime-observed",
+            Self::IndexedFile => "indexed-file",
+            Self::ModelAuthored => "model-authored",
+            Self::Derived => "derived",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// The cheap, always-knowable source rule: authorship from the chunk
+    /// kind, index observation from a real file path. Stored-entry and
+    /// projection metadata refine this further at full-standing sites
+    /// (see `concerto-memory::recall_status`); this rule alone never
+    /// claims more than the kind and path establish.
+    #[must_use]
+    pub fn for_chunk(chunk_type: ChunkType, file_path: Option<&str>) -> Self {
+        match chunk_type {
+            ChunkType::Fact | ChunkType::SessionSummary => Self::ModelAuthored,
+            _ if file_path.is_some_and(|path| !path.is_empty()) => Self::IndexedFile,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl std::fmt::Display for RecallSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// One recalled chunk with its evidence-bearing verdict (H11).
+///
+/// The trait-safe projection of the read-time `MemoryEvidence` composite:
+/// everything here is a core type so the [`crate::traits::memory`]
+/// contract can return it without depending on the memory crate. The full
+/// composite (relevance, corroboration score, drift stamps) stays in
+/// `concerto-memory::evidence`; this struct carries what an agent needs to
+/// answer "what is this and why should I trust it": source attribution,
+/// status, the derivation in words, model freshness, and whether retrieval
+/// ran degraded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvidentChunk {
+    /// The recalled chunk (its `score` remains the rank signal only —
+    /// never freshness; see `derivation`).
+    pub chunk: MemoryChunk,
+    /// Truth status from deterministic substrate (never from rank/score).
+    pub truth: FactStatusView,
+    /// Where the item comes from.
+    pub source: RecallSource,
+    /// Calibration. [`Confidence::Unknown`] when no calibration exists
+    /// (the memory path holds none today).
+    #[serde(default)]
+    pub confidence: Confidence,
+    /// Model freshness (`1.0` current model, `0.0` superseded model):
+    /// freshness of the *model*, never of the rank. Content age is out of
+    /// scope here — see `derivation`.
+    pub freshness: f64,
+    /// Why this status, in words: which substrate spoke (or that none
+    /// did). Bounded at assembly; never carries scores-as-truth.
+    pub derivation: String,
+    /// `true` when retrieval ran vector-disabled (FTS-only fallback):
+    /// reduced capability, surfaced — never hidden.
+    pub degraded: bool,
+}
+
+impl EvidentChunk {
+    /// Validated constructor: `freshness` must be finite within
+    /// `0.0..=1.0` (mirroring the rejecting `Freshness::new` rule without
+    /// depending on the memory crate). Returns `None` for NaN, infinities,
+    /// and out-of-range values — there is no clamping path that would
+    /// invent a freshness the substrate never had.
+    #[must_use]
+    pub fn new(
+        chunk: MemoryChunk,
+        truth: FactStatusView,
+        source: RecallSource,
+        confidence: Confidence,
+        freshness: f64,
+        derivation: String,
+        degraded: bool,
+    ) -> Option<Self> {
+        if freshness.is_finite() && (0.0..=1.0).contains(&freshness) {
+            Some(Self { chunk, truth, source, confidence, freshness, derivation, degraded })
+        } else {
+            None
+        }
     }
 }
 
@@ -1037,12 +1177,94 @@ mod tests {
             (FactStatusView::Stale, "\"stale\""),
             (FactStatusView::Contradicted, "\"contradicted\""),
             (FactStatusView::OutsideWindow, "\"outside-window\""),
+            (FactStatusView::Superseded, "\"superseded\""),
+            (FactStatusView::Unknown, "\"unknown\""),
         ] {
             let json = serde_json::to_string(&view).expect("serializes");
             assert_eq!(json, expected);
             assert_eq!(view.to_string(), view.as_str());
             let back: FactStatusView = serde_json::from_str(&json).expect("round-trips");
             assert_eq!(back, view);
+        }
+    }
+
+    #[test]
+    fn recall_source_rule_never_claims_more_than_kind_and_path() {
+        use ChunkType as T;
+        // Model-authored kinds are claims whatever the path.
+        assert_eq!(RecallSource::for_chunk(T::Fact, Some("src/a.rs")), RecallSource::ModelAuthored);
+        assert_eq!(RecallSource::for_chunk(T::SessionSummary, None), RecallSource::ModelAuthored);
+        // Indexed kinds with a real path are indexer-observed.
+        assert_eq!(
+            RecallSource::for_chunk(T::Function, Some("src/a.rs")),
+            RecallSource::IndexedFile
+        );
+        assert_eq!(
+            RecallSource::for_chunk(T::SlidingWindow, Some("notes.md")),
+            RecallSource::IndexedFile
+        );
+        // No path, non-claim kind: nothing established.
+        assert_eq!(RecallSource::for_chunk(T::Function, None), RecallSource::Unknown);
+        assert_eq!(RecallSource::for_chunk(T::Function, Some("")), RecallSource::Unknown);
+        // Sources render in kebab-case and round-trip.
+        for (source, expected) in [
+            (RecallSource::RuntimeObserved, "\"runtime-observed\""),
+            (RecallSource::IndexedFile, "\"indexed-file\""),
+            (RecallSource::ModelAuthored, "\"model-authored\""),
+            (RecallSource::Derived, "\"derived\""),
+            (RecallSource::Unknown, "\"unknown\""),
+        ] {
+            let json = serde_json::to_string(&source).expect("serializes");
+            assert_eq!(json, expected);
+            assert_eq!(source.to_string(), source.as_str());
+            let back: RecallSource = serde_json::from_str(&json).expect("round-trips");
+            assert_eq!(back, source);
+        }
+    }
+
+    #[test]
+    fn evident_chunk_rejects_invalid_freshness() {
+        let project_id = ProjectId("p".into());
+        let chunk = MemoryChunk {
+            id: "c".into(),
+            project_id: project_id.clone(),
+            namespace: MemoryNamespace::Project(project_id),
+            content: "c".into(),
+            file_path: None,
+            start_line: None,
+            end_line: None,
+            chunk_type: ChunkType::Fact,
+            score: 0.9,
+            model_id: String::new(),
+            model_version: String::new(),
+            stale: false,
+        };
+        // Boundaries are inclusive; NaN/infinities/out-of-range refused —
+        // no clamping path invents a freshness.
+        assert!(EvidentChunk::new(
+            chunk.clone(),
+            FactStatusView::Assumed,
+            RecallSource::ModelAuthored,
+            Confidence::Unknown,
+            1.0,
+            "claim".into(),
+            false,
+        )
+        .is_some());
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 1.1] {
+            assert!(
+                EvidentChunk::new(
+                    chunk.clone(),
+                    FactStatusView::Unknown,
+                    RecallSource::Unknown,
+                    Confidence::Unknown,
+                    bad,
+                    "unknown".into(),
+                    false,
+                )
+                .is_none(),
+                "must refuse freshness {bad}"
+            );
         }
     }
 

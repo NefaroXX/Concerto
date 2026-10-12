@@ -80,9 +80,10 @@ pub use authorization::{
 // Re-export Phase 4 memory types from the dedicated module.
 pub use memory::{
     ChunkType, Confidence, ConfidenceSource, Decision, DecisionCategory, DecisionId,
-    EmbeddingRecord, EvidenceScore, FactStatusView, FtsResult, MemoryChunk, MemoryEntry,
-    MemoryFilter, MemoryId, MemoryLink, MemoryLinkKind, MemoryNamespace, MemoryQuery, Relevance,
-    TaskNode, TaskNodeId, TaskStatus, VectorResult, WorkingMemorySnapshot, EVIDENCE_SCORE_MAX,
+    EmbeddingRecord, EvidenceScore, EvidentChunk, FactStatusView, FtsResult, MemoryChunk,
+    MemoryEntry, MemoryFilter, MemoryId, MemoryLink, MemoryLinkKind, MemoryNamespace, MemoryQuery,
+    RecallSource, Relevance, TaskNode, TaskNodeId, TaskStatus, VectorResult, WorkingMemorySnapshot,
+    EVIDENCE_SCORE_MAX,
 };
 
 // Re-export traits needed by other crates
@@ -90,7 +91,7 @@ pub use traits::approval::{ApprovalDecision, ApprovalSink};
 pub use traits::context_overflow::{ContextOverflowStrategy, NoOpOverflowStrategy, TruncateOldest};
 pub use traits::memory::MemoryStore;
 pub use traits::provider::LlmProvider;
-pub use traits::vector_store::{RowIndexFact, VectorStore};
+pub use traits::vector_store::{ChunkProvenance, RowIndexFact, VectorStore};
 
 /// Durable file checkpoints (ADR-82 §4, slice 5): the record envelope, the
 /// sidecar byte budget, the capture grammar, and the restore collaborator
