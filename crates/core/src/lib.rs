@@ -119,6 +119,19 @@ pub use environment_manifest::{
     ManifestToolEntry, PersistenceClass, PolicyScopeDescription, RestoreCapabilities,
     ENVIRONMENT_MANIFEST_DIGEST_MAX_TOOLS, ENVIRONMENT_MANIFEST_SCHEMA_VERSION,
 };
+/// Portable sandbox capability interface (H10, ADR-83): the backend-neutral,
+/// versioned per-profile × per-platform descriptor (isolation in force,
+/// declared resource coverage as H09 offers, explicit tri-state platform
+/// availability, named unrestorable resources). Descriptive only — never an
+/// admission gate, convertible into no policy type.
+pub use sandbox::{
+    current_sandbox_capability_table, sandbox_capability_for, sandbox_capability_table,
+    sandbox_offers_for, ContainerRuntime, PlatformAvailability, RuntimeAvailability,
+    SandboxCapabilityDescriptor, SandboxIsolation, UnrestorableResource, UnrestorableResourceKind,
+    CONTAINER_RECREATION_LIMITATION, MOUNTED_HOST_DATA_UNRESTORABLE, NO_SANDBOX_RESTORE_MILESTONE,
+    OUTSIDE_WRITABLE_LAYER_UNRESTORABLE, REMOTE_SERVICES_UNRESTORABLE,
+    SANDBOX_CAPABILITY_SCHEMA_VERSION, SANDBOX_WINDOWS_DECISION,
+};
 
 /// Typed tool-failure envelope (ADR-82 §1, slice 2): the bounded failure
 /// vocabulary core owns so no consumer parses `Display` text to classify a
