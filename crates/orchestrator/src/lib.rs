@@ -33,6 +33,7 @@ pub mod design_doc_verifier;
 pub mod environment_describe;
 pub mod environment_manifest;
 pub mod exec_backend;
+pub mod experiment;
 pub mod external_change;
 pub mod failure_diagnosis;
 pub mod file_checkpoint;

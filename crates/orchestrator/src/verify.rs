@@ -576,6 +576,97 @@ impl FreshnessClock {
 }
 
 // ---------------------------------------------------------------------------
+// Verification tree (H08): the host workspace or one experiment copy
+// ---------------------------------------------------------------------------
+
+/// H08 — what tree a verification run executes against: the host workspace
+/// or one managed experiment copy.
+///
+/// An experiment workspace is a first-class scope, not a bypass: a scoped
+/// run arms its own [`FreshnessClock`] from the scope's own root (via
+/// [`capture_scoped_generation`]), so its generation, fingerprints, and
+/// coalescing keys bind to the experiment copy's bytes. Host evidence never
+/// counts for experiment code and vice versa — a generation stamped from the
+/// wrong root reports `Generation` staleness instead of passing on foreign
+/// bytes. Coalescing, generation binding, and fingerprint invalidation are
+/// unchanged; only the root they bind to is scoped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifyTree {
+    /// The host workspace.
+    Host,
+    /// One managed experiment copy (`experiment_id` names the
+    /// [`crate::experiment::ExperimentRecord`]).
+    Experiment {
+        /// The experiment under verification.
+        experiment_id: String,
+    },
+}
+
+impl VerifyTree {
+    /// Machine-checkable scope label (record attribution, coalescing keys).
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Self::Host => "host".to_string(),
+            Self::Experiment { experiment_id } => format!("experiment:{experiment_id}"),
+        }
+    }
+
+    /// Whether this scope is an experiment copy.
+    #[must_use]
+    pub fn is_experiment(&self) -> bool {
+        matches!(self, Self::Experiment { .. })
+    }
+}
+
+/// Errors resolving a verification tree to a filesystem root.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum VerifyTreeError {
+    /// An experiment scope without its workspace root: fail-closed (a scoped
+    /// run must never silently verify the host tree while claiming the
+    /// experiment scope).
+    #[error("experiment scope {experiment_id} has no workspace root: refusing to fall back to the host tree")]
+    ExperimentRootMissing {
+        /// The experiment asking for a root.
+        experiment_id: String,
+    },
+}
+
+/// Resolve the filesystem root a scoped verification run executes against:
+/// the host root for [`VerifyTree::Host`], the experiment workspace root
+/// for [`VerifyTree::Experiment`]. `None` experiment roots are
+/// [`VerifyTreeError::ExperimentRootMissing`] — never a silent host
+/// fallback.
+pub fn verify_root_for(
+    host_root: &Path,
+    scope: &VerifyTree,
+    experiment_root: Option<&Path>,
+) -> Result<PathBuf, VerifyTreeError> {
+    match scope {
+        VerifyTree::Host => Ok(host_root.to_path_buf()),
+        VerifyTree::Experiment { experiment_id } => experiment_root
+            .map(Path::to_path_buf)
+            .ok_or(VerifyTreeError::ExperimentRootMissing { experiment_id: experiment_id.clone() }),
+    }
+}
+
+/// Capture the freshness base generation for a scope: the content-addressed
+/// workspace generation of the scope's own root — a workspace generation
+/// scoped to the experiment copy for experiment scopes, the host generation
+/// for host scopes. Returns the resolved root with its generation so the
+/// caller arms exactly the clock it verifies.
+pub fn capture_scoped_generation(
+    host_root: &Path,
+    scope: &VerifyTree,
+    experiment_root: Option<&Path>,
+    cancel: &CancellationToken,
+) -> Result<(PathBuf, String), VerifyTreeError> {
+    let root = verify_root_for(host_root, scope, experiment_root)?;
+    Ok((root.clone(), capture_base_generation(&root, cancel)))
+}
+
+// ---------------------------------------------------------------------------
 // Record builders (shared by the loop sweep and the service adapters)
 // ---------------------------------------------------------------------------
 
