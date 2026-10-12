@@ -27,6 +27,7 @@ pub use concerto_core::error::MemoryError;
 
 pub mod budget;
 pub mod chunk_selector;
+pub mod db_checkpoint;
 pub mod decision_store;
 pub mod embedder;
 pub mod embedder_health;
