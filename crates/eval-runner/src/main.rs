@@ -139,6 +139,7 @@ fn no_provider_result() -> AgentRunResult {
         total_tokens: 0,
         total_cost_usd: 0.0,
         interventions: 0,
+        observation: Default::default(),
     }
 }
 
@@ -161,6 +162,10 @@ async fn run_agent(
     description: String,
     project_dir: PathBuf,
 ) -> Result<AgentRunResult, String> {
+    // Wall-clock run start: metric 3 (time to fresh passing evidence) is
+    // measured against this, so capture it before any run work begins.
+    let run_started_at = time::OffsetDateTime::now_utc();
+
     // Create tool registry
     let mut registry = ToolRegistry::default();
     let project_dir_utf8 = camino::Utf8PathBuf::from_path_buf(project_dir.clone())
@@ -220,6 +225,10 @@ async fn run_agent(
     let task = AgentTask::new(concerto_core::ids::Ulid::new(), description);
     match agent_loop.run(task, cancel).await {
         Ok(output) => {
+            // Build the read-only observation export before moving the fields
+            // out of `output`.
+            let observation =
+                concerto_eval::observation::observe_agent_output(&output, run_started_at);
             let final_message = output.final_message;
             let total_tokens = final_message.len() as u64; // Approximation
             Ok(AgentRunResult {
@@ -230,6 +239,7 @@ async fn run_agent(
                 total_tokens,
                 total_cost_usd: 0.0, // Not tracked in eval
                 interventions: 0,    // Not tracked in eval
+                observation,
             })
         }
         Err(_) => Ok(AgentRunResult {
@@ -240,6 +250,7 @@ async fn run_agent(
             total_tokens: 0,
             total_cost_usd: 0.0,
             interventions: 0,
+            observation: Default::default(),
         }),
     }
 }
@@ -425,6 +436,7 @@ impl concerto_core::traits::approval::ApprovalSink for AllowAllApprovalSink {
 #[cfg(test)]
 mod live_eval_tests {
     use super::*;
+    use concerto_eval::observation::AgentObservation;
     use concerto_providers::openai::OpenAiProvider;
 
     /// The live leg's env contract, reusing the in-tree `CONCERTO_LIVE_PROXY`
@@ -441,6 +453,28 @@ mod live_eval_tests {
         Some((base.trim_end_matches('/').to_string(), key, model))
     }
 
+    /// Per-task metrics derived from the H15 read-only observation export.
+    ///
+    /// A metric that cannot be honestly computed is omitted (`None`) or
+    /// flagged inexact rather than fabricated — see the `*_exact` flags.
+    #[derive(serde::Serialize)]
+    struct LiveTaskMetrics {
+        task_id: String,
+        /// Metric 1: probing calls before the first useful action. `exact` is
+        /// false when the window was truncated and no write was observed, so
+        /// the value is a lower bound.
+        probing_calls: Option<u32>,
+        probing_calls_exact: bool,
+        /// Metric 2: identical failed-call retries before any success.
+        identical_failed_retries: Option<u32>,
+        identical_failed_retries_exact: bool,
+        /// Metric 3: milliseconds to the first passing verification.
+        time_to_first_passing_verification_ms: Option<u64>,
+        tool_calls_total: u32,
+        tool_calls_truncated: bool,
+        verifications_total: u32,
+    }
+
     /// One serialized live-leg result: the manual release check reads
     /// `status`/`reason` from stdout.
     #[derive(serde::Serialize)]
@@ -448,16 +482,54 @@ mod live_eval_tests {
         leg: &'static str,
         status: &'static str,
         reason: String,
+        /// The richer per-task observation data (H15). Empty on skip.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        metrics: Vec<LiveTaskMetrics>,
     }
 
     impl LiveLegOutcome {
         fn skip(reason: impl Into<String>) -> Self {
-            Self { leg: LIVE_LEG, status: "skip", reason: reason.into() }
+            Self { leg: LIVE_LEG, status: "skip", reason: reason.into(), metrics: Vec::new() }
         }
 
         fn emit(&self) {
             println!("{}", serde_json::to_string(self).unwrap_or_default());
         }
+    }
+
+    /// Derive the three metrics for each task from the observation export.
+    /// Positionally aligned with `report.individual_results`.
+    fn live_task_metrics(
+        report: &BenchmarkReport,
+        observations: &[AgentObservation],
+    ) -> Vec<LiveTaskMetrics> {
+        use concerto_eval::observation::{
+            identical_failed_retries, probing_calls_before_first_write,
+            time_to_first_passing_verification,
+        };
+
+        report
+            .individual_results
+            .iter()
+            .zip(observations)
+            .map(|(result, observation)| {
+                let probing = probing_calls_before_first_write(observation);
+                let retries = identical_failed_retries(observation);
+                let time_to_evidence = time_to_first_passing_verification(observation);
+                LiveTaskMetrics {
+                    task_id: result.task_id.to_string(),
+                    probing_calls: probing.value(),
+                    probing_calls_exact: probing.is_exact(),
+                    identical_failed_retries: retries.value(),
+                    identical_failed_retries_exact: retries.is_exact(),
+                    time_to_first_passing_verification_ms: time_to_evidence
+                        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
+                    tool_calls_total: observation.tool_calls_total,
+                    tool_calls_truncated: observation.tool_calls_truncated,
+                    verifications_total: observation.verifications_total,
+                }
+            })
+            .collect()
     }
 
     const LIVE_LEG: &str = "live-runtime-benchmark";
@@ -501,8 +573,9 @@ mod live_eval_tests {
             .with_timeout(600)
             .with_agent_factory(provider_agent_factory(provider));
 
-        match runner.run_suite().await {
-            Ok(report) => {
+        match runner.run_suite_observed().await {
+            Ok(observed) => {
+                let report = &observed.report;
                 let status =
                     if report.task_count > 0 && report.pass_rate > 0.0 { "pass" } else { "fail" };
                 LiveLegOutcome {
@@ -512,6 +585,7 @@ mod live_eval_tests {
                         "tasks={} pass_rate={:.3}",
                         report.task_count, report.pass_rate
                     ),
+                    metrics: live_task_metrics(report, &observed.observations),
                 }
                 .emit();
                 // Manual release check, not a merge gate: the run must at least
@@ -520,7 +594,13 @@ mod live_eval_tests {
             }
             Err(error) => {
                 let reason = format!("live eval run failed: {error}");
-                LiveLegOutcome { leg: LIVE_LEG, status: "fail", reason: reason.clone() }.emit();
+                LiveLegOutcome {
+                    leg: LIVE_LEG,
+                    status: "fail",
+                    reason: reason.clone(),
+                    metrics: Vec::new(),
+                }
+                .emit();
                 panic!("{reason}");
             }
         }
