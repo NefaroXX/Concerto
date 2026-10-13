@@ -39,7 +39,7 @@ are run on demand.
 | Restore latency + retained bytes at representative sizes | **benchmark** | `crates/orchestrator/benches/checkpoint_restore.rs` |
 | Environment-probing calls before the first useful action | **live-procedure** (observation export built; values unmeasured) | `concerto_eval::observation::probing_calls_before_first_write` over `AgentRunResult::observation`; "Live procedure" below; fixture `.../probe_locate_scale` |
 | Identical failed-call retries | **live-procedure** (observation export built; values unmeasured) | `concerto_eval::observation::identical_failed_retries` over `AgentRunResult::observation`; "Live procedure" below; fixture `.../retry_signature_change` |
-| Elapsed time to fresh passing evidence | **live-procedure** (observation export built; values unmeasured) | `concerto_eval::observation::time_to_first_passing_verification` over the first `is_passing_evidence` record's typed `checked_at`; "Live procedure" below; fixture `.../verify_fix_is_even` |
+| Elapsed time to fresh passing evidence | **live-procedure** (observation export built; values unmeasured) | `concerto_eval::observation::time_to_first_passing_verification` over the first `is_passing_evidence` record's typed `checked_at`; "Live procedure" below (including the metric-3 note on which run surfaces can stamp the R2 basis); fixture `.../verify_fix_is_even` |
 
 ## In-tree assertions (run these)
 
@@ -202,11 +202,42 @@ leg's summary. Two honest options, in preference order:
 
    Building the export does **not** measure the metrics: an operator run over a
    real model and config (the procedure above) is still required, and the
-   values below remain unclaimed. Note in particular that the eval path's own
-   test-suite-mode verification records carry verifier/scope but not
-   generation/content-fingerprint/evidence-ids, so their `is_passing_evidence`
-   verdict is false and metric 3 stays unmeasured there too — correct per H04,
-   not a regression; only a live run stamping the full R2 basis can satisfy it.
+   values below remain unclaimed.
+
+   Metric 3 needs one precise caveat, because "a live run" is not uniform —
+   the two honest run surfaces stamp different things:
+
+   - **The eval-runner eval leg cannot satisfy `is_passing_evidence`, even
+     live.** `run_agent` (`crates/eval-runner/src/main.rs:160`) builds a bare
+     `AgentLoop` (`:206`) and runs it (`:226`) with defaults: the strict
+     verification gate stays off (`agent_loop.rs:415`), so the run freshness
+     clock is never armed (`agent_loop.rs:542-543`, "Gate off: the clock
+     stays disarmed"), and no tool-facts writer is wired, so no write
+     records an evidence id. Harness records therefore carry empty
+     `generation`/`evidence_ids` (stamped from the disarmed stamp —
+     `verify.rs:853-857`) and, **by design**, an empty
+     `content_fingerprint` (a workspace check names no single file —
+     `verify.rs:2257-2259`). Per-file sweep records do carry a blake3
+     content fingerprint but inherit the same empty generation/evidence
+     axes (`verify.rs:1719-1724`). So every eval-path record's
+     `is_passing_evidence` verdict is false and
+     `time_to_first_passing_verification` returns `None` even after a fully
+     successful live eval run — correct per H04, not a regression: the
+     predicate demands a real basis, and the eval leg never builds one.
+     Closing that gap would mean arming the gate and wiring a tool-facts
+     writer (which needs a sessions-DB pool) inside the benchmark leg — a
+     deliberate change to what the benchmark exercises, and the writer is
+     not on the orchestrator's public surface (`mod tool_facts;` is
+     private, `crates/orchestrator/src/lib.rs:85`) — so it is an
+     owner/ADR decision, deferred, not silently done in a documentation
+     pass.
+   - **A CLI/desktop single-agent session (option 1) can.** It wires
+     `[agent] strict_verification_gate` and the production tool-facts
+     writer from real config, so its live verification records carry the
+     full R2 basis (generation, evidence ids, and — for per-file records —
+     the content fingerprint) and can satisfy `is_passing_evidence`. That
+     is the only run surface on which metric 3 can honestly be measured
+     today.
 
 ### Repetition
 
