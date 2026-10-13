@@ -95,16 +95,24 @@ impl HarnessInvocation {
         self.data.get("degraded").and_then(serde_json::Value::as_bool).unwrap_or(false)
     }
 
-    /// Whether the operation reports partial success (`checkpoint.inspect` of
-    /// a `Partial` record, a partial restore).
+    /// Whether the operation reports partial success (a `Partial` checkpoint
+    /// record from create/inspect, or a partial restore).
     pub fn is_partial(&self) -> bool {
-        self.data.get("status").and_then(serde_json::Value::as_str) == Some("partial")
-            || self
-                .data
-                .get("record")
-                .and_then(|record| record.get("status"))
-                .and_then(|status| status.get("partial"))
-                .is_some()
+        // Restore: `status` is the string `"partial"`.
+        if self.data.get("status").and_then(serde_json::Value::as_str) == Some("partial") {
+            return true;
+        }
+        // create: the record is the payload root; its `status` is an
+        // externally-tagged `{"partial": {...}}`.
+        if self.data.get("status").and_then(|status| status.get("partial")).is_some() {
+            return true;
+        }
+        // inspect: the record is nested under `record`.
+        self.data
+            .get("record")
+            .and_then(|record| record.get("status"))
+            .and_then(|status| status.get("partial"))
+            .is_some()
     }
 }
 
@@ -797,6 +805,20 @@ mod tests {
             data: serde_json::json!({ "status": "partial" }),
         };
         assert!(partial.is_partial());
+        // create: the record is the payload root, status externally tagged.
+        let create_partial = HarnessInvocation {
+            operation: CHECKPOINT_CREATE_TOOL_NAME.into(),
+            summary: "s".into(),
+            data: serde_json::json!({ "status": { "partial": { "missing": ["a"] } } }),
+        };
+        assert!(create_partial.is_partial());
+        // inspect: the record is nested under `record`.
+        let inspect_partial = HarnessInvocation {
+            operation: CHECKPOINT_INSPECT_TOOL_NAME.into(),
+            summary: "s".into(),
+            data: serde_json::json!({ "found": true, "record": { "status": { "partial": { "missing": ["a"] } } } }),
+        };
+        assert!(inspect_partial.is_partial());
         let complete = HarnessInvocation {
             operation: CHECKPOINT_RESTORE_TOOL_NAME.into(),
             summary: "s".into(),
