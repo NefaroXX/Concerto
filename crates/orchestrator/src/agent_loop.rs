@@ -1629,7 +1629,7 @@ impl AgentLoop {
         // means the provider did not report one for this message; both `None`
         // and `0` are legitimate values, so no coalescing happens here.
         let (tokens_in, tokens_out) = match usage {
-            Some(CompletionUsage { prompt_tokens, completion_tokens }) => {
+            Some(CompletionUsage { prompt_tokens, completion_tokens, .. }) => {
                 (prompt_tokens, completion_tokens)
             }
             None => (None, None),
@@ -8781,7 +8781,11 @@ mod tests {
 
                 ..Default::default()
             }],
-            Some(CompletionUsage { prompt_tokens: Some(100), completion_tokens: Some(20) }),
+            Some(CompletionUsage {
+                prompt_tokens: Some(100),
+                completion_tokens: Some(20),
+                ..Default::default()
+            }),
             &TaskExecutionMode::ActionRequired { min_tool_calls: 1, require_verification: false },
             0,
             1,

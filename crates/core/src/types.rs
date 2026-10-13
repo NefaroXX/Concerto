@@ -2443,6 +2443,11 @@ pub struct EvalOutcome {
 /// Result of running a single benchmark task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkResult {
+    /// Legacy subtotal fields below are incomplete when telemetry says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<crate::provider_call::ProviderCallSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<Ulid>,
     pub task_id: Ulid,
     pub task_description: String,
     pub completed: bool,

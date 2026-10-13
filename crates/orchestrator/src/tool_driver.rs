@@ -316,7 +316,6 @@ pub fn merge_usage(
                 .reasoning_tokens
                 .zip(b.reasoning_tokens)
                 .map(|(a, b)| a.saturating_add(b)),
-            ..CompletionUsage::default()
         }),
         (None, b) => b,
         (a, None) => a,

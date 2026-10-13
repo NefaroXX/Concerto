@@ -161,7 +161,6 @@ mod tests {
             cache_write_5m_tokens: Some(200),
             cache_write_1h_tokens: Some(100),
             reasoning_tokens: Some(50),
-            ..CompletionUsage::default()
         };
         assert!((pricing.estimate(usage).unwrap() - 0.00333).abs() < 1e-10);
         assert_eq!(pricing.estimate(CompletionUsage { cache_read_tokens: None, ..usage }), None);

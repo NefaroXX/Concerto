@@ -23,6 +23,7 @@ pub mod lock;
 pub mod memory;
 pub mod policy;
 pub mod policy_presets;
+pub mod provider_call;
 pub mod sandbox;
 pub mod sanitizer;
 pub mod secret;

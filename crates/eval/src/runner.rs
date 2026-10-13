@@ -16,6 +16,8 @@ use concerto_core::CancellationToken;
 
 /// The result of running a single agent task.
 pub struct AgentRunResult {
+    pub session_id: Option<concerto_core::ids::Ulid>,
+    pub telemetry: Option<concerto_core::provider_call::ProviderCallSummary>,
     pub completed: bool,
     pub files_modified: Vec<String>,
     pub tool_call_count: u32,
@@ -257,6 +259,8 @@ impl EvalRunner {
                 tests_passing_after: eval_res.passed,
                 files_correctly_modified: files_correctly_modified as f32,
                 agent_outcome: agent_result.final_message,
+                session_id: agent_result.session_id,
+                telemetry: agent_result.telemetry,
             })
         } else {
             // Fallback mode: just run the (scratch-copied) project's test suite.
@@ -283,6 +287,8 @@ impl EvalRunner {
                 tests_passing_after: eval_res.passed,
                 files_correctly_modified: if eval_res.passed { 1.0 } else { 0.0 },
                 agent_outcome: "fallback: test-suite-only".into(),
+                session_id: None,
+                telemetry: None,
             })
         }
     }
@@ -293,7 +299,24 @@ impl EvalRunner {
         let mut results = Vec::new();
 
         for task in &tasks {
-            let result = self.run_task(task).await?;
+            let start = Instant::now();
+            let result = match self.run_task(task).await {
+                Ok(result) => result,
+                Err(error) => BenchmarkResult {
+                    task_id: task.id,
+                    task_description: task.description.clone(),
+                    completed: false,
+                    interventions: 0,
+                    total_tokens: 0,
+                    total_cost_usd: 0.0,
+                    time_to_complete_ms: start.elapsed().as_millis() as u64,
+                    tests_passing_after: false,
+                    files_correctly_modified: 0.0,
+                    agent_outcome: format!("benchmark failed: {error}"),
+                    telemetry: None,
+                    session_id: None,
+                },
+            };
             results.push(result);
         }
 
@@ -302,7 +325,13 @@ impl EvalRunner {
         let pass_rate = if task_count == 0 {
             0.0
         } else {
-            results.iter().filter(|r| r.tests_passing_after).count() as f64 / task_count as f64
+            results
+                .iter()
+                .filter(|r| {
+                    r.completed && r.tests_passing_after && r.files_correctly_modified >= 1.0
+                })
+                .count() as f64
+                / task_count as f64
         };
         let avg_latency_ms = if task_count == 0 {
             0
@@ -443,6 +472,8 @@ mod tests {
         let factory: AgentFactory = Arc::new(|_desc, _dir| {
             Box::pin(async {
                 Ok(AgentRunResult {
+                    session_id: None,
+                    telemetry: None,
                     completed: false,
                     files_modified: vec![],
                     tool_call_count: 0,

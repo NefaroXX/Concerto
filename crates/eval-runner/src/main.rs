@@ -16,6 +16,7 @@ use concerto_eval::EvalRunner;
 use concerto_orchestrator::agent_loop::AgentLoop;
 use concerto_orchestrator::prompts::PromptBuilder;
 use concerto_providers::factory::ProviderFactory;
+use concerto_sessions::SessionStore;
 use concerto_tools::filesystem::FilesystemTool;
 use concerto_tools::shell::ShellTool;
 use std::sync::Arc;
@@ -75,7 +76,14 @@ async fn main() {
         // task from the config's primary provider (no provider configured is
         // reported, never silently mocked).
         let provider_config = config.primary_provider_config.clone();
-        runner = runner.with_agent_factory(config_agent_factory(provider_config));
+        runner = runner.with_agent_factory(config_agent_factory(
+            provider_config,
+            config
+                .context
+                .as_ref()
+                .and_then(|context| context.cache_stable_prefix)
+                .unwrap_or(false),
+        ));
     } else {
         // No config provided - fallback to test-suite-only mode
         eprintln!("No --config provided. Running in test-suite-only fallback mode. Use --config=PATH to enable agent-driven evaluation.");
@@ -113,7 +121,10 @@ async fn main() {
 /// from the config's primary provider, then run the shared agent runtime. A
 /// config with no primary provider yields the historical explicit failure
 /// result (never a mock substitution).
-fn config_agent_factory(provider_config: Option<concerto_config::ProviderConfig>) -> AgentFactory {
+fn config_agent_factory(
+    provider_config: Option<concerto_config::ProviderConfig>,
+    stable_prefix: bool,
+) -> AgentFactory {
     Arc::new(move |description: String, project_dir: PathBuf| {
         let provider_config = provider_config.clone();
         Box::pin(async move {
@@ -123,7 +134,7 @@ fn config_agent_factory(provider_config: Option<concerto_config::ProviderConfig>
                     .map_err(|e| format!("failed to build provider: {e}"))?,
                 None => return Ok(no_provider_result()),
             };
-            run_agent(provider, description, project_dir).await
+            run_agent(provider, description, project_dir, stable_prefix).await
         })
     })
 }
@@ -132,6 +143,8 @@ fn config_agent_factory(provider_config: Option<concerto_config::ProviderConfig>
 /// non-completed benchmark outcome (never a silently mocked success).
 fn no_provider_result() -> AgentRunResult {
     AgentRunResult {
+        session_id: None,
+        telemetry: None,
         completed: false,
         files_modified: Vec::new(),
         tool_call_count: 0,
@@ -148,7 +161,7 @@ fn no_provider_result() -> AgentRunResult {
 fn provider_agent_factory(provider: Arc<dyn LlmProvider>) -> AgentFactory {
     Arc::new(move |description: String, project_dir: PathBuf| {
         let provider = provider.clone();
-        Box::pin(async move { run_agent(provider, description, project_dir).await })
+        Box::pin(async move { run_agent(provider, description, project_dir, false).await })
     })
 }
 
@@ -160,18 +173,53 @@ async fn run_agent(
     provider: Arc<dyn LlmProvider>,
     description: String,
     project_dir: PathBuf,
+    stable_prefix: bool,
 ) -> Result<AgentRunResult, String> {
     // Create tool registry
     let mut registry = ToolRegistry::default();
     let project_dir_utf8 = camino::Utf8PathBuf::from_path_buf(project_dir.clone())
         .map_err(|_| format!("project_dir must be valid UTF-8: {}", project_dir.display()))?;
+    let store = Arc::new(
+        concerto_sessions::SqliteSessionStore::connect_shared()
+            .await
+            .map_err(|error| format!("benchmark persistence failed: {error}"))?,
+    );
+    let session = store
+        .create_session(
+            &project_dir_utf8,
+            provider.provider_name(),
+            "benchmark",
+            CancellationToken::new(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let bus = concerto_core::event::EventBus::new(256);
+    let recording =
+        concerto_sessions::recording::EventRecording::start(&bus, store.clone(), session.id);
+    let task = AgentTask::new(session.id, description);
+    let _ = bus.publish_for_session(
+        session.id,
+        task.id.0,
+        concerto_core::event::EventKind::BenchmarkRunMetadata {
+            task_id: task.id,
+            metadata: serde_json::json!({
+                "schema_version": 1, "run_id": session.id, "runtime_mode": "single_agent_fixture",
+                "policy_mode": "permissive_fixture", "max_iterations": 10,
+                "cache_stable_prefix": stable_prefix,
+                "commit": std::process::Command::new("git").args(["rev-parse", "HEAD"])
+                    .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
+                    .output().ok().filter(|output| output.status.success())
+                    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string()),
+            }),
+        },
+    );
     registry.register(Box::new(FilesystemTool::new(project_dir_utf8)));
     registry.register(Box::new(ShellTool::new()));
     let registry = Arc::new(registry);
 
     // Create policy engine with permissive rules (expert mode)
     // Empty rules means expert mode - all tools auto-approved
-    let policy = Arc::new(SimplePolicyEngine::new(Vec::new(), Arc::new(NullAuditLog {})));
+    let policy = Arc::new(SimplePolicyEngine::new(Vec::new(), store.audit_sink()));
 
     // Create tool executor with auto-approval
     let approval_sink = Arc::new(AllowAllApprovalSink {});
@@ -186,7 +234,8 @@ async fn run_agent(
     // Create prompt builder with the canonical build system prompt (ADR-55
     // §8: the Build prompt constant in concerto-core is the single
     // source of truth).
-    let prompt_builder = PromptBuilder::new(concerto_core::types::SYSTEM_PROMPT_BUILD);
+    let prompt_builder = PromptBuilder::new(concerto_core::types::SYSTEM_PROMPT_BUILD)
+        .with_cache_stable_prefix(stable_prefix);
 
     // Create memory store - use NullMemoryStore for eval (no persistent
     // memory needed)
@@ -199,7 +248,7 @@ async fn run_agent(
 
     // Create agent loop
     let mut agent_loop = AgentLoop::with_project_root(
-        concerto_core::event::EventBus::new(256),
+        bus.clone(),
         approval_sink,
         provider,
         tool_executor,
@@ -216,32 +265,55 @@ async fn run_agent(
     // Create cancellation token
     let cancel = CancellationToken::new();
 
-    // Run the agent
-    let task = AgentTask::new(concerto_core::ids::Ulid::new(), description);
-    match agent_loop.run(task, cancel).await {
-        Ok(output) => {
-            let final_message = output.final_message;
-            let total_tokens = final_message.len() as u64; // Approximation
-            Ok(AgentRunResult {
-                completed: true,
-                files_modified: output.files_modified.into_iter().map(|p| p.to_string()).collect(),
-                tool_call_count: output.tool_call_count,
-                final_message,
-                total_tokens,
-                total_cost_usd: 0.0, // Not tracked in eval
-                interventions: 0,    // Not tracked in eval
-            })
-        }
-        Err(_) => Ok(AgentRunResult {
-            completed: false,
-            files_modified: Vec::new(),
-            tool_call_count: 0,
-            final_message: "Agent failed to complete".to_string(),
-            total_tokens: 0,
-            total_cost_usd: 0.0,
-            interventions: 0,
-        }),
-    }
+    // Preserve evidence for failures as well as successes. Await the durable
+    // drain before computing any report; a persistence failure is explicit.
+    let outcome = agent_loop.run(task, cancel).await;
+    recording
+        .finish()
+        .await
+        .map_err(|error| format!("benchmark event recording failed: {error}"))?;
+    let report = concerto_sessions::cache::load_cache_report(
+        store.as_ref(),
+        session.id,
+        CancellationToken::new(),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let telemetry = report.summary;
+    let total_tokens = telemetry.reported_input_tokens + telemetry.reported_output_tokens;
+    let total_cost_usd = telemetry.known_estimated_cost_usd;
+    let audit = store
+        .load_audit_log(
+            session.id,
+            &concerto_sessions::AuditLogFilter::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let interventions = audit
+        .iter()
+        .filter(|row| row.verdict == "Deny" || row.verdict == "RequireApproval")
+        .count() as u32;
+    let (completed, files_modified, tool_call_count, final_message) = match outcome {
+        Ok(output) => (
+            output.completion_status == concerto_core::types::AgentCompletionStatus::Completed,
+            output.files_modified.into_iter().map(|path| path.to_string()).collect(),
+            output.tool_call_count,
+            output.final_message,
+        ),
+        Err(error) => (false, Vec::new(), 0, format!("Agent failed: {error}")),
+    };
+    Ok(AgentRunResult {
+        completed,
+        files_modified,
+        tool_call_count,
+        final_message,
+        total_tokens,
+        total_cost_usd,
+        interventions,
+        session_id: Some(session.id),
+        telemetry: Some(telemetry),
+    })
 }
 
 /// Compare current report against a baseline, returning Err if any metric
@@ -300,8 +372,24 @@ fn compare_with_baseline(
         }
     }
 
+    let measured = |report: &BenchmarkReport| {
+        !report.individual_results.is_empty()
+            && report.individual_results.iter().all(|result| {
+                result.telemetry.as_ref().is_some_and(|telemetry| {
+                    telemetry.cache.calls > 0
+                        && telemetry.missing_usage_calls == 0
+                        && telemetry.missing_cost_calls == 0
+                })
+            })
+    };
+    let efficiency_comparable = measured(current) && measured(&baseline);
+    if !efficiency_comparable {
+        eprintln!(
+            "Cost/token comparisons unavailable: provider telemetry is incomplete or legacy."
+        );
+    }
     // Cost: higher is bad.
-    if baseline.avg_cost_usd > 0.0 {
+    if efficiency_comparable && baseline.avg_cost_usd > 0.0 {
         let delta = (current.avg_cost_usd - baseline.avg_cost_usd) / baseline.avg_cost_usd;
         if delta > threshold {
             regressions.push(format!(
@@ -319,7 +407,7 @@ fn compare_with_baseline(
     }
 
     // Tokens: higher is bad.
-    if baseline.avg_tokens > 0 {
+    if efficiency_comparable && baseline.avg_tokens > 0 {
         let delta =
             (current.avg_tokens as f64 - baseline.avg_tokens as f64) / baseline.avg_tokens as f64;
         if delta > threshold {
@@ -365,21 +453,6 @@ fn compare_with_baseline(
             baseline: worst_baseline,
             current: worst_current,
         })
-    }
-}
-
-// NullAuditLog implements AuditLog trait for eval to avoid sqlite dependency
-struct NullAuditLog {}
-
-#[async_trait::async_trait]
-impl concerto_core::traits::policy::AuditLog for NullAuditLog {
-    async fn record(
-        &self,
-        _entry: concerto_core::traits::policy::AuditEntry,
-        _cancel: concerto_core::CancellationToken,
-    ) -> Result<(), concerto_core::error::PolicyError> {
-        // No-op for eval - just log to tracing if needed
-        Ok(())
     }
 }
 

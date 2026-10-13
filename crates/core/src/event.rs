@@ -48,6 +48,18 @@ impl ThinkingKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum EventKind {
+    BenchmarkRunMetadata {
+        task_id: TaskId,
+        metadata: serde_json::Value,
+    },
+    ProviderCallStarted {
+        record: crate::provider_call::ProviderCallRecord,
+    },
+    /// One provider attempt, including failed and interrupted attempts.
+    /// Content is represented by fingerprints only, never prompt bodies.
+    ProviderCallFinished {
+        record: crate::provider_call::ProviderCallRecord,
+    },
     // --- Phase 0 variants ---
     ToolCalled {
         tool_name: String,
