@@ -238,19 +238,17 @@ async fn init_path_attaches_maintenance_ledger_to_both_stores() {
     handles.decision_store.insert(newer.clone()).expect("insert newer decision");
     handles.decision_store.supersede(old.id, newer.id).expect("supersede");
 
-    let mut supersession = None;
-    for _ in 0..200 {
-        tokio::task::yield_now().await;
-        let rows = ledger
-            .for_target(&old.id.0.to_string(), CancellationToken::new())
-            .await
-            .expect("read the ledger");
-        if let Some(row) = rows.into_iter().next() {
-            supersession = Some(row);
-            break;
-        }
-    }
-    let row = supersession.expect("the bootstrapped decision store records its supersession");
+    // H17: the supersession ledger record is spawned fire-and-forget on the
+    // production path; flush the store's retained persistence handles before
+    // reading, so the assertion is deterministic under full-suite load
+    // instead of racing a bounded yield loop.
+    handles.decision_store.flush_persistence().await;
+    let rows = ledger
+        .for_target(&old.id.0.to_string(), CancellationToken::new())
+        .await
+        .expect("read the ledger");
+    let row =
+        rows.into_iter().next().expect("the bootstrapped decision store records its supersession");
     assert_eq!(row.kind, MaintenanceKind::Supersession);
 
     // (2) The bootstrap's LINK-store attach path carries the same ledger: the
