@@ -1314,6 +1314,24 @@ pub struct ToolExecutionSummary {
     /// existed (legacy checkpoints/transcripts decode with `None`).
     #[serde(default)]
     pub failure: Option<crate::tool_failure::ToolFailure>,
+    /// Wall-clock time the call finished (UTC).
+    ///
+    /// Additive and serde-defaulted: `None` on summaries recorded before the
+    /// field existed (legacy checkpoints/transcripts) and by backends that do
+    /// not stamp time. The read-only eval observation export (H15) carries
+    /// this so a run's tool-call sequence is orderable in wall-clock time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<OffsetDateTime>,
+    /// Canonical input fingerprint for identical-call/retry detection: the
+    /// audit's `input_hash` grammar (BLAKE3 hex of the normalized call
+    /// arguments), the same key the deterministic-failure ledger uses.
+    ///
+    /// A hash, never raw arguments, so no secrets reach a transcript or an
+    /// eval artifact, and an identical retry keeps the same key. `None` when
+    /// the call never reached argument normalization (e.g. a pre-execution
+    /// guard rejection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_fingerprint: Option<String>,
 }
 
 /// One structured verification result for a written file.

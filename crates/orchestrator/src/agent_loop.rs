@@ -2389,6 +2389,9 @@ impl AgentLoop {
                     canonical_tool: None,
                     canonical_operation: None,
                     failure: None,
+                    at: Some(time::OffsetDateTime::now_utc()),
+                    // Rejected before argument normalization: no input key.
+                    input_fingerprint: None,
                 });
                 let _ = self.bus.publish_for_session(
                     task.session_id,
@@ -2472,6 +2475,9 @@ impl AgentLoop {
                 canonical_tool: None,
                 canonical_operation: None,
                 failure: None,
+                at: Some(time::OffsetDateTime::now_utc()),
+                // The refusal keys on the same normalized input the ledger uses.
+                input_fingerprint: Some(input_key.clone()),
             });
             let _ = self.bus.publish_for_session(
                 task.session_id,
@@ -2673,6 +2679,8 @@ impl AgentLoop {
                 canonical_tool: canonical_tool.clone(),
                 canonical_operation: canonical_operation.clone(),
                 failure: None,
+                at: Some(time::OffsetDateTime::now_utc()),
+                input_fingerprint: Some(input_key.clone()),
             });
             let served_data = serde_json::json!({
                 "content": serve.content,
@@ -2795,6 +2803,8 @@ impl AgentLoop {
                     canonical_tool: canonical_tool.clone(),
                     canonical_operation: canonical_operation.clone(),
                     failure: None,
+                    at: Some(time::OffsetDateTime::now_utc()),
+                    input_fingerprint: Some(input_key.clone()),
                 });
                 let finished_detail =
                     match output.data.get("absolute_path").and_then(|v| v.as_str()) {
@@ -2920,6 +2930,8 @@ impl AgentLoop {
                     canonical_tool: canonical_tool.clone(),
                     canonical_operation: canonical_operation.clone(),
                     failure: Some(approval_failure),
+                    at: Some(time::OffsetDateTime::now_utc()),
+                    input_fingerprint: Some(input_key.clone()),
                 });
                 let _ = self.bus.publish_for_session(
                     task.session_id,
@@ -2972,6 +2984,8 @@ impl AgentLoop {
                     canonical_tool: canonical_tool.clone(),
                     canonical_operation: canonical_operation.clone(),
                     failure: Some(denial_failure.clone()),
+                    at: Some(time::OffsetDateTime::now_utc()),
+                    input_fingerprint: Some(input_key.clone()),
                 });
                 let _ = self.bus.publish_for_session(
                     task.session_id,
@@ -3071,6 +3085,8 @@ impl AgentLoop {
                     canonical_tool: canonical_tool.clone(),
                     canonical_operation: canonical_operation.clone(),
                     failure: Some(failure.clone()),
+                    at: Some(time::OffsetDateTime::now_utc()),
+                    input_fingerprint: Some(input_key.clone()),
                 });
                 let _ = self.bus.publish_for_session(
                     task.session_id,
@@ -8980,6 +8996,8 @@ mod tests {
                 canonical_tool: None,
                 canonical_operation: None,
                 failure: None,
+                at: None,
+                input_fingerprint: None,
             }],
             ..agent_output_base()
         };
@@ -9014,6 +9032,8 @@ mod tests {
             canonical_tool: None,
             canonical_operation: None,
             failure: None,
+            at: None,
+            input_fingerprint: None,
         }];
         let blocked =
             loop_.decide_exit(&task, &no_writes, 1, 0, 0, &None, true, Vec::new()).unwrap();
@@ -9042,6 +9062,8 @@ mod tests {
                 canonical_tool: None,
                 canonical_operation: None,
                 failure: None,
+                at: None,
+                input_fingerprint: None,
             }],
             verification,
             ..agent_output_base()
