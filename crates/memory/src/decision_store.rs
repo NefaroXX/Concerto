@@ -10,6 +10,10 @@ use std::sync::Mutex;
 use concerto_core::error::MemoryError;
 use concerto_core::memory::{Decision, DecisionCategory, DecisionId};
 
+use crate::maintenance::{
+    MaintenanceContext, MaintenanceKind, MaintenanceLedger, MaintenanceRecord,
+    MaintenanceTargetKind,
+};
 use crate::storage::MemoryDb;
 
 /// Persistent store for agent decisions.
@@ -20,17 +24,22 @@ use crate::storage::MemoryDb;
 pub struct DecisionStore {
     decisions: Mutex<HashMap<DecisionId, Decision>>,
     db: Option<Arc<MemoryDb>>,
+    /// H12: optional maintenance ledger. When attached, `supersede` records
+    /// a durable `Supersession` observation (by whom, on what evidence).
+    /// Absent means no ledger was wired (in-memory-only stores) — the
+    /// supersession still happens; only its durable observation is skipped.
+    maintenance: Option<MaintenanceContext>,
 }
 
 impl DecisionStore {
     /// Create a new in-memory-only decision store.
     pub fn new() -> Self {
-        Self { decisions: Mutex::new(HashMap::new()), db: None }
+        Self { decisions: Mutex::new(HashMap::new()), db: None, maintenance: None }
     }
 
     /// Create a decision store with optional SQLite persistence.
     pub fn with_db(db: Option<Arc<MemoryDb>>) -> Self {
-        Self { decisions: Mutex::new(HashMap::new()), db }
+        Self { decisions: Mutex::new(HashMap::new()), db, maintenance: None }
     }
 
     /// Hydrate existing decisions and mirror subsequent changes to the same DB.
@@ -41,7 +50,20 @@ impl DecisionStore {
             .into_iter()
             .map(|decision| (decision.id, decision))
             .collect();
-        Ok(Self { decisions: Mutex::new(decisions), db: Some(db) })
+        Ok(Self { decisions: Mutex::new(decisions), db: Some(db), maintenance: None })
+    }
+
+    /// Attach the H12 maintenance ledger so `supersede` records a durable
+    /// `Supersession` outcome under `project_id` (the memory database is
+    /// per-project, but the store does not hold the id itself).
+    #[must_use]
+    pub fn with_maintenance_ledger(
+        mut self,
+        ledger: Arc<MaintenanceLedger>,
+        project_id: impl Into<String>,
+    ) -> Self {
+        self.maintenance = Some(MaintenanceContext::new(ledger, "decision-store", project_id));
+        self
     }
 
     /// Insert a decision.
@@ -116,6 +138,12 @@ impl DecisionStore {
     }
 
     /// Mark a decision as superseded by another.
+    ///
+    /// H12: when a maintenance ledger is attached, a durable `Supersession`
+    /// observation is recorded (target = the superseded decision, evidence =
+    /// the superseding decision). Recording mirrors the existing SQLite
+    /// persistence contract: it is spawned and fail-soft, so it can never
+    /// change the supersession's own result.
     pub fn supersede(&self, id: DecisionId, superseded_by: DecisionId) -> Result<(), MemoryError> {
         let mut store = self
             .decisions
@@ -129,8 +157,37 @@ impl DecisionStore {
                     db.supersede_decision(id, superseded_by).await
                 });
             }
+            if let Some(ref maintenance) = self.maintenance {
+                let record = MaintenanceRecord::completed(
+                    MaintenanceKind::Supersession,
+                    id.0.to_string(),
+                    MaintenanceTargetKind::Decision,
+                    maintenance.actor.clone(),
+                    maintenance.project_id.clone(),
+                )
+                .with_evidence(vec![superseded_by.0.to_string()]);
+                let ledger = maintenance.ledger.clone();
+                spawn_persistence("record supersession outcome", async move {
+                    ledger.record(&record).await
+                });
+            }
             Ok(())
         } else {
+            if let Some(ref maintenance) = self.maintenance {
+                let record = MaintenanceRecord::failed(
+                    MaintenanceKind::Supersession,
+                    id.0.to_string(),
+                    MaintenanceTargetKind::Decision,
+                    "supersession target decision not found",
+                    maintenance.actor.clone(),
+                    maintenance.project_id.clone(),
+                )
+                .with_evidence(vec![superseded_by.0.to_string()]);
+                let ledger = maintenance.ledger.clone();
+                spawn_persistence("record failed supersession outcome", async move {
+                    ledger.record(&record).await
+                });
+            }
             Err(MemoryError::RetrievalFailed(format!("decision {id} not found")))
         }
     }
@@ -178,7 +235,40 @@ where
 mod tests {
     use super::*;
     use concerto_core::ids::Ulid;
+    use concerto_core::CancellationToken;
     use time::OffsetDateTime;
+
+    use crate::maintenance::{
+        MaintenanceKind as Mk, MaintenanceOutcome, MaintenanceTargetKind as Mtk,
+    };
+
+    /// Poll the ledger until `pred` matches or the bounded yields run out —
+    /// the record is written by a spawned task (the SQLite-persistence
+    /// contract), so the test must let the runtime run it.
+    async fn wait_for_outcome(
+        ledger: &MaintenanceLedger,
+        target: &str,
+        pred: impl Fn(&MaintenanceRecord) -> bool,
+    ) -> Option<MaintenanceRecord> {
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+            let rows = ledger.for_target(target, CancellationToken::new()).await.unwrap();
+            if let Some(found) = rows.into_iter().find(|record| pred(record)) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    async fn test_ledger() -> (sqlx::SqlitePool, Arc<MaintenanceLedger>) {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let ledger = Arc::new(MaintenanceLedger::connect(pool.clone()).await.unwrap());
+        (pool, ledger)
+    }
 
     fn make_decision(id_str: &str) -> (DecisionId, Decision) {
         let id = DecisionId(Ulid::from_string(id_str).unwrap_or_else(|_| {
@@ -235,5 +325,44 @@ mod tests {
         store.supersede(id1, id2).unwrap();
         let retrieved = store.get(id1).unwrap().unwrap();
         assert_eq!(retrieved.superseded_by, Some(id2));
+    }
+
+    #[tokio::test]
+    async fn supersede_records_a_durable_supersession_outcome() {
+        let (_pool, ledger) = test_ledger().await;
+        let store = DecisionStore::new().with_maintenance_ledger(ledger.clone(), "proj-1");
+        let (id1, d1) = make_decision("d1");
+        let (id2, d2) = make_decision("d2");
+        store.insert(d1).unwrap();
+        store.insert(d2).unwrap();
+        store.supersede(id1, id2).unwrap();
+
+        let target = id1.0.to_string();
+        let found = wait_for_outcome(&ledger, &target, |_| true).await;
+        let record = found.expect("the supersession outcome is recorded");
+        assert_eq!(record.kind, Mk::Supersession);
+        assert_eq!(record.outcome, MaintenanceOutcome::Completed);
+        assert_eq!(record.target_kind, Mtk::Decision);
+        assert_eq!(record.evidence, vec![id2.0.to_string()]);
+        assert_eq!(record.actor, "decision-store");
+        assert_eq!(record.project_id, "proj-1");
+    }
+
+    #[tokio::test]
+    async fn supersede_of_a_missing_decision_records_failed() {
+        let (_pool, ledger) = test_ledger().await;
+        let store = DecisionStore::new().with_maintenance_ledger(ledger.clone(), "proj-1");
+        let (missing, _) = make_decision("missing");
+        let (newer, d) = make_decision("newer");
+        store.insert(d).unwrap();
+
+        assert!(store.supersede(missing, newer).is_err(), "the target does not exist");
+
+        let target = missing.0.to_string();
+        let record = wait_for_outcome(&ledger, &target, |_| true)
+            .await
+            .expect("the failed supersession is recorded, never absent");
+        assert_eq!(record.outcome, MaintenanceOutcome::Failed);
+        assert!(record.reason.contains("not found"), "{}", record.reason);
     }
 }

@@ -144,8 +144,9 @@ async fn init_path_attaches_link_store_over_project_pool() {
     //    project database: a link persisted through the same builder the
     //    init path calls round-trips from the database the vector store
     //    indexes into.
-    let link_store =
-        build_link_store(&pool, None).await.expect("production link-store helper must attach");
+    let link_store = build_link_store(&pool, None, None, "test")
+        .await
+        .expect("production link-store helper must attach");
     let link = MemoryLink::new("src-init", "tgt-init", MemoryLinkKind::References);
     link_store
         .put(&link, CancellationToken::new())
@@ -156,6 +157,122 @@ async fn init_path_attaches_link_store_over_project_pool() {
         .await
         .expect("read the link back");
     assert_eq!(read_back, vec![link], "production memory db must round-trip a persisted link");
+}
+
+/// H12 production wiring: `init_memory_system_with_handles` must attach the
+/// shared maintenance ledger to BOTH the decision store it returns and the
+/// link store it builds, so an operator supersede / link verdict records a
+/// durable `maintenance_outcomes` row through the production path (not just
+/// through `MaintenanceLedger::connect` in a unit test).
+#[tokio::test]
+async fn init_path_attaches_maintenance_ledger_to_both_stores() {
+    use concerto_core::memory::{
+        Decision, DecisionCategory, DecisionId, MemoryLink, MemoryLinkKind, ProjectId,
+    };
+    use concerto_memory::maintenance::{MaintenanceKind, MaintenanceLedger};
+
+    let _serial = MEMORY_INIT_TEST_SERIAL.lock().await;
+    let temp = tempfile::tempdir().unwrap();
+    let _xdg = XdgDataHomeGuard::redirect(temp.path());
+    let project_dir = temp.path().join("project");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let reindex: Arc<Mutex<Option<Arc<ProjectIndexer>>>> = Arc::new(Mutex::new(None));
+    let reindex_sync: Arc<Mutex<Option<Arc<ChunkSyncService>>>> = Arc::new(Mutex::new(None));
+    let memory_cancel: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
+    let data_dir_lock: Arc<Mutex<Option<Arc<DataDirLock>>>> = Arc::new(Mutex::new(None));
+
+    let mut config = AppConfig::default();
+    config.memory.dedup_judge = false;
+
+    let handles = init_memory_system_with_handles(
+        EventBus::default(),
+        &config,
+        &project_dir,
+        &reindex,
+        &reindex_sync,
+        &memory_cancel,
+        &data_dir_lock,
+    )
+    .await
+    .expect("production memory init must succeed");
+
+    // Open the production memory db the init path used.
+    let db_path = temp.path().join("xdg-data/concerto/memory/memory.db");
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&db_path)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .busy_timeout(std::time::Duration::from_secs(30));
+    let pool =
+        sqlx::SqlitePool::connect_with(options).await.expect("open the production memory db");
+
+    // The production path ran migration 003 (the ledger table exists).
+    let table: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master \
+         WHERE type = 'table' AND name = 'maintenance_outcomes'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query sqlite_master for maintenance_outcomes");
+    assert_eq!(table, 1, "production init must run migration 003");
+
+    let ledger = MaintenanceLedger::from_pool(pool.clone());
+
+    // (1) The returned decision store carries a LIVE ledger: a supersede
+    //     records a durable Supersession outcome.
+    let session_id = concerto_core::ids::Ulid::new();
+    let old = Decision {
+        id: DecisionId(concerto_core::ids::Ulid::new()),
+        session_id,
+        task_id: None,
+        what: "old approach".into(),
+        why: "first".into(),
+        outcome: None,
+        category: DecisionCategory::Architecture,
+        confidence: 0.5,
+        superseded_by: None,
+        created_at: time::OffsetDateTime::now_utc(),
+    };
+    let newer = Decision { id: DecisionId(concerto_core::ids::Ulid::new()), ..old.clone() };
+    handles.decision_store.insert(old.clone()).expect("insert old decision");
+    handles.decision_store.insert(newer.clone()).expect("insert newer decision");
+    handles.decision_store.supersede(old.id, newer.id).expect("supersede");
+
+    let mut supersession = None;
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+        let rows = ledger
+            .for_target(&old.id.0.to_string(), CancellationToken::new())
+            .await
+            .expect("read the ledger");
+        if let Some(row) = rows.into_iter().next() {
+            supersession = Some(row);
+            break;
+        }
+    }
+    let row = supersession.expect("the bootstrapped decision store records its supersession");
+    assert_eq!(row.kind, MaintenanceKind::Supersession);
+
+    // (2) The bootstrap's LINK-store attach path carries the same ledger: the
+    //     exact builder the init path calls records a Contradiction outcome.
+    //     (The link store is not surfaced on `MemorySystemHandles`, so this
+    //     drives the identical `build_link_store` attach the bootstrap uses.)
+    let project_id = ProjectId(concerto_core::helpers::project_id_hash(&project_dir));
+    let link_store = build_link_store(&pool, None, Some(&ledger), &project_id.0)
+        .await
+        .expect("bootstrap link-store helper must attach");
+    link_store
+        .put(
+            &MemoryLink::new("critic", "claim", MemoryLinkKind::Contradicts),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("link write through the bootstrapped link store");
+    let rows = ledger.for_target("claim", CancellationToken::new()).await.expect("read the ledger");
+    assert!(
+        rows.iter().any(|row| row.kind == MaintenanceKind::Contradiction),
+        "the bootstrapped link store records its verdict: {rows:?}"
+    );
 }
 
 /// ADR-54 re-enable + ADR-69 slice 2 wiring on the production init path:

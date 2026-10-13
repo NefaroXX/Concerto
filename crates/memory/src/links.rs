@@ -12,14 +12,41 @@ use concerto_core::memory::{MemoryLink, MemoryLinkKind};
 use concerto_core::CancellationToken;
 use sqlx::{AssertSqlSafe, Row, SqlitePool};
 use std::collections::HashMap;
+use std::sync::Arc;
 use time::OffsetDateTime;
 
+use crate::maintenance::{
+    MaintenanceContext, MaintenanceKind, MaintenanceLedger, MaintenanceOutcome, MaintenanceRecord,
+    MaintenanceTargetKind,
+};
 use crate::scoring::TimedLink;
 
 /// Default per-chunk out-degree cap (ADR-69 A2), applied by [`LinkStore::put`]
 /// when no explicit cap is configured: a chunk may point at at most this many
 /// other chunks before further NEW links are rejected with a warning.
 pub const DEFAULT_MAX_OUT_DEGREE: usize = 32;
+
+/// The maintenance outcome kind a link verdict application produces, if any.
+///
+/// Only the standing-changing verdicts are maintenance events: a `Supersedes`
+/// / `Merges` link supersedes its target, and a `Contradicts` link contradicts
+/// it. Corroboration (`Supports` / `Extends`) and context (`References`) are
+/// not maintenance and record nothing.
+fn link_maintenance_kind(kind: MemoryLinkKind) -> Option<MaintenanceKind> {
+    match kind {
+        MemoryLinkKind::Supersedes | MemoryLinkKind::Merges => Some(MaintenanceKind::Supersession),
+        MemoryLinkKind::Contradicts => Some(MaintenanceKind::Contradiction),
+        _ => None,
+    }
+}
+
+/// How a link application ended, for the maintenance ledger.
+enum PutVerdict {
+    /// The link was written (or idempotently upserted).
+    Applied,
+    /// The out-degree cap rejected a new link (fail-open, nothing written).
+    Rejected,
+}
 
 /// Mirrors migration 002 so a pool created directly (without the migration
 /// runner) still works; the migration stays the canonical path.
@@ -40,6 +67,12 @@ pub struct LinkStore {
     pool: SqlitePool,
     /// New-link rejection threshold per source (ADR-69 A2). Always ≥ 1.
     max_out_degree: usize,
+    /// H12: optional maintenance ledger. When attached, applying a
+    /// standing-changing link verdict (`Supersedes`/`Merges`/`Contradicts`)
+    /// records a durable outcome — including the out-degree-cap rejection
+    /// (`degraded`) and a write failure (`failed`). `None` means no ledger
+    /// was wired; the link still applies, only its observation is skipped.
+    maintenance: Option<MaintenanceContext>,
 }
 
 impl LinkStore {
@@ -55,14 +88,68 @@ impl LinkStore {
         .execute(&pool)
         .await
         .map_err(|e| MemoryError::Persistence(e.to_string()))?;
-        Ok(Self { pool, max_out_degree: DEFAULT_MAX_OUT_DEGREE })
+        Ok(Self { pool, max_out_degree: DEFAULT_MAX_OUT_DEGREE, maintenance: None })
     }
 
     /// DDL-free constructor for read-only consumers in sibling modules
     /// (e.g. [`crate::mermaid`] graph loading): assumes the `memory_links`
     /// table already exists and never creates it.
     pub(crate) fn from_pool(pool: SqlitePool) -> Self {
-        Self { pool, max_out_degree: DEFAULT_MAX_OUT_DEGREE }
+        Self { pool, max_out_degree: DEFAULT_MAX_OUT_DEGREE, maintenance: None }
+    }
+
+    /// Attach the H12 maintenance ledger so applied link verdicts record a
+    /// durable outcome under `project_id` (the memory database is
+    /// per-project, but the store does not hold the id itself).
+    #[must_use]
+    pub fn with_maintenance_ledger(
+        mut self,
+        ledger: Arc<MaintenanceLedger>,
+        project_id: impl Into<String>,
+    ) -> Self {
+        self.maintenance = Some(MaintenanceContext::new(ledger, "link-store", project_id));
+        self
+    }
+
+    /// Record one link-verdict outcome, fail-soft. A no-op when no ledger is
+    /// attached.
+    async fn emit_link_outcome(
+        &self,
+        kind: MaintenanceKind,
+        target: &str,
+        outcome: MaintenanceOutcome,
+        reason: String,
+        evidence: Vec<String>,
+    ) {
+        let Some(ctx) = self.maintenance.as_ref() else {
+            return;
+        };
+        let record = match outcome {
+            MaintenanceOutcome::Completed => MaintenanceRecord::completed(
+                kind,
+                target,
+                MaintenanceTargetKind::Chunk,
+                ctx.actor.clone(),
+                ctx.project_id.clone(),
+            ),
+            MaintenanceOutcome::Degraded => MaintenanceRecord::degraded(
+                kind,
+                target,
+                MaintenanceTargetKind::Chunk,
+                reason,
+                ctx.actor.clone(),
+                ctx.project_id.clone(),
+            ),
+            MaintenanceOutcome::Failed => MaintenanceRecord::failed(
+                kind,
+                target,
+                MaintenanceTargetKind::Chunk,
+                reason,
+                ctx.actor.clone(),
+                ctx.project_id.clone(),
+            ),
+        };
+        ctx.record(&record.with_evidence(evidence)).await;
     }
 
     /// Bound how many distinct NEW links a source may hold (ADR-69 A2).
@@ -85,11 +172,75 @@ impl LinkStore {
     /// the source already holds [`LinkStore::max_out_degree`] links. The
     /// rejection is fail-open — `Ok(())`, nothing persisted — so callers
     /// treat it as advisory, never as an error that could drop a memory.
+    ///
+    /// H12: applying a standing-changing verdict (`Supersedes`/`Merges` →
+    /// `Supersession`; `Contradicts` → `Contradiction`) records a durable
+    /// maintenance outcome when a ledger is attached. The cap rejection is
+    /// `degraded` (fail-open) and a write failure is `failed` — never absent.
     pub async fn put(
         &self,
         link: &MemoryLink,
         cancel: CancellationToken,
     ) -> Result<(), MemoryError> {
+        let maintenance_kind = link_maintenance_kind(link.kind);
+        match self.put_apply(link, cancel).await {
+            Ok(PutVerdict::Applied) => {
+                if let Some(kind) = maintenance_kind {
+                    self.emit_link_outcome(
+                        kind,
+                        &link.to,
+                        MaintenanceOutcome::Completed,
+                        String::new(),
+                        vec![link.from.clone()],
+                    )
+                    .await;
+                }
+                Ok(())
+            }
+            Ok(PutVerdict::Rejected) => {
+                if let Some(kind) = maintenance_kind {
+                    self.emit_link_outcome(
+                        kind,
+                        &link.to,
+                        MaintenanceOutcome::Degraded,
+                        format!(
+                            "out-degree cap ({}) reached; link rejected (fail-open)",
+                            self.max_out_degree
+                        ),
+                        vec![link.from.clone()],
+                    )
+                    .await;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if let Some(kind) = maintenance_kind {
+                    let outcome = if matches!(error, MemoryError::Cancelled) {
+                        MaintenanceOutcome::Degraded
+                    } else {
+                        MaintenanceOutcome::Failed
+                    };
+                    self.emit_link_outcome(
+                        kind,
+                        &link.to,
+                        outcome,
+                        format!("link verdict not applied: {error}"),
+                        vec![link.from.clone()],
+                    )
+                    .await;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// The write body of [`Self::put`], separated so the caller can classify
+    /// the outcome (applied / cap-rejected / errored) for the H12 ledger.
+    async fn put_apply(
+        &self,
+        link: &MemoryLink,
+        cancel: CancellationToken,
+    ) -> Result<PutVerdict, MemoryError> {
         if cancel.is_cancelled() {
             return Err(MemoryError::Cancelled);
         }
@@ -116,7 +267,7 @@ impl LinkStore {
                 cap = self.max_out_degree,
                 "ADR-69 out-degree cap reached; link rejected (fail-open)"
             );
-            return Ok(());
+            return Ok(PutVerdict::Rejected);
         }
 
         let created_at = OffsetDateTime::now_utc().to_string();
@@ -136,7 +287,7 @@ impl LinkStore {
         .execute(&self.pool)
         .await
         .map_err(|e| MemoryError::Persistence(format!("failed to persist memory link: {e}")))?;
-        Ok(())
+        Ok(PutVerdict::Applied)
     }
 
     /// Persist many links in order.
@@ -554,5 +705,127 @@ mod tests {
             store.incoming_links(&["a".into()], cancel).await,
             Err(MemoryError::Cancelled)
         ));
+    }
+
+    // ---------------------------------------------------------------------
+    // H12 — link-verdict application records observed maintenance outcomes.
+    // ---------------------------------------------------------------------
+
+    async fn ledger_pool() -> (SqlitePool, Arc<MaintenanceLedger>) {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let ledger = Arc::new(MaintenanceLedger::connect(pool.clone()).await.unwrap());
+        (pool, ledger)
+    }
+
+    #[tokio::test]
+    async fn applying_link_verdicts_records_supersession_and_contradiction() {
+        let (pool, ledger) = ledger_pool().await;
+        let store = LinkStore::new(pool.clone())
+            .await
+            .unwrap()
+            .with_maintenance_ledger(ledger.clone(), "proj-x");
+        let token = CancellationToken::new();
+
+        store
+            .put(&MemoryLink::new("v2", "old-chunk", MemoryLinkKind::Supersedes), token.clone())
+            .await
+            .unwrap();
+        store
+            .put(
+                &MemoryLink::new("critic", "claim-chunk", MemoryLinkKind::Contradicts),
+                token.clone(),
+            )
+            .await
+            .unwrap();
+        // A `References` link is context, not maintenance: no record.
+        store
+            .put(&MemoryLink::new("a", "b", MemoryLinkKind::References), token.clone())
+            .await
+            .unwrap();
+
+        let all = ledger.list(20, CancellationToken::new()).await.unwrap();
+        assert_eq!(all.len(), 2, "only the standing-changing verdicts record: {all:?}");
+        let supersession = all
+            .iter()
+            .find(|r| r.kind == MaintenanceKind::Supersession)
+            .expect("supersession recorded");
+        assert_eq!(supersession.outcome, MaintenanceOutcome::Completed);
+        assert_eq!(supersession.target, "old-chunk");
+        assert_eq!(supersession.evidence, vec!["v2".to_string()]);
+        let contradiction = all
+            .iter()
+            .find(|r| r.kind == MaintenanceKind::Contradiction)
+            .expect("contradiction recorded");
+        assert_eq!(contradiction.target, "claim-chunk");
+        assert_eq!(contradiction.evidence, vec!["critic".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn out_degree_cap_rejection_records_degraded() {
+        let (pool, ledger) = ledger_pool().await;
+        let store = LinkStore::new(pool.clone())
+            .await
+            .unwrap()
+            .with_max_out_degree(1)
+            .with_maintenance_ledger(ledger.clone(), "proj-x");
+        let token = CancellationToken::new();
+
+        store
+            .put(&MemoryLink::new("src", "first", MemoryLinkKind::Supersedes), token.clone())
+            .await
+            .unwrap();
+        // The cap rejects the second new edge fail-open.
+        store
+            .put(&MemoryLink::new("src", "second", MemoryLinkKind::Supersedes), token.clone())
+            .await
+            .unwrap();
+
+        let all = ledger.list(20, CancellationToken::new()).await.unwrap();
+        assert_eq!(all.len(), 2, "both applications recorded: {all:?}");
+        assert!(all
+            .iter()
+            .any(|r| r.outcome == MaintenanceOutcome::Completed && r.target == "first"));
+        let rejected = all.iter().find(|r| r.target == "second").expect("rejected edge recorded");
+        assert_eq!(rejected.outcome, MaintenanceOutcome::Degraded);
+        assert!(rejected.reason.contains("out-degree cap"), "{}", rejected.reason);
+    }
+
+    #[tokio::test]
+    async fn link_write_failure_records_failed() {
+        // The ledger lives on its own pool, so closing the LINK pool makes the
+        // write fail while the outcome is still recorded — never absent.
+        let (ledger_pool, ledger) = ledger_pool().await;
+        let link_pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let store = LinkStore::new(link_pool.clone())
+            .await
+            .unwrap()
+            .with_maintenance_ledger(ledger, "proj-x");
+        link_pool.close().await;
+
+        let result = store
+            .put(
+                &MemoryLink::new("v2", "old", MemoryLinkKind::Supersedes),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(result.is_err(), "the link write fails");
+
+        let records = MaintenanceLedger::from_pool(ledger_pool.clone())
+            .list(10, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(
+            records.iter().any(|r| r.kind == MaintenanceKind::Supersession
+                && r.outcome == MaintenanceOutcome::Failed),
+            "the failed application is recorded: {records:?}"
+        );
     }
 }
