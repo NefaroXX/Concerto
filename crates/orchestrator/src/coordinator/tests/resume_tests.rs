@@ -1796,40 +1796,214 @@ async fn resume_f3_evidence_becomes_explicit_reconcilable_records() {
     assert_eq!(restored.external_changes.len(), 2, "records survive the checkpoint JSON");
 }
 
-/// H12 / DEFERRED row 41 — live interrupt/resume with MEMORY grounding.
+// ---------------------------------------------------------------------------
+// D-41r: repeated interrupt/resume stress over a STORAGE-MEDIATED substrate
+// ---------------------------------------------------------------------------
+
+/// Open a real SQLite memory database in `dir` (the production `MemoryDb`
+/// constructor, migrations included) — the storage the decision/task stores
+/// are hydrated from, so a resume reads run 1's decisions from DISK.
+async fn open_test_memory_db(dir: &std::path::Path) -> concerto_memory::storage::MemoryDb {
+    let db_path = camino::Utf8PathBuf::from_path_buf(dir.join("h18_memory.db"))
+        .expect("memory db path is UTF-8");
+    concerto_memory::storage::MemoryDb::connect(&db_path)
+        .await
+        .expect("memory db opens (migrations run)")
+}
+
+/// A FRESH `DecisionStore`/`TaskTreeStore` pair hydrated from the shared
+/// memory DB — exactly the production construction (`DecisionStore::load`,
+/// `TaskTreeStore::load`), never a shared in-memory map. Each resume cycle
+/// builds its own pair so its grounding can only come from storage.
+async fn storage_backed_stores(
+    mem_db: &Arc<concerto_memory::storage::MemoryDb>,
+) -> (
+    Arc<concerto_memory::decision_store::DecisionStore>,
+    Arc<concerto_memory::task_tree::TaskTreeStore>,
+) {
+    let decisions = Arc::new(
+        concerto_memory::decision_store::DecisionStore::load(mem_db.clone())
+            .await
+            .expect("decision store hydrates from SQLite"),
+    );
+    let task_tree = Arc::new(
+        concerto_memory::task_tree::TaskTreeStore::load(mem_db.clone())
+            .await
+            .expect("task tree hydrates from SQLite"),
+    );
+    (decisions, task_tree)
+}
+
+/// Poll the disk view until `pred` holds. The decision write-back is detached
+/// onto the runtime (`spawn_persistence`), so the read-back must wait for it;
+/// the poll is bounded (≤512 × 1 ms) and deterministic in outcome.
+async fn wait_for_decisions(
+    mem_db: &concerto_memory::storage::MemoryDb,
+    pred: impl Fn(&[concerto_core::memory::Decision]) -> bool,
+) -> Vec<concerto_core::memory::Decision> {
+    let mut rows = Vec::new();
+    for _ in 0..512 {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        rows = mem_db.list_decisions().await.expect("list decisions");
+        if pred(&rows) {
+            break;
+        }
+    }
+    rows
+}
+
+/// A resumed run must never read as `Completed`; a recoverable stop surfaces
+/// as `Partial`, and a hard stop as `Err(Cancelled)`.
+fn assert_honestly_interrupted(outcome: &Result<AgentOutput, OrchestratorError>, cycle: &str) {
+    match outcome {
+        Ok(output) => assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Partial,
+            "{cycle}: an interrupted run must not read as Completed: {}",
+            output.final_message
+        ),
+        Err(OrchestratorError::Cancelled) => {}
+        Err(other) => panic!("{cycle}: unexpected interrupt outcome: {other:?}"),
+    }
+}
+
+/// D-41r (4): the Phase-0 grounding (a) cites the architect decision that was
+/// persisted to SQLite and (b) keeps its plan-scoped chunks standing-free by
+/// construction (`interrupted == false`, `degraded == false`) — the deliberate
+/// Option-B decision documented on `CoordinatorAgent::retrieve_memory_context`.
+fn assert_grounded_in_persisted_decision(chunks: &[EvidentChunk], cycle: &str) {
+    assert!(!chunks.is_empty(), "{cycle}: Phase-0 grounding must not be empty");
+    assert!(
+        chunks.iter().any(|evident| evident.chunk.content.contains("architect completed subtask")),
+        "{cycle}: grounding must cite the STORAGE-persisted architect decision: {chunks:?}"
+    );
+    assert!(
+        chunks.iter().all(|evident| evident.chunk.id.starts_with("plan://")),
+        "{cycle}: storage-mediated grounding is the plan-scoped projection: {chunks:?}"
+    );
+    assert!(
+        chunks.iter().all(|evident| !evident.interrupted && !evident.degraded),
+        "{cycle}: standing-free plan chunks carry no interrupted/degraded flag: {chunks:?}"
+    );
+}
+
+/// The checkpoint objective, read through the production checkpoint parser.
+fn checkpoint_objective(state_json: &str) -> String {
+    checkpoint::GraphCheckpoint::from_json(state_json)
+        .expect("the persisted checkpoint parses")
+        .objective
+}
+
+/// The checkpoint's objective hash, read through the production parser.
+fn checkpoint_objective_hash(state_json: &str) -> String {
+    checkpoint::GraphCheckpoint::from_json(state_json)
+        .expect("the persisted checkpoint parses")
+        .objective_hash
+}
+
+/// How many persisted decisions match `session_id` and contain `needle`.
+fn decision_count_for(
+    decisions: &[concerto_core::memory::Decision],
+    session_id: Ulid,
+    needle: &str,
+) -> usize {
+    decisions
+        .iter()
+        .filter(|decision| decision.session_id == session_id && decision.what.contains(needle))
+        .count()
+}
+
+/// Populate a fresh coordinator's Phase-0 context exactly as `run()` does for
+/// a resume (the checkpoint's run-id seed), returning the task + context the
+/// caller then drives the run with. Because the context is pre-populated,
+/// `run()` will not re-derive it — the grounding asserted here IS the
+/// grounding the run uses.
+async fn phase0_grounding(
+    coordinator: &mut CoordinatorAgent,
+    session_id: Ulid,
+    dir: &std::path::Path,
+    checkpoint_json: Option<&str>,
+) -> (AgentTask, AgentContext) {
+    let seed = CoordinatorAgent::checkpoint_run_id_hint(checkpoint_json);
+    let task = AgentTask::new(session_id, "continue");
+    let mut context =
+        AgentContext::new(concerto_core::types::SessionContext::new(session_id, dir.to_path_buf()));
+    coordinator
+        .retrieve_memory_context(&task, &mut context, seed.as_deref(), CancellationToken::new())
+        .await;
+    (task, context)
+}
+
+/// H12 / DEFERRED row 41 (D-41r) — REPEATED interrupt/resume stress on one
+/// session, over a STORAGE-MEDIATED decision substrate.
 ///
-/// The row parks memory-grounded resume M3 on "live stress/interrupt
-/// evidence". This test supplies it with a REAL interruption: the specialist
-/// mock cancels the run token the moment its call is in flight (the operator
-/// pressing stop mid-dispatch), so the run ends interrupted with a durable,
-/// resumable checkpoint — not a mocked stall. A fresh coordinator then resumes
-/// from that checkpoint and its Phase-0 retrieval is asserted to be grounded
-/// in run 1's OWN persisted memory (the architect's decision), with the
-/// settled step never re-dispatched (a canary fails the run if it is).
+/// The original H12 evidence was a single interrupt/resume cycle whose
+/// decision store was `DecisionStore::new()` — in-memory and `Arc`-shared
+/// between the two coordinators — so only the checkpoint half of the resume
+/// was storage-mediated. This test closes the recorded residuals:
+///
+/// * **N = 3 consecutive interrupt/resume cycles** on the same session,
+///   interrupting at a different point in the run lifecycle each cycle, each
+///   on a DISTINCT planner-issued implement node so the resumed planner always
+///   has fresh work:
+///   (1) the fresh run's `coder` interrupted **mid-dispatch** — the call is
+///   issued and never settles (`Err(Cancelled)`);
+///   (2) the first resume's `coder_b` interrupted **during the resume**,
+///   mid-dispatch;
+///   (3) the second resume's `coder_c` interrupted **after dispatch, before
+///   settlement** — the call settles while the operator stop wins the race
+///   (the C4 crash-window, `Ok(Success)`).
+///
+///   The settle-boundary race durably records the node `Completed`, after
+///   which the resumed run closes instead of re-entering the planner — so it
+///   is the FINAL cycle. That is a real boundary of the resume-drive
+///   semantics, not a test artifact: cycles that must leave re-armable work
+///   interrupt BEFORE a node settles (cycles 1 and 2).
+/// * **A real SQLite decision substrate**: run 1's settled architect decision
+///   is persisted through `DecisionStore::load(MemoryDb)`; the next cycle
+///   reads it back through a FRESHLY-hydrated `DecisionStore`; and Phase-0
+///   grounding is asserted to cite that persisted text — never a shared
+///   in-memory map.
+/// * **No silent drift**: every cycle ends honestly interrupted (never
+///   `Completed`) with a resumable checkpoint; the checkpoint's objective and
+///   hash never change; the settled architect decision is never re-dispatched
+///   (a zero-invocation canary) and never duplicated.
+///
+/// The specialists stay mocks **by construction**: the interrupt must be a
+/// deterministic, in-process operator stop (`MockExpertAgent::cancel_on_run`)
+/// — no live provider can be driven from CI, and a failing specialist is what
+/// forces the interrupt. What this test proves is not that the specialist is
+/// real but that the decision/memory substrate it reads IS storage-backed and
+/// real.
 #[tokio::test]
 async fn interrupt_midrun_then_resume_stays_memory_grounded() {
     let dir = tempfile::tempdir().expect("tempdir for interrupt/resume workspace");
-    let decision_store = Arc::new(concerto_memory::decision_store::DecisionStore::new());
-    let task_tree = Arc::new(concerto_memory::task_tree::TaskTreeStore::new());
+    // The SQLite storage every cycle's decision/task stores are hydrated from.
+    let mem_db = Arc::new(open_test_memory_db(dir.path()).await);
 
-    // ── run 1: interrupted while the coder call is in flight ───
-    let bus = EventBus::new(256);
-    let stop = CancellationToken::new();
-    let mut registry = AgentRegistry::from_mocks(vec![
-        MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
-        // The stop lands inside the coder's call: the mock cancels the run
-        // token, and the coordinator records the interrupted dispatch.
-        MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
-            .with_artifact_writer()
-            .cancel_on_run(stop.clone()),
-    ]);
-    registry.attach_configs_for_test(
-        std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
-    );
-    let registry = Arc::new(registry);
-    let (mut coordinator, store, session_id) = coordinator_with_store(
-        bus.clone(),
-        registry,
+    // ── Cycle 1: fresh run, interrupted MID-DISPATCH ─────────────
+    let stop1 = CancellationToken::new();
+    let coder1 =
+        MockExpertAgent::sequence(AgentId::new("coder"), vec![Err(OrchestratorError::Cancelled)])
+            .cancel_on_run(stop1.clone());
+    let coder_calls1 = coder1.call_count_handle();
+    let registry1 = {
+        let mut registry = AgentRegistry::from_mocks(vec![
+            MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
+            // The call is issued and cancelled before it ever settles.
+            coder1,
+        ]);
+        registry.attach_configs_for_test(
+            std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
+        );
+        Arc::new(registry)
+    };
+    let (ds1, tt1) = storage_backed_stores(&mem_db).await;
+    // The in-memory session/checkpoint store is shared across every cycle so
+    // each resume matches the SAME session row (a resume must match its row).
+    let (coordinator1, session_store, session_id) = coordinator_with_store(
+        EventBus::new(256),
+        registry1,
         vec![
             CoordinatorTurn::Calls(vec![call_specialist("architect", "design it")]),
             CoordinatorTurn::Calls(vec![call_specialist("coder", "implement")]),
@@ -1838,112 +2012,169 @@ async fn interrupt_midrun_then_resume_stays_memory_grounded() {
         dir.path(),
     )
     .await;
-    coordinator =
-        coordinator.with_memory_writeback(Some(decision_store.clone()), Some(task_tree.clone()));
+    let mut coordinator1 = coordinator1.with_memory_writeback(Some(ds1), Some(tt1));
 
-    let task = AgentTask::new(session_id, "build the thing");
-    let context = AgentContext::new(concerto_core::types::SessionContext::new(
+    let task1 = AgentTask::new(session_id, "build the thing");
+    let context1 = AgentContext::new(concerto_core::types::SessionContext::new(
         session_id,
         dir.path().to_path_buf(),
     ));
-    let first = coordinator.run(task, context, stop.clone(), None).await;
+    let first = coordinator1.run(task1, context1, stop1.clone(), None).await;
+    assert_honestly_interrupted(&first, "cycle 1 (mid-dispatch)");
+    assert!(
+        coder_calls1.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "cycle 1 must interrupt the coder WHILE its dispatch is in flight"
+    );
 
-    // The interrupt is honest: the run did NOT silently complete. It either
-    // surfaces as Partial (a recoverable stop) or as Cancelled.
-    let interrupted = match first {
-        Ok(output) => {
-            assert_eq!(
-                output.completion_status,
-                concerto_core::types::AgentCompletionStatus::Partial,
-                "an interrupted run must not read as Completed: {}",
-                output.final_message
-            );
-            true
-        }
-        Err(OrchestratorError::Cancelled) => true,
-        Err(other) => panic!("unexpected interrupt outcome: {other:?}"),
-    };
-    assert!(interrupted, "the run was interrupted");
-
-    // The cooperative-cancel path persisted a durable, resumable checkpoint.
-    let record = store
+    // Run 1's settled architect decision is on DISK — read it back through the
+    // production SQLite view, then confirm a fresh store hydrates it.
+    let persisted = wait_for_decisions(&mem_db, |rows| !rows.is_empty()).await;
+    assert!(
+        persisted.iter().any(|decision| decision.session_id == session_id
+            && decision.what.contains("architect completed subtask")),
+        "run 1's settled decision survives to disk: {persisted:?}"
+    );
+    let record1 = session_store
         .load_orchestration_checkpoint(session_id)
         .await
         .expect("checkpoint store read")
-        .expect("the interrupted run persisted a resumable checkpoint");
-    assert!(!record.completed, "the interrupted run stays resumable");
-
-    // Run 1's settled design step is in the memory store — the grounding the
-    // resume will read.
-    let decisions = decision_store.list_all().expect("decisions listed");
-    assert!(
-        decisions
-            .iter()
-            .any(|decision| decision.what.contains("architect") || decision.why.contains("design")),
-        "run 1's settled decision survives the interrupt: {decisions:?}"
-    );
-
-    // ── run 2: a fresh coordinator resumes from the durable checkpoint ──
-    let bus2 = EventBus::new(256);
-    // Canary: the settled design step must never re-dispatch. `always_fail`
-    // alone is weak — the failure is absorbed by the failure-diagnosis path
-    // and an exhausted script defaults to `Success("mock default")` — so the
-    // test also asserts the mock's invocation count stays zero.
-    let architect_canary =
-        MockExpertAgent::always_fail(AgentId::new("architect"), "must not be dispatched");
-    let architect_calls = architect_canary.call_count_handle();
-    let registry2 = Arc::new(AgentRegistry::from_mocks(vec![
-        architect_canary,
-        MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
-            .with_artifact_writer(),
-    ]));
-    let mut coordinator2 = coordinator_on_store(
-        bus2,
-        registry2,
-        vec![CoordinatorTurn::Text(String::new())],
-        store.clone(),
-    )
-    .with_memory_writeback(Some(decision_store.clone()), Some(task_tree.clone()));
-
-    // The resumed run's Phase-0 seed — the same derivation `run()` uses — must
-    // ground the plan in run 1's own memory.
-    let seed = CoordinatorAgent::checkpoint_run_id_hint(Some(&record.state_json));
-    let resume_task = AgentTask::new(session_id, "continue");
-    let mut resume_ctx = AgentContext::new(concerto_core::types::SessionContext::new(
-        session_id,
-        dir.path().to_path_buf(),
-    ));
-    coordinator2
-        .retrieve_memory_context(
-            &resume_task,
-            &mut resume_ctx,
-            seed.as_deref(),
-            CancellationToken::new(),
-        )
-        .await;
-    assert!(
-        !resume_ctx.retrieved_chunks.is_empty(),
-        "the resumed plan is grounded in run 1's memory, not empty"
-    );
-    assert!(
-        resume_ctx.retrieved_chunks.iter().all(|evident| evident.chunk.id.starts_with("plan://")
-            || evident.chunk.id.starts_with("memory://")),
-        "the grounding is run 1's persisted memory: {:?}",
-        resume_ctx.retrieved_chunks
-    );
-
-    // The resume runs to completion; the architect canary was NEVER invoked.
-    let second = coordinator2
-        .run(resume_task, resume_ctx, CancellationToken::new(), Some(record.state_json))
-        .await
-        .expect("the resumed run should succeed");
-    assert_ne!(
-        second.final_message, "must not be dispatched",
-        "a settled step was re-dispatched on resume"
+        .expect("cycle 1 persisted a resumable checkpoint");
+    assert!(!record1.completed, "cycle 1 stays resumable");
+    assert_eq!(
+        checkpoint_objective(&record1.state_json),
+        "build the thing",
+        "the checkpoint objective never drifts"
     );
     assert_eq!(
-        architect_calls.load(std::sync::atomic::Ordering::SeqCst),
+        checkpoint_objective_hash(&record1.state_json),
+        blake3::hash("build the thing".as_bytes()).to_hex().to_string(),
+        "the checkpoint objective hash is the ORIGINAL objective's hash"
+    );
+
+    // ── Cycle 2: resume 1 — the planner issues a fresh implement node
+    //    (`coder_b`) and the operator stop lands MID-DISPATCH ────────────
+    let stop2 = CancellationToken::new();
+    let architect_canary2 =
+        MockExpertAgent::always_fail(AgentId::new("architect"), "must not be dispatched");
+    let architect_calls2 = architect_canary2.call_count_handle();
+    // Mid-dispatch stop on the resume re-dispatch: the call is issued and
+    // cancelled before it ever settles. A DISTINCT implement role (`coder_b`)
+    // guarantees the resumed planner has fresh work to issue.
+    let coder2 =
+        MockExpertAgent::sequence(AgentId::new("coder_b"), vec![Err(OrchestratorError::Cancelled)])
+            .with_stage(Some(concerto_core::types::AgentStage::new("implement")))
+            .cancel_on_run(stop2.clone());
+    let coder_calls2 = coder2.call_count_handle();
+    let registry2 = Arc::new(AgentRegistry::from_mocks(vec![architect_canary2, coder2]));
+    let (ds2, tt2) = storage_backed_stores(&mem_db).await;
+    let mut coordinator2 = coordinator_on_store(
+        EventBus::new(256),
+        registry2,
+        vec![
+            CoordinatorTurn::Calls(vec![call_specialist("coder_b", "implement")]),
+            CoordinatorTurn::Text("continuing".into()),
+        ],
+        session_store.clone(),
+    )
+    .with_memory_writeback(Some(ds2), Some(tt2));
+    let (resume_task2, resume_ctx2) =
+        phase0_grounding(&mut coordinator2, session_id, dir.path(), Some(&record1.state_json))
+            .await;
+    assert_grounded_in_persisted_decision(&resume_ctx2.retrieved_chunks, "cycle 2");
+    let second =
+        coordinator2.run(resume_task2, resume_ctx2, stop2.clone(), Some(record1.state_json)).await;
+    assert_honestly_interrupted(&second, "cycle 2 (mid-dispatch on resume)");
+    assert!(
+        coder_calls2.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "cycle 2 must dispatch coder_b from the resumed planner"
+    );
+    assert_eq!(
+        architect_calls2.load(std::sync::atomic::Ordering::SeqCst),
         0,
-        "the settled design step must never be re-dispatched on resume"
+        "the settled design step must never re-dispatch on resume"
+    );
+    let record2 = session_store
+        .load_orchestration_checkpoint(session_id)
+        .await
+        .expect("checkpoint store read")
+        .expect("cycle 2 persisted a resumable checkpoint");
+    assert_eq!(
+        checkpoint_objective(&record2.state_json),
+        "build the thing",
+        "the checkpoint objective never drifts across cycles"
+    );
+    let decisions2 = wait_for_decisions(&mem_db, |rows| !rows.is_empty()).await;
+    assert_eq!(
+        decision_count_for(&decisions2, session_id, "architect completed subtask"),
+        1,
+        "the architect decision is persisted exactly once, never duplicated: {decisions2:?}"
+    );
+
+    // ── Cycle 3: resume 2 — the planner issues a fresh implement node
+    //    (`coder_c`) and the call SETTLES while the stop wins the race ────
+    let stop3 = CancellationToken::new();
+    let architect_canary3 =
+        MockExpertAgent::always_fail(AgentId::new("architect"), "must not be dispatched");
+    let architect_calls3 = architect_canary3.call_count_handle();
+    let coder3 = MockExpertAgent::always_succeed(AgentId::new("coder_c"), "implemented")
+        .with_stage(Some(concerto_core::types::AgentStage::new("implement")))
+        .with_artifact_writer()
+        .cancel_on_run(stop3.clone());
+    let coder_calls3 = coder3.call_count_handle();
+    let registry3 = Arc::new(AgentRegistry::from_mocks(vec![architect_canary3, coder3]));
+    let (ds3, tt3) = storage_backed_stores(&mem_db).await;
+    let mut coordinator3 = coordinator_on_store(
+        EventBus::new(256),
+        registry3,
+        vec![
+            CoordinatorTurn::Calls(vec![call_specialist("coder_c", "implement")]),
+            CoordinatorTurn::Text("continuing".into()),
+        ],
+        session_store.clone(),
+    )
+    .with_memory_writeback(Some(ds3), Some(tt3));
+    let (resume_task3, resume_ctx3) =
+        phase0_grounding(&mut coordinator3, session_id, dir.path(), Some(&record2.state_json))
+            .await;
+    assert_grounded_in_persisted_decision(&resume_ctx3.retrieved_chunks, "cycle 3");
+    let third =
+        coordinator3.run(resume_task3, resume_ctx3, stop3.clone(), Some(record2.state_json)).await;
+    assert_honestly_interrupted(&third, "cycle 3 (settle race during resume)");
+    assert!(
+        coder_calls3.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "cycle 3 must dispatch coder_c from the resumed planner"
+    );
+    assert_eq!(
+        architect_calls3.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the settled design step must never re-dispatch on the second resume"
+    );
+    // The run stays honestly interrupted with a resumable checkpoint; the
+    // decision set never shrank and the architect decision is still singular.
+    let final_record = session_store
+        .load_orchestration_checkpoint(session_id)
+        .await
+        .expect("checkpoint store read")
+        .expect("cycle 3 persisted a resumable checkpoint");
+    assert!(!final_record.completed, "cycle 3 stays resumable, never Completed");
+    assert_eq!(
+        checkpoint_objective(&final_record.state_json),
+        "build the thing",
+        "the checkpoint objective survives all three cycles"
+    );
+    assert_eq!(
+        checkpoint_objective_hash(&final_record.state_json),
+        blake3::hash("build the thing".as_bytes()).to_hex().to_string(),
+        "the checkpoint objective hash survives all three cycles"
+    );
+    let decisions3 = wait_for_decisions(&mem_db, |rows| !rows.is_empty()).await;
+    assert!(
+        decisions3.len() >= persisted.len(),
+        "the persisted decision set never shrinks across cycles: {decisions3:?}"
+    );
+    assert_eq!(
+        decision_count_for(&decisions3, session_id, "architect completed subtask"),
+        1,
+        "no drift: the architect decision is still singular after three cycles: {decisions3:?}"
     );
 }

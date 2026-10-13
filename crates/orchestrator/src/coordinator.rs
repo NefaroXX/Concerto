@@ -6681,6 +6681,24 @@ impl CoordinatorAgent {
     /// merged AHEAD of the vector results — a resumed specialist is then
     /// grounded in what this run already decided, not task-text matches
     /// alone. Chunks carry `score` 1.0 and the `top_k` bound is preserved.
+    ///
+    /// # `interrupted` / `degraded` on the Phase-0 grounding (D-41r (4))
+    ///
+    /// The vector recall below routes through
+    /// [`MemoryStore::retrieve_with_evidence`] (H13), so a recall that is
+    /// interrupted (cancelled) or degraded reaches the consumer with its
+    /// machine-readable `EvidentChunk::interrupted` / `degraded` flags intact —
+    /// there is no plain `MemoryStore::retrieve` call left on this path. The
+    /// plan-scoped chunks are a different substrate: they are synthesized
+    /// synchronously by [`Self::plan_scoped_memory_chunks`] from this run's own
+    /// decision/task stores and projected with [`project_without_standing`],
+    /// whose `interrupted: false` / `degraded: false` are correct BY
+    /// CONSTRUCTION — there is no recall to interrupt (the stores are read
+    /// in-process, with no cancellation point) and no standing substrate to
+    /// degrade. Routing those chunks through `retrieve_with_evidence` would be
+    /// a category error and would regress the standing-free rule they exist
+    /// under, so the deliberate decision (D-41r (4), Option B) is to leave the
+    /// projection unchanged.
     async fn retrieve_memory_context(
         &self,
         task: &AgentTask,
