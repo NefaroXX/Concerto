@@ -299,11 +299,11 @@ mod tests {
         };
 
         let project_id = ProjectId("project-a".into());
-        let evident = EvidentChunk {
+        let make_chunk = |interrupted: bool| EvidentChunk {
             chunk: MemoryChunk {
                 id: "chunk-1".into(),
                 project_id: project_id.clone(),
-                namespace: MemoryNamespace::Project(project_id),
+                namespace: MemoryNamespace::Project(project_id.clone()),
                 content: "content".into(),
                 file_path: None,
                 start_line: None,
@@ -320,9 +320,9 @@ mod tests {
             freshness: 1.0,
             derivation: "recall interrupted before standing was established".into(),
             degraded: false,
-            interrupted: true,
+            interrupted,
         };
-        let formatted = format_evident_memory(&[evident]);
+        let formatted = format_evident_memory(&[make_chunk(true)]);
         assert!(formatted.contains("\"interrupted\":true"), "per-chunk signal");
         assert!(formatted.contains("recall_interrupted"), "block-level signal");
         assert!(
@@ -331,6 +331,10 @@ mod tests {
         );
         // A completed recall carries the field as false — never missing
         // and never indistinguishable.
-        assert!(formatted.contains("\"interrupted\":true"));
+        let formatted_completed = format_evident_memory(&[make_chunk(false)]);
+        assert!(
+            formatted_completed.contains("\"interrupted\":false"),
+            "completed recall renders the flag as false"
+        );
     }
 }
