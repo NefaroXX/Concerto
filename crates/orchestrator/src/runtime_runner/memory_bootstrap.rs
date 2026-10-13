@@ -94,9 +94,12 @@ pub(crate) async fn init_memory_system_with_handles(
     // path, vector & FTS stores, optional embedder, background indexing).
     let (project_id, lifecycle, db, pool, data_dir) =
         open_memory_db(project_dir, memory_cancel, data_dir_lock).await?;
-    // H12: one shared maintenance ledger every emitter writes to. Fail-soft:
-    // an unopenable ledger leaves the emitters' observations unrecorded (with
-    // a warning), never failing memory init.
+    // H12: the shared maintenance ledger attached to the link and decision
+    // stores below. The init-retention `TtlManager` builds its own handle to
+    // the SAME table (its constructor derives one from the pool), so every
+    // emitter records into one `maintenance_outcomes` table. Fail-soft: an
+    // unopenable ledger leaves the emitters' observations unrecorded (with a
+    // warning), never failing memory init.
     let maintenance = match MaintenanceLedger::connect(pool.clone()).await {
         Ok(ledger) => Some(Arc::new(ledger)),
         Err(error) => {
