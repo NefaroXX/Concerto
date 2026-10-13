@@ -390,8 +390,16 @@ impl HybridRetriever {
                 .await;
         }
 
-        let ids: Vec<String> = fused.iter().map(|result| result.chunk_id.clone()).collect();
-        let scores = self.score_links(scorer, &ids, config.score_timeout, cancel).await;
+        // A tier whose γ cannot move a result is skipped outright rather than
+        // paying for a scoring pass whose output cannot change the order (see
+        // [`tier_can_reorder`]). Ranking is provably unchanged; the empty map
+        // then takes the existing no-reorder path below.
+        let scores = if tier_can_reorder(tier) {
+            let ids: Vec<String> = fused.iter().map(|result| result.chunk_id.clone()).collect();
+            self.score_links(scorer, &ids, config.score_timeout, cancel).await
+        } else {
+            HashMap::new()
+        };
         if scores.is_empty() {
             return (fused, scores);
         }
@@ -582,6 +590,26 @@ impl HybridRetriever {
             }
         }
     }
+}
+
+/// Whether this tier's γ can actually move a result in the cascade order.
+///
+/// `cascade_key` is `rank + γ·(LINK_SCORE_MAX − score)`, so swapping ranks
+/// `i < j` requires `(j − i) < γ·(score_j − score_i) ≤ γ·LINK_SCORE_MAX`.
+/// Ranks are integers, so when `γ·LINK_SCORE_MAX ≤ 1` no swap is arithmetically
+/// possible and the sort is a no-op.
+///
+/// That is the case for `Mild` (0.05·10 = 0.5) and `Aggressive` (0.10·10 =
+/// 1.0 — ties only, never a swap). Only `Emergency` (0.20·10 = 2 slots, which
+/// needs a link-score gap > 5.0) can reorder. Those tiers are widening tiers:
+/// their `candidate_multiplier` still does real work when the fused set cannot
+/// fill `top_k`.
+///
+/// At an inert tier the link-scoring pass — a per-recall cost with its own
+/// budget — is computed and discarded, so it is skipped. Ranking is provably
+/// identical either way; the empty map takes the existing no-reorder path.
+fn tier_can_reorder(tier: CascadeTier) -> bool {
+    tier.gamma() * LINK_SCORE_MAX > 1.0
 }
 
 /// ADR-69 A4/A6 ordering key for the cascade reorder: `rank + γ·(10 − score)`.
@@ -1544,5 +1572,155 @@ mod tests {
         assert_eq!(envelope.max_chars_per_memory, 800);
         assert_eq!(envelope.max_total_chars, 4000);
         assert_eq!(envelope.timeout_ms, 1200);
+    }
+
+    /// Counts how many times a scoring pass was actually performed, so the
+    /// inert-tier skip can be observed rather than assumed.
+    struct CountingScorer {
+        scores: HashMap<String, f64>,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl LinkScorer for CountingScorer {
+        async fn link_scores(
+            &self,
+            chunk_ids: &[String],
+            _cancel: CancellationToken,
+        ) -> Result<HashMap<String, f64>, MemoryError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(chunk_ids
+                .iter()
+                .filter_map(|id| self.scores.get(id).map(|score| (id.clone(), *score)))
+                .collect())
+        }
+    }
+
+    /// The skip must be observed at the call site, not merely derived: an
+    /// inert tier never consults the scorer, a reordering tier always does.
+    #[tokio::test]
+    async fn cascade_skips_link_scoring_at_an_inert_tier() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (retriever, pid) = cascade_seeded_retriever();
+        let query = cascade_query(pid, 2);
+        let scores = HashMap::from([("a_plain".to_string(), 0.0), ("b_linked".to_string(), 10.0)]);
+
+        for (tier, expected_calls) in
+            [(CascadeTier::Mild, 0), (CascadeTier::Aggressive, 0), (CascadeTier::Emergency, 1)]
+        {
+            let calls = std::sync::Arc::new(AtomicUsize::new(0));
+            let scorer = CountingScorer { scores: scores.clone(), calls: calls.clone() };
+            let config = LinkCascadeConfig {
+                decay_days: Some(90),
+                start_tier: tier,
+                score_timeout: Duration::from_millis(250),
+            };
+            let results = retriever
+                .retrieve_with_cascade(
+                    &query,
+                    &[0.1; 4],
+                    Some(2),
+                    config.start_tier,
+                    &scorer,
+                    &config,
+                    CancellationToken::new(),
+                )
+                .await;
+            assert_eq!(results.len(), 2);
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                expected_calls,
+                "{tier:?}: scoring pass count"
+            );
+        }
+
+        // Behaviour is unchanged by the skip: the Mild run still returns both
+        // results in fused rank order, never promoted by link evidence.
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let scorer = CountingScorer { scores, calls };
+        let config = LinkCascadeConfig {
+            decay_days: Some(90),
+            start_tier: CascadeTier::Mild,
+            score_timeout: Duration::from_millis(250),
+        };
+        let results = retriever
+            .retrieve_with_cascade(
+                &query,
+                &[0.1; 4],
+                Some(2),
+                config.start_tier,
+                &scorer,
+                &config,
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(results[0].chunk_id, "a_plain", "Mild preserves fused rank order");
+        assert_eq!(results[1].chunk_id, "b_linked");
+    }
+
+    /// The reorder is arithmetically impossible below this γ·scale product, so
+    /// those tiers must not pay for a scoring pass they cannot use.
+    #[test]
+    fn only_emergency_tier_can_reorder() {
+        assert!(!tier_can_reorder(CascadeTier::Mild), "0.05·10 = 0.5 slots");
+        assert!(!tier_can_reorder(CascadeTier::Aggressive), "0.10·10 = 1.0 slots, ties only");
+        assert!(tier_can_reorder(CascadeTier::Emergency), "0.20·10 = 2 slots");
+    }
+
+    /// The skip must not change the order. Ranking at an inert tier is
+    /// identical whether or not link scores are supplied, because no pair of
+    /// ranks can swap.
+    #[test]
+    fn an_inert_tier_reorders_nothing_even_with_perfect_link_scores() {
+        let chunk = |id: &str, score: f64| FusedResult {
+            chunk_id: id.to_string(),
+            score,
+            vector_score: score,
+            fts_score: 0.0,
+            content: id.to_string(),
+            notice: None,
+            stale: false,
+        };
+        let fused = vec![chunk("a", 1.0), chunk("b", 0.9), chunk("c", 0.8), chunk("d", 0.7)];
+        // The most extreme possible score spread: 0 for the tail, full marks
+        // for the head. Even this cannot move anything at an inert γ.
+        let scores = HashMap::from([("d".to_string(), 10.0), ("c".to_string(), 9.0)]);
+        for tier in [CascadeTier::Mild, CascadeTier::Aggressive] {
+            let mut ranked: Vec<(usize, FusedResult)> =
+                fused.clone().into_iter().enumerate().collect();
+            ranked.sort_by(|(left_rank, left), (right_rank, right)| {
+                left.stale.cmp(&right.stale).then_with(|| {
+                    cascade_key(*left_rank, left, &scores, tier.gamma())
+                        .partial_cmp(&cascade_key(*right_rank, right, &scores, tier.gamma()))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+            });
+            let order: Vec<String> =
+                ranked.into_iter().map(|(_, result)| result.chunk_id).collect();
+            assert_eq!(order, vec!["a", "b", "c", "d"], "{tier:?} must preserve fused rank order");
+        }
+        // Control: at Emergency the same spread does move something, which is
+        // what makes the inert-tier assertion above meaningful.
+        let mut ranked: Vec<(usize, FusedResult)> = fused.into_iter().enumerate().collect();
+        ranked.sort_by(|(left_rank, left), (right_rank, right)| {
+            left.stale.cmp(&right.stale).then_with(|| {
+                cascade_key(*left_rank, left, &scores, CascadeTier::Emergency.gamma())
+                    .partial_cmp(&cascade_key(
+                        *right_rank,
+                        right,
+                        &scores,
+                        CascadeTier::Emergency.gamma(),
+                    ))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        });
+        let emergency: Vec<String> =
+            ranked.into_iter().map(|(_, result)| result.chunk_id).collect();
+        assert_ne!(
+            emergency,
+            vec!["a", "b", "c", "d"],
+            "Emergency control must reorder, proving the fixture can move"
+        );
     }
 }
