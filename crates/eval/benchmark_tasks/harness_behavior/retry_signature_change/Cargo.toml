@@ -1,0 +1,10 @@
+# Harness-behavior benchmark fixture: a signature change that fails to compile
+# on the agent's first edit attempt. Used by docs/harness-measurement.md to
+# count identical failed-call retries.
+[package]
+name = "retry_signature_change"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"

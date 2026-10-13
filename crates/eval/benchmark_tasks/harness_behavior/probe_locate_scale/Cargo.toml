@@ -1,0 +1,13 @@
+# Harness-behavior benchmark fixture: locate the project scale before editing.
+#
+# The value the implementation needs lives in a different module than the
+# function under change, so the agent must explore the project before its first
+# useful edit. Used by docs/harness-measurement.md to count environment-probing
+# calls before the first useful action.
+[package]
+name = "probe_locate_scale"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"

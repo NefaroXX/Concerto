@@ -1,0 +1,1 @@
+{ "id": "01M4TSBFWZ0000000000000003", "description": "Fix the is_even function so it returns true for even integers and false for odd integers. The existing test asserts the behavior.", "project_snapshot_path": "./", "expected_outcomes": [] }
