@@ -1468,6 +1468,67 @@ mod tests {
         }
     }
 
+    /// The plan's "retained bytes" metric at the accounting level: the bytes the
+    /// sidecar retains across every banked path equal the bytes written, for
+    /// representative sizes (small text, multi-chunk binary within budget, a
+    /// large within-budget file), and a hash-only resource banks nothing and is
+    /// accounted as such. Per-file byte-exactness is asserted by the round-trip
+    /// tests above; this is the aggregate accounting invariant, including the
+    /// hash-only boundary.
+    #[tokio::test]
+    async fn retained_bytes_account_for_every_banked_path() {
+        let (_dir, store) = test_store().await;
+        let cid = Ulid::new();
+
+        let text = b"hello, checkpoint\n".to_vec();
+        let binary: Vec<u8> =
+            (0..CHECKPOINT_BLOB_LIMIT_BYTES + 4096).map(|i| (i % 251) as u8).collect();
+        let large = vec![b'q'; CHECKPOINT_BLOB_LIMIT_BYTES * 3 + 7];
+        let written_total = text.len() + binary.len() + large.len();
+
+        let mut resources =
+            vec![banked("small.txt", &cid), banked("bin.dat", &cid), banked("large.txt", &cid)];
+        // A hash-only resource (no `byte_ref`) banks no bytes.
+        resources.push(CheckpointResource {
+            kind: CheckpointResourceKind::FileOverwrite,
+            canonical_path: "hash-only.txt".to_owned(),
+            pre_hash: Some("deadbeef".to_owned()),
+            post_hash: Some("deadbeef".to_owned()),
+            byte_ref: None,
+            size_bytes: None,
+        });
+
+        let mut record =
+            record_with(CheckpointStatus::Active, resources, RestoreMethod::PreImageStore);
+        record.checkpoint_id = cid;
+        let blobs = BTreeMap::from([
+            ("small.txt".to_owned(), text.clone()),
+            ("bin.dat".to_owned(), binary.clone()),
+            ("large.txt".to_owned(), large.clone()),
+        ]);
+        let report = store.create_checkpoint(&record, &blobs, &token()).await.expect("create");
+        assert_eq!(report, CheckpointCreateReport { stored: 3, hash_only: 1 });
+
+        let mut retained_total = 0usize;
+        for (path, original) in [("small.txt", &text), ("bin.dat", &binary), ("large.txt", &large)]
+        {
+            match load_bytes_via_trait(&store, &cid.to_string(), path).await {
+                PreImageBytes::Stored { bytes, .. } => {
+                    assert_eq!(&bytes, original, "{path} retains exactly the bytes written");
+                    retained_total += bytes.len();
+                }
+                other => panic!("{path} must retain bytes, got {other:?}"),
+            }
+        }
+        assert_eq!(retained_total, written_total, "retained bytes equal bytes written");
+
+        // The hash-only path retains zero restorable bytes.
+        match load_bytes_via_trait(&store, &cid.to_string(), "hash-only.txt").await {
+            PreImageBytes::HashOnly { .. } | PreImageBytes::Absent => {}
+            other => panic!("hash-only path must bank no bytes, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn empty_file_banks_an_explicit_empty_row() {
         let (_dir, store) = test_store().await;

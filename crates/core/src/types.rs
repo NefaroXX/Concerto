@@ -3493,4 +3493,48 @@ mod tests {
             .with_evidence_ids(vec!["evt-1".to_string()]);
         assert!(!fresh_failure.is_passing_evidence());
     }
+
+    /// The plan's explicit zero target, at the taxonomy level: enumerate every
+    /// non-`Passed` verification outcome and prove that none — not even when
+    /// stamped with the complete R2 freshness basis — is ever passing evidence
+    /// or reports as a pass. This is the "skipped/unavailable-as-success"
+    /// property; the historically dangerous cases (`Skipped`, `Unavailable`)
+    /// are asserted directly, and a required-check absence can therefore never
+    /// map to verified completion.
+    #[test]
+    fn no_non_passing_outcome_is_ever_passing_evidence() {
+        let non_passing = [
+            VerificationOutcome::Failed,
+            VerificationOutcome::Skipped,
+            VerificationOutcome::Unavailable,
+            VerificationOutcome::Error,
+            VerificationOutcome::Cancelled,
+        ];
+        for outcome in non_passing {
+            let record = VerificationSummary::new("a.py", "py_compile", outcome, "detail")
+                .with_verifier("concerto-verify-sweep")
+                .with_scope("a.py")
+                .with_content_fingerprint("fp")
+                .with_generation("gen-1")
+                .with_evidence_ids(vec!["evt-1".to_string()]);
+            assert_eq!(record.outcome, Some(outcome));
+            assert!(!record.passed, "`{}` must never set the legacy pass flag", outcome.as_str());
+            assert!(
+                !record.is_passing_evidence(),
+                "`{}` must never count as passing evidence, however fresh",
+                outcome.as_str()
+            );
+            assert!(!record.effective_outcome().is_pass(), "`{}` is not a pass", outcome.as_str());
+        }
+
+        // The single passing outcome, with the same full stamp, is the only
+        // one that counts — the enumeration above is not vacuous.
+        let passing = VerificationSummary::passed("a.py", "py_compile", "ok")
+            .with_verifier("concerto-verify-sweep")
+            .with_scope("a.py")
+            .with_content_fingerprint("fp")
+            .with_generation("gen-1")
+            .with_evidence_ids(vec!["evt-1".to_string()]);
+        assert!(passing.is_passing_evidence(), "a full-stamped pass remains evidence");
+    }
 }
