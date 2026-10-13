@@ -570,4 +570,80 @@ mod tests {
         .unwrap();
         assert_eq!(table, 1, "migration 002 must upgrade a 001-only database");
     }
+
+    #[tokio::test]
+    /// H12: migration 003 creates the `maintenance_outcomes` ledger table with
+    /// its expected columns on a fresh database — strictly through the
+    /// migration runner (`MemoryDb::connect`), NOT through
+    /// `MaintenanceLedger::connect`'s mirrored `CREATE TABLE IF NOT EXISTS`
+    /// DDL. Deleting the migration must fail this test.
+    async fn connect_creates_maintenance_outcomes_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = camino::Utf8PathBuf::from_path_buf(dir.path().join("memory.db")).unwrap();
+        let db = MemoryDb::connect(&db_path).await.unwrap();
+
+        let table: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'table' AND name = 'maintenance_outcomes'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(table, 1, "migration 003 must create maintenance_outcomes");
+
+        let columns: Vec<String> =
+            sqlx::query("SELECT name FROM pragma_table_info('maintenance_outcomes')")
+                .fetch_all(db.pool())
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| row.get::<String, _>("name"))
+                .collect();
+        for expected in [
+            "id",
+            "kind",
+            "target",
+            "target_kind",
+            "evidence",
+            "outcome",
+            "reason",
+            "actor",
+            "project_id",
+            "observed_at",
+        ] {
+            assert!(
+                columns.iter().any(|column| column == expected),
+                "migration 003 must create column {expected}: {columns:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    /// H12: an existing install (created before migration 003) is upgraded in
+    /// place by the SAME `MemoryDb::connect` path production uses — migration
+    /// 003 runs in order after 001/002, so the ledger table is present without
+    /// any `MaintenanceLedger::connect` DDL.
+    async fn connect_upgrades_existing_db_with_migration_003() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = camino::Utf8PathBuf::from_path_buf(dir.path().join("memory.db")).unwrap();
+
+        let pool = SqlitePool::connect_with(
+            SqliteConnectOptions::new().filename(db_path.as_std_path()).create_if_missing(true),
+        )
+        .await
+        .unwrap();
+        let migrations = sqlx::migrate!("./migrations");
+        migrations.run_to(2, &pool).await.unwrap();
+        pool.close().await;
+
+        let db = MemoryDb::connect(&db_path).await.unwrap();
+        let table: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'table' AND name = 'maintenance_outcomes'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(table, 1, "migration 003 must upgrade a pre-003 database");
+    }
 }
