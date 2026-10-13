@@ -397,6 +397,42 @@ impl ApprovalSink for DenyApprovalSink {
     }
 }
 
+/// An approval sink for a one-shot operator invocation (a typed
+/// `concerto harness ...` command, or a desktop control press).
+///
+/// The operator issuing the request *is* the approval for that single
+/// operation; this sink approves within the process that was explicitly
+/// started for it. It never widens a running agent's authority: the
+/// in-process/run path continues to use the run's configured sink.
+pub struct ApproveInvocationSink;
+
+#[async_trait::async_trait]
+impl ApprovalSink for ApproveInvocationSink {
+    async fn request_approval(
+        &self,
+        _action: &concerto_core::types::PolicyAction<'_>,
+        _cancel: CancellationToken,
+    ) -> ApprovalDecision {
+        ApprovalDecision::Approve
+    }
+
+    async fn approve_all_for_session(
+        &self,
+        _session_id: concerto_core::ids::Ulid,
+        _cancel: CancellationToken,
+    ) {
+    }
+
+    async fn request_ack(
+        &self,
+        _session_id: concerto_core::ids::Ulid,
+        _message: &str,
+        _cancel: CancellationToken,
+    ) -> bool {
+        true
+    }
+}
+
 /// A standalone harness service plus the state that must outlive it.
 ///
 /// Frontends that are not inside an agent run (the CLI's `harness` subcommand,
