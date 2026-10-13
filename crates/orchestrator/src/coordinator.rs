@@ -19,11 +19,11 @@ use concerto_core::executor::ToolExecutor;
 use concerto_core::ids::Ulid;
 use concerto_core::intent::{RequestedOutcome, RouterRoute};
 use concerto_core::memory::{
-    ChunkType, Decision, DecisionCategory, DecisionId, MemoryChunk, MemoryNamespace, MemoryQuery,
-    TaskNode, TaskNodeId, TaskStatus,
+    ChunkType, Decision, DecisionCategory, DecisionId, EvidentChunk, MemoryChunk, MemoryNamespace,
+    MemoryQuery, TaskNode, TaskNodeId, TaskStatus,
 };
 use concerto_core::traits::agent::ExpertAgent;
-use concerto_core::traits::memory::MemoryStore;
+use concerto_core::traits::memory::{project_without_standing, MemoryStore};
 use concerto_core::traits::policy::PolicyEngine;
 use concerto_core::types::{
     AgentContext, AgentId, AgentOutcome, AgentOutput, AgentRunResult, AgentStage, AgentTask,
@@ -6707,10 +6707,13 @@ impl CoordinatorAgent {
                 query.top_k,
             );
             let vector_chunks =
-                self.memory_store.retrieve(&query, cancel).await.unwrap_or_default();
+                self.memory_store.retrieve_with_evidence(&query, cancel).await.unwrap_or_default();
             // Plan-scoped facts first (they are this run's decisions), then
-            // the vector matches; the budget is the query's `top_k`.
-            let mut merged = plan_chunks;
+            // the vector matches; the budget is the query's `top_k`. Plan
+            // chunks are projected through the same standing-free honesty
+            // rule the store default uses (this run's decisions are
+            // model-authored claims until evidence supports them).
+            let mut merged = project_without_standing(plan_chunks);
             merged.extend(vector_chunks);
             merged.truncate(query.top_k);
             context.retrieved_chunks = merged;
@@ -9384,11 +9387,14 @@ impl CoordinatorAgent {
                         top_k: 3,
                         filters: vec![],
                     };
-                    let role_chunks =
-                        match this.memory_store.retrieve(&query, cancel_clone.clone()).await {
-                            Ok(chunks) if !chunks.is_empty() => chunks,
-                            Ok(_) | Err(_) => ctx_rc,
-                        };
+                    let role_chunks = match this
+                        .memory_store
+                        .retrieve_with_evidence(&query, cancel_clone.clone())
+                        .await
+                    {
+                        Ok(chunks) if !chunks.is_empty() => chunks,
+                        Ok(_) | Err(_) => ctx_rc,
+                    };
                     let agent_ctx = AgentContext {
                         session: ctx_sesh,
                         parent_task: Some(ctx_parent),
@@ -10240,7 +10246,7 @@ impl CoordinatorAgent {
         session: &concerto_core::types::SessionContext,
         parent_task: &AgentTask,
         working_memory: &concerto_core::memory::WorkingMemorySnapshot,
-        retrieved_chunks: &[MemoryChunk],
+        retrieved_chunks: &[EvidentChunk],
         cancel: &CancellationToken,
         task: &AgentTask,
         graph: &mut TaskGraph,
@@ -17923,12 +17929,12 @@ impl CoordinatorAgent {
 
     /// The working-memory block for the coordinator's dispatch prompt: the
     /// active orchestration run state (the `WorkingMemorySnapshot` projection)
-    /// followed by the retrieved project-memory chunks, exactly the shape the
-    /// single-agent loop assembles from `format_working_memory` +
-    /// `format_retrieved_memory`.
+    /// followed by the evidence-bearing retrieved project-memory chunks,
+    /// exactly the shape the single-agent loop assembles from
+    /// `format_working_memory` + `format_evident_memory`.
     fn dispatch_working_memory_block(&self, base_ctx: &AgentContext) -> String {
         let active = crate::memory_prompt::format_run_memory(&base_ctx.working_memory);
-        let retrieved = crate::memory_prompt::format_retrieved_memory(&base_ctx.retrieved_chunks);
+        let retrieved = crate::memory_prompt::format_evident_memory(&base_ctx.retrieved_chunks);
         if retrieved.is_empty() {
             active
         } else {
@@ -35027,22 +35033,25 @@ mod tests {
             blocking: Vec::new(),
             created_at: time::OffsetDateTime::now_utc(),
         });
-        // Retrieved project memory: one chunk.
+        // Retrieved project memory: one evidence-bearing chunk (the
+        // population site stores `EvidentChunk`s).
         let project_id = concerto_core::memory::ProjectId("project-a".into());
-        context.retrieved_chunks.push(concerto_core::memory::MemoryChunk {
-            id: "chunk-1".into(),
-            project_id: project_id.clone(),
-            namespace: concerto_core::memory::MemoryNamespace::Project(project_id),
-            content: "the module graph is documented here".into(),
-            file_path: Some(camino::Utf8PathBuf::from("src/lib.rs")),
-            start_line: Some(1),
-            end_line: Some(3),
-            chunk_type: concerto_core::memory::ChunkType::Function,
-            score: 1.0,
-            model_id: "test".into(),
-            model_version: "1".into(),
-            stale: false,
-        });
+        context.retrieved_chunks.extend(concerto_core::traits::memory::project_without_standing(
+            vec![concerto_core::memory::MemoryChunk {
+                id: "chunk-1".into(),
+                project_id: project_id.clone(),
+                namespace: concerto_core::memory::MemoryNamespace::Project(project_id),
+                content: "the module graph is documented here".into(),
+                file_path: Some(camino::Utf8PathBuf::from("src/lib.rs")),
+                start_line: Some(1),
+                end_line: Some(3),
+                chunk_type: concerto_core::memory::ChunkType::Function,
+                score: 1.0,
+                model_id: "test".into(),
+                model_version: "1".into(),
+                stale: false,
+            }],
+        ));
         let _ = coordinator
             .run(task, context, CancellationToken::new(), None)
             .await
@@ -37346,7 +37355,7 @@ mod tests {
         let plan_chunks: Vec<_> = context
             .retrieved_chunks
             .iter()
-            .filter(|chunk| chunk.id.starts_with("plan://plan-42/"))
+            .filter(|evident| evident.chunk.id.starts_with("plan://plan-42/"))
             .collect();
         assert_eq!(
             plan_chunks.len(),
@@ -37356,21 +37365,24 @@ mod tests {
         assert!(
             plan_chunks
                 .iter()
-                .any(|chunk| chunk.content.contains("pinned the sqlite vector store")),
+                .any(|evident| evident.chunk.content.contains("pinned the sqlite vector store")),
             "the decision's `what` reaches the prompt"
         );
         assert!(
-            plan_chunks.iter().any(|chunk| chunk.content.contains("wire the resume seed")),
+            plan_chunks
+                .iter()
+                .any(|evident| evident.chunk.content.contains("wire the resume seed")),
             "the settled task node reaches the prompt"
         );
         assert!(
             plan_chunks
                 .iter()
-                .all(|chunk| chunk.chunk_type == ChunkType::Fact && chunk.score == 1.0),
+                .all(|evident| evident.chunk.chunk_type == ChunkType::Fact
+                    && evident.chunk.score == 1.0),
             "plan memory is rendered as deterministic fact chunks"
         );
         assert!(
-            plan_chunks.iter().all(|chunk| chunk.model_id == "concerto://plan-memory"),
+            plan_chunks.iter().all(|evident| evident.chunk.model_id == "concerto://plan-memory"),
             "the synthetic chunks carry the plan-memory provenance model"
         );
     }
@@ -37416,8 +37428,11 @@ mod tests {
             .await;
 
         assert_eq!(context.retrieved_chunks.len(), 1);
-        assert!(context.retrieved_chunks[0].id.starts_with("memory://decision:"));
-        assert!(context.retrieved_chunks[0].content.contains("kept the resume seed optional"));
+        assert!(context.retrieved_chunks[0].chunk.id.starts_with("memory://decision:"));
+        assert!(context.retrieved_chunks[0]
+            .chunk
+            .content
+            .contains("kept the resume seed optional"));
     }
 
     /// #5 coverage: the multi-agent retrieval path APPLIES its bound —
@@ -37475,17 +37490,20 @@ mod tests {
             context.retrieved_chunks.len()
         );
         assert!(
-            context.retrieved_chunks.iter().all(|chunk| chunk.id.starts_with("plan://plan-x/")),
+            context
+                .retrieved_chunks
+                .iter()
+                .all(|evident| evident.chunk.id.starts_with("plan://plan-x/")),
             "plan findings fill the whole budget on the plan-seeded path"
         );
         assert!(
-            context.retrieved_chunks[0].content.contains("decision number 6"),
+            context.retrieved_chunks[0].chunk.content.contains("decision number 6"),
             "plan memory is newest-first: {}",
-            context.retrieved_chunks[0].content
+            context.retrieved_chunks[0].chunk.content
         );
-        for chunk in &context.retrieved_chunks {
-            assert_eq!(chunk.chunk_type, ChunkType::Fact);
-            assert_eq!(chunk.score, 1.0, "plan memory is rendered as deterministic facts");
+        for evident in &context.retrieved_chunks {
+            assert_eq!(evident.chunk.chunk_type, ChunkType::Fact);
+            assert_eq!(evident.chunk.score, 1.0, "plan memory is rendered as deterministic facts");
         }
     }
 
@@ -38068,7 +38086,10 @@ mod tests {
             )
             .await;
         assert!(
-            resume_ctx.retrieved_chunks.iter().any(|chunk| chunk.content.contains("implemented")),
+            resume_ctx
+                .retrieved_chunks
+                .iter()
+                .any(|evident| evident.chunk.content.contains("implemented")),
             "the grounded plan carries process 1's outcome: {:?}",
             resume_ctx.retrieved_chunks
         );

@@ -463,7 +463,13 @@ impl ApprovalDecisionWire {
 }
 
 /// One retrieved memory chunk (ADR-60 D6).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// H13: the H11 evidence-bearing recall's per-chunk standing rides this wire
+/// shape as additive, `#[serde(default)]` fields, so a supervised agent's
+/// `retrieve-memory` result carries the same source/status/why the in-process
+/// path carries. A pre-H13 peer that omits them decodes to `None`/`false`
+/// (unknown status), never to a falsely-good verdict.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct MemoryChunk {
     /// The chunk's text content.
     pub text: String,
@@ -473,6 +479,24 @@ pub struct MemoryChunk {
     pub score: f64,
     /// Whiteboard `event_id` this chunk originated from, when known.
     pub source_event_id: Option<String>,
+    /// H11 truth status label (`verified` / `assumed` / `unknown` /
+    /// `superseded` / `contradicted`); `None` when the peer did not carry it.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// H11 source attribution label (e.g. `model-authored`, `file`); `None`
+    /// when the peer did not carry it.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// H11 derivation (why this status), when the peer carried it.
+    #[serde(default)]
+    pub why: Option<String>,
+    /// `true` when the recall ran vector-disabled (FTS-only fallback).
+    #[serde(default)]
+    pub degraded: bool,
+    /// `true` when the recall was interrupted before standing was fully
+    /// established.
+    #[serde(default)]
+    pub interrupted: bool,
 }
 
 /// Wire projection of a memory write crossing `store-memory` (ADR-60 D6).
@@ -1195,8 +1219,43 @@ mod tests {
                 kind: "fact".to_owned(),
                 score: 0.93,
                 source_event_id: Some("evt-1".to_owned()),
+                status: Some("assumed".to_owned()),
+                source: Some("model-authored".to_owned()),
+                why: Some("model-authored claim".to_owned()),
+                degraded: false,
+                interrupted: false,
             }],
         });
+    }
+
+    /// H13 wire discipline: a pre-H13 `retrieve-memory` payload (no standing
+    /// fields) decodes with the additive defaults, so an older peer's chunks
+    /// read as unknown standing rather than a falsely-good verdict.
+    #[test]
+    fn retrieve_memory_legacy_payload_decodes_to_unknown_standing() {
+        let legacy = serde_json::json!({
+            "type": "retrieve-memory",
+            "value": {
+                "chunks": [{
+                    "text": "old peer chunk",
+                    "kind": "fact",
+                    "score": 0.5,
+                    "source_event_id": null
+                }]
+            }
+        });
+        let decoded: IpcResult =
+            serde_json::from_value(legacy).expect("legacy payload decodes additively");
+        match decoded {
+            IpcResult::RetrieveMemory { chunks } => {
+                assert_eq!(chunks.len(), 1);
+                assert_eq!(chunks[0].status, None);
+                assert_eq!(chunks[0].source, None);
+                assert!(!chunks[0].degraded);
+                assert!(!chunks[0].interrupted);
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
     }
 
     #[test]

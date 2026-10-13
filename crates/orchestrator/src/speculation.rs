@@ -281,7 +281,7 @@ pub(crate) struct ConsultExecutionInputs {
     pub task: AgentTask,
     pub session: concerto_core::types::SessionContext,
     pub working_memory: concerto_core::memory::WorkingMemorySnapshot,
-    pub retrieved_chunks: Vec<concerto_core::memory::MemoryChunk>,
+    pub retrieved_chunks: Vec<concerto_core::memory::EvidentChunk>,
     pub snapshot_digest: Option<String>,
     /// ADR-82 §2: the cached manifest summary, beside the snapshot digest.
     /// Pure render — no probes run to produce it.

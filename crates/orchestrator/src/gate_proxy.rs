@@ -29,7 +29,8 @@ use async_trait::async_trait;
 use concerto_core::error::{MemoryError, ToolError};
 use concerto_core::ids::Ulid;
 use concerto_core::memory::{
-    ChunkType, MemoryChunk, MemoryEntry, MemoryId, MemoryNamespace, MemoryQuery, ProjectId,
+    ChunkType, Confidence, EvidentChunk, FactStatusView, MemoryChunk, MemoryEntry, MemoryId,
+    MemoryNamespace, MemoryQuery, ProjectId, RecallSource,
 };
 use concerto_core::traits::memory::MemoryStore;
 use concerto_core::types::{SessionContext, ToolDefinition, ToolOutput};
@@ -510,15 +511,14 @@ impl GateProxyMemoryStore {
     ) -> Self {
         Self { client, agent_id, project_id }
     }
-}
 
-#[async_trait]
-impl MemoryStore for GateProxyMemoryStore {
-    async fn retrieve(
+    /// Fetch the supervisor's `retrieve-memory` wire chunks (the raw
+    /// projection carrying the H13 standing fields).
+    async fn fetch_wire_chunks(
         &self,
         query: &MemoryQuery,
         cancel: CancellationToken,
-    ) -> Result<Vec<MemoryChunk>, MemoryError> {
+    ) -> Result<Vec<crate::ipc::MemoryChunk>, MemoryError> {
         if cancel.is_cancelled() {
             return Err(MemoryError::Cancelled);
         }
@@ -542,30 +542,118 @@ impl MemoryStore for GateProxyMemoryStore {
                 error.code, error.message
             )));
         }
-        let chunks = match response.result {
-            Some(IpcResult::RetrieveMemory { chunks }) => chunks,
-            _ => return Err(MemoryError::Persistence("retrieve-memory result missing".to_owned())),
-        };
-        // The wire chunk is a projection (text/kind/score); rebuild the
-        // store chunk with placeholder metadata — the whitespace/prompt
-        // consumers only read content and score today (ADR-60 D6 linkage
-        // lands in a later chunk).
-        Ok(chunks
+        match response.result {
+            Some(IpcResult::RetrieveMemory { chunks }) => Ok(chunks),
+            _ => Err(MemoryError::Persistence("retrieve-memory result missing".to_owned())),
+        }
+    }
+
+    /// Rebuild one store chunk from a wire chunk (placeholder metadata; the
+    /// whitespace/prompt consumers only read content and score today).
+    fn core_chunk_from_wire(&self, chunk: crate::ipc::MemoryChunk) -> MemoryChunk {
+        core_chunk_from_wire(&self.project_id, chunk)
+    }
+}
+
+/// Placeholder-metadata chunk from a wire chunk (free function so the
+/// evidence-projection test can exercise it without a live IPC client).
+fn core_chunk_from_wire(project_id: &ProjectId, chunk: crate::ipc::MemoryChunk) -> MemoryChunk {
+    MemoryChunk {
+        id: chunk.source_event_id.unwrap_or_default(),
+        project_id: project_id.clone(),
+        namespace: MemoryNamespace::Project(project_id.clone()),
+        content: chunk.text,
+        file_path: None,
+        start_line: None,
+        end_line: None,
+        chunk_type: ChunkType::Test,
+        score: chunk.score,
+        model_id: String::new(),
+        model_version: String::new(),
+        stale: false,
+    }
+}
+
+/// Map one supervisor wire chunk (with H13 standing fields) into the H11
+/// evidence-bearing projection. A peer that omitted the standing fields falls
+/// back to the standing-free honesty rule, never to a verdict it did not send.
+fn evidence_from_wire_chunk(
+    project_id: &ProjectId,
+    chunk: crate::ipc::MemoryChunk,
+) -> EvidentChunk {
+    let core = core_chunk_from_wire(project_id, chunk.clone());
+    let standing =
+        chunk.status.as_deref().zip(chunk.source.as_deref()).map(|(status_label, source_label)| {
+            (
+                FactStatusView::parse(status_label).unwrap_or(FactStatusView::Unknown),
+                RecallSource::parse(source_label).unwrap_or(RecallSource::Unknown),
+            )
+        });
+    match standing {
+        Some((truth, source)) => EvidentChunk {
+            chunk: core,
+            truth,
+            source,
+            confidence: Confidence::Unknown,
+            freshness: 1.0,
+            derivation: chunk
+                .why
+                .unwrap_or_else(|| "status carried on the supervisor wire".to_string()),
+            degraded: chunk.degraded,
+            interrupted: chunk.interrupted,
+        },
+        None => {
+            let source = RecallSource::for_chunk(
+                core.chunk_type,
+                core.file_path.as_ref().map(|p| p.as_str()),
+            );
+            EvidentChunk {
+                chunk: core,
+                truth: FactStatusView::Unknown,
+                source,
+                confidence: Confidence::Unknown,
+                freshness: 1.0,
+                derivation: "status not carried on the supervisor wire".to_string(),
+                degraded: chunk.degraded,
+                interrupted: chunk.interrupted,
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl MemoryStore for GateProxyMemoryStore {
+    async fn retrieve(
+        &self,
+        query: &MemoryQuery,
+        cancel: CancellationToken,
+    ) -> Result<Vec<MemoryChunk>, MemoryError> {
+        // The wire chunk is a projection; the H13 standing fields
+        // (status/source/why/degraded/interrupted) are carried for the
+        // evidence-bearing method below. This bare method returns store
+        // chunks as the trait contract requires.
+        Ok(self
+            .fetch_wire_chunks(query, cancel)
+            .await?
             .into_iter()
-            .map(|chunk| MemoryChunk {
-                id: chunk.source_event_id.unwrap_or_default(),
-                project_id: self.project_id.clone(),
-                namespace: MemoryNamespace::Project(self.project_id.clone()),
-                content: chunk.text,
-                file_path: None,
-                start_line: None,
-                end_line: None,
-                chunk_type: ChunkType::Test,
-                score: chunk.score,
-                model_id: String::new(),
-                model_version: String::new(),
-                stale: false,
-            })
+            .map(|chunk| self.core_chunk_from_wire(chunk))
+            .collect())
+    }
+
+    /// H13: rebuild the H11 evidence-bearing projection from the supervisor
+    /// wire, so a supervised agent's recall carries the same source/status/why
+    /// attribution the in-process path carries. A peer that omitted the
+    /// standing fields (pre-H13) falls back to the standing-free projection,
+    /// never to a falsely-good verdict.
+    async fn retrieve_with_evidence(
+        &self,
+        query: &MemoryQuery,
+        cancel: CancellationToken,
+    ) -> Result<Vec<EvidentChunk>, MemoryError> {
+        let wire = self.fetch_wire_chunks(query, cancel).await?;
+        Ok(wire
+            .into_iter()
+            .map(|chunk| evidence_from_wire_chunk(&self.project_id, chunk))
             .collect())
     }
 
@@ -752,6 +840,42 @@ pub(crate) fn gate_proxy_to_tool_error(error: GateProxyError) -> ToolError {
 mod tests {
     use super::*;
     use crate::gate::GateOutcome;
+
+    /// H13: the supervised recall reconstructs the H11 evidence standing from
+    /// the wire — status, source, why, and the degraded/interrupted flags all
+    /// survive the round trip.
+    #[test]
+    fn wire_standing_rebuilds_evidence_bearing_chunks() {
+        let project = ProjectId("p".to_owned());
+        let with_standing = crate::ipc::MemoryChunk {
+            text: "gate writes are WAL-before-execute".to_owned(),
+            kind: "fact".to_owned(),
+            score: 0.9,
+            source_event_id: Some("evt-1".to_owned()),
+            status: Some("assumed".to_owned()),
+            source: Some("model-authored".to_owned()),
+            why: Some("model-authored claim".to_owned()),
+            degraded: true,
+            interrupted: true,
+        };
+        let evident = evidence_from_wire_chunk(&project, with_standing);
+        assert_eq!(evident.truth, FactStatusView::Assumed);
+        assert_eq!(evident.source, RecallSource::ModelAuthored);
+        assert_eq!(evident.derivation, "model-authored claim");
+        assert!(evident.degraded);
+        assert!(evident.interrupted);
+        assert_eq!(evident.chunk.content, "gate writes are WAL-before-execute");
+
+        let legacy = crate::ipc::MemoryChunk {
+            text: "old peer".to_owned(),
+            kind: "fact".to_owned(),
+            score: 0.1,
+            ..Default::default()
+        };
+        let evident = evidence_from_wire_chunk(&project, legacy);
+        assert_eq!(evident.truth, FactStatusView::Unknown);
+        assert!(evident.derivation.contains("not carried"));
+    }
 
     /// The supervisor answers `execute-tool` with the gate outcome; the
     /// backend must reconstruct a full [`ToolOutput`] from `outcome.result`

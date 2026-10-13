@@ -2153,9 +2153,11 @@ async fn handle_retrieve_memory(
     };
     match services.memory.retrieve_with_evidence(&query, cancel.clone()).await {
         Ok(evident) => {
-            // H11: the spine recalls evidence-bearing results. The wire
-            // shape is unchanged (text + kind + rank score), so status
-            // travels as observability here, not as new wire fields.
+            // H13 (completing the H11 carry-forward): the spine recalls
+            // evidence-bearing results and now carries the per-chunk standing
+            // on the wire as additive fields (status/source/why/degraded/
+            // interrupted), so a supervised agent sees the same evidence the
+            // in-process path sees — not logs-plus-counts only.
             let mut contradicted = 0usize;
             let mut superseded = 0usize;
             let mut unknown = 0usize;
@@ -2188,6 +2190,11 @@ async fn handle_retrieve_memory(
                         kind: format!("{:?}", item.chunk.chunk_type).to_lowercase(),
                         score: item.chunk.score,
                         source_event_id: None,
+                        status: Some(item.truth.as_str().to_owned()),
+                        source: Some(item.source.as_str().to_owned()),
+                        why: Some(item.derivation.clone()),
+                        degraded: item.degraded,
+                        interrupted: item.interrupted,
                     }
                 })
                 .collect();

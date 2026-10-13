@@ -722,6 +722,24 @@ impl FactStatusView {
             Self::Unknown => "unknown",
         }
     }
+
+    /// Parse the stable string form back (H13): used by the supervised
+    /// `retrieve-memory` facade to rebuild wire standing. `None` for an
+    /// unrecognized label, so a caller can fall back to the standing-free
+    /// projection rather than inventing a verdict.
+    #[must_use]
+    pub fn parse(label: &str) -> Option<Self> {
+        match label {
+            "verified" => Some(Self::Verified),
+            "assumed" => Some(Self::Assumed),
+            "stale" => Some(Self::Stale),
+            "contradicted" => Some(Self::Contradicted),
+            "outside-window" => Some(Self::OutsideWindow),
+            "superseded" => Some(Self::Superseded),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for FactStatusView {
@@ -775,6 +793,22 @@ impl RecallSource {
             Self::ModelAuthored => "model-authored",
             Self::Derived => "derived",
             Self::Unknown => "unknown",
+        }
+    }
+
+    /// Parse the stable string form back (H13): used by the supervised
+    /// `retrieve-memory` facade to rebuild wire attribution. `None` for an
+    /// unrecognized label, so a caller falls back rather than inventing a
+    /// source.
+    #[must_use]
+    pub fn parse(label: &str) -> Option<Self> {
+        match label {
+            "runtime-observed" => Some(Self::RuntimeObserved),
+            "indexed-file" => Some(Self::IndexedFile),
+            "model-authored" => Some(Self::ModelAuthored),
+            "derived" => Some(Self::Derived),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
         }
     }
 
@@ -1255,6 +1289,36 @@ mod tests {
             let back: FactStatusView = serde_json::from_str(&json).expect("round-trips");
             assert_eq!(back, view);
         }
+    }
+
+    #[test]
+    fn fact_status_view_parse_round_trips_and_rejects_unknown_labels() {
+        for view in [
+            FactStatusView::Verified,
+            FactStatusView::Assumed,
+            FactStatusView::Stale,
+            FactStatusView::Contradicted,
+            FactStatusView::OutsideWindow,
+            FactStatusView::Superseded,
+            FactStatusView::Unknown,
+        ] {
+            assert_eq!(FactStatusView::parse(view.as_str()), Some(view));
+        }
+        assert_eq!(FactStatusView::parse("not-a-status"), None);
+    }
+
+    #[test]
+    fn recall_source_parse_round_trips_and_rejects_unknown_labels() {
+        for source in [
+            RecallSource::RuntimeObserved,
+            RecallSource::IndexedFile,
+            RecallSource::ModelAuthored,
+            RecallSource::Derived,
+            RecallSource::Unknown,
+        ] {
+            assert_eq!(RecallSource::parse(source.as_str()), Some(source));
+        }
+        assert_eq!(RecallSource::parse("not-a-source"), None);
     }
 
     #[test]
