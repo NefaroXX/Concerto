@@ -44,6 +44,25 @@ frontends call. "Equivalent semantics and evidence" means the same operation
 through any covered adapter yields the same `HarnessInvocation.data` payload
 (asserted by the equivalence tests).
 
+Adapter proof map:
+
+- In-process / standalone service: `tests/harness_equivalence.rs`
+  (`memory.recall` equals a direct `retrieve_with_evidence`; the standalone
+  `environment.describe` payload is stable across builds; the checkpoint
+  lifecycle round-trips real bytes and records its evidence).
+- Supervised: `gate_proxy::tests::wire_standing_rebuilds_evidence_bearing_chunks`
+  (the wire's status/source/why/degraded/interrupted rebuild the same
+  `EvidentChunk` evidence) plus the `ipc` wire round-trip/legacy-decode tests.
+- CLI JSON: `concerto-cli::dispatch::harness` tests invoke the real service
+  end-to-end for `environment.describe` and the checkpoint lifecycle and
+  assert the `--json` payload is the service shape. `memory.recall`/`inspect`
+  CLI dispatch is covered by unit tests and by the shared service seam; a full
+  CLI `memory.recall` end-to-end run is **not claimed** here because the first
+  recall triggers `fastembed` model resolution (a network download) in this
+  environment — the same embedder every in-process recall uses.
+- Desktop: `concerto-desktop::views::harness` tests (request building,
+  completion recording incl. refusals, and rendering the service payload).
+
 ## External access — deliberate non-coverage
 
 "External agents should receive narrow, run/project-scoped API access."
