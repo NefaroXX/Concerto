@@ -758,6 +758,53 @@ mod tests {
         assert!(MemoryEvidence::from_json(&value.to_string()).is_err());
     }
 
+    /// The schema-v4 rename (`freshness` → `model_freshness`) must fail loudly
+    /// on a v3 payload, not silently misread it: a v3 envelope is rejected by
+    /// the version gate, and a v4 envelope carrying the old `freshness` key
+    /// instead of `model_freshness` is rejected for the missing field (which
+    /// deliberately has no serde default).
+    #[test]
+    fn v3_payload_with_freshness_key_is_rejected() {
+        let evidence = MemoryEvidence::assemble(
+            "c".to_string(),
+            FactStatusView::Assumed,
+            RecallSource::ModelAuthored,
+            Relevance::clamped(0.1),
+            EvidenceScore::clamped(1.0),
+            Confidence::Unknown,
+            Freshness::fresh(),
+            "model-authored claim".to_string(),
+            false,
+            false,
+            1,
+            stamps().observed_at,
+        );
+        let mut v3 = serde_json::to_value(&evidence).expect("serializes");
+        // A v3 envelope: old version number, old field name.
+        v3["schema_version"] = serde_json::json!(3);
+        if let Some(map) = v3.as_object_mut() {
+            if let Some(freshness) = map.remove("model_freshness") {
+                map.insert("freshness".to_string(), freshness);
+            }
+        }
+        assert!(
+            MemoryEvidence::from_json(&v3.to_string()).is_err(),
+            "v3 payload must not decode under the v4 contract"
+        );
+        // A v4 envelope with the old key but no new key also fails — the
+        // renamed field has no default to rescue it.
+        let mut renamed = serde_json::to_value(&evidence).expect("serializes");
+        if let Some(map) = renamed.as_object_mut() {
+            if let Some(freshness) = map.remove("model_freshness") {
+                map.insert("freshness".to_string(), freshness);
+            }
+        }
+        assert!(
+            MemoryEvidence::from_json(&renamed.to_string()).is_err(),
+            "old field name must not decode without model_freshness"
+        );
+    }
+
     #[test]
     fn missing_degraded_key_reads_as_false() {
         let evidence = MemoryEvidence::assemble(
