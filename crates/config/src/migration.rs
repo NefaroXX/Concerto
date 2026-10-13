@@ -69,6 +69,7 @@ pub fn migrate_config(config: AppConfig) -> Result<AppConfig, ConfigError> {
 fn migrate_v1_to_v2(config: AppConfig) -> Result<AppConfig, ConfigError> {
     Ok(AppConfig {
         shell_security: config.shell_security,
+        cache_pricing: config.cache_pricing,
         // Preserve all existing v1 fields as-is.
         schema_version: 2,
         primary_provider: config.primary_provider,
@@ -126,6 +127,7 @@ fn migrate_v1_to_v2(config: AppConfig) -> Result<AppConfig, ConfigError> {
 fn migrate_v2_to_v3(config: AppConfig) -> Result<AppConfig, ConfigError> {
     Ok(AppConfig {
         shell_security: config.shell_security,
+        cache_pricing: config.cache_pricing,
         schema_version: 3,
         primary_provider: config.primary_provider,
         primary_provider_config: config.primary_provider_config,
