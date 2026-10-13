@@ -87,7 +87,14 @@ impl AnthropicStreamState {
         let output_tokens = raw["output_tokens"].as_u64();
         let reads = raw["cache_read_input_tokens"].as_u64();
         let writes = raw["cache_creation_input_tokens"].as_u64();
-        if input_tokens.is_none() && output_tokens.is_none() && reads.is_none() && writes.is_none()
+        let short = raw["cache_creation"]["ephemeral_5m_input_tokens"].as_u64();
+        let long = raw["cache_creation"]["ephemeral_1h_input_tokens"].as_u64();
+        if input_tokens.is_none()
+            && output_tokens.is_none()
+            && reads.is_none()
+            && writes.is_none()
+            && short.is_none()
+            && long.is_none()
         {
             return;
         }
@@ -101,10 +108,10 @@ impl AnthropicStreamState {
         if let Some(writes) = writes {
             usage.cache_write_tokens = Some(writes);
         }
-        if let Some(short) = raw["cache_creation"]["ephemeral_5m_input_tokens"].as_u64() {
+        if let Some(short) = short {
             usage.cache_write_5m_tokens = Some(short);
         }
-        if let Some(long) = raw["cache_creation"]["ephemeral_1h_input_tokens"].as_u64() {
+        if let Some(long) = long {
             usage.cache_write_1h_tokens = Some(long);
         }
         // Snapshots are cumulative: replace each reported component, then
@@ -292,6 +299,19 @@ mod tests {
         assert_eq!(state.usage.unwrap().prompt_tokens, None);
         state.capture_usage(&serde_json::json!({"usage": {"cache_creation_input_tokens": 0}}));
         assert_eq!(state.usage.unwrap().prompt_tokens, Some(30));
+    }
+
+    #[test]
+    fn ttl_only_snapshot_preserves_write_breakdown() {
+        let mut state = AnthropicStreamState::new();
+        state.capture_usage(&serde_json::json!({"usage": {
+            "cache_creation": {"ephemeral_5m_input_tokens": 20, "ephemeral_1h_input_tokens": 30}
+        }}));
+        let usage = state.usage.unwrap();
+        assert_eq!(usage.cache_write_5m_tokens, Some(20));
+        assert_eq!(usage.cache_write_1h_tokens, Some(30));
+        assert_eq!(usage.prompt_tokens, None);
+        assert_eq!(usage.cache_write_tokens, None);
     }
 
     #[test]

@@ -242,6 +242,7 @@ mod tests {
     fn v1_fixture() -> AppConfig {
         AppConfig {
             shell_security: Default::default(),
+            cache_pricing: Default::default(),
             schema_version: 1,
             primary_provider: Some("anthropic".into()),
             primary_provider_config: None,
@@ -280,6 +281,7 @@ mod tests {
     fn v2_fixture() -> AppConfig {
         AppConfig {
             shell_security: Default::default(),
+            cache_pricing: Default::default(),
             schema_version: 2,
             primary_provider: Some("openai".into()),
             primary_provider_config: None,
@@ -340,6 +342,7 @@ mod tests {
     fn v3_config_passes_through_unchanged() {
         let v3 = AppConfig {
             shell_security: Default::default(),
+            cache_pricing: Default::default(),
             schema_version: 3,
             primary_provider: Some("anthropic".into()),
             primary_provider_config: None,

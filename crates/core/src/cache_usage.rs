@@ -71,6 +71,20 @@ pub struct CachePricing {
 }
 
 impl CachePricing {
+    pub fn is_valid(&self) -> bool {
+        !self.version.trim().is_empty()
+            && [
+                Some(self.input),
+                Some(self.output),
+                self.cache_read,
+                self.cache_write,
+                self.cache_write_5m,
+                self.cache_write_1h,
+            ]
+            .into_iter()
+            .flatten()
+            .all(|rate| rate.is_finite() && rate >= 0.0)
+    }
     /// A complete estimate requires every charged component. Reasoning is
     /// already included in output; cache TTL counts are subsets of writes.
     pub fn estimate(&self, usage: CompletionUsage) -> Option<f64> {
@@ -81,7 +95,7 @@ impl CachePricing {
             let rate = rate?;
             (rate.is_finite() && rate >= 0.0).then_some(tokens as f64 * rate)
         }
-        if self.version.trim().is_empty() {
+        if !self.is_valid() {
             return None;
         }
         if self.writes_charged_as_input {
@@ -122,6 +136,35 @@ impl CachePricing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_cache_prices_inclusive_input_without_inventing_writes() {
+        let mut pricing = CachePricing {
+            version: "fixture-v1".into(),
+            input: 2.0,
+            output: 4.0,
+            cache_read: Some(0.5),
+            cache_write: None,
+            cache_write_5m: None,
+            cache_write_1h: None,
+            writes_charged_as_input: true,
+        };
+        let usage = CompletionUsage {
+            prompt_tokens: Some(1000),
+            completion_tokens: Some(100),
+            cache_read_tokens: Some(600),
+            ..Default::default()
+        };
+        assert!((pricing.estimate(usage).unwrap() - 0.0015).abs() < 1e-10);
+        assert_eq!(
+            pricing.estimate(CompletionUsage { cache_read_tokens: Some(1001), ..usage }),
+            None
+        );
+        assert_eq!(pricing.estimate(CompletionUsage { cache_read_tokens: None, ..usage }), None);
+        pricing.input = f64::NAN;
+        assert!(!pricing.is_valid());
+        assert_eq!(pricing.estimate(usage), None);
+    }
 
     #[test]
     fn ratios_use_matched_token_sums_and_expose_unknown_coverage() {

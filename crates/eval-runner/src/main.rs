@@ -482,9 +482,7 @@ fn compare_with_baseline(
         !report.individual_results.is_empty()
             && report.individual_results.iter().all(|result| {
                 result.telemetry.as_ref().is_some_and(|telemetry| {
-                    telemetry.cache.calls > 0
-                        && telemetry.missing_usage_calls == 0
-                        && telemetry.missing_cost_calls == 0
+                    telemetry.cache.calls > 0 && telemetry.missing_usage_calls == 0
                 })
             })
     };
@@ -499,7 +497,15 @@ fn compare_with_baseline(
             (metadata.get("pricing_fingerprint").cloned(), metadata.get("cost_source").cloned())
         })
     };
-    let costs_comparable = efficiency_comparable && price_basis(current) == price_basis(&baseline);
+    let complete_costs = |report: &BenchmarkReport| {
+        report.individual_results.iter().all(|result| {
+            result.telemetry.as_ref().is_some_and(|telemetry| telemetry.missing_cost_calls == 0)
+        })
+    };
+    let costs_comparable = efficiency_comparable
+        && complete_costs(current)
+        && complete_costs(&baseline)
+        && price_basis(current) == price_basis(&baseline);
     if !costs_comparable {
         eprintln!("Cost comparison unavailable: missing measurements or different price versions.");
     }

@@ -112,3 +112,33 @@ impl Drop for AttemptRecorder {
         self.publish();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropping_attempt_records_interruption_once_without_fabricated_usage() {
+        let bus = EventBus::new(1);
+        let mut durable = bus.subscribe_durable();
+        let session = Ulid::new();
+        let task = TaskId::new();
+        let request = CompletionRequest { model: "fixture".into(), ..Default::default() };
+        let recorder =
+            AttemptRecorder::new(bus, session, task, Ulid::new(), 1, "fixture", &request);
+        drop(recorder);
+        let started = durable.try_recv().unwrap();
+        let finished = durable.try_recv().unwrap();
+        let EventKind::ProviderCallStarted { record: start } = &started.kind else {
+            panic!("start missing")
+        };
+        let EventKind::ProviderCallFinished { record: end } = &finished.kind else {
+            panic!("finish missing")
+        };
+        assert_eq!(start.attempt_id, end.attempt_id);
+        assert_eq!(end.status, "interrupted");
+        assert!(end.usage.is_none());
+        assert!(end.estimated_cost_usd.is_none());
+        assert!(durable.try_recv().is_err());
+    }
+}
