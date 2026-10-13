@@ -1795,3 +1795,146 @@ async fn resume_f3_evidence_becomes_explicit_reconcilable_records() {
     let restored = crate::checkpoint::GraphCheckpoint::from_json(&json).expect("checkpoint loads");
     assert_eq!(restored.external_changes.len(), 2, "records survive the checkpoint JSON");
 }
+
+/// H12 / DEFERRED row 41 — live interrupt/resume with MEMORY grounding.
+///
+/// The row parks memory-grounded resume M3 on "live stress/interrupt
+/// evidence". This test supplies it with a REAL interruption: the specialist
+/// mock cancels the run token the moment its call is in flight (the operator
+/// pressing stop mid-dispatch), so the run ends interrupted with a durable,
+/// resumable checkpoint — not a mocked stall. A fresh coordinator then resumes
+/// from that checkpoint and its Phase-0 retrieval is asserted to be grounded
+/// in run 1's OWN persisted memory (the architect's decision), with the
+/// settled step never re-dispatched (a canary fails the run if it is).
+#[tokio::test]
+async fn interrupt_midrun_then_resume_stays_memory_grounded() {
+    let dir = tempfile::tempdir().expect("tempdir for interrupt/resume workspace");
+    let decision_store = Arc::new(concerto_memory::decision_store::DecisionStore::new());
+    let task_tree = Arc::new(concerto_memory::task_tree::TaskTreeStore::new());
+
+    // ── run 1: interrupted while the coder call is in flight ───
+    let bus = EventBus::new(256);
+    let stop = CancellationToken::new();
+    let mut registry = AgentRegistry::from_mocks(vec![
+        MockExpertAgent::always_succeed(AgentId::new("architect"), DESIGN_DOC_JSON),
+        // The stop lands inside the coder's call: the mock cancels the run
+        // token, and the coordinator records the interrupted dispatch.
+        MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+            .with_artifact_writer()
+            .cancel_on_run(stop.clone()),
+    ]);
+    registry.attach_configs_for_test(
+        std::iter::once((AgentId::new("architect"), design_doc_config("architect"))).collect(),
+    );
+    let registry = Arc::new(registry);
+    let (mut coordinator, store, session_id) = coordinator_with_store(
+        bus.clone(),
+        registry,
+        vec![
+            CoordinatorTurn::Calls(vec![call_specialist("architect", "design it")]),
+            CoordinatorTurn::Calls(vec![call_specialist("coder", "implement")]),
+            CoordinatorTurn::Text("done".into()),
+        ],
+        dir.path(),
+    )
+    .await;
+    coordinator =
+        coordinator.with_memory_writeback(Some(decision_store.clone()), Some(task_tree.clone()));
+
+    let task = AgentTask::new(session_id, "build the thing");
+    let context = AgentContext::new(concerto_core::types::SessionContext::new(
+        session_id,
+        dir.path().to_path_buf(),
+    ));
+    let first = coordinator.run(task, context, stop.clone(), None).await;
+
+    // The interrupt is honest: the run did NOT silently complete. It either
+    // surfaces as Partial (a recoverable stop) or as Cancelled.
+    let interrupted = match first {
+        Ok(output) => {
+            assert_eq!(
+                output.completion_status,
+                concerto_core::types::AgentCompletionStatus::Partial,
+                "an interrupted run must not read as Completed: {}",
+                output.final_message
+            );
+            true
+        }
+        Err(OrchestratorError::Cancelled) => true,
+        Err(other) => panic!("unexpected interrupt outcome: {other:?}"),
+    };
+    assert!(interrupted, "the run was interrupted");
+
+    // The cooperative-cancel path persisted a durable, resumable checkpoint.
+    let record = store
+        .load_orchestration_checkpoint(session_id)
+        .await
+        .expect("checkpoint store read")
+        .expect("the interrupted run persisted a resumable checkpoint");
+    assert!(!record.completed, "the interrupted run stays resumable");
+
+    // Run 1's settled design step is in the memory store — the grounding the
+    // resume will read.
+    let decisions = decision_store.list_all().expect("decisions listed");
+    assert!(
+        decisions
+            .iter()
+            .any(|decision| decision.what.contains("architect") || decision.why.contains("design")),
+        "run 1's settled decision survives the interrupt: {decisions:?}"
+    );
+
+    // ── run 2: a fresh coordinator resumes from the durable checkpoint ──
+    let bus2 = EventBus::new(256);
+    let registry2 = Arc::new(AgentRegistry::from_mocks(vec![
+        // Canary: the settled design step must never re-dispatch.
+        MockExpertAgent::always_fail(AgentId::new("architect"), "must not be dispatched"),
+        MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
+            .with_artifact_writer(),
+    ]));
+    let mut coordinator2 = coordinator_on_store(
+        bus2,
+        registry2,
+        vec![CoordinatorTurn::Text(String::new())],
+        store.clone(),
+    )
+    .with_memory_writeback(Some(decision_store.clone()), Some(task_tree.clone()));
+
+    // The resumed run's Phase-0 seed — the same derivation `run()` uses — must
+    // ground the plan in run 1's own memory.
+    let seed = CoordinatorAgent::checkpoint_run_id_hint(Some(&record.state_json));
+    let resume_task = AgentTask::new(session_id, "continue");
+    let mut resume_ctx = AgentContext::new(concerto_core::types::SessionContext::new(
+        session_id,
+        dir.path().to_path_buf(),
+    ));
+    coordinator2
+        .retrieve_memory_context(
+            &resume_task,
+            &mut resume_ctx,
+            seed.as_deref(),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(
+        !resume_ctx.retrieved_chunks.is_empty(),
+        "the resumed plan is grounded in run 1's memory, not empty"
+    );
+    assert!(
+        resume_ctx
+            .retrieved_chunks
+            .iter()
+            .all(|chunk| chunk.id.starts_with("plan://") || chunk.id.starts_with("memory://")),
+        "the grounding is run 1's persisted memory: {:?}",
+        resume_ctx.retrieved_chunks
+    );
+
+    // The resume runs to completion; the architect canary never fires.
+    let second = coordinator2
+        .run(resume_task, resume_ctx, CancellationToken::new(), Some(record.state_json))
+        .await
+        .expect("the resumed run should succeed");
+    assert_ne!(
+        second.final_message, "must not be dispatched",
+        "a settled step was re-dispatched on resume"
+    );
+}
