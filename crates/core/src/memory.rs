@@ -846,7 +846,7 @@ impl std::fmt::Display for RecallSource {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvidentChunk {
     /// The recalled chunk (its `score` remains the rank signal only —
-    /// never freshness; see `derivation`).
+    /// never model freshness; see `derivation`).
     pub chunk: MemoryChunk,
     /// Truth status from deterministic substrate (never from rank/score).
     pub truth: FactStatusView,
@@ -856,10 +856,14 @@ pub struct EvidentChunk {
     /// (the memory path holds none today).
     #[serde(default)]
     pub confidence: Confidence,
-    /// Model freshness (`1.0` current model, `0.0` superseded model):
-    /// freshness of the *model*, never of the rank. Content age is out of
-    /// scope here — see `derivation`.
-    pub freshness: f64,
+    /// Model-version freshness (`1.0` current model, `0.0` superseded
+    /// model): freshness of the *model*, never of the rank and never of
+    /// the content. Named `model_freshness` — not `freshness` — so it
+    /// cannot be misread beside `truth`: a TTL-expired chunk legitimately
+    /// carries `truth: Stale` with `model_freshness: 1.0`, because TTL
+    /// staleness lives in `truth` (and its `derivation`), not here.
+    /// Content age is out of scope here — see `derivation`.
+    pub model_freshness: f64,
     /// Why this status, in words: which substrate spoke (or that none
     /// did). Bounded at assembly; never carries scores-as-truth.
     pub derivation: String,
@@ -878,11 +882,11 @@ pub struct EvidentChunk {
 }
 
 impl EvidentChunk {
-    /// Validated constructor: `freshness` must be finite within
+    /// Validated constructor: `model_freshness` must be finite within
     /// `0.0..=1.0` (mirroring the rejecting `Freshness::new` rule without
     /// depending on the memory crate). Returns `None` for NaN, infinities,
     /// and out-of-range values — there is no clamping path that would
-    /// invent a freshness the substrate never had.
+    /// invent a model freshness the substrate never had.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -890,18 +894,18 @@ impl EvidentChunk {
         truth: FactStatusView,
         source: RecallSource,
         confidence: Confidence,
-        freshness: f64,
+        model_freshness: f64,
         derivation: String,
         degraded: bool,
         interrupted: bool,
     ) -> Option<Self> {
-        if freshness.is_finite() && (0.0..=1.0).contains(&freshness) {
+        if model_freshness.is_finite() && (0.0..=1.0).contains(&model_freshness) {
             Some(Self {
                 chunk,
                 truth,
                 source,
                 confidence,
-                freshness,
+                model_freshness,
                 derivation,
                 degraded,
                 interrupted,
@@ -1356,7 +1360,7 @@ mod tests {
     }
 
     #[test]
-    fn evident_chunk_rejects_invalid_freshness() {
+    fn evident_chunk_rejects_invalid_model_freshness() {
         let project_id = ProjectId("p".into());
         let chunk = MemoryChunk {
             id: "c".into(),
@@ -1373,7 +1377,7 @@ mod tests {
             stale: false,
         };
         // Boundaries are inclusive; NaN/infinities/out-of-range refused —
-        // no clamping path invents a freshness.
+        // no clamping path invents a model freshness.
         assert!(EvidentChunk::new(
             chunk.clone(),
             FactStatusView::Assumed,
@@ -1398,7 +1402,7 @@ mod tests {
                     false,
                 )
                 .is_none(),
-                "must refuse freshness {bad}"
+                "must refuse model freshness {bad}"
             );
         }
     }
@@ -1425,7 +1429,7 @@ mod tests {
             "truth": "unknown",
             "source": "unknown",
             "confidence": "unknown",
-            "freshness": 1.0,
+            "model_freshness": 1.0,
             "derivation": "unknown",
             "degraded": false,
         });

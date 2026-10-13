@@ -160,14 +160,14 @@ pub fn project_without_standing(chunks: Vec<MemoryChunk>) -> Vec<EvidentChunk> {
                 _ => "status not established by this store (no standing substrate)".to_string(),
             };
             // Model freshness from the chunk's own stale flag only —
-            // rank (`chunk.score`) never enters freshness here.
-            let freshness = if chunk.stale { 0.0 } else { 1.0 };
+            // rank (`chunk.score`) never enters model freshness here.
+            let model_freshness = if chunk.stale { 0.0 } else { 1.0 };
             EvidentChunk {
                 chunk,
                 truth,
                 source,
                 confidence: Confidence::Unknown,
-                freshness,
+                model_freshness,
                 derivation,
                 degraded: false,
                 interrupted: false,

@@ -595,7 +595,7 @@ fn evidence_from_wire_chunk(
             truth,
             source,
             confidence: Confidence::Unknown,
-            freshness: 1.0,
+            model_freshness: 1.0,
             derivation: chunk
                 .why
                 .unwrap_or_else(|| "status carried on the supervisor wire".to_string()),
@@ -612,7 +612,7 @@ fn evidence_from_wire_chunk(
                 truth: FactStatusView::Unknown,
                 source,
                 confidence: Confidence::Unknown,
-                freshness: 1.0,
+                model_freshness: 1.0,
                 derivation: "status not carried on the supervisor wire".to_string(),
                 degraded: chunk.degraded,
                 interrupted: chunk.interrupted,

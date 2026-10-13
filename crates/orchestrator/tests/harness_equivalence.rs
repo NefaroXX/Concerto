@@ -178,7 +178,7 @@ fn fixed_evidence_chunk() -> EvidentChunk {
         truth: FactStatusView::Assumed,
         source: RecallSource::ModelAuthored,
         confidence: Confidence::Unknown,
-        freshness: 1.0,
+        model_freshness: 1.0,
         derivation: "model-authored claim; no supporting evidence in range".into(),
         degraded: false,
         interrupted: false,
