@@ -1293,17 +1293,23 @@ impl AgentLoop {
 
     /// Phase 2: Retrieve memory chunks for context unless in fast mode.
     /// Returns a formatted memory block to inject into the prompt.
+    ///
+    /// H11: recall is evidence-bearing — each result carries source
+    /// attribution, status, and the derivation, rendered by
+    /// `format_evident_memory` so the model sees claims as claims and
+    /// unknown as unknown. The RAG budget still bounds by rank score;
+    /// evidence rides along untouched by clipping.
     async fn retrieve_working_memory(
         &self,
         description: &str,
         session: &SessionContext,
         cancel: CancellationToken,
     ) -> String {
-        let mut memory_chunks = if self.fast {
+        let mut evident = if self.fast {
             Vec::new()
         } else {
             self.memory
-                .retrieve(
+                .retrieve_with_evidence(
                     &MemoryQuery {
                         text: description.to_string(),
                         project_id: session.project_id.clone(),
@@ -1322,10 +1328,10 @@ impl AgentLoop {
         // minus the response reservation) — never the raw total capacity.
         if let Some(ref allocator) = self.budget_allocator {
             let budget = self.provider.context_capacity(&self.usage_model);
-            memory_chunks = allocator.truncate_to_rag_limit(memory_chunks, &budget);
+            evident = allocator.truncate_evident_to_rag_limit(evident, &budget);
         }
 
-        crate::memory_prompt::format_retrieved_memory(&memory_chunks)
+        crate::memory_prompt::format_evident_memory(&evident)
     }
 
     /// Phase 3: Build a `CompletionRequest` with working memory, conversation
@@ -4050,6 +4056,318 @@ mod tests {
             "no second hidden owner: a loop without the allocator stays unbounded \
              ({unbounded_tokens} tokens)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // H11 — production recall path (integration): the real `MemorySystem`
+    // over SQLite stores, behind `retrieve_working_memory`, rendered by
+    // `format_evident_memory`.
+    // -----------------------------------------------------------------------
+
+    /// Seed one chunk directly (vector row via `store_projection` so a
+    /// metadata sidecar can ride along, plus the FTS row) — bypassing
+    /// `MemorySystem::store` for chunks that need explicit metadata.
+    async fn seed_projection_chunk(
+        vector_store: &concerto_memory::vector_store::SqliteVectorStore,
+        fts_store: &concerto_memory::fts::SqliteFullTextStore,
+        pid: &concerto_core::types::ProjectId,
+        id: &str,
+        content: &str,
+        file_path: &str,
+        metadata: serde_json::Value,
+    ) {
+        use concerto_memory::fts::FullTextStore as _;
+
+        let record = concerto_core::memory::EmbeddingRecord {
+            id: id.to_string(),
+            project_id: pid.clone(),
+            chunk_hash: blake3::hash(content.as_bytes()).to_string(),
+            content: content.to_string(),
+            file_path: file_path.into(),
+            start_line: None,
+            end_line: None,
+            chunk_type: concerto_core::memory::ChunkType::Fact,
+            vector: Vec::new(),
+            model_id: "seed".into(),
+            model_version: "1".into(),
+            stale: false,
+            created_at: time::OffsetDateTime::now_utc(),
+        };
+        vector_store
+            .store_projection(&record, &metadata, CancellationToken::new())
+            .await
+            .expect("projection seed");
+        fts_store
+            .insert(
+                &concerto_core::memory::MemoryChunk {
+                    id: id.to_string(),
+                    project_id: pid.clone(),
+                    namespace: concerto_core::memory::MemoryNamespace::Project(pid.clone()),
+                    content: content.to_string(),
+                    file_path: Some(file_path.into()),
+                    start_line: None,
+                    end_line: None,
+                    chunk_type: concerto_core::memory::ChunkType::Fact,
+                    score: 1.0,
+                    model_id: "seed".into(),
+                    model_version: "1".into(),
+                    stale: false,
+                },
+                pid,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("fts seed");
+    }
+
+    /// Blocking review follow-up (item 6): prove `Superseded` /
+    /// `Contradicted` / `Verified` actually RENDER, with their reasons,
+    /// through the production single-agent recall path — a real
+    /// `MemorySystem` over SQLite stores (populated link store, decision
+    /// metadata, and the `resource_facts` observation seam), behind
+    /// `AgentLoop::retrieve_working_memory` → `format_evident_memory` —
+    /// not only reachable in unit tests.
+    #[tokio::test]
+    async fn production_recall_path_renders_evidence_statuses_with_reasons() {
+        use concerto_core::memory::{
+            Decision, DecisionCategory, DecisionId, MemoryEntry, MemoryId, MemoryLink,
+            MemoryLinkKind, MemoryNamespace,
+        };
+        use concerto_core::traits::memory::MemoryStore as _;
+        use concerto_memory::decision_store::DecisionStore;
+        use concerto_memory::fts::SqliteFullTextStore;
+        use concerto_memory::links::LinkStore;
+        use concerto_memory::system::MemorySystem;
+        use concerto_memory::task_tree::TaskTreeStore;
+        use concerto_memory::vector_store::SqliteVectorStore;
+
+        let dir = tempfile::tempdir().expect("project root tempdir");
+        let project_dir = std::path::PathBuf::from(dir.path());
+        let session = SessionContext::new(Ulid::new(), project_dir.clone());
+        let pid = session.project_id.clone();
+
+        // The memory DB pool and its stores — the same SQLite trio the
+        // bootstrap builds (vector + FTS + links share one pool).
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("memory pool connects");
+        let vector_store =
+            Arc::new(SqliteVectorStore::new(pool.clone()).await.expect("vector store opens"));
+        let fts_store = Arc::new(SqliteFullTextStore::new(pool.clone()).await.expect("fts opens"));
+        let link_store = Arc::new(LinkStore::new(pool.clone()).await.expect("links open"));
+        let decision_store = Arc::new(DecisionStore::new());
+        let system = MemorySystem::new(
+            vector_store.clone(),
+            fts_store.clone(),
+            decision_store.clone(),
+            Arc::new(TaskTreeStore::new()),
+            None, // no embedder: FTS carries the recall (the healthy fused path)
+            pid.clone(),
+            None,
+        )
+        .with_link_store(link_store.clone());
+
+        let token = CancellationToken::new();
+        let entry = |content: &str| MemoryEntry {
+            id: MemoryId(Ulid::new()),
+            project_id: pid.clone(),
+            namespace: MemoryNamespace::Project(pid.clone()),
+            content: content.into(),
+            chunk_type: concerto_core::memory::ChunkType::Fact,
+            model_id: None,
+            model_version: None,
+            metadata: serde_json::json!({}),
+            expires_at: None,
+            created_at: time::OffsetDateTime::now_utc(),
+        };
+
+        // (a) Contradicted: a stored fact with a live `Contradicts` link.
+        let contradicted = system
+            .store(entry("contradicted claim about the loader integration marker"), token.clone())
+            .await
+            .expect("contradicted fact stores");
+        link_store
+            .put(
+                &MemoryLink::new("critic-a", contradicted.to_string(), MemoryLinkKind::Contradicts),
+                token.clone(),
+            )
+            .await
+            .expect("contradiction link persists");
+
+        // (b) Superseded by link: a stored fact replaced by a newer chunk.
+        let superseded = system
+            .store(entry("superseded claim about the loader integration marker"), token.clone())
+            .await
+            .expect("superseded fact stores");
+        link_store
+            .put(
+                &MemoryLink::new(
+                    "replacement-b",
+                    superseded.to_string(),
+                    MemoryLinkKind::Supersedes,
+                ),
+                token.clone(),
+            )
+            .await
+            .expect("supersession link persists");
+
+        // (c) Superseded by cited decision: a chunk whose metadata cites a
+        // decision the journal records as superseded.
+        let old = Decision {
+            id: DecisionId(Ulid::new()),
+            session_id: Ulid::nil(),
+            task_id: None,
+            what: "old approach".into(),
+            why: "first try".into(),
+            outcome: None,
+            category: DecisionCategory::Architecture,
+            confidence: 0.6,
+            superseded_by: None,
+            created_at: time::OffsetDateTime::now_utc(),
+        };
+        let newer = Decision { id: DecisionId(Ulid::new()), ..old.clone() };
+        decision_store.insert(old.clone()).expect("old decision inserts");
+        decision_store.insert(newer.clone()).expect("new decision inserts");
+        decision_store.supersede(old.id, newer.id).expect("supersede records");
+        seed_projection_chunk(
+            &vector_store,
+            &fts_store,
+            &pid,
+            "cited-decision-chunk",
+            "decision-cited notes about the loader integration marker",
+            "memory",
+            serde_json::json!({ "decision_id": old.id.to_string() }),
+        )
+        .await;
+
+        // (d) Verified through the real observation seam: an indexed chunk
+        // with a real file path and a clean `resource_facts` row, attached
+        // through the erased `Arc<dyn MemoryStore>` handle exactly like
+        // the run path does.
+        seed_projection_chunk(
+            &vector_store,
+            &fts_store,
+            &pid,
+            "verified-chunk",
+            "verified loader notes integration marker",
+            "src/verified.rs",
+            serde_json::json!({}),
+        )
+        .await;
+        let sessions_dir = tempfile::tempdir().expect("sessions tempdir");
+        let sessions_path = sessions_dir.path().join("sessions.db");
+        let sessions_options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&sessions_path)
+            .create_if_missing(true);
+        let sessions_pool = sqlx::pool::PoolOptions::new()
+            .max_connections(1)
+            .connect_with(sessions_options)
+            .await
+            .expect("sessions pool connects");
+        sqlx::migrate!("../sessions/migrations")
+            .run(&sessions_pool)
+            .await
+            .expect("sessions migrations apply");
+        concerto_sessions::resource_facts::ResourceFacts::new(sessions_pool.clone())
+            .apply_observed(
+                "ev-verified-1",
+                "agent-a",
+                time::OffsetDateTime::now_utc().unix_timestamp(),
+                &concerto_sessions::resource_facts::ToolExecutedPayload {
+                    agent_id: Some("agent-a".to_owned()),
+                    task_id: None,
+                    run_id: None,
+                    tool: "read".to_owned(),
+                    args: serde_json::json!({ "path": "src/verified.rs" }),
+                    success: true,
+                    exit_code: Some(0),
+                    generation: "gen-1".to_owned(),
+                    project_root_hash: crate::tool_facts::project_root_hash(&project_dir),
+                    paths: vec![concerto_sessions::resource_facts::ObservedPath {
+                        path: "src/verified.rs".to_owned(),
+                        size_bytes: Some(10),
+                        mtime_ms: Some(1_000),
+                        content_hash: Some("h".to_owned()),
+                    }],
+                    served_from: None,
+                    canonical_tool: None,
+                    canonical_operation: None,
+                    failure: None,
+                },
+                &token,
+            )
+            .await
+            .expect("clean observation applies");
+
+        let memory: Arc<dyn MemoryStore> = Arc::new(system);
+        memory.attach_path_observations(Arc::new(
+            crate::memory_observations::ResourceFactObservations::new(
+                sessions_pool.clone(),
+                &project_dir,
+            ),
+        ));
+
+        // The production loop shape: not fast (the RAG path runs), no
+        // budget allocator.
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(EchoTool));
+        let allow_all = vec![PolicyRule::AutoApprove(Condition::Always)];
+        let policy = Arc::new(SimplePolicyEngine::new(allow_all, Arc::new(TestAudit)));
+        let executor = Arc::new(ToolExecutor::new(Arc::new(registry), policy));
+        let root_str = project_dir.to_string_lossy().into_owned();
+        let loop_with_memory = AgentLoop::with_project_root(
+            EventBus::new(64),
+            Arc::new(ApprovalTestHarness::always_approve()),
+            Arc::new(TinyBudgetProvider),
+            executor,
+            memory,
+            Arc::new(std::sync::Mutex::new(UndoManager::new(&root_str))),
+            EvalEngine::new(&root_str),
+            PromptBuilder::new("test system prompt"),
+            1,
+            false,
+            project_dir.clone(),
+            None,
+        );
+
+        let block = loop_with_memory
+            .retrieve_working_memory("integration marker", &session, CancellationToken::new())
+            .await;
+
+        // Every status renders with its reason — none is reachable only in
+        // unit tests.
+        assert!(block.contains("\"status\":\"contradicted\""), "contradicted renders: {block}");
+        assert!(
+            block.contains("contradicted by critic-a"),
+            "the contradicting source is cited: {block}"
+        );
+        assert!(block.contains("\"status\":\"superseded\""), "superseded renders: {block}");
+        assert!(
+            block.contains("superseded by replacement-b"),
+            "the replacing chunk is cited: {block}"
+        );
+        assert!(
+            block.contains("cites superseded decision"),
+            "the decision-cited supersession renders: {block}"
+        );
+        assert!(
+            block.contains(&old.id.to_string()),
+            "the superseded decision id is cited: {block}"
+        );
+        assert!(block.contains("\"status\":\"verified\""), "verified renders: {block}");
+        assert!(
+            block.contains("\"source\":\"runtime-observed\""),
+            "the observation seam upgrades the source: {block}"
+        );
+        assert!(
+            block.contains("clean resource-fact observation ev-verified-1"),
+            "the verifying observation is cited: {block}"
+        );
+        // The interruption signal rides per chunk as false — present, not
+        // missing, on a completed recall.
+        assert!(block.contains("\"interrupted\":false"));
     }
 
     // -----------------------------------------------------------------------

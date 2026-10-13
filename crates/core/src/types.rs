@@ -2216,6 +2216,16 @@ pub struct AgentContext {
     pub session: SessionContext,
     pub parent_task: Option<AgentTask>,
     pub working_memory: crate::memory::WorkingMemorySnapshot,
+    /// Bare recalled chunks for the multi-agent prompt path.
+    ///
+    /// H11 gap (recorded for a future owner): the single-agent path recalls
+    /// evidence-bearing items (`MemoryStore::retrieve_with_evidence` →
+    /// `EvidentChunk`: source, status, why), but this field still carries
+    /// bare `MemoryChunk`s because it is populated in the orchestrator's
+    /// `coordinator.rs`, which H11 must not touch. The chunks come from
+    /// the same evidence-backed recall implementation; only the projection
+    /// is lost here. Closing the gap means switching this field to
+    /// `Vec<EvidentChunk>` and updating the coordinator population site.
     pub retrieved_chunks: Vec<crate::memory::MemoryChunk>,
     pub previous_results: Vec<AgentRunResult>,
     pub budget_remaining_usd: Option<f64>,

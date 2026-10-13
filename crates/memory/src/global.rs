@@ -7,11 +7,13 @@
 //! Schema is intentionally simple — a KV-like table with an FTS5 index for
 //! text search. No embedding pipeline, no chunk metadata.
 
+use async_trait::async_trait;
 use camino::Utf8Path;
 use concerto_core::error::MemoryError as CoreMemoryError;
 use concerto_core::memory::{
     ChunkType, MemoryChunk, MemoryEntry, MemoryId, MemoryNamespace, MemoryQuery, ProjectId,
 };
+use concerto_core::traits::memory::MemoryStore;
 use concerto_core::CancellationToken;
 use sqlx::SqlitePool;
 use time::OffsetDateTime;
@@ -249,6 +251,47 @@ impl GlobalMemoryStore {
             return Err(CoreMemoryError::NotFound(id.to_string()));
         }
         Ok(())
+    }
+}
+
+/// H11: the global store speaks the shared [`MemoryStore`] contract, so
+/// routing (the memory system's global branch) and agents reach the same
+/// evidence-bearing recall everywhere. The default
+/// `retrieve_with_evidence` projection applies: global rows are
+/// user-scoped `Fact` entries, so they recall as model-authored claims
+/// (`Assumed`) until evidence supports them — never as verified facts.
+#[async_trait]
+impl MemoryStore for GlobalMemoryStore {
+    async fn retrieve(
+        &self,
+        query: &MemoryQuery,
+        cancel: CancellationToken,
+    ) -> Result<Vec<MemoryChunk>, CoreMemoryError> {
+        Self::retrieve(self, query, cancel).await
+    }
+
+    async fn store(
+        &self,
+        entry: MemoryEntry,
+        cancel: CancellationToken,
+    ) -> Result<MemoryId, CoreMemoryError> {
+        Self::store(self, &entry, cancel).await
+    }
+
+    async fn invalidate(
+        &self,
+        id: MemoryId,
+        cancel: CancellationToken,
+    ) -> Result<(), CoreMemoryError> {
+        Self::invalidate(self, id, cancel).await
+    }
+
+    async fn invalidate_chunk(
+        &self,
+        id: &str,
+        cancel: CancellationToken,
+    ) -> Result<(), CoreMemoryError> {
+        Self::invalidate_chunk(self, id, cancel).await
     }
 }
 
