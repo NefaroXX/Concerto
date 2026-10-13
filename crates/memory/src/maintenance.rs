@@ -13,9 +13,15 @@
 //! maintenance run that could not complete (store locked, embedder down,
 //! cancelled mid-pass) is recorded as [`MaintenanceOutcome::Degraded`] or
 //! [`MaintenanceOutcome::Failed`] with a reason — an *absent* record for an
-//! attempted run is the exact defect H12 exists to close, so recording is
+//! attempted run is the defect H12 exists to close, so recording is
 //! deliberately **not** gated on the maintenance pass's own cancellation
 //! token (see [`MaintenanceLedger::record`]).
+//!
+//! Recording is best-effort, and the code claims no more than that: every
+//! attempt records, but a ledger-write failure (the table unavailable, the
+//! pool closed) degrades to a `tracing::warn!` and leaves the pass's own
+//! result unchanged. A failed write cannot be recorded in the ledger it
+//! failed to write — a bounded circularity, not a silent success.
 //!
 //! Identity: targets are memory-native ids (chunk ids, decision ids); a sweep
 //! targets the project id. This does not reuse the `resource_facts` keying
@@ -154,9 +160,12 @@ impl MaintenanceTargetKind {
 /// One durable maintenance observation.
 ///
 /// Construct through [`MaintenanceRecord::completed`],
-/// [`MaintenanceRecord::degraded`] or [`MaintenanceRecord::failed`]: the
-/// degraded/failed constructors *require* a reason, so an honest failure
-/// cannot be recorded without saying why (type-enforced honesty).
+/// [`MaintenanceRecord::degraded`] or [`MaintenanceRecord::failed`]. The
+/// degraded/failed constructors take a reason; a blank one is not rejected —
+/// it is replaced by an explicit placeholder (see `with_outcome`), so a
+/// missing reason is *made visible* in the stored row rather than silently
+/// omitted. The constructor does not require a reason; it refuses to store an
+/// empty one that would read as "no problem".
 #[derive(Debug, Clone, PartialEq)]
 pub struct MaintenanceRecord {
     /// Unique row id (ULID).
@@ -171,7 +180,8 @@ pub struct MaintenanceRecord {
     pub evidence: Vec<String>,
     /// How the event ended.
     pub outcome: MaintenanceOutcome,
-    /// Why, in bounded prose. Required (non-empty) for degraded/failed.
+    /// Why, in bounded prose. A blank value for a degraded/failed outcome is
+    /// replaced by an explicit placeholder, never stored empty.
     pub reason: String,
     /// Who performed it (explicit attribution, never inferred).
     pub actor: String,
@@ -440,7 +450,7 @@ impl MaintenanceLedger {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| MemoryError::RetrievalFailed(e.to_string()))?;
-        rows.iter().map(row_to_record).collect()
+        Ok(rows.iter().filter_map(row_to_record).collect())
     }
 
     /// The most recent outcomes across all targets, newest first, bounded by
@@ -465,7 +475,7 @@ impl MaintenanceLedger {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| MemoryError::RetrievalFailed(e.to_string()))?;
-        rows.iter().map(row_to_record).collect()
+        Ok(rows.iter().filter_map(row_to_record).collect())
     }
 
     /// Every outcome recorded for a project, newest first.
@@ -487,35 +497,52 @@ impl MaintenanceLedger {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| MemoryError::RetrievalFailed(e.to_string()))?;
-        rows.iter().map(row_to_record).collect()
+        Ok(rows.iter().filter_map(row_to_record).collect())
     }
 }
 
-/// Decode one stored row. Unknown kind/outcome/target_kind are skipped
-/// (fail-open), never an error — an older binary reading a newer row must not
-/// fail the read.
-fn row_to_record(row: &sqlx::sqlite::SqliteRow) -> Result<MaintenanceRecord, MemoryError> {
+/// Decode one stored row, or `None` to SKIP it.
+///
+/// An unknown `kind`/`outcome`/`target_kind` (a row written by a newer binary
+/// — the enums are `#[non_exhaustive]`, so this is expected) is skipped with a
+/// per-row warning, never an error: one future row must not brick a whole
+/// read. This is the fail-open contract the migration and the enum `parse`
+/// docs promise. Every recognized row decodes; a malformed `evidence` blob
+/// falls back to an empty list (never an error).
+fn row_to_record(row: &sqlx::sqlite::SqliteRow) -> Option<MaintenanceRecord> {
+    let id: String = row.get("id");
     let kind_str: String = row.get("kind");
     let outcome_str: String = row.get("outcome");
     let target_kind_str: String = row.get("target_kind");
     let Some(kind) = MaintenanceKind::parse(&kind_str) else {
-        return Err(MemoryError::RetrievalFailed(format!("unknown maintenance kind '{kind_str}'")));
+        tracing::warn!(
+            row_id = %id,
+            kind = %kind_str,
+            "skipping maintenance outcome with unknown kind (fail-open)"
+        );
+        return None;
     };
     let Some(outcome) = MaintenanceOutcome::parse(&outcome_str) else {
-        return Err(MemoryError::RetrievalFailed(format!(
-            "unknown maintenance outcome '{outcome_str}'"
-        )));
+        tracing::warn!(
+            row_id = %id,
+            outcome = %outcome_str,
+            "skipping maintenance outcome with unknown outcome (fail-open)"
+        );
+        return None;
     };
     let Some(target_kind) = MaintenanceTargetKind::parse(&target_kind_str) else {
-        return Err(MemoryError::RetrievalFailed(format!(
-            "unknown maintenance target kind '{target_kind_str}'"
-        )));
+        tracing::warn!(
+            row_id = %id,
+            target_kind = %target_kind_str,
+            "skipping maintenance outcome with unknown target kind (fail-open)"
+        );
+        return None;
     };
     let evidence_json: String = row.get("evidence");
     let evidence: Vec<String> = serde_json::from_str(&evidence_json).unwrap_or_default();
     let observed_at_unix: i64 = row.get("observed_at");
-    Ok(MaintenanceRecord {
-        id: row.get("id"),
+    Some(MaintenanceRecord {
+        id,
         kind,
         target: row.get("target"),
         target_kind,
@@ -708,16 +735,62 @@ mod tests {
     #[tokio::test]
     async fn unknown_stored_kind_is_skipped_not_fatal() {
         let (pool, ledger) = ledger().await;
+        // A known row and a future-kind row (a newer binary wrote it).
+        ledger.record(&completed("known-target")).await.unwrap();
         sqlx::query(
             "INSERT INTO maintenance_outcomes \
              (id, kind, target, target_kind, evidence, outcome, reason, actor, project_id, observed_at) \
-             VALUES ('x', 'future_kind', 't', 'chunk', '[]', 'completed', '', 'a', 'p', 1)",
+             VALUES ('future-1', 'future_kind', 'future-target', 'chunk', '[]', 'completed', '', 'a', 'p', 2)",
         )
         .execute(&pool)
         .await
         .unwrap();
-        // The row is unreadable by this binary and surfaces as an error for
-        // the whole read — never silently reinterpreted.
-        assert!(ledger.list(10, CancellationToken::new()).await.is_err());
+
+        // The read SUCCEEDS, the unknown row is skipped (with a warning), and
+        // every known row is still returned — one future row never bricks a
+        // whole read (the migration/parse fail-open contract).
+        let all = ledger.list(10, CancellationToken::new()).await.expect("read must not fail");
+        assert_eq!(all.len(), 1, "only the known row is returned: {all:?}");
+        assert_eq!(all[0].target, "known-target");
+
+        // Same skip on the point read, and the known target still answers.
+        assert!(
+            ledger.for_target("future-target", CancellationToken::new()).await.unwrap().is_empty(),
+            "the future-kind row is skipped, not reinterpreted"
+        );
+        assert_eq!(
+            ledger.for_target("known-target", CancellationToken::new()).await.unwrap().len(),
+            1
+        );
+        // The known row's project ("proj-1" from `completed`) still answers;
+        // the future row's project "p" has only a skipped row.
+        assert_eq!(ledger.for_project("proj-1", CancellationToken::new()).await.unwrap().len(), 1);
+        assert!(
+            ledger.for_project("p", CancellationToken::new()).await.unwrap().is_empty(),
+            "the future-kind row is skipped on the project read too"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_stored_outcome_and_target_kind_are_also_skipped() {
+        let (pool, ledger) = ledger().await;
+        sqlx::query(
+            "INSERT INTO maintenance_outcomes \
+             (id, kind, target, target_kind, evidence, outcome, reason, actor, project_id, observed_at) \
+             VALUES ('future-2', 'expiry', 't2', 'chunk', '[]', 'maybe', '', 'a', 'p', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO maintenance_outcomes \
+             (id, kind, target, target_kind, evidence, outcome, reason, actor, project_id, observed_at) \
+             VALUES ('future-3', 'expiry', 't3', 'future_target_kind', '[]', 'completed', '', 'a', 'p', 2)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let all = ledger.list(10, CancellationToken::new()).await.expect("read must not fail");
+        assert!(all.is_empty(), "unknown outcome/target_kind rows are skipped: {all:?}");
     }
 }

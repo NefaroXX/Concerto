@@ -67,8 +67,10 @@ pub struct TtlManager {
     default_ttl_days: Option<u16>,
     /// H12: durable ledger every pass records its outcome to. Always present
     /// — the manager holds the pool the ledger writes to, so a maintenance
-    /// pass cannot run without its outcome being recorded (a failed or
-    /// cancelled pass records degraded/failed, never nothing).
+    /// pass cannot run without *attempting* to record its outcome (a failed
+    /// or cancelled pass records degraded/failed, never nothing). Recording
+    /// is best-effort: a ledger-write failure degrades to a warning and
+    /// leaves the pass's own result unchanged.
     ledger: MaintenanceLedger,
 }
 
