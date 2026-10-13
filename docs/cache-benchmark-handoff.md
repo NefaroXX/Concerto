@@ -38,9 +38,12 @@ tests that assumed Unix's `NotFound` rather than Windows's `NotADirectory`.
 The follow-up boxes the desktop report payload and checks preservation of the
 native OS spawn error using isolated missing directories. A headless desktop
 smoke test loads durably recorded evidence, renders the report across all themes,
-and preserves unknown cost for unfinished attempts. This does not replace an
-interactive desktop smoke test. Inspect the latest PR checks before merge; do
-not infer success from older runs.
+and preserves unknown cost for unfinished attempts. The CI build job also runs
+`scripts/cache-report-smoke.py` against the freshly built launcher using an
+isolated synthetic SQLite session. It checks configured pricing, duplicate and
+unfinished attempts, text/JSON output and legacy sessions without telemetry.
+These checks do not replace an interactive desktop smoke test. Inspect the
+latest PR checks before merge; do not infer success from older runs.
 
 This is an implemented reporting/export slice, not completion of every research
 phase in the original plan. Explicit remaining work:
@@ -75,6 +78,7 @@ python3 -m unittest discover -s scripts/tests -v
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+python3 scripts/cache-report-smoke.py ./target/debug/concerto
 ```
 
 Keep the PR draft until validation and scope review are complete. Do not merge,
