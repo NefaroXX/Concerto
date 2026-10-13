@@ -601,7 +601,7 @@ impl App {
                         report.reprice(&app_config.cache_pricing);
                     }
                 }
-                (records, cache_report)
+                (records, cache_report.map(Box::new))
             },
             |(records, cache_report)| {
                 Message::Chat(views::chat::Message::SpendLogsLoaded(records, cache_report))

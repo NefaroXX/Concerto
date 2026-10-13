@@ -99,7 +99,7 @@ pub enum Message {
     ToggleRun(String),
     /// Spend records for the active session loaded (Spend Log modal body).
     /// Driven from `App::load_spend_log`; best-effort (empty on failure).
-    SpendLogsLoaded(Vec<SpendRecord>, Option<concerto_sessions::cache::CacheReport>),
+    SpendLogsLoaded(Vec<SpendRecord>, Option<Box<concerto_sessions::cache::CacheReport>>),
     /// Refresh the Spend Log modal's records. Handled by App (needs the
     /// session handler), like `SelectSession`.
     RefreshSpendLog,
@@ -1774,7 +1774,7 @@ impl State {
                 self.toggle_run(&run_id);
             }
             Message::SpendLogsLoaded(records, cache_report) => {
-                self.cache_report = cache_report;
+                self.cache_report = cache_report.map(|report| *report);
                 self.spend_log = records;
                 self.spend_log_loaded = true;
             }

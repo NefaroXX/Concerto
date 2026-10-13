@@ -1059,21 +1059,34 @@ mod tests {
     /// kind with only the bare OS text yields the identical ledger +
     /// envelope disposition.
     #[tokio::test]
-    async fn git_spawn_failure_yields_typed_io_with_context() {
+    async fn git_spawn_failure_yields_typed_io_with_context(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::TempDir::new()?;
+        let missing = dir.path().join("missing-repo");
+        let native_error =
+            match std::process::Command::new("git").arg("status").current_dir(&missing).output() {
+                Err(error) => error,
+                Ok(_) => panic!("spawn in a missing repo dir must fail"),
+            };
         let cancel = CancellationToken::new();
-        let error = cli_fallback::run_git(
-            "/concerto_no_such_repo_dir_for_git_spawn_test",
+        let error = match cli_fallback::run_git(
+            missing.to_str().ok_or("temp directory is not UTF-8")?,
             &["status"],
             &cancel,
             Duration::from_secs(GIT_TIMEOUT_SECS),
         )
         .await
-        .expect_err("spawn in a missing repo dir must fail");
+        {
+            Err(error) => error,
+            Ok(_) => panic!("spawn in a missing repo dir must fail"),
+        };
         let kind = match &error {
             ToolError::Io(io) => io.kind(),
             other => panic!("expected typed ToolError::Io, got {other:?}"),
         };
-        assert_eq!(kind, std::io::ErrorKind::NotFound, "the OS verdict is preserved");
+        // Windows reports NotADirectory here; Unix reports NotFound. Preserve
+        // the native verdict rather than normalizing it to a Unix error.
+        assert_eq!(kind, native_error.kind(), "the OS verdict is preserved");
         let display = error.to_string();
         assert!(display.contains("failed to execute git"), "missing spawn verb: {display}");
         assert!(error.is_deterministic_failure(), "the kind classifies structurally");
@@ -1103,6 +1116,7 @@ mod tests {
             failure.disposition, bare_failure.disposition,
             "same disposition with and without context text"
         );
+        Ok(())
     }
 
     /// Stage worktree changes via the system `git` binary (used only in tests,

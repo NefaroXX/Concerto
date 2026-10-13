@@ -21,16 +21,26 @@ Read `AGENTS.md`, then `docs/cache-benchmarks.md`. Continue on this branch.
 ## Validation and current limits
 
 Six offline comparison/export tests, formatting/diff checks and desktop palette
-check passed locally. CI validates full Rust builds/tests on runners with system
-dependencies; this workspace lacks OpenSSL/pkg-config development prerequisites.
-Earlier local builds also produced malformed zero-length dependency archive
-members. Do not keep retrying full builds in the web workspace.
+check passed locally. The current local checkout has OpenSSL, D-Bus, SQLite and
+the WASM target installed; workspace Rust validation can run here. The earlier
+web workspace lacked development prerequisites and produced malformed zero-length
+dependency archive members; do not keep retrying full builds in that environment.
 
 CI on checkpoint `4d592d4` failed because two config migrations omitted the new
 field. `aafd726` fixed production constructors; subsequent CI found three explicit
-test fixtures also missing it. The closeout commit fixes those fixtures and adds
+test fixtures also missing it. Checkpoint `d8f319b` fixes those fixtures and adds
 regression tests for durable draining, interrupted attempts and TTL-only usage.
-Inspect the latest PR checks before merge; do not infer success from older runs.
+Its latest CI passed workspace tests, builds, benchmark smoke runs, WASM, supply
+chain, formatting and palette checks. Clippy failed because the desktop cache
+report enlarged nested message enums; Windows failed two existing spawn-error
+tests that assumed Unix's `NotFound` rather than Windows's `NotADirectory`.
+
+The follow-up boxes the desktop report payload and checks preservation of the
+native OS spawn error using isolated missing directories. A headless desktop
+smoke test loads durably recorded evidence, renders the report across all themes,
+and preserves unknown cost for unfinished attempts. This does not replace an
+interactive desktop smoke test. Inspect the latest PR checks before merge; do
+not infer success from older runs.
 
 This is an implemented reporting/export slice, not completion of every research
 phase in the original plan. Explicit remaining work:
