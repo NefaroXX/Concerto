@@ -38,6 +38,7 @@ pub mod global;
 mod ignore_rules;
 pub mod indexer;
 pub mod links;
+pub mod maintenance;
 pub mod mermaid;
 pub mod prefs;
 pub mod rag;

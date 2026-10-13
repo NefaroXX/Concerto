@@ -18,8 +18,14 @@ use time::OffsetDateTime;
 
 use crate::fts::FullTextStore;
 use crate::links::LinkStore;
+use crate::maintenance::{
+    MaintenanceKind, MaintenanceLedger, MaintenanceRecord, MaintenanceTargetKind,
+};
 use crate::scoring::{chunk_link_score, parse_db_timestamp, ORPHAN_TRIM_SCORE};
 use crate::vector_store::VectorStore;
+
+/// Explicit attribution for outcomes emitted by the TTL/retention manager.
+pub const TTL_MAINTENANCE_ACTOR: &str = "ttl-manager";
 
 /// Default TTL for different chunk types (in days).
 pub const TTL_FUNCTION_DAYS: i64 = 90;
@@ -59,6 +65,11 @@ pub struct TtlManager {
     fts_store: Arc<dyn FullTextStore>,
     pool: SqlitePool,
     default_ttl_days: Option<u16>,
+    /// H12: durable ledger every pass records its outcome to. Always present
+    /// — the manager holds the pool the ledger writes to, so a maintenance
+    /// pass cannot run without its outcome being recorded (a failed or
+    /// cancelled pass records degraded/failed, never nothing).
+    ledger: MaintenanceLedger,
 }
 
 impl TtlManager {
@@ -67,7 +78,8 @@ impl TtlManager {
         fts_store: Arc<dyn FullTextStore>,
         pool: SqlitePool,
     ) -> Self {
-        Self { vector_store, fts_store, pool, default_ttl_days: None }
+        let ledger = MaintenanceLedger::from_pool(pool.clone());
+        Self { vector_store, fts_store, pool, default_ttl_days: None, ledger }
     }
 
     /// Use one user-configured retention window for every indexed chunk.
@@ -77,7 +89,51 @@ impl TtlManager {
         pool: SqlitePool,
         ttl_days: u16,
     ) -> Self {
-        Self { vector_store, fts_store, pool, default_ttl_days: Some(ttl_days) }
+        let ledger = MaintenanceLedger::from_pool(pool.clone());
+        Self { vector_store, fts_store, pool, default_ttl_days: Some(ttl_days), ledger }
+    }
+
+    /// The maintenance ledger every pass writes its outcome to.
+    #[must_use]
+    pub fn ledger(&self) -> &MaintenanceLedger {
+        &self.ledger
+    }
+
+    /// Record one pass outcome, fail-soft: a ledger write failure logs and
+    /// never changes the pass's own result.
+    async fn record_outcome(&self, record: MaintenanceRecord) {
+        if let Err(error) = self.ledger.record(&record).await {
+            tracing::warn!(%error, "failed to record maintenance outcome");
+        }
+    }
+
+    /// The outcome for a pass that ended on an error: a cancellation is
+    /// `degraded` (partial progress), anything else is `failed`.
+    fn pass_error_outcome(
+        kind: MaintenanceKind,
+        target: &str,
+        error: &MemoryError,
+        context: &str,
+    ) -> MaintenanceRecord {
+        if matches!(error, MemoryError::Cancelled) {
+            MaintenanceRecord::degraded(
+                kind,
+                target,
+                MaintenanceTargetKind::Project,
+                format!("{context}: cancelled mid-pass"),
+                TTL_MAINTENANCE_ACTOR,
+                target,
+            )
+        } else {
+            MaintenanceRecord::failed(
+                kind,
+                target,
+                MaintenanceTargetKind::Project,
+                format!("{context}: {error}"),
+                TTL_MAINTENANCE_ACTOR,
+                target,
+            )
+        }
     }
 
     /// Remove all expired entries for a project.
@@ -92,7 +148,17 @@ impl TtlManager {
         project_id: &ProjectId,
         cancel: CancellationToken,
     ) -> Result<usize, MemoryError> {
+        let target = project_id.0.clone();
         if cancel.is_cancelled() {
+            self.record_outcome(MaintenanceRecord::degraded(
+                MaintenanceKind::Expiry,
+                target.clone(),
+                MaintenanceTargetKind::Project,
+                "cancelled before the expiry sweep examined any row",
+                TTL_MAINTENANCE_ACTOR,
+                target,
+            ))
+            .await;
             return Ok(0);
         }
 
@@ -103,14 +169,27 @@ impl TtlManager {
         // `datetime(created_at, '+N days') < datetime('now')` predicate was a
         // silent never-match. `parse_db_timestamp` handles the exact stored
         // shape and normalizes any stored UTC offset before comparing.
-        let rows = sqlx::query(
+        let rows = match sqlx::query(
             "SELECT id, chunk_type, created_at FROM vector_store \
              WHERE project_id = ? AND tombstone = 0",
         )
         .bind(&project_id.0)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| MemoryError::RetrievalFailed(e.to_string()))?;
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                let error = MemoryError::RetrievalFailed(error.to_string());
+                self.record_outcome(Self::pass_error_outcome(
+                    MaintenanceKind::Expiry,
+                    &target,
+                    &error,
+                    "expiry sweep could not read rows",
+                ))
+                .await;
+                return Err(error);
+            }
+        };
 
         let now_unix = OffsetDateTime::now_utc().unix_timestamp();
         let mut expired: Vec<String> = Vec::new();
@@ -132,6 +211,14 @@ impl TtlManager {
         }
 
         if expired.is_empty() {
+            self.record_outcome(MaintenanceRecord::completed(
+                MaintenanceKind::Expiry,
+                target.clone(),
+                MaintenanceTargetKind::Project,
+                TTL_MAINTENANCE_ACTOR,
+                target,
+            ))
+            .await;
             return Ok(0);
         }
 
@@ -139,13 +226,44 @@ impl TtlManager {
 
         // Tombstone each expired entry in the vector store and delete from FTS.
         for chunk_id in &expired {
-            self.vector_store.tombstone(chunk_id, project_id, cancel.clone()).await?;
+            if let Err(error) =
+                self.vector_store.tombstone(chunk_id, project_id, cancel.clone()).await
+            {
+                self.record_outcome(Self::pass_error_outcome(
+                    MaintenanceKind::Expiry,
+                    &target,
+                    &error,
+                    "expiry sweep aborted while tombstoning",
+                ))
+                .await;
+                return Err(error);
+            }
             let _ = self.fts_store.delete(chunk_id, project_id, cancel.clone()).await;
         }
 
         // Compact: permanently remove tombstoned entries.
-        self.vector_store.delete_tombstoned(project_id, cancel).await?;
+        if let Err(error) = self.vector_store.delete_tombstoned(project_id, cancel).await {
+            self.record_outcome(Self::pass_error_outcome(
+                MaintenanceKind::Expiry,
+                &target,
+                &error,
+                "expiry sweep aborted while compacting",
+            ))
+            .await;
+            return Err(error);
+        }
 
+        self.record_outcome(
+            MaintenanceRecord::completed(
+                MaintenanceKind::Expiry,
+                target.clone(),
+                MaintenanceTargetKind::Project,
+                TTL_MAINTENANCE_ACTOR,
+                target,
+            )
+            .with_evidence(expired),
+        )
+        .await;
         Ok(count)
     }
 
@@ -159,35 +277,104 @@ impl TtlManager {
         current_model_version: &str,
         cancel: CancellationToken,
     ) -> Result<usize, MemoryError> {
+        let target = project_id.0.clone();
+        if cancel.is_cancelled() {
+            self.record_outcome(MaintenanceRecord::degraded(
+                MaintenanceKind::Revalidation,
+                target.clone(),
+                MaintenanceTargetKind::Project,
+                "cancelled before the embedding revalidation examined any row",
+                TTL_MAINTENANCE_ACTOR,
+                target,
+            ))
+            .await;
+            return Ok(0);
+        }
         // Mark stale in the vector store (sets stale=1 for rows whose
         // `model_version` MISMATCHES the current model — model-bump refresh).
-        self.vector_store.mark_stale(project_id, current_model_version, cancel.clone()).await?;
+        if let Err(error) =
+            self.vector_store.mark_stale(project_id, current_model_version, cancel.clone()).await
+        {
+            self.record_outcome(Self::pass_error_outcome(
+                MaintenanceKind::Revalidation,
+                &target,
+                &error,
+                "embedding revalidation could not mark stale rows",
+            ))
+            .await;
+            return Err(error);
+        }
 
         // Also tombstone stale entries so they drop out of search results
         // until re-indexed with the current model.
         //
         // We query for stale entries, tombstone them, and delete from FTS.
-        let rows = sqlx::query(
+        let rows = match sqlx::query(
             "SELECT id FROM vector_store WHERE project_id = ? AND stale = 1 AND tombstone = 0",
         )
         .bind(&project_id.0)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| MemoryError::RetrievalFailed(e.to_string()))?;
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                let error = MemoryError::RetrievalFailed(error.to_string());
+                self.record_outcome(Self::pass_error_outcome(
+                    MaintenanceKind::Revalidation,
+                    &target,
+                    &error,
+                    "embedding revalidation could not read stale rows",
+                ))
+                .await;
+                return Err(error);
+            }
+        };
 
         let count = rows.len();
 
         for row in &rows {
             let chunk_id: String = row.get("id");
-            self.vector_store.tombstone(&chunk_id, project_id, cancel.clone()).await?;
+            if let Err(error) =
+                self.vector_store.tombstone(&chunk_id, project_id, cancel.clone()).await
+            {
+                self.record_outcome(Self::pass_error_outcome(
+                    MaintenanceKind::Revalidation,
+                    &target,
+                    &error,
+                    "embedding revalidation aborted while tombstoning",
+                ))
+                .await;
+                return Err(error);
+            }
             let _ = self.fts_store.delete(&chunk_id, project_id, cancel.clone()).await;
         }
 
         // Compact tombstoned entries.
         if count > 0 {
-            self.vector_store.delete_tombstoned(project_id, cancel).await?;
+            if let Err(error) = self.vector_store.delete_tombstoned(project_id, cancel).await {
+                self.record_outcome(Self::pass_error_outcome(
+                    MaintenanceKind::Revalidation,
+                    &target,
+                    &error,
+                    "embedding revalidation aborted while compacting",
+                ))
+                .await;
+                return Err(error);
+            }
         }
 
+        let stale_ids: Vec<String> = rows.iter().map(|row| row.get::<String, _>("id")).collect();
+        self.record_outcome(
+            MaintenanceRecord::completed(
+                MaintenanceKind::Revalidation,
+                target.clone(),
+                MaintenanceTargetKind::Project,
+                TTL_MAINTENANCE_ACTOR,
+                target,
+            )
+            .with_evidence(stale_ids),
+        )
+        .await;
         Ok(count)
     }
 
@@ -226,12 +413,42 @@ impl TtlManager {
         retention_days: u16,
         cancel: CancellationToken,
     ) -> Result<PruneReport, MemoryError> {
+        let target = project_id.0.clone();
         let mut report = PruneReport::default();
         if cancel.is_cancelled() {
+            self.record_outcome(MaintenanceRecord::degraded(
+                MaintenanceKind::Expiry,
+                target.clone(),
+                MaintenanceTargetKind::Project,
+                "cancelled before the retention prune examined any row",
+                TTL_MAINTENANCE_ACTOR,
+                target,
+            ))
+            .await;
             return Ok(report);
         }
-        let rows = self.load_derived_rows(project_id, cancel.clone()).await?;
+        let rows = match self.load_derived_rows(project_id, cancel.clone()).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                self.record_outcome(Self::pass_error_outcome(
+                    MaintenanceKind::Expiry,
+                    &target,
+                    &error,
+                    "retention prune could not read derived rows",
+                ))
+                .await;
+                return Err(error);
+            }
+        };
         if rows.is_empty() {
+            self.record_outcome(MaintenanceRecord::completed(
+                MaintenanceKind::Expiry,
+                target.clone(),
+                MaintenanceTargetKind::Project,
+                TTL_MAINTENANCE_ACTOR,
+                target,
+            ))
+            .await;
             return Ok(report);
         }
 
@@ -273,7 +490,18 @@ impl TtlManager {
         report.sessions_examined = buckets.len();
         report.pruned_ids = pruned;
 
-        self.remove_derived_rows(project_id, &report.pruned_ids, cancel).await?;
+        if let Err(error) =
+            self.remove_derived_rows(project_id, &report.pruned_ids, cancel.clone()).await
+        {
+            self.record_outcome(Self::pass_error_outcome(
+                MaintenanceKind::Expiry,
+                &target,
+                &error,
+                "retention prune aborted while removing rows",
+            ))
+            .await;
+            return Err(error);
+        }
         if !report.pruned_ids.is_empty() {
             tracing::info!(
                 pruned = report.pruned_ids.len(),
@@ -281,6 +509,27 @@ impl TtlManager {
                 "pruned derived summary chunks past retention (ADR-65 §8)"
             );
         }
+        // A pass cancelled between removals is degraded (partial progress is
+        // valid); a pass that ran its whole scope is completed.
+        let outcome = if cancel.is_cancelled() {
+            MaintenanceRecord::degraded(
+                MaintenanceKind::Expiry,
+                target.clone(),
+                MaintenanceTargetKind::Project,
+                "cancelled mid-pass; partial progress retained",
+                TTL_MAINTENANCE_ACTOR,
+                target,
+            )
+        } else {
+            MaintenanceRecord::completed(
+                MaintenanceKind::Expiry,
+                target.clone(),
+                MaintenanceTargetKind::Project,
+                TTL_MAINTENANCE_ACTOR,
+                target,
+            )
+        };
+        self.record_outcome(outcome.with_evidence(report.pruned_ids.clone())).await;
         Ok(report)
     }
 
@@ -300,12 +549,42 @@ impl TtlManager {
         decay_days: Option<u16>,
         cancel: CancellationToken,
     ) -> Result<PruneReport, MemoryError> {
+        let target = project_id.0.clone();
         let mut report = PruneReport::default();
         if cancel.is_cancelled() {
+            self.record_outcome(MaintenanceRecord::degraded(
+                MaintenanceKind::OrphanPrune,
+                target.clone(),
+                MaintenanceTargetKind::Project,
+                "cancelled before the orphan prune examined any row",
+                TTL_MAINTENANCE_ACTOR,
+                target,
+            ))
+            .await;
             return Ok(report);
         }
-        let rows = self.load_derived_rows(project_id, cancel.clone()).await?;
+        let rows = match self.load_derived_rows(project_id, cancel.clone()).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                self.record_outcome(Self::pass_error_outcome(
+                    MaintenanceKind::OrphanPrune,
+                    &target,
+                    &error,
+                    "orphan prune could not read derived rows",
+                ))
+                .await;
+                return Err(error);
+            }
+        };
         if rows.is_empty() {
+            self.record_outcome(MaintenanceRecord::completed(
+                MaintenanceKind::OrphanPrune,
+                target.clone(),
+                MaintenanceTargetKind::Project,
+                TTL_MAINTENANCE_ACTOR,
+                target,
+            ))
+            .await;
             return Ok(report);
         }
 
@@ -317,10 +596,30 @@ impl TtlManager {
                     %error,
                     "orphaned-derived prune skipped: link store unavailable (fail-open)"
                 );
+                // The pass could not complete its judgment: record it as
+                // degraded, never as absent — the exact failure mode H12
+                // exists to surface.
+                self.record_outcome(MaintenanceRecord::degraded(
+                    MaintenanceKind::OrphanPrune,
+                    target.clone(),
+                    MaintenanceTargetKind::Project,
+                    format!("link store unavailable (fail-open): {error}"),
+                    TTL_MAINTENANCE_ACTOR,
+                    target,
+                ))
+                .await;
                 return Ok(report);
             }
         };
         if incoming.is_empty() {
+            self.record_outcome(MaintenanceRecord::completed(
+                MaintenanceKind::OrphanPrune,
+                target.clone(),
+                MaintenanceTargetKind::Project,
+                TTL_MAINTENANCE_ACTOR,
+                target,
+            ))
+            .await;
             return Ok(report);
         }
 
@@ -338,13 +637,43 @@ impl TtlManager {
             }
         }
 
-        self.remove_derived_rows(project_id, &report.pruned_ids, cancel).await?;
+        if let Err(error) =
+            self.remove_derived_rows(project_id, &report.pruned_ids, cancel.clone()).await
+        {
+            self.record_outcome(Self::pass_error_outcome(
+                MaintenanceKind::OrphanPrune,
+                &target,
+                &error,
+                "orphan prune aborted while removing rows",
+            ))
+            .await;
+            return Err(error);
+        }
         if !report.pruned_ids.is_empty() {
             tracing::info!(
                 pruned = report.pruned_ids.len(),
                 "pruned low-score derived rows with cold link evidence (ADR-69 slice 2)"
             );
         }
+        let outcome = if cancel.is_cancelled() {
+            MaintenanceRecord::degraded(
+                MaintenanceKind::OrphanPrune,
+                target.clone(),
+                MaintenanceTargetKind::Project,
+                "cancelled mid-pass; partial progress retained",
+                TTL_MAINTENANCE_ACTOR,
+                target,
+            )
+        } else {
+            MaintenanceRecord::completed(
+                MaintenanceKind::OrphanPrune,
+                target.clone(),
+                MaintenanceTargetKind::Project,
+                TTL_MAINTENANCE_ACTOR,
+                target,
+            )
+        };
+        self.record_outcome(outcome.with_evidence(report.pruned_ids.clone())).await;
         Ok(report)
     }
 
@@ -450,6 +779,7 @@ pub fn suggested_ttl_days(chunk_type: &concerto_core::memory::ChunkType) -> i64 
 mod tests {
     use super::*;
     use crate::fts::SqliteFullTextStore;
+    use crate::maintenance::MaintenanceOutcome;
     use crate::vector_store::SqliteVectorStore;
     use concerto_core::memory::ChunkType;
     use concerto_core::memory::EmbeddingRecord;
@@ -510,6 +840,9 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
+        // H12: the maintenance ledger table the pass outcomes are recorded to.
+        // A directly-created pool does not run migration 003, so mirror it.
+        MaintenanceLedger::connect(pool.clone()).await.unwrap();
         let vector = Arc::new(SqliteVectorStore::new(pool.clone()).await.unwrap());
         let fts = Arc::new(SqliteFullTextStore::new(pool.clone()).await.unwrap());
         let manager = TtlManager::new(vector.clone(), fts, pool.clone());
@@ -944,5 +1277,140 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(gone.len(), 1, "the row survives an unavailable link store");
+    }
+
+    // ---------------------------------------------------------------------
+    // H12 — observed maintenance outcomes. Every attempted pass records a
+    // durable outcome; a pass that could not complete records degraded/failed,
+    // never nothing.
+    // ---------------------------------------------------------------------
+
+    async fn outcome_count(manager: &TtlManager) -> usize {
+        manager.ledger().list(100, CancellationToken::new()).await.unwrap().len()
+    }
+
+    async fn last_outcome(manager: &TtlManager) -> MaintenanceRecord {
+        manager
+            .ledger()
+            .list(1, CancellationToken::new())
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("an outcome was recorded")
+    }
+
+    #[tokio::test]
+    async fn every_attempted_maintenance_pass_records_an_outcome() {
+        let (pool, store, manager) = test_manager().await;
+        let project = ProjectId("retention".into());
+        seed_source(&store, "fn-old", offset_days_ago(200)).await;
+        let link_store = LinkStore::new(pool.clone()).await.unwrap();
+
+        // A cancelled pass is still an ATTEMPTED pass: it must leave a
+        // degraded record, never nothing.
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let before = outcome_count(&manager).await;
+        manager.purge_expired(&project, cancelled.clone()).await.unwrap();
+        assert!(outcome_count(&manager).await > before, "cancelled purge still records");
+        assert_eq!(last_outcome(&manager).await.outcome, MaintenanceOutcome::Degraded);
+
+        let before = outcome_count(&manager).await;
+        manager.prune_derived_summaries(&project, 2, 30, cancelled.clone()).await.unwrap();
+        assert!(outcome_count(&manager).await > before, "cancelled expiry prune still records");
+        assert_eq!(last_outcome(&manager).await.outcome, MaintenanceOutcome::Degraded);
+
+        let before = outcome_count(&manager).await;
+        manager
+            .prune_orphaned_derived(&project, &link_store, Some(90), cancelled.clone())
+            .await
+            .unwrap();
+        assert!(outcome_count(&manager).await > before, "cancelled orphan prune still records");
+        assert_eq!(last_outcome(&manager).await.outcome, MaintenanceOutcome::Degraded);
+
+        let before = outcome_count(&manager).await;
+        manager.mark_stale_embeddings(&project, "2", cancelled.clone()).await.unwrap();
+        assert!(outcome_count(&manager).await > before, "cancelled revalidation still records");
+        assert_eq!(last_outcome(&manager).await.outcome, MaintenanceOutcome::Degraded);
+
+        // A completed pass records completed.
+        let before = outcome_count(&manager).await;
+        let purged = manager.purge_expired(&project, CancellationToken::new()).await.unwrap();
+        assert_eq!(purged, 1, "the 200-day-old source chunk expires");
+        assert!(outcome_count(&manager).await > before, "completed purge records");
+        let completed = last_outcome(&manager).await;
+        assert_eq!(completed.outcome, MaintenanceOutcome::Completed);
+        assert_eq!(completed.kind, MaintenanceKind::Expiry);
+        assert_eq!(completed.evidence, vec!["fn-old".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn orphan_prune_unavailable_link_store_records_degraded_not_absent() {
+        let (_pool, store, manager) = test_manager().await;
+        let project = ProjectId("retention".into());
+        seed(&store, "cold-linked", ChunkType::Fact, "s", "old fact", offset_days_ago(30)).await;
+
+        // A link store whose pool is closed: the prune cannot judge, and must
+        // record degraded — the failure mode that used to be a log line only.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("links.db");
+        let options =
+            sqlx::sqlite::SqliteConnectOptions::new().filename(&path).create_if_missing(true);
+        let pool = sqlx::SqlitePool::connect_with(options).await.unwrap();
+        let link_store = LinkStore::new(pool).await.unwrap();
+        link_store.close_pool().await;
+
+        manager
+            .prune_orphaned_derived(&project, &link_store, Some(90), CancellationToken::new())
+            .await
+            .unwrap();
+        let outcome = last_outcome(&manager).await;
+        assert_eq!(outcome.kind, MaintenanceKind::OrphanPrune);
+        assert_eq!(outcome.outcome, MaintenanceOutcome::Degraded);
+        assert!(
+            outcome.reason.contains("link store unavailable"),
+            "the reason names the cause: {}",
+            outcome.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_expired_records_failed_when_the_vector_store_errors() {
+        // The ledger pool stays writable while the VECTOR store's own pool is
+        // closed, so a tombstone failure is a real error the pass must record
+        // as failed — not an absence.
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        MaintenanceLedger::connect(pool.clone()).await.unwrap();
+        let seeder = Arc::new(SqliteVectorStore::new(pool.clone()).await.unwrap());
+        seed_source(&seeder, "fn-old", offset_days_ago(200)).await;
+
+        let broken_pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let broken_store: Arc<dyn VectorStore> =
+            Arc::new(SqliteVectorStore::new(broken_pool.clone()).await.unwrap());
+        broken_pool.close().await;
+
+        let fts = Arc::new(SqliteFullTextStore::new(pool.clone()).await.unwrap());
+        let manager = TtlManager::new(broken_store, fts, pool.clone());
+        let project = ProjectId("retention".into());
+
+        let result = manager.purge_expired(&project, CancellationToken::new()).await;
+        assert!(result.is_err(), "the tombstone failure propagates");
+
+        let outcomes = manager.ledger().list(10, CancellationToken::new()).await.unwrap();
+        assert!(
+            outcomes.iter().any(|r| r.kind == MaintenanceKind::Expiry
+                && r.outcome == MaintenanceOutcome::Failed
+                && r.reason.contains("tombstoning")),
+            "the failed purge is recorded with its cause: {outcomes:?}"
+        );
     }
 }

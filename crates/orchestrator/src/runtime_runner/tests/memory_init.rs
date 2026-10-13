@@ -144,8 +144,9 @@ async fn init_path_attaches_link_store_over_project_pool() {
     //    project database: a link persisted through the same builder the
     //    init path calls round-trips from the database the vector store
     //    indexes into.
-    let link_store =
-        build_link_store(&pool, None).await.expect("production link-store helper must attach");
+    let link_store = build_link_store(&pool, None, None, "test")
+        .await
+        .expect("production link-store helper must attach");
     let link = MemoryLink::new("src-init", "tgt-init", MemoryLinkKind::References);
     link_store
         .put(&link, CancellationToken::new())
