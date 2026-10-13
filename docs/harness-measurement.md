@@ -37,9 +37,9 @@ are run on demand.
 | Redundant verification runs (coalescing) | **assert** (pre-existing H05) + **benchmark** premise | `crates/orchestrator/src/verify.rs` `project_wide_spawns_coalesce_on_generation`; restated as a bench premise in `crates/orchestrator/benches/verification.rs` |
 | Verification latency | **benchmark** | `crates/orchestrator/benches/verification.rs` |
 | Restore latency + retained bytes at representative sizes | **benchmark** | `crates/orchestrator/benches/checkpoint_restore.rs` |
-| Environment-probing calls before the first useful action | **live-procedure** (declared-unmeasured here) | "Live procedure" below; fixtures under `crates/eval/benchmark_tasks/harness_behavior/probe_locate_scale` |
-| Identical failed-call retries | **live-procedure** (declared-unmeasured here) | "Live procedure" below; fixture `.../retry_signature_change` |
-| Elapsed time to fresh passing evidence | **live-procedure** (declared-unmeasured here) | "Live procedure" below; fixture `.../verify_fix_is_even` |
+| Environment-probing calls before the first useful action | **live-procedure** (observation export built; values unmeasured) | `concerto_eval::observation::probing_calls_before_first_write` over `AgentRunResult::observation`; "Live procedure" below; fixture `.../probe_locate_scale` |
+| Identical failed-call retries | **live-procedure** (observation export built; values unmeasured) | `concerto_eval::observation::identical_failed_retries` over `AgentRunResult::observation`; "Live procedure" below; fixture `.../retry_signature_change` |
+| Elapsed time to fresh passing evidence | **live-procedure** (observation export built; values unmeasured) | `concerto_eval::observation::time_to_first_passing_verification` over the typed `checked_at`; "Live procedure" below; fixture `.../verify_fix_is_even` |
 
 ## In-tree assertions (run these)
 
@@ -172,11 +172,33 @@ leg's summary. Two honest options, in preference order:
      and the freshness verdict are not captured, **mark this unmeasured** — the
      audit-row timestamp alone is a coarse proxy, not the metric.
 
-2. **Eval-runner observation export (future).** Adding a read-only export of
-   the run's tool-event sequence and `checked_at` stamps to `eval-runner`'s
-   `AgentRunResult` would let option 1 be measured from the harness directly.
-   This is a small, additive change owned by the eval track, not by H14; it is
-   **not** built here, and building it would not be a "second runner".
+2. **Eval-runner observation export (built).** The run's tool-event sequence
+   and typed `checked_at` stamps are exported read-only on
+   `concerto_eval::runner::AgentRunResult::observation`
+   (`concerto_eval::observation::AgentObservation`), projected from the
+   `AgentOutput` the eval factory already holds — no second runner, no
+   audit-log re-read. The live leg (`run_suite_observed`) emits the derived
+   per-task metrics. The export is **bounded and shaped**: it retains the first
+   `MAX_OBSERVED_TOOL_CALLS = 512` calls and `MAX_OBSERVED_VERIFICATIONS = 128`
+   verifications, records the totals, and sets `tool_calls_truncated` /
+   `verifications_truncated` so a truncated window under-counts honestly
+   instead of reporting a wrong-looking exact number. It carries canonical
+   identity — `tool` + `operation` (ADR-82 policy-view pair) and an
+   `input_fingerprint` hash (never raw arguments) — plus `success`, the typed
+   failure `code`, and the finish `at` stamp; it drops tool summaries, paths,
+   and verification output, so no secrets ride into the artifact.
+
+   The three metrics are derivable directly from the export
+   (`concerto_eval::observation`):
+   `probing_calls_before_first_write`, `identical_failed_retries`, and
+   `time_to_first_passing_verification`. Each returns an `ObservedCount`
+   (`Exact` / `LowerBound` / `Unknown`) for metrics 1–2 and `Option<Duration>`
+   for metric 3, so a truncated window is a visible lower bound, never a
+   fabricated exact value.
+
+   Building the export does **not** measure the metrics: an operator run over a
+   real model and config (the procedure above) is still required, and the
+   values below remain unclaimed.
 
 ### Repetition
 
