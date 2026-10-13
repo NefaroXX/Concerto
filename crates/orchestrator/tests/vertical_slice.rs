@@ -832,7 +832,7 @@ async fn step7_persist_evidence_and_recall_in_another_session() {
     );
     assert!(evident[0].derivation.contains("claim"), "recall says why: {}", evident[0].derivation);
     assert!(!evident[0].degraded);
-    assert_eq!(evident[0].freshness, 1.0, "current-model row: full freshness");
+    assert_eq!(evident[0].model_freshness, 1.0, "current-model row: full model freshness");
 
     // The `MemoryEvidence` composite behind the projection is assembled AT
     // RECALL (never stored): bare enrichment without chunk standing reads
@@ -867,7 +867,7 @@ async fn step7_persist_evidence_and_recall_in_another_session() {
     assert_eq!(evidence.len(), 1);
     assert_eq!(evidence[0].chunk_id, chunks[0].id);
     assert_eq!(evidence[0].truth, FactStatusView::Unknown, "no standing, no status");
-    assert_eq!(evidence[0].freshness.value(), 1.0, "current-model row: full freshness");
+    assert_eq!(evidence[0].model_freshness.value(), 1.0, "current-model row: full model freshness");
     assert_eq!(evidence[0].schema_version, EVIDENCE_SCHEMA_VERSION);
 
     // … and the composite round-trips as a read-time projection while an

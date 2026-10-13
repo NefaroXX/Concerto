@@ -2,9 +2,10 @@
 //! H11 wires it into the live recall path with deterministic status.
 //!
 //! The epistemic axes — truth status, relevance, evidence/corroboration
-//! score, confidence, and freshness — stay separate and non-interchangeable;
-//! they are never collapsed into one number. The composite is the ONLY place
-//! the relevance and evidence scores appear together, side by side, labeled.
+//! score, confidence, and model freshness — stay separate and
+//! non-interchangeable; they are never collapsed into one number. The
+//! composite is the ONLY place the relevance and evidence scores appear
+//! together, side by side, labeled.
 //!
 //! Storage rule: [`MemoryEvidence`] is assembled at retrieval (the
 //! [`crate::rag`] evidence-bearing enrichment path) and NEVER persisted —
@@ -32,9 +33,12 @@
 //!   deserialization path from an `f64` to a [`FactStatusView`].
 //! - Relevance ([`Relevance`], `0.0..=1.0`), corroboration
 //!   ([`EvidenceScore`], `0.0..=[`EVIDENCE_SCORE_MAX`]`), calibration
-//!   ([`Confidence`]), and freshness ([`Freshness`], `0.0..=1.0`) are
-//!   separate fields with distinct types and ranges. No `From`/`Into`
-//!   converts between them or from a raw `f64`.
+//!   ([`Confidence`]), and model freshness ([`Freshness`], `0.0..=1.0`)
+//!   are separate fields with distinct types and ranges. No
+//!   `From`/`Into` converts between them or from a raw `f64`. The field
+//!   is named `model_freshness`, never `freshness`, so it cannot be
+//!   misread beside `truth`: TTL staleness speaks on `truth`, model
+//!   currency on `model_freshness`, and they are allowed to disagree.
 //! - Enforcement is constructor-plus-convention-plus-test, not absolute
 //!   type safety: a caller holding a raw `f64` can still deliberately build
 //!   the wrong newtype. What the types guarantee is that no score can
@@ -57,13 +61,19 @@ use crate::recall_status::{ChunkStanding, DerivationContext};
 /// Named-version policy (per the ADR-82 compatibility section and the
 /// checkpoint precedent): the current version loads as-is; unknown (future)
 /// versions are rejected by [`MemoryEvidence::from_json`], never silently
-/// accepted. Neither v1 nor v2 ever persisted anywhere (the storage rule
-/// forbids it), so v3 — which adds the `interrupted` recall-interruption
-/// signal — supersedes them with no migration path: an older payload is
-/// rejected like any other non-current version. The bump matters because
-/// an old reader would silently drop `interrupted` — exactly the silent
-/// misread versions exist to catch.
-pub const EVIDENCE_SCHEMA_VERSION: u16 = 3;
+/// accepted. No version ever persisted anywhere (the storage rule forbids
+/// it), so each bump supersedes its predecessors with no migration path: an
+/// older payload is rejected like any other non-current version. The bumps
+/// matter because a reader would otherwise silently misread what changed —
+/// exactly the silent misread versions exist to catch. v3 added the
+/// `interrupted` recall-interruption signal. v4 renames `freshness` to
+/// `model_freshness`, so the field name carries its model-only meaning
+/// beside `truth` (a TTL-expired row is `truth: Stale` with
+/// `model_freshness: 1.0` — orthogonal axes, not a contradiction). The
+/// rename is deliberately a hard load failure in both directions — an old
+/// reader must never read the new field under the old, ambiguous name, and
+/// a new reader must never invent a default where the field is missing.
+pub const EVIDENCE_SCHEMA_VERSION: u16 = 4;
 
 /// Retrieval-time freshness projection, `0.0..=1.0` decay multiplier.
 ///
@@ -167,8 +177,13 @@ pub struct MemoryEvidence {
     /// until a calibrated producer exists.
     #[serde(default)]
     pub confidence: Confidence,
-    /// Model freshness (`0.0..=1.0`); content age is out of scope here.
-    pub freshness: Freshness,
+    /// Model-version freshness (`0.0..=1.0`), named so it cannot be
+    /// misread beside [`Self::truth`]: TTL-driven staleness lives in
+    /// `truth` (a TTL-expired row is `truth: Stale` with
+    /// `model_freshness: 1.0` when its embedding model is current), and
+    /// content age is out of scope here — see [`Self::derivation`] and
+    /// [`Self::observed_at`].
+    pub model_freshness: Freshness,
     /// Why this status, in words: which substrate spoke, or that none did
     /// (H11 derivation, bounded at assembly).
     pub derivation: String,
@@ -213,7 +228,7 @@ impl MemoryEvidence {
         relevance: Relevance,
         evidence_score: EvidenceScore,
         confidence: Confidence,
-        freshness: Freshness,
+        model_freshness: Freshness,
         derivation: String,
         degraded: bool,
         interrupted: bool,
@@ -228,7 +243,7 @@ impl MemoryEvidence {
             relevance,
             evidence_score,
             confidence,
-            freshness,
+            model_freshness,
             derivation,
             degraded,
             interrupted,
@@ -242,16 +257,17 @@ impl MemoryEvidence {
     /// model freshness, and the degraded/interrupted flags.
     #[must_use]
     pub fn to_evident_chunk(&self, chunk: MemoryChunk) -> EvidentChunk {
-        // `freshness` left this struct through the validated `Freshness`
-        // newtype, so it is finite within `0.0..=1.0` by construction.
-        let freshness = self.freshness.value();
-        debug_assert!(freshness.is_finite() && (0.0..=1.0).contains(&freshness));
+        // `model_freshness` left this struct through the validated
+        // `Freshness` newtype, so it is finite within `0.0..=1.0` by
+        // construction.
+        let model_freshness = self.model_freshness.value();
+        debug_assert!(model_freshness.is_finite() && (0.0..=1.0).contains(&model_freshness));
         EvidentChunk {
             chunk,
             truth: self.truth,
             source: self.source,
             confidence: self.confidence,
-            freshness,
+            model_freshness,
             derivation: self.derivation.clone(),
             degraded: self.degraded,
             interrupted: self.interrupted,
@@ -298,14 +314,15 @@ impl MemoryEvidence {
 ///   order-preserving lift of a rank signal, not a calibrated probability.
 ///   RRF scores cluster near zero, so relevance values from different
 ///   queries are not comparable — only the order within one pass. Rank
-///   NEVER enters truth, source, freshness, or derivation: the standing
-///   input has no score field, so leakage is structural, not conventional.
+///   NEVER enters truth, source, model freshness, or derivation: the
+///   standing input has no score field, so leakage is structural, not
+///   conventional.
 /// - `evidence_score` is [`EvidenceScore::clamped`] over the link-score
 ///   map; chunks absent from the map score `0.0` (no supporting evidence —
 ///   the same convention as the cascade reorder key).
 /// - `confidence` is [`Confidence::Unknown`]: the retrieval path holds no
 ///   calibration for a chunk.
-/// - `freshness` is model freshness from the fused stale flag
+/// - `model_freshness` is model freshness from the fused stale flag
 ///   ([`Freshness::fresh`] / [`Freshness::stale_model`]); content age is
 ///   out of scope — see the derivation and [`MemoryEvidence::observed_at`].
 /// - `degraded` follows the fused result's degraded notice (the
@@ -329,7 +346,8 @@ pub fn enrich_with_standing(
             // complete. Fail-open philosophy preserved — the recall still
             // serves — but the interruption is explicit, never silent.
             let interrupted = ctx.interrupted;
-            let (truth, source, freshness, derivation) = match standings.get(&result.chunk_id) {
+            let (truth, source, model_freshness, derivation) = match standings.get(&result.chunk_id)
+            {
                 Some(standing) => {
                     let verdict = crate::recall_status::derive_recall_verdict(standing, ctx);
                     let derivation = if interrupted {
@@ -379,7 +397,7 @@ pub fn enrich_with_standing(
                 Relevance::clamped(result.score),
                 EvidenceScore::clamped(scores.get(&result.chunk_id).copied().unwrap_or(0.0)),
                 Confidence::Unknown,
-                freshness,
+                model_freshness,
                 derivation,
                 degraded,
                 interrupted,
@@ -466,21 +484,21 @@ mod tests {
         assert!(!first.degraded);
         assert_eq!(first.confidence, Confidence::Unknown);
         assert_eq!(first.evidence_score.value(), 8.0);
-        assert_eq!(first.freshness, Freshness::fresh());
+        assert_eq!(first.model_freshness, Freshness::fresh());
         assert_eq!(first.snapshot_generation, 7);
 
         let second = &evidence[1];
         // Absent from the score map: no supporting evidence, not an error.
         assert_eq!(second.evidence_score.value(), 0.0);
-        assert_eq!(second.freshness, Freshness::stale_model());
+        assert_eq!(second.model_freshness, Freshness::stale_model());
         // Relevance order follows the fused order.
         assert!(first.relevance.value() > second.relevance.value());
     }
 
     /// H11 ranking-independence: the query held constant, only rank varied.
-    /// Truth, source, freshness, and derivation must not move when scores
-    /// do — relevance (the labeled rank signal) is the only axis allowed
-    /// to follow rank.
+    /// Truth, source, model freshness, and derivation must not move when
+    /// scores do — relevance (the labeled rank signal) is the only axis
+    /// allowed to follow rank.
     #[test]
     fn recall_status_ignores_rank_scores() {
         use crate::recall_status::{ChunkStanding, DerivationContext};
@@ -520,7 +538,7 @@ mod tests {
         assert_eq!(bottom.len(), 1);
         assert_eq!(top[0].truth, bottom[0].truth);
         assert_eq!(top[0].source, bottom[0].source);
-        assert_eq!(top[0].freshness, bottom[0].freshness);
+        assert_eq!(top[0].model_freshness, bottom[0].model_freshness);
         assert_eq!(top[0].derivation, bottom[0].derivation);
         assert_eq!(top[0].evidence_score, bottom[0].evidence_score);
         // …while relevance — the labeled rank signal — does follow rank,
@@ -740,6 +758,53 @@ mod tests {
         assert!(MemoryEvidence::from_json(&value.to_string()).is_err());
     }
 
+    /// The schema-v4 rename (`freshness` → `model_freshness`) must fail loudly
+    /// on a v3 payload, not silently misread it: a v3 envelope is rejected by
+    /// the version gate, and a v4 envelope carrying the old `freshness` key
+    /// instead of `model_freshness` is rejected for the missing field (which
+    /// deliberately has no serde default).
+    #[test]
+    fn v3_payload_with_freshness_key_is_rejected() {
+        let evidence = MemoryEvidence::assemble(
+            "c".to_string(),
+            FactStatusView::Assumed,
+            RecallSource::ModelAuthored,
+            Relevance::clamped(0.1),
+            EvidenceScore::clamped(1.0),
+            Confidence::Unknown,
+            Freshness::fresh(),
+            "model-authored claim".to_string(),
+            false,
+            false,
+            1,
+            stamps().observed_at,
+        );
+        let mut v3 = serde_json::to_value(&evidence).expect("serializes");
+        // A v3 envelope: old version number, old field name.
+        v3["schema_version"] = serde_json::json!(3);
+        if let Some(map) = v3.as_object_mut() {
+            if let Some(freshness) = map.remove("model_freshness") {
+                map.insert("freshness".to_string(), freshness);
+            }
+        }
+        assert!(
+            MemoryEvidence::from_json(&v3.to_string()).is_err(),
+            "v3 payload must not decode under the v4 contract"
+        );
+        // A v4 envelope with the old key but no new key also fails — the
+        // renamed field has no default to rescue it.
+        let mut renamed = serde_json::to_value(&evidence).expect("serializes");
+        if let Some(map) = renamed.as_object_mut() {
+            if let Some(freshness) = map.remove("model_freshness") {
+                map.insert("freshness".to_string(), freshness);
+            }
+        }
+        assert!(
+            MemoryEvidence::from_json(&renamed.to_string()).is_err(),
+            "old field name must not decode without model_freshness"
+        );
+    }
+
     #[test]
     fn missing_degraded_key_reads_as_false() {
         let evidence = MemoryEvidence::assemble(
@@ -799,11 +864,88 @@ mod tests {
         assert_eq!(evident.truth, FactStatusView::Contradicted);
         assert_eq!(evident.source, RecallSource::IndexedFile);
         assert_eq!(evident.derivation, "contradicted by critic");
-        assert_eq!(evident.freshness, 1.0);
+        assert_eq!(evident.model_freshness, 1.0);
         assert!(!evident.degraded);
         // The rank signal rides along labeled as the chunk score — never
-        // as freshness.
+        // as model freshness.
         assert_eq!(evident.chunk.score, 0.02);
+    }
+
+    /// H16 honesty seam: recall TTL staleness (`truth`) and model-version
+    /// currency (`model_freshness`) are orthogonal axes, and the field
+    /// name must not blur them. A chunk past its retention window on a
+    /// CURRENT embedding model reads `truth: Stale` with
+    /// `model_freshness: Freshness::fresh()` — a legitimate combination,
+    /// not a contradiction. If either field read as a generic
+    /// "freshness", an agent would either distrust a current-model row or
+    /// trust an expired one.
+    #[test]
+    fn ttl_expired_stale_truth_keeps_current_model_freshness() {
+        use crate::recall_status::{ChunkStanding, DerivationContext};
+        use concerto_core::memory::{ChunkType, MemoryChunk, MemoryNamespace, ProjectId};
+
+        let now_unix = 1_784_000_000;
+        let mut standings = HashMap::new();
+        standings.insert(
+            "c".to_string(),
+            ChunkStanding {
+                chunk_type: ChunkType::Function,
+                file_path: Some("src/lib.rs".to_string()),
+                stale_model: false,
+                created_at: Some(
+                    OffsetDateTime::from_unix_timestamp(now_unix - 200 * 86_400)
+                        .expect("fixed time"),
+                ),
+                metadata: None,
+                incoming: Vec::new(),
+                cited_decision: None,
+                path_observation: None,
+            },
+        );
+        let ctx = DerivationContext {
+            decay_days: Some(90),
+            now_unix,
+            current_generation: None,
+            interrupted: false,
+        };
+        let evidence = enrich_with_standing(
+            &[fused("c", 0.5, false)],
+            &HashMap::new(),
+            stamps(),
+            &standings,
+            &ctx,
+        );
+        assert_eq!(evidence.len(), 1);
+        // TTL expiry speaks on truth — 200d against a 90-day window.
+        assert_eq!(evidence[0].truth, FactStatusView::Stale);
+        assert!(
+            evidence[0].derivation.contains("retention window"),
+            "derivation names the TTL: {}",
+            evidence[0].derivation
+        );
+        // …while model currency stays at full credit: the embedding model
+        // is current, and only the model axis may say otherwise.
+        assert_eq!(evidence[0].model_freshness, Freshness::fresh());
+
+        // The split survives the agent-facing projection unchanged.
+        let project_id = ProjectId("p".into());
+        let chunk = MemoryChunk {
+            id: "c".into(),
+            project_id: project_id.clone(),
+            namespace: MemoryNamespace::Project(project_id),
+            content: "content".into(),
+            file_path: Some("src/lib.rs".into()),
+            start_line: None,
+            end_line: None,
+            chunk_type: ChunkType::Function,
+            score: 0.5,
+            model_id: String::new(),
+            model_version: String::new(),
+            stale: false,
+        };
+        let evident = evidence[0].to_evident_chunk(chunk);
+        assert_eq!(evident.truth, FactStatusView::Stale);
+        assert_eq!(evident.model_freshness, 1.0);
     }
 
     #[test]
