@@ -33,7 +33,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use concerto_core::checkpoint::{
-    CheckpointExclusion, CheckpointRecord, CheckpointScope, CheckpointStatus, RestoreOutcome,
+    CheckpointExclusion, CheckpointRecord, CheckpointScope, CheckpointStatus, RestoreMethod,
+    RestoreOutcome,
 };
 use concerto_core::traits::tool::Tool;
 use concerto_core::traits::PolicyEngine;
@@ -95,12 +96,17 @@ pub struct CheckpointRestoreInput {
 
 /// Serializable projection of [`RestoreOutcome`] — the service's restore
 /// evidence shape (the domain enum carries no serde derive). Field-for-field;
-/// no outcome is collapsed or invented.
+/// no outcome is collapsed or invented. Every variant carries the
+/// [`RestoreMethod`] the restore actually ran, so an operator reading the
+/// projection never has to reverse-engineer which restore branch ran from
+/// the `status` tag alone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum HarnessRestoreOutcome {
     /// Every included resource was restored through gated writes.
     Restored {
+        /// The restore method that ran (always `pre_image_store` here).
+        method: RestoreMethod,
         /// Canonical paths written back (byte-exact).
         restored: Vec<String>,
         /// Paths recreated (absent at restore time, bytes banked).
@@ -115,6 +121,8 @@ pub enum HarnessRestoreOutcome {
     },
     /// The checkpoint was already restored (recorded no-op).
     AlreadyRestored {
+        /// The restore method the FIRST restore ran.
+        method: RestoreMethod,
         /// Unix epoch millis of the first restore.
         at_ms: i64,
         /// Who performed the first restore.
@@ -122,6 +130,8 @@ pub enum HarnessRestoreOutcome {
     },
     /// The byte-carrying subset restored; `missing` names hash-only paths.
     Partial {
+        /// The restore method that ran (always `pre_image_store` here).
+        method: RestoreMethod,
         /// Canonical paths written back.
         restored: Vec<String>,
         /// Canonical paths without restorable bytes.
@@ -131,11 +141,15 @@ pub enum HarnessRestoreOutcome {
     },
     /// Nothing was written; the operator follows `limitations`.
     RequiresOperator {
+        /// The restore method (always `manual` here).
+        method: RestoreMethod,
         /// Why auto-restore is unavailable.
         limitations: Vec<String>,
     },
     /// The stash pop ran outside the byte path.
     StashRestored {
+        /// The restore method (always `git_stash` here).
+        method: RestoreMethod,
         /// What the stash restorer reported.
         detail: String,
     },
@@ -144,17 +158,26 @@ pub enum HarnessRestoreOutcome {
 impl From<RestoreOutcome> for HarnessRestoreOutcome {
     fn from(outcome: RestoreOutcome) -> Self {
         match outcome {
-            RestoreOutcome::Restored { restored, recreated, deleted, verified_skips, notes } => {
-                Self::Restored { restored, recreated, deleted, verified_skips, notes }
+            RestoreOutcome::Restored {
+                method,
+                restored,
+                recreated,
+                deleted,
+                verified_skips,
+                notes,
+            } => Self::Restored { method, restored, recreated, deleted, verified_skips, notes },
+            RestoreOutcome::AlreadyRestored { method, at_ms, by } => {
+                Self::AlreadyRestored { method, at_ms, by }
             }
-            RestoreOutcome::AlreadyRestored { at_ms, by } => Self::AlreadyRestored { at_ms, by },
-            RestoreOutcome::Partial { restored, missing, limitations } => {
-                Self::Partial { restored, missing, limitations }
+            RestoreOutcome::Partial { method, restored, missing, limitations } => {
+                Self::Partial { method, restored, missing, limitations }
             }
-            RestoreOutcome::RequiresOperator { limitations } => {
-                Self::RequiresOperator { limitations }
+            RestoreOutcome::RequiresOperator { method, limitations } => {
+                Self::RequiresOperator { method, limitations }
             }
-            RestoreOutcome::StashRestored { detail } => Self::StashRestored { detail },
+            RestoreOutcome::StashRestored { method, detail } => {
+                Self::StashRestored { method, detail }
+            }
         }
     }
 }
@@ -405,6 +428,7 @@ mod tests {
     #[test]
     fn restore_outcome_projection_is_field_for_field() {
         let outcome = RestoreOutcome::Restored {
+            method: RestoreMethod::PreImageStore,
             restored: vec!["a".into()],
             recreated: vec!["b".into()],
             deleted: vec!["c".into()],
@@ -415,6 +439,7 @@ mod tests {
         assert_eq!(projected.summary(), "restored");
         let value = serde_json::to_value(&projected).expect("serializes");
         assert_eq!(value["status"], "restored");
+        assert_eq!(value["method"], "pre_image_store");
         assert_eq!(value["restored"][0], "a");
         assert_eq!(value["verified_skips"][0], "d");
     }
@@ -422,8 +447,13 @@ mod tests {
     #[test]
     fn already_restored_and_partial_round_trip() {
         for outcome in [
-            HarnessRestoreOutcome::AlreadyRestored { at_ms: 7, by: "agent".into() },
+            HarnessRestoreOutcome::AlreadyRestored {
+                method: RestoreMethod::PreImageStore,
+                at_ms: 7,
+                by: "agent".into(),
+            },
             HarnessRestoreOutcome::Partial {
+                method: RestoreMethod::PreImageStore,
                 restored: vec!["x".into()],
                 missing: vec!["y".into()],
                 limitations: vec!["hash-only".into()],

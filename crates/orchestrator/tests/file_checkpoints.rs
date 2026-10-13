@@ -553,7 +553,7 @@ async fn over_total_file_degrades_to_manual_with_limitations() {
     .await
     .expect("manual surfaces, never fails")
     {
-        concerto_core::checkpoint::RestoreOutcome::RequiresOperator { limitations } => {
+        concerto_core::checkpoint::RestoreOutcome::RequiresOperator { limitations, .. } => {
             assert!(!limitations.is_empty());
         }
         other => panic!("expected RequiresOperator, got {other:?}"),
@@ -593,7 +593,12 @@ async fn over_total_file_degrades_to_manual_with_limitations() {
     .await
     .expect("partial restore succeeds")
     {
-        concerto_core::checkpoint::RestoreOutcome::Partial { restored, missing, limitations } => {
+        concerto_core::checkpoint::RestoreOutcome::Partial {
+            restored,
+            missing,
+            limitations,
+            ..
+        } => {
             assert_eq!(restored, vec!["small.txt".to_string()]);
             assert_eq!(missing, vec!["big.bin".to_string()]);
             assert!(limitations.iter().any(|l| l.contains("big.bin")));
@@ -1243,7 +1248,12 @@ async fn corrupt_chunk_set_restores_partial_without_success_claim() {
     .await
     .expect("partial restore surfaces, never fails")
     {
-        concerto_core::checkpoint::RestoreOutcome::Partial { restored, missing, limitations } => {
+        concerto_core::checkpoint::RestoreOutcome::Partial {
+            restored,
+            missing,
+            limitations,
+            ..
+        } => {
             assert_eq!(restored, vec!["ok.txt".to_string()]);
             assert_eq!(missing, vec!["frag.dat".to_string()]);
             assert!(limitations.iter().any(|l| l.contains("frag.dat")));
@@ -1308,7 +1318,12 @@ async fn tampered_chunk_set_fails_hash_verification() {
     .await
     .expect("partial restore surfaces, never fails")
     {
-        concerto_core::checkpoint::RestoreOutcome::Partial { restored, missing, limitations } => {
+        concerto_core::checkpoint::RestoreOutcome::Partial {
+            restored,
+            missing,
+            limitations,
+            ..
+        } => {
             assert!(restored.is_empty());
             assert_eq!(missing, vec!["sealed.dat".to_string()]);
             assert!(
@@ -2368,7 +2383,12 @@ async fn pruned_sidecar_on_done_row_restores_partial_never_a_skip() {
     .await
     .expect("byte-less restore surfaces, never fails")
     {
-        concerto_core::checkpoint::RestoreOutcome::Partial { restored, missing, limitations } => {
+        concerto_core::checkpoint::RestoreOutcome::Partial {
+            restored,
+            missing,
+            limitations,
+            ..
+        } => {
             assert!(
                 restored.is_empty(),
                 "a sidecar-less `done` row must never be claimed as restored, got {restored:?}"
@@ -2409,4 +2429,186 @@ async fn pruned_sidecar_on_done_row_restores_partial_never_a_skip() {
         "the monotonic guard keeps the earlier true `done` (`done → missing` refused)"
     );
     assert_eq!(h.disk("a.txt"), "a-v1", "no bytes: nothing written, disk left as found");
+}
+
+/// H16 honesty defect 2: every restore path reports the `RestoreMethod` it
+/// actually ran, end-to-end through the real store/executor — an operator
+/// reading an outcome never reverse-engineers the branch from the variant.
+/// Drives one real restore per method (PreImageStore, Manual, GitStash).
+#[tokio::test]
+async fn every_restore_method_is_named_on_its_outcome() {
+    use concerto_core::checkpoint::RestoreOutcome;
+    use concerto_orchestrator::file_checkpoint::create_git_stash_checkpoint;
+    use concerto_tools::undo::UndoManager;
+
+    // --- PreImageStore: the byte path. ---
+    let h = Harness::new().await;
+    h.gated_write("w-1", "agent-a", "notes.txt", "version one").await;
+    let preimage = create_file_checkpoint(
+        &h.store,
+        &h.root,
+        h.session_id,
+        fs_scope(&["notes.txt"]),
+        vec!["notes.txt".to_string()],
+        "agent-a",
+        BTreeMap::new(),
+        Vec::new(),
+        None,
+        None,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("pre-image checkpoint");
+    assert_eq!(preimage.restore_method, RestoreMethod::PreImageStore);
+    h.gated_write("w-2", "agent-a", "notes.txt", "version two").await;
+    let outcome = restore_file_checkpoint(
+        &h.executor,
+        &h.store,
+        &h.gate,
+        None,
+        &h.session(),
+        &preimage.checkpoint_id.to_string(),
+        "agent-a",
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("pre-image restore succeeds");
+    match outcome {
+        RestoreOutcome::Restored { method, .. } => {
+            assert_eq!(method, RestoreMethod::PreImageStore, "byte path names itself");
+        }
+        other => panic!("expected Restored, got {other:?}"),
+    }
+
+    // A second restore (the recorded no-op) names the method the FIRST ran.
+    let again = restore_file_checkpoint(
+        &h.executor,
+        &h.store,
+        &h.gate,
+        None,
+        &h.session(),
+        &preimage.checkpoint_id.to_string(),
+        "agent-a",
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("re-restore surfaces");
+    match again {
+        RestoreOutcome::AlreadyRestored { method, .. } => {
+            assert_eq!(method, RestoreMethod::PreImageStore, "no-op echoes the first method");
+        }
+        other => panic!("expected AlreadyRestored, got {other:?}"),
+    }
+
+    // --- Manual: an over-total file degrades to Manual and says so. ---
+    let big_bytes = vec![b'x'; CHECKPOINT_TOTAL_LIMIT_BYTES + 1];
+    std::fs::write(h.root.join("big.bin"), &big_bytes).expect("seed over-total file");
+    let manual = create_file_checkpoint(
+        &h.store,
+        &h.root,
+        h.session_id,
+        fs_scope(&["big.bin"]),
+        vec!["big.bin".to_string()],
+        "agent-a",
+        BTreeMap::new(),
+        Vec::new(),
+        None,
+        None,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("manual checkpoint");
+    assert_eq!(manual.restore_method, RestoreMethod::Manual);
+    let outcome = restore_file_checkpoint(
+        &h.executor,
+        &h.store,
+        &h.gate,
+        None,
+        &h.session(),
+        &manual.checkpoint_id.to_string(),
+        "agent-a",
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("manual restore surfaces");
+    match outcome {
+        RestoreOutcome::RequiresOperator { method, limitations } => {
+            assert_eq!(method, RestoreMethod::Manual, "manual path names itself");
+            assert!(!limitations.is_empty(), "manual still explains why");
+        }
+        other => panic!("expected RequiresOperator, got {other:?}"),
+    }
+
+    // --- GitStash: the stash path names itself. ---
+    let g = Harness::new().await;
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(&g.root)
+        .output()
+        .expect("git init");
+    std::process::Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(&g.root)
+        .output()
+        .expect("git config email");
+    std::process::Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(&g.root)
+        .output()
+        .expect("git config name");
+    std::fs::write(g.root.join("tracked.txt"), "base").expect("seed");
+    std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(&g.root)
+        .output()
+        .expect("git add");
+    std::process::Command::new("git")
+        .args(["commit", "-m", "base"])
+        .current_dir(&g.root)
+        .output()
+        .expect("git commit");
+
+    std::fs::write(g.root.join("tracked.txt"), "dirty").expect("dirty");
+    let undo = Arc::new(std::sync::Mutex::new(UndoManager::new(g.root.clone())));
+    let task_id = TaskId::new();
+    let stash = create_git_stash_checkpoint(
+        &g.store,
+        &undo,
+        g.session_id,
+        task_id,
+        CheckpointScope::Task { task_id },
+        "agent-a",
+        Vec::new(),
+        None,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("stash checkpoint");
+    assert_eq!(stash.restore_method, RestoreMethod::GitStash);
+
+    std::fs::write(g.root.join("tracked.txt"), "post").expect("post");
+    std::process::Command::new("git")
+        .args(["checkout", "--", "tracked.txt"])
+        .current_dir(&g.root)
+        .output()
+        .expect("git checkout");
+    let outcome = restore_file_checkpoint(
+        &g.executor,
+        &g.store,
+        &g.gate,
+        Some(&undo),
+        &g.session(),
+        &stash.checkpoint_id.to_string(),
+        "agent-a",
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("stash restore succeeds");
+    match outcome {
+        RestoreOutcome::StashRestored { method, detail } => {
+            assert_eq!(method, RestoreMethod::GitStash, "stash path names itself");
+            assert!(!detail.is_empty(), "stash detail is still reported");
+        }
+        other => panic!("expected StashRestored, got {other:?}"),
+    }
 }

@@ -311,6 +311,9 @@ async fn checkpoint_lifecycle_round_trips_through_the_standalone_service() {
         .await
         .expect("restore");
     assert_eq!(restored.data["status"], "restored");
+    // H16 defect 2: the service projection names the method that ran, so an
+    // operator never reverse-engineers the branch from the status tag.
+    assert_eq!(restored.data["method"], "pre_image_store");
     assert_eq!(std::fs::read_to_string(project.join("a.txt")).expect("read"), "original\n");
 
     // Inspect reports the transitioned record (evidence, not a claim).

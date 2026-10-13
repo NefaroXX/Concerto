@@ -1398,7 +1398,11 @@ impl ToolExecutor {
             .ok_or_else(|| RestoreError::NotFound(checkpoint_id.to_owned()))?;
 
         if let CheckpointStatus::Restored { at_ms, by } = &record.status {
-            return Ok(RestoreOutcome::AlreadyRestored { at_ms: *at_ms, by: by.clone() });
+            return Ok(RestoreOutcome::AlreadyRestored {
+                method: record.restore_method,
+                at_ms: *at_ms,
+                by: by.clone(),
+            });
         }
         match &record.status {
             CheckpointStatus::Expired { reason } => {
@@ -1426,7 +1430,10 @@ impl ToolExecutor {
                             .to_string(),
                     );
                 }
-                return Ok(RestoreOutcome::RequiresOperator { limitations });
+                return Ok(RestoreOutcome::RequiresOperator {
+                    method: RestoreMethod::Manual,
+                    limitations,
+                });
             }
             RestoreMethod::GitStash => {
                 let detail = stash.restore_stash(&record).map_err(RestoreError::ExecutionFailed)?;
@@ -1437,7 +1444,10 @@ impl ToolExecutor {
                     .mark_restored(checkpoint_id, crate::checkpoint::now_millis(), by_agent, cancel)
                     .await
                     .map_err(RestoreError::Store)?;
-                return Ok(RestoreOutcome::StashRestored { detail });
+                return Ok(RestoreOutcome::StashRestored {
+                    method: RestoreMethod::GitStash,
+                    detail,
+                });
             }
             RestoreMethod::PreImageStore => {}
         }
@@ -1823,7 +1833,14 @@ impl ToolExecutor {
             )
             .await;
             if transitioned {
-                Ok(RestoreOutcome::Restored { restored, recreated, deleted, verified_skips, notes })
+                Ok(RestoreOutcome::Restored {
+                    method: RestoreMethod::PreImageStore,
+                    restored,
+                    recreated,
+                    deleted,
+                    verified_skips,
+                    notes,
+                })
             } else {
                 // Lost a race with a concurrent restore: report the stored
                 // no-op rather than claiming this call restored.
@@ -1831,12 +1848,13 @@ impl ToolExecutor {
                     .load_record(checkpoint_id, CancellationToken::new())
                     .await
                     .map_err(RestoreError::Store)?
-                    .map(|record| record.status)
+                    .map(|raced| (raced.restore_method, raced.status))
                 {
-                    Some(CheckpointStatus::Restored { at_ms, by }) => {
-                        Ok(RestoreOutcome::AlreadyRestored { at_ms, by })
+                    Some((method, CheckpointStatus::Restored { at_ms, by })) => {
+                        Ok(RestoreOutcome::AlreadyRestored { method, at_ms, by })
                     }
                     _ => Ok(RestoreOutcome::Restored {
+                        method: RestoreMethod::PreImageStore,
                         restored,
                         recreated,
                         deleted,
@@ -1857,7 +1875,12 @@ impl ToolExecutor {
                 cancel.clone(),
             )
             .await;
-            Ok(RestoreOutcome::Partial { restored, missing, limitations })
+            Ok(RestoreOutcome::Partial {
+                method: RestoreMethod::PreImageStore,
+                restored,
+                missing,
+                limitations,
+            })
         }
     }
 
@@ -4736,7 +4759,8 @@ mod restore_tests {
             .await
             .expect("manual surfaces, never fails")
         {
-            RestoreOutcome::RequiresOperator { limitations } => {
+            RestoreOutcome::RequiresOperator { method, limitations } => {
+                assert_eq!(method, RestoreMethod::Manual, "Manual outcome names its method");
                 assert!(!limitations.is_empty());
             }
             other => panic!("expected RequiresOperator, got {other:?}"),
@@ -4764,7 +4788,8 @@ mod restore_tests {
             .await
             .expect("partial restore succeeds")
         {
-            RestoreOutcome::Partial { restored, missing, limitations } => {
+            RestoreOutcome::Partial { method, restored, missing, limitations } => {
+                assert_eq!(method, RestoreMethod::PreImageStore, "partial runs the byte path");
                 assert!(restored.is_empty());
                 assert_eq!(missing, vec!["gone.txt"]);
                 assert!(!limitations.is_empty());
@@ -4867,7 +4892,10 @@ mod restore_tests {
             .await
             .expect("stash restore succeeds")
         {
-            RestoreOutcome::StashRestored { detail } => assert_eq!(detail, "stash popped"),
+            RestoreOutcome::StashRestored { method, detail } => {
+                assert_eq!(method, RestoreMethod::GitStash, "stash restore names its method");
+                assert_eq!(detail, "stash popped");
+            }
             other => panic!("expected StashRestored, got {other:?}"),
         }
         assert_eq!(*stash.calls.lock().expect("stash lock"), 1);

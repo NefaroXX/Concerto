@@ -1002,10 +1002,21 @@ pub struct OwnershipConflictInfo {
 }
 
 /// Outcome of [`ToolExecutor::restore_checkpoint`](crate::executor::ToolExecutor::restore_checkpoint).
+///
+/// Every variant carries the [`RestoreMethod`] the restore actually ran
+/// (or would have run) — a `RequiresOperator` outcome names
+/// `Manual`, a `StashRestored` names `GitStash`, and the byte path names
+/// `PreImageStore` — so an operator reading an outcome never has to
+/// reverse-engineer which restore branch ran from the variant alone. The
+/// field is sourced from the checkpoint record's recorded method; it is
+/// never inferred from the outcome shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RestoreOutcome {
     /// Every included resource was restored through gated writes.
     Restored {
+        /// The restore method that ran (always `PreImageStore` here —
+        /// the byte path).
+        method: RestoreMethod,
         /// Canonical paths written back (byte-exact).
         restored: Vec<String>,
         /// Paths recreated (absent at restore time, bytes banked).
@@ -1029,6 +1040,9 @@ pub enum RestoreOutcome {
     /// The checkpoint was already `Restored`: no write ran (recorded no-op;
     /// the first restore's `Restored{at, by}` is the record).
     AlreadyRestored {
+        /// The restore method the FIRST restore ran (carried on the
+        /// recorded outcome, not re-inferred here).
+        method: RestoreMethod,
         /// When the first restore ran, Unix epoch millis.
         at_ms: i64,
         /// Who ran the first restore.
@@ -1038,6 +1052,9 @@ pub enum RestoreOutcome {
     /// (their `limitations` explain why). The checkpoint transitioned to
     /// `Partial{missing}`.
     Partial {
+        /// The restore method that ran (always `PreImageStore` here — the
+        /// byte path).
+        method: RestoreMethod,
         /// Canonical paths written back.
         restored: Vec<String>,
         /// Canonical paths without restorable bytes.
@@ -1048,11 +1065,15 @@ pub enum RestoreOutcome {
     /// `RestoreMethod::Manual`: nothing was written; the operator follows
     /// `limitations`.
     RequiresOperator {
+        /// The restore method (always `Manual` here).
+        method: RestoreMethod,
         /// Why auto-restore is unavailable.
         limitations: Vec<String>,
     },
     /// `RestoreMethod::GitStash`: the stash pop ran outside the byte path.
     StashRestored {
+        /// The restore method (always `GitStash` here).
+        method: RestoreMethod,
         /// What the stash restorer reported.
         detail: String,
     },
