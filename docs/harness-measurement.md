@@ -202,7 +202,11 @@ leg's summary. Two honest options, in preference order:
 
    Building the export does **not** measure the metrics: an operator run over a
    real model and config (the procedure above) is still required, and the
-   values below remain unclaimed.
+   values below remain unclaimed. Note in particular that the eval path's own
+   test-suite-mode verification records carry verifier/scope but not
+   generation/content-fingerprint/evidence-ids, so their `is_passing_evidence`
+   verdict is false and metric 3 stays unmeasured there too — correct per H04,
+   not a regression; only a live run stamping the full R2 basis can satisfy it.
 
 ### Repetition
 
