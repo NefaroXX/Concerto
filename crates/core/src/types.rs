@@ -1330,6 +1330,14 @@ pub struct ToolExecutionSummary {
     /// eval artifact, and an identical retry keeps the same key. `None` when
     /// the call never reached argument normalization (e.g. a pre-execution
     /// guard rejection).
+    ///
+    /// **Known limitation (documented, not fixed):** the value is the first
+    /// 16 hex chars of the BLAKE3 digest (64 bits). It is collision-resistant
+    /// for a single run's call set, but like any hash it is reversible for
+    /// low-entropy inputs by enumeration. The 64-bit form is deliberately kept
+    /// identical to the audit-log `input_hash` grammar so option 1 (audit rows)
+    /// and option 2 (the eval observation export) agree on call identity; it is
+    /// not widened.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_fingerprint: Option<String>,
 }
