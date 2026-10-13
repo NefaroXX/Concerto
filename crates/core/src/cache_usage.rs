@@ -55,7 +55,7 @@ impl CacheUsageSummary {
 
 /// Caller supplies effective model prices and their version; no guessed
 /// discount is applied to unknown gateway/model routes. All rates are USD/MTok.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CachePricing {
     pub version: String,
     pub input: f64,
@@ -64,6 +64,10 @@ pub struct CachePricing {
     pub cache_write: Option<f64>,
     pub cache_write_5m: Option<f64>,
     pub cache_write_1h: Option<f64>,
+    /// For protocols whose cache writes are billed at the ordinary input
+    /// rate (e.g. automatic read-only discount accounting). Explicit opt-in.
+    #[serde(default)]
+    pub writes_charged_as_input: bool,
 }
 
 impl CachePricing {
@@ -76,6 +80,18 @@ impl CachePricing {
             }
             let rate = rate?;
             (rate.is_finite() && rate >= 0.0).then_some(tokens as f64 * rate)
+        }
+        if self.version.trim().is_empty() {
+            return None;
+        }
+        if self.writes_charged_as_input {
+            let reads = usage.cache_read_tokens?;
+            let ordinary = usage.prompt_tokens?.checked_sub(reads)?;
+            let cost = (priced(ordinary, Some(self.input))?
+                + priced(reads, self.cache_read)?
+                + priced(usage.completion_tokens?, Some(self.output))?)
+                / 1_000_000.0;
+            return cost.is_finite().then_some(cost);
         }
         let input = usage.uncached_prompt_tokens?;
         let reads = usage.cache_read_tokens?;
@@ -151,6 +167,7 @@ mod tests {
             cache_write: None,
             cache_write_5m: Some(3.75),
             cache_write_1h: Some(6.0),
+            writes_charged_as_input: false,
         };
         let usage = CompletionUsage {
             prompt_tokens: Some(1000),

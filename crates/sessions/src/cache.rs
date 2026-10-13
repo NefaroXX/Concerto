@@ -23,6 +23,23 @@ pub struct CacheReport {
 }
 
 impl CacheReport {
+    /// Recompute reporting costs with an explicit, versioned price table.
+    /// Missing prices/counts remain unknown; no nominal fallback is mixed in.
+    pub fn reprice(&mut self, prices: &BTreeMap<String, concerto_core::cache_usage::CachePricing>) {
+        self.summary = ProviderCallSummary::default();
+        self.by_provider_model.clear();
+        for call in &mut self.attempts {
+            let key = format!("{} / {}", call.provider, call.model);
+            call.estimated_cost_usd = None;
+            call.cost_source = "missing_configured_price".into();
+            if let Some(price) = prices.get(&key) {
+                call.estimated_cost_usd = call.usage.and_then(|usage| price.estimate(usage));
+                call.cost_source = format!("configured_estimate:{}", price.version);
+            }
+            self.summary.record(call);
+            self.by_provider_model.entry(key).or_default().record(call);
+        }
+    }
     pub fn from_events(
         session_id: Ulid,
         events: &[crate::replay::StoredEvent],

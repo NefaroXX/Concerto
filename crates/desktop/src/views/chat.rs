@@ -2815,6 +2815,25 @@ pub fn spend_log_view<'a>(
         )
         .size(caption)
         .color(palette.text_muted),
+        text(
+            cache_report
+                .map(|report| {
+                    let cost = report
+                        .summary
+                        .complete_estimated_cost_usd()
+                        .map(|cost| format!("${cost:.5}"))
+                        .unwrap_or_else(|| "N/A".into());
+                    let source = report
+                        .attempts
+                        .first()
+                        .map(|call| call.cost_source.as_str())
+                        .unwrap_or("unknown");
+                    format!("Provider cost estimate: {cost} · {source}")
+                })
+                .unwrap_or_else(|| "Provider cost estimate: unavailable".into())
+        )
+        .size(caption)
+        .color(palette.text_muted),
         body,
         rule::horizontal(1),
         spend_log_daily_row(daily_cost, palette, caption),

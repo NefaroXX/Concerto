@@ -592,9 +592,15 @@ impl App {
                     }
                 };
                 let records = handler.list_spend_records(session_id).await.unwrap_or_default();
-                let cache_report = handler.load_events(session_id).await.ok().and_then(|events| {
-                    concerto_sessions::cache::CacheReport::from_events(session_id, &events).ok()
-                });
+                let mut cache_report =
+                    handler.load_events(session_id).await.ok().and_then(|events| {
+                        concerto_sessions::cache::CacheReport::from_events(session_id, &events).ok()
+                    });
+                if !app_config.cache_pricing.is_empty() {
+                    if let Some(report) = &mut cache_report {
+                        report.reprice(&app_config.cache_pricing);
+                    }
+                }
                 (records, cache_report)
             },
             |(records, cache_report)| {

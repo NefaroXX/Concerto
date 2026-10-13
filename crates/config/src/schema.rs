@@ -427,6 +427,10 @@ pub fn resolve_terminal_title_enabled(explicit_no_title: Option<bool>, config: &
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
+    /// Explicit USD/MTok reporting prices keyed by "provider / model".
+    /// Empty keeps legacy nominal estimates; these do not change spend caps.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub cache_pricing: std::collections::BTreeMap<String, concerto_core::cache_usage::CachePricing>,
     pub schema_version: u32,
 
     /// Legacy default-provider field retained for deserializing older configs.
@@ -615,6 +619,7 @@ impl PartialEq for AppConfig {
     /// (design doc §1.2, review F8/Q1).
     fn eq(&self, other: &Self) -> bool {
         self.schema_version == other.schema_version
+            && self.cache_pricing == other.cache_pricing
             && self.primary_provider == other.primary_provider
             && self.primary_provider_config == other.primary_provider_config
             && self.fallback_provider == other.fallback_provider
@@ -648,6 +653,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
+            cache_pricing: Default::default(),
             primary_provider: None,
             primary_provider_config: None,
             fallback_provider: None,

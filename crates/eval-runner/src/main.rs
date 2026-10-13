@@ -30,6 +30,7 @@ async fn main() {
     let mut category: Option<String> = None;
     let mut variant: Option<String> = None;
     let mut preparation: Option<String> = None;
+    let mut pricing_fingerprint: Option<String> = None;
     let agent_driven = env::args().any(|arg| arg.starts_with("--config="));
 
     for arg in env::args().skip(1) {
@@ -82,9 +83,21 @@ async fn main() {
         // Build the config-driven agent factory: the provider is built per
         // task from the config's primary provider (no provider configured is
         // reported, never silently mocked).
+        if !config.cache_pricing.is_empty() {
+            pricing_fingerprint = Some(
+                blake3::hash(
+                    serde_json::to_string(&config.cache_pricing)
+                        .expect("price table serializes")
+                        .as_bytes(),
+                )
+                .to_hex()
+                .to_string(),
+            );
+        }
         let provider_config = config.primary_provider_config.clone();
         runner = runner.with_agent_factory(config_agent_factory(
             provider_config,
+            config.cache_pricing.clone(),
             config
                 .context
                 .as_ref()
@@ -110,7 +123,9 @@ async fn main() {
         "cache_preparation_source": "operator_label_not_provider_proof",
         "runtime_mode": if agent_driven { "single_agent_fixture" } else { "test_suite_only" },
         "policy_mode": if agent_driven { "permissive_fixture" } else { "test_suite_only" },
-        "cost_source": "legacy_nominal_estimate", "reported_costs_are_subtotals_when_usage_is_missing": true,
+        "cost_source": if pricing_fingerprint.is_some() { "configured_estimate" } else { "legacy_nominal_estimate" },
+        "pricing_fingerprint": pricing_fingerprint,
+        "reported_costs_are_subtotals_when_usage_is_missing": true,
     }));
 
     // If baseline provided, compare with 5% threshold.
@@ -138,10 +153,12 @@ async fn main() {
 /// result (never a mock substitution).
 fn config_agent_factory(
     provider_config: Option<concerto_config::ProviderConfig>,
+    pricing: std::collections::BTreeMap<String, concerto_core::cache_usage::CachePricing>,
     stable_prefix: bool,
 ) -> AgentFactory {
     Arc::new(move |description: String, project_dir: PathBuf| {
         let provider_config = provider_config.clone();
+        let pricing = pricing.clone();
         Box::pin(async move {
             let model =
                 provider_config.as_ref().map(|config| config.model.clone()).unwrap_or_default();
@@ -165,6 +182,7 @@ fn config_agent_factory(
                 stable_prefix,
                 model,
                 Some(config_fingerprint),
+                pricing,
             )
             .await
         })
@@ -194,9 +212,10 @@ fn provider_agent_factory(provider: Arc<dyn LlmProvider>, model: String) -> Agen
     Arc::new(move |description: String, project_dir: PathBuf| {
         let provider = provider.clone();
         let model = model.clone();
-        Box::pin(
-            async move { run_agent(provider, description, project_dir, false, model, None).await },
-        )
+        Box::pin(async move {
+            run_agent(provider, description, project_dir, false, model, None, Default::default())
+                .await
+        })
     })
 }
 
@@ -211,6 +230,7 @@ async fn run_agent(
     stable_prefix: bool,
     model: String,
     configuration_fingerprint: Option<String>,
+    pricing: std::collections::BTreeMap<String, concerto_core::cache_usage::CachePricing>,
 ) -> Result<AgentRunResult, String> {
     // Create tool registry
     let mut registry = ToolRegistry::default();
@@ -313,13 +333,16 @@ async fn run_agent(
         .finish()
         .await
         .map_err(|error| format!("benchmark event recording failed: {error}"))?;
-    let report = concerto_sessions::cache::load_cache_report(
+    let mut report = concerto_sessions::cache::load_cache_report(
         store.as_ref(),
         session.id,
         CancellationToken::new(),
     )
     .await
     .map_err(|error| error.to_string())?;
+    if !pricing.is_empty() {
+        report.reprice(&pricing);
+    }
     let telemetry = report.summary;
     let total_tokens = telemetry.reported_input_tokens + telemetry.reported_output_tokens;
     let total_cost_usd = telemetry.known_estimated_cost_usd;
@@ -471,8 +494,17 @@ fn compare_with_baseline(
             "Cost/token comparisons unavailable: provider telemetry is incomplete or legacy."
         );
     }
+    let price_basis = |report: &BenchmarkReport| {
+        report.metadata.as_ref().map(|metadata| {
+            (metadata.get("pricing_fingerprint").cloned(), metadata.get("cost_source").cloned())
+        })
+    };
+    let costs_comparable = efficiency_comparable && price_basis(current) == price_basis(&baseline);
+    if !costs_comparable {
+        eprintln!("Cost comparison unavailable: missing measurements or different price versions.");
+    }
     // Cost: higher is bad.
-    if efficiency_comparable && baseline.avg_cost_usd > 0.0 {
+    if costs_comparable && baseline.avg_cost_usd > 0.0 {
         let delta = (current.avg_cost_usd - baseline.avg_cost_usd) / baseline.avg_cost_usd;
         if delta > threshold {
             regressions.push(format!(

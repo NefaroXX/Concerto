@@ -694,7 +694,12 @@ fn run_sessions_subcommand(args: &[String], project_root: &Path) -> anyhow::Resu
                 anyhow::bail!("usage: concerto sessions cache <id> [--json]");
             }
             let session_id = parse_session_id(&args[1])?;
-            let report = tokio::runtime::Runtime::new()?.block_on(async {
+            let pricing = concerto_config::load_config(
+                concerto_config::default_config_path().as_ref(),
+                Some(project_root),
+            )?
+            .cache_pricing;
+            let mut report = tokio::runtime::Runtime::new()?.block_on(async {
                 let store = concerto_sessions::SqliteSessionStore::connect_shared().await?;
                 use concerto_sessions::SessionStore;
                 if store.load_session(session_id, CancellationToken::new()).await?.is_none() {
@@ -707,6 +712,9 @@ fn run_sessions_subcommand(args: &[String], project_root: &Path) -> anyhow::Resu
                 )
                 .await
             })?;
+            if !pricing.is_empty() {
+                report.reprice(&pricing);
+            }
             if args.len() == 3 {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -722,9 +730,13 @@ fn run_sessions_subcommand(args: &[String], project_root: &Path) -> anyhow::Resu
                         summary.cache.calls, summary.missing_usage_calls
                     );
                 }
-                println!("Cost source: nominal estimates; cache savings are not inferred. Missing cost calls: {}", report.summary.missing_cost_calls);
+                println!(
+                    "Estimated cost: {:?}; missing cost calls: {}",
+                    report.summary.complete_estimated_cost_usd(),
+                    report.summary.missing_cost_calls
+                );
             }
-            Ok(())
+            return Ok(());
         }
         "list" => {
             let rt = tokio::runtime::Runtime::new()?;
