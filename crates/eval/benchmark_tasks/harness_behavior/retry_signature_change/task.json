@@ -1,0 +1,1 @@
+{ "id": "01M4TSBFWZ0000000000000002", "description": "Change parse_port so it returns a Result instead of panicking on invalid input. The existing test already asserts the target behavior; make the project compile and pass it.", "project_snapshot_path": "./", "expected_outcomes": [] }

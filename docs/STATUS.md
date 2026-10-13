@@ -171,6 +171,22 @@ The expected manual release checks are maintained in [Testing](../TESTING.md).
 
 ## What's new (unreleased)
 
+- 2026-10-13: **Harness-upgrade measurement + reconciled plan (H14).** The
+  harness-upgrade effort's measurement section is landed observationally: the
+  "skipped/unavailable-as-success = zero" target is asserted as an explicit
+  taxonomy enumeration (`concerto-core`) and at the strict gate's ledger
+  (`concerto-orchestrator`); retained-bytes accounting and restore behavior are
+  asserted; verification latency/coalescing and checkpoint create/restore
+  latency/bytes have criterion benches (not CI-wired). The three agent-behavior
+  metrics (environment-probing calls, identical failed-call retries,
+  time-to-fresh-passing-evidence) are declared-unmeasured with a written
+  procedure over a new `harness_behavior` fixture corpus, driven by the existing
+  `eval-runner` — no second runner, no invented numbers. Reconciled H00–H13
+  status, evidence and the live task register:
+  [`docs/harness-upgrade-plan.md`](harness-upgrade-plan.md). Measurement buckets:
+  [`docs/harness-measurement.md`](harness-measurement.md). One new deferred row:
+  external harness access (`docs/DEFERRED.md` row 48).
+
 - 2026-09-28: **Delegation doctrine (ADR-74) + auditable tool trail.** ADR-74
   makes delegation the Coordinator's default: self-execution is permitted only
   on roster exhaustion and is refused by a named `delegation-required` policy

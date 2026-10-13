@@ -1,0 +1,10 @@
+# Harness-behavior benchmark fixture: a seeded correctness bug with a failing
+# test. Used by docs/harness-measurement.md to time the first fresh passing
+# verification record for the task.
+[package]
+name = "verify_fix_is_even"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"

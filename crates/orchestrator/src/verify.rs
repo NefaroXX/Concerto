@@ -3282,6 +3282,70 @@ mod tests {
         );
     }
 
+    /// The plan's explicit zero target at the gate-ledger level: enumerate the
+    /// full verification-outcome taxonomy and prove that no non-`Passed`
+    /// outcome — however completely stamped with the R2 freshness basis — is
+    /// ever counted as a fresh pass. A `Failed`/`Skipped`/`Unavailable`/`Error`/
+    /// `Cancelled` record therefore cannot satisfy a required check, so a
+    /// skipped or unavailable check can never map to verified completion.
+    ///
+    /// The control at the end proves the assertion is not vacuous: a
+    /// fully-fresh `Passed` record for the same scope/bytes does count.
+    #[tokio::test]
+    async fn gate_ledger_never_counts_a_non_passing_outcome_as_fresh() {
+        let dir = tempfile::tempdir().expect("tempdir created");
+        write_fixture(dir.path(), "a.py", "x = 1\n");
+        let bytes = std::fs::read(dir.path().join("a.py")).expect("fixture readable");
+        let fingerprint = blake3::hash(&bytes).to_hex().to_string();
+
+        let non_passing = [
+            VerificationOutcome::Failed,
+            VerificationOutcome::Skipped,
+            VerificationOutcome::Unavailable,
+            VerificationOutcome::Error,
+            VerificationOutcome::Cancelled,
+        ];
+        for outcome in non_passing {
+            let record = VerificationSummary::new("a.py", "py_compile", outcome, "detail")
+                .with_verifier(VERIFY_SWEEP_VERIFIER)
+                .with_scope("a.py")
+                .with_content_fingerprint(fingerprint.clone())
+                .with_generation("base#0")
+                .with_evidence_ids(vec!["evt-1".to_string()]);
+            assert!(
+                !record.is_passing_evidence(),
+                "`{}` must never be passing evidence, however fresh",
+                outcome.as_str()
+            );
+            let ledger = evaluate_gate_ledger(
+                dir.path(),
+                "base",
+                0,
+                &HashMap::new(),
+                std::slice::from_ref(&record),
+            );
+            assert_eq!(ledger.fresh, 0, "`{}` must not count as a fresh pass", outcome.as_str());
+            assert_eq!(
+                ledger.typed_passes,
+                0,
+                "`{}` must not count as a typed pass",
+                outcome.as_str()
+            );
+        }
+
+        // Control: the same scope and bytes with a `Passed` outcome is the one
+        // record that satisfies the ledger.
+        let passing = VerificationSummary::passed("a.py", "py_compile", "ok")
+            .with_verifier(VERIFY_SWEEP_VERIFIER)
+            .with_scope("a.py")
+            .with_content_fingerprint(fingerprint)
+            .with_generation("base#0")
+            .with_evidence_ids(vec!["evt-1".to_string()]);
+        let ledger = evaluate_gate_ledger(dir.path(), "base", 0, &HashMap::new(), &[passing]);
+        assert_eq!(ledger.fresh, 1, "a fully-fresh pass is the one record that counts");
+        assert_eq!(ledger.typed_passes, 1);
+    }
+
     /// Timeout and cancellation are honored: a hung adapter yields a bounded
     /// timeout record, a cancelled token yields `Cancelled`.
     #[tokio::test]
