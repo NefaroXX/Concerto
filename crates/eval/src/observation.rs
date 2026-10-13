@@ -122,9 +122,11 @@ pub struct ObservedVerification {
     /// The resolved outcome label (`passed`, `failed`, `skipped`, ...).
     pub outcome: String,
     /// The freshness verdict: whether this record satisfies the strict
-    /// `is_passing_evidence` predicate. False for the eval path's records
-    /// (they carry no verifier/scope/evidence ids), which is itself the
-    /// honest signal metric 3's operator needs.
+    /// `is_passing_evidence` predicate (outcome `passed` **and** the full R2
+    /// freshness basis — verifier, scope, generation, content fingerprint,
+    /// typed `checked_at`, evidence ids). False for the eval path's records,
+    /// which set verifier/scope but not generation, content fingerprint, or
+    /// evidence ids — itself the honest signal metric 3's operator needs.
     pub is_passing_evidence: bool,
     /// Typed check timestamp (ADR-82 R2). `None` on legacy records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -150,11 +152,26 @@ pub enum ObservedCount {
 }
 
 impl ObservedCount {
-    /// The numeric value, if any.
+    /// The **exact** value, or `None` when the count is a lower bound or
+    /// unknown.
+    ///
+    /// Deliberately returns nothing for [`Self::LowerBound`]: a truncated
+    /// window's count must be acknowledged as a lower bound through
+    /// [`Self::lower_bound_value`] and never read as a bare number. No single
+    /// accessor returns a value for both `Exact` and `LowerBound`, so a caller
+    /// cannot silently treat a lower bound as exact.
     pub fn value(self) -> Option<u32> {
         match self {
-            Self::Exact(value) | Self::LowerBound(value) => Some(value),
-            Self::Unknown => None,
+            Self::Exact(value) => Some(value),
+            Self::LowerBound(_) | Self::Unknown => None,
+        }
+    }
+
+    /// The **lower-bound** value, or `None` when the count is exact or unknown.
+    pub fn lower_bound_value(self) -> Option<u32> {
+        match self {
+            Self::LowerBound(value) => Some(value),
+            Self::Exact(_) | Self::Unknown => None,
         }
     }
 
@@ -266,16 +283,21 @@ pub fn probing_calls_before_first_write(observation: &AgentObservation) -> Obser
 
 /// Whether two calls share the retry identity `(tool, operation, input)`.
 ///
-/// Falls back to `(tool, operation)` when neither side carries an input
-/// fingerprint — a coarser but honest match, since an absent fingerprint means
-/// the call never reached argument normalization.
+/// Falls back to `(tool, operation)` **only when neither side carries an input
+/// fingerprint** — a coarser but honest match, since an absent fingerprint on
+/// both sides means neither input was normalized. A fingerprinted call and an
+/// unfingerprinted one are deliberately NOT the same identity: the missing
+/// fingerprint means that call's input is unknown, so folding it into a retry
+/// would inflate the count with a plausible-wrong number.
 fn same_retry_identity(a: &ObservedToolCall, b: &ObservedToolCall) -> bool {
     if a.tool != b.tool || a.operation != b.operation {
         return false;
     }
     match (&a.input_fingerprint, &b.input_fingerprint) {
         (Some(left), Some(right)) => left == right,
-        _ => true,
+        (None, None) => true,
+        // One side fingerprinted, the other not: not provably identical.
+        _ => false,
     }
 }
 
@@ -319,15 +341,20 @@ pub fn identical_failed_retries(observation: &AgentObservation) -> ObservedCount
     }
 }
 
-/// Metric 3: elapsed time from run start to the first passing verification.
+/// Metric 3: elapsed time from run start to the first fresh passing evidence.
 ///
-/// Uses the typed [`ObservedVerification::checked_at`] of the first record
-/// whose outcome is `passed` — never a coarse audit-row proxy. Returns `None`
-/// when the run start or a passing `checked_at` is not captured (the metric is
-/// then unmeasured, not estimated).
+/// Selects the first record whose [`ObservedVerification::is_passing_evidence`]
+/// verdict is true — the strict H04 freshness predicate — and uses its typed
+/// [`ObservedVerification::checked_at`]. The raw `outcome == "passed"` label is
+/// deliberately NOT sufficient: a record can read `passed` while failing the
+/// freshness basis (a legacy record missing verifier/scope/generation/content
+/// fingerprint/evidence ids), and that is display-grade, not fresh evidence.
+///
+/// Returns `None` when the run start, a fresh passing record, or its typed
+/// `checked_at` is not captured (the metric is then unmeasured, not estimated).
 pub fn time_to_first_passing_verification(observation: &AgentObservation) -> Option<Duration> {
     let start = observation.run_started_at?;
-    let first = observation.verifications.iter().find(|record| record.outcome == "passed")?;
+    let first = observation.verifications.iter().find(|record| record.is_passing_evidence)?;
     let checked_at = first.checked_at?;
     let elapsed = checked_at - start;
     if elapsed.is_negative() {
@@ -418,7 +445,9 @@ mod tests {
         let count = probing_calls_before_first_write(&observation);
         assert_eq!(count, ObservedCount::LowerBound(2));
         assert!(count.is_lower_bound(), "a truncated window under-counts, never exact");
-        assert_eq!(count.value(), Some(2));
+        // The bare `value()` must NOT hand back a lower bound as if exact.
+        assert_eq!(count.value(), None);
+        assert_eq!(count.lower_bound_value(), Some(2));
     }
 
     // ---- Metric 2: identical failed-call retries -------------------------
@@ -471,6 +500,29 @@ mod tests {
     }
 
     #[test]
+    fn identical_retries_does_not_fold_a_fingerprinted_call_into_an_unfingerprinted_one() {
+        // Regression (blocker 1): a fingerprinted call followed by an
+        // unfingerprinted call with the same tool/operation has UNKNOWN input
+        // on the second call — it must not be counted as an identical retry.
+        let observation = observation_with(vec![
+            call(0, "filesystem", Some("write"), false, Some("known-input")),
+            call(1, "filesystem", Some("write"), false, None),
+        ]);
+        assert_eq!(
+            identical_failed_retries(&observation),
+            ObservedCount::Exact(0),
+            "a mixed fingerprint pair is not an identical retry"
+        );
+
+        // The reverse order is equally not a retry.
+        let reversed = observation_with(vec![
+            call(0, "filesystem", Some("write"), false, None),
+            call(1, "filesystem", Some("write"), false, Some("known-input")),
+        ]);
+        assert_eq!(identical_failed_retries(&reversed), ObservedCount::Exact(0));
+    }
+
+    #[test]
     fn identical_retries_is_a_lower_bound_when_truncated_without_success() {
         let mut observation = observation_with(vec![
             call(0, "shell", Some("exec"), false, Some("same")),
@@ -491,6 +543,19 @@ mod tests {
         assert_eq!(probing_calls_before_first_write(&uncaptured), ObservedCount::Unknown);
         assert_eq!(identical_failed_retries(&uncaptured), ObservedCount::Unknown);
         assert_eq!(probing_calls_before_first_write(&uncaptured).value(), None);
+        assert_eq!(probing_calls_before_first_write(&uncaptured).lower_bound_value(), None);
+    }
+
+    #[test]
+    fn observed_count_never_exposes_a_lower_bound_as_a_bare_value() {
+        // Regression (blocker 3): no single accessor returns a value for both
+        // `Exact` and `LowerBound`; the caller must acknowledge which it got.
+        assert_eq!(ObservedCount::Exact(4).value(), Some(4));
+        assert_eq!(ObservedCount::Exact(4).lower_bound_value(), None);
+        assert_eq!(ObservedCount::LowerBound(4).value(), None);
+        assert_eq!(ObservedCount::LowerBound(4).lower_bound_value(), Some(4));
+        assert_eq!(ObservedCount::Unknown.value(), None);
+        assert_eq!(ObservedCount::Unknown.lower_bound_value(), None);
     }
 
     // ---- Metric 3: time to first passing verification --------------------
@@ -525,7 +590,56 @@ mod tests {
         assert_eq!(
             time_to_first_passing_verification(&observation),
             Some(Duration::from_secs(5)),
-            "the first passing record's typed checked_at wins"
+            "the first fresh passing record's typed checked_at wins"
+        );
+    }
+
+    #[test]
+    fn time_to_first_passing_verification_requires_the_freshness_verdict_not_just_passed() {
+        let start = OffsetDateTime::UNIX_EPOCH;
+        // Regression (blocker 2): a `passed`-labelled record that fails the
+        // freshness basis is display-grade, not fresh evidence, so it must NOT
+        // satisfy the metric.
+        let stale_pass = AgentObservation {
+            run_started_at: Some(start),
+            verifications: vec![ObservedVerification {
+                command: "cargo test".to_string(),
+                outcome: "passed".to_string(),
+                is_passing_evidence: false,
+                checked_at: Some(start + time::Duration::seconds(3)),
+            }],
+            ..AgentObservation::default()
+        };
+        assert_eq!(
+            time_to_first_passing_verification(&stale_pass),
+            None,
+            "outcome == passed without the freshness verdict is not fresh evidence"
+        );
+
+        // The first record whose VERDICT is true wins, even when an earlier
+        // record carries a `passed` label without the freshness basis.
+        let verdict_wins = AgentObservation {
+            run_started_at: Some(start),
+            verifications: vec![
+                ObservedVerification {
+                    command: "cargo test".to_string(),
+                    outcome: "passed".to_string(),
+                    is_passing_evidence: false,
+                    checked_at: Some(start + time::Duration::seconds(3)),
+                },
+                ObservedVerification {
+                    command: "cargo test".to_string(),
+                    outcome: "passed".to_string(),
+                    is_passing_evidence: true,
+                    checked_at: Some(start + time::Duration::seconds(7)),
+                },
+            ],
+            ..AgentObservation::default()
+        };
+        assert_eq!(
+            time_to_first_passing_verification(&verdict_wins),
+            Some(Duration::from_secs(7)),
+            "the freshness verdict, not the raw outcome label, selects the record"
         );
     }
 

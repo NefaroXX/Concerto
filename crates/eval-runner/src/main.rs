@@ -455,20 +455,22 @@ mod live_eval_tests {
 
     /// Per-task metrics derived from the H15 read-only observation export.
     ///
-    /// A metric that cannot be honestly computed is omitted (`None`) or
-    /// flagged inexact rather than fabricated — see the `*_exact` flags.
+    /// Exact and lower-bound values are emitted in **separate fields**, never
+    /// as one ambiguous number: a truncated window under-counts, so its value
+    /// is a lower bound and is labelled as such. A metric that cannot be
+    /// honestly computed leaves both fields absent.
     #[derive(serde::Serialize)]
     struct LiveTaskMetrics {
         task_id: String,
-        /// Metric 1: probing calls before the first useful action. `exact` is
-        /// false when the window was truncated and no write was observed, so
-        /// the value is a lower bound.
-        probing_calls: Option<u32>,
-        probing_calls_exact: bool,
-        /// Metric 2: identical failed-call retries before any success.
-        identical_failed_retries: Option<u32>,
-        identical_failed_retries_exact: bool,
-        /// Metric 3: milliseconds to the first passing verification.
+        /// Metric 1: probing calls before the first useful action (exact).
+        probing_calls_exact: Option<u32>,
+        /// Metric 1 lower bound (truncated window, no write observed).
+        probing_calls_lower_bound: Option<u32>,
+        /// Metric 2: identical failed-call retries before any success (exact).
+        identical_failed_retries_exact: Option<u32>,
+        /// Metric 2 lower bound (truncated window, no success observed).
+        identical_failed_retries_lower_bound: Option<u32>,
+        /// Metric 3: milliseconds to the first fresh passing evidence.
         time_to_first_passing_verification_ms: Option<u64>,
         tool_calls_total: u32,
         tool_calls_truncated: bool,
@@ -518,10 +520,10 @@ mod live_eval_tests {
                 let time_to_evidence = time_to_first_passing_verification(observation);
                 LiveTaskMetrics {
                     task_id: result.task_id.to_string(),
-                    probing_calls: probing.value(),
-                    probing_calls_exact: probing.is_exact(),
-                    identical_failed_retries: retries.value(),
-                    identical_failed_retries_exact: retries.is_exact(),
+                    probing_calls_exact: probing.value(),
+                    probing_calls_lower_bound: probing.lower_bound_value(),
+                    identical_failed_retries_exact: retries.value(),
+                    identical_failed_retries_lower_bound: retries.lower_bound_value(),
                     time_to_first_passing_verification_ms: time_to_evidence
                         .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
                     tool_calls_total: observation.tool_calls_total,

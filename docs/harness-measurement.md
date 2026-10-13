@@ -39,7 +39,7 @@ are run on demand.
 | Restore latency + retained bytes at representative sizes | **benchmark** | `crates/orchestrator/benches/checkpoint_restore.rs` |
 | Environment-probing calls before the first useful action | **live-procedure** (observation export built; values unmeasured) | `concerto_eval::observation::probing_calls_before_first_write` over `AgentRunResult::observation`; "Live procedure" below; fixture `.../probe_locate_scale` |
 | Identical failed-call retries | **live-procedure** (observation export built; values unmeasured) | `concerto_eval::observation::identical_failed_retries` over `AgentRunResult::observation`; "Live procedure" below; fixture `.../retry_signature_change` |
-| Elapsed time to fresh passing evidence | **live-procedure** (observation export built; values unmeasured) | `concerto_eval::observation::time_to_first_passing_verification` over the typed `checked_at`; "Live procedure" below; fixture `.../verify_fix_is_even` |
+| Elapsed time to fresh passing evidence | **live-procedure** (observation export built; values unmeasured) | `concerto_eval::observation::time_to_first_passing_verification` over the first `is_passing_evidence` record's typed `checked_at`; "Live procedure" below; fixture `.../verify_fix_is_even` |
 
 ## In-tree assertions (run these)
 
@@ -191,10 +191,14 @@ leg's summary. Two honest options, in preference order:
    The three metrics are derivable directly from the export
    (`concerto_eval::observation`):
    `probing_calls_before_first_write`, `identical_failed_retries`, and
-   `time_to_first_passing_verification`. Each returns an `ObservedCount`
-   (`Exact` / `LowerBound` / `Unknown`) for metrics 1–2 and `Option<Duration>`
-   for metric 3, so a truncated window is a visible lower bound, never a
-   fabricated exact value.
+   `time_to_first_passing_verification`. Metrics 1–2 return an `ObservedCount`
+   whose exact value and lower bound are read through **separate** accessors
+   (`value()` / `lower_bound_value()`; `Unknown` when the observation was not
+   captured), so a truncated window is a visible lower bound, never a
+   fabricated exact value. Metric 3 selects the first record whose
+   `is_passing_evidence` freshness verdict is true — a raw `outcome ==
+   "passed"` label without the R2 freshness basis does **not** count — and
+   returns `Option<Duration>` from its typed `checked_at`.
 
    Building the export does **not** measure the metrics: an operator run over a
    real model and config (the procedure above) is still required, and the
