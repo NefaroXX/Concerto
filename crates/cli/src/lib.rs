@@ -42,6 +42,7 @@ pub fn has_cli_subcommand(args: &[String]) -> bool {
                         | "plugin"
                         | "extensions"
                         | "health"
+                        | "harness"
                         | "memory"
                         | "audit"
                         | "logs"
@@ -74,6 +75,7 @@ pub const CLI_COMMAND_HELP: &str =
     projects <list|current|use>
     sessions <list|show|events|resume|prune>
     memory <graph|explain>   health [--json]   audit   logs <path|show>
+    harness <environment|verify|checkpoint|memory> [--json]
 
 SETTINGS EXAMPLES:
     concerto config show --global
@@ -163,6 +165,9 @@ fn run_cli_inner(
             "plugin" => return run_plugin_subcommand(&remaining[1..]),
             "extensions" => return run_extensions_subcommand(&remaining[1..], &project_root),
             "health" => return run_health_subcommand(&remaining[1..], &project_root),
+            "harness" => {
+                return dispatch::harness::run_harness_subcommand(&remaining[1..], &project_root)
+            }
             "memory" => return run_memory_subcommand(&remaining[1..], &project_root),
             "audit" => return run_audit_subcommand(&remaining[1..]),
             "agents" => return settings::run_agents(&remaining[1..], &project_root),

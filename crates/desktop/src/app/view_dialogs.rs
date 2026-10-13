@@ -233,6 +233,42 @@ impl App {
                     ..container::Style::default()
                 });
             stack![after_subview, backdrop].into()
+        } else if self.harness_view_open {
+            // H13 harness modal: the desktop controls over the shared harness
+            // service. Same modal-card + palette backdrop mechanism as the
+            // memory explorer above; every result is the service payload.
+            let harness_content = self.harness.view(&self.current_theme).map(Message::Harness);
+            let modal = container(
+                column![
+                    row![
+                        text("Harness").size(18).width(Length::Fill),
+                        button(text("✕").size(14))
+                            .style(crate::ui::button::secondary)
+                            .on_press(Message::CloseHarnessModal),
+                    ]
+                    .align_y(iced::Alignment::Center),
+                    harness_content,
+                ]
+                .spacing(10)
+                .padding(20)
+                .width(Length::Fill),
+            )
+            .width(Length::FillPortion(2))
+            .height(Length::FillPortion(2))
+            .style(crate::ui::container::modal);
+            let backdrop = container(modal)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .style(|_theme: &iced::Theme| container::Style {
+                    background: Some(iced::Background::Color(iced::Color {
+                        a: 0.55,
+                        ..self.current_theme.palette.background
+                    })),
+                    ..container::Style::default()
+                });
+            stack![after_subview, backdrop].into()
         } else if self.show_help {
             // Shortcuts reference modal (`?` or the right-toolbar keyboard
             // button). Lists every binding from `shortcuts::ALL` so the panel

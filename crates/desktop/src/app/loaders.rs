@@ -349,6 +349,44 @@ impl App {
         )
     }
 
+    /// Run one harness operation through the shared service seam (H13). The
+    /// desktop reuses its long-lived memory store so a `memory.recall` never
+    /// re-initialises (and cannot deadlock on the data-dir lock the app holds).
+    pub(super) fn run_harness_request(
+        &self,
+        request: views::harness::HarnessRequest,
+    ) -> iced::Task<Message> {
+        let memory = self.memory_services.clone();
+        let project_dir = self.project_dir.clone();
+        let bus = self.bus.clone();
+        let config = self.config.clone().unwrap_or_default();
+        iced::Task::perform(
+            async move {
+                let provided = if request.memory {
+                    resolve_desktop_memory_store(&memory, bus, &config, &project_dir).await
+                } else {
+                    None
+                };
+                let harness =
+                    concerto_orchestrator::harness_service::build_standalone_harness_with_memory(
+                        &project_dir,
+                        &config,
+                        request.memory,
+                        provided,
+                        Arc::new(concerto_orchestrator::harness_service::ApproveInvocationSink),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                harness
+                    .service
+                    .invoke(&request.operation, request.input, CancellationToken::new())
+                    .await
+                    .map_err(|error| error.to_string())
+            },
+            |result| Message::Harness(views::harness::Message::Completed(result)),
+        )
+    }
+
     pub(super) fn delete_memory_entry(&self, id: String) -> iced::Task<Message> {
         let memory = self.memory_services.clone();
         let result_id = id.clone();
@@ -609,4 +647,71 @@ impl App {
             |(session_id, snapshot)| Message::StudioRuntimeLoaded(session_id, snapshot),
         )
     }
+}
+
+/// Resolve the desktop's project-scoped memory store for the harness panel,
+/// reusing the cached one when present and initialising (without a re-index)
+/// otherwise. Returns `None` when memory is disabled or init fails — the
+/// harness `memory.recall` then reports *unavailable*, never a fake store.
+async fn resolve_desktop_memory_store(
+    memory: &Arc<Mutex<Option<ActiveMemoryServices>>>,
+    bus: EventBus,
+    config: &AppConfig,
+    project_dir: &Path,
+) -> Option<Arc<dyn MemoryStore>> {
+    if !config.memory.enabled {
+        return None;
+    }
+    let project_id = concerto_core::memory::ProjectId(project_id_hash(project_dir));
+    if let Some(store) = memory
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+        .and_then(|active| (active.project_id == project_id).then(|| active.store.clone()))
+    {
+        return Some(store);
+    }
+    let reindex_temp: Arc<Mutex<Option<Arc<ProjectIndexer>>>> = Arc::new(Mutex::new(None));
+    let reindex_sync_temp: Arc<Mutex<Option<Arc<ChunkSyncService>>>> = Arc::new(Mutex::new(None));
+    let cancel_temp: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
+    let lock_temp: Arc<Mutex<Option<Arc<concerto_core::lock::DataDirLock>>>> =
+        Arc::new(Mutex::new(None));
+    let store = match init_memory_system(
+        bus,
+        config,
+        project_dir,
+        &reindex_temp,
+        &reindex_sync_temp,
+        &cancel_temp,
+        &lock_temp,
+    )
+    .await
+    {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "desktop harness memory init failed; recall reports unavailable"
+            );
+            return None;
+        }
+    };
+    let reindex = reindex_temp.lock().unwrap_or_else(|error| error.into_inner()).take()?;
+    let reindex_sync =
+        reindex_sync_temp.lock().unwrap_or_else(|error| error.into_inner()).take()?;
+    let cancel =
+        cancel_temp.lock().unwrap_or_else(|error| error.into_inner()).take().unwrap_or_default();
+    let data_dir_lock = lock_temp.lock().unwrap_or_else(|error| error.into_inner()).take();
+    let active = ActiveMemoryServices {
+        project_id,
+        store: store.clone(),
+        reindex,
+        reindex_sync,
+        cancel,
+        data_dir_lock,
+        decision_store: None,
+        task_tree: None,
+    };
+    *memory.lock().unwrap_or_else(|error| error.into_inner()) = Some(active);
+    Some(store)
 }

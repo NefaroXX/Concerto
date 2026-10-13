@@ -2640,12 +2640,21 @@ pub struct VerifyRunInput {
 /// an authorization input — no policy path reads verification results.
 pub struct VerifyRunTool {
     service: Arc<VerifierService>,
+    /// Default selector when the caller omits one (`[harness].verify_selector`).
+    default_selector: VerifySelector,
 }
 
 impl VerifyRunTool {
     /// Attach to an existing service (registration + tests).
     pub fn with_service(service: Arc<VerifierService>) -> Self {
-        Self { service }
+        Self { service, default_selector: VerifySelector::All }
+    }
+
+    /// Override the default selector applied when the input omits `verifier`.
+    #[must_use]
+    pub fn with_default_selector(mut self, selector: VerifySelector) -> Self {
+        self.default_selector = selector;
+        self
     }
 
     /// Parse a raw tool input into a [`VerifyRequest`]. The project root
@@ -2687,7 +2696,7 @@ impl VerifyRunTool {
             }
         };
         let selector = match input.verifier.as_deref().map(str::trim) {
-            None | Some("") => VerifySelector::All,
+            None | Some("") => self.default_selector,
             Some(raw) => VerifySelector::parse_override(raw).map_err(|message| {
                 ToolError::ExecutionFailed {
                     message: format!("invalid verify.run input: {message}"),
@@ -2843,11 +2852,32 @@ pub fn register_verify_tool(
     eval: EvalEngine,
     overlay_source: Option<OverlayPendingSource>,
 ) -> Arc<VerifierService> {
+    register_verify_tool_with_selector(
+        registry,
+        project_root,
+        eval,
+        overlay_source,
+        VerifySelector::All,
+    )
+}
+
+/// As [`register_verify_tool`], additionally setting the default selector
+/// applied when a `verify.run` call omits `verifier` (H13
+/// `[harness].verify_selector`).
+pub fn register_verify_tool_with_selector(
+    registry: &mut ToolRegistry,
+    project_root: &Path,
+    eval: EvalEngine,
+    overlay_source: Option<OverlayPendingSource>,
+    default_selector: VerifySelector,
+) -> Arc<VerifierService> {
     let service = Arc::new(VerifierService::new(project_root.to_path_buf(), eval));
     if let Some(source) = overlay_source {
         service.set_overlay_source(source);
     }
-    registry.register(Box::new(VerifyRunTool::with_service(service.clone())));
+    registry.register(Box::new(
+        VerifyRunTool::with_service(service.clone()).with_default_selector(default_selector),
+    ));
     service
 }
 

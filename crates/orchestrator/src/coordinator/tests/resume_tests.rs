@@ -1926,10 +1926,8 @@ async fn interrupt_midrun_then_resume_stays_memory_grounded() {
         "the resumed plan is grounded in run 1's memory, not empty"
     );
     assert!(
-        resume_ctx
-            .retrieved_chunks
-            .iter()
-            .all(|chunk| chunk.id.starts_with("plan://") || chunk.id.starts_with("memory://")),
+        resume_ctx.retrieved_chunks.iter().all(|evident| evident.chunk.id.starts_with("plan://")
+            || evident.chunk.id.starts_with("memory://")),
         "the grounding is run 1's persisted memory: {:?}",
         resume_ctx.retrieved_chunks
     );

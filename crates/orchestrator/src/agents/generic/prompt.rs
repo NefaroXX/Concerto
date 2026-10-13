@@ -135,9 +135,8 @@ impl GenericSpecialistAgent {
         // follow-up ADR, not a regression from the removed strategy.
         if !context.retrieved_chunks.is_empty() {
             prompt.push_str("\n\n");
-            prompt.push_str(&crate::memory_prompt::format_retrieved_memory(
-                &context.retrieved_chunks,
-            ));
+            prompt
+                .push_str(&crate::memory_prompt::format_evident_memory(&context.retrieved_chunks));
         }
 
         if !context.expected_artifacts.is_empty() {

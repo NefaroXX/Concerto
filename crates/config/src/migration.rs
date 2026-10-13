@@ -110,6 +110,9 @@ fn migrate_v1_to_v2(config: AppConfig) -> Result<AppConfig, ConfigError> {
         // ADR-82 slice 4 adds [agent]; additive Option, no version bump.
         // Preserve any deserialized value (a v1 file may already carry it).
         agent: config.agent,
+        // H13 adds [harness]; additive Option, no version bump. Preserve any
+        // deserialized value.
+        harness: config.harness,
         // ADR-70 adds [project_context]; additive Option defaults to None.
         project_context: None,
         orchestration: None,
@@ -161,6 +164,8 @@ fn migrate_v2_to_v3(config: AppConfig) -> Result<AppConfig, ConfigError> {
         // ADR-82 slice 4 adds [agent]; additive Option, no version bump.
         // Preserve any deserialized value (a v2 file may already carry it).
         agent: config.agent,
+        // H13 adds [harness]; additive Option, no version bump.
+        harness: config.harness,
         // ADR-70 adds [project_context]; additive Option defaults to None.
         project_context: None,
         orchestration: None,
@@ -265,6 +270,7 @@ mod tests {
             project_context: None,
             orchestration: None,
             resolved_blueprint: None,
+            harness: None,
             agent_files_authoritative: false,
         }
     }
@@ -302,6 +308,7 @@ mod tests {
             project_context: None,
             orchestration: None,
             resolved_blueprint: None,
+            harness: None,
             agent_files_authoritative: false,
         }
     }
@@ -361,6 +368,7 @@ mod tests {
             project_context: None,
             orchestration: None,
             resolved_blueprint: None,
+            harness: None,
             agent_files_authoritative: false,
         };
         let result = migrate_config(v3.clone()).expect("v3 should pass through");

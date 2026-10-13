@@ -264,6 +264,12 @@ fn load_config_documents(
     config.retry.validate()?;
     config.memory.validate()?;
 
+    // Validate harness settings (H13): recall limit / retention bounds and a
+    // known verifier selector. Additive and client/operator-controlled.
+    if let Some(harness) = &config.harness {
+        harness.validate()?;
+    }
+
     // Validate MCP server entries (ADR-43 §4: non-empty id, no ':').
     if let Some(mcp) = &config.mcp {
         mcp.validate()?;
