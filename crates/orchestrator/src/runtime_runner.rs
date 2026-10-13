@@ -940,7 +940,7 @@ pub(crate) use continuity::*;
 /// to [`NoopAuditLog`] with a warning rather than failing the run. Shared by
 /// the infra-audit sites (MCP/plugin startup) and the policy engine so every
 /// writer in one run targets the same `sessions.db`.
-async fn build_audit_sink() -> (Arc<dyn AuditLog>, Option<sqlx::SqlitePool>) {
+pub(crate) async fn build_audit_sink() -> (Arc<dyn AuditLog>, Option<sqlx::SqlitePool>) {
     match concerto_sessions::app_data_dir() {
         Ok(data_dir) => match create_audit_pool(&data_dir).await {
             Ok(pool) => (Arc::new(SqliteAuditLog::new(pool.clone())), Some(pool)),
@@ -969,7 +969,7 @@ async fn build_audit_sink() -> (Arc<dyn AuditLog>, Option<sqlx::SqlitePool>) {
 /// its whiteboard rows to the same durable DB.
 #[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
-async fn setup_policy_and_audit(
+pub(crate) async fn setup_policy_and_audit(
     config: &AppConfig,
     project_dir: &Path,
     approval_sink: Arc<dyn ApprovalSink>,
