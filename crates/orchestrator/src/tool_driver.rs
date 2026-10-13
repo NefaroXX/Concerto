@@ -292,6 +292,31 @@ pub fn merge_usage(
         (Some(a), Some(b)) => Some(CompletionUsage {
             prompt_tokens: add_optional_tokens(a.prompt_tokens, b.prompt_tokens),
             completion_tokens: add_optional_tokens(a.completion_tokens, b.completion_tokens),
+            uncached_prompt_tokens: a
+                .uncached_prompt_tokens
+                .zip(b.uncached_prompt_tokens)
+                .map(|(a, b)| a.saturating_add(b)),
+            cache_read_tokens: a
+                .cache_read_tokens
+                .zip(b.cache_read_tokens)
+                .map(|(a, b)| a.saturating_add(b)),
+            cache_write_tokens: a
+                .cache_write_tokens
+                .zip(b.cache_write_tokens)
+                .map(|(a, b)| a.saturating_add(b)),
+            cache_write_5m_tokens: a
+                .cache_write_5m_tokens
+                .zip(b.cache_write_5m_tokens)
+                .map(|(a, b)| a.saturating_add(b)),
+            cache_write_1h_tokens: a
+                .cache_write_1h_tokens
+                .zip(b.cache_write_1h_tokens)
+                .map(|(a, b)| a.saturating_add(b)),
+            reasoning_tokens: a
+                .reasoning_tokens
+                .zip(b.reasoning_tokens)
+                .map(|(a, b)| a.saturating_add(b)),
+            ..CompletionUsage::default()
         }),
         (None, b) => b,
         (a, None) => a,

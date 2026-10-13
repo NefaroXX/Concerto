@@ -200,6 +200,8 @@ struct PartialToolCall {
 const ENVELOPE_CALL_INDEX: usize = usize::MAX;
 
 struct OpenAiStreamState {
+    finish_seen: bool,
+    terminal_emitted: bool,
     parser: BufferedSseParser,
     pending: VecDeque<Result<CompletionChunk, ProviderError>>,
     partial_tools: HashMap<usize, PartialToolCall>,
@@ -237,6 +239,8 @@ struct OpenAiStreamState {
 impl OpenAiStreamState {
     fn new() -> Self {
         Self {
+            finish_seen: false,
+            terminal_emitted: false,
             parser: BufferedSseParser::new(),
             pending: VecDeque::new(),
             partial_tools: HashMap::new(),
@@ -257,10 +261,28 @@ impl OpenAiStreamState {
     /// gateway: no `usage`, no counts, or a non-integer count all keep
     /// `None` — never an error, never a fabricated `0`.
     fn capture_usage(&mut self, parsed: &serde_json::Value) {
-        if self.usage.is_some() {
+        if let Some(usage) = crate::adapters::openai_compat::map_usage(parsed) {
+            self.usage = Some(usage);
+        }
+    }
+
+    /// A finish reason ends content, but usage can follow in another event.
+    /// Terminal usage is emitted exactly once, at DONE or clean EOF.
+    fn finish_stream(&mut self) {
+        if self.terminal_emitted {
             return;
         }
-        self.usage = crate::adapters::openai_compat::map_usage(parsed);
+        self.terminal_emitted = true;
+        self.flush_content();
+        self.emit_remaining_tools();
+        self.emit_reasoning_if_any();
+        self.pending.push_back(Ok(CompletionChunk {
+            delta: String::new(),
+            reasoning: None,
+            tool_call: None,
+            is_final: true,
+            usage: self.usage.take(),
+        }));
     }
 
     /// Emit a final chunk carrying the accumulated reasoning (if any) before
@@ -624,16 +646,7 @@ impl OpenAiStreamState {
         };
 
         if data == "[DONE]" {
-            self.flush_content();
-            self.emit_remaining_tools();
-            self.emit_reasoning_if_any();
-            self.pending.push_back(Ok(CompletionChunk {
-                delta: String::new(),
-                reasoning: None,
-                tool_call: None,
-                is_final: true,
-                usage: self.usage.take(),
-            }));
+            self.finish_stream();
             return;
         }
 
@@ -687,16 +700,10 @@ impl OpenAiStreamState {
 
         if let Some(finish_reason) = choice["finish_reason"].as_str() {
             if !finish_reason.is_empty() && finish_reason != "null" {
+                self.finish_seen = true;
                 self.flush_content();
                 self.emit_remaining_tools();
                 self.emit_reasoning_if_any();
-                self.pending.push_back(Ok(CompletionChunk {
-                    delta: String::new(),
-                    reasoning: None,
-                    tool_call: None,
-                    is_final: true,
-                    usage: self.usage.take(),
-                }));
             }
         }
     }
@@ -847,8 +854,10 @@ impl LlmProvider for OpenAiProvider {
         let s = stream! {
             let mut state = state;
             let mut byte_stream = response.bytes_stream();
+            let mut failed = false;
             while let Some(chunk) = byte_stream.next().await {
                 if cancel.is_cancelled() {
+                    failed = true;
                     yield Err(ProviderError::Cancelled);
                     break;
                 }
@@ -870,15 +879,17 @@ impl LlmProvider for OpenAiProvider {
                     // post-assembly — re-issue is side-effect-free within
                     // the bounded attempt budget); framing/parse failures
                     // inside a healthy stream stay fatal.
-                    Err(e) => vec![Err(ProviderError::StreamTransport(format!(
+                    Err(e) => { failed = true; vec![Err(ProviderError::StreamTransport(format!(
                         "connection dropped mid-stream: {}",
                         describe_error_chain(&e)
-                    )))]
+                    )))] },
                 };
                 for item in items {
                     yield item;
                 }
+                if failed { break; }
             }
+            if !failed && state.finish_seen { state.finish_stream(); }
             // Drain any remaining pending items at end of stream
             while let Some(item) = state.pending.pop_front() {
                 yield item;
@@ -1308,7 +1319,11 @@ mod tests {
         assert!(chunks[1].is_final);
         assert_eq!(
             chunks[1].usage,
-            Some(CompletionUsage { prompt_tokens: Some(42), completion_tokens: Some(7) })
+            Some(CompletionUsage {
+                prompt_tokens: Some(42),
+                completion_tokens: Some(7),
+                ..CompletionUsage::default()
+            })
         );
     }
 
@@ -1334,8 +1349,53 @@ mod tests {
         let final_chunk = chunks.iter().find(|chunk| chunk.is_final).expect("final chunk");
         assert_eq!(
             final_chunk.usage,
-            Some(CompletionUsage { prompt_tokens: Some(9), completion_tokens: Some(3) })
+            Some(CompletionUsage {
+                prompt_tokens: Some(9),
+                completion_tokens: Some(3),
+                ..CompletionUsage::default()
+            })
         );
+        assert_eq!(chunks.iter().filter(|chunk| chunk.is_final).count(), 1);
+    }
+
+    #[test]
+    fn trailing_cache_usage_survives_finish_reason_and_duplicate_done() {
+        let mut state = OpenAiStreamState::new();
+        let event = |data: &str| crate::sse::SseEvent {
+            event: None,
+            data: Some(data.into()),
+            id: None,
+            keepalive: false,
+        };
+        state.handle_event(event(
+            r#"{"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}"#,
+        ));
+        assert!(state.pending.iter().all(|item| !item.as_ref().unwrap().is_final));
+        state.handle_event(event(r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":80}}}"#));
+        state.handle_event(event("[DONE]"));
+        state.handle_event(event("[DONE]"));
+        let chunks: Vec<_> = state.pending.drain(..).map(Result::unwrap).collect();
+        assert_eq!(chunks.iter().filter(|chunk| chunk.is_final).count(), 1);
+        assert_eq!(chunks.last().unwrap().usage.unwrap().cache_read_tokens, Some(80));
+        assert_eq!(chunks.last().unwrap().usage.unwrap().prompt_tokens, Some(100));
+    }
+
+    #[test]
+    fn clean_eof_after_finish_emits_usage_once() {
+        let mut state = OpenAiStreamState::new();
+        state.handle_event(crate::sse::SseEvent {
+            event: None,
+            data: Some(
+                r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10}}"#
+                    .into(),
+            ),
+            id: None,
+            keepalive: false,
+        });
+        state.finish_stream();
+        state.finish_stream();
+        assert_eq!(state.pending.len(), 1);
+        assert_eq!(state.pending[0].as_ref().unwrap().usage.unwrap().prompt_tokens, Some(10));
     }
 
     /// ADR-48 §4: a `usage` object with no token counts is ignored — it is not
@@ -1462,7 +1522,11 @@ mod tests {
         let final_chunk = chunks.iter().find(|c| c.is_final).expect("terminal chunk");
         assert_eq!(
             final_chunk.usage,
-            Some(CompletionUsage { prompt_tokens: Some(11), completion_tokens: Some(5) })
+            Some(CompletionUsage {
+                prompt_tokens: Some(11),
+                completion_tokens: Some(5),
+                ..CompletionUsage::default()
+            })
         );
     }
 

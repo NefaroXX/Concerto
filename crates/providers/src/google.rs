@@ -239,11 +239,24 @@ impl GoogleStreamState {
     fn capture_usage(&mut self, parsed: &serde_json::Value) {
         let Some(metadata) = parsed.get("usageMetadata") else { return };
         let prompt_tokens = metadata["promptTokenCount"].as_u64();
-        let completion_tokens = metadata["candidatesTokenCount"].as_u64();
-        if prompt_tokens.is_none() && completion_tokens.is_none() {
-            return;
+        let reasoning_tokens = metadata["thoughtsTokenCount"].as_u64();
+        let completion_tokens = metadata["candidatesTokenCount"]
+            .as_u64()
+            .and_then(|visible| visible.checked_add(reasoning_tokens.unwrap_or(0)));
+        let cache_read_tokens = metadata["cachedContentTokenCount"].as_u64();
+        let usage = CompletionUsage {
+            prompt_tokens,
+            completion_tokens,
+            cache_read_tokens,
+            reasoning_tokens,
+            uncached_prompt_tokens: prompt_tokens
+                .zip(cache_read_tokens)
+                .and_then(|(total, reads)| total.checked_sub(reads)),
+            ..CompletionUsage::default()
+        };
+        if usage.has_measurements() {
+            self.usage = Some(usage);
         }
-        self.usage = Some(CompletionUsage { prompt_tokens, completion_tokens });
     }
 
     /// Reduce one SSE event into canonical chunks to yield.
@@ -1335,7 +1348,11 @@ mod tests {
         assert!(terminal.is_final);
         assert_eq!(
             terminal.usage,
-            Some(CompletionUsage { prompt_tokens: Some(11), completion_tokens: Some(5) })
+            Some(CompletionUsage {
+                prompt_tokens: Some(11),
+                completion_tokens: Some(5),
+                ..CompletionUsage::default()
+            })
         );
         crate::testing::assert_terminal_usage_contract(&chunks);
     }
@@ -1368,7 +1385,11 @@ mod tests {
         assert!(terminal.is_final);
         assert_eq!(
             terminal.usage,
-            Some(CompletionUsage { prompt_tokens: Some(9), completion_tokens: Some(3) })
+            Some(CompletionUsage {
+                prompt_tokens: Some(9),
+                completion_tokens: Some(3),
+                ..CompletionUsage::default()
+            })
         );
         crate::testing::assert_terminal_usage_contract(&chunks);
     }

@@ -1158,13 +1158,18 @@ mod tests {
                 usage: Some(CompletionUsage {
                     prompt_tokens: Some(10),
                     completion_tokens: Some(5),
+                    ..CompletionUsage::default()
                 }),
             }),
         ]));
         let (_, _, _, usage) = collect_stream(stream).await.unwrap();
         assert_eq!(
             usage,
-            Some(CompletionUsage { prompt_tokens: Some(10), completion_tokens: Some(5) })
+            Some(CompletionUsage {
+                prompt_tokens: Some(10),
+                completion_tokens: Some(5),
+                ..CompletionUsage::default()
+            })
         );
     }
 

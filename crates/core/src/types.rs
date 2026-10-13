@@ -196,12 +196,43 @@ impl CompletionChunk {
 /// downstream: it applies only where `usage` is `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CompletionUsage {
-    /// Input (prompt) tokens attributed to this completion.
+    /// Inclusive input tokens, including cache reads and writes.
     #[serde(default)]
     pub prompt_tokens: Option<u64>,
     /// Output (completion) tokens attributed to this completion.
     #[serde(default)]
     pub completion_tokens: Option<u64>,
+    /// Ordinary input tokens; absent when the provider does not report them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uncached_prompt_tokens: Option<u64>,
+    /// Input tokens read from the provider's prompt cache. Missing is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    /// Input tokens written to the provider's prompt cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
+    /// Five-minute and one-hour write counts are subsets of cache writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_5m_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_1h_tokens: Option<u64>,
+    /// Reasoning tokens are a subset of inclusive completion tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+}
+
+impl CompletionUsage {
+    /// An empty usage object is not a measurement.
+    pub fn has_measurements(&self) -> bool {
+        self.prompt_tokens.is_some()
+            || self.completion_tokens.is_some()
+            || self.uncached_prompt_tokens.is_some()
+            || self.cache_read_tokens.is_some()
+            || self.cache_write_tokens.is_some()
+            || self.cache_write_5m_tokens.is_some()
+            || self.cache_write_1h_tokens.is_some()
+            || self.reasoning_tokens.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -3241,7 +3272,11 @@ mod tests {
 
     #[test]
     fn completion_usage_serde_round_trip() {
-        let usage = CompletionUsage { prompt_tokens: Some(10), completion_tokens: Some(5) };
+        let usage = CompletionUsage {
+            prompt_tokens: Some(10),
+            completion_tokens: Some(5),
+            ..CompletionUsage::default()
+        };
         let json = serde_json::to_string(&usage).unwrap();
         let back: CompletionUsage = serde_json::from_str(&json).unwrap();
         assert_eq!(back, usage);

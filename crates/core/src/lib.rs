@@ -1,6 +1,7 @@
 #![deny(clippy::all)]
 #![deny(unused_imports, unused_variables, dead_code)]
 #![allow(missing_docs)]
+
 //! `concerto-core` — the foundational contracts every other crate builds on.
 //!
 //! Provides the layered error taxonomy, event bus, ULID-based correlation
@@ -8,6 +9,7 @@
 //! approval), and foundational types.
 
 pub mod authorization;
+pub mod cache_usage;
 pub mod checkpoint;
 pub mod environment_manifest;
 pub mod error;

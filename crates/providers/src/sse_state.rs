@@ -81,15 +81,44 @@ impl AnthropicStreamState {
     /// `output_tokens` placeholder (`1`) is overwritten by the later real
     /// cumulative total.
     fn capture_usage(&mut self, data: &serde_json::Value) {
-        let input_tokens = data["message"]["usage"]["input_tokens"].as_u64();
-        let output_tokens = data["usage"]["output_tokens"].as_u64();
-        if input_tokens.is_none() && output_tokens.is_none() {
+        let raw = data.get("usage").or_else(|| data.get("message")?.get("usage"));
+        let Some(raw) = raw else { return };
+        let input_tokens = raw["input_tokens"].as_u64();
+        let output_tokens = raw["output_tokens"].as_u64();
+        let reads = raw["cache_read_input_tokens"].as_u64();
+        let writes = raw["cache_creation_input_tokens"].as_u64();
+        if input_tokens.is_none() && output_tokens.is_none() && reads.is_none() && writes.is_none()
+        {
             return;
         }
         let usage = self.usage.get_or_insert_with(CompletionUsage::default);
         if let Some(input) = input_tokens {
-            usage.prompt_tokens = Some(input);
+            usage.uncached_prompt_tokens = Some(input);
         }
+        if let Some(reads) = reads {
+            usage.cache_read_tokens = Some(reads);
+        }
+        if let Some(writes) = writes {
+            usage.cache_write_tokens = Some(writes);
+        }
+        if let Some(short) = raw["cache_creation"]["ephemeral_5m_input_tokens"].as_u64() {
+            usage.cache_write_5m_tokens = Some(short);
+        }
+        if let Some(long) = raw["cache_creation"]["ephemeral_1h_input_tokens"].as_u64() {
+            usage.cache_write_1h_tokens = Some(long);
+        }
+        // Snapshots are cumulative: replace each reported component, then
+        // derive the inclusive total. Never add snapshots across events.
+        usage.prompt_tokens =
+            match (usage.uncached_prompt_tokens, usage.cache_read_tokens, usage.cache_write_tokens)
+            {
+                (Some(input), Some(reads), Some(writes)) => {
+                    input.checked_add(reads).and_then(|total| total.checked_add(writes))
+                }
+                // Legacy APIs with no cache fields report ordinary input only.
+                (input, None, None) => input,
+                _ => None,
+            };
         if let Some(output) = output_tokens {
             usage.completion_tokens = Some(output);
         }
@@ -231,6 +260,39 @@ impl AnthropicStreamState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_input_is_inclusive_and_snapshots_do_not_double_count() {
+        let mut state = AnthropicStreamState::new();
+        let start = serde_json::json!({"message": {"usage": {
+            "input_tokens": 100, "cache_read_input_tokens": 300,
+            "cache_creation_input_tokens": 600,
+            "cache_creation": {"ephemeral_5m_input_tokens": 400,
+                "ephemeral_1h_input_tokens": 200}
+        }}});
+        state.capture_usage(&start);
+        state.capture_usage(&start);
+        state.capture_usage(&serde_json::json!({"usage": {"output_tokens": 25}}));
+        let usage = state.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, Some(1000));
+        assert_eq!(usage.uncached_prompt_tokens, Some(100));
+        assert_eq!(usage.cache_read_tokens, Some(300));
+        assert_eq!(usage.cache_write_tokens, Some(600));
+        assert_eq!(usage.cache_write_5m_tokens, Some(400));
+        assert_eq!(usage.cache_write_1h_tokens, Some(200));
+        assert_eq!(usage.completion_tokens, Some(25));
+    }
+
+    #[test]
+    fn partial_cache_components_do_not_fabricate_an_input_total() {
+        let mut state = AnthropicStreamState::new();
+        state.capture_usage(&serde_json::json!({"usage": {
+            "input_tokens": 10, "cache_read_input_tokens": 20
+        }}));
+        assert_eq!(state.usage.unwrap().prompt_tokens, None);
+        state.capture_usage(&serde_json::json!({"usage": {"cache_creation_input_tokens": 0}}));
+        assert_eq!(state.usage.unwrap().prompt_tokens, Some(30));
+    }
 
     #[test]
     fn parse_state_default_is_empty() {
@@ -390,7 +452,12 @@ mod tests {
         assert!(terminal.is_final);
         assert_eq!(
             terminal.usage,
-            Some(CompletionUsage { prompt_tokens: Some(25), completion_tokens: Some(15) })
+            Some(CompletionUsage {
+                prompt_tokens: Some(25),
+                completion_tokens: Some(15),
+                uncached_prompt_tokens: Some(25),
+                ..CompletionUsage::default()
+            })
         );
         crate::testing::assert_terminal_usage_contract(&chunks);
     }

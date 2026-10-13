@@ -117,7 +117,11 @@ mod tests {
         });
         assert_eq!(
             map_usage(&payload),
-            Some(CompletionUsage { prompt_tokens: Some(120), completion_tokens: Some(34) })
+            Some(CompletionUsage {
+                prompt_tokens: Some(120),
+                completion_tokens: Some(34),
+                ..CompletionUsage::default()
+            })
         );
     }
 
