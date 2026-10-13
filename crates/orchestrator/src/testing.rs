@@ -7,6 +7,7 @@
 #![allow(unused_imports, dead_code)]
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use concerto_core::event::{EventBus, EventKind};
@@ -64,6 +65,11 @@ pub struct MockExpertAgent {
     stage: Option<AgentStage>,
     write_expected_artifacts: bool,
     cancel_on_run: Option<CancellationToken>,
+    /// How many times `run` was invoked. Lets a test assert a role was NEVER
+    /// dispatched (a canary with teeth): an `always_fail` mock's failure can be
+    /// absorbed by the coordinator's failure-diagnosis path, so asserting on
+    /// the run's output alone cannot prove non-dispatch.
+    runs: Arc<AtomicUsize>,
 }
 
 /// The pipeline stage conventionally declared by a built-in id, so mocks
@@ -105,6 +111,7 @@ impl MockExpertAgent {
             stage: default_stage(&id),
             write_expected_artifacts: false,
             cancel_on_run: None,
+            runs: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -171,6 +178,13 @@ impl MockExpertAgent {
         self.cancel_on_run = Some(cancel);
         self
     }
+
+    /// A shared handle to this mock's `run` invocation count. Clone it before
+    /// moving the mock into a registry, then assert it after the run to prove
+    /// the role was (or was not) dispatched.
+    pub fn call_count_handle(&self) -> Arc<AtomicUsize> {
+        self.runs.clone()
+    }
 }
 
 #[async_trait::async_trait]
@@ -194,6 +208,7 @@ impl ExpertAgent for MockExpertAgent {
         _model: &str,
         _cancel: CancellationToken,
     ) -> Result<AgentRunResult, OrchestratorError> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
         // A configured stop fires the moment the call is in flight, before
         // any scripted result is read back.
         if let Some(cancel) = &self.cancel_on_run {

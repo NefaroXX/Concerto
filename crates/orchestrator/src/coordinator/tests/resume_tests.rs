@@ -1885,9 +1885,15 @@ async fn interrupt_midrun_then_resume_stays_memory_grounded() {
 
     // ── run 2: a fresh coordinator resumes from the durable checkpoint ──
     let bus2 = EventBus::new(256);
+    // Canary: the settled design step must never re-dispatch. `always_fail`
+    // alone is weak — the failure is absorbed by the failure-diagnosis path
+    // and an exhausted script defaults to `Success("mock default")` — so the
+    // test also asserts the mock's invocation count stays zero.
+    let architect_canary =
+        MockExpertAgent::always_fail(AgentId::new("architect"), "must not be dispatched");
+    let architect_calls = architect_canary.call_count_handle();
     let registry2 = Arc::new(AgentRegistry::from_mocks(vec![
-        // Canary: the settled design step must never re-dispatch.
-        MockExpertAgent::always_fail(AgentId::new("architect"), "must not be dispatched"),
+        architect_canary,
         MockExpertAgent::always_succeed(AgentId::new("coder"), "implemented")
             .with_artifact_writer(),
     ]));
@@ -1928,7 +1934,7 @@ async fn interrupt_midrun_then_resume_stays_memory_grounded() {
         resume_ctx.retrieved_chunks
     );
 
-    // The resume runs to completion; the architect canary never fires.
+    // The resume runs to completion; the architect canary was NEVER invoked.
     let second = coordinator2
         .run(resume_task, resume_ctx, CancellationToken::new(), Some(record.state_json))
         .await
@@ -1936,5 +1942,10 @@ async fn interrupt_midrun_then_resume_stays_memory_grounded() {
     assert_ne!(
         second.final_message, "must not be dispatched",
         "a settled step was re-dispatched on resume"
+    );
+    assert_eq!(
+        architect_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the settled design step must never be re-dispatched on resume"
     );
 }
