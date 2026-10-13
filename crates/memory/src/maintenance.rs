@@ -444,7 +444,7 @@ impl MaintenanceLedger {
             "SELECT id, kind, target, target_kind, evidence, outcome, reason, actor, \
              project_id, observed_at \
              FROM maintenance_outcomes WHERE target = ? \
-             ORDER BY observed_at DESC, id DESC",
+             ORDER BY observed_at DESC, rowid DESC",
         )
         .bind(target)
         .fetch_all(&self.pool)
@@ -455,6 +455,9 @@ impl MaintenanceLedger {
 
     /// The most recent outcomes across all targets, newest first, bounded by
     /// `limit` (a caller-supplied bound; `0` reads nothing).
+    /// Recency is insertion order (`rowid` tiebreak): `observed_at` has
+    /// 1-second granularity and `id` is a random ULID, so neither can order
+    /// same-second rows — `rowid` is the only total recency order.
     pub async fn list(
         &self,
         limit: usize,
@@ -469,7 +472,7 @@ impl MaintenanceLedger {
         let rows = sqlx::query(
             "SELECT id, kind, target, target_kind, evidence, outcome, reason, actor, \
              project_id, observed_at \
-             FROM maintenance_outcomes ORDER BY observed_at DESC, id DESC LIMIT ?",
+             FROM maintenance_outcomes ORDER BY observed_at DESC, rowid DESC LIMIT ?",
         )
         .bind(limit as i64)
         .fetch_all(&self.pool)
@@ -491,7 +494,7 @@ impl MaintenanceLedger {
             "SELECT id, kind, target, target_kind, evidence, outcome, reason, actor, \
              project_id, observed_at \
              FROM maintenance_outcomes WHERE project_id = ? \
-             ORDER BY observed_at DESC, id DESC",
+             ORDER BY observed_at DESC, rowid DESC",
         )
         .bind(project_id)
         .fetch_all(&self.pool)
