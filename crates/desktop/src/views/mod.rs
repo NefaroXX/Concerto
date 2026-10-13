@@ -3,6 +3,7 @@ pub mod chat;
 pub mod code_editor;
 pub mod context_bar;
 pub mod diff;
+pub mod harness;
 pub mod memory;
 pub mod memory_graph;
 pub mod nav;

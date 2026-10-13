@@ -483,6 +483,20 @@ pub async fn build_standalone_harness(
     memory_enabled: bool,
     approval_sink: Arc<dyn ApprovalSink>,
 ) -> Result<StandaloneHarness, concerto_core::OrchestratorError> {
+    build_standalone_harness_with_memory(project_root, config, memory_enabled, None, approval_sink)
+        .await
+}
+
+/// As [`build_standalone_harness`], but reusing an already-initialised memory
+/// store (the desktop App's long-lived store) instead of initialising a second
+/// one. `provided_memory = Some` takes precedence over `memory_enabled`.
+pub async fn build_standalone_harness_with_memory(
+    project_root: &std::path::Path,
+    config: &concerto_config::AppConfig,
+    memory_enabled: bool,
+    provided_memory: Option<Arc<dyn MemoryStore>>,
+    approval_sink: Arc<dyn ApprovalSink>,
+) -> Result<StandaloneHarness, concerto_core::OrchestratorError> {
     use std::sync::Mutex as StdMutex;
 
     use concerto_core::event::EventBus;
@@ -502,13 +516,16 @@ pub async fn build_standalone_harness(
         None,
     );
 
-    // Memory: same funnel as a run; failed init degrades to the null store.
+    // Memory: the caller's store when provided (desktop reuse), else the same
+    // funnel a run uses; a failed init degrades to the null store.
     let project_id = ProjectId(concerto_core::helpers::project_id_hash(project_root));
     let reindex: Arc<StdMutex<Option<Arc<ProjectIndexer>>>> = Arc::new(StdMutex::new(None));
     let reindex_sync: Arc<StdMutex<Option<Arc<ChunkSyncService>>>> = Arc::new(StdMutex::new(None));
     let memory_cancel: Arc<StdMutex<Option<CancellationToken>>> = Arc::new(StdMutex::new(None));
     let data_dir_lock: Arc<StdMutex<Option<Arc<DataDirLock>>>> = Arc::new(StdMutex::new(None));
-    let memory_store: Arc<dyn MemoryStore> = if memory_enabled {
+    let memory_store: Arc<dyn MemoryStore> = if let Some(store) = provided_memory {
+        store
+    } else if memory_enabled {
         match crate::runtime_runner::init_memory_system(
             bus.clone(),
             config,

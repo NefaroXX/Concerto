@@ -365,7 +365,17 @@ pub fn quick_panel_view(app: &App) -> Element<'_, Message> {
         text("Keyboard shortcuts (?)").size(11),
         Position::Left,
     );
-    let footer_tools = row![memory_btn, shortcuts_btn]
+    // H13: open the harness panel (environment/verify/checkpoint/memory ops
+    // over the shared service).
+    let harness_btn = tooltip(
+        button(text("Harness").size(ts.caption))
+            .style(button::secondary)
+            .width(Length::Fill)
+            .on_press(Message::OpenHarnessModal),
+        text("Open Harness operations").size(11),
+        Position::Left,
+    );
+    let footer_tools = row![memory_btn, harness_btn, shortcuts_btn]
         .spacing(sp.sm)
         .align_y(Alignment::Center)
         .width(Length::Fill);
