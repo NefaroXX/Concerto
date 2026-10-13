@@ -197,6 +197,10 @@ pub struct DescribeFacts {
     pub probe_candidates: Option<Vec<String>>,
     /// `PATH`-directory override for hermetic tests (`None` reads `PATH`).
     pub probe_path_dirs: Option<Vec<PathBuf>>,
+    /// H13 `[harness].declared_capabilities`: descriptive labels the operator
+    /// declares for their environment. Descriptive only — never an admission
+    /// gate and never read by any authorization path.
+    pub declared_capabilities: Vec<String>,
 }
 
 impl DescribeFacts {
@@ -422,6 +426,11 @@ pub fn register_describe_tool(
         tool_names,
         probe_candidates: None,
         probe_path_dirs: None,
+        declared_capabilities: config
+            .harness
+            .as_ref()
+            .map(|harness| harness.declared_capabilities.clone())
+            .unwrap_or_default(),
         // One cached probe at registration: zero per-call probes after this.
         sandbox_runtime: detect_container_runtime(),
     };
@@ -461,6 +470,7 @@ fn effective_cap(requested: Option<u32>, default: usize, ceiling: usize) -> usiz
 fn render_summary(
     manifest: &EnvironmentManifest,
     sandbox_capability: &SandboxCapabilityDescriptor,
+    declared_capabilities: &[String],
 ) -> ToolOutput {
     let backend = manifest.backend.map_or("unknown", |backend| backend.as_str());
     ToolOutput {
@@ -483,6 +493,7 @@ fn render_summary(
             "persistence": manifest.persistence.iter().map(|class| class.as_str()).collect::<Vec<_>>(),
             "restore": manifest.restore,
             "sandbox_capability": sandbox_capability,
+            "declared_capabilities": declared_capabilities,
             "summary": manifest.summary(),
         }),
     }
@@ -496,6 +507,7 @@ fn render_full(
     max_tools: Option<u32>,
     max_executables: Option<u32>,
     sandbox_capability: &SandboxCapabilityDescriptor,
+    declared_capabilities: &[String],
 ) -> ToolOutput {
     let tools_cap = effective_cap(
         max_tools,
@@ -534,6 +546,10 @@ fn render_full(
         object.insert(
             "sandbox_capability".to_string(),
             serde_json::to_value(sandbox_capability).unwrap_or(serde_json::Value::Null),
+        );
+        object.insert(
+            "declared_capabilities".to_string(),
+            serde_json::to_value(declared_capabilities).unwrap_or(serde_json::Value::Null),
         );
     }
     ToolOutput {
@@ -731,12 +747,17 @@ impl Tool for EnvironmentDescribeTool {
         // probes), descriptive only, offering no restore coverage.
         let sandbox_capability = describe_sandbox_capability(&snapshot.facts);
         Ok(match parsed.detail {
-            DescribeDetail::Summary => render_summary(&manifest, &sandbox_capability),
+            DescribeDetail::Summary => render_summary(
+                &manifest,
+                &sandbox_capability,
+                &snapshot.facts.declared_capabilities,
+            ),
             DescribeDetail::Full => render_full(
                 &manifest,
                 parsed.max_tools,
                 parsed.max_executables,
                 &sandbox_capability,
+                &snapshot.facts.declared_capabilities,
             ),
         })
     }
@@ -847,6 +868,7 @@ mod tests {
             sandbox_runtime: RuntimeAvailability::Unavailable {
                 reason: "test: no container runtime".to_string(),
             },
+            declared_capabilities: vec!["test-declared".to_string()],
         }
     }
 

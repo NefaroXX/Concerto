@@ -75,9 +75,8 @@ authorization path.
 
 | Key | Meaning | Controlled by | Why |
 | --- | --- | --- | --- |
-| `harness.checkpoint_retention_days` | Retention window for checkpoint byte rows | client/operator | Local disk-lifecycle choice; `0`/unset keeps today's keep-all behavior |
-| `harness.checkpoint_limits.max_checkpoints` | Advisory cap on retained checkpoints | client/operator | Local resource bound; never a correctness gate |
-| `harness.recall_limit` | Default `memory.recall` `top_k` | client/operator | Local disclosure bound; callers may request less |
+| `harness.checkpoint_retention_days` | Retention window for checkpoint byte rows | client/operator | Local disk-lifecycle choice; `0`/unset keeps today's keep-all behavior. Applied only by the operator-invoked `concerto harness checkpoint prune` |
+| `harness.recall_limit` | Default `memory.recall` `top_k` | client/operator | Local disclosure bound (validated `1..=50`); callers may request less |
 | `harness.verify_selector` | Default verifier selection for `verify.run` | client/operator | Operator preference, not an authorization decision |
 | `harness.declared_capabilities` | Descriptive capability declarations surfaced by `environment.describe` | client/operator | Descriptive labels only; never an admission gate |
 

@@ -2053,11 +2053,18 @@ async fn setup_shared_tooling(
                 vfs.lock().map(|guard| !guard.changed_paths().is_empty()).unwrap_or(true)
             }) as crate::verify::OverlayPendingSource
         });
-    let verify_service = crate::verify::register_verify_tool(
+    let verify_service = crate::verify::register_verify_tool_with_selector(
         &mut registry,
         &req.project_dir,
         EvalEngine::new(&req.project_dir),
         overlay_source,
+        services
+            .config
+            .harness
+            .as_ref()
+            .and_then(|harness| harness.effective_verify_selector())
+            .and_then(|label| crate::verify::VerifySelector::parse_override(label).ok())
+            .unwrap_or_default(),
     );
     // H13: checkpoint + memory operations into the shared registry. The
     // checkpoint sidecar rides the same sessions pool the gate appends to; the
@@ -2081,6 +2088,7 @@ async fn setup_shared_tooling(
                 memory: services.memory.clone(),
             })),
             memory_db_path: harness_memory_db,
+            recall_default_top_k: services.config.harness.as_ref().and_then(|h| h.recall_limit),
             project_id: harness_project_id,
         },
     );

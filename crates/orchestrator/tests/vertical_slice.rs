@@ -348,6 +348,7 @@ async fn step1_environment_describe_reports_effective_write_and_restore_scope() 
         sandbox_runtime: concerto_core::sandbox::RuntimeAvailability::Unavailable {
             reason: "test: no container runtime".to_string(),
         },
+        declared_capabilities: Vec::new(),
     };
     let state = new_shared_state(facts, Arc::new(CountingProber::default()), None);
     let mut registry = ToolRegistry::default();

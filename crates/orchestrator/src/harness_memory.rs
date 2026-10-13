@@ -85,17 +85,34 @@ impl RecallSource {
 pub struct MemoryRecallTool {
     source: RecallSource,
     project_id: ProjectId,
+    /// Default `top_k` when the caller omits one (from `[harness].recall_limit`).
+    default_top_k: u32,
 }
 
 impl MemoryRecallTool {
     /// Attach to a memory store scoped to `project_id`.
     pub fn new(store: Arc<dyn MemoryStore>, project_id: ProjectId) -> Self {
-        Self { source: RecallSource::Fixed(store), project_id }
+        Self {
+            source: RecallSource::Fixed(store),
+            project_id,
+            default_top_k: MEMORY_RECALL_DEFAULT_TOP_K,
+        }
     }
 
     /// Attach to a lazily-resolved store (the runtime's shared handle).
     pub fn lazy(resolver: Arc<dyn MemoryStoreResolver>, project_id: ProjectId) -> Self {
-        Self { source: RecallSource::Lazy(resolver), project_id }
+        Self {
+            source: RecallSource::Lazy(resolver),
+            project_id,
+            default_top_k: MEMORY_RECALL_DEFAULT_TOP_K,
+        }
+    }
+
+    /// Override the default `top_k` (clamped to the operation ceiling).
+    #[must_use]
+    pub fn with_default_top_k(mut self, default_top_k: u32) -> Self {
+        self.default_top_k = default_top_k.clamp(1, MEMORY_RECALL_MAX_TOP_K);
+        self
     }
 }
 
@@ -141,8 +158,7 @@ impl Tool for MemoryRecallTool {
             ToolError::ExecutionFailed { message: format!("invalid memory.recall input: {error}") }
         })?;
         let top_k =
-            parsed.top_k.unwrap_or(MEMORY_RECALL_DEFAULT_TOP_K).clamp(1, MEMORY_RECALL_MAX_TOP_K)
-                as usize;
+            parsed.top_k.unwrap_or(self.default_top_k).clamp(1, MEMORY_RECALL_MAX_TOP_K) as usize;
         let Some(store) = self.source.resolve() else {
             // Memory disabled / not yet initialised: an honest empty recall
             // with the reason stated, never a synthesized result.

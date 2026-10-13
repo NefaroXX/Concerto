@@ -25,6 +25,7 @@ const HARNESS_USAGE: &str =
      checkpoint create --path P [--path P] ...\n\
      checkpoint inspect <id>\n\
      checkpoint restore <id>\n\
+     checkpoint prune [--retention-days N]\n\
      memory recall <query> [--top-k N]\n\
      memory inspect <chunk-id>";
 
@@ -79,6 +80,12 @@ pub(crate) fn invoke_harness(
         "memory" => parse_memory(&args[1..])?,
         other => anyhow::bail!("unknown harness group '{other}'\n{HARNESS_USAGE}"),
     };
+
+    // `checkpoint.prune` is an operator maintenance action (not one of the six
+    // service operations); it runs through the sessions store's retention seam.
+    if operation == "checkpoint.prune" {
+        return run_checkpoint_prune(&config, project_root, &input);
+    }
 
     let rt = tokio::runtime::Runtime::new()?;
     // The `StandaloneHarness` is dropped inside the async block (its `Drop`
@@ -206,8 +213,75 @@ fn parse_checkpoint(args: &[String]) -> anyhow::Result<(String, serde_json::Valu
             })?;
             Ok((CHECKPOINT_RESTORE_TOOL_NAME.to_string(), json!({ "checkpoint_id": id }), false))
         }
+        "prune" => {
+            let mut input = json!({});
+            let mut index = 1;
+            while index < args.len() {
+                match args[index].as_str() {
+                    "--retention-days" => {
+                        index += 1;
+                        let raw = args.get(index).ok_or_else(|| {
+                            anyhow::anyhow!("--retention-days requires a value\n{HARNESS_USAGE}")
+                        })?;
+                        let days: u64 = raw.parse().map_err(|_| {
+                            anyhow::anyhow!("invalid --retention-days value '{raw}'")
+                        })?;
+                        input["retention_days"] = json!(days);
+                    }
+                    other => {
+                        anyhow::bail!("unknown checkpoint prune option '{other}'\n{HARNESS_USAGE}")
+                    }
+                }
+                index += 1;
+            }
+            Ok(("checkpoint.prune".to_string(), input, false))
+        }
         other => anyhow::bail!("unknown checkpoint action '{other}'\n{HARNESS_USAGE}"),
     }
+}
+
+/// `checkpoint.prune`: operator-invoked retention over the checkpoint sidecar,
+/// applying `[harness].checkpoint_retention_days` unless `--retention-days`
+/// overrides it. Never runs automatically — H13 wires the setting to this
+/// explicit action, and nothing else.
+fn run_checkpoint_prune(
+    config: &concerto_config::AppConfig,
+    _project_root: &Path,
+    input: &serde_json::Value,
+) -> anyhow::Result<HarnessInvocation> {
+    let retention_days = input
+        .get("retention_days")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| config.harness.as_ref().and_then(|harness| harness.checkpoint_retention_days))
+        .filter(|days| *days > 0);
+    let Some(retention_days) = retention_days else {
+        return Ok(HarnessInvocation {
+            operation: "checkpoint.prune".to_string(),
+            summary: "checkpoint.prune skipped: no retention window configured".to_string(),
+            data: json!({
+                "pruned": false,
+                "reason": "no retention window (set [harness].checkpoint_retention_days or pass --retention-days)",
+            }),
+        });
+    };
+    let rt = tokio::runtime::Runtime::new()?;
+    let report = rt.block_on(async {
+        let store = concerto_sessions::SqliteSessionStore::connect().await?;
+        store.prune_file_checkpoints(retention_days, &concerto_core::CancellationToken::new()).await
+    })?;
+    Ok(HarnessInvocation {
+        operation: "checkpoint.prune".to_string(),
+        summary: format!(
+            "checkpoint.prune retention_days={retention_days} expired={} sidecar_rows_deleted={}",
+            report.expired, report.sidecar_rows_deleted,
+        ),
+        data: json!({
+            "retention_days": retention_days,
+            "expired": report.expired,
+            "sidecar_rows_deleted": report.sidecar_rows_deleted,
+            "cutoff_unix": report.cutoff_unix,
+        }),
+    })
 }
 
 /// Parse `memory <recall|inspect> ...`.
@@ -334,6 +408,23 @@ mod tests {
     fn unknown_group_and_action_are_errors() {
         assert!(parse_checkpoint(&args(&["nope"])).is_err());
         assert!(parse_memory(&args(&["nope"])).is_err());
+    }
+
+    #[test]
+    fn checkpoint_prune_parses_and_skips_without_a_window() {
+        let (op, input, memory) =
+            parse_checkpoint(&args(&["prune", "--retention-days", "14"])).unwrap();
+        assert_eq!(op, "checkpoint.prune");
+        assert_eq!(input["retention_days"], 14);
+        assert!(!memory);
+        // No `[harness]` window and no flag: skip without touching the store.
+        let invocation = run_checkpoint_prune(
+            &concerto_config::AppConfig::default(),
+            std::path::Path::new("."),
+            &serde_json::json!({}),
+        )
+        .expect("prune skip is not an error");
+        assert_eq!(invocation.data["pruned"], false);
     }
 
     /// RAII guard restoring `XDG_DATA_HOME` even on panic (the CLI service

@@ -337,6 +337,8 @@ pub struct HarnessToolRegistration<'a> {
     pub memory_resolver: Option<Arc<dyn MemoryStoreResolver>>,
     /// Memory database path for `memory.inspect`.
     pub memory_db_path: Option<std::path::PathBuf>,
+    /// Default `memory.recall` `top_k` from `[harness].recall_limit`.
+    pub recall_default_top_k: Option<u32>,
     /// Project id for `memory.recall` / `memory.inspect`.
     pub project_id: ProjectId,
 }
@@ -355,10 +357,22 @@ pub fn register_harness_tools(registry: &mut ToolRegistry, config: HarnessToolRe
         )));
         registry.register(Box::new(CheckpointInspectTool::new(store)));
     }
+    let recall_default = config.recall_default_top_k;
     if let Some(resolver) = config.memory_resolver {
-        registry.register(Box::new(MemoryRecallTool::lazy(resolver, config.project_id.clone())));
+        let tool = match recall_default {
+            Some(limit) => MemoryRecallTool::lazy(resolver, config.project_id.clone())
+                .with_default_top_k(limit),
+            None => MemoryRecallTool::lazy(resolver, config.project_id.clone()),
+        };
+        registry.register(Box::new(tool));
     } else if let Some(store) = config.memory_store {
-        registry.register(Box::new(MemoryRecallTool::new(store, config.project_id.clone())));
+        let tool = match recall_default {
+            Some(limit) => {
+                MemoryRecallTool::new(store, config.project_id.clone()).with_default_top_k(limit)
+            }
+            None => MemoryRecallTool::new(store, config.project_id.clone()),
+        };
+        registry.register(Box::new(tool));
     }
     if let Some(db_path) = config.memory_db_path {
         registry.register(Box::new(MemoryInspectTool::new(db_path, config.project_id)));
@@ -509,11 +523,19 @@ pub async fn build_standalone_harness_with_memory(
     let (audit, gate_pool) = crate::runtime_runner_impl::build_audit_sink().await;
 
     // verify.run before environment.describe (describe snapshots tool names).
-    let _verify = crate::verify::register_verify_tool(
+    // `[harness].verify_selector` supplies the default when a call omits it.
+    let default_selector = config
+        .harness
+        .as_ref()
+        .and_then(|harness| harness.effective_verify_selector())
+        .and_then(|label| crate::verify::VerifySelector::parse_override(label).ok())
+        .unwrap_or_default();
+    let _verify = crate::verify::register_verify_tool_with_selector(
         &mut registry,
         project_root,
         concerto_eval::EvalEngine::new(project_root),
         None,
+        default_selector,
     );
 
     // Memory: the caller's store when provided (desktop reuse), else the same
@@ -562,6 +584,7 @@ pub async fn build_standalone_harness_with_memory(
             memory_store: Some(memory_store),
             memory_resolver: None,
             memory_db_path,
+            recall_default_top_k: config.harness.as_ref().and_then(|harness| harness.recall_limit),
             project_id,
         },
     );
