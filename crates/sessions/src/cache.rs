@@ -14,6 +14,9 @@ pub struct CacheReport {
     pub session_id: Ulid,
     pub recorded_events: usize,
     pub unfinished_attempts: u64,
+    pub token_hit_rate: Option<f64>,
+    pub request_hit_rate: Option<f64>,
+    pub measurement_coverage: Option<f64>,
     pub summary: ProviderCallSummary,
     pub by_provider_model: BTreeMap<String, ProviderCallSummary>,
     pub attempts: Vec<ProviderCallRecord>,
@@ -47,6 +50,9 @@ impl CacheReport {
             session_id,
             recorded_events: events.len(),
             unfinished_attempts: 0,
+            token_hit_rate: None,
+            request_hit_rate: None,
+            measurement_coverage: None,
             summary: ProviderCallSummary::default(),
             by_provider_model: BTreeMap::new(),
             attempts,
@@ -65,6 +71,9 @@ impl CacheReport {
                 .or_default()
                 .record(call);
         }
+        report.token_hit_rate = report.summary.cache.token_hit_rate();
+        report.request_hit_rate = report.summary.cache.request_hit_rate();
+        report.measurement_coverage = report.summary.cache.measurement_coverage();
         Ok(report)
     }
 

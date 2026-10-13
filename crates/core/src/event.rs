@@ -1358,6 +1358,21 @@ impl EventBus {
     /// If a sanitizer is configured, the event's string fields are
     /// sanitized before publication.
     pub fn publish(&self, event: Event) -> Result<(), crate::error::CoreError> {
+        self.publish_inner(event, true)
+    }
+
+    /// Record-only telemetry reaches durable consumers without evicting
+    /// progress and approval events from bounded UI broadcast queues.
+    pub fn publish_durable_for_session(
+        &self,
+        session_id: Ulid,
+        correlation_id: Ulid,
+        kind: EventKind,
+    ) -> Result<(), crate::error::CoreError> {
+        self.publish_inner(Event::new(correlation_id, session_id, kind), false)
+    }
+
+    fn publish_inner(&self, event: Event, broadcast: bool) -> Result<(), crate::error::CoreError> {
         let event = if let Some(ref sanitizer) = self.sanitizer {
             Event {
                 id: event.id,
@@ -1393,6 +1408,9 @@ impl EventBus {
                     );
                 }
             }
+        }
+        if !broadcast {
+            return Ok(());
         }
         match self.tx.send(event) {
             Ok(_) => {}

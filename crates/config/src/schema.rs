@@ -1557,7 +1557,7 @@ pub struct ProviderConfig {
     /// Emit Anthropic prompt-cache breakpoints; default off.
     ///
     /// When enabled, the Anthropic connector annotates each request body with
-    /// `cache_control` markers on the system prompt and the first user turn so
+    /// `cache_control` markers on stable system blocks, tools and the conversation tail so
     /// the provider can reuse the byte-identical conversation prefix across
     /// consecutive turns (ADR-48 decision 3 — opt-in extension point). Only
     /// meaningful for `provider == "anthropic"`; other families treat it as a

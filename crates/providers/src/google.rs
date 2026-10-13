@@ -1160,6 +1160,7 @@ mod tests {
             .with_tool_schema_mode(concerto_config::ToolSchemaMode::Loose);
 
         let mut request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             tools: Some(vec![ToolDefinition {
                 name: "runner".into(),
                 description: String::new(),
@@ -1214,6 +1215,7 @@ mod tests {
         let loose = GoogleProvider::new("k".to_string(), "gemini-2.0-flash".into(), 30)
             .with_tool_schema_mode(concerto_config::ToolSchemaMode::Loose);
         let mut request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             tools: Some(vec![ToolDefinition {
                 name: "t".into(),
                 description: String::new(),
@@ -1240,6 +1242,7 @@ mod tests {
         let provider = GoogleProvider::new("k".to_string(), "space-bunny-free".into(), 30)
             .with_tool_schema_mode(concerto_config::ToolSchemaMode::Auto);
         let mut request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             tools: Some(vec![ToolDefinition {
                 name: "t".into(),
                 description: String::new(),
@@ -1267,6 +1270,7 @@ mod tests {
         let heuristic = GoogleProvider::new("k".to_string(), "gemini-2.0-flash-mini".into(), 30)
             .with_tool_schema_mode(concerto_config::ToolSchemaMode::Auto);
         let make_request = || CompletionRequest {
+            stable_system_prefix_bytes: None,
             tools: Some(vec![ToolDefinition {
                 name: "t".into(),
                 description: String::new(),

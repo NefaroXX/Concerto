@@ -114,6 +114,7 @@ impl GenericSpecialistAgent {
             progress.begin_turn();
 
             let mut request = CompletionRequest {
+                stable_system_prefix_bytes: None,
                 model: model.to_string(),
                 messages: messages.clone(),
                 tools: match &tool_driver {

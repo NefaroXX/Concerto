@@ -30,6 +30,7 @@ pub mod tokenizer;
 
 pub mod adapters;
 pub mod anthropic;
+mod cache_policy;
 pub mod capability;
 pub mod cerebras;
 pub mod cohere;

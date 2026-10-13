@@ -1377,6 +1377,7 @@ impl App {
                     }
                     views::chat::SubView::SpendLog => views::chat::spend_log_view(
                         self.chat.spend_log(),
+                        self.chat.cache_report(),
                         self.daily_cost,
                         self.session_cap,
                         &self.cap_state,

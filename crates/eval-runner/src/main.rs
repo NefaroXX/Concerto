@@ -28,6 +28,9 @@ async fn main() {
     let mut baseline_path: Option<PathBuf> = None;
     let mut config_path: Option<PathBuf> = None;
     let mut category: Option<String> = None;
+    let mut variant: Option<String> = None;
+    let mut preparation: Option<String> = None;
+    let agent_driven = env::args().any(|arg| arg.starts_with("--config="));
 
     for arg in env::args().skip(1) {
         if let Some(val) = arg.strip_prefix("--suite=") {
@@ -36,6 +39,10 @@ async fn main() {
             baseline_path = Some(PathBuf::from(val));
         } else if let Some(val) = arg.strip_prefix("--config=") {
             config_path = Some(PathBuf::from(val));
+        } else if let Some(val) = arg.strip_prefix("--variant=") {
+            variant = Some(val.to_string());
+        } else if let Some(val) = arg.strip_prefix("--cache-preparation=") {
+            preparation = Some(val.to_string());
         } else if let Some(val) = arg.strip_prefix("--category=") {
             category = Some(val.to_string());
         }
@@ -90,13 +97,21 @@ async fn main() {
     }
 
     // Run the evaluation suite
-    let report = match runner.run_suite().await {
+    let mut report = match runner.run_suite().await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Eval run failed: {}", e);
             exit(1);
         }
     };
+
+    report.metadata = Some(serde_json::json!({
+        "schema_version": 1, "variant": variant, "cache_preparation": preparation,
+        "cache_preparation_source": "operator_label_not_provider_proof",
+        "runtime_mode": if agent_driven { "single_agent_fixture" } else { "test_suite_only" },
+        "policy_mode": if agent_driven { "permissive_fixture" } else { "test_suite_only" },
+        "cost_source": "legacy_nominal_estimate", "reported_costs_are_subtotals_when_usage_is_missing": true,
+    }));
 
     // If baseline provided, compare with 5% threshold.
     if let Some(baseline_file) = baseline_path {
@@ -128,13 +143,30 @@ fn config_agent_factory(
     Arc::new(move |description: String, project_dir: PathBuf| {
         let provider_config = provider_config.clone();
         Box::pin(async move {
+            let model =
+                provider_config.as_ref().map(|config| config.model.clone()).unwrap_or_default();
+            let config_fingerprint = blake3::hash(
+                serde_json::to_string(&provider_config)
+                    .map_err(|error| error.to_string())?
+                    .as_bytes(),
+            )
+            .to_hex()
+            .to_string();
             let creds = concerto_config::CredentialStore::new();
             let provider = match provider_config.as_ref() {
                 Some(pc) => ProviderFactory::build(pc, &creds)
                     .map_err(|e| format!("failed to build provider: {e}"))?,
                 None => return Ok(no_provider_result()),
             };
-            run_agent(provider, description, project_dir, stable_prefix).await
+            run_agent(
+                provider,
+                description,
+                project_dir,
+                stable_prefix,
+                model,
+                Some(config_fingerprint),
+            )
+            .await
         })
     })
 }
@@ -158,10 +190,13 @@ fn no_provider_result() -> AgentRunResult {
 /// An agent factory over an already-built provider — the live-runtime eval leg
 /// (row #17) installs this with a provider built from the live env contract.
 #[cfg(test)]
-fn provider_agent_factory(provider: Arc<dyn LlmProvider>) -> AgentFactory {
+fn provider_agent_factory(provider: Arc<dyn LlmProvider>, model: String) -> AgentFactory {
     Arc::new(move |description: String, project_dir: PathBuf| {
         let provider = provider.clone();
-        Box::pin(async move { run_agent(provider, description, project_dir, false).await })
+        let model = model.clone();
+        Box::pin(
+            async move { run_agent(provider, description, project_dir, false, model, None).await },
+        )
     })
 }
 
@@ -174,6 +209,8 @@ async fn run_agent(
     description: String,
     project_dir: PathBuf,
     stable_prefix: bool,
+    model: String,
+    configuration_fingerprint: Option<String>,
 ) -> Result<AgentRunResult, String> {
     // Create tool registry
     let mut registry = ToolRegistry::default();
@@ -188,7 +225,7 @@ async fn run_agent(
         .create_session(
             &project_dir_utf8,
             provider.provider_name(),
-            "benchmark",
+            &model,
             CancellationToken::new(),
         )
         .await
@@ -206,7 +243,10 @@ async fn run_agent(
                 "schema_version": 1, "run_id": session.id, "runtime_mode": "single_agent_fixture",
                 "policy_mode": "permissive_fixture", "max_iterations": 10,
                 "cache_stable_prefix": stable_prefix,
-                "commit": std::process::Command::new("git").args(["rev-parse", "HEAD"])
+                "model": model, "provider_configuration_fingerprint": configuration_fingerprint,
+                "starting_workspace_fingerprint": workspace_fingerprint(&project_dir)?,
+                "workspace_exclusions": [".git", "target", "node_modules", "symlinks"],
+                "runtime_source_checkout_commit": std::process::Command::new("git").args(["rev-parse", "HEAD"])
                     .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
                     .output().ok().filter(|output| output.status.success())
                     .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string()),
@@ -260,7 +300,8 @@ async fn run_agent(
         false, // fast mode
         project_dir,
         None, // budget_allocator
-    );
+    )
+    .with_usage_model(model);
 
     // Create cancellation token
     let cancel = CancellationToken::new();
@@ -314,6 +355,48 @@ async fn run_agent(
         session_id: Some(session.id),
         telemetry: Some(telemetry),
     })
+}
+
+fn workspace_fingerprint(root: &std::path::Path) -> Result<String, String> {
+    fn visit(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        hash: &mut blake3::Hasher,
+    ) -> Result<(), String> {
+        let mut entries = std::fs::read_dir(dir)
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let kind = entry.file_type().map_err(|error| error.to_string())?;
+            let path = entry.path();
+            if kind.is_symlink() {
+                continue;
+            }
+            if kind.is_dir() {
+                if !matches!(entry.file_name().to_str(), Some(".git" | "target" | "node_modules")) {
+                    visit(root, &path, hash)?;
+                }
+            } else if kind.is_file() {
+                let relative = path
+                    .strip_prefix(root)
+                    .map_err(|error| error.to_string())?
+                    .to_str()
+                    .ok_or("workspace path is not UTF-8")?
+                    .replace('\\', "/");
+                let content = std::fs::read(&path).map_err(|error| error.to_string())?;
+                hash.update(&(relative.len() as u64).to_le_bytes());
+                hash.update(relative.as_bytes());
+                hash.update(&(content.len() as u64).to_le_bytes());
+                hash.update(&content);
+            }
+        }
+        Ok(())
+    }
+    let mut hash = blake3::Hasher::new();
+    visit(root, root, &mut hash)?;
+    Ok(hash.finalize().to_hex().to_string())
 }
 
 /// Compare current report against a baseline, returning Err if any metric
@@ -569,10 +652,10 @@ mod live_eval_tests {
         }
 
         let provider: Arc<dyn LlmProvider> =
-            Arc::new(OpenAiProvider::new(key, model, 120).with_api_base(base));
+            Arc::new(OpenAiProvider::new(key, model.clone(), 120).with_api_base(base));
         let runner = EvalRunner::new(&suite)
             .with_timeout(600)
-            .with_agent_factory(provider_agent_factory(provider));
+            .with_agent_factory(provider_agent_factory(provider, model));
 
         match runner.run_suite().await {
             Ok(report) => {

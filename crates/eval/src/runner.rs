@@ -355,6 +355,7 @@ impl EvalRunner {
         };
 
         Ok(BenchmarkReport {
+            metadata: None,
             task_count,
             pass_rate,
             avg_latency_ms,

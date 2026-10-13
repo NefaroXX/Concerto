@@ -63,6 +63,7 @@ mod tests {
 
     fn streamed_request() -> CompletionRequest {
         CompletionRequest {
+            stable_system_prefix_bytes: None,
             messages: vec![Message {
                 role: Role::User,
                 content: "Hello".into(),

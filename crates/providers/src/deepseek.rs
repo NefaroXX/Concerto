@@ -236,6 +236,7 @@ mod tests {
             base,
         );
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             stream: true,
             messages: vec![user_message("list files")],
             tools: Some(vec![ToolDefinition {
@@ -278,6 +279,7 @@ mod tests {
             base,
         );
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             stream: true,
             messages: vec![user_message("read the manifest")],
             tools: Some(vec![ToolDefinition {
@@ -318,6 +320,7 @@ mod tests {
             base,
         );
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             stream: true,
             messages: vec![
                 // The previous assistant turn issued a tool call and carried

@@ -55,7 +55,7 @@ impl AttemptRecorder {
                 cost_source: "unknown".into(),
             },
         };
-        let _ = recorder.bus.publish_for_session(
+        let _ = recorder.bus.publish_durable_for_session(
             session_id,
             task_id.0,
             EventKind::ProviderCallStarted { record: recorder.record.clone() },
@@ -97,7 +97,7 @@ impl AttemptRecorder {
         }
         self.published = true;
         self.record.elapsed_ms = self.start.elapsed().as_millis() as u64;
-        if let Err(error) = self.bus.publish_for_session(
+        if let Err(error) = self.bus.publish_durable_for_session(
             self.record.session_id,
             self.record.task_id.0,
             EventKind::ProviderCallFinished { record: self.record.clone() },

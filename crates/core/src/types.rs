@@ -40,6 +40,10 @@ pub enum ToolChoice {
 
 #[derive(Debug, Clone, Default)]
 pub struct CompletionRequest {
+    /// Byte boundary of the stable prefix in the first system message.
+    /// Prompt assembly supplies this hint; provider renderers validate it.
+    /// It changes cache placement only and never grants instruction authority.
+    pub stable_system_prefix_bytes: Option<usize>,
     pub model: String,
     pub messages: Vec<Message>,
     pub tools: Option<Vec<ToolDefinition>>,
@@ -2486,6 +2490,8 @@ impl BenchmarkMetric {
 /// Aggregate report from running a benchmark suite.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
     pub task_count: usize,
     pub pass_rate: f64,
     pub avg_latency_ms: u64,

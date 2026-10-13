@@ -99,7 +99,7 @@ pub enum Message {
     ToggleRun(String),
     /// Spend records for the active session loaded (Spend Log modal body).
     /// Driven from `App::load_spend_log`; best-effort (empty on failure).
-    SpendLogsLoaded(Vec<SpendRecord>),
+    SpendLogsLoaded(Vec<SpendRecord>, Option<concerto_sessions::cache::CacheReport>),
     /// Refresh the Spend Log modal's records. Handled by App (needs the
     /// session handler), like `SelectSession`.
     RefreshSpendLog,
@@ -564,6 +564,7 @@ pub struct State {
     /// Log modal. Populated by `Message::SpendLogsLoaded` (driven from
     /// `App::load_spend_log`); cleared when the active session changes.
     spend_log: Vec<SpendRecord>,
+    cache_report: Option<concerto_sessions::cache::CacheReport>,
     /// Whether `spend_log` has been loaded at least once for the current
     /// session (distinguishes "not loaded yet" from "loaded, empty").
     spend_log_loaded: bool,
@@ -666,6 +667,7 @@ impl State {
             handoff_hold: None,
             shimmer_phase: 0,
             spend_log: Vec::new(),
+            cache_report: None,
             spend_log_loaded: false,
         }
     }
@@ -723,6 +725,7 @@ impl State {
             handoff_hold: None,
             shimmer_phase: 0,
             spend_log: Vec::new(),
+            cache_report: None,
             spend_log_loaded: false,
         }
     }
@@ -968,6 +971,10 @@ impl State {
     }
 
     /// Spend records for the active session (Spend Log modal body).
+    pub fn cache_report(&self) -> Option<&concerto_sessions::cache::CacheReport> {
+        self.cache_report.as_ref()
+    }
+
     pub fn spend_log(&self) -> &[SpendRecord] {
         &self.spend_log
     }
@@ -982,6 +989,7 @@ impl State {
     /// session never shows another session's records.
     pub fn clear_spend_log(&mut self) {
         self.spend_log.clear();
+        self.cache_report = None;
         self.spend_log_loaded = false;
     }
 
@@ -1765,7 +1773,8 @@ impl State {
             Message::ToggleRun(run_id) => {
                 self.toggle_run(&run_id);
             }
-            Message::SpendLogsLoaded(records) => {
+            Message::SpendLogsLoaded(records, cache_report) => {
+                self.cache_report = cache_report;
                 self.spend_log = records;
                 self.spend_log_loaded = true;
             }
@@ -2766,6 +2775,7 @@ const SPEND_LOG_LIST_HEIGHT: f32 = 360.0;
 /// button; this function fills the body, mirroring the Tool Log modal.
 pub fn spend_log_view<'a>(
     spend_log: &'a [SpendRecord],
+    cache_report: Option<&'a concerto_sessions::cache::CacheReport>,
     daily_cost: Option<f64>,
     cap: Option<f64>,
     cap_state: &'a CapUiState,
@@ -2798,6 +2808,13 @@ pub fn spend_log_view<'a>(
 
     column![
         spend_log_header(totals, cap, cap_state, theme),
+        text(
+            cache_report
+                .map(|report| report.caption())
+                .unwrap_or_else(|| "Prompt cache: N/A · telemetry unavailable".into())
+        )
+        .size(caption)
+        .color(palette.text_muted),
         body,
         rule::horizontal(1),
         spend_log_daily_row(daily_cost, palette, caption),

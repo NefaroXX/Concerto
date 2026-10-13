@@ -492,6 +492,7 @@ mod tests {
     fn augment_request_strips_tools_and_injects_section() {
         let driver = driver();
         let mut request = concerto_core::types::CompletionRequest {
+            stable_system_prefix_bytes: None,
             messages: vec![
                 Message {
                     role: Role::System,
@@ -536,6 +537,7 @@ mod tests {
     fn augment_request_inserts_system_message_when_missing() {
         let driver = driver();
         let mut request = concerto_core::types::CompletionRequest {
+            stable_system_prefix_bytes: None,
             messages: vec![Message {
                 role: Role::User,
                 content: "do the thing".into(),

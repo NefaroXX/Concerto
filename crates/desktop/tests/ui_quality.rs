@@ -150,11 +150,12 @@ fn spend_log_subview_renders_without_panic() {
             created_at: OffsetDateTime::now_utc(),
         })
         .collect();
-    let _ = state.update(views::chat::Message::SpendLogsLoaded(fixtures));
+    let _ = state.update(views::chat::Message::SpendLogsLoaded(fixtures, None));
 
     let theme = AppTheme::by_name("Midnight");
     let _element = views::chat::spend_log_view(
         state.spend_log(),
+        None,
         None,
         Some(1.0),
         &views::spend::CapUiState::Normal,
@@ -167,8 +168,14 @@ fn spend_log_subview_renders_without_panic() {
 #[test]
 fn spend_log_empty_state_renders_in_all_themes() {
     for theme in AppTheme::all() {
-        let _element =
-            views::chat::spend_log_view(&[], None, None, &views::spend::CapUiState::Normal, &theme);
+        let _element = views::chat::spend_log_view(
+            &[],
+            None,
+            None,
+            None,
+            &views::spend::CapUiState::Normal,
+            &theme,
+        );
     }
 }
 
@@ -192,11 +199,11 @@ fn spend_log_renders_with_approaching_cap() {
         cost_usd: 0.9,
         created_at: OffsetDateTime::now_utc(),
     }];
-    let _ = state.update(views::chat::Message::SpendLogsLoaded(fixtures));
+    let _ = state.update(views::chat::Message::SpendLogsLoaded(fixtures, None));
 
     let theme = AppTheme::by_name("Midnight");
     let approaching =
         views::spend::CapUiState::Approaching { current_usd: 0.9, cap_usd: 1.0, pct: 90.0 };
     let _element =
-        views::chat::spend_log_view(state.spend_log(), None, Some(1.0), &approaching, &theme);
+        views::chat::spend_log_view(state.spend_log(), None, None, Some(1.0), &approaching, &theme);
 }

@@ -292,6 +292,8 @@ impl PromptBuilder {
             self.assemble_system(working_memory_block, prev_summary)
         };
 
+        let stable_system_prefix_bytes =
+            self.cache_stable_prefix.then(|| self.stable_system_head(prev_summary).len());
         let mut all_messages = Vec::with_capacity(messages.len() + 1);
 
         all_messages.push(Message {
@@ -307,9 +309,16 @@ impl PromptBuilder {
         all_messages.extend_from_slice(messages);
 
         CompletionRequest {
+            stable_system_prefix_bytes,
             model: String::new(), // filled in by the caller or provider context guard
             messages: all_messages,
-            tools: tools.map(|t| t.to_vec()),
+            tools: tools.map(|definitions| {
+                let mut tools = definitions.to_vec();
+                if self.cache_stable_prefix {
+                    tools.sort_by(|a, b| a.name.cmp(&b.name));
+                }
+                tools
+            }),
             tool_choice: None,
             temperature: None,
             max_tokens: None,

@@ -38,10 +38,18 @@ pub struct ProviderCallSummary {
     pub reported_output_tokens: u64,
     /// Known subtotal; never a complete cost when missing_cost_calls > 0.
     pub known_estimated_cost_usd: f64,
+    #[serde(default)]
+    pub first_content_ms: Vec<u64>,
+    #[serde(default)]
+    pub elapsed_ms: Vec<u64>,
 }
 
 impl ProviderCallSummary {
     pub fn record(&mut self, call: &ProviderCallRecord) {
+        self.elapsed_ms.push(call.elapsed_ms);
+        if let Some(time) = call.first_content_ms {
+            self.first_content_ms.push(time);
+        }
         self.cache.record(call.usage);
         self.failed_attempts += u64::from(call.status == "error");
         self.interrupted_attempts +=
