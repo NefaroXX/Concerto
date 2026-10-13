@@ -124,6 +124,16 @@ lifecycle decisions. What is true on `dev` today:
 - **Release hardening:** bounded durable event-bus backlog with health flag,
   debounced memory re-index watcher, size-bounded log rotation, `sessions
   prune`, centralized provider retry/backoff.
+- **Harness upgrade (H00–H14):** the contract surface (typed failures,
+  verification outcomes, environment manifest, durable checkpoints, memory
+  evidence), verification-as-a-service, experiment workspaces, restore-coverage
+  preflight, the portable sandbox capability interface, evidence-bearing recall,
+  observed maintenance outcomes, and one common access seam are landed on `dev`
+  (H00–H13). Reconciled status, evidence and the live task register:
+  [`docs/harness-upgrade-plan.md`](docs/harness-upgrade-plan.md); measurement
+  buckets (assert / benchmark / live-procedure / declared-unmeasured):
+  [`docs/harness-measurement.md`](docs/harness-measurement.md). H14 is
+  observational and moves no semantics.
 
 ## In progress
 
