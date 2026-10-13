@@ -16,9 +16,13 @@
 //!   restore must itself issue gated `filesystem` writes: it calls
 //!   [`ToolExecutor::restore_checkpoint`][concerto_core::executor::ToolExecutor::restore_checkpoint],
 //!   the executor's dedicated restore pipeline (per-resource policy + audit).
-//!   Registering restore as a nested tool would make the tool require the very
-//!   executor that contains it; the service seam keeps a single policy path
-//!   instead.
+//!   Restore is operator/frontend-scoped **by design**: rewriting workspace
+//!   state is never something an agent invokes on itself mid-run, so restore
+//!   is reachable from the CLI, the desktop, and the standalone service —
+//!   not from an agent's own tool registry. (The codebase already holds the
+//!   precedent for making such an operation agent-reachable later — the
+//!   lazy-resolver pattern behind `SharedMemoryResolver` — but this release
+//!   deliberately does not.)
 //!
 //! No adapter may touch the checkpoint store directly: the tools own the store
 //! handle, and adapters only ever see the service's [`ToolOutput`] payload.

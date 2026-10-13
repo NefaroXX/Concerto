@@ -16,23 +16,30 @@ One service seam — `concerto_orchestrator::harness_service::HarnessService`
 | `checkpoint.create` | `CheckpointCreateTool` | `ToolExecutor::execute` |
 | `checkpoint.inspect` | `CheckpointInspectTool` | `ToolExecutor::execute` |
 | `checkpoint.restore` | `restore_file_checkpoint` | `ToolExecutor::restore_checkpoint` |
+| `checkpoint.prune` (CLI-only carve-out, see below) | `run_checkpoint_prune` (CLI dispatch) | direct `SqliteSessionStore::prune_file_checkpoints` — operator-invoked, delete-only of window-expired rows, same precedent as `sessions prune` |
 | `verify.run` | `VerifyRunTool` | `ToolExecutor::execute` |
 | `memory.recall` | `MemoryRecallTool` | `ToolExecutor::execute` |
 | `memory.inspect` | `MemoryInspectTool` | `ToolExecutor::execute` |
 
 Every adapter calls `HarnessService`; no adapter touches a filesystem path, a
-SQLite pool, or a `FileCheckpointStore` directly. `checkpoint.restore` is a
+SQLite pool, or a `FileCheckpointStore` directly — with one explicit,
+operator-scoped exception: `checkpoint.prune` (CLI-only, see below) connects
+to the session store directly to delete window-expired sidecar rows, mirroring
+the pre-existing `sessions prune` precedent. It is delete-only, never runs
+automatically, and is listed in the operations table as its own row rather
+than hidden inside the service claim. `checkpoint.restore` is a
 service-level operation because a restore must itself issue gated `filesystem`
 writes; it calls the executor's dedicated `restore_checkpoint` pipeline (one
-policy decision + audit row per resource). Registering restore as a nested tool
-would make the tool require the executor that contains it.
+policy decision + audit row per resource). Restore is operator/frontend-scoped
+by design, not a structural impossibility: rewriting workspace state is never
+something an agent invokes on itself mid-run.
 
 ## Declared coverage
 
 | Adapter path | Status | Proof |
 | --- | --- | --- |
-| In-process single-agent | covered | `harness_service::tests`, `vertical_slice` |
-| In-process coordinator | covered | `harness_service::tests` |
+| In-process single-agent | covered except `checkpoint.restore` (operator/frontend-scoped, see below) | `harness_service::tests`, `vertical_slice` |
+| In-process coordinator | covered except `checkpoint.restore` (operator/frontend-scoped, see below) | `resume_with_memory_still_grounds` (evidence-bearing recall) |
 | Supervised agents | covered (memory recall evidence) | `ipc::MemoryChunk` status fields + `supervisor` |
 | CLI JSON | covered | `concerto-cli` `harness` subcommand |
 | Desktop | covered | `concerto-desktop` harness panel |

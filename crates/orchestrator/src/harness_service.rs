@@ -10,8 +10,8 @@
 //!
 //! | Adapter path | Status | Where proven |
 //! | --- | --- | --- |
-//! | In-process single-agent | covered | `harness_service::tests`, `vertical_slice` |
-//! | In-process coordinator | covered | `harness_service::tests` |
+//! | In-process single-agent | covered except `checkpoint.restore` (operator/frontend-scoped, see below) | `harness_service::tests`, `vertical_slice` |
+//! | In-process coordinator | covered except `checkpoint.restore` (operator/frontend-scoped, see below) | `resume_with_memory_still_grounds` (evidence-bearing recall) |
 //! | Supervised agents | covered (memory recall) | `ipc` wire + `supervisor` status fields |
 //! | CLI JSON | covered | `concerto-cli` `harness` subcommand tests |
 //! | Desktop | covered | `concerto-desktop` harness view tests |

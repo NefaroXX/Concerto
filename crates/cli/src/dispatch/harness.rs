@@ -2,9 +2,12 @@
 //!
 //! Every subcommand builds the ONE harness service
 //! ([`concerto_orchestrator::harness_service::build_standalone_harness`]) and
-//! invokes an operation on it. The service is the same seam the desktop and
-//! in-process paths call; the CLI never touches a tool, a checkpoint store, or
-//! a memory database directly.
+//! invokes an operation on it — with one explicit, operator-scoped exception:
+//! `checkpoint.prune` connects to the session store directly to delete
+//! window-expired sidecar rows (mirroring the pre-existing `sessions prune`
+//! precedent; delete-only, never automatic). The service is the same seam the
+//! desktop and in-process paths call; the CLI otherwise never touches a tool,
+//! a checkpoint store, or a memory database directly.
 //!
 //! Human-readable by default; `--json` emits the service invocation
 //! ([`HarnessInvocation`]) as compact JSON — the service's shape, not a second
