@@ -185,7 +185,7 @@ The expected manual release checks are maintained in [Testing](../TESTING.md).
   status, evidence and the live task register:
   [`docs/harness-upgrade-plan.md`](harness-upgrade-plan.md). Measurement buckets:
   [`docs/harness-measurement.md`](harness-measurement.md). One new deferred row:
-  external harness access (`docs/DEFERRED.md` row 50).
+  external harness access (`docs/DEFERRED.md` row 48).
 
 - 2026-09-28: **Delegation doctrine (ADR-74) + auditable tool trail.** ADR-74
   makes delegation the Coordinator's default: self-execution is permitted only

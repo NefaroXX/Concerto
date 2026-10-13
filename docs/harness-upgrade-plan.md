@@ -51,7 +51,7 @@ outstanding register are referenced, not duplicated.
 | # | Item | What remains | Source | Re-entry condition | Size |
 | --- | --- | --- | --- | --- | --- |
 | D-18 | Cross-process continue | `restore_graph`/`load_checkpoint` exist but no CLI/desktop path reconstructs and continues a run from its checkpoint. | `DEFERRED.md` row 18 | A CLI/desktop path that reconstructs a run from its checkpoint + e2e test | L |
-| D-50 | External harness access | No external path meets the bar; needs its own run-scoped transport/auth/lifecycle decision. Declared out of scope in `harness-access.md`. | `DEFERRED.md` row 50 (new); `harness-access.md` §"External access"; `EXTERNAL_ACCESS_NON_COVERAGE` | Someone writes that decision | S |
+| D-48 | External harness access | No external path meets the bar; needs its own run-scoped transport/auth/lifecycle decision. Declared out of scope in `harness-access.md`. | `DEFERRED.md` row 48 (new); `harness-access.md` §"External access"; `EXTERNAL_ACCESS_NON_COVERAGE` | Someone writes that decision | S |
 | D-13r | Mild-tier reorder observation | The ADR-69 cascade reorder was observed at `CascadeTier::Emergency` (γ = 0.20); production wires `CascadeTier::Mild` (γ = 0.05), where the same data would not reorder. | `DEFERRED.md` row 13 residual | Production-default Mild-tier data observed to reorder | S |
 | D-41r | Resume stress/test fidelity | Row 41's interrupt/resume evidence is a single interrupt cycle, specialists are mocks, the decision store is in-memory Arc-shared (not storage-mediated), and H11's `interrupted` flag is not surfaced on the Phase-0 grounding path. | `DEFERRED.md` row 41 residual | A repeated-interrupt stress run with a storage-mediated decision store; or a Phase-0 consumer of `interrupted` | M |
 | D-09m | Multi-adapter restore reachability | A rollback across experiment effects is not a single coherent workspace restore: live process memory, non-managed processes/grandchildren, shell/network effects, FTS/vector/reindex state, and DB schema/DDL are unclaimed and refused (or qualified) by construction. `preflight` reports this honestly; the reachability ceiling stands. | `crates/orchestrator/src/managed_rollback.rs` honest-limits index; `ADR-83` §Residuals | A backend that claims (and failure-injection-proves) any listed kind, or an explicit acknowledged scope that still refuses them | M |
@@ -74,4 +74,4 @@ settings).
    section — the ceiling is stated there, not hidden.
 4. For DEFERRED-owned rows, read the row in `docs/DEFERRED.md`; H14 did not
    reopen rows 13/18/31/41 (13/41 were already promoted with precise residuals;
-   18 stays open) and added **one new row (50)** for external access.
+   18 stays open) and added **one new row (48)** for external access.
