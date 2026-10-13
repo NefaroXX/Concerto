@@ -52,16 +52,50 @@ pub struct MemoryInspectInput {
     pub chunk_id: String,
 }
 
+/// Resolves a project's memory store lazily.
+///
+/// The runtime registers `memory.recall` into the shared registry *before* the
+/// project memory store is initialised (the registry is frozen into the
+/// executor first), so the tool resolves the store from the run's shared
+/// handle at call time. A resolver that finds no store (memory disabled or
+/// init failed) yields an honest empty recall, never a fake one.
+pub trait MemoryStoreResolver: Send + Sync {
+    /// The current project's store, or `None` when memory is unavailable.
+    fn resolve(&self) -> Option<Arc<dyn MemoryStore>>;
+}
+
+/// Where a `MemoryRecallTool` gets its store.
+enum RecallSource {
+    /// A fixed store (CLI/desktop standalone service, tests).
+    Fixed(Arc<dyn MemoryStore>),
+    /// The runtime's shared handle, resolved per call.
+    Lazy(Arc<dyn MemoryStoreResolver>),
+}
+
+impl RecallSource {
+    fn resolve(&self) -> Option<Arc<dyn MemoryStore>> {
+        match self {
+            Self::Fixed(store) => Some(store.clone()),
+            Self::Lazy(resolver) => resolver.resolve(),
+        }
+    }
+}
+
 /// The `memory.recall` operation.
 pub struct MemoryRecallTool {
-    store: Arc<dyn MemoryStore>,
+    source: RecallSource,
     project_id: ProjectId,
 }
 
 impl MemoryRecallTool {
     /// Attach to a memory store scoped to `project_id`.
     pub fn new(store: Arc<dyn MemoryStore>, project_id: ProjectId) -> Self {
-        Self { store, project_id }
+        Self { source: RecallSource::Fixed(store), project_id }
+    }
+
+    /// Attach to a lazily-resolved store (the runtime's shared handle).
+    pub fn lazy(resolver: Arc<dyn MemoryStoreResolver>, project_id: ProjectId) -> Self {
+        Self { source: RecallSource::Lazy(resolver), project_id }
     }
 }
 
@@ -109,6 +143,20 @@ impl Tool for MemoryRecallTool {
         let top_k =
             parsed.top_k.unwrap_or(MEMORY_RECALL_DEFAULT_TOP_K).clamp(1, MEMORY_RECALL_MAX_TOP_K)
                 as usize;
+        let Some(store) = self.source.resolve() else {
+            // Memory disabled / not yet initialised: an honest empty recall
+            // with the reason stated, never a synthesized result.
+            return Ok(ToolOutput {
+                summary: "memory.recall unavailable: no project memory store".to_string(),
+                data: serde_json::json!({
+                    "chunks": [],
+                    "total": 0,
+                    "degraded": false,
+                    "interrupted": false,
+                    "unavailable": true,
+                }),
+            });
+        };
         let query = MemoryQuery {
             text: parsed.query,
             project_id: self.project_id.clone(),
@@ -116,7 +164,7 @@ impl Tool for MemoryRecallTool {
             top_k,
             filters: Vec::new(),
         };
-        let chunks = self.store.retrieve_with_evidence(&query, cancel).await.map_err(|error| {
+        let chunks = store.retrieve_with_evidence(&query, cancel).await.map_err(|error| {
             ToolError::ExecutionFailed { message: format!("memory.recall failed: {error}") }
         })?;
         let degraded = chunks.iter().any(|chunk| chunk.degraded);

@@ -50,7 +50,8 @@ use crate::harness_checkpoint::{
     CHECKPOINT_INSPECT_TOOL_NAME, CHECKPOINT_RESTORE_TOOL_NAME,
 };
 use crate::harness_memory::{
-    MemoryInspectTool, MemoryRecallTool, MEMORY_INSPECT_TOOL_NAME, MEMORY_RECALL_TOOL_NAME,
+    MemoryInspectTool, MemoryRecallTool, MemoryStoreResolver, MEMORY_INSPECT_TOOL_NAME,
+    MEMORY_RECALL_TOOL_NAME,
 };
 use crate::verify::VERIFY_RUN_TOOL_NAME;
 
@@ -331,6 +332,9 @@ pub struct HarnessToolRegistration<'a> {
     pub checkpoint_store: Option<Arc<FileCheckpointStore>>,
     /// Project-scoped memory store for `memory.recall`.
     pub memory_store: Option<Arc<dyn MemoryStore>>,
+    /// Lazily-resolved memory store for `memory.recall` (runtime registration,
+    /// where the store is initialised after the registry is frozen).
+    pub memory_resolver: Option<Arc<dyn MemoryStoreResolver>>,
     /// Memory database path for `memory.inspect`.
     pub memory_db_path: Option<std::path::PathBuf>,
     /// Project id for `memory.recall` / `memory.inspect`.
@@ -351,7 +355,9 @@ pub fn register_harness_tools(registry: &mut ToolRegistry, config: HarnessToolRe
         )));
         registry.register(Box::new(CheckpointInspectTool::new(store)));
     }
-    if let Some(store) = config.memory_store {
+    if let Some(resolver) = config.memory_resolver {
+        registry.register(Box::new(MemoryRecallTool::lazy(resolver, config.project_id.clone())));
+    } else if let Some(store) = config.memory_store {
         registry.register(Box::new(MemoryRecallTool::new(store, config.project_id.clone())));
     }
     if let Some(db_path) = config.memory_db_path {
@@ -501,6 +507,7 @@ pub async fn build_standalone_harness(
             project_root,
             checkpoint_store: checkpoint_store.clone(),
             memory_store: Some(memory_store),
+            memory_resolver: None,
             memory_db_path,
             project_id,
         },

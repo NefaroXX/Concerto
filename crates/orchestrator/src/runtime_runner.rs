@@ -1976,6 +1976,24 @@ struct SharedTooling {
     verify_service: Arc<crate::verify::VerifierService>,
 }
 
+/// Resolves the run's memory store lazily for the `memory.recall` operation.
+///
+/// The registry is frozen into the executor before the project memory store is
+/// initialised, so the tool reads the shared handle at call time.
+struct SharedMemoryResolver {
+    memory: Arc<Mutex<Option<ActiveMemoryServices>>>,
+}
+
+impl crate::harness_memory::MemoryStoreResolver for SharedMemoryResolver {
+    fn resolve(&self) -> Option<Arc<dyn MemoryStore>> {
+        self.memory
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|active| active.store.clone())
+    }
+}
+
 /// W2d (P1-P3b): build the tool registry, audit sink, plugin/MCP tools, and
 /// the resolved provider/model in their original order. Returns the same
 /// values the inlined phases produced, so the caller's subsequent
@@ -2040,6 +2058,31 @@ async fn setup_shared_tooling(
         &req.project_dir,
         EvalEngine::new(&req.project_dir),
         overlay_source,
+    );
+    // H13: checkpoint + memory operations into the shared registry. The
+    // checkpoint sidecar rides the same sessions pool the gate appends to; the
+    // memory store is initialised AFTER this registry is frozen into the
+    // executor, so `memory.recall` resolves it lazily from the run's shared
+    // handle (an unavailable store yields an honest empty recall).
+    let harness_checkpoint_store = gate_pool
+        .clone()
+        .map(|pool| Arc::new(concerto_sessions::file_checkpoints::FileCheckpointStore::new(pool)));
+    let harness_project_id =
+        concerto_core::memory::ProjectId(concerto_core::helpers::project_id_hash(&req.project_dir));
+    let harness_memory_db =
+        concerto_sessions::app_data_dir().ok().map(|dir| dir.join("memory").join("memory.db"));
+    crate::harness_service::register_harness_tools(
+        &mut registry,
+        crate::harness_service::HarnessToolRegistration {
+            project_root: &req.project_dir,
+            checkpoint_store: harness_checkpoint_store,
+            memory_store: None,
+            memory_resolver: Some(Arc::new(SharedMemoryResolver {
+                memory: services.memory.clone(),
+            })),
+            memory_db_path: harness_memory_db,
+            project_id: harness_project_id,
+        },
     );
     // ADR-82 H03: register `environment.describe` LAST so its tool-names
     // snapshot covers every other tool (filesystem, shell, git, LSP, plugin,
