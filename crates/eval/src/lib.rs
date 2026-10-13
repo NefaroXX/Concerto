@@ -31,6 +31,7 @@ pub trait EvalProcessExecutor: Send + Sync {
 }
 
 pub mod categories;
+pub mod observation;
 pub mod persona_mem;
 pub mod runner;
 pub mod scenarios;

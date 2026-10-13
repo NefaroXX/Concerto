@@ -22,6 +22,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 ulid = { workspace = true }
 camino = { workspace = true }
+time = { workspace = true }
 tempfile = "3"
 async-trait = "0.1"
 
