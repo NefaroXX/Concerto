@@ -118,7 +118,7 @@ blake3 = "1"
 # bytes through the JSON tool-call boundary (`content_b64` on the filesystem
 # write input): JSON strings are Unicode, so arbitrary bytes ride base64 and
 # are decoded at the tool boundary — never normalized, never text-guessed.
-base64 = "0.22"
+base64 = "0.23"
 
 # ---- Secret material held in RAM (threat model §6 gap #9) ----
 # Already a transitive dependency of the credential stack (keyring, rustls,
