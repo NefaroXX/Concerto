@@ -1448,7 +1448,7 @@ dependencies = [
  "concerto-core",
  "metrics",
  "metrics-exporter-prometheus",
- "opentelemetry 0.31.0",
+ "opentelemetry 0.33.1",
  "opentelemetry-langfuse",
  "opentelemetry-otlp",
  "opentelemetry-stdout",
@@ -6641,6 +6641,7 @@ dependencies = [
  "js-sys",
  "pin-project-lite",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
