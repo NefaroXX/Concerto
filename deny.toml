@@ -93,24 +93,28 @@ ignore = [
     # Scope: transitive dep via iced font rendering
     # Review date: 2026-10-01
     "RUSTSEC-2026-0192",  # ttf-parser unmaintained — no security issue, maintenance only
-    # === lru unsoundness (ratatui + iced_wgpu/cryoglyph paths) ===
-    # Reason: two distinct lru advisories on two pinned transitive paths.
-    # - RUSTSEC-2026-0002: lru v0.12.5 Stacked Borrows violation in IterMut,
-    #   via ratatui v0.29.0 (concerto-cli TUI).
+    # === lru unsoundness (iced_wgpu/cryoglyph path) ===
+    # Reason: one lru advisory on one pinned transitive path.
     # - RUSTSEC-2026-0253: lru < 0.18.2 unsoundness in LruCache::pop
     #   (use-after-free under panic in `pop`), via iced_wgpu -> cryoglyph
-    #   (desktop glyph cache). cryoglyph pins `lru = "^0.16"`, and the fix
-    #   (0.18.2) is a breaking release outside that requirement — bumping is
-    #   not selectable until iced/cryoglyph upstream relax the pin.
+    #   (desktop glyph cache), which resolves lru 0.16.4. cryoglyph pins
+    #   `lru = "^0.16"`, and the fix (0.18.2) is a breaking release outside
+    #   that requirement — bumping is not selectable until iced/cryoglyph
+    #   upstream relax the pin.
     # Risk: memory-safety issue that requires the specific call patterns the
-    # advisory describes; both consumers are single-threaded UI caches, not
-    # adversarial-input paths.
-    # Scope: concerto-cli (ratatui path) + concerto-desktop (cryoglyph path).
-    # Note: enforced by `unsound = "transitive"` above — both advisories ARE
-    # detected on their transitive paths and suppressed here.
-    # Review date: 2026-10-01 — re-check ratatui 0.30+ and iced/cryoglyph
-    # releases for relaxed lru pins (>=0.18.2), then drop these ignores.
-    "RUSTSEC-2026-0002",  # lru — unsound IterMut, transitive via ratatui
+    # advisory describes; the consumer is a single-threaded UI cache, not an
+    # adversarial-input path.
+    # Scope: concerto-desktop (cryoglyph path) only.
+    # Note: enforced by `unsound = "transitive"` above — this advisory IS
+    # detected on its transitive path and suppressed here.
+    # RETIRED 2026-10-14 — RUSTSEC-2026-0002 (unsound `IterMut`, Stacked
+    # Borrows violation) was removed from this list because it no longer
+    # matches any crate: the ratatui 0.29.0 -> 0.30.2 bump moved concerto-cli's
+    # lru off the vulnerable 0.12.5 and onto 0.18.5, which is past the fix.
+    # Leaving the entry would have reintroduced the dormant-suppression class
+    # removed in #345 (a stale ignore that silently stops firing).
+    # Review date: 2026-10-14 — re-check iced/cryoglyph releases for a relaxed
+    # lru pin (>=0.18.2), then drop this ignore and close the last lru entry.
     "RUSTSEC-2026-0253",  # lru — unsound pop, transitive via iced_wgpu -> cryoglyph (pinned ^0.16)
 ]
 
