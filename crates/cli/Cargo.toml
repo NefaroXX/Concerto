@@ -28,7 +28,7 @@ camino = { workspace = true }
 semver = { workspace = true }
 reqwest = { workspace = true }
 
-ratatui = { workspace = true }
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 crossterm = { workspace = true }
 concerto-orchestrator = { path = "../orchestrator", version = "0.1.0" }
 concerto-providers = { path = "../providers", version = "0.1.0" }

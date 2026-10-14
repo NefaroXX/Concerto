@@ -168,6 +168,36 @@ setup wizard. Evidence references remain intact in the output.
 
 ## Appearance
 
+### Terminal navigation and editing
+
+The TUI separates the conversation, message composer, keyboard hints and run
+status into their own rows. The composer grows for multiline drafts and keeps
+the cursor visible when text is longer than the terminal width.
+
+| Action | Keys |
+|---|---|
+| Open the command menu from chat | `F1` or `Ctrl+P`; `?` in browse mode |
+| Choose a menu item | Up/Down, then Enter; Esc closes without changing the draft |
+| Switch between typing and browsing | Esc |
+| Send the current message | Enter, when no run is active |
+| Insert a newline | `Ctrl+J` (Alt/Shift+Enter also works when reported by the terminal) |
+| Edit within a draft | Left/Right, Home/End, Backspace/Delete |
+| Read earlier/later conversation | PageUp/PageDown; Up/Down or j/k in browse mode |
+| Jump to the oldest/latest output | Home/End in browse mode |
+| Cancel a run / quit when idle | `Ctrl+C` |
+
+Bracketed paste inserts text into the draft without sending it. Approval,
+intent and plan prompts retain priority over pasting and navigation shortcuts.
+While a run is active, the composer keeps the next draft until it can be sent.
+Opening settings or cancelling project selection preserves the draft.
+
+Chat follows the latest output until you scroll back; new output leaves your
+reading position in place. Returning to the bottom resumes following. Sessions,
+agent models, tool history and the command menu scroll their selected row into
+view. Tool history supports Up/Down, Home/End and `c` to clear the displayed log.
+
+### Theme and motion preferences
+
 ```sh
 concerto config set display.theme '"Slate"'
 concerto config set display.reduced_motion true

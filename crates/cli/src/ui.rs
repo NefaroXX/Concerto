@@ -1,7 +1,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 use ratatui::text::Span;
@@ -29,17 +29,18 @@ pub fn draw(frame: &mut Frame, app: &App) {
         draw_intent_modal(frame, frame.area(), &intent, &app.cli_theme);
     } else if let Some(plan) = app.plan_prompt() {
         draw_plan_modal(frame, frame.area(), &plan, app.plan_scroll, &app.cli_theme);
+    } else if app.command_menu.is_some() {
+        draw_command_menu(frame, app);
     }
 }
 
+/// Runtime-inspection screen: scrollable inspector text above the key-hint row.
 fn draw_runtime_inspector(frame: &mut Frame, app: &App) {
-    let areas = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(2)])
-        .split(frame.area());
-    let block = Block::default().borders(Borders::ALL).title("Runtime inspector");
+    let block = panel(" Runtime inspector ", &app.cli_theme);
+    let inner = block.inner(frame.area());
+    frame.render_widget(block, frame.area());
+    let areas = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(inner);
     let body = Paragraph::new(app.runtime_inspector.text.as_str())
-        .block(block)
         .wrap(Wrap { trim: false })
         .scroll((app.runtime_inspector.scroll, 0));
     frame.render_widget(body, areas[0]);
@@ -49,64 +50,205 @@ fn draw_runtime_inspector(frame: &mut Frame, app: &App) {
     frame.render_widget(help, areas[1]);
 }
 
+/// Shared menu labels and their existing command-mode shortcuts.
+pub(crate) const CHAT_COMMANDS: &[(char, &str)] = &[
+    ('s', "Settings"),
+    ('l', "Sessions"),
+    ('t', "Tool history"),
+    ('d', "Review changes"),
+    ('i', "Runtime"),
+    ('p', "Switch project"),
+    ('n', "New session"),
+];
+
+fn panel(title: impl Into<Line<'static>>, theme: &CliTheme) -> Block<'static> {
+    let title: Line<'static> = title.into();
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.border))
+        .title(title)
+}
+
+fn draw_command_menu(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    let width = area.width.min(52);
+    let height = area.height.min(11);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, popup);
+    let block = panel(" Commands ", &app.cli_theme);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let areas = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(inner);
+    let items: Vec<ListItem> = CHAT_COMMANDS
+        .iter()
+        .map(|(key, name)| {
+            let note = if *key == 'n' && app.running { " (run active)" } else { "" };
+            ListItem::new(format!("{key}  {name}{note}"))
+        })
+        .collect();
+    draw_selected_list(frame, areas[0], items, app.command_menu.unwrap_or(0), &app.cli_theme);
+    frame.render_widget(
+        Paragraph::new("↑/↓ select · Enter open\nEsc close · draft kept")
+            .style(Style::default().fg(app.cli_theme.muted)),
+        areas[1],
+    );
+}
+
+fn draw_selected_list(
+    frame: &mut Frame,
+    area: Rect,
+    items: Vec<ListItem<'static>>,
+    selected: usize,
+    theme: &CliTheme,
+) {
+    let selected = selected.min(items.len().saturating_sub(1));
+    let mut state = ListState::default().with_selected(Some(selected));
+    let list = List::new(items)
+        .highlight_symbol("› ")
+        .highlight_style(Style::default().fg(theme.warning).add_modifier(Modifier::BOLD));
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
 // ---------------------------------------------------------------------------
 // Chat screen
 // ---------------------------------------------------------------------------
 
 fn draw_chat_screen(frame: &mut Frame, app: &App) {
     let area = frame.area();
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(3)])
-        .split(area);
+    let input_rows = app.input.split('\n').count().clamp(1, 5) as u16;
+    let composer_height = (input_rows + 2).min(area.height.saturating_sub(5).max(3));
+    let chunks = Layout::vertical([
+        Constraint::Length(u16::from(area.height >= 12)),
+        Constraint::Min(1),
+        Constraint::Length(composer_height),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(area);
 
-    draw_chat(frame, chunks[0], app);
-    draw_input(frame, chunks[1], app);
-    draw_status_bar(frame, app);
+    let project = app.project_dir.file_name().and_then(|name| name.to_str()).unwrap_or("project");
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " CONCERTO ",
+                Style::default().fg(app.cli_theme.user).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("/ {project}")),
+        ])),
+        chunks[0],
+    );
+    draw_chat(frame, chunks[1], app);
+    draw_input(frame, chunks[2], app);
+    let hint = if app.running {
+        "Ctrl+C cancel · F1 commands"
+    } else if app.project_picker_mode {
+        "Enter switch · Esc keep draft"
+    } else if !app.input_mode && chunks[3].width < 45 {
+        "Esc type · F1 commands"
+    } else if chunks[3].width < 45 {
+        "Enter send · F1 commands"
+    } else if app.input_mode {
+        "Enter send · Ctrl+J newline · PgUp history · F1 commands"
+    } else {
+        "Esc type · F1 commands · ↑/↓ history · End latest · q quit"
+    };
+    frame.render_widget(
+        Paragraph::new(hint).style(Style::default().fg(app.cli_theme.muted)),
+        chunks[3],
+    );
+    draw_status_bar(frame, chunks[4], app);
 }
 
 fn draw_chat(frame: &mut Frame, area: Rect, app: &App) {
-    let block = Block::default().borders(Borders::ALL).title("Chat");
-
+    let title =
+        if app.follow_chat { " Conversation · LIVE " } else { " History · End for latest " };
+    let block = panel(title, &app.cli_theme);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-
-    let lines: Vec<Line> = app.messages.to_vec();
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((app.scroll, 0));
-    frame.render_widget(paragraph, inner);
+    if inner.is_empty() {
+        return;
+    }
+    let paragraph = Paragraph::new(app.messages.to_vec()).wrap(Wrap { trim: false });
+    // Use the renderer's own word-wrap accounting, including wide glyphs.
+    let max = paragraph.line_count(inner.width).saturating_sub(usize::from(inner.height));
+    let max = max.min(usize::from(u16::MAX)) as u16;
+    app.chat_max_scroll.set(max);
+    let scroll = if app.follow_chat { max } else { app.scroll.min(max) };
+    frame.render_widget(paragraph.scroll((scroll, 0)), inner);
 }
 
 fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
-    let style = if app.input_mode {
-        Style::default().fg(app.cli_theme.success)
+    let title = if app.project_picker_mode {
+        " Project path "
+    } else if !app.input_mode {
+        " Browse · Esc to type "
+    } else if app.running {
+        " Draft · send after this run "
     } else {
-        Style::default().fg(app.cli_theme.muted)
+        " Message "
     };
-
-    let block = Block::default().borders(Borders::ALL).title("Input").border_style(style);
-
+    let block = panel(title, &app.cli_theme).border_style(Style::default().fg(if app.input_mode {
+        app.cli_theme.success
+    } else {
+        app.cli_theme.muted
+    }));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-
-    let text = if app.project_picker_mode {
-        format!("Project path: {}", app.input)
-    } else if app.input_mode {
-        app.input.clone()
+    if inner.is_empty() {
+        return;
+    }
+    let before = &app.input[..app.cursor_offset()];
+    let row = before.bytes().filter(|byte| *byte == b'\n').count();
+    let column = Line::from(before.rsplit('\n').next().unwrap_or("")).width();
+    let top = row.saturating_sub(usize::from(inner.height.saturating_sub(1)));
+    let left = column.saturating_sub(usize::from(inner.width.saturating_sub(1)));
+    // Slice the visible logical lines rather than casting unbounded offsets
+    // to u16. The cursor always stays inside the composer, even for long paste.
+    let lines: Vec<Line> = app
+        .input
+        .split('\n')
+        .skip(top)
+        .take(usize::from(inner.height))
+        .map(|line| {
+            let mut skipped = 0;
+            let visible: String = line
+                .chars()
+                .skip_while(|c| {
+                    if skipped >= left {
+                        return false;
+                    }
+                    skipped += Span::raw(c.to_string()).width();
+                    true
+                })
+                .collect();
+            Line::from(format!("{}{visible}", " ".repeat(skipped.saturating_sub(left))))
+        })
+        .collect();
+    if app.input.is_empty() && !app.project_picker_mode {
+        frame.render_widget(
+            Paragraph::new("Ask a question or describe a change…")
+                .style(Style::default().fg(app.cli_theme.muted)),
+            inner,
+        );
     } else {
-        String::from(
-            "[Esc] edit | [s] settings | [l] sessions | [t] log | [d] diff | [i] runtime | [n] new | [p] project | [q] quit",
-        )
-    };
-    let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, inner);
-
-    if app.input_mode || app.project_picker_mode {
-        let text_len = if app.project_picker_mode {
-            "Project path: ".len() + app.input.len()
-        } else {
-            app.input.len()
-        };
-        frame.set_cursor_position((inner.x + text_len as u16, inner.y));
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+    if (app.input_mode || app.project_picker_mode)
+        && app.command_menu.is_none()
+        && app.approval_prompt().is_none()
+        && app.intent_prompt().is_none()
+        && app.plan_prompt().is_none()
+    {
+        frame.set_cursor_position((
+            inner.x + (column - left).min(usize::from(inner.width - 1)) as u16,
+            inner.y + (row - top).min(usize::from(inner.height - 1)) as u16,
+        ));
     }
 }
 
@@ -115,52 +257,37 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
 // ---------------------------------------------------------------------------
 
 fn draw_sessions_screen(frame: &mut Frame, app: &App) {
-    let area = frame.area();
-    let block =
-        Block::default().borders(Borders::ALL).title("Sessions  (Esc to return, Enter to resume)");
-
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
+    let block = panel(format!(" Sessions · {} saved ", app.sessions_list.len()), &app.cli_theme);
+    let inner = block.inner(frame.area());
+    frame.render_widget(block, frame.area());
+    let areas = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(inner);
     if app.sessions_list.is_empty() {
-        let text = Paragraph::new("No sessions found for this project.").wrap(Wrap { trim: false });
-        frame.render_widget(text, inner);
-        return;
+        frame.render_widget(
+            Paragraph::new("No sessions in this project yet.\nEsc returns to your conversation.")
+                .wrap(Wrap { trim: false }),
+            areas[0],
+        );
+    } else {
+        let format =
+            time::format_description::parse("[month]-[day] [hour]:[minute]").unwrap_or_default();
+        let items = app
+            .sessions_list
+            .iter()
+            .map(|session| {
+                let date = session.created_at.format(&format).unwrap_or_else(|_| "?".into());
+                ListItem::new(format!(
+                    "{date}  {}  · {} messages · ${:.4}",
+                    session.model, session.message_count, session.total_cost_usd
+                ))
+            })
+            .collect();
+        draw_selected_list(frame, areas[0], items, app.sessions_index, &app.cli_theme);
     }
-
-    let items: Vec<ListItem> = app
-        .sessions_list
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let selected = i == app.sessions_index;
-            let style = if selected {
-                Style::default().fg(app.cli_theme.warning).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-            // Build the format descriptor once. Both formats are well-known
-            // time format strings; handle parse failure gracefully so we
-            // never panic on a poisoned time crate state.
-            let format_desc =
-                time::format_description::parse("[year]-[month]-[day] [hour]:[minute]")
-                    .unwrap_or_else(|_| {
-                        // Fallback to a simple time-only format (still handled
-                        // without unwrap).
-                        time::format_description::parse("[hour]:[minute]").unwrap_or_default()
-                    });
-            let date = s.created_at.format(&format_desc).unwrap_or_else(|_| "?".to_string());
-            let prefix = if selected { "> " } else { "  " };
-            let content = format!(
-                "{}{} | {} | {} msg | ${:.4}",
-                prefix, date, s.model, s.message_count, s.total_cost_usd
-            );
-            ListItem::new(Line::from(Span::styled(content, style)))
-        })
-        .collect();
-
-    let list = List::new(items);
-    frame.render_widget(list, inner);
+    frame.render_widget(
+        Paragraph::new("↑/↓ select · Enter resume\nEsc back to conversation")
+            .style(Style::default().fg(app.cli_theme.muted)),
+        areas[1],
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -168,31 +295,36 @@ fn draw_sessions_screen(frame: &mut Frame, app: &App) {
 // ---------------------------------------------------------------------------
 
 fn draw_tool_log_screen(frame: &mut Frame, app: &App) {
-    let area = frame.area();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!("Tool Log  ({} entries)  [Esc/t] close  [c] clear", app.tool_log.len()));
-
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
+    let block = panel(format!(" Tool history · {} entries ", app.tool_log.len()), &app.cli_theme);
+    let inner = block.inner(frame.area());
+    frame.render_widget(block, frame.area());
+    let areas = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(inner);
     if app.tool_log.is_empty() {
-        let text = Paragraph::new("No tool executions yet.").wrap(Wrap { trim: false });
-        frame.render_widget(text, inner);
-        return;
+        frame.render_widget(
+            Paragraph::new("No tool executions yet.\nActivity appears here during a run.")
+                .wrap(Wrap { trim: false }),
+            areas[0],
+        );
+    } else {
+        let items = app
+            .tool_log
+            .iter()
+            .rev()
+            .map(|entry| {
+                ListItem::new(tool_log_line_with_theme(
+                    entry,
+                    crate::app::styling_enabled(),
+                    &app.cli_theme,
+                ))
+            })
+            .collect();
+        draw_selected_list(frame, areas[0], items, app.tool_log_index, &app.cli_theme);
     }
-
-    let styling = crate::app::styling_enabled();
-    let theme = &app.cli_theme;
-    let items: Vec<ListItem> = app
-        .tool_log
-        .iter()
-        .rev()
-        .map(|entry| ListItem::new(tool_log_line_with_theme(entry, styling, theme)))
-        .collect();
-
-    let list = List::new(items);
-    frame.render_widget(list, inner);
+    frame.render_widget(
+        Paragraph::new("↑/↓ browse · c clear view\nEsc back · newest first")
+            .style(Style::default().fg(app.cli_theme.muted)),
+        areas[1],
+    );
 }
 
 /// One tool-log row: status icon + name + duration + detail + provenance rail.
@@ -383,64 +515,48 @@ fn diff_review_lines(result: &DiffResult, width: u16, theme: &CliTheme) -> Vec<L
 // ---------------------------------------------------------------------------
 
 fn draw_agent_assignments_screen(frame: &mut Frame, app: &App) {
-    let area = frame.area();
-    let block = Block::default().borders(Borders::ALL).title("Agent Assignments  (Esc to return)");
-
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
+    let block = panel(" Agent models ", &app.cli_theme);
+    let inner = block.inner(frame.area());
+    frame.render_widget(block, frame.area());
+    let areas = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(inner);
     if app.agent_assignments.is_empty() {
-        let text = Paragraph::new("No agent assignments configured.").wrap(Wrap { trim: false });
-        frame.render_widget(text, inner);
-        return;
+        frame.render_widget(
+            Paragraph::new("No agent assignments configured.").wrap(Wrap { trim: false }),
+            areas[0],
+        );
+    } else {
+        let items = app
+            .agent_assignments
+            .iter()
+            .map(|assignment| {
+                ListItem::new(format!(
+                    "{}: {}",
+                    assignment.agent_role,
+                    assignment.model_override.as_deref().unwrap_or("(default)")
+                ))
+            })
+            .collect();
+        draw_selected_list(frame, areas[0], items, app.agent_assignment_index, &app.cli_theme);
     }
-
-    let items: Vec<ListItem> = app
-        .agent_assignments
-        .iter()
-        .enumerate()
-        .map(|(i, assignment)| {
-            let selected = i == app.agent_assignment_index;
-            let (indicator, style) = if selected {
-                ("> ", Style::default().fg(app.cli_theme.warning).add_modifier(Modifier::BOLD))
-            } else {
-                ("  ", Style::default())
-            };
-            let model = assignment.model_override.as_deref().unwrap_or("(default)");
-            let line = format!("{}{}: {}", indicator, assignment.agent_role, model);
-            ListItem::new(Line::from(Span::styled(line, style)))
-        })
-        .collect();
-
-    let list = List::new(items);
-    frame.render_widget(list, inner);
-
-    // Help text at bottom.
-    let help_area = Rect {
-        x: inner.x,
-        y: inner.y + inner.height.saturating_sub(3),
-        width: inner.width,
-        height: 3,
-    };
-    let help = Paragraph::new(vec![
-        Line::from("Up/Down or j/k: navigate"),
-        Line::from("Enter/Right: next model  Left: previous model"),
-        Line::from("Esc or q: return to Settings"),
-    ]);
-    frame.render_widget(help, help_area);
+    frame.render_widget(
+        Paragraph::new("↑/↓ select · ←/→ model\nEnter next model\nEsc save and return")
+            .style(Style::default().fg(app.cli_theme.muted)),
+        areas[1],
+    );
 }
 
-/// Single-line status bar at the very bottom showing key info.
-fn draw_status_bar(frame: &mut Frame, app: &App) {
-    let area = frame.area();
-    // Status bar is the last row.
-    let status_area =
-        Rect { x: area.x, y: area.y + area.height.saturating_sub(1), width: area.width, height: 1 };
-
-    let status = status_line(app);
-    let style = Style::default().fg(app.cli_theme.muted);
-    let paragraph = Paragraph::new(status).style(style);
-    frame.render_widget(paragraph, status_area);
+fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
+    let state =
+        if app.running { app.run_stage.map(run_stage_label).unwrap_or("Running") } else { "Ready" };
+    let status = if area.width < 80 {
+        format!(" {state} · {}", app.model_label())
+    } else {
+        format!(" {state} · {}", status_line(app))
+    };
+    frame.render_widget(
+        Paragraph::new(status).style(Style::default().fg(app.cli_theme.muted)),
+        area,
+    );
 }
 
 /// Status-bar text for `app` (pure: extracted for tests).
@@ -509,7 +625,7 @@ fn run_stage_label(stage: RunStage) -> &'static str {
 
 fn draw_settings_screen(frame: &mut Frame, app: &App) {
     let area = frame.area();
-    let block = Block::default().borders(Borders::ALL).title("Global settings  (Esc to return)");
+    let block = panel(" Global settings · Esc back ", &app.cli_theme);
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -1028,6 +1144,108 @@ fn closes(chars: &[char], from: usize, marker: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn chat_follows_latest_then_keeps_the_reading_position_during_output() {
+        let mut app = App::new();
+        app.messages = (0..50).map(|i| Line::from(format!("message-{i:02}"))).collect();
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        assert!(buffer_text(&terminal).contains("message-49"));
+        app.handle_key(key_event(KeyCode::PageUp, KeyModifiers::empty()));
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let reading = buffer_text(&terminal);
+        assert!(!reading.contains("message-49"));
+        app.messages.push(Line::from("message-50"));
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        assert_eq!(reading, buffer_text(&terminal));
+        app.handle_key(key_event(KeyCode::Esc, KeyModifiers::empty()));
+        app.handle_key(key_event(KeyCode::End, KeyModifiers::empty()));
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        assert!(buffer_text(&terminal).contains("message-50"));
+    }
+
+    #[test]
+    fn composer_keeps_unicode_and_multiline_cursors_inside_its_content() {
+        for width in [12, 24, 40, 80, 120] {
+            for input in ["界".repeat(80), "héllo\n".repeat(20), "e\u{301}".repeat(80)] {
+                let mut app = App::new();
+                app.input = input;
+                let mut terminal = Terminal::new(TestBackend::new(width, 8)).unwrap();
+                terminal.draw(|frame| draw_input(frame, Rect::new(0, 0, width, 5), &app)).unwrap();
+                let cursor = terminal.get_cursor_position().unwrap();
+                assert!((1..width - 1).contains(&cursor.x));
+                assert!((1..4).contains(&cursor.y));
+            }
+        }
+    }
+
+    #[test]
+    fn navigation_lists_keep_the_last_selection_visible_in_short_terminals() {
+        use crate::app::{ToolLogEntry, ToolStatus};
+        use concerto_config::AgentModelAssignment;
+        use concerto_sessions::SessionSummary;
+        for (width, height) in [(24, 8), (40, 12), (80, 24), (120, 40)] {
+            let mut app = App::new();
+            app.sessions_list = (0..40)
+                .map(|i| SessionSummary {
+                    id: ulid::Ulid::new(),
+                    created_at: time::OffsetDateTime::UNIX_EPOCH,
+                    provider: "test".into(),
+                    model: if i == 39 { "LAST".into() } else { format!("model-{i}") },
+                    message_count: i,
+                    total_cost_usd: 0.0,
+                    total_tokens_in: 0,
+                    total_tokens_out: 0,
+                })
+                .collect();
+            app.sessions_index = 39;
+            app.agent_assignments = (0..40)
+                .map(|i| AgentModelAssignment {
+                    agent_role: if i == 39 { "LAST".into() } else { format!("agent-{i}") },
+                    provider_config_id: "test".into(),
+                    model_override: None,
+                })
+                .collect();
+            app.agent_assignment_index = 39;
+            app.tool_log = (0..40)
+                .map(|i| ToolLogEntry {
+                    tool_name: if i == 0 { "LAST".into() } else { format!("tool-{i}") },
+                    status: ToolStatus::Success,
+                    duration_ms: Some(1),
+                    detail: None,
+                })
+                .collect();
+            app.tool_log_index = 39;
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            for screen in [Screen::Sessions, Screen::AgentAssignments, Screen::ToolLog] {
+                app.screen = screen;
+                terminal.draw(|frame| draw(frame, &app)).unwrap();
+                assert!(buffer_text(&terminal).contains("LAST"), "{screen:?} at {width}x{height}");
+            }
+            app.screen = Screen::Chat;
+            app.command_menu = Some(CHAT_COMMANDS.len() - 1);
+            terminal.draw(|frame| draw(frame, &app)).unwrap();
+            assert!(buffer_text(&terminal).contains("New session"));
+        }
+    }
+
+    #[test]
+    fn chat_layout_reserves_separate_composer_hint_and_status_rows() {
+        for (width, height) in [(24, 8), (40, 12), (80, 24), (120, 40)] {
+            let mut app = App::new();
+            app.input = "draft-kept".into();
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, &app)).unwrap();
+            let row = |y| {
+                (0..width).map(|x| terminal.backend().buffer()[(x, y)].symbol()).collect::<String>()
+            };
+            assert!(row(height - 1).contains("Ready"));
+            assert!(row(height - 2).contains("Enter send"));
+            assert!(row(height - 3).starts_with('╰'));
+            assert!(row(height - 4).contains("draft-kept"));
+        }
+    }
+
     #[test]
     fn settings_selection_stays_visible_at_narrow_and_short_terminal_sizes() {
         use crate::app::{App, Screen, SettingsField};
