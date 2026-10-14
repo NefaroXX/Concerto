@@ -48,6 +48,7 @@ use concerto_sessions::{
 use crate::agent_runner::AgentRunner;
 use crate::agents::GenericSpecialistAgent;
 use crate::checkpoint;
+use crate::completion_evidence::is_build_or_test_command;
 use crate::consultation::{consult_tool_definition, CONSULT_SPECIALIST_TOOL};
 use crate::cost::AgentCostEstimator;
 use crate::delta::FileDeltaTracker;
@@ -1224,50 +1225,6 @@ fn is_mutating_tool_fact(fact: &concerto_sessions::ToolExecutedPayload) -> bool 
     }
 }
 
-/// Whether a recorded `shell` tool command is a build/test/lint/format
-/// invocation. Bounded, documented classifier over the first one or two
-/// whitespace-separated tokens of `command` + `args` (joined). Pure so it is
-/// unit-testable. Unknown runners return `false` (fail-closed).
-fn is_build_or_test_command(args: &serde_json::Value) -> bool {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(command) = args.get("command").and_then(serde_json::Value::as_str) {
-        parts.push(command.to_owned());
-    }
-    if let Some(list) = args.get("args").and_then(serde_json::Value::as_array) {
-        for item in list {
-            if let Some(value) = item.as_str() {
-                parts.push(value.to_owned());
-            }
-        }
-    }
-    if parts.is_empty() {
-        return false;
-    }
-    let normalized = parts.join(" ").to_lowercase();
-    let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
-    let tokens: Vec<&str> = normalized.split(' ').collect();
-    let first = tokens.first().copied().unwrap_or("");
-    let second = tokens.get(1).copied().unwrap_or("");
-    match first {
-        "cargo" => {
-            matches!(
-                second,
-                "build" | "check" | "test" | "clippy" | "fmt" | "nextest" | "deny" | "audit"
-            )
-        }
-        "make" => true,
-        "npm" | "yarn" | "pnpm" => matches!(second, "test" | "run"),
-        "pytest" => true,
-        "python" => second == "-m" && tokens.get(2).copied() == Some("pytest"),
-        "go" => matches!(second, "build" | "test" | "vet"),
-        "dotnet" => matches!(second, "build" | "test"),
-        "mvn" => matches!(second, "test" | "verify" | "package"),
-        "gradle" | "./gradlew" => matches!(second, "test" | "build"),
-        "tsc" | "eslint" | "rustfmt" => true,
-        _ => false,
-    }
-}
-
 /// Every path a recorded tool fact touches: the observed `paths` plus the
 /// raw arguments' `path` / `destination` / `target`. The destination is read
 /// explicitly because move/copy record it in the arguments and in the tool's
@@ -1306,34 +1263,27 @@ fn fact_touches_declared_deliverable(
 }
 
 /// Evaluate a run's recorded `ToolExecuted` facts for C-06 evidence (2).
-/// FAIL-CLOSED: only `success == true` facts qualify, so a failed or
-/// policy-refused call never counts; a fact whose payload cannot be decoded
-/// contributes nothing. Facts are attributed to the run when they carry no
-/// `run_id` (legacy/test producers) or when their `run_id` matches the
-/// current run — a fact from a different run is ignored.
+/// FAIL-CLOSED: only successful, non-contradictory facts attributed to the
+/// current run qualify. Legacy unscoped rows remain readable but cannot
+/// attest completion for a later run in the same session.
 fn tool_fact_verification_evidence(
     events: &[WhiteboardEvent],
     run_id: Option<&str>,
     declared: &[camino::Utf8PathBuf],
 ) -> Option<VerificationEvidence> {
     for event in events {
-        let Ok(fact) =
-            serde_json::from_value::<concerto_sessions::ToolExecutedPayload>(event.payload.clone())
-        else {
+        let Some(fact) = crate::completion_evidence::successful_fact(event, run_id) else {
             continue;
         };
-        if !fact.success {
-            continue;
-        }
-        if let (Some(fact_run), Some(current_run)) = (fact.run_id.as_deref(), run_id) {
-            if fact_run != current_run {
-                continue;
-            }
-        }
-        if fact.tool == "shell" && is_build_or_test_command(&fact.args) {
+        if fact.canonical_tool.as_deref().unwrap_or(&fact.tool) == "shell"
+            && is_build_or_test_command(&fact.args)
+        {
             return Some(VerificationEvidence {
                 kind: VerificationEvidenceKind::BuildOrTestCommand,
-                detail: format!("successful build/test/lint command via `{}`", fact.tool),
+                detail: format!(
+                    "successful build/test/lint command via `{}` (event {})",
+                    fact.tool, event.event_id
+                ),
             });
         }
         if is_mutating_tool_fact(&fact)
@@ -1342,8 +1292,8 @@ fn tool_fact_verification_evidence(
             return Some(VerificationEvidence {
                 kind: VerificationEvidenceKind::MutatingToolOnDeliverable,
                 detail: format!(
-                    "successful mutating tool `{}` touched a declared deliverable",
-                    fact.tool
+                    "successful mutating tool `{}` touched a declared deliverable (event {}; production evidence, not a passing check)",
+                    fact.tool, event.event_id
                 ),
             });
         }
@@ -2295,11 +2245,14 @@ pub struct CoordinatorAgent {
     /// re-dispatch that never settles can attach the diff to its Partial note.
     /// Cleared as soon as it is read; `None` on a run without confirmed drift.
     plan_drift_redispatch: Option<crate::external_change::PlanDriftRedispatch>,
-    /// ADR-65 §3: the run id (fresh per `execute_graph`, matching the
+    /// ADR-65 §3: the run id (shared by dispatch and graph execution, matching the
     /// checkpoint scope) stamped into every dispatched agent's tool-evidence
     /// facts, so a run's tool commands are attributable across task
     /// boundaries. `None` only when no run has started yet.
     run_id: Option<String>,
+    /// Last checkpoint coordinate for the current run. Carry its sequence
+    /// across the dispatch-to-graph boundary and seed it on resume.
+    last_checkpoint_sequence: Option<(Ulid, u64)>,
     /// Phase 6 M3b: the shared decision store — the SAME `Arc` the memory
     /// system wraps — backing outcome write-back on subtask settlement
     /// (`Decision` records) and the run-scoped Phase-0 retrieval (M3a).
@@ -3936,6 +3889,7 @@ impl CoordinatorAgent {
             environment_manifest: None,
             plan_drift_redispatch: None,
             run_id: None,
+            last_checkpoint_sequence: None,
             memory_decision_store: None,
             memory_task_tree: None,
             last_doc_resolution: None,
@@ -5454,6 +5408,7 @@ impl CoordinatorAgent {
         checkpoint: &mut checkpoint::GraphCheckpoint,
         model_assignments: &HashMap<TaskId, String>,
     ) {
+        self.last_checkpoint_sequence = Some((checkpoint.run_id, checkpoint.sequence_num));
         // ADR-65 §7: stamp the whiteboard cursor at PERSIST time — the log
         // head is the consistent cut this checkpoint is consistent with, so
         // a resume reads only facts appended after it. Fail-soft: without a
@@ -8724,8 +8679,19 @@ impl CoordinatorAgent {
         // revision subtasks get fresh `TaskId`s, so `subtask_attempts` cannot
         // limit them, and `max_total_iterations` defaults to `None`.
         let mut zero_file_revision_queued_roots: HashSet<TaskId> = HashSet::new();
+        // Decision-loop facts and graph execution belong to the same run.
+        // A resumed run keeps both its identity and checkpoint coordinate.
+        let execution_run_id = self
+            .run_id
+            .as_deref()
+            .and_then(|id| id.parse().ok())
+            .unwrap_or_else(concerto_core::ids::new_id);
+        let sequence_num = self
+            .last_checkpoint_sequence
+            .filter(|(run_id, _)| *run_id == execution_run_id)
+            .map_or(0, |(_, sequence)| sequence);
         let mut checkpoint_scope = checkpoint::CheckpointScope {
-            run_id: Ulid::new(),
+            run_id: execution_run_id,
             session_id: task.session_id,
             root_task_id: task.id,
             project_id: context.session.project_id.0.clone(),
@@ -8735,7 +8701,7 @@ impl CoordinatorAgent {
             objective: run_objective,
             objective_hash: run_objective_hash,
             source_revision: self.source_revision.clone(),
-            sequence_num: 0,
+            sequence_num,
         };
         // ADR-65 §3: stamp the run id (matching the checkpoint scope) so
         // every dispatched agent records its tool evidence under this run.
@@ -10076,6 +10042,15 @@ impl CoordinatorAgent {
         // by construction: an unreadable checkpoint simply yields `None`.
         let checkpoint_run_id = Self::checkpoint_run_id_hint(resume_checkpoint_json.as_deref());
 
+        // Reset attribution for a new invocation, or seed it from the restored
+        // checkpoint when no decision-loop re-entry is needed. Fresh/replanned
+        // decision sessions establish their own scope before executing tools.
+        self.run_id = checkpoint_run_id.clone();
+        self.last_checkpoint_sequence = resume_checkpoint_json
+            .as_deref()
+            .and_then(|json| checkpoint::GraphCheckpoint::from_json(json).ok())
+            .map(|checkpoint| (checkpoint.run_id, checkpoint.sequence_num));
+
         // Phase 1: Decompose or restore
         let DecomposeResult {
             graph,
@@ -11381,10 +11356,14 @@ impl CoordinatorAgent {
             pool,
             &session,
             WhiteboardKind::ToolExecuted,
-            VERIFICATION_EVIDENCE_SCAN_LIMIT,
+            VERIFICATION_EVIDENCE_SCAN_LIMIT + 1,
         )
         .await
         {
+            Ok(events) if events.len() > VERIFICATION_EVIDENCE_SCAN_LIMIT => {
+                warn!("C-06 evidence: scan truncated (fail-closed)");
+                return None;
+            }
             Ok(events) => {
                 if let Some(evidence) = tool_fact_verification_evidence(&events, run_id, declared) {
                     return Some(evidence);
@@ -11399,12 +11378,24 @@ impl CoordinatorAgent {
             pool,
             &session,
             WhiteboardKind::Decision,
-            VERIFICATION_EVIDENCE_SCAN_LIMIT,
+            VERIFICATION_EVIDENCE_SCAN_LIMIT + 1,
         )
         .await
         {
+            Ok(events) if events.len() > VERIFICATION_EVIDENCE_SCAN_LIMIT => {
+                warn!("C-06 evidence: scan truncated (fail-closed)");
+                return None;
+            }
             Ok(events) => {
                 for event in events {
+                    if event.agent_id != "coordinator"
+                        || !crate::completion_evidence::matches_run(
+                            event.payload.get("run_id").and_then(serde_json::Value::as_str),
+                            run_id,
+                        )
+                    {
+                        continue;
+                    }
                     let code =
                         event.payload.get("required_output").and_then(serde_json::Value::as_str);
                     let reason = event
@@ -12535,8 +12526,8 @@ impl CoordinatorAgent {
         // scope-creation site — gives every decision session (fresh
         // decompose, evidence re-entry, resume-drive) the id its
         // mid-session `RunInterruptedByUser` and its in-session dispatch
-        // evidence are reported under: `execute_graph` stamps its own id
-        // only at Phase 2, so without this a fresh run stopped during
+        // evidence are reported under. `execute_graph` retains this id at
+        // Phase 2; stamping it here also lets a fresh run stopped during
         // planning would have no run to name.
         self.run_id = Some(scope.run_id.to_string());
         let dispatching = self.orchestration_depth != OrchestrationDepth::PlanningOnly;
@@ -17123,10 +17114,11 @@ impl CoordinatorAgent {
         }
         // ── 3. Record (fail-soft at the seam, but the call succeeded only
         //      when a sink existed).
-        crate::bypass_decision::record_decision_row(
+        crate::bypass_decision::record_scoped_decision_row(
             self.tool_executor.as_deref(),
             self.review_store.as_ref(),
             session_id,
+            self.run_id.as_deref(),
             VERIFICATION_EXEMPT_DECISION_CODE,
             reason,
         )
@@ -23901,28 +23893,32 @@ mod tests {
     /// file — the shape of a real specialist that actually did work (so the
     /// zero-work/vacuous guards stay out of the way of the C-06 assertions).
     fn coder_with_tool_work() -> MockExpertAgent {
+        coder_with_tool_work_for_runs(1)
+    }
+
+    fn coder_with_tool_work_for_runs(count: usize) -> MockExpertAgent {
+        let result = AgentRunResult {
+            task_id: TaskId::new(),
+            role: AgentId::new("coder"),
+            outcome: AgentOutcome::Success,
+            summary: "implemented".to_owned(),
+            files_modified: vec![camino::Utf8PathBuf::from("src/a.rs")],
+            tool_call_count: 1,
+            cost_usd: 0.0,
+            latency_ms: 0,
+            provider: "mock".to_owned(),
+            model: "mock".to_owned(),
+            tokens_in: 0,
+            tokens_out: 0,
+        };
         MockExpertAgent::sequence(
             AgentId::new("coder"),
-            vec![Ok(AgentRunResult {
-                task_id: TaskId::new(),
-                role: AgentId::new("coder"),
-                outcome: AgentOutcome::Success,
-                summary: "implemented".to_owned(),
-                files_modified: vec![camino::Utf8PathBuf::from("src/a.rs")],
-                tool_call_count: 1,
-                cost_usd: 0.0,
-                latency_ms: 0,
-                provider: "mock".to_owned(),
-                model: "mock".to_owned(),
-                tokens_in: 0,
-                tokens_out: 0,
-            })],
+            (0..count).map(|_| Ok(result.clone())).collect(),
         )
     }
 
-    /// Append one `ToolExecuted` fact attributed to `session_id` (no
-    /// `run_id`, so the gate's run filter accepts it), mirroring what a real
-    /// specialist's evidence writer records.
+    /// Append a legacy unscoped fact. It stays inspectable but must never
+    /// satisfy the current run's completion gate.
     async fn append_evidence_tool_fact(
         pool: &sqlx::SqlitePool,
         session_id: Ulid,
@@ -23972,6 +23968,75 @@ mod tests {
         registry
     }
 
+    /// Synthetic specialist that records its execution fact using the actual
+    /// dispatch context. This exercises attribution across both Coordinator
+    /// phases rather than pre-seeding an unscoped success before the run.
+    struct EvidenceCoder {
+        pool: sqlx::SqlitePool,
+        tool: String,
+        args: serde_json::Value,
+    }
+
+    #[async_trait::async_trait]
+    impl concerto_core::traits::agent::ExpertAgent for EvidenceCoder {
+        fn id(&self) -> AgentId {
+            AgentId::new("coder")
+        }
+        fn stage(&self) -> Option<AgentStage> {
+            Some(AgentStage::new(AgentStage::IMPLEMENT))
+        }
+        fn capabilities(&self) -> concerto_core::types::CapabilitySet {
+            concerto_core::types::CapabilitySet::default()
+        }
+        async fn run(
+            &self,
+            task: &SubTask,
+            context: AgentContext,
+            model: &str,
+            cancel: CancellationToken,
+        ) -> Result<AgentRunResult, OrchestratorError> {
+            let run_id = context.run_id.clone();
+            let result = concerto_core::traits::agent::ExpertAgent::run(
+                &coder_with_tool_work(),
+                task,
+                context,
+                model,
+                cancel,
+            )
+            .await?;
+            let event = NewWhiteboardEvent {
+                event_id: Ulid::new().to_string(),
+                agent_id: "coder".into(),
+                kind: WhiteboardKind::ToolExecuted,
+                scope: String::new(),
+                session_id: Some(task.session_id.to_string()),
+                plan_id: None,
+                causation: None,
+                payload: serde_json::json!({
+                    "run_id": run_id, "tool": self.tool, "args": self.args,
+                    "success": true, "outcome": "ok", "exit_code": 0,
+                    "paths": [{"path": "src/a.rs"}],
+                }),
+                pre_image_hash: None,
+                created_at: crate::tool_facts::unix_ms(),
+            };
+            append_whiteboard_event(&self.pool, &event)
+                .await
+                .map_err(|error| OrchestratorError::AgentLoopError(error.to_string()))?;
+            Ok(result)
+        }
+    }
+
+    fn c06_recording_registry(
+        pool: sqlx::SqlitePool,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> AgentRegistry {
+        let mut registry = c06_build_registry();
+        registry.register(Arc::new(EvidenceCoder { pool, tool: tool.into(), args }));
+        registry
+    }
+
     fn c06_build_turns() -> Vec<CoordinatorTurn> {
         vec![
             CoordinatorTurn::Calls(vec![
@@ -23996,13 +24061,18 @@ mod tests {
     /// the run is not downgraded by C-06. A fact attributed to another
     /// session is ignored (sanity for the run/session filter).
     #[tokio::test]
-    async fn c06_mutating_tool_evidence_completes_without_validator() {
+    async fn c06_mutating_tool_evidence_completes_without_validator(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, root) = c06_workspace();
         let (_log_dir, pool) = resume_log_pool().await;
         let bus = EventBus::new(256);
         let mut coordinator = coordinator_with_grounded_turns(
             bus.clone(),
-            Arc::new(c06_build_registry()),
+            Arc::new(c06_recording_registry(
+                pool.clone(),
+                "filesystem",
+                serde_json::json!({ "operation": "move", "path": "src/a.rs" }),
+            )),
             c06_build_turns(),
             &["src/a.rs"],
         )
@@ -24018,24 +24088,12 @@ mod tests {
             &["src/a.rs"],
         )
         .await;
-        // The real fact, attributed to this run's session.
-        append_evidence_tool_fact(
-            &pool,
-            task.session_id,
-            "filesystem",
-            serde_json::json!({ "operation": "move", "path": "src/a.rs" }),
-            true,
-            &["src/a.rs"],
-        )
-        .await;
+        let context_session = task.session_id.to_string();
         let context = AgentContext::new(concerto_core::types::SessionContext::new(
             task.session_id,
             root.clone(),
         ));
-        let output = coordinator
-            .run(task, context, CancellationToken::new(), None)
-            .await
-            .expect("coordinator run should succeed");
+        let output = coordinator.run(task, context, CancellationToken::new(), None).await?;
         assert_eq!(
             output.completion_status,
             concerto_core::types::AgentCompletionStatus::Completed,
@@ -24047,6 +24105,22 @@ mod tests {
             "unexpected C-06 downgrade: {}",
             output.final_message
         );
+
+        let events = concerto_sessions::whiteboard::load_session_events_of_kind(
+            &pool,
+            &context_session,
+            WhiteboardKind::ToolExecuted,
+            20,
+        )
+        .await?;
+        assert!(
+            events.iter().any(|event| {
+                event.payload.get("run_id").and_then(serde_json::Value::as_str)
+                    == coordinator.run_id.as_deref()
+            }),
+            "dispatch and completion must retain the same run id"
+        );
+        Ok(())
     }
 
     /// (c) A run whose only tool attempt FAILED does not complete: a failed
@@ -24096,41 +24170,50 @@ mod tests {
 
     /// (2b) A successful build/test/lint command is verification evidence.
     #[tokio::test]
-    async fn c06_successful_build_command_is_evidence() {
+    async fn c06_successful_build_command_is_evidence() -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, root) = c06_workspace();
         let (_log_dir, pool) = resume_log_pool().await;
         let bus = EventBus::new(256);
         let mut coordinator = coordinator_with_grounded_turns(
             bus.clone(),
-            Arc::new(c06_build_registry()),
+            Arc::new(c06_recording_registry(
+                pool.clone(),
+                "shell",
+                serde_json::json!({ "command": "cargo", "args": ["test"] }),
+            )),
             c06_build_turns(),
             &["src/a.rs"],
         )
         .with_review_store(Some(pool.clone()));
         let task = AgentTask::new(Ulid::new(), "build a main");
-        append_evidence_tool_fact(
-            &pool,
-            task.session_id,
-            "shell",
-            serde_json::json!({ "command": "cargo", "args": ["test"] }),
-            true,
-            &[],
-        )
-        .await;
+        let context_session = task.session_id.to_string();
         let context = AgentContext::new(concerto_core::types::SessionContext::new(
             task.session_id,
             root.clone(),
         ));
-        let output = coordinator
-            .run(task, context, CancellationToken::new(), None)
-            .await
-            .expect("coordinator run should succeed");
+        let output = coordinator.run(task, context, CancellationToken::new(), None).await?;
         assert_eq!(
             output.completion_status,
             concerto_core::types::AgentCompletionStatus::Completed,
             "a successful build/test command must satisfy the gate: {}",
             output.final_message
         );
+
+        let events = concerto_sessions::whiteboard::load_session_events_of_kind(
+            &pool,
+            &context_session,
+            WhiteboardKind::ToolExecuted,
+            20,
+        )
+        .await?;
+        assert!(
+            events.iter().any(|event| {
+                event.payload.get("run_id").and_then(serde_json::Value::as_str)
+                    == coordinator.run_id.as_deref()
+            }),
+            "dispatch and completion must retain the same run id"
+        );
+        Ok(())
     }
 
     /// (d) A recorded coordinator declaration completes the run and the
@@ -24201,7 +24284,7 @@ mod tests {
             &serde_json::json!({ "command": "cargo", "args": ["test"] })
         ));
         assert!(is_build_or_test_command(&serde_json::json!({ "command": "cargo test" })));
-        assert!(is_build_or_test_command(&serde_json::json!({ "command": "make" })));
+        assert!(is_build_or_test_command(&serde_json::json!({ "command": "make test" })));
         assert!(is_build_or_test_command(&serde_json::json!({ "command": "pytest" })));
         assert!(is_build_or_test_command(
             &serde_json::json!({ "command": "npm", "args": ["test"] })
@@ -24214,6 +24297,78 @@ mod tests {
         ));
         assert!(!is_build_or_test_command(&serde_json::json!({ "command": "ls" })));
         assert!(!is_build_or_test_command(&serde_json::json!({})));
+    }
+
+    #[tokio::test]
+    async fn c06_legacy_success_cannot_complete_a_new_run() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_dir, root) = c06_workspace();
+        let (_log_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let mut coordinator = coordinator_with_grounded_turns(
+            bus,
+            Arc::new(c06_build_registry()),
+            c06_build_turns(),
+            &["src/a.rs"],
+        )
+        .with_review_store(Some(pool.clone()));
+        let task = AgentTask::new(Ulid::new(), "build a main");
+        append_evidence_tool_fact(
+            &pool,
+            task.session_id,
+            "shell",
+            serde_json::json!({"command": "cargo test"}),
+            true,
+            &[],
+        )
+        .await;
+        let context =
+            AgentContext::new(concerto_core::types::SessionContext::new(task.session_id, root));
+        let output = coordinator.run(task, context, CancellationToken::new(), None).await?;
+        assert_eq!(output.completion_status, concerto_core::types::AgentCompletionStatus::Partial);
+        assert!(output.final_message.contains("Acceptance gate C-06"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn c06_exemption_does_not_leak_into_the_next_run(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (_dir, root) = c06_workspace();
+        let (_log_dir, pool) = resume_log_pool().await;
+        let bus = EventBus::new(256);
+        let turns = vec![
+            CoordinatorTurn::Calls(vec![ToolCall {
+                id: "exempt-first".into(),
+                name: DECLARE_VERIFICATION_EXEMPT_TOOL.into(),
+                arguments: serde_json::json!({"reason": "mechanical rename"}),
+                ..Default::default()
+            }]),
+            CoordinatorTurn::Calls(vec![call_specialist("coder", "implement")]),
+            CoordinatorTurn::Text("first done".into()),
+            CoordinatorTurn::Calls(vec![call_specialist("coder", "implement again")]),
+            CoordinatorTurn::Text("second done".into()),
+        ];
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![coder_with_tool_work_for_runs(2)]));
+        let mut coordinator =
+            coordinator_with_turns(bus, registry, turns).with_review_store(Some(pool.clone()));
+        let session = Ulid::new();
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(session, root));
+        let first = coordinator
+            .run(AgentTask::new(session, "first"), context.clone(), CancellationToken::new(), None)
+            .await?;
+        assert_eq!(first.completion_status, concerto_core::types::AgentCompletionStatus::Completed);
+        let first_run_id = coordinator.run_id.clone();
+        let second = coordinator
+            .run(AgentTask::new(session, "second"), context, CancellationToken::new(), None)
+            .await?;
+        assert_ne!(coordinator.run_id, first_run_id);
+        assert_eq!(second.completion_status, concerto_core::types::AgentCompletionStatus::Partial);
+        assert!(
+            second.final_message.contains("Acceptance gate C-06"),
+            "the second run must reach acceptance: {}",
+            second.final_message
+        );
+        Ok(())
     }
 
     #[test]
@@ -31749,6 +31904,32 @@ mod tests {
             .await
             .expect("execute_graph returns");
         output
+    }
+
+    #[tokio::test]
+    async fn graph_execution_retains_restored_run_attribution() {
+        let bus = EventBus::new(256);
+        let registry = Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+            AgentId::new("reviewer"),
+            "approved",
+        )]));
+        let mut coordinator = coordinator_with_turns(bus, registry, Vec::new());
+        let session = Ulid::new();
+        let restored_id = Ulid::new();
+        let restored_run = restored_id.to_string();
+        coordinator.run_id = Some(restored_run.clone());
+        coordinator.last_checkpoint_sequence = Some((restored_id, 41));
+        let graph = graph_with_status(session, "reviewer", SubTaskStatus::Completed);
+        let output =
+            run_action_required_graph_for_test(&mut coordinator, session, graph, Vec::new()).await;
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed
+        );
+        assert_eq!(coordinator.run_id.as_deref(), Some(restored_run.as_str()));
+        assert!(coordinator.last_checkpoint_sequence.is_some_and(|(run_id, sequence)| {
+            run_id.to_string() == restored_run && sequence > 41
+        }));
     }
 
     /// Whether a completion-guard Decision with `reason` landed on the log.
