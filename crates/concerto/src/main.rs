@@ -123,7 +123,7 @@ DEFAULT BEHAVIOR:
 
 CLI SUBCOMMANDS:
     concerto --cli projects <list|current|use>
-    concerto --cli sessions <list|show|events|resume>
+    concerto --cli sessions <list|show|events|runtime|resume|prune>
     concerto --cli providers list
     concerto --cli logs <path|show>
     concerto --cli config <show|get|keys|set|unset|path|init|doctor|help>

@@ -21,6 +21,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Screen::ToolLog => draw_tool_log_screen(frame, app),
         Screen::AgentAssignments => draw_agent_assignments_screen(frame, app),
         Screen::DiffReview => draw_diff_review_screen(frame, app),
+        Screen::RuntimeInspector => draw_runtime_inspector(frame, app),
     }
     if let Some(prompt) = app.approval_prompt() {
         draw_approval_modal(frame, frame.area(), &prompt, &app.cli_theme);
@@ -29,6 +30,23 @@ pub fn draw(frame: &mut Frame, app: &App) {
     } else if let Some(plan) = app.plan_prompt() {
         draw_plan_modal(frame, frame.area(), &plan, app.plan_scroll, &app.cli_theme);
     }
+}
+
+fn draw_runtime_inspector(frame: &mut Frame, app: &App) {
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(2)])
+        .split(frame.area());
+    let block = Block::default().borders(Borders::ALL).title("Runtime inspector");
+    let body = Paragraph::new(app.runtime_inspector.text.as_str())
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((app.runtime_inspector.scroll, 0));
+    frame.render_widget(body, areas[0]);
+    let help = Paragraph::new("r refresh | Esc back | j/k scroll | PgUp/PgDn | Home")
+        .style(Style::default().fg(app.cli_theme.muted))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(help, areas[1]);
 }
 
 // ---------------------------------------------------------------------------
@@ -76,7 +94,7 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
         app.input.clone()
     } else {
         String::from(
-            "[Esc] edit | [s] settings | [l] sessions | [t] log | [d] diff | [n] new | [p] project | [q] quit",
+            "[Esc] edit | [s] settings | [l] sessions | [t] log | [d] diff | [i] runtime | [n] new | [p] project | [q] quit",
         )
     };
     let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
@@ -1441,6 +1459,28 @@ mod tests {
 
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
         terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect()
+    }
+
+    #[test]
+    fn runtime_inspector_renders_and_scrolls_at_supported_terminal_sizes() {
+        for (width, height) in [(24, 8), (40, 12), (80, 24), (120, 40)] {
+            let mut app = App::new();
+            app.screen = Screen::RuntimeInspector;
+            app.runtime_inspector.text =
+                "Saved checkpoint\nDecision journal\nWorld model\nFailure diagnoses\nSuitability"
+                    .into();
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| super::draw(frame, &app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(text.contains("Runtime inspector"), "{width}x{height}: {text}");
+            assert!(text.contains("Saved checkpoint"));
+            assert!(text.contains("r refresh"));
+            app.runtime_inspector.scroll = 2;
+            terminal.draw(|frame| super::draw(frame, &app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(!text.contains("Saved checkpoint"));
+            assert!(text.contains("World model"));
+        }
     }
 
     /// Review screen showing one staged file with a two-line change.

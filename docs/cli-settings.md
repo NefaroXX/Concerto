@@ -133,6 +133,39 @@ Choose a shell profile ID from `shell list`; detected IDs depend on the host.
 CLI runs build a fresh plugin manager. Restart Desktop after changing installed
 plugin files through these commands; its runtime manager is retained across runs.
 
+## Runtime inspection
+
+```sh
+concerto sessions list
+concerto sessions runtime SESSION_ID
+concerto sessions runtime SESSION_ID --json
+concerto sessions runtime SESSION_ID --view decisions --limit 20
+concerto sessions runtime SESSION_ID --view world --json
+concerto sessions runtime SESSION_ID --view diagnoses
+concerto sessions runtime SESSION_ID --view suitability
+```
+
+The TUI opens the same four inspection panels with **Esc, then i** for the
+active session. Use `r` to refresh, arrows or `j/k` to scroll, Page Up/Down to
+page, Home to return to the top, and Esc to return to chat.
+
+Both frontends use the shared checkpoint projection and suitability ranking.
+This shows **persisted checkpoint data**, not live Coordinator state; completed
+or cleared checkpoints may have no inspection data. It does not pause, resume,
+dispatch, or modify a run. Command mode can inspect alongside a running frontend:
+its database connection is read-only and performs no initialization, migrations,
+retention, recovery, or encryption setup. Pending encryption setup must be
+completed by normal application startup; existing keys are required.
+
+`--view` accepts `all` (default), `decisions`, `world`, `diagnoses`, or
+`suitability`. `--limit` is 1–1000 (default 50), applied to each history newest
+first and to agents per suitability class best first. The world model is kept
+complete. JSON includes `schema_version`, `session_id`, `source`, `empty`,
+`limit`, unfiltered `totals`, and the requested `data` sections. Unknown sessions,
+unavailable storage, and invalid checkpoints exit nonzero; an existing session
+without a checkpoint returns an empty report. Inspection needs no provider or
+setup wizard. Evidence references remain intact in the output.
+
 ## Appearance
 
 ```sh
