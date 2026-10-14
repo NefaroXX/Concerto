@@ -213,6 +213,7 @@ mod tests {
     /// plus a tool list and a forced tool choice.
     fn fixture_request() -> CompletionRequest {
         CompletionRequest {
+            stable_system_prefix_bytes: None,
             model: String::new(),
             messages: vec![
                 Message {
@@ -460,6 +461,7 @@ mod tests {
     #[test]
     fn golden_serialized_body_system_and_user() {
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             messages: vec![
                 Message {
                     role: Role::System,
@@ -574,6 +576,7 @@ mod tests {
     #[test]
     fn multiple_tool_results_flatten_to_first_result_only() {
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             messages: vec![Message {
                 role: Role::Tool,
                 content: String::new(),
@@ -626,6 +629,7 @@ mod tests {
     #[test]
     fn tool_message_without_results_keeps_content_and_no_call_id() {
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             messages: vec![Message {
                 role: Role::Tool,
                 content: "plain tool output".into(),
@@ -662,6 +666,7 @@ mod tests {
     #[test]
     fn multiple_system_messages_are_all_kept_in_order() {
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             messages: vec![
                 Message {
                     role: Role::System,

@@ -587,13 +587,25 @@ impl App {
                         None => match DesktopSessionHandler::connect_with_config(&app_config).await
                         {
                             Ok(h) => Arc::new(h),
-                            Err(_) => return Vec::new(),
+                            Err(_) => return (Vec::new(), None),
                         },
                     }
                 };
-                handler.list_spend_records(session_id).await.unwrap_or_default()
+                let records = handler.list_spend_records(session_id).await.unwrap_or_default();
+                let mut cache_report =
+                    handler.load_events(session_id).await.ok().and_then(|events| {
+                        concerto_sessions::cache::CacheReport::from_events(session_id, &events).ok()
+                    });
+                if !app_config.cache_pricing.is_empty() {
+                    if let Some(report) = &mut cache_report {
+                        report.reprice(&app_config.cache_pricing);
+                    }
+                }
+                (records, cache_report.map(Box::new))
             },
-            |records| Message::Chat(views::chat::Message::SpendLogsLoaded(records)),
+            |(records, cache_report)| {
+                Message::Chat(views::chat::Message::SpendLogsLoaded(records, cache_report))
+            },
         )
     }
 

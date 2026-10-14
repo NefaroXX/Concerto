@@ -51,6 +51,7 @@ fn build_request(n: usize, tool_calls: bool) -> CompletionRequest {
         })
         .collect();
     CompletionRequest {
+        stable_system_prefix_bytes: None,
         model: "gpt-4o".into(),
         messages,
         tools: None,

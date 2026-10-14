@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::PathBuf;
@@ -10,6 +11,7 @@ use ratatui::text::{Line, Span};
 use crate::approval::{
     ApprovalPrompt, CliApprovalSink, CliApprovalState, IntentPrompt, PlanPrompt,
 };
+use crate::dispatch::runtime::RuntimeInspector;
 use crate::theme::CliTheme;
 use crate::ui::{self, chat_line_with_theme, ChatRole};
 use concerto_api_types::diff::DiffResult;
@@ -141,6 +143,8 @@ pub enum Screen {
     AgentAssignments,
     /// Staged unified-diff review (P02): accept/reject each staged file.
     DiffReview,
+    /// Read-only persisted Coordinator state, shared with Desktop.
+    RuntimeInspector,
 }
 
 /// Outcome of a per-file review decision on the staged-diff screen.
@@ -447,7 +451,15 @@ pub struct App {
     /// active and is cleared once the full text is shown.
     reveal: Option<RevealState>,
     pub input: String,
+    /// None follows the end; explicit positions are UTF-8 byte boundaries.
+    pub(crate) input_cursor: Option<usize>,
+    project_draft: Option<(String, Option<usize>)>,
+    pub(crate) command_menu: Option<usize>,
+    /// Absolute transcript row while browsing; live mode follows the bottom.
     pub scroll: u16,
+    pub(crate) follow_chat: bool,
+    pub(crate) chat_max_scroll: Cell<u16>,
+    pub(crate) tool_log_index: usize,
     /// Vertical scroll offset of the plan-approval modal's plan body (ADR-55
     /// §4). The stored plan can be up to 16 KiB, far larger than the
     /// modal, so j/k / arrow keys page through it.
@@ -529,6 +541,7 @@ pub struct App {
     pub(crate) vfs: Arc<Mutex<VirtualFs>>,
     /// Staged unified-diff review screen state (P02).
     pub(crate) diff_review: DiffReviewState,
+    pub(crate) runtime_inspector: RuntimeInspector,
 }
 
 impl Default for App {
@@ -548,13 +561,19 @@ impl App {
                 let mut initial = startup_signature_lines(styling_enabled());
                 initial.push(Line::from("Concerto CLI — type a message and press Enter"));
                 initial.push(Line::from(
-                    "Esc: commands/settings  [l] sessions  [t] log  [d] diff  [n] new  [p] project  Ctrl+C: cancel or quit",
+                    "Esc: commands/settings  [l] sessions  [t] log  [d] diff  [i] runtime  [n] new  [p] project  Ctrl+C: cancel or quit",
                 ));
                 initial
             },
             reveal: None,
             input: String::new(),
+            input_cursor: None,
+            project_draft: None,
+            command_menu: None,
             scroll: 0,
+            follow_chat: true,
+            chat_max_scroll: Cell::new(0),
+            tool_log_index: 0,
             plan_scroll: 0,
             input_mode: true,
             screen: Screen::Chat,
@@ -595,6 +614,7 @@ impl App {
             cli_theme: CliTheme::by_name("Midnight"),
             vfs: Arc::new(Mutex::new(VirtualFs::new())),
             diff_review: DiffReviewState::default(),
+            runtime_inspector: RuntimeInspector::default(),
         }
     }
 
@@ -718,6 +738,8 @@ impl App {
         // Reset session state.
         self.session_id = None;
         self.messages.clear();
+        self.follow_chat = true;
+        self.scroll = 0;
         self.push_line(Line::from(format!("Switched to project: {}", canonical.display())));
 
         // Staged overlay entries are project-scoped: a fresh project starts
@@ -898,7 +920,11 @@ impl App {
         terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
         rt: &tokio::runtime::Runtime,
     ) -> anyhow::Result<()> {
-        crossterm::execute!(io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+        crossterm::execute!(
+            io::stdout(),
+            crossterm::terminal::EnterAlternateScreen,
+            event::EnableBracketedPaste
+        )?;
         crossterm::terminal::enable_raw_mode()?;
 
         let (event_tx, event_rx) = std::sync::mpsc::channel::<UiLine>();
@@ -974,7 +1000,11 @@ impl App {
             prev.cancel.cancel();
         }
         crossterm::terminal::disable_raw_mode()?;
-        crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen)?;
+        crossterm::execute!(
+            io::stdout(),
+            event::DisableBracketedPaste,
+            crossterm::terminal::LeaveAlternateScreen
+        )?;
         result
     }
 
@@ -1082,6 +1112,7 @@ impl App {
                 self.sync_terminal_title();
             }
 
+            self.runtime_inspector.poll(self.session_id);
             terminal.draw(|frame| ui::draw(frame, self))?;
             // While a reveal is animating, poll at the typewriter cadence so
             // each tick can redraw a longer prefix; idle stays at the original
@@ -1230,6 +1261,8 @@ impl App {
                 self.session_id = Some(session.session_id);
                 self.approval_sink.set_auto_approve(false);
                 self.messages.clear();
+                self.follow_chat = true;
+                self.scroll = 0;
                 self.push_line(Line::from(format!(
                     "New session {} — {}",
                     session.session_id,
@@ -1477,6 +1510,20 @@ impl App {
     }
 
     pub(crate) fn handle_key(&mut self, event: Event) -> Action {
+        if let Event::Paste(text) = event {
+            if self.screen == Screen::Chat
+                && (self.input_mode || self.project_picker_mode)
+                && self.command_menu.is_none()
+                && !self.is_awaiting_approval()
+            {
+                let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                let text: String =
+                    text.chars().filter(|c| !c.is_control() || *c == '\n' || *c == '\t').collect();
+                let text = text.replace('\t', "    ");
+                self.insert_input(&text);
+            }
+            return Action::None;
+        }
         let Event::Key(key) = event else { return Action::None };
         if key.kind != KeyEventKind::Press {
             return Action::None;
@@ -1561,6 +1608,67 @@ impl App {
             return if self.running { Action::Cancel } else { Action::Quit };
         }
 
+        if self.screen == Screen::Chat && !self.project_picker_mode {
+            if key.code == KeyCode::F(1)
+                || (key.code == KeyCode::Char('p')
+                    && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL))
+                || (key.code == KeyCode::Char('?') && !self.input_mode)
+            {
+                self.command_menu = if self.command_menu.is_some() { None } else { Some(0) };
+                return Action::None;
+            }
+            if let Some(selected) = self.command_menu {
+                let choice = match key.code {
+                    KeyCode::Enter => Some(selected),
+                    KeyCode::Char(c) => {
+                        ui::CHAT_COMMANDS.iter().position(|(shortcut, _)| *shortcut == c)
+                    }
+                    _ => None,
+                };
+                if let Some(choice) = choice {
+                    let shortcut = ui::CHAT_COMMANDS[choice].0;
+                    if shortcut == 'n' && self.running {
+                        return Action::None;
+                    }
+                    self.command_menu = None;
+                    let editing = self.input_mode;
+                    self.input_mode = false;
+                    let action = self.handle_chat_key(KeyCode::Char(shortcut));
+                    self.input_mode = editing;
+                    return action;
+                }
+                match key.code {
+                    KeyCode::Esc => self.command_menu = None,
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.command_menu = Some(selected.saturating_sub(1));
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.command_menu = Some((selected + 1).min(ui::CHAT_COMMANDS.len() - 1));
+                    }
+                    _ => {}
+                }
+                return Action::None;
+            }
+        }
+
+        if self.screen == Screen::Chat && (self.input_mode || self.project_picker_mode) {
+            let newline = (key.code == KeyCode::Char('j')
+                && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL))
+                || (key.code == KeyCode::Enter && !key.modifiers.is_empty());
+            if newline && !self.project_picker_mode {
+                self.insert_input("\n");
+                return Action::None;
+            }
+            if key.modifiers.intersects(
+                crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT,
+            ) {
+                return Action::None;
+            }
+            if self.edit_input(key.code) {
+                return Action::None;
+            }
+        }
+
         match self.screen {
             Screen::Chat => self.handle_chat_key(key.code),
             Screen::Settings => self.handle_settings_key(key.code),
@@ -1568,6 +1676,7 @@ impl App {
             Screen::ToolLog => self.handle_tool_log_key(key.code),
             Screen::AgentAssignments => self.handle_agent_assignments_key(key.code),
             Screen::DiffReview => self.handle_diff_review_key(key.code),
+            Screen::RuntimeInspector => self.handle_runtime_key(key.code),
         }
     }
 
@@ -1589,16 +1698,71 @@ impl App {
         }
     }
 
+    pub(crate) fn cursor_offset(&self) -> usize {
+        let mut cursor = self.input_cursor.unwrap_or(self.input.len()).min(self.input.len());
+        while !self.input.is_char_boundary(cursor) {
+            cursor = cursor.saturating_sub(1);
+        }
+        cursor
+    }
+
+    fn insert_input(&mut self, text: &str) {
+        let cursor = self.cursor_offset();
+        self.input.insert_str(cursor, text);
+        self.input_cursor = Some(cursor + text.len());
+    }
+
+    fn edit_input(&mut self, key: KeyCode) -> bool {
+        let cursor = self.cursor_offset();
+        let previous = self.input[..cursor].char_indices().last().map(|(i, _)| i).unwrap_or(0);
+        let next =
+            self.input[cursor..].chars().next().map(|c| cursor + c.len_utf8()).unwrap_or(cursor);
+        match key {
+            KeyCode::Char(c) if !c.is_control() => self.insert_input(&c.to_string()),
+            KeyCode::Left => self.input_cursor = Some(previous),
+            KeyCode::Right => self.input_cursor = Some(next),
+            KeyCode::Home => {
+                self.input_cursor =
+                    Some(self.input[..cursor].rfind('\n').map(|i| i + 1).unwrap_or(0));
+            }
+            KeyCode::End => {
+                self.input_cursor = Some(
+                    self.input[cursor..].find('\n').map(|i| cursor + i).unwrap_or(self.input.len()),
+                );
+            }
+            KeyCode::Backspace => {
+                self.input.replace_range(previous..cursor, "");
+                self.input_cursor = Some(previous);
+            }
+            KeyCode::Delete => {
+                self.input.replace_range(cursor..next, "");
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn scroll_chat(&mut self, delta: i16) {
+        let max = self.chat_max_scroll.get();
+        let current = if self.follow_chat { max } else { self.scroll.min(max) };
+        self.scroll = current.saturating_add_signed(delta).min(max);
+        self.follow_chat = delta > 0 && self.scroll == max;
+    }
+
     fn handle_chat_key(&mut self, key: KeyCode) -> Action {
         // Project picker mode takes over normal input.
         if self.project_picker_mode {
             match key {
                 KeyCode::Esc => {
                     self.project_picker_mode = false;
-                    self.input.clear();
+                    let (draft, cursor) = self.project_draft.take().unwrap_or_default();
+                    self.input = draft;
+                    self.input_cursor = cursor;
                 }
                 KeyCode::Enter => {
                     let path = std::mem::take(&mut self.input);
+                    self.input_cursor = None;
+                    self.project_draft = None;
                     self.project_picker_mode = false;
                     if !path.trim().is_empty() {
                         let new_dir = PathBuf::from(path.trim());
@@ -1619,7 +1783,9 @@ impl App {
             KeyCode::Esc => self.input_mode = !self.input_mode,
             KeyCode::Enter if self.input_mode && !self.running => {
                 let input = std::mem::take(&mut self.input);
+                self.input_cursor = None;
                 if !input.trim().is_empty() {
+                    self.follow_chat = true;
                     return Action::Dispatch(input);
                 }
             }
@@ -1637,20 +1803,33 @@ impl App {
                 self.load_sessions();
             }
             KeyCode::Char('t') if !self.input_mode => {
+                self.tool_log_index = 0;
                 self.screen = Screen::ToolLog;
             }
             KeyCode::Char('d') if !self.input_mode => {
                 self.refresh_diff_review();
                 self.screen = Screen::DiffReview;
             }
+            KeyCode::Char('i') if !self.input_mode => {
+                self.refresh_runtime_inspector();
+                self.screen = Screen::RuntimeInspector;
+            }
             KeyCode::Char('n') if !self.input_mode => return Action::NewSession,
             KeyCode::Char('p') if !self.input_mode => {
                 self.project_picker_mode = true;
-                self.input.clear();
+                self.project_draft = Some((std::mem::take(&mut self.input), self.input_cursor));
+                self.input_cursor = None;
             }
             KeyCode::Char('q') if !self.input_mode => return Action::Quit,
-            KeyCode::Up if !self.input_mode => self.scroll = self.scroll.saturating_add(1),
-            KeyCode::Down if !self.input_mode => self.scroll = self.scroll.saturating_sub(1),
+            KeyCode::Up | KeyCode::Char('k') if !self.input_mode => self.scroll_chat(-1),
+            KeyCode::Down | KeyCode::Char('j') if !self.input_mode => self.scroll_chat(1),
+            KeyCode::PageUp => self.scroll_chat(-10),
+            KeyCode::PageDown => self.scroll_chat(10),
+            KeyCode::Home if !self.input_mode => {
+                self.follow_chat = false;
+                self.scroll = 0;
+            }
+            KeyCode::End if !self.input_mode => self.follow_chat = true,
             _ => {}
         }
         Action::None
@@ -1770,10 +1949,49 @@ impl App {
         Action::None
     }
 
+    fn refresh_runtime_inspector(&mut self) {
+        let store = self.session_manager.as_ref().map(|manager| manager.store());
+        self.runtime_inspector.load(self.session_id, store);
+    }
+
+    fn handle_runtime_key(&mut self, key: KeyCode) -> Action {
+        match key {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.runtime_inspector = RuntimeInspector::default();
+                self.screen = Screen::Chat;
+            }
+            KeyCode::Char('r') => self.refresh_runtime_inspector(),
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.runtime_inspector.scroll = self.runtime_inspector.scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.runtime_inspector.scroll = self.runtime_inspector.scroll.saturating_add(1);
+            }
+            KeyCode::PageUp => {
+                self.runtime_inspector.scroll = self.runtime_inspector.scroll.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                self.runtime_inspector.scroll = self.runtime_inspector.scroll.saturating_add(10);
+            }
+            KeyCode::Home => self.runtime_inspector.scroll = 0,
+            _ => {}
+        }
+        Action::None
+    }
+
     fn handle_tool_log_key(&mut self, key: KeyCode) -> Action {
         match key {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('t') => self.screen = Screen::Chat,
             KeyCode::Char('c') => self.clear_tool_log(),
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.tool_log_index = self.tool_log_index.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.tool_log_index =
+                    (self.tool_log_index + 1).min(self.tool_log.len().saturating_sub(1));
+            }
+            KeyCode::Home => self.tool_log_index = 0,
+            KeyCode::End => self.tool_log_index = self.tool_log.len().saturating_sub(1),
             _ => {}
         }
         Action::None
@@ -1973,6 +2191,8 @@ impl App {
                 Err(_) => return,
             };
         self.messages.clear();
+        self.follow_chat = true;
+        self.scroll = 0;
         self.push_line(Line::from(format!("Resumed session {session_id}")));
         let styling = styling_enabled();
         let theme = self.cli_theme;
@@ -2857,6 +3077,7 @@ impl App {
 
     pub fn clear_tool_log(&mut self) {
         self.tool_log.clear();
+        self.tool_log_index = 0;
     }
 }
 
@@ -3494,27 +3715,81 @@ mod tests {
     }
 
     #[test]
-    fn command_mode_up_increases_scroll() {
+    fn command_mode_up_browses_older_rows_from_live_position() {
         let mut app = App::new();
+        app.chat_max_scroll.set(10);
         app.handle_key(key_event(KeyCode::Esc, KeyModifiers::empty()));
-        assert_eq!(app.scroll, 0);
         app.handle_key(key_event(KeyCode::Up, KeyModifiers::empty()));
-        assert_eq!(app.scroll, 1);
+        assert_eq!(app.scroll, 9);
+        assert!(!app.follow_chat);
         app.handle_key(key_event(KeyCode::Up, KeyModifiers::empty()));
-        assert_eq!(app.scroll, 2);
+        assert_eq!(app.scroll, 8);
     }
 
     #[test]
-    fn command_mode_down_decreases_scroll_from_floor() {
+    fn command_mode_down_returns_to_live_at_the_bottom() {
         let mut app = App::new();
         app.scroll = 3;
+        app.follow_chat = false;
+        app.chat_max_scroll.set(4);
         app.handle_key(key_event(KeyCode::Esc, KeyModifiers::empty()));
         app.handle_key(key_event(KeyCode::Down, KeyModifiers::empty()));
-        assert_eq!(app.scroll, 2);
-        // Scrolling below 0 should saturate at 0.
-        app.scroll = 0;
+        assert_eq!(app.scroll, 4);
+        assert!(app.follow_chat);
         app.handle_key(key_event(KeyCode::Down, KeyModifiers::empty()));
-        assert_eq!(app.scroll, 0);
+        assert_eq!(app.scroll, 4);
+    }
+
+    #[test]
+    fn unicode_input_can_be_edited_in_the_middle_and_pasted_without_sending() {
+        let mut app = App::new();
+        app.handle_key(Event::Paste("hé界".into()));
+        app.handle_key(key_event(KeyCode::Left, KeyModifiers::empty()));
+        app.handle_key(key_event(KeyCode::Backspace, KeyModifiers::empty()));
+        app.handle_key(key_event(KeyCode::Char('i'), KeyModifiers::empty()));
+        assert_eq!(app.input, "hi界");
+        app.handle_key(key_event(KeyCode::Delete, KeyModifiers::empty()));
+        assert_eq!(app.input, "hi");
+        assert!(matches!(
+            app.handle_key(Event::Paste("\r\nnext\rline\t\u{7}".into())),
+            Action::None
+        ));
+        assert_eq!(app.input, "hi\nnext\nline    ");
+        app.handle_key(key_event(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        assert!(app.input.ends_with('\n'));
+        assert!(!app.running);
+    }
+
+    #[test]
+    fn command_menu_and_cancelled_project_picker_keep_the_draft() {
+        let mut app = App::new();
+        app.input = "unfinished question".into();
+        app.handle_key(key_event(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(app.command_menu, Some(0));
+        app.handle_key(Event::Paste("must not replace draft".into()));
+        app.handle_key(key_event(KeyCode::Enter, KeyModifiers::empty()));
+        assert_eq!(app.screen, Screen::Settings);
+        app.handle_key(key_event(KeyCode::Esc, KeyModifiers::empty()));
+        assert_eq!(app.input, "unfinished question");
+        app.handle_key(key_event(KeyCode::Esc, KeyModifiers::empty()));
+        app.handle_key(key_event(KeyCode::Char('p'), KeyModifiers::empty()));
+        app.handle_key(Event::Paste("/another/project".into()));
+        app.handle_key(key_event(KeyCode::Esc, KeyModifiers::empty()));
+        assert_eq!(app.input, "unfinished question");
+        assert!(!app.project_picker_mode);
+    }
+
+    /// Regression for the TUI-UX/runtime merge: the Runtime screen stays
+    /// reachable through the F1 command menu via its `i` shortcut, not only
+    /// as a bare browse-mode key.
+    #[test]
+    fn command_menu_shortcut_opens_runtime_inspector() {
+        let mut app = App::new();
+        app.handle_key(key_event(KeyCode::F(1), KeyModifiers::empty()));
+        assert!(app.command_menu.is_some());
+        app.handle_key(key_event(KeyCode::Char('i'), KeyModifiers::empty()));
+        assert!(app.command_menu.is_none());
+        assert_eq!(app.screen, Screen::RuntimeInspector);
     }
 
     // ------------------------------------------------------------------
@@ -3772,6 +4047,21 @@ mod tests {
             )
             .await
         })
+    }
+
+    #[tokio::test]
+    async fn pending_intent_blocks_paste_and_command_menu_shortcuts() {
+        let mut app = App::new();
+        app.input = "draft".into();
+        let handle = spawn_intent(&mut app, &[RequestedOutcome::Execute]);
+        wait_for_intent(&app.approval_state).await;
+        app.handle_key(Event::Paste("y\n".into()));
+        app.handle_key(key_event(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(app.input, "draft");
+        assert!(app.command_menu.is_none());
+        assert!(app.intent_prompt().is_some());
+        app.handle_key(key_event(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(handle.await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -4244,6 +4534,21 @@ mod tests {
     // ------------------------------------------------------------------
     // Staged unified-diff review (P02)
     // ------------------------------------------------------------------
+
+    #[test]
+    fn runtime_inspector_opens_scrolls_refreshes_and_closes() {
+        let mut app = App::new();
+        app.handle_key(key_event(KeyCode::Esc, KeyModifiers::empty()));
+        app.handle_key(key_event(KeyCode::Char('i'), KeyModifiers::empty()));
+        assert_eq!(app.screen, Screen::RuntimeInspector);
+        assert!(app.runtime_inspector.text.contains("No active session"));
+        app.handle_key(key_event(KeyCode::PageDown, KeyModifiers::empty()));
+        assert_eq!(app.runtime_inspector.scroll, 10);
+        app.handle_key(key_event(KeyCode::Char('r'), KeyModifiers::empty()));
+        assert_eq!(app.runtime_inspector.scroll, 0);
+        app.handle_key(key_event(KeyCode::Esc, KeyModifiers::empty()));
+        assert_eq!(app.screen, Screen::Chat);
+    }
 
     /// Stage one file in the overlay — `read_disk` registers the on-disk
     /// baseline, then `write` stages the proposal (the same overlay sequence

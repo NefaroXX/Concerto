@@ -63,6 +63,7 @@ mod tests {
 
     fn streamed_request() -> CompletionRequest {
         CompletionRequest {
+            stable_system_prefix_bytes: None,
             messages: vec![Message {
                 role: Role::User,
                 content: "Hello".into(),
@@ -117,7 +118,11 @@ mod tests {
         });
         assert_eq!(
             map_usage(&payload),
-            Some(CompletionUsage { prompt_tokens: Some(120), completion_tokens: Some(34) })
+            Some(CompletionUsage {
+                prompt_tokens: Some(120),
+                completion_tokens: Some(34),
+                ..CompletionUsage::default()
+            })
         );
     }
 

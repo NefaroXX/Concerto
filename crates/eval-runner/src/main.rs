@@ -16,6 +16,7 @@ use concerto_eval::EvalRunner;
 use concerto_orchestrator::agent_loop::AgentLoop;
 use concerto_orchestrator::prompts::PromptBuilder;
 use concerto_providers::factory::ProviderFactory;
+use concerto_sessions::SessionStore;
 use concerto_tools::filesystem::FilesystemTool;
 use concerto_tools::shell::ShellTool;
 use std::sync::Arc;
@@ -27,6 +28,10 @@ async fn main() {
     let mut baseline_path: Option<PathBuf> = None;
     let mut config_path: Option<PathBuf> = None;
     let mut category: Option<String> = None;
+    let mut variant: Option<String> = None;
+    let mut preparation: Option<String> = None;
+    let mut pricing_fingerprint: Option<String> = None;
+    let agent_driven = env::args().any(|arg| arg.starts_with("--config="));
 
     for arg in env::args().skip(1) {
         if let Some(val) = arg.strip_prefix("--suite=") {
@@ -35,6 +40,10 @@ async fn main() {
             baseline_path = Some(PathBuf::from(val));
         } else if let Some(val) = arg.strip_prefix("--config=") {
             config_path = Some(PathBuf::from(val));
+        } else if let Some(val) = arg.strip_prefix("--variant=") {
+            variant = Some(val.to_string());
+        } else if let Some(val) = arg.strip_prefix("--cache-preparation=") {
+            preparation = Some(val.to_string());
         } else if let Some(val) = arg.strip_prefix("--category=") {
             category = Some(val.to_string());
         }
@@ -74,21 +83,50 @@ async fn main() {
         // Build the config-driven agent factory: the provider is built per
         // task from the config's primary provider (no provider configured is
         // reported, never silently mocked).
+        if !config.cache_pricing.is_empty() {
+            pricing_fingerprint = Some(
+                blake3::hash(
+                    serde_json::to_string(&config.cache_pricing)
+                        .expect("price table serializes")
+                        .as_bytes(),
+                )
+                .to_hex()
+                .to_string(),
+            );
+        }
         let provider_config = config.primary_provider_config.clone();
-        runner = runner.with_agent_factory(config_agent_factory(provider_config));
+        runner = runner.with_agent_factory(config_agent_factory(
+            provider_config,
+            config.cache_pricing.clone(),
+            config
+                .context
+                .as_ref()
+                .and_then(|context| context.cache_stable_prefix)
+                .unwrap_or(false),
+        ));
     } else {
         // No config provided - fallback to test-suite-only mode
         eprintln!("No --config provided. Running in test-suite-only fallback mode. Use --config=PATH to enable agent-driven evaluation.");
     }
 
     // Run the evaluation suite
-    let report = match runner.run_suite().await {
+    let mut report = match runner.run_suite().await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Eval run failed: {}", e);
             exit(1);
         }
     };
+
+    report.metadata = Some(serde_json::json!({
+        "schema_version": 1, "variant": variant, "cache_preparation": preparation,
+        "cache_preparation_source": "operator_label_not_provider_proof",
+        "runtime_mode": if agent_driven { "single_agent_fixture" } else { "test_suite_only" },
+        "policy_mode": if agent_driven { "permissive_fixture" } else { "test_suite_only" },
+        "cost_source": if pricing_fingerprint.is_some() { "configured_estimate" } else { "legacy_nominal_estimate" },
+        "pricing_fingerprint": pricing_fingerprint,
+        "reported_costs_are_subtotals_when_usage_is_missing": true,
+    }));
 
     // If baseline provided, compare with 5% threshold.
     if let Some(baseline_file) = baseline_path {
@@ -113,17 +151,40 @@ async fn main() {
 /// from the config's primary provider, then run the shared agent runtime. A
 /// config with no primary provider yields the historical explicit failure
 /// result (never a mock substitution).
-fn config_agent_factory(provider_config: Option<concerto_config::ProviderConfig>) -> AgentFactory {
+fn config_agent_factory(
+    provider_config: Option<concerto_config::ProviderConfig>,
+    pricing: std::collections::BTreeMap<String, concerto_core::cache_usage::CachePricing>,
+    stable_prefix: bool,
+) -> AgentFactory {
     Arc::new(move |description: String, project_dir: PathBuf| {
         let provider_config = provider_config.clone();
+        let pricing = pricing.clone();
         Box::pin(async move {
+            let model =
+                provider_config.as_ref().map(|config| config.model.clone()).unwrap_or_default();
+            let config_fingerprint = blake3::hash(
+                serde_json::to_string(&provider_config)
+                    .map_err(|error| error.to_string())?
+                    .as_bytes(),
+            )
+            .to_hex()
+            .to_string();
             let creds = concerto_config::CredentialStore::new();
             let provider = match provider_config.as_ref() {
                 Some(pc) => ProviderFactory::build(pc, &creds)
                     .map_err(|e| format!("failed to build provider: {e}"))?,
                 None => return Ok(no_provider_result()),
             };
-            run_agent(provider, description, project_dir).await
+            run_agent(
+                provider,
+                description,
+                project_dir,
+                stable_prefix,
+                model,
+                Some(config_fingerprint),
+                pricing,
+            )
+            .await
         })
     })
 }
@@ -132,6 +193,8 @@ fn config_agent_factory(provider_config: Option<concerto_config::ProviderConfig>
 /// non-completed benchmark outcome (never a silently mocked success).
 fn no_provider_result() -> AgentRunResult {
     AgentRunResult {
+        session_id: None,
+        telemetry: None,
         completed: false,
         files_modified: Vec::new(),
         tool_call_count: 0,
@@ -146,10 +209,14 @@ fn no_provider_result() -> AgentRunResult {
 /// An agent factory over an already-built provider — the live-runtime eval leg
 /// (row #17) installs this with a provider built from the live env contract.
 #[cfg(test)]
-fn provider_agent_factory(provider: Arc<dyn LlmProvider>) -> AgentFactory {
+fn provider_agent_factory(provider: Arc<dyn LlmProvider>, model: String) -> AgentFactory {
     Arc::new(move |description: String, project_dir: PathBuf| {
         let provider = provider.clone();
-        Box::pin(async move { run_agent(provider, description, project_dir).await })
+        let model = model.clone();
+        Box::pin(async move {
+            run_agent(provider, description, project_dir, false, model, None, Default::default())
+                .await
+        })
     })
 }
 
@@ -161,6 +228,10 @@ async fn run_agent(
     provider: Arc<dyn LlmProvider>,
     description: String,
     project_dir: PathBuf,
+    stable_prefix: bool,
+    model: String,
+    configuration_fingerprint: Option<String>,
+    pricing: std::collections::BTreeMap<String, concerto_core::cache_usage::CachePricing>,
 ) -> Result<AgentRunResult, String> {
     // Wall-clock run start: metric 3 (time to fresh passing evidence) is
     // measured against this, so capture it before any run work begins.
@@ -170,13 +241,50 @@ async fn run_agent(
     let mut registry = ToolRegistry::default();
     let project_dir_utf8 = camino::Utf8PathBuf::from_path_buf(project_dir.clone())
         .map_err(|_| format!("project_dir must be valid UTF-8: {}", project_dir.display()))?;
+    let store = Arc::new(
+        concerto_sessions::SqliteSessionStore::connect_shared()
+            .await
+            .map_err(|error| format!("benchmark persistence failed: {error}"))?,
+    );
+    let session = store
+        .create_session(
+            &project_dir_utf8,
+            provider.provider_name(),
+            &model,
+            CancellationToken::new(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let bus = concerto_core::event::EventBus::new(256);
+    let recording =
+        concerto_sessions::recording::EventRecording::start(&bus, store.clone(), session.id);
+    let task = AgentTask::new(session.id, description);
+    let _ = bus.publish_for_session(
+        session.id,
+        task.id.0,
+        concerto_core::event::EventKind::BenchmarkRunMetadata {
+            task_id: task.id,
+            metadata: serde_json::json!({
+                "schema_version": 1, "run_id": session.id, "runtime_mode": "single_agent_fixture",
+                "policy_mode": "permissive_fixture", "max_iterations": 10,
+                "cache_stable_prefix": stable_prefix,
+                "model": model, "provider_configuration_fingerprint": configuration_fingerprint,
+                "starting_workspace_fingerprint": workspace_fingerprint(&project_dir)?,
+                "workspace_exclusions": [".git", "target", "node_modules", "symlinks"],
+                "runtime_source_checkout_commit": std::process::Command::new("git").args(["rev-parse", "HEAD"])
+                    .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
+                    .output().ok().filter(|output| output.status.success())
+                    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string()),
+            }),
+        },
+    );
     registry.register(Box::new(FilesystemTool::new(project_dir_utf8)));
     registry.register(Box::new(ShellTool::new()));
     let registry = Arc::new(registry);
 
     // Create policy engine with permissive rules (expert mode)
     // Empty rules means expert mode - all tools auto-approved
-    let policy = Arc::new(SimplePolicyEngine::new(Vec::new(), Arc::new(NullAuditLog {})));
+    let policy = Arc::new(SimplePolicyEngine::new(Vec::new(), store.audit_sink()));
 
     // Create tool executor with auto-approval
     let approval_sink = Arc::new(AllowAllApprovalSink {});
@@ -191,7 +299,8 @@ async fn run_agent(
     // Create prompt builder with the canonical build system prompt (ADR-55
     // §8: the Build prompt constant in concerto-core is the single
     // source of truth).
-    let prompt_builder = PromptBuilder::new(concerto_core::types::SYSTEM_PROMPT_BUILD);
+    let prompt_builder = PromptBuilder::new(concerto_core::types::SYSTEM_PROMPT_BUILD)
+        .with_cache_stable_prefix(stable_prefix);
 
     // Create memory store - use NullMemoryStore for eval (no persistent
     // memory needed)
@@ -204,7 +313,7 @@ async fn run_agent(
 
     // Create agent loop
     let mut agent_loop = AgentLoop::with_project_root(
-        concerto_core::event::EventBus::new(256),
+        bus.clone(),
         approval_sink,
         provider,
         tool_executor,
@@ -216,43 +325,114 @@ async fn run_agent(
         false, // fast mode
         project_dir,
         None, // budget_allocator
-    );
+    )
+    .with_usage_model(model);
 
     // Create cancellation token
     let cancel = CancellationToken::new();
 
-    // Run the agent
-    let task = AgentTask::new(concerto_core::ids::Ulid::new(), description);
-    match agent_loop.run(task, cancel).await {
+    // Preserve evidence for failures as well as successes. Await the durable
+    // drain before computing any report; a persistence failure is explicit.
+    let outcome = agent_loop.run(task, cancel).await;
+    recording
+        .finish()
+        .await
+        .map_err(|error| format!("benchmark event recording failed: {error}"))?;
+    let mut report = concerto_sessions::cache::load_cache_report(
+        store.as_ref(),
+        session.id,
+        CancellationToken::new(),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    if !pricing.is_empty() {
+        report.reprice(&pricing);
+    }
+    let telemetry = report.summary;
+    let total_tokens = telemetry.reported_input_tokens + telemetry.reported_output_tokens;
+    let total_cost_usd = telemetry.known_estimated_cost_usd;
+    let audit = store
+        .load_audit_log(
+            session.id,
+            &concerto_sessions::AuditLogFilter::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let interventions = audit
+        .iter()
+        .filter(|row| row.verdict == "Deny" || row.verdict == "RequireApproval")
+        .count() as u32;
+    let (completed, files_modified, tool_call_count, final_message, observation) = match outcome {
         Ok(output) => {
             // Build the read-only observation export before moving the fields
             // out of `output`.
             let observation =
                 concerto_eval::observation::observe_agent_output(&output, run_started_at);
-            let final_message = output.final_message;
-            let total_tokens = final_message.len() as u64; // Approximation
-            Ok(AgentRunResult {
-                completed: true,
-                files_modified: output.files_modified.into_iter().map(|p| p.to_string()).collect(),
-                tool_call_count: output.tool_call_count,
-                final_message,
-                total_tokens,
-                total_cost_usd: 0.0, // Not tracked in eval
-                interventions: 0,    // Not tracked in eval
+            (
+                output.completion_status == concerto_core::types::AgentCompletionStatus::Completed,
+                output.files_modified.into_iter().map(|path| path.to_string()).collect(),
+                output.tool_call_count,
+                output.final_message,
                 observation,
-            })
+            )
         }
-        Err(_) => Ok(AgentRunResult {
-            completed: false,
-            files_modified: Vec::new(),
-            tool_call_count: 0,
-            final_message: "Agent failed to complete".to_string(),
-            total_tokens: 0,
-            total_cost_usd: 0.0,
-            interventions: 0,
-            observation: Default::default(),
-        }),
+        Err(error) => (false, Vec::new(), 0, format!("Agent failed: {error}"), Default::default()),
+    };
+    Ok(AgentRunResult {
+        completed,
+        files_modified,
+        tool_call_count,
+        final_message,
+        total_tokens,
+        total_cost_usd,
+        interventions,
+        session_id: Some(session.id),
+        telemetry: Some(telemetry),
+        observation,
+    })
+}
+
+fn workspace_fingerprint(root: &std::path::Path) -> Result<String, String> {
+    fn visit(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        hash: &mut blake3::Hasher,
+    ) -> Result<(), String> {
+        let mut entries = std::fs::read_dir(dir)
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let kind = entry.file_type().map_err(|error| error.to_string())?;
+            let path = entry.path();
+            if kind.is_symlink() {
+                continue;
+            }
+            if kind.is_dir() {
+                if !matches!(entry.file_name().to_str(), Some(".git" | "target" | "node_modules")) {
+                    visit(root, &path, hash)?;
+                }
+            } else if kind.is_file() {
+                let relative = path
+                    .strip_prefix(root)
+                    .map_err(|error| error.to_string())?
+                    .to_str()
+                    .ok_or("workspace path is not UTF-8")?
+                    .replace('\\', "/");
+                let content = std::fs::read(&path).map_err(|error| error.to_string())?;
+                hash.update(&(relative.len() as u64).to_le_bytes());
+                hash.update(relative.as_bytes());
+                hash.update(&(content.len() as u64).to_le_bytes());
+                hash.update(&content);
+            }
+        }
+        Ok(())
     }
+    let mut hash = blake3::Hasher::new();
+    visit(root, root, &mut hash)?;
+    Ok(hash.finalize().to_hex().to_string())
 }
 
 /// Compare current report against a baseline, returning Err if any metric
@@ -311,8 +491,39 @@ fn compare_with_baseline(
         }
     }
 
+    let measured = |report: &BenchmarkReport| {
+        !report.individual_results.is_empty()
+            && report.individual_results.iter().all(|result| {
+                result.telemetry.as_ref().is_some_and(|telemetry| {
+                    telemetry.cache.calls > 0 && telemetry.missing_usage_calls == 0
+                })
+            })
+    };
+    let efficiency_comparable = measured(current) && measured(&baseline);
+    if !efficiency_comparable {
+        eprintln!(
+            "Cost/token comparisons unavailable: provider telemetry is incomplete or legacy."
+        );
+    }
+    let price_basis = |report: &BenchmarkReport| {
+        report.metadata.as_ref().map(|metadata| {
+            (metadata.get("pricing_fingerprint").cloned(), metadata.get("cost_source").cloned())
+        })
+    };
+    let complete_costs = |report: &BenchmarkReport| {
+        report.individual_results.iter().all(|result| {
+            result.telemetry.as_ref().is_some_and(|telemetry| telemetry.missing_cost_calls == 0)
+        })
+    };
+    let costs_comparable = efficiency_comparable
+        && complete_costs(current)
+        && complete_costs(&baseline)
+        && price_basis(current) == price_basis(&baseline);
+    if !costs_comparable {
+        eprintln!("Cost comparison unavailable: missing measurements or different price versions.");
+    }
     // Cost: higher is bad.
-    if baseline.avg_cost_usd > 0.0 {
+    if costs_comparable && baseline.avg_cost_usd > 0.0 {
         let delta = (current.avg_cost_usd - baseline.avg_cost_usd) / baseline.avg_cost_usd;
         if delta > threshold {
             regressions.push(format!(
@@ -330,7 +541,7 @@ fn compare_with_baseline(
     }
 
     // Tokens: higher is bad.
-    if baseline.avg_tokens > 0 {
+    if efficiency_comparable && baseline.avg_tokens > 0 {
         let delta =
             (current.avg_tokens as f64 - baseline.avg_tokens as f64) / baseline.avg_tokens as f64;
         if delta > threshold {
@@ -376,21 +587,6 @@ fn compare_with_baseline(
             baseline: worst_baseline,
             current: worst_current,
         })
-    }
-}
-
-// NullAuditLog implements AuditLog trait for eval to avoid sqlite dependency
-struct NullAuditLog {}
-
-#[async_trait::async_trait]
-impl concerto_core::traits::policy::AuditLog for NullAuditLog {
-    async fn record(
-        &self,
-        _entry: concerto_core::traits::policy::AuditEntry,
-        _cancel: concerto_core::CancellationToken,
-    ) -> Result<(), concerto_core::error::PolicyError> {
-        // No-op for eval - just log to tracing if needed
-        Ok(())
     }
 }
 
@@ -570,10 +766,10 @@ mod live_eval_tests {
         }
 
         let provider: Arc<dyn LlmProvider> =
-            Arc::new(OpenAiProvider::new(key, model, 120).with_api_base(base));
+            Arc::new(OpenAiProvider::new(key, model.clone(), 120).with_api_base(base));
         let runner = EvalRunner::new(&suite)
             .with_timeout(600)
-            .with_agent_factory(provider_agent_factory(provider));
+            .with_agent_factory(provider_agent_factory(provider, model));
 
         match runner.run_suite_observed().await {
             Ok(observed) => {

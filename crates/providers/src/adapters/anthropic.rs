@@ -104,7 +104,22 @@ impl Dialect for AnthropicChatDialect {
             body["temperature"] = json!(temp);
         }
         if let Some(system) = system_prompt {
-            body["system"] = json!(system);
+            let boundary = request
+                .stable_system_prefix_bytes
+                .filter(|boundary| {
+                    *boundary > 0 && *boundary < system.len() && system.is_char_boundary(*boundary)
+                })
+                .filter(|_| {
+                    request.messages.first().is_some_and(|message| {
+                        message.role == Role::System && message.content == system
+                    })
+                });
+            body["system"] = if let Some(boundary) = boundary {
+                json!([{"type": "text", "text": &system[..boundary]},
+                    {"type": "text", "text": &system[boundary..]}])
+            } else {
+                json!(system)
+            };
         }
         if let Some(tools) = &request.tools {
             body["tools"] = json!(build_anthropic_tools(tools));
@@ -118,53 +133,11 @@ impl Dialect for AnthropicChatDialect {
         body
     }
 
-    /// Mark the two Anthropic prompt-cache breakpoints on the rendered body
-    /// (ADR-48 decision 3: prefix discipline, opt-in extension point):
-    ///
-    /// 1. The top-level `system` prompt is wrapped as a single typed text block
-    ///    object with an ephemeral `cache_control`, so the system prompt joins
-    ///    the cached prefix (Anthropic accepts a single content block object
-    ///    for `system`). Unchanged when `system` is absent or already wrapped.
-    /// 2. The FIRST `user` message's FIRST `text` block gains an ephemeral
-    ///    `cache_control` — Anthropic's documented pattern for caching the
-    ///    conversation prefix. Subsequent user turns are left unmarked.
-    ///
-    /// `tool_use`/`tool_result` blocks are deliberately untouched (out of scope
-    /// for this milestone). The method is idempotent: each breakpoint is only
-    /// written when not already present, so applying it twice yields the same
-    /// body the second time.
+    /// Opt-in cache policy: stable system blocks, tool definitions, and a
+    /// moving conversation tail, within Anthropic's four-breakpoint limit.
+    /// Existing manual markers and their TTLs are preserved.
     fn apply_cache_breakpoints(&self, body: &mut serde_json::Value) {
-        // 1. System prompt. Only a plain string is wrapped; an already-wrapped
-        //    (object) system value is left alone, which also keeps the call
-        //    idempotent on repeat application.
-        if let Some(text) = body.get("system").and_then(|s| s.as_str()) {
-            body["system"] = json!({
-                "type": "text",
-                "text": text,
-                "cache_control": {"type": "ephemeral"},
-            });
-        }
-
-        // 2. First user message, first text block only.
-        let mut user_seen = false;
-        if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
-            for msg in messages {
-                if msg["role"] != "user" {
-                    continue;
-                }
-                if user_seen {
-                    continue;
-                }
-                user_seen = true;
-                if let Some(blocks) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
-                    if let Some(first_text) = blocks.iter_mut().find(|b| b["type"] == "text") {
-                        if first_text.get("cache_control").is_none() {
-                            first_text["cache_control"] = json!({"type": "ephemeral"});
-                        }
-                    }
-                }
-            }
-        }
+        crate::cache_policy::apply_anthropic(body);
     }
 }
 
@@ -240,6 +213,7 @@ mod tests {
     /// a follow-up user turn, plus a tool list and a forced tool choice.
     fn fixture_request() -> CompletionRequest {
         CompletionRequest {
+            stable_system_prefix_bytes: None,
             model: String::new(),
             messages: vec![
                 Message {
@@ -459,6 +433,7 @@ mod tests {
             ),
         ] {
             let request = CompletionRequest {
+                stable_system_prefix_bytes: None,
                 tools: Some(vec![ToolDefinition {
                     name: "submit_design_doc".into(),
                     description: "Submit a structured design document.".into(),
@@ -486,6 +461,7 @@ mod tests {
     #[test]
     fn golden_serialized_body_system_and_user() {
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             messages: vec![
                 Message {
                     role: Role::System,
@@ -612,6 +588,7 @@ mod tests {
     #[test]
     fn multiple_tool_results_fold_into_one_user_message() {
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             messages: vec![Message {
                 role: Role::Tool,
                 content: String::new(),
@@ -668,6 +645,7 @@ mod tests {
     #[test]
     fn tool_message_without_results_renders_empty_user_message() {
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             messages: vec![Message {
                 role: Role::Tool,
                 content: String::new(),
@@ -703,6 +681,7 @@ mod tests {
     #[test]
     fn last_system_message_wins() {
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             messages: vec![
                 Message {
                     role: Role::System,
@@ -732,50 +711,36 @@ mod tests {
         assert_eq!(msgs.len(), 0, "system messages never appear in the messages array");
     }
 
-    /// ADR-48 decision 3 / Phase 3 M3: the system prompt is wrapped as a single
-    /// typed text block with an ephemeral `cache_control`, and the FIRST user
-    /// message's FIRST text block is marked. Subsequent user turns (including a
-    /// tool-result fold-in and a later plain user) stay unmarked.
     #[test]
-    fn cache_breakpoints_mark_system_and_first_user_block() {
+    fn cache_breakpoints_mark_system_tools_and_conversation_tail() {
         let request = fixture_request();
         let body = render_with_breakpoints(&request, "claude-3-5-sonnet");
-
+        assert_eq!(body["system"][0]["text"], "You are a helpful assistant.");
+        assert_eq!(body["system"][0]["cache_control"], json!({"type": "ephemeral"}));
+        let messages = body["messages"].as_array().unwrap();
+        assert!(messages[0]["content"][0].get("cache_control").is_none());
         assert_eq!(
-            body["system"],
-            json!({
-                "type": "text",
-                "text": "You are a helpful assistant.",
-                "cache_control": {"type": "ephemeral"},
-            }),
-            "system must be wrapped as a single cache-marked text block"
+            messages.last().unwrap()["content"][0]["cache_control"],
+            json!({"type": "ephemeral"})
         );
+        assert!(body["tools"].as_array().unwrap().last().unwrap().get("cache_control").is_some());
+    }
 
-        let msgs = body["messages"].as_array().expect("should have messages");
-        // First user message: its first block is a text block and gets the mark.
-        assert_eq!(msgs[0]["role"], "user");
-        assert_eq!(msgs[0]["content"][0]["type"], "text");
-        assert_eq!(
-            msgs[0]["content"][0]["cache_control"],
-            json!({"type": "ephemeral"}),
-            "first user's first text block carries the prefix breakpoint"
-        );
-
-        // The other user-role messages (tool result, follow-up user) are
-        // NOT marked — only the first user message participates.
-        for idx in [3usize, 4] {
-            let content = msgs[idx]["content"].as_array().expect("content array");
-            for block in content {
-                assert!(
-                    block.get("cache_control").is_none(),
-                    "user message {idx} must not carry a breakpoint: {block}"
-                );
-            }
-        }
-        // tool_use / tool_result blocks are out of scope and stay untouched.
-        let tool_use = &msgs[1]["content"][1];
-        assert_eq!(tool_use["type"], "tool_use");
-        assert!(tool_use.get("cache_control").is_none());
+    #[test]
+    fn stable_prefix_boundary_is_independent_of_changing_memory() {
+        let mut request = CompletionRequest {
+            messages: vec![msg(Role::System, "stable instructions\n\nvolatile memory")],
+            stable_system_prefix_bytes: Some("stable instructions".len()),
+            ..Default::default()
+        };
+        let first = render_with_breakpoints(&request, "claude-3-5-sonnet");
+        request.messages[0].content = "stable instructions\n\nchanged memory".into();
+        let second = render_with_breakpoints(&request, "claude-3-5-sonnet");
+        assert_eq!(first["system"][0], second["system"][0]);
+        assert_ne!(first["system"][1], second["system"][1]);
+        request.stable_system_prefix_bytes = Some(usize::MAX);
+        let invalid = render(&request, "claude-3-5-sonnet");
+        assert_eq!(invalid["system"], request.messages[0].content);
     }
 
     /// ADR-48 prefix discipline: applying the breakpoints twice yields the
@@ -818,13 +783,13 @@ mod tests {
         );
         let msgs = body["messages"].as_array().expect("should have messages");
         assert_eq!(
-            msgs[0]["content"][0]["cache_control"],
+            msgs[2]["content"][0]["cache_control"],
             json!({"type": "ephemeral"}),
-            "first user message must still be marked"
+            "conversation tail must still be marked"
         );
         assert!(
-            msgs[2]["content"][0].get("cache_control").is_none(),
-            "second user message must stay unmarked"
+            msgs[0]["content"][0].get("cache_control").is_none(),
+            "old user message must stay unmarked"
         );
     }
     /// ADR-48 decision 3 (prefix discipline): two consecutive conversations
@@ -857,6 +822,24 @@ mod tests {
                 AnthropicChatDialect.apply_cache_breakpoints(&mut short_body);
                 AnthropicChatDialect.apply_cache_breakpoints(&mut extended_body);
             }
+            fn strip_markers(value: &mut serde_json::Value) {
+                match value {
+                    serde_json::Value::Object(object) => {
+                        object.remove("cache_control");
+                        for value in object.values_mut() {
+                            strip_markers(value);
+                        }
+                    }
+                    serde_json::Value::Array(array) => {
+                        for value in array {
+                            strip_markers(value);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            strip_markers(&mut short_body);
+            strip_markers(&mut extended_body);
             let short_msgs = short_body["messages"].as_array().expect("messages");
             let extended_msgs = extended_body["messages"].as_array().expect("messages");
             assert!(

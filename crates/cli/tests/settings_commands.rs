@@ -218,3 +218,52 @@ fn shell_help_states_the_protected_paths_scope_limit() {
     let shown = fixture.success(&["shell", "security", "show"]);
     assert!(shown.contains(note), "security show is missing the scope note: {shown}");
 }
+
+#[test]
+fn runtime_inspection_reads_saved_state_while_another_frontend_holds_the_lock() {
+    let fixture = Fixture::new();
+    assert!(fixture.success(&["sessions", "runtime", "--help"]).contains("--view"));
+    assert!(!fixture.dir.path().join("data/concerto/sessions.db").exists());
+    fixture.success(&["sessions", "list"]);
+    let id = ulid::Ulid::new().to_string();
+    let state = serde_json::json!({
+        "schema_version": 4,
+        "session_id": id,
+        "subtasks": [], "edges": [], "completed_results": {},
+        "total_cost": 0.0, "total_tool_calls": 0, "provider_metrics": [],
+        "all_files": [], "subtask_attempts": {}, "retry_feedback": {},
+        "world_model": {"objective": "portable runtime inspection"}
+    })
+    .to_string();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let pool = sqlx::SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(fixture.dir.path().join("data/concerto/sessions.db")),
+        ).await.unwrap();
+        sqlx::query("INSERT INTO sessions (id, created_at, project_dir, provider, model) VALUES (?, 1, '/project', 'test', 'test')")
+            .bind(&id).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO orchestration_checkpoints (session_id, run_id, root_task_id, project_id, objective_hash, schema_version, sequence_num, state_json, completed, updated_at) VALUES (?, ?, ?, 'test', 'test', 4, 1, ?, 0, 1)")
+            .bind(&id).bind(&id).bind(&id).bind(&state).execute(&pool).await.unwrap();
+        pool.close().await;
+    });
+    let _lock = concerto_core::lock::acquire_data_dir_lock(
+        &fixture.dir.path().join("data/concerto"),
+        Some(std::time::Duration::from_secs(1)),
+        None,
+    )
+    .unwrap();
+    let output = fixture.success(&["sessions", "runtime", &id, "--json"]);
+    let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(value["session_id"], id);
+    assert_eq!(value["data"]["world_model"]["objective"], "portable runtime inspection");
+    assert_eq!(value["data"].as_object().unwrap().len(), 4);
+    let output = fixture.success(&["sessions", "runtime", &id, "--view", "world", "--json"]);
+    let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(value["data"].as_object().unwrap().len(), 1);
+    assert!(fixture.success(&["sessions", "runtime", &id]).contains("World model"));
+    assert!(!fixture.command(&["sessions", "runtime", &id, "--limit", "0"]).status.success());
+    let unknown = ulid::Ulid::new().to_string();
+    assert!(!fixture.command(&["sessions", "runtime", &unknown, "--json"]).status.success());
+    assert!(!fixture.config_path().exists(), "inspection must not launch setup");
+}

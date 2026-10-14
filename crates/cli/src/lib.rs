@@ -73,7 +73,7 @@ pub const CLI_COMMAND_HELP: &str =
     Note: protected_paths constrains only the built-in filesystem tool; native
     run commands and container project mounts are not covered.
     projects <list|current|use>
-    sessions <list|show|events|resume|prune>
+    sessions <list|show|events|cache|runtime|resume|prune>
     memory <graph|explain>   health [--json]   audit   logs <path|show>
     harness <environment|verify|checkpoint|memory> [--json]
 
@@ -686,9 +686,61 @@ async fn run_prune(
 
 fn run_sessions_subcommand(args: &[String], project_root: &Path) -> anyhow::Result<()> {
     if args.is_empty() {
-        anyhow::bail!("usage: concerto sessions <list|show <id>|events <id>|resume <id>|prune>");
+        anyhow::bail!(
+            "usage: concerto sessions <list|show <id>|events <id>|cache <id> [--json]|runtime <id>|resume <id>|prune>"
+        );
     }
     match args[0].as_str() {
+        "cache" => {
+            if !(args.len() == 2 || (args.len() == 3 && args[2] == "--json")) {
+                anyhow::bail!("usage: concerto sessions cache <id> [--json]");
+            }
+            let session_id = parse_session_id(&args[1])?;
+            let pricing = concerto_config::load_config(
+                concerto_config::default_config_path().as_ref(),
+                Some(project_root),
+            )?
+            .cache_pricing;
+            let mut report = tokio::runtime::Runtime::new()?.block_on(async {
+                let store = concerto_sessions::SqliteSessionStore::connect_shared().await?;
+                use concerto_sessions::SessionStore;
+                if store.load_session(session_id, CancellationToken::new()).await?.is_none() {
+                    return Err(concerto_sessions::SessionError::NotFound(session_id.to_string()));
+                }
+                concerto_sessions::cache::load_cache_report(
+                    &store,
+                    session_id,
+                    CancellationToken::new(),
+                )
+                .await
+            })?;
+            if !pricing.is_empty() {
+                report.reprice(&pricing);
+            }
+            if args.len() == 3 {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", report.caption());
+                for (model, summary) in &report.by_provider_model {
+                    let rate = summary
+                        .cache
+                        .token_hit_rate()
+                        .map(|rate| format!("{:.1}%", rate * 100.0))
+                        .unwrap_or_else(|| "N/A".into());
+                    println!(
+                        "{model}: {rate} token reuse, {} attempts, {} missing usage",
+                        summary.cache.calls, summary.missing_usage_calls
+                    );
+                }
+                println!(
+                    "Estimated cost: {:?}; missing cost calls: {}",
+                    report.summary.complete_estimated_cost_usd(),
+                    report.summary.missing_cost_calls
+                );
+            }
+            return Ok(());
+        }
+        "runtime" => return dispatch::runtime::run(&args[1..]),
         "list" => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
@@ -818,7 +870,7 @@ fn run_sessions_subcommand(args: &[String], project_root: &Path) -> anyhow::Resu
         }
         other => {
             eprintln!("error: unknown sessions subcommand '{other}'");
-            eprintln!("available: list, show, events, resume, prune");
+            eprintln!("available: list, show, events, cache, runtime, resume, prune");
             std::process::exit(1);
         }
     }
@@ -1451,14 +1503,15 @@ fn parse_session_id(value: &str) -> anyhow::Result<concerto_core::ids::Ulid> {
         .map_err(|error| anyhow::anyhow!("invalid session id '{value}': {error}"))
 }
 
-/// Concerto flags end before native command operands, which may contain any flag.
-/// Project/theme option values are skipped so a directory named shell stays a value.
+/// Shell and session commands own their operands, including subcommand help.
+/// Project/theme option values are skipped so a directory named shell or sessions
+/// stays a value rather than ending startup flag parsing.
 pub fn startup_arguments(args: &[String]) -> &[String] {
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--project" | "-p" | "--theme" => index += 2,
-            "shell" => return &args[..index],
+            "shell" | "sessions" => return &args[..index],
             value if value.starts_with('-') => index += 1,
             _ => break,
         }
@@ -1530,7 +1583,9 @@ pub fn parse_cli_args<'a>(
     let mut reconfigure = false;
     let mut reduced_motion: Option<bool> = None;
     let mut remaining = Vec::new();
-    for arg in args {
+    let args: Vec<String> = args.cloned().collect();
+    let startup_count = startup_arguments(&args).len();
+    for arg in &args[..startup_count] {
         match arg.as_str() {
             "--multi-agent" | "-m" => multi_agent = true,
             "--fast" | "-f" => fast = true,
@@ -1557,6 +1612,7 @@ pub fn parse_cli_args<'a>(
             _ => remaining.push(arg.clone()),
         }
     }
+    remaining.extend_from_slice(&args[startup_count..]);
     (multi_agent, fast, reconfigure, reduced_motion, remaining)
 }
 
@@ -1652,6 +1708,16 @@ mod tests {
     }
 
     // verifies: native operands survive all startup parsing, including program-specific project/theme flags.
+    #[test]
+    fn runtime_help_belongs_to_the_session_command_in_both_launchers() {
+        let args =
+            ["--fast", "--project", "sessions", "sessions", "runtime", "--help"].map(str::to_owned);
+        assert_eq!(startup_arguments(&args), &args[..3]);
+        let (_, fast, _, _, remaining) = parse_cli_args(args.iter());
+        assert!(fast);
+        assert_eq!(remaining, args[1..]);
+    }
+
     #[test]
     fn native_shell_preserves_program_flags() {
         let args = [

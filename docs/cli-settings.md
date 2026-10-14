@@ -133,7 +133,70 @@ Choose a shell profile ID from `shell list`; detected IDs depend on the host.
 CLI runs build a fresh plugin manager. Restart Desktop after changing installed
 plugin files through these commands; its runtime manager is retained across runs.
 
+## Runtime inspection
+
+```sh
+concerto sessions list
+concerto sessions runtime SESSION_ID
+concerto sessions runtime SESSION_ID --json
+concerto sessions runtime SESSION_ID --view decisions --limit 20
+concerto sessions runtime SESSION_ID --view world --json
+concerto sessions runtime SESSION_ID --view diagnoses
+concerto sessions runtime SESSION_ID --view suitability
+```
+
+The TUI opens the same four inspection panels with **Esc, then i** for the
+active session. Use `r` to refresh, arrows or `j/k` to scroll, Page Up/Down to
+page, Home to return to the top, and Esc to return to chat.
+
+Both frontends use the shared checkpoint projection and suitability ranking.
+This shows **persisted checkpoint data**, not live Coordinator state; completed
+or cleared checkpoints may have no inspection data. It does not pause, resume,
+dispatch, or modify a run. Command mode can inspect alongside a running frontend:
+its database connection is read-only and performs no initialization, migrations,
+retention, recovery, or encryption setup. Pending encryption setup must be
+completed by normal application startup; existing keys are required.
+
+`--view` accepts `all` (default), `decisions`, `world`, `diagnoses`, or
+`suitability`. `--limit` is 1–1000 (default 50), applied to each history newest
+first and to agents per suitability class best first. The world model is kept
+complete. JSON includes `schema_version`, `session_id`, `source`, `empty`,
+`limit`, unfiltered `totals`, and the requested `data` sections. Unknown sessions,
+unavailable storage, and invalid checkpoints exit nonzero; an existing session
+without a checkpoint returns an empty report. Inspection needs no provider or
+setup wizard. Evidence references remain intact in the output.
+
 ## Appearance
+
+### Terminal navigation and editing
+
+The TUI separates the conversation, message composer, keyboard hints and run
+status into their own rows. The composer grows for multiline drafts and keeps
+the cursor visible when text is longer than the terminal width.
+
+| Action | Keys |
+|---|---|
+| Open the command menu from chat | `F1` or `Ctrl+P`; `?` in browse mode |
+| Choose a menu item | Up/Down, then Enter; Esc closes without changing the draft |
+| Switch between typing and browsing | Esc |
+| Send the current message | Enter, when no run is active |
+| Insert a newline | `Ctrl+J` (Alt/Shift+Enter also works when reported by the terminal) |
+| Edit within a draft | Left/Right, Home/End, Backspace/Delete |
+| Read earlier/later conversation | PageUp/PageDown; Up/Down or j/k in browse mode |
+| Jump to the oldest/latest output | Home/End in browse mode |
+| Cancel a run / quit when idle | `Ctrl+C` |
+
+Bracketed paste inserts text into the draft without sending it. Approval,
+intent and plan prompts retain priority over pasting and navigation shortcuts.
+While a run is active, the composer keeps the next draft until it can be sent.
+Opening settings or cancelling project selection preserves the draft.
+
+Chat follows the latest output until you scroll back; new output leaves your
+reading position in place. Returning to the bottom resumes following. Sessions,
+agent models, tool history and the command menu scroll their selected row into
+view. Tool history supports Up/Down, Home/End and `c` to clear the displayed log.
+
+### Theme and motion preferences
 
 ```sh
 concerto config set display.theme '"Slate"'

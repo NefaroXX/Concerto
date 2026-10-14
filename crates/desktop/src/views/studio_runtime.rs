@@ -12,18 +12,21 @@
 //! error yields an empty snapshot (plus an optional muted note), never a
 //! crash and never a blocking wait.
 
-use std::sync::Arc;
-
-use concerto_core::ids::Ulid;
-use concerto_core::CancellationToken;
-use concerto_orchestrator::checkpoint::GraphCheckpoint;
-use concerto_orchestrator::decisions::CoordinatorDecision;
-use concerto_orchestrator::failure_diagnosis::FailureDiagnosis;
-use concerto_orchestrator::suitability::{
-    AgentSuitability, SuitabilityIndex, SuitabilityState, TaskClass,
+pub use concerto_orchestrator::studio_runtime::{
+    CheckpointStudioRuntimeReader, StudioRuntimeReader, StudioRuntimeSnapshot, TaskClassSuitability,
 };
+
+#[cfg(test)]
+use concerto_core::{ids::Ulid, CancellationToken};
+#[cfg(test)]
+use concerto_orchestrator::studio_runtime::{suitability_rankings, StudioRuntimeError};
+#[cfg(test)]
+use concerto_orchestrator::suitability::{SuitabilityState, TaskClass};
+#[cfg(test)]
 use concerto_orchestrator::world_model::WorldModel;
-use concerto_sessions::SessionStore;
+#[cfg(test)]
+use std::sync::Arc;
+#[cfg(test)]
 use time::OffsetDateTime;
 
 use iced::widget::{column, container, scrollable, text};
@@ -66,179 +69,6 @@ impl StudioRuntimePanel {
             StudioRuntimePanel::FailureDiagnoses => "Failure Diagnoses",
             StudioRuntimePanel::Suitability => "Suitability",
         }
-    }
-}
-
-/// One task class's deterministic suitability ranking.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TaskClassSuitability {
-    pub task_class: TaskClass,
-    pub agents: Vec<AgentSuitability>,
-}
-
-/// The bounded, read-only Coordinator 2.0 runtime snapshot the panels render.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct StudioRuntimeSnapshot {
-    /// The typed decision journal (whiteboard Decision events reconciled in the
-    /// persisted `decision_journal`).
-    pub decisions: Vec<CoordinatorDecision>,
-    /// The compact world-model projection, when the run produced one.
-    pub world_model: Option<WorldModel>,
-    /// The structured failure-diagnosis history.
-    pub diagnoses: Vec<FailureDiagnosis>,
-    /// Per-task-class suitability rankings restored from the checkpoint.
-    pub suitability: Vec<TaskClassSuitability>,
-    /// Set when the load failed. The panels still render their empty states;
-    /// the surface shows this muted note (fail-soft).
-    pub load_error: Option<String>,
-}
-
-impl StudioRuntimeSnapshot {
-    /// Extract the snapshot from a persisted checkpoint. Pure; reads only the
-    /// existing additive Coordinator fields — no new sources, no runtime APIs.
-    pub fn from_checkpoint(checkpoint: &GraphCheckpoint) -> Self {
-        Self::from_parts(
-            &checkpoint.decision_journal,
-            &checkpoint.failure_diagnoses,
-            &checkpoint.world_model,
-            &checkpoint.suitability,
-            OffsetDateTime::now_utc(),
-        )
-    }
-
-    /// The testable extraction core: `now` is injected so suitability rankings
-    /// stay deterministic in tests.
-    pub fn from_parts(
-        decision_journal: &[CoordinatorDecision],
-        failure_diagnoses: &[FailureDiagnosis],
-        world_model: &WorldModel,
-        suitability: &SuitabilityState,
-        now: OffsetDateTime,
-    ) -> Self {
-        Self {
-            decisions: decision_journal.to_vec(),
-            world_model: world_model_present(world_model),
-            diagnoses: failure_diagnoses.to_vec(),
-            suitability: suitability_rankings(suitability, now),
-            load_error: None,
-        }
-    }
-
-    /// An empty snapshot carrying the reason the read failed. The panels show
-    /// their empty states; the note is muted and non-blocking.
-    pub fn unavailable(message: impl Into<String>) -> Self {
-        Self { load_error: Some(message.into()), ..Self::default() }
-    }
-
-    /// Whether the snapshot holds any Coordinator 2.0 state to display.
-    pub fn is_empty(&self) -> bool {
-        self.decisions.is_empty()
-            && self.world_model.is_none()
-            && self.diagnoses.is_empty()
-            && self.suitability.is_empty()
-    }
-}
-
-/// A world model counts as present unless it is the untouched zero value
-/// (empty beyond the objective and with no objective). This mirrors the
-/// checkpoint's serde-default field: old checkpoints deserialize an empty
-/// model, which must not render as a bogus pane.
-fn world_model_present(model: &WorldModel) -> Option<WorldModel> {
-    if model.is_empty_beyond_objective() && model.objective.is_none() {
-        None
-    } else {
-        Some(model.clone())
-    }
-}
-
-/// Rank the recorded suitability state per task class. Deterministic given
-/// `now`; the candidate set is exactly the agents with recorded outcomes for
-/// the class — never a fabricated roster.
-pub fn suitability_rankings(
-    state: &SuitabilityState,
-    now: OffsetDateTime,
-) -> Vec<TaskClassSuitability> {
-    let index = SuitabilityIndex::from_state(state.clone());
-    let mut classes: Vec<TaskClass> =
-        state.buckets.iter().map(|keyed| keyed.key.task_class).collect();
-    classes.sort();
-    classes.dedup();
-    classes
-        .into_iter()
-        .map(|task_class| {
-            let mut candidates: Vec<String> = state
-                .buckets
-                .iter()
-                .filter(|keyed| keyed.key.task_class == task_class)
-                .map(|keyed| keyed.key.agent_id.clone())
-                .collect();
-            candidates.sort();
-            candidates.dedup();
-            TaskClassSuitability { task_class, agents: index.rank(&candidates, task_class, now) }
-        })
-        .collect()
-}
-
-/// Why a runtime snapshot could not be read. The caller fail-softs to an empty
-/// panel plus this note, never an error page.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StudioRuntimeError(pub String);
-
-impl std::fmt::Display for StudioRuntimeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for StudioRuntimeError {}
-
-/// The read seam the observability panels are fed through: production reads
-/// the session's persisted checkpoint; tests inject a fixed snapshot.
-#[async_trait::async_trait]
-pub trait StudioRuntimeReader: Send + Sync {
-    async fn load(
-        &self,
-        session_id: Ulid,
-        cancel: CancellationToken,
-    ) -> Result<StudioRuntimeSnapshot, StudioRuntimeError>;
-}
-
-/// Production reader: the session's persisted orchestration checkpoint via the
-/// existing `SessionStore` the desktop crate already depends on.
-pub struct CheckpointStudioRuntimeReader {
-    store: Arc<dyn SessionStore>,
-}
-
-impl CheckpointStudioRuntimeReader {
-    pub fn new(store: Arc<dyn SessionStore>) -> Self {
-        Self { store }
-    }
-}
-
-#[async_trait::async_trait]
-impl StudioRuntimeReader for CheckpointStudioRuntimeReader {
-    async fn load(
-        &self,
-        session_id: Ulid,
-        cancel: CancellationToken,
-    ) -> Result<StudioRuntimeSnapshot, StudioRuntimeError> {
-        // Honor cancellation at the seam before any I/O (CancellationToken is
-        // threaded through every async op).
-        if cancel.is_cancelled() {
-            return Ok(StudioRuntimeSnapshot::default());
-        }
-        let record = self
-            .store
-            .load_orchestration_checkpoint(session_id)
-            .await
-            .map_err(|error| StudioRuntimeError(format!("checkpoint read failed: {error}")))?;
-        let Some(record) = record else {
-            // No persisted run state for this session: empty panel, no error.
-            return Ok(StudioRuntimeSnapshot::default());
-        };
-        let checkpoint = GraphCheckpoint::from_json(&record.state_json)
-            .map_err(|error| StudioRuntimeError(format!("checkpoint parse failed: {error}")))?;
-        Ok(StudioRuntimeSnapshot::from_checkpoint(&checkpoint))
     }
 }
 

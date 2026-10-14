@@ -292,6 +292,8 @@ impl PromptBuilder {
             self.assemble_system(working_memory_block, prev_summary)
         };
 
+        let stable_system_prefix_bytes =
+            self.cache_stable_prefix.then(|| self.stable_system_head(prev_summary).len());
         let mut all_messages = Vec::with_capacity(messages.len() + 1);
 
         all_messages.push(Message {
@@ -307,9 +309,16 @@ impl PromptBuilder {
         all_messages.extend_from_slice(messages);
 
         CompletionRequest {
+            stable_system_prefix_bytes,
             model: String::new(), // filled in by the caller or provider context guard
             messages: all_messages,
-            tools: tools.map(|t| t.to_vec()),
+            tools: tools.map(|definitions| {
+                let mut tools = definitions.to_vec();
+                if self.cache_stable_prefix {
+                    tools.sort_by(|a, b| a.name.cmp(&b.name));
+                }
+                tools
+            }),
             tool_choice: None,
             temperature: None,
             max_tokens: None,
@@ -670,24 +679,51 @@ pub async fn complete_provider_request(
     let first_byte_timeout = Duration::from_secs(retry_policy.config().time_to_first_byte_seconds);
     let idle_timeout = Duration::from_secs(retry_policy.config().stream_idle_timeout_seconds);
     let provider_name = provider.provider_name();
+    let request_id = Ulid::new();
+    let attempt = std::sync::atomic::AtomicU32::new(0);
 
     with_provider_retry(retry_policy, bus, session_id, task_id, provider_name, cancel, || {
         let provider = provider.clone();
         let request = request.clone();
         let request_cancel = cancel.clone();
+        let mut recorder = crate::provider_telemetry::AttemptRecorder::new(
+            bus.clone(),
+            session_id,
+            task_id,
+            request_id,
+            attempt.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+            provider_name,
+            &request,
+        );
         async move {
-            let stream = tokio::time::timeout(
-                first_byte_timeout,
-                provider.stream_completion(request, request_cancel.clone()),
-            )
-            .await
-            .map_err(|_| ProviderError::Timeout {
-                phase: "time-to-first-byte",
-                timeout: first_byte_timeout,
-            })??;
-
-            collect_stream_with_timeouts(stream, &request_cancel, first_byte_timeout, idle_timeout)
+            let result = async {
+                let stream = tokio::time::timeout(
+                    first_byte_timeout,
+                    provider.stream_completion(request, request_cancel.clone()),
+                )
                 .await
+                .map_err(|_| ProviderError::Timeout {
+                    phase: "time-to-first-byte",
+                    timeout: first_byte_timeout,
+                })??;
+
+                collect_stream_measured(
+                    stream,
+                    &request_cancel,
+                    first_byte_timeout,
+                    idle_timeout,
+                    Some(&mut recorder),
+                )
+                .await
+            }
+            .await;
+            let status = match &result {
+                Ok(_) => "completed",
+                Err(ProviderError::Cancelled) => "cancelled",
+                Err(_) => "error",
+            };
+            recorder.finish(status, provider.as_ref());
+            result
         }
     })
     .await
@@ -701,10 +737,20 @@ pub async fn complete_provider_request(
 }
 
 pub(crate) async fn collect_stream_with_timeouts(
+    stream: CompletionStream,
+    cancel: &CancellationToken,
+    first_byte_timeout: Duration,
+    idle_timeout: Duration,
+) -> Result<(String, Option<String>, Vec<ToolCall>, Option<CompletionUsage>), ProviderError> {
+    collect_stream_measured(stream, cancel, first_byte_timeout, idle_timeout, None).await
+}
+
+async fn collect_stream_measured(
     mut stream: CompletionStream,
     cancel: &CancellationToken,
     first_byte_timeout: Duration,
     idle_timeout: Duration,
+    mut recorder: Option<&mut crate::provider_telemetry::AttemptRecorder>,
 ) -> Result<(String, Option<String>, Vec<ToolCall>, Option<CompletionUsage>), ProviderError> {
     use futures::StreamExt;
 
@@ -730,6 +776,9 @@ pub(crate) async fn collect_stream_with_timeouts(
         };
         first_chunk = false;
         let chunk = chunk?;
+        if let Some(recorder) = recorder.as_deref_mut() {
+            recorder.observe(&chunk);
+        }
         text.push_str(&chunk.delta);
         if let Some(r) = chunk.reasoning {
             reasoning.push_str(&r);
@@ -1158,13 +1207,18 @@ mod tests {
                 usage: Some(CompletionUsage {
                     prompt_tokens: Some(10),
                     completion_tokens: Some(5),
+                    ..CompletionUsage::default()
                 }),
             }),
         ]));
         let (_, _, _, usage) = collect_stream(stream).await.unwrap();
         assert_eq!(
             usage,
-            Some(CompletionUsage { prompt_tokens: Some(10), completion_tokens: Some(5) })
+            Some(CompletionUsage {
+                prompt_tokens: Some(10),
+                completion_tokens: Some(5),
+                ..CompletionUsage::default()
+            })
         );
     }
 
