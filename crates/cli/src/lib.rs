@@ -870,7 +870,7 @@ fn run_sessions_subcommand(args: &[String], project_root: &Path) -> anyhow::Resu
         }
         other => {
             eprintln!("error: unknown sessions subcommand '{other}'");
-            eprintln!("available: list, show, events, runtime, resume, prune");
+            eprintln!("available: list, show, events, cache, runtime, resume, prune");
             std::process::exit(1);
         }
     }
