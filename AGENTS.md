@@ -87,11 +87,17 @@ cargo audit
   `scripts/check-hardcoded-colors.sh` in CI; `widgets/` and `theme/` are exempt.
 
 ## Gotchas — do NOT "fix" these without review
-- **cargo-deny exceptions are intentional**: many `RUSTSEC-*` advisories are
-  ignored for unmaintained *transitive* deps, and `wasmtime` is pinned to
-  the **24.0.x** line (v43+ needs a `func_wrap` API migration). Read
-  `deny.toml`
-  justification/scope before changing anything.
+- **cargo-deny exceptions require written justification — not a blanket
+  pass**: many `RUSTSEC-*` advisories are ignored for unmaintained
+  *transitive* deps, but that label alone is insufficient. Each ignore needs a
+  reachability analysis, upstream constraint, or tracked migration in
+  `deny.toml`; new advisories are fixed, not suppressed, unless a genuine
+  blocker is written down. Issue #340 tracks the (accepted, not permanent)
+  backlog of outdated deps toward zero unjustified suppressions. The
+  `wasmtime` **24.0.x** pin (v43+ needs a `func_wrap` API migration) stays —
+  read each entry's justification/scope before changing anything. `cargo deny
+  check` honours those ignores, so it can be green while `cargo audit` is red;
+  run both.
 - **Dependencies**: historical phase comments are not authorization to retain
   unused crates. Add a dependency only for a current, tested need. Wasmtime is
   pinned to the patched 24.0.x line for the current RustSec advisory; do not
