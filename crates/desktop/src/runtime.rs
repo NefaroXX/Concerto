@@ -82,11 +82,20 @@ pub enum DesktopEvent {
         tool_name: String,
         approved: bool,
     },
+    /// The backend retained a checkpoint for the active orchestration run.
+    ResumeRequested {
+        session_id: Ulid,
+    },
     /// Sub-task created in multi-agent mode.
     SubTaskCreated {
         task_id: TaskId,
         role: concerto_core::AgentId,
         description: String,
+    },
+    /// An existing or newly declared sub-task began specialist execution.
+    SubTaskStarted {
+        task_id: TaskId,
+        role: concerto_core::AgentId,
     },
     /// Sub-task completed.
     SubTaskCompleted {
@@ -299,6 +308,9 @@ fn translate_approval_event(event: &BackendEvent) -> Option<DesktopEvent> {
 /// messages or structured subtask events.
 fn translate_coordinator_event(event: &BackendEvent) -> Option<DesktopEvent> {
     match &event.kind {
+        EventKind::ResumeRequested { session_id, .. } => {
+            Some(DesktopEvent::ResumeRequested { session_id: *session_id })
+        }
         EventKind::MultiAgentModeStarted { task_id, subtask_count, .. } => activity(
             "Coordinator",
             format!("Decomposed task {task_id} into {subtask_count} specialist subtasks."),
@@ -315,7 +327,7 @@ fn translate_coordinator_event(event: &BackendEvent) -> Option<DesktopEvent> {
             })
         }
         EventKind::SubTaskStarted { task_id, role } => {
-            activity(format!("{role:?}"), format!("Started subtask {task_id}."))
+            Some(DesktopEvent::SubTaskStarted { task_id: *task_id, role: role.clone() })
         }
         EventKind::SubTaskCompleted { task_id, outcome, role } => {
             Some(DesktopEvent::SubTaskCompleted {
@@ -637,6 +649,18 @@ pub fn route_event(
                 ThinkingKind::Detail,
             );
         }
+        DesktopEvent::SubTaskStarted { task_id, role } => {
+            agent_graph_state.on_subtask_created(agent_graph::SubtaskEvent::Started {
+                task_id: *task_id,
+                role: role.clone(),
+            });
+            chat_state.record_subtask_started(task_id.to_string(), role.as_str());
+            chat_state.add_thinking(
+                role.as_str(),
+                "Started specialist execution".into(),
+                ThinkingKind::Detail,
+            );
+        }
         DesktopEvent::SubTaskCompleted { task_id, outcome, role } => {
             agent_graph_state.on_subtask_created(agent_graph::SubtaskEvent::Completed {
                 task_id: *task_id,
@@ -676,6 +700,8 @@ pub fn route_event(
                 role: role.clone(),
                 on: on.clone(),
             });
+            chat_state
+                .record_subtask_finished(&task_id.to_string(), Some(format!("Blocked on {on:?}")));
             chat_state.add_thinking(role, format!("Blocked on {on:?}"), ThinkingKind::Detail);
         }
         DesktopEvent::SubTaskCancelled { task_id, role, reason } => {
@@ -715,6 +741,9 @@ pub fn route_event(
                 tool_name: tool_name.clone(),
                 approved: *approved,
             });
+        }
+        DesktopEvent::ResumeRequested { .. } => {
+            // Confirms continuation at App level before specialist events arrive.
         }
         DesktopEvent::SessionSaved => {
             // Status bar refresh is handled at App level
@@ -776,6 +805,88 @@ pub fn route_event(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn started_event_reopens_held_graph_and_chat_without_another_creation() {
+        let task_id = TaskId::new();
+        let mut chat = chat::State::new();
+        let mut graph = agent_graph::State::new();
+        let mut tools = tool_log::State::new();
+        let mut memory = memory::State::new();
+        let kinds = [
+            EventKind::SubTaskCreated {
+                task_id,
+                role: AgentId::new("coder"),
+                description: "Repair the implementation".into(),
+            },
+            EventKind::SubTaskNeedsRevision {
+                task_id,
+                role: AgentId::new("coder"),
+                reason: "Execution limit reached".into(),
+            },
+            EventKind::SubTaskStarted { task_id, role: AgentId::new("repairer") },
+            EventKind::SubTaskBlocked {
+                task_id,
+                role: AgentId::new("repairer"),
+                on: vec![TaskId::new()],
+            },
+            EventKind::SubTaskStarted { task_id, role: AgentId::new("repairer") },
+            EventKind::SubTaskCompleted {
+                task_id,
+                role: AgentId::new("repairer"),
+                outcome: "Repair complete".into(),
+            },
+        ];
+        for (index, kind) in kinds.into_iter().enumerate() {
+            let event = Event::new(Ulid::new(), Ulid::new(), kind);
+            let Some(desktop) = translate_event(&event) else {
+                panic!("subtask lifecycle event did not translate");
+            };
+            if index == 2 || index == 4 {
+                assert!(matches!(
+                    &desktop,
+                    DesktopEvent::SubTaskStarted { task_id: id, role }
+                        if *id == task_id && role.as_str() == "repairer"
+                ));
+            }
+            route_event(&desktop, &mut chat, &mut tools, &mut graph, &mut memory);
+            assert_eq!(graph.model.nodes.len(), 1);
+            match index {
+                1 => {
+                    assert_eq!(
+                        graph.model.nodes[0].state,
+                        crate::widgets::agent_graph::NodeState::NeedsRevision
+                    );
+                    assert!(!chat.has_running_subagent());
+                }
+                2 | 4 => {
+                    assert_eq!(
+                        graph.model.nodes[0].state,
+                        crate::widgets::agent_graph::NodeState::Active
+                    );
+                    assert!(chat.agent_running("repairer"));
+                    assert!(!chat.agent_running("coder"));
+                }
+                3 => {
+                    assert_eq!(
+                        graph.model.nodes[0].state,
+                        crate::widgets::agent_graph::NodeState::Blocked
+                    );
+                    assert!(!chat.has_running_subagent());
+                }
+                5 => {
+                    assert_eq!(
+                        graph.model.nodes[0].state,
+                        crate::widgets::agent_graph::NodeState::Completed
+                    );
+                    assert_eq!(graph.model.nodes[0].task_summary, "Repair complete");
+                    assert!(!chat.has_running_subagent());
+                }
+                _ => {}
+            }
+        }
+    }
+
     use super::*;
     use concerto_core::event::{Event, IntentRouteDecision};
     use concerto_core::{AgentId, TaskId};

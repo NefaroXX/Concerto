@@ -1442,6 +1442,191 @@ fn agent_run_completed_clears_run_stage() {
 
 // ── Dispatch-boundary validation (plan §13 Runtime selection) ──────────
 
+#[test]
+fn resume_dispatch_preserves_held_views_when_provider_validation_blocks_start() {
+    use crate::runtime::DesktopEvent;
+    use crate::widgets::agent_graph::NodeState;
+    use concerto_core::AgentId;
+
+    let (mut app, _) = App::new();
+    app.config = None;
+    app.settings.providers.clear();
+    app.multi_agent = true;
+    let task_id = TaskId::new();
+    for event in [
+        DesktopEvent::SubTaskCreated {
+            task_id,
+            role: AgentId::new("coder"),
+            description: "Repair a.rs".into(),
+        },
+        DesktopEvent::SubTaskNeedsRevision {
+            task_id,
+            role: "coder".into(),
+            reason: "Execution limit reached".into(),
+        },
+    ] {
+        let _ = app.update(Message::DesktopEvent(event));
+    }
+    let checkpoint = serde_json::json!({
+        "subtasks": [], "edges": [], "completed_results": {},
+        "total_cost": 0.0, "total_tool_calls": 0, "provider_metrics": [],
+        "all_files": [], "subtask_attempts": {}, "retry_feedback": {}
+    })
+    .to_string();
+    assert!(concerto_orchestrator::checkpoint::GraphCheckpoint::from_json(&checkpoint).is_ok());
+    app.resume_checkpoint_json = Some(checkpoint.clone());
+
+    let _ = app.submit_to_agent("Continue".into());
+    assert_eq!(app.run_status, RunStatus::Idle, "validation must still block dispatch");
+    assert_eq!(app.resume_checkpoint_json.as_deref(), Some(checkpoint.as_str()));
+    assert_eq!(app.agent_graph.model.nodes.len(), 1);
+    assert_eq!(app.agent_graph.model.nodes[0].state, NodeState::NeedsRevision);
+
+    // The backend confirms retention before any resumed specialist dispatch.
+    let session_id = Ulid::new();
+    app.active_session_id = Some(session_id);
+    app.run_status = RunStatus::Running;
+    let event = concerto_core::event::Event::new(
+        Ulid::new(),
+        Ulid::new(),
+        EventKind::ResumeRequested {
+            run_id: Some("run".into()),
+            session_id,
+            message: "Continue".into(),
+        },
+    );
+    let Some(desktop) = crate::runtime::translate_event(&event) else {
+        panic!("resume signal must translate");
+    };
+    assert!(matches!(
+        &desktop,
+        DesktopEvent::ResumeRequested { session_id: id } if *id == session_id
+    ));
+    let _ = app.update(Message::DesktopEvent(desktop));
+    // Once execution begins, the same task row and card reopen without Created.
+    let _ = app.update(Message::DesktopEvent(DesktopEvent::SubTaskStarted {
+        task_id,
+        role: AgentId::new("coder"),
+    }));
+    assert_eq!(app.agent_graph.model.nodes.len(), 1);
+    assert_eq!(app.agent_graph.model.nodes[0].state, NodeState::Active);
+    assert_eq!(app.agent_graph.model.nodes[0].label, "coder: Repair a.rs");
+    assert!(app.chat.agent_running("coder"));
+}
+
+#[test]
+fn fresh_and_single_agent_dispatches_clear_previous_task_views() {
+    use crate::runtime::DesktopEvent;
+    use concerto_core::AgentId;
+
+    for (multi_agent, checkpoint) in [(true, None), (false, Some("old checkpoint".into()))] {
+        let (mut app, _) = App::new();
+        app.config = None;
+        app.settings.providers.clear();
+        app.multi_agent = multi_agent;
+        app.resume_checkpoint_json = checkpoint;
+        let _ = app.update(Message::DesktopEvent(DesktopEvent::SubTaskCreated {
+            task_id: TaskId::new(),
+            role: AgentId::new("coder"),
+            description: "Previous work".into(),
+        }));
+        assert!(app.chat.has_running_subagent());
+        let _ = app.submit_to_agent("New task".into());
+        assert_eq!(app.run_status, RunStatus::Idle);
+        assert!(app.agent_graph.model.nodes.is_empty());
+        assert!(!app.chat.has_running_subagent());
+    }
+}
+
+#[test]
+fn stale_resume_signal_cannot_keep_old_views_for_fresh_specialist_work() {
+    use crate::runtime::DesktopEvent;
+    use concerto_core::AgentId;
+
+    for stale_signal in [false, true] {
+        let (mut app, _) = App::new();
+        app.config = None;
+        app.settings.providers.clear();
+        app.multi_agent = true;
+        let active = Ulid::new();
+        app.active_session_id = Some(active);
+        let old_task = TaskId::new();
+        let _ = app.update(Message::DesktopEvent(DesktopEvent::SubTaskCreated {
+            task_id: old_task,
+            role: AgentId::new("coder"),
+            description: "Previous objective".into(),
+        }));
+        app.resume_checkpoint_json = Some("candidate checkpoint".into());
+        let _ = app.submit_to_agent("A different objective".into());
+        assert_eq!(app.agent_graph.model.nodes.len(), 1, "await the backend decision");
+        if stale_signal {
+            let _ = app.update(Message::DesktopEvent(DesktopEvent::ResumeRequested {
+                session_id: active,
+            }));
+            assert!(app.pending_task_view_reset, "an idle replay cannot confirm resume");
+        }
+        app.run_status = RunStatus::Running;
+        if stale_signal {
+            let _ = app.update(Message::DesktopEvent(DesktopEvent::ResumeRequested {
+                session_id: Ulid::new(),
+            }));
+        }
+        let new_task = TaskId::new();
+        let _ = app.update(Message::DesktopEvent(DesktopEvent::SubTaskCreated {
+            task_id: new_task,
+            role: AgentId::new("reviewer"),
+            description: "Fresh work".into(),
+        }));
+        assert_eq!(app.agent_graph.model.nodes.len(), 1);
+        assert_eq!(app.agent_graph.model.nodes[0].role, AgentId::new("reviewer"));
+        assert!(!app.chat.agent_running("coder"));
+        assert!(app.chat.agent_running("reviewer"));
+        assert!(!app.pending_task_view_reset);
+    }
+}
+
+#[test]
+fn fresh_completion_without_specialists_clears_candidate_views() -> std::io::Result<()> {
+    use crate::runtime::DesktopEvent;
+    use concerto_core::AgentId;
+
+    let dir = tempfile::tempdir()?;
+    let (mut app, _) = App::new();
+    app.project_dir = dir.path().to_path_buf();
+    app.config = None;
+    app.settings.providers.clear();
+    app.multi_agent = true;
+    let _ = app.update(Message::DesktopEvent(DesktopEvent::SubTaskCreated {
+        task_id: TaskId::new(),
+        role: AgentId::new("coder"),
+        description: "Old objective".into(),
+    }));
+    app.resume_checkpoint_json = Some("candidate checkpoint".into());
+    let _ = app.submit_to_agent("Answer a new question".into());
+    app.run_status = RunStatus::Running;
+    let _ = app.update(Message::AgentRunCompleted(
+        None,
+        Box::new(Ok(AgentOutput {
+            task_id: TaskId::new(),
+            session_id: Ulid::new(),
+            final_message: "The answer".into(),
+            files_modified: vec![],
+            tool_call_count: 0,
+            eval_result: None,
+            tool_events: vec![],
+            verification: vec![],
+            project_root: None,
+            completion_status: AgentCompletionStatus::Completed,
+            provider_metrics: vec![],
+            checkpoint_json: None,
+        })),
+    ));
+    assert!(app.agent_graph.model.nodes.is_empty());
+    assert!(!app.chat.has_running_subagent());
+    assert!(!app.pending_task_view_reset);
+    Ok(())
+}
+
 fn push_provider(app: &mut App, id: &str, provider: &str, model: &str) {
     app.settings.providers.push(ProviderConfig {
         id: id.into(),

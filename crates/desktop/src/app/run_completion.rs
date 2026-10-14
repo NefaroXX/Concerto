@@ -1,25 +1,8 @@
-//! The `AgentRunCompleted` arm for [`App`] — NORM slice S43.
+//! Agent-run settlement for [`App`].
 //!
-//! This module owns the single deepest-coupled arm of the root `update`
-//! match: the run-settled teardown that runs exactly once at every agent-run
-//! boundary. It resets the run status/stage, flushes any deferred memory
-//! teardown, closes the open thinking phases, settles the chat tool calls and
-//! the agent graph against the outcome, stores (or clears) the resume
-//! checkpoint, persists the transcript and the active agent graph, reloads the
-//! VFS diff, and returns the session-list + git-summary refresh batch.
-//!
-//! The body moved verbatim from `app.rs` — at the same 12-space arm indent, so
-//! the copy is line-for-line with its origin — and the only structural edit is
-//! the arm becoming one `pub(super)` method taking the full [`Message`] and
-//! re-matching it (the same pattern as the sibling `simple_updates` /
-//! `project_switch` / `delegated_updates` / `event_model_updates` /
-//! `view_dispatch` / `settings_updates` / `navigation_updates` /
-//! `update_routing` groups), so the arm keeps its exact `Task` semantics. The
-//! parent `update` keeps one thin delegating arm; the fallback arm here is
-//! unreachable through the parent dispatcher and is a documented no-op. No
-//! `Message` / `App` shape change and no behavior change: every helper the arm
-//! calls stays in `app.rs`, and the tests in `app.rs`'s `mod tests` stay put
-//! and drive `update()` unchanged.
+//! Clear unconfirmed continuation views when a fresh run settles without any
+//! specialist lifecycle events, then apply the existing outcome, transcript,
+//! checkpoint, graph persistence and session-refresh handling.
 
 use super::*;
 
@@ -36,6 +19,9 @@ impl App {
     pub(super) fn update_run_completed(&mut self, message: Message) -> iced::Task<Message> {
         match message {
             Message::AgentRunCompleted(session_id, res) => {
+                // A discarded checkpoint can settle without specialist events
+                // (e.g. an answer-only task); clear its old presentation here.
+                self.reset_pending_task_views();
                 self.run_status = RunStatus::Idle;
                 self.note_run_settled();
                 // ADR-57 §3a: memory teardown may have been deferred while the

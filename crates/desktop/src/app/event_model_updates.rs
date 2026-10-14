@@ -1,28 +1,9 @@
-//! Backend-event and model/config `App::update()` arms for [`App`] — NORM
-//! slice S38.
+//! Backend event and model/configuration updates for [`App`].
 //!
-//! This module owns two groups of the root update match, extracted from
-//! `app.rs`:
-//!
-//! * [`App::update_desktop_event`] — the `DesktopEvent` arm: the App-level
-//!   spend / cap / run-stage chip updates, the `ErrorOccurred` error toast,
-//!   and the `route_event` fan-out into the chat / tool-log / agent-graph /
-//!   memory view states.
-//! * [`App::update_model_config`] — `SetActiveProvider`, `SetActiveModel`,
-//!   `SetAgentModel`, and `ConfigReloaded` (the active provider/model
-//!   selection + refresh kickoff and the ADR-57 external config reload).
-//!
-//! Bodies moved verbatim at the same 12-space arm indent, so each arm is
-//! line-for-line with its origin; the only structural edit is each group
-//! becoming one `pub(super)` method taking the full [`Message`] and
-//! re-matching it (the same pattern as `views::settings::update_mcp` and
-//! the sibling `simple_updates` / `project_switch` / `delegated_updates`
-//! groups), so every arm keeps its exact early-return `Task` semantics.
-//! The parent `update` keeps one thin delegating arm per group; the
-//! fallback arm in each method is unreachable through the parent
-//! dispatcher and is a documented no-op. No `Message` / `App` shape change
-//! and no behavior change: the tests in `app.rs`'s `mod tests` stay put
-//! and drive `update()` unchanged.
+//! ResumeRequested confirms candidate continuation views for the active session.
+//! The first fresh specialist event clears any unconfirmed candidate before
+//! routing to graph/chat consumers. Spend, stage and settings updates retain
+//! their existing behavior.
 
 use super::*;
 
@@ -43,6 +24,18 @@ impl App {
                 // states. Session-id mismatches are ignored: the chip tracks
                 // the active session, and session switches reset this state.
                 match &evt {
+                    crate::runtime::DesktopEvent::ResumeRequested { session_id }
+                        if self.run_status == RunStatus::Running
+                            && self.active_session_id == Some(*session_id) =>
+                    {
+                        self.pending_task_view_reset = false;
+                    }
+                    crate::runtime::DesktopEvent::SubTaskCreated { .. }
+                    | crate::runtime::DesktopEvent::SubTaskStarted { .. }
+                        if self.run_status == RunStatus::Running =>
+                    {
+                        self.reset_pending_task_views();
+                    }
                     crate::runtime::DesktopEvent::SpendUpdated { total_usd } => {
                         self.live_session_cost = *total_usd;
                         self.reconcile_cap_state(*total_usd);

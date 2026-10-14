@@ -66,6 +66,7 @@ impl From<GraphMessage> for Message {
 #[derive(Debug, Clone)]
 pub enum SubtaskEvent {
     Created { task_id: TaskId, description: String, role: AgentId },
+    Started { task_id: TaskId, role: AgentId },
     Completed { task_id: TaskId, outcome: String, role: String },
     NeedsRevision { task_id: TaskId, reason: String, role: String },
     Blocked { task_id: TaskId, role: String, on: Vec<TaskId> },
@@ -235,24 +236,55 @@ impl State {
             SubtaskEvent::Created { task_id, description, role } => {
                 let role_label = role.as_str().to_string();
                 let compact_description: String = description.chars().take(40).collect();
-                let node_id = self.model.add_node(
-                    format!("{role_label}: {compact_description}"),
-                    NodeState::Active,
-                    role,
-                );
-                self.task_nodes.insert(task_id, node_id);
+                let label = format!("{role_label}: {compact_description}");
+                let node_id = if let Some(node_id) = self.task_nodes.get(&task_id).copied() {
+                    if let Some(node) = self.model.nodes.iter_mut().find(|node| node.id == node_id)
+                    {
+                        node.label = label;
+                        node.role = role;
+                        node.state = NodeState::Active;
+                        node.task_summary.clear();
+                    }
+                    node_id
+                } else {
+                    let node_id = self.model.add_node(label, NodeState::Active, role);
+                    self.task_nodes.insert(task_id, node_id);
+                    node_id
+                };
                 self.selected = Some(node_id);
                 // The agent's stated task is its intent (thinking) and the
                 // start of its work trail (work log).
                 self.add_thinking_log(node_id, format!("Intent: {}", description));
                 self.add_work_log(node_id, format!("Started: {}", description));
             }
+            SubtaskEvent::Started { task_id, role } => {
+                // Continuations publish Started without another Created event.
+                // Use the stable task identity, including after restoring logs.
+                let node_id = if let Some(node_id) = self.task_nodes.get(&task_id).copied() {
+                    node_id
+                } else {
+                    let node_id =
+                        self.model.add_node(role.to_string(), NodeState::Active, role.clone());
+                    self.task_nodes.insert(task_id, node_id);
+                    node_id
+                };
+                if let Some(node) = self.model.nodes.iter_mut().find(|node| node.id == node_id) {
+                    let description = node.label.split_once(": ").map(|(_, text)| text.to_owned());
+                    node.label = description.map_or_else(
+                        || role.to_string(),
+                        |description| format!("{role}: {description}"),
+                    );
+                    node.role = role;
+                    node.state = NodeState::Active;
+                    node.task_summary = "Working".into();
+                }
+                self.selected = Some(node_id);
+                self.add_work_log(node_id, "Started specialist execution".into());
+            }
             SubtaskEvent::Completed { task_id, outcome, role } => {
                 if let Some(node) = self.node_for_event(task_id, &role) {
                     node.state = NodeState::Completed;
-                    if node.task_summary.is_empty() {
-                        node.task_summary = outcome.clone();
-                    }
+                    node.task_summary = outcome.clone();
                     let id = node.id;
                     self.add_work_log(id, format!("Completed: {}", outcome));
                 }
@@ -359,6 +391,7 @@ impl State {
                     text("Agent Details").size(20).color(palette.text),
                     text(format!("Label: {}", node.label)).size(16).color(palette.text),
                     text(format!("State: {:?}", node.state)).size(16).color(palette.text),
+                    text(&node.task_summary).size(14).color(palette.text),
                     text("Logs").size(16).color(palette.primary),
                     thinking_button,
                     work_button,
@@ -457,6 +490,92 @@ fn log_button<'a>(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn restored_held_task_continues_in_its_original_row() -> std::io::Result<()> {
+        let mut state = State::new();
+        let task_id = TaskId::new();
+        state.on_subtask_created(SubtaskEvent::Created {
+            task_id,
+            description: "Repair the file".into(),
+            role: AgentId::new("coder"),
+        });
+        state.add_work_log(0, "Wrote a.rs".into());
+        state.on_subtask_created(SubtaskEvent::NeedsRevision {
+            task_id,
+            reason: "Execution limit reached".into(),
+            role: "coder".into(),
+        });
+        let path = temp_path();
+        state.save_to(&path)?;
+        let mut restored = State::load_from(&path)
+            .ok_or_else(|| std::io::Error::other("graph did not restore"))?;
+        std::fs::remove_file(&path)?;
+        assert_eq!(restored.model.nodes[0].state, NodeState::NeedsRevision);
+
+        restored
+            .on_subtask_created(SubtaskEvent::Started { task_id, role: AgentId::new("repairer") });
+        assert_eq!(restored.model.nodes.len(), 1);
+        assert_eq!(restored.model.nodes[0].state, NodeState::Active);
+        assert_eq!(restored.model.nodes[0].role, AgentId::new("repairer"));
+        assert_eq!(restored.model.nodes[0].label, "repairer: Repair the file");
+        assert_eq!(restored.model.nodes[0].task_summary, "Working");
+        assert_eq!(restored.selected, Some(0));
+        assert!(restored.work_logs[&0].iter().any(|line| line == "Wrote a.rs"));
+        assert!(restored.work_logs[&0].iter().any(|line| line.contains("Execution limit")));
+
+        restored.on_subtask_created(SubtaskEvent::Completed {
+            task_id,
+            outcome: "Repair complete".into(),
+            role: "repairer".into(),
+        });
+        assert_eq!(restored.model.nodes[0].state, NodeState::Completed);
+        assert_eq!(restored.model.nodes[0].task_summary, "Repair complete");
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_creation_updates_the_same_task_without_merging_sibling_roles() {
+        let mut state = State::new();
+        let task_id = TaskId::new();
+        let sibling = TaskId::new();
+        for id in [task_id, sibling] {
+            state.on_subtask_created(SubtaskEvent::Created {
+                task_id: id,
+                description: "Initial work".into(),
+                role: AgentId::new("coder"),
+            });
+        }
+        state.on_subtask_created(SubtaskEvent::Created {
+            task_id,
+            description: "Revised obligation".into(),
+            role: AgentId::new("reviewer"),
+        });
+        assert_eq!(state.model.nodes.len(), 2);
+        assert_eq!(state.model.nodes[0].label, "reviewer: Revised obligation");
+        assert_eq!(state.model.nodes[1].role, AgentId::new("coder"));
+        assert_eq!(state.work_logs[&0].len(), 2);
+        assert_eq!(state.work_logs[&1].len(), 1);
+    }
+
+    #[test]
+    fn started_without_saved_creation_keeps_later_events_addressable() {
+        let mut state = State::new();
+        let task_id = TaskId::new();
+        for _ in 0..2 {
+            state
+                .on_subtask_created(SubtaskEvent::Started { task_id, role: AgentId::new("coder") });
+        }
+        assert_eq!(state.model.nodes.len(), 1);
+        state.on_subtask_created(SubtaskEvent::Failed {
+            task_id,
+            role: "coder".into(),
+            error: "Provider unavailable".into(),
+        });
+        assert_eq!(state.model.nodes[0].state, NodeState::Failed);
+        assert_eq!(state.model.nodes[0].task_summary, "Provider unavailable");
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 

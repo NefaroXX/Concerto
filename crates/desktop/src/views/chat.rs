@@ -904,8 +904,9 @@ impl State {
         }
     }
 
-    /// Record a coordinator dispatch as a new per-run progress card. A repeated
-    /// run id replaces the previous card (replay safety). Entries pushed from
+    /// Record a coordinator dispatch as a per-task progress card. A repeated
+    /// task id retains its original transcript position and owned entries.
+    /// Entries pushed from
     /// here on are attributed via [`Self::owning_run_id`], which keys on this
     /// run id — never on the agent name — so a second concurrent run of the
     /// same agent is a separate card with its own, non-overlapping entries.
@@ -913,8 +914,11 @@ impl State {
         // Bracket the run cleanly: close any open thinking so earlier work
         // can never merge into an entry this run is about to own.
         self.finish_open_thinking();
-        let start_idx = self.entries.len();
-        self.runs.retain(|run| run.run_id != run_id);
+        let start_idx = if let Some(index) = self.runs.iter().position(|run| run.run_id == run_id) {
+            self.runs.remove(index).start_idx
+        } else {
+            self.entries.len()
+        };
         self.runs.push(SubagentRun {
             run_id,
             agent: normalize_agent_id(agent),
@@ -923,6 +927,25 @@ impl State {
             start_idx,
             expanded: true,
         });
+    }
+
+    /// Reopen an existing task card when a specialist continues. Preserve its
+    /// transcript anchor and entry ownership; make it the latest active card
+    /// so new role-scoped thoughts and tool calls attach to this attempt.
+    pub fn record_subtask_started(&mut self, run_id: String, agent: &str) {
+        let Some(index) = self.runs.iter().position(|run| run.run_id == run_id) else {
+            self.record_subtask_created(run_id, agent, String::new());
+            return;
+        };
+        self.finish_open_thinking();
+        let mut run = self.runs.remove(index);
+        if !run.running {
+            run.summary = Some("Working".into());
+        }
+        run.agent = normalize_agent_id(agent);
+        run.running = true;
+        run.expanded = true;
+        self.runs.push(run);
     }
 
     /// Settle a run with an optional terminal digest (completion outcome or
@@ -3068,6 +3091,52 @@ fn input_bar<'a>(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn continued_task_preserves_card_anchor_and_exclusive_entry_ownership() {
+        let mut state = State::new();
+        state.record_subtask_created("held".into(), "coder", "Repair a.rs".into());
+        state.add_thinking("coder", "Wrote a.rs".into(), ThinkingKind::Detail);
+        state.record_subtask_finished("held", Some("Needs revision: turn limit".into()));
+        state.record_subtask_created("sibling".into(), "coder", "Separate task".into());
+        state.add_thinking("coder", "Sibling work".into(), ThinkingKind::Detail);
+        state.record_subtask_finished("sibling", Some("Completed".into()));
+        let original_anchor = state.runs[0].start_idx;
+        let prior_entries = state.run_owned_indices("held");
+
+        state.record_subtask_started("held".into(), "repairer");
+        assert_eq!(state.runs.len(), 2);
+        assert_eq!(state.runs[1].start_idx, original_anchor);
+        assert_eq!(state.runs[1].summary.as_deref(), Some("Working"));
+        assert!(state.agent_running("repairer"));
+        assert!(!state.agent_running("coder"));
+        state.add_thinking("repairer", "Checked live bytes".into(), ThinkingKind::Detail);
+        state.add_tool_call("shell".into(), "cargo test".into());
+        assert_eq!(state.run_owned_indices("held"), vec![0, 2, 3]);
+        assert_eq!(prior_entries, vec![0]);
+        assert_eq!(state.run_owned_indices("sibling"), vec![1]);
+        assert_runs_share_no_entries(&state);
+        assert_eq!(emitted_run_cards(&state), vec!["held", "sibling"]);
+
+        state.record_subtask_finished("held", Some("Completed: repaired".into()));
+        assert!(!state.has_running_subagent());
+        assert_eq!(state.runs[1].summary.as_deref(), Some("Completed: repaired"));
+        assert_eq!(state.run_owned_indices("held"), vec![0, 2, 3]);
+    }
+
+    #[test]
+    fn repeated_creation_preserves_original_card_position_and_prior_work() {
+        let mut state = State::new();
+        state.record_subtask_created("task".into(), "coder", "Initial work".into());
+        state.add_thinking("coder", "Prior work".into(), ThinkingKind::Detail);
+        state.record_subtask_created("task".into(), "coder", "Updated work".into());
+        assert_eq!(state.runs.len(), 1);
+        assert_eq!(state.runs[0].start_idx, 0);
+        assert_eq!(state.run_owned_indices("task"), vec![0]);
+        assert_eq!(state.runs[0].summary.as_deref(), Some("Updated work"));
+        assert_eq!(emitted_run_cards(&state), vec!["task"]);
+    }
+
     use super::*;
 
     #[test]

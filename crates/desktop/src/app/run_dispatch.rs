@@ -1,27 +1,23 @@
-//! Run/dispatch helpers for [`App`] — NORM slice S49.
+//! Run/dispatch helpers for [`App`]: runtime configuration projections,
+//! provider/assignment validation, and run submission.
 //!
-//! This module owns the run-boundary helpers moved verbatim from `app.rs`:
-//! the config-backed runtime projections (`runtime_providers`,
-//! `runtime_assignments`, `runtime_model_names`), the dispatch-boundary
-//! validator (`dispatch_validation_error`), and the run submitter
-//! (`submit_to_agent`) with its async `iced::Task::perform` that captures the
-//! bus/config/memory/VFS/session handles. Every body is line-for-line with
-//! its origin at the same 4-space `impl` indent; the only structural edit is
-//! each method becoming `pub(super)`, which keeps the existing callers — the
-//! `App::new` boot batch, the sibling submodule groups (`update_routing`,
-//! `settings_updates`, `event_model_updates`, `sync_config`), and the tests
-//! in `app.rs`'s `mod tests` — resolving through `self.*` / `app.*` unchanged
-//! (the same visibility pattern as the sibling group modules). No `Message` /
-//! `App` shape change and no behavior change: the async `Task::perform`
-//! timing and ordering inside `submit_to_agent` are preserved exactly.
-//!
-//! Left in `app.rs` deliberately: the sync VFS diff reload
-//! (`load_diff_from_vfs`) and the Settings-save plugin re-collect
-//! (`refresh_plugin_providers`) — neither is a run/dispatch seam.
+//! Fresh runs clear graph rows and chat cards at the dispatch boundary.
+//! Candidate multi-agent continuations retain those views until the backend
+//! confirms resume or starts fresh work. Specialist Started events reactivate
+//! the existing task and its history on confirmed resumes. The
+//! request builder, checkpoint payload and async submission remain unchanged.
 
 use super::*;
 
 impl App {
+    pub(super) fn reset_pending_task_views(&mut self) {
+        if self.pending_task_view_reset {
+            self.agent_graph = views::agent_graph::State::new();
+            self.chat.begin_run();
+            self.pending_task_view_reset = false;
+        }
+    }
+
     /// Validate that the active provider/model and (in multi-agent mode) every
     /// agent assignment resolves to a ready, complete provider. Returns a
     /// human-readable reason when something is incomplete; `None` when ready.
@@ -122,13 +118,14 @@ impl App {
         if self.run_status != RunStatus::Idle {
             return iced::Task::none();
         }
-        // The graph describes one orchestration run, not the lifetime of the
-        // conversation. Reset it at the run boundary even when dispatch
-        // validation fails, so an old phase cannot attach to a newer prompt.
-        self.agent_graph = views::agent_graph::State::new();
-        // Drop the previous run's per-subagent progress cards for the same
-        // reason: a stale card must never attach to the new prompt.
-        self.chat.begin_run();
+        // A local checkpoint is only a candidate: the backend may discard it
+        // for a new objective or invalid scope. ResumeRequested confirms it;
+        // otherwise the first specialist event (or completion) resets the views.
+        self.pending_task_view_reset = self.multi_agent && self.resume_checkpoint_json.is_some();
+        if !self.pending_task_view_reset {
+            self.agent_graph = views::agent_graph::State::new();
+            self.chat.begin_run();
+        }
         // Dispatch-boundary validation: block the run with a clear message if
         // the active provider/model or any agent assignment is incomplete,
         // rather than failing deep inside the orchestrator.
