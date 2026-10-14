@@ -1247,7 +1247,7 @@ name = "concerto-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "camino",
  "chrono",
@@ -1464,7 +1464,7 @@ name = "concerto-orchestrator"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "camino",
  "concerto-api-types",
@@ -1620,7 +1620,7 @@ name = "concerto-tools"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "camino",
  "concerto-api-types",
