@@ -191,6 +191,7 @@ fn ok_run_result(
     tool_calls: u32,
 ) -> Result<AgentRunResult, OrchestratorError> {
     Ok(AgentRunResult {
+        verification: Vec::new(),
         task_id: concerto_core::types::TaskId::new(),
         role: AgentId::new(role),
         outcome: AgentOutcome::Success,
@@ -1055,6 +1056,7 @@ async fn malformed_output_gets_corrective_feedback_retry() {
         AgentId::new("coder"),
         vec![
             Ok(AgentRunResult {
+                verification: Vec::new(),
                 task_id: concerto_core::types::TaskId::new(),
                 role: AgentId::new("coder"),
                 outcome: failure_outcome("the model produced malformed JSON output"),
@@ -1199,6 +1201,7 @@ async fn blocked_dependency_is_diagnosed_and_recovered() {
         AgentId::new("coder"),
         vec![
             Ok(AgentRunResult {
+                verification: Vec::new(),
                 task_id: concerto_core::types::TaskId::new(),
                 role: AgentId::new("coder"),
                 outcome: AgentOutcome::Blocked { on: vec![blocker] },
@@ -1448,6 +1451,7 @@ async fn reviewer_disagreement_sends_revision_and_completes() {
         AgentId::new("coder"),
         vec![
             Ok(AgentRunResult {
+                verification: Vec::new(),
                 task_id: concerto_core::types::TaskId::new(),
                 role: AgentId::new("coder"),
                 outcome: AgentOutcome::NeedsRevision { reason: "missed the error path".into() },

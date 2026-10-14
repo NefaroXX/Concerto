@@ -627,6 +627,7 @@ mod tests {
     #[tokio::test]
     async fn successful_run_publishes_spend_updated_after_settlement() {
         let run_result = AgentRunResult {
+            verification: Vec::new(),
             task_id: TaskId::new(),
             role: AgentId::new("researcher"),
             outcome: AgentOutcome::Success,
@@ -764,6 +765,7 @@ mod tests {
     async fn blocked_outcome_publishes_blocked_not_completed() {
         let blocker = TaskId::new();
         let run_result = AgentRunResult {
+            verification: Vec::new(),
             task_id: TaskId::new(),
             role: AgentId::new("researcher"),
             outcome: AgentOutcome::Blocked { on: vec![blocker] },
@@ -917,6 +919,7 @@ mod tests {
     async fn success_sets_model_and_latency() {
         let task_id = TaskId::new();
         let ok_result = AgentRunResult {
+            verification: Vec::new(),
             task_id,
             role: AgentId::new("researcher"),
             outcome: AgentOutcome::Success,

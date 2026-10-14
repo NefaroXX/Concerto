@@ -38,6 +38,7 @@ impl ExpertAgent for ContinuingAgent {
             progress.final_answer();
         }
         Ok(AgentRunResult {
+            verification: Vec::new(),
             task_id: task.id,
             role: task.role.clone(),
             outcome: progress.outcome(task, "retained a.rs"),

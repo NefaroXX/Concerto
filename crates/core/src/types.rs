@@ -1406,8 +1406,9 @@ pub struct VerificationSummary {
     /// What was checked (workspace-relative path under check, or the eval root).
     #[serde(default)]
     pub scope: String,
-    /// blake3 hex of the checked file's bytes at check time; empty when the
-    /// bytes were unreadable (the record stays display-grade, never evidence).
+    /// blake3 of checked file bytes, or a versioned workspace source-tree
+    /// fingerprint. Empty when coverage is unknown, unreadable or over budget;
+    /// those records remain display data and never count as evidence.
     #[serde(default)]
     pub content_fingerprint: String,
     /// Workspace generation the check ran against (`""` when the producer
@@ -2250,6 +2251,10 @@ pub enum AgentOutcome {
 /// Result of running a single specialist agent on a subtask.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRunResult {
+    /// Runtime-observed canonical checks. Missing on legacy checkpoints.
+    /// A transported record is evidence only after current-state validation.
+    #[serde(default)]
+    pub verification: Vec<VerificationSummary>,
     pub task_id: TaskId,
     pub role: AgentId,
     pub outcome: AgentOutcome,

@@ -1005,6 +1005,7 @@ fn is_model_not_found_error(error: &OrchestratorError) -> bool {
 
 fn failed_attempt_result(task_id: TaskId, role: AgentId, error: String) -> AgentRunResult {
     AgentRunResult {
+        verification: Vec::new(),
         task_id,
         role,
         outcome: AgentOutcome::Failed { error: error.clone() },
@@ -1406,6 +1407,7 @@ fn run_is_stalled(
 /// verdict, so it is never attributed to a specialist role.
 fn acceptance_failure_result(task: &AgentTask, summary: String) -> AgentRunResult {
     AgentRunResult {
+        verification: Vec::new(),
         task_id: task.id,
         role: AgentId::new("coordinator"),
         outcome: AgentOutcome::Failed { error: summary.clone() },
@@ -23898,6 +23900,7 @@ mod tests {
 
     fn coder_with_tool_work_for_runs(count: usize) -> MockExpertAgent {
         let result = AgentRunResult {
+            verification: Vec::new(),
             task_id: TaskId::new(),
             role: AgentId::new("coder"),
             outcome: AgentOutcome::Success,
@@ -24461,6 +24464,7 @@ mod tests {
     #[test]
     fn metrics_from_result_aggregates_fields() {
         let result = AgentRunResult {
+            verification: Vec::new(),
             task_id: TaskId::new(),
             role: AgentId::new("coder"),
             outcome: AgentOutcome::Success,
@@ -24766,6 +24770,7 @@ mod tests {
 
     fn ok_result(role: &str, summary: &str) -> Result<AgentRunResult, OrchestratorError> {
         Ok(AgentRunResult {
+            verification: Vec::new(),
             task_id: TaskId::new(),
             role: AgentId::new(role),
             outcome: AgentOutcome::Success,
@@ -24886,6 +24891,7 @@ mod tests {
     /// must route through the ordinary failed-outcome handling.
     fn ok_failed(role: &str, error: &str) -> Result<AgentRunResult, OrchestratorError> {
         Ok(AgentRunResult {
+            verification: Vec::new(),
             task_id: TaskId::new(),
             role: AgentId::new(role),
             outcome: AgentOutcome::Failed { error: error.into() },
@@ -28882,6 +28888,7 @@ mod tests {
                 written_paths.push(path.clone());
             }
             Ok(AgentRunResult {
+                verification: Vec::new(),
                 task_id: task.id,
                 role: self.id.clone(),
                 outcome: AgentOutcome::Success,
@@ -28927,6 +28934,7 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<AgentRunResult, OrchestratorError> {
             Ok(AgentRunResult {
+                verification: Vec::new(),
                 task_id: task.id,
                 role: AgentId::new("reviewer"),
                 outcome: AgentOutcome::NeedsRevision { reason: "needs more work".into() },
@@ -31007,6 +31015,7 @@ mod tests {
         ledger.completed_results.insert(
             completed,
             AgentRunResult {
+                verification: Vec::new(),
                 task_id: completed,
                 role: AgentId::new("coder"),
                 outcome: AgentOutcome::Success,
@@ -37485,6 +37494,7 @@ mod tests {
     /// A successful `AgentRunResult` for the write-back tests.
     fn success_result(task_id: TaskId, role: &str, summary: &str) -> AgentRunResult {
         AgentRunResult {
+            verification: Vec::new(),
             task_id,
             role: AgentId::new(role),
             outcome: AgentOutcome::Success,
@@ -40189,6 +40199,7 @@ mod tests {
             vec![CoordinatorTurn::Text(String::new())],
         );
         let architect_result = AgentRunResult {
+            verification: Vec::new(),
             task_id: TaskId::new(),
             role: AgentId::new("architect"),
             outcome: AgentOutcome::Success,
@@ -40203,6 +40214,7 @@ mod tests {
             tokens_out: 0,
         };
         let coder_result = AgentRunResult {
+            verification: Vec::new(),
             task_id: TaskId::new(),
             role: AgentId::new("coder"),
             outcome: AgentOutcome::Success,
@@ -40252,6 +40264,7 @@ mod tests {
     /// A successful `AgentRunResult` for the phase-marker test.
     fn phase_run_result(role: &str) -> AgentRunResult {
         AgentRunResult {
+            verification: Vec::new(),
             task_id: TaskId::new(),
             role: AgentId::new(role),
             outcome: AgentOutcome::Success,

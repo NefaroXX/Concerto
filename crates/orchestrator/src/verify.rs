@@ -50,6 +50,8 @@
 //! record (own path/scope/fingerprint) from the cached spawn. A changed file
 //! re-scopes to that file's adapters instead of re-running project-wide work.
 
+mod fingerprint;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -464,6 +466,10 @@ pub fn is_file_scope_record(project_root: &Path, record: &VerificationSummary) -
 /// fingerprint. Any doubt is stale — never fresh.
 pub fn fingerprint_matches(project_root: &Path, record: &VerificationSummary) -> bool {
     let resolved = resolve_verification_path(project_root, &record.path);
+    if record.content_fingerprint.starts_with(fingerprint::WORKSPACE_PREFIX) {
+        return fingerprint::workspace_fingerprint(project_root, &resolved, &CancellationToken::new())
+            .is_some_and(|value| value == record.content_fingerprint);
+    }
     match std::fs::read(&resolved) {
         Ok(bytes) => blake3::hash(&bytes).to_hex().to_string() == record.content_fingerprint,
         Err(_) => false,
@@ -722,11 +728,8 @@ pub async fn sweep_record_with_verifier(
     exit_code: Option<i32>,
     verifier: &str,
 ) -> VerificationSummary {
-    let full = resolve_verification_path(project_root, path);
-    let content_fingerprint = match tokio::fs::read(&full).await {
-        Ok(bytes) => blake3::hash(&bytes).to_hex().to_string(),
-        Err(_) => String::new(),
-    };
+    let content_fingerprint =
+        fingerprint::checked_fingerprint(project_root, path, &CancellationToken::new()).await;
     let mut record = VerificationSummary::new(path.clone(), command, outcome, output)
         .with_verifier(verifier)
         .with_scope(path.as_str())

@@ -476,6 +476,7 @@ fn extract_completed_result(event: &WhiteboardEvent) -> Option<(TaskId, AgentRun
     Some((
         task_id,
         AgentRunResult {
+            verification: Vec::new(),
             task_id,
             role: concerto_core::types::AgentId::new(&role),
             outcome: concerto_core::types::AgentOutcome::Success,
@@ -769,6 +770,7 @@ mod tests {
         completed_results.insert(
             task_id,
             AgentRunResult {
+                verification: Vec::new(),
                 task_id,
                 role: concerto_core::types::AgentId::new("coder"),
                 outcome: concerto_core::types::AgentOutcome::Success,

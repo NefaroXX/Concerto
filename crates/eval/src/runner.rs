@@ -514,6 +514,7 @@ mod tests {
         let factory: AgentFactory = Arc::new(|_desc, _dir| {
             Box::pin(async {
                 Ok(AgentRunResult {
+                    verification: Vec::new(),
                     session_id: None,
                     telemetry: None,
                     completed: false,

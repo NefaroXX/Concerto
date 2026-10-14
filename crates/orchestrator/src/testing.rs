@@ -89,6 +89,7 @@ fn default_stage(id: &AgentId) -> Option<AgentStage> {
 impl MockExpertAgent {
     fn make_run_result(id: AgentId, outcome: AgentOutcome, summary: String) -> AgentRunResult {
         AgentRunResult {
+            verification: Vec::new(),
             task_id: concerto_core::types::TaskId::new(),
             role: id,
             outcome,

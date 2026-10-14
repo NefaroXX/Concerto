@@ -258,6 +258,7 @@ mod tests {
 
     fn result(id: TaskId, summary: &str) -> AgentRunResult {
         AgentRunResult {
+            verification: Vec::new(),
             task_id: id,
             role: AgentId::new("researcher"),
             outcome: AgentOutcome::Success,

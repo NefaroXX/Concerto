@@ -298,6 +298,7 @@ mod tests {
         projection.completed_results.insert(
             dep_id,
             AgentRunResult {
+                verification: Vec::new(),
                 task_id: dep_id,
                 role: AgentId::new("coder"),
                 outcome: AgentOutcome::Success,

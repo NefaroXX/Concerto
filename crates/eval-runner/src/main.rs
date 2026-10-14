@@ -193,6 +193,7 @@ fn config_agent_factory(
 /// non-completed benchmark outcome (never a silently mocked success).
 fn no_provider_result() -> AgentRunResult {
     AgentRunResult {
+        verification: Vec::new(),
         session_id: None,
         telemetry: None,
         completed: false,
@@ -380,6 +381,7 @@ async fn run_agent(
         Err(error) => (false, Vec::new(), 0, format!("Agent failed: {error}"), Default::default()),
     };
     Ok(AgentRunResult {
+        verification: Vec::new(),
         completed,
         files_modified,
         tool_call_count,

@@ -1300,6 +1300,7 @@ mod tests {
         let graph = TaskGraph::new();
         let task_id = TaskId::new();
         let result = AgentRunResult {
+            verification: Vec::new(),
             task_id,
             role: AgentId::new("coder"),
             outcome: AgentOutcome::Success,
@@ -1724,6 +1725,7 @@ mod tests {
 
         // Completed result for the completed task.
         let result = AgentRunResult {
+            verification: Vec::new(),
             task_id: done_id,
             role: AgentId::new("coder"),
             outcome: AgentOutcome::Success,

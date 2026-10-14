@@ -244,7 +244,7 @@ pub fn capture_workspace_snapshot(
 /// True when the immediate file-name component of `path` is on the default
 /// skip list (applied to directories and files alike, matching the indexer's
 /// component-style excludes; `.git` must never leak into planning context).
-fn dir_component_is_skipped(path: &Path) -> bool {
+pub(crate) fn dir_component_is_skipped(path: &Path) -> bool {
     path.file_name()
         .map(|name| {
             let name = name.to_string_lossy();

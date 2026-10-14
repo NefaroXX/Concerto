@@ -793,6 +793,7 @@ impl GenericSpecialistAgent {
                     },
                 );
                 return Ok(AgentRunResult {
+                    verification: Vec::new(),
                     task_id: task.id,
                     role: self.id.clone(),
                     outcome: AgentOutcome::Failed { error: format!("EvalEngine failed: {e}") },
@@ -832,6 +833,7 @@ impl GenericSpecialistAgent {
         );
 
         Ok(AgentRunResult {
+            verification: Vec::new(),
             task_id: task.id,
             role: self.id.clone(),
             outcome: if passed {
@@ -1877,6 +1879,7 @@ impl GenericSpecialistAgent {
         );
 
         Ok(AgentRunResult {
+            verification: Vec::new(),
             task_id: task.id,
             role: self.id.clone(),
             outcome,
@@ -4039,6 +4042,7 @@ mod tests {
         };
         let mut context = AgentContext::new(session);
         context.previous_results.push(AgentRunResult {
+            verification: Vec::new(),
             task_id: TaskId::new(),
             role: AgentId::new("coder"),
             outcome: AgentOutcome::Success,
@@ -4378,6 +4382,7 @@ mod tests {
     /// A pre-existing coder result providing the run's write evidence.
     fn evidence_result(relative_paths: &[&str]) -> AgentRunResult {
         AgentRunResult {
+            verification: Vec::new(),
             task_id: TaskId::new(),
             role: AgentId::new("coder"),
             outcome: AgentOutcome::Success,

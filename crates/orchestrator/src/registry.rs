@@ -762,6 +762,7 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<AgentRunResult, OrchestratorError> {
             Ok(AgentRunResult {
+                verification: Vec::new(),
                 task_id: concerto_core::types::TaskId::new(),
                 role: self.id.clone(),
                 outcome: AgentOutcome::Success,

@@ -546,6 +546,7 @@ impl GenericSpecialistAgent {
         );
 
         Ok(AgentRunResult {
+            verification: Vec::new(),
             task_id: task.id,
             role: self.id.clone(),
             outcome,
