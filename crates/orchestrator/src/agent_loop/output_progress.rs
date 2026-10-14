@@ -186,6 +186,8 @@ mod tests {
             canonical_tool: None,
             canonical_operation: None,
             failure: None,
+            at: None,
+            input_fingerprint: None,
         }
     }
 
@@ -204,6 +206,8 @@ mod tests {
             canonical_tool: Some(canonical_tool.to_string()),
             canonical_operation: canonical_operation.map(str::to_string),
             failure: None,
+            at: None,
+            input_fingerprint: None,
         }
     }
 

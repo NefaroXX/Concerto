@@ -20,6 +20,7 @@ use concerto_core::error::MemoryError;
 use concerto_core::memory::{
     ChunkType, EmbeddingRecord, MemoryChunk, MemoryNamespace, ProjectId, VectorResult,
 };
+use concerto_core::ChunkProvenance;
 
 /// SQLite based implementation of `VectorStore`.
 pub struct SqliteVectorStore {
@@ -568,6 +569,56 @@ impl VectorStore for SqliteVectorStore {
 
     fn supports_chunk_metadata(&self) -> bool {
         true
+    }
+
+    async fn chunk_provenance(
+        &self,
+        project_id: &ProjectId,
+        chunk_ids: &[String],
+        cancel: CancellationToken,
+    ) -> Result<std::collections::HashMap<String, ChunkProvenance>, MemoryError> {
+        use std::collections::HashMap;
+
+        let mut provenance: HashMap<String, ChunkProvenance> = HashMap::new();
+        if chunk_ids.is_empty() || cancel.is_cancelled() {
+            return Ok(provenance);
+        }
+        // Batched IN-windows like `LinkStore::incoming_links`: one bounded
+        // lookup per recall, never a table scan. Tombstoned rows are
+        // excluded exactly like `get_chunks`, so provenance never describes
+        // a chunk recall cannot serve.
+        const BATCH: usize = 200;
+        for window in chunk_ids.chunks(BATCH) {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let placeholders = vec!["?"; window.len()].join(", ");
+            let sql = format!(
+                "SELECT id, created_at, metadata FROM vector_store \
+                 WHERE project_id = ? AND tombstone = 0 AND id IN ({placeholders})"
+            );
+            // AUDITED (sqlx 0.9 `AssertSqlSafe`): static fragments plus a
+            // fixed `?` placeholder list; every filter value is bound below.
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+            query = query.bind(&project_id.0);
+            for id in window {
+                query = query.bind(id.as_str());
+            }
+            let rows = query
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|error| MemoryError::RetrievalFailed(error.to_string()))?;
+            for row in &rows {
+                let id: String = row.get("id");
+                let created_raw: String = row.get("created_at");
+                let created_at = crate::scoring::parse_db_timestamp(&created_raw);
+                let metadata: Option<serde_json::Value> = row
+                    .get::<Option<String>, _>("metadata")
+                    .and_then(|json| serde_json::from_str(&json).ok());
+                provenance.insert(id, ChunkProvenance { created_at, metadata });
+            }
+        }
+        Ok(provenance)
     }
 
     async fn tombstone(

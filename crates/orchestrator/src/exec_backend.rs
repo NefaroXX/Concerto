@@ -48,6 +48,10 @@ impl concerto_eval::EvalProcessExecutor for NativeEvalExecutor {
         };
         result.map_err(|error| match error {
             ToolError::Cancelled => concerto_eval::EvalError::Cancelled,
+            // A policy denial stays a denial across the seam (never a plain
+            // runner failure): verification adapters report it honestly and
+            // never fall back to an ungoverned spawn (ADR-62).
+            ToolError::PolicyDenied { rule } => concerto_eval::EvalError::Denied(rule),
             other => concerto_eval::EvalError::TestRunnerFailed(other.to_string()),
         })
     }

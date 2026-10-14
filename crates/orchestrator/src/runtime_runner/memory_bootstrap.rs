@@ -37,6 +37,7 @@ use concerto_memory::entities::{L1DedupJudge, L1Extractor};
 use concerto_memory::fts::{FullTextStore, SqliteFullTextStore};
 use concerto_memory::indexer::{IndexConfig, ProjectIndexer};
 use concerto_memory::links::LinkStore;
+use concerto_memory::maintenance::MaintenanceLedger;
 use concerto_memory::rag::{CascadeTier, LinkCascadeConfig};
 use concerto_memory::scoring::DECAY_FLOOR_DAYS;
 use concerto_memory::storage::MemoryDb;
@@ -93,11 +94,35 @@ pub(crate) async fn init_memory_system_with_handles(
     // path, vector & FTS stores, optional embedder, background indexing).
     let (project_id, lifecycle, db, pool, data_dir) =
         open_memory_db(project_dir, memory_cancel, data_dir_lock).await?;
-    let (link_store, vector_store, fts_store) = build_memory_stores(&pool, config).await?;
+    // H12: the shared maintenance ledger attached to the link and decision
+    // stores below. The init-retention `TtlManager` builds its own handle to
+    // the SAME table (its constructor derives one from the pool), so every
+    // emitter records into one `maintenance_outcomes` table. Fail-soft: an
+    // unopenable ledger leaves the emitters' observations unrecorded (with a
+    // warning), never failing memory init.
+    let maintenance = match MaintenanceLedger::connect(pool.clone()).await {
+        Ok(ledger) => Some(Arc::new(ledger)),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "maintenance ledger unavailable; maintenance outcomes will not be recorded"
+            );
+            None
+        }
+    };
+    let (link_store, vector_store, fts_store) =
+        build_memory_stores(&pool, config, maintenance.as_deref(), &project_id.0).await?;
     run_memory_retention(&vector_store, &fts_store, &pool, &link_store, &project_id, config).await;
-    let decision_store = Arc::new(DecisionStore::load(db.clone()).await.map_err(|error| {
-        OrchestratorError::AgentLoopError(format!("DecisionStore load error: {error}"))
-    })?);
+    let decision_store = {
+        let store = DecisionStore::load(db.clone()).await.map_err(|error| {
+            OrchestratorError::AgentLoopError(format!("DecisionStore load error: {error}"))
+        })?;
+        let store = match &maintenance {
+            Some(ledger) => store.with_maintenance_ledger(ledger.clone(), project_id.0.clone()),
+            None => store,
+        };
+        Arc::new(store)
+    };
     let task_tree = Arc::new(TaskTreeStore::load(db.clone()).await.map_err(|error| {
         OrchestratorError::AgentLoopError(format!("TaskTreeStore load error: {error}"))
     })?);
@@ -361,13 +386,16 @@ async fn open_memory_db(
 async fn build_memory_stores(
     pool: &sqlx::SqlitePool,
     config: &AppConfig,
+    maintenance: Option<&MaintenanceLedger>,
+    project_id: &str,
 ) -> Result<(Option<Arc<LinkStore>>, Arc<dyn VectorStore>, Arc<dyn FullTextStore>), OrchestratorError>
 {
     // ADR-69 slice 1 link store: built here (over the same pool the vector
     // store uses) so the init retention prunes below can also run the
     // slice-2 orphan-evidence prune against it. Fail-open: an unopenable
     // store leaves links off and memory behaves exactly as before.
-    let link_store = build_link_store(pool, config.memory.max_out_degree).await;
+    let link_store =
+        build_link_store(pool, config.memory.max_out_degree, maintenance, project_id).await;
     let vector_store: Arc<dyn VectorStore> = Arc::new(
         SqliteVectorStore::new(pool.clone())
             .await
@@ -491,12 +519,21 @@ pub(crate) fn build_llm_summarizer(
 pub(crate) async fn build_link_store(
     pool: &sqlx::SqlitePool,
     max_out_degree: Option<usize>,
+    maintenance: Option<&MaintenanceLedger>,
+    project_id: &str,
 ) -> Option<Arc<LinkStore>> {
     match LinkStore::new(pool.clone()).await {
-        Ok(store) => match max_out_degree {
-            Some(cap) => Some(Arc::new(store.with_max_out_degree(cap))),
-            None => Some(Arc::new(store)),
-        },
+        Ok(store) => {
+            let store = match max_out_degree {
+                Some(cap) => store.with_max_out_degree(cap),
+                None => store,
+            };
+            let store = match maintenance {
+                Some(ledger) => store.with_maintenance_ledger(Arc::new(ledger.clone()), project_id),
+                None => store,
+            };
+            Some(Arc::new(store))
+        }
         Err(error) => {
             tracing::warn!(%error, "memory link store not attached; ADR-69 links disabled");
             None

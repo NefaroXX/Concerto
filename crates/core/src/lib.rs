@@ -80,31 +80,36 @@ pub use authorization::{
 // Re-export Phase 4 memory types from the dedicated module.
 pub use memory::{
     ChunkType, Confidence, ConfidenceSource, Decision, DecisionCategory, DecisionId,
-    EmbeddingRecord, EvidenceScore, FactStatusView, FtsResult, MemoryChunk, MemoryEntry,
-    MemoryFilter, MemoryId, MemoryLink, MemoryLinkKind, MemoryNamespace, MemoryQuery, Relevance,
-    TaskNode, TaskNodeId, TaskStatus, VectorResult, WorkingMemorySnapshot, EVIDENCE_SCORE_MAX,
+    EmbeddingRecord, EvidenceScore, EvidentChunk, FactStatusView, FtsResult, MemoryChunk,
+    MemoryEntry, MemoryFilter, MemoryId, MemoryLink, MemoryLinkKind, MemoryNamespace, MemoryQuery,
+    PathObservation, PathObservationSource, RecallSource, Relevance, TaskNode, TaskNodeId,
+    TaskStatus, VectorResult, WorkingMemorySnapshot, EVIDENCE_SCORE_MAX,
 };
 
 // Re-export traits needed by other crates
 pub use traits::approval::{ApprovalDecision, ApprovalSink};
 pub use traits::context_overflow::{ContextOverflowStrategy, NoOpOverflowStrategy, TruncateOldest};
-pub use traits::memory::MemoryStore;
+pub use traits::memory::{project_without_standing, MemoryStore};
 pub use traits::provider::LlmProvider;
-pub use traits::vector_store::{RowIndexFact, VectorStore};
+pub use traits::vector_store::{ChunkProvenance, RowIndexFact, VectorStore};
 
 /// Durable file checkpoints (ADR-82 §4, slice 5): the record envelope, the
 /// sidecar byte budget, the capture grammar, and the restore collaborator
 /// traits the executor restores through.
 pub use checkpoint::{
-    plan_capture, versioned_fs_targets, CaptureKind, CheckpointByteRef, CheckpointExclusion,
-    CheckpointExclusionClass, CheckpointRecord, CheckpointRecordError, CheckpointResource,
-    CheckpointResourceKind, CheckpointScope, CheckpointStatus, CheckpointStore,
-    CheckpointStoreError, MutationCaptureSink, OwnershipConflictInfo, OwnershipOracle,
-    PlannedCapture, PreImageBytes, RestoreError, RestoreMethod, RestoreOutcome, StashRestorer,
-    CHECKPOINT_BLOB_LIMIT_BYTES, CHECKPOINT_LIMITATIONS_MAX_ENTRIES,
-    CHECKPOINT_LIMITATION_MAX_BYTES, CHECKPOINT_METADATA_MAX_ENTRIES,
-    CHECKPOINT_METADATA_MAX_KEY_BYTES, CHECKPOINT_METADATA_MAX_VALUE_BYTES,
-    CHECKPOINT_PATH_MAX_BYTES, CHECKPOINT_RECORD_SCHEMA_VERSION, PARTIAL_SCOPE_LIMITATION,
+    file_checkpoint_coverage, plan_capture, preflight_rollback_guarantee, verify_absent_on_disk,
+    verify_bytes_on_disk, versioned_fs_targets, CaptureKind, CheckpointByteRef,
+    CheckpointExclusion, CheckpointExclusionClass, CheckpointRecord, CheckpointRecordError,
+    CheckpointResource, CheckpointResourceKind, CheckpointScope, CheckpointStatus, CheckpointStore,
+    CheckpointStoreError, CoverageGap, EffectCoverage, EffectKind, EffectSupport,
+    MutationCaptureSink, OwnershipConflictInfo, OwnershipOracle, PlannedCapture, PreImageBytes,
+    PreflightVerdict, RestoreAttemptInfo, RestoreAttemptOutcome, RestoreError, RestoreMethod,
+    RestoreOutcome, RestoreProgressEntry, RestoreProgressItem, RestoreResourceState,
+    RollbackPreflight, StashRestorer, CHECKPOINT_BLOB_LIMIT_BYTES,
+    CHECKPOINT_LIMITATIONS_MAX_ENTRIES, CHECKPOINT_LIMITATION_MAX_BYTES,
+    CHECKPOINT_METADATA_MAX_ENTRIES, CHECKPOINT_METADATA_MAX_KEY_BYTES,
+    CHECKPOINT_METADATA_MAX_VALUE_BYTES, CHECKPOINT_PATH_MAX_BYTES,
+    CHECKPOINT_RECORD_SCHEMA_VERSION, PARTIAL_SCOPE_LIMITATION,
 };
 
 /// Descriptive per-run environment declaration (ADR-82 §2, slice 6): the
@@ -114,6 +119,19 @@ pub use environment_manifest::{
     EnvironmentManifest, ExecutableObservation, FreshnessStamp, ManifestExecutionBackend,
     ManifestToolEntry, PersistenceClass, PolicyScopeDescription, RestoreCapabilities,
     ENVIRONMENT_MANIFEST_DIGEST_MAX_TOOLS, ENVIRONMENT_MANIFEST_SCHEMA_VERSION,
+};
+/// Portable sandbox capability interface (H10, ADR-83): the backend-neutral,
+/// versioned per-profile × per-platform descriptor (isolation in force,
+/// declared resource coverage as H09 offers, explicit tri-state platform
+/// availability, named unrestorable resources). Descriptive only — never an
+/// admission gate, convertible into no policy type.
+pub use sandbox::{
+    current_sandbox_capability_table, sandbox_capability_for, sandbox_capability_table,
+    sandbox_offers_for, ContainerRuntime, PlatformAvailability, RuntimeAvailability,
+    SandboxCapabilityDescriptor, SandboxIsolation, UnrestorableResource, UnrestorableResourceKind,
+    CONTAINER_RECREATION_LIMITATION, MOUNTED_HOST_DATA_UNRESTORABLE, NO_SANDBOX_RESTORE_MILESTONE,
+    OUTSIDE_WRITABLE_LAYER_UNRESTORABLE, REMOTE_SERVICES_UNRESTORABLE,
+    SANDBOX_CAPABILITY_SCHEMA_VERSION, SANDBOX_WINDOWS_DECISION,
 };
 
 /// Typed tool-failure envelope (ADR-82 §1, slice 2): the bounded failure

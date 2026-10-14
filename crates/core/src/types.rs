@@ -1314,6 +1314,32 @@ pub struct ToolExecutionSummary {
     /// existed (legacy checkpoints/transcripts decode with `None`).
     #[serde(default)]
     pub failure: Option<crate::tool_failure::ToolFailure>,
+    /// Wall-clock time the call finished (UTC).
+    ///
+    /// Additive and serde-defaulted: `None` on summaries recorded before the
+    /// field existed (legacy checkpoints/transcripts) and by backends that do
+    /// not stamp time. The read-only eval observation export (H15) carries
+    /// this so a run's tool-call sequence is orderable in wall-clock time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<OffsetDateTime>,
+    /// Canonical input fingerprint for identical-call/retry detection: the
+    /// audit's `input_hash` grammar (BLAKE3 hex of the normalized call
+    /// arguments), the same key the deterministic-failure ledger uses.
+    ///
+    /// A hash, never raw arguments, so no secrets reach a transcript or an
+    /// eval artifact, and an identical retry keeps the same key. `None` when
+    /// the call never reached argument normalization (e.g. a pre-execution
+    /// guard rejection).
+    ///
+    /// **Known limitation (documented, not fixed):** the value is the first
+    /// 16 hex chars of the BLAKE3 digest (64 bits). It is collision-resistant
+    /// for a single run's call set, but like any hash it is reversible for
+    /// low-entropy inputs by enumeration. The 64-bit form is deliberately kept
+    /// identical to the audit-log `input_hash` grammar so option 1 (audit rows)
+    /// and option 2 (the eval observation export) agree on call identity; it is
+    /// not widened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_fingerprint: Option<String>,
 }
 
 /// One structured verification result for a written file.
@@ -2216,7 +2242,15 @@ pub struct AgentContext {
     pub session: SessionContext,
     pub parent_task: Option<AgentTask>,
     pub working_memory: crate::memory::WorkingMemorySnapshot,
-    pub retrieved_chunks: Vec<crate::memory::MemoryChunk>,
+    /// Evidence-bearing recalled chunks for the multi-agent prompt path.
+    ///
+    /// H11/H13: the single-agent path recalls evidence-bearing items
+    /// (`MemoryStore::retrieve_with_evidence` → `EvidentChunk`: source,
+    /// status, why) and so does this field — the coordinator population site
+    /// calls the same evidence-bearing recall, so multi-agent prompts carry
+    /// the same source/status attribution as the single-agent path (rendered
+    /// through `format_evident_memory`).
+    pub retrieved_chunks: Vec<crate::memory::EvidentChunk>,
     pub previous_results: Vec<AgentRunResult>,
     pub budget_remaining_usd: Option<f64>,
     /// Files that the plan expects to exist after this agent completes.
@@ -3484,5 +3518,49 @@ mod tests {
             .with_generation("gen-1")
             .with_evidence_ids(vec!["evt-1".to_string()]);
         assert!(!fresh_failure.is_passing_evidence());
+    }
+
+    /// The plan's explicit zero target, at the taxonomy level: enumerate every
+    /// non-`Passed` verification outcome and prove that none — not even when
+    /// stamped with the complete R2 freshness basis — is ever passing evidence
+    /// or reports as a pass. This is the "skipped/unavailable-as-success"
+    /// property; the historically dangerous cases (`Skipped`, `Unavailable`)
+    /// are asserted directly, and a required-check absence can therefore never
+    /// map to verified completion.
+    #[test]
+    fn no_non_passing_outcome_is_ever_passing_evidence() {
+        let non_passing = [
+            VerificationOutcome::Failed,
+            VerificationOutcome::Skipped,
+            VerificationOutcome::Unavailable,
+            VerificationOutcome::Error,
+            VerificationOutcome::Cancelled,
+        ];
+        for outcome in non_passing {
+            let record = VerificationSummary::new("a.py", "py_compile", outcome, "detail")
+                .with_verifier("concerto-verify-sweep")
+                .with_scope("a.py")
+                .with_content_fingerprint("fp")
+                .with_generation("gen-1")
+                .with_evidence_ids(vec!["evt-1".to_string()]);
+            assert_eq!(record.outcome, Some(outcome));
+            assert!(!record.passed, "`{}` must never set the legacy pass flag", outcome.as_str());
+            assert!(
+                !record.is_passing_evidence(),
+                "`{}` must never count as passing evidence, however fresh",
+                outcome.as_str()
+            );
+            assert!(!record.effective_outcome().is_pass(), "`{}` is not a pass", outcome.as_str());
+        }
+
+        // The single passing outcome, with the same full stamp, is the only
+        // one that counts — the enumeration above is not vacuous.
+        let passing = VerificationSummary::passed("a.py", "py_compile", "ok")
+            .with_verifier("concerto-verify-sweep")
+            .with_scope("a.py")
+            .with_content_fingerprint("fp")
+            .with_generation("gen-1")
+            .with_evidence_ids(vec!["evt-1".to_string()]);
+        assert!(passing.is_passing_evidence(), "a full-stamped pass remains evidence");
     }
 }

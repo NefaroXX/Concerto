@@ -63,6 +63,18 @@
 //! the first describe call observes the fingerprint mismatch, and the revision
 //! bumps exactly once. Fresh-runs and same-config resumes match on the first
 //! comparison and never re-probe.
+//!
+//! # Sandbox capability reporting (H10, ADR-83)
+//!
+//! Every describe rendering carries the run's [`SandboxCapabilityDescriptor`]
+//! (H10 portable capability interface): the run profile evaluated against the
+//! registration-time runtime probe. It is descriptive only — never an
+//! admission gate — and offers no restore coverage (no container/runtime
+//! checkpoint-restore backend ships in this milestone). The probe result is
+//! captured once at registration (the cached system probe: one `PATH` scan
+//! per process, zero subprocess spawns), so reporting performs zero per-call
+//! probes; it is point-in-time observation like the executable set and is
+//! deliberately NOT fingerprinted as config.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -71,6 +83,10 @@ use async_trait::async_trait;
 use concerto_core::environment_manifest::{
     EnvironmentManifest, ManifestExecutionBackend, ManifestToolEntry, PersistenceClass,
     PolicyScopeDescription,
+};
+use concerto_core::sandbox::{
+    detect_container_runtime, sandbox_capability_for, RuntimeAvailability,
+    SandboxCapabilityDescriptor,
 };
 use concerto_core::traits::tool::Tool;
 use concerto_core::traits::PolicyEngine;
@@ -170,10 +186,21 @@ pub struct DescribeFacts {
     /// Sorted registered tool names at registration (plus this tool's own
     /// name), the membership half of the fingerprint.
     pub tool_names: Vec<String>,
+    /// Container-runtime probe result captured at registration (the cached
+    /// system probe — one `PATH` scan per process, zero subprocess spawns),
+    /// so sandbox capability reporting performs zero per-call probes.
+    /// Point-in-time observation like the executable set: deliberately NOT
+    /// fingerprinted as config (a runtime installed mid-session changes what
+    /// is observed, not what the run was configured with).
+    pub sandbox_runtime: RuntimeAvailability,
     /// Probe-candidate override (`None` selects the collector default).
     pub probe_candidates: Option<Vec<String>>,
     /// `PATH`-directory override for hermetic tests (`None` reads `PATH`).
     pub probe_path_dirs: Option<Vec<PathBuf>>,
+    /// H13 `[harness].declared_capabilities`: descriptive labels the operator
+    /// declares for their environment. Descriptive only — never an admission
+    /// gate and never read by any authorization path.
+    pub declared_capabilities: Vec<String>,
 }
 
 impl DescribeFacts {
@@ -299,6 +326,19 @@ pub fn fingerprint_of_manifest(manifest: &EnvironmentManifest) -> String {
     })
 }
 
+/// The run's sandbox capability descriptor (H10): the run profile (or `None`
+/// when unconfigured) evaluated against the registration-time runtime probe.
+///
+/// Pure — zero probes per call. The descriptor is descriptive only (never an
+/// admission gate) and offers no restore coverage: no container/runtime
+/// checkpoint-restore backend ships in this milestone (ADR-83).
+pub fn describe_sandbox_capability(facts: &DescribeFacts) -> SandboxCapabilityDescriptor {
+    sandbox_capability_for(
+        facts.sandbox_profile.unwrap_or(SandboxProfile::None),
+        &facts.sandbox_runtime,
+    )
+}
+
 /// Mutable per-run describe cache behind [`SharedDescribeState`].
 pub struct DescribeState {
     /// The cached manifest: barrier-populated on the coordinator path, lazily
@@ -386,6 +426,13 @@ pub fn register_describe_tool(
         tool_names,
         probe_candidates: None,
         probe_path_dirs: None,
+        declared_capabilities: config
+            .harness
+            .as_ref()
+            .map(|harness| harness.declared_capabilities.clone())
+            .unwrap_or_default(),
+        // One cached probe at registration: zero per-call probes after this.
+        sandbox_runtime: detect_container_runtime(),
     };
     let state = new_shared_state(facts, Arc::new(SystemVersionProber::default()), pool);
     registry.register(Box::new(EnvironmentDescribeTool { state: state.clone() }));
@@ -420,7 +467,11 @@ fn effective_cap(requested: Option<u32>, default: usize, ceiling: usize) -> usiz
 /// Bounded summary rendering: the manifest digest plus scalar
 /// revision/freshness/count fields. Complete by construction — the digest
 /// itself folds the tool list, so no truncation flags are needed.
-fn render_summary(manifest: &EnvironmentManifest) -> ToolOutput {
+fn render_summary(
+    manifest: &EnvironmentManifest,
+    sandbox_capability: &SandboxCapabilityDescriptor,
+    declared_capabilities: &[String],
+) -> ToolOutput {
     let backend = manifest.backend.map_or("unknown", |backend| backend.as_str());
     ToolOutput {
         summary: manifest.summary(),
@@ -441,6 +492,8 @@ fn render_summary(manifest: &EnvironmentManifest) -> ToolOutput {
             "policy_scope": manifest.policy_scope,
             "persistence": manifest.persistence.iter().map(|class| class.as_str()).collect::<Vec<_>>(),
             "restore": manifest.restore,
+            "sandbox_capability": sandbox_capability,
+            "declared_capabilities": declared_capabilities,
             "summary": manifest.summary(),
         }),
     }
@@ -453,6 +506,8 @@ fn render_full(
     manifest: &EnvironmentManifest,
     max_tools: Option<u32>,
     max_executables: Option<u32>,
+    sandbox_capability: &SandboxCapabilityDescriptor,
+    declared_capabilities: &[String],
 ) -> ToolOutput {
     let tools_cap = effective_cap(
         max_tools,
@@ -488,6 +543,14 @@ fn render_full(
         object.insert("total_tools".to_string(), total_tools.into());
         object.insert("truncated_executables".to_string(), truncated_executables.into());
         object.insert("total_executables".to_string(), total_executables.into());
+        object.insert(
+            "sandbox_capability".to_string(),
+            serde_json::to_value(sandbox_capability).unwrap_or(serde_json::Value::Null),
+        );
+        object.insert(
+            "declared_capabilities".to_string(),
+            serde_json::to_value(declared_capabilities).unwrap_or(serde_json::Value::Null),
+        );
     }
     ToolOutput {
         summary: format!(
@@ -679,11 +742,23 @@ impl Tool for EnvironmentDescribeTool {
             });
         };
 
+        // H10: the run's sandbox capability rides every describe rendering —
+        // computed pure from the registration-time facts (zero per-call
+        // probes), descriptive only, offering no restore coverage.
+        let sandbox_capability = describe_sandbox_capability(&snapshot.facts);
         Ok(match parsed.detail {
-            DescribeDetail::Summary => render_summary(&manifest),
-            DescribeDetail::Full => {
-                render_full(&manifest, parsed.max_tools, parsed.max_executables)
-            }
+            DescribeDetail::Summary => render_summary(
+                &manifest,
+                &sandbox_capability,
+                &snapshot.facts.declared_capabilities,
+            ),
+            DescribeDetail::Full => render_full(
+                &manifest,
+                parsed.max_tools,
+                parsed.max_executables,
+                &sandbox_capability,
+                &snapshot.facts.declared_capabilities,
+            ),
         })
     }
 }
@@ -788,6 +863,12 @@ mod tests {
                 "probe-missing-xyz".to_string(),
             ]),
             probe_path_dirs: Some(vec![dir.to_path_buf()]),
+            // Hermetic runtime: tests control the probe result, so sandbox
+            // reporting never depends on the host's docker/podman.
+            sandbox_runtime: RuntimeAvailability::Unavailable {
+                reason: "test: no container runtime".to_string(),
+            },
+            declared_capabilities: vec!["test-declared".to_string()],
         }
     }
 
@@ -893,6 +974,131 @@ mod tests {
         assert_eq!(entries[1].verdict, "ExecutionSucceeded");
         assert_eq!(entries[1].tool_name, ENVIRONMENT_DESCRIBE_TOOL_NAME);
         assert_eq!(entries[0].correlation_id, entries[1].correlation_id);
+    }
+
+    #[tokio::test]
+    async fn describe_reports_the_sandbox_capability() {
+        // H10: every describe rendering carries the run's sandbox capability
+        // descriptor — hermetic here (the facts' canned probe), so no host
+        // runtime can change the verdicts.
+        let exe_dir = fake_exe_dir();
+        let root = tempfile::tempdir().expect("tempdir created");
+        let facts = hermetic_facts(
+            root.path(),
+            vec![ENVIRONMENT_DESCRIBE_TOOL_NAME.to_string()],
+            exe_dir.path(),
+        );
+        let (state, _prober) = test_state(facts, CountingProber::default());
+        let tool = EnvironmentDescribeTool::with_state(state);
+        let session = test_session(root.path().to_path_buf());
+        let policy = SimplePolicyEngine::new(vec![], Arc::new(TestAudit));
+
+        let summary = tool
+            .execute(serde_json::json!({}), &policy, &session, CancellationToken::new())
+            .await
+            .expect("summary executes");
+        let capability = &summary.data["sandbox_capability"];
+        assert_eq!(capability["schema_version"], 1);
+        assert_eq!(capability["profile"], "None");
+        assert_eq!(capability["isolation"], "unconfined");
+        // (Externally tagged: {"unavailable": {"reason": …}}.)
+        assert!(
+            !capability["linux"]["unavailable"]["reason"].as_str().expect("reason").is_empty(),
+            "the Unavailable reason is the report: {capability}"
+        );
+        assert!(
+            capability["linux"]["unavailable"]["reason"]
+                .as_str()
+                .expect("reason")
+                .contains("no sandbox isolation"),
+            "unconfined reports Unavailable with a reason: {capability}"
+        );
+        assert_eq!(capability["windows"]["unsupported_by_decision"]["decision"], "ADR-72 §5");
+        assert!(
+            !capability["windows"]["unsupported_by_decision"]["reason"]
+                .as_str()
+                .expect("reason")
+                .is_empty(),
+            "the decision carries its reason: {capability}"
+        );
+        let unrestorable: Vec<&str> = capability["cannot_restore"]
+            .as_array()
+            .expect("cannot_restore array")
+            .iter()
+            .map(|entry| entry["kind"].as_str().expect("kind string"))
+            .collect();
+        for expected in ["mounted_host_data", "remote_services", "outside_container_writable_layer"]
+        {
+            assert!(unrestorable.contains(&expected), "named unrestorable: {unrestorable:?}");
+        }
+        // The reported coverage refuses shell/network through H09's
+        // preflight (adaptation, not a preflight fork).
+        let coverage: Vec<concerto_core::checkpoint::EffectCoverage> =
+            serde_json::from_value(capability["coverage"].clone()).expect("coverage decodes");
+        let report = concerto_core::checkpoint::preflight_rollback_guarantee(
+            &[
+                concerto_core::checkpoint::EffectKind::File,
+                concerto_core::checkpoint::EffectKind::Shell,
+                concerto_core::checkpoint::EffectKind::Network,
+            ],
+            &coverage,
+        );
+        assert_eq!(report.verdict, concerto_core::checkpoint::PreflightVerdict::Refused);
+
+        // Full detail carries the same descriptor.
+        let full = tool
+            .execute(
+                serde_json::json!({"detail": "full"}),
+                &policy,
+                &session,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("full executes");
+        assert_eq!(full.data["sandbox_capability"]["schema_version"], 1);
+        assert_eq!(
+            full.data["sandbox_capability"]["windows"]["unsupported_by_decision"]["decision"],
+            "ADR-72 §5"
+        );
+    }
+
+    #[tokio::test]
+    async fn describe_honors_a_found_runtime_without_probing_windows() {
+        // Failure injection the other way: a FOUND runtime is Available on
+        // Linux/macOS yet Windows stays decided — the decision ignores the
+        // probe (a probe would be a lie).
+        use concerto_core::sandbox::ContainerRuntime;
+        let exe_dir = fake_exe_dir();
+        let root = tempfile::tempdir().expect("tempdir created");
+        let mut facts = hermetic_facts(
+            root.path(),
+            vec![ENVIRONMENT_DESCRIBE_TOOL_NAME.to_string()],
+            exe_dir.path(),
+        );
+        facts.sandbox_profile = Some(SandboxProfile::Containerized);
+        facts.sandbox_runtime = RuntimeAvailability::Available(ContainerRuntime::Docker);
+        let (state, _prober) = test_state(facts, CountingProber::default());
+        let tool = EnvironmentDescribeTool::with_state(state);
+        let session = test_session(root.path().to_path_buf());
+        let policy = SimplePolicyEngine::new(vec![], Arc::new(TestAudit));
+        let output = tool
+            .execute(serde_json::json!({}), &policy, &session, CancellationToken::new())
+            .await
+            .expect("describe executes");
+        let capability = &output.data["sandbox_capability"];
+        assert_eq!(capability["profile"], "Containerized");
+        assert!(
+            capability["linux"]["available"]["detail"].as_str().expect("detail").contains("docker"),
+            "found runtime is honored where probes are meaningful: {capability}"
+        );
+        assert_eq!(capability["windows"]["unsupported_by_decision"]["decision"], "ADR-72 §5");
+        assert!(
+            capability["windows"]["unsupported_by_decision"]["reason"]
+                .as_str()
+                .expect("reason")
+                .contains("not consulted"),
+            "Windows ignores the found runtime: {capability}"
+        );
     }
 
     #[tokio::test]

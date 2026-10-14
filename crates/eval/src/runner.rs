@@ -9,12 +9,14 @@ use std::time::Instant;
 
 use camino::Utf8PathBuf;
 
+use crate::observation::AgentObservation;
 use crate::EvalEngine;
 use concerto_core::error::EvalError;
 use concerto_core::types::{BenchmarkReport, BenchmarkResult, EvalTask};
 use concerto_core::CancellationToken;
 
 /// The result of running a single agent task.
+#[derive(Debug, Clone, Default)]
 pub struct AgentRunResult {
     pub completed: bool,
     pub files_modified: Vec<String>,
@@ -23,6 +25,20 @@ pub struct AgentRunResult {
     pub total_tokens: u64,
     pub total_cost_usd: f64,
     pub interventions: u32,
+    /// Read-only observation export (H15): the ordered tool-call sequence and
+    /// typed verification stamps for this run. `Default` (empty) for callers
+    /// that do not populate it; populated by the live eval factory from the
+    /// agent output it already holds.
+    pub observation: AgentObservation,
+}
+
+/// A suite run plus the read-only per-task observation exports.
+///
+/// `observations` is positionally aligned with
+/// [`BenchmarkReport::individual_results`] — same length, same task order.
+pub struct ObservedSuiteRun {
+    pub report: BenchmarkReport,
+    pub observations: Vec<AgentObservation>,
 }
 
 /// Factory function that creates an agent runner for a given task.
@@ -174,8 +190,12 @@ impl EvalRunner {
         Ok(tasks)
     }
 
-    /// Execute a single task and produce a benchmark result.
-    async fn run_task(&self, task: &EvalTask) -> Result<BenchmarkResult, EvalError> {
+    /// Execute a single task and produce a benchmark result plus its
+    /// read-only observation export.
+    async fn run_task(
+        &self,
+        task: &EvalTask,
+    ) -> Result<(BenchmarkResult, AgentObservation), EvalError> {
         let start = Instant::now();
 
         // Scratch copy of the task snapshot, created on disk (never in the
@@ -246,18 +266,21 @@ impl EvalRunner {
 
             let time_ms = start.elapsed().as_millis() as u64;
 
-            Ok(BenchmarkResult {
-                task_id: task.id,
-                task_description: task.description.clone(),
-                completed: agent_result.completed && eval_res.passed,
-                interventions: agent_result.interventions,
-                total_tokens: agent_result.total_tokens,
-                total_cost_usd: agent_result.total_cost_usd,
-                time_to_complete_ms: time_ms,
-                tests_passing_after: eval_res.passed,
-                files_correctly_modified: files_correctly_modified as f32,
-                agent_outcome: agent_result.final_message,
-            })
+            Ok((
+                BenchmarkResult {
+                    task_id: task.id,
+                    task_description: task.description.clone(),
+                    completed: agent_result.completed && eval_res.passed,
+                    interventions: agent_result.interventions,
+                    total_tokens: agent_result.total_tokens,
+                    total_cost_usd: agent_result.total_cost_usd,
+                    time_to_complete_ms: time_ms,
+                    tests_passing_after: eval_res.passed,
+                    files_correctly_modified: files_correctly_modified as f32,
+                    agent_outcome: agent_result.final_message,
+                },
+                agent_result.observation,
+            ))
         } else {
             // Fallback mode: just run the (scratch-copied) project's test suite.
             let engine = EvalEngine::new(&temp_path);
@@ -272,29 +295,41 @@ impl EvalRunner {
 
             let time_ms = start.elapsed().as_millis() as u64;
 
-            Ok(BenchmarkResult {
-                task_id: task.id,
-                task_description: task.description.clone(),
-                completed: eval_res.passed,
-                interventions: 0,
-                total_tokens: 0,
-                total_cost_usd: 0.0,
-                time_to_complete_ms: time_ms,
-                tests_passing_after: eval_res.passed,
-                files_correctly_modified: if eval_res.passed { 1.0 } else { 0.0 },
-                agent_outcome: "fallback: test-suite-only".into(),
-            })
+            Ok((
+                BenchmarkResult {
+                    task_id: task.id,
+                    task_description: task.description.clone(),
+                    completed: eval_res.passed,
+                    interventions: 0,
+                    total_tokens: 0,
+                    total_cost_usd: 0.0,
+                    time_to_complete_ms: time_ms,
+                    tests_passing_after: eval_res.passed,
+                    files_correctly_modified: if eval_res.passed { 1.0 } else { 0.0 },
+                    agent_outcome: "fallback: test-suite-only".into(),
+                },
+                AgentObservation::default(),
+            ))
         }
     }
 
     /// Execute the suite and produce a benchmark report.
     pub async fn run_suite(&self) -> Result<BenchmarkReport, EvalError> {
+        Ok(self.run_suite_observed().await?.report)
+    }
+
+    /// Execute the suite, returning the benchmark report **and** the
+    /// read-only per-task observation exports (positionally aligned with
+    /// `report.individual_results`).
+    pub async fn run_suite_observed(&self) -> Result<ObservedSuiteRun, EvalError> {
         let tasks = self.load_tasks()?;
         let mut results = Vec::new();
+        let mut observations = Vec::new();
 
         for task in &tasks {
-            let result = self.run_task(task).await?;
+            let (result, observation) = self.run_task(task).await?;
             results.push(result);
+            observations.push(observation);
         }
 
         // Aggregate metrics.
@@ -325,14 +360,17 @@ impl EvalRunner {
             results.iter().map(|r| r.interventions as f32).sum::<f32>() / task_count as f32
         };
 
-        Ok(BenchmarkReport {
-            task_count,
-            pass_rate,
-            avg_latency_ms,
-            avg_cost_usd,
-            avg_tokens,
-            avg_interventions,
-            individual_results: results,
+        Ok(ObservedSuiteRun {
+            report: BenchmarkReport {
+                task_count,
+                pass_rate,
+                avg_latency_ms,
+                avg_cost_usd,
+                avg_tokens,
+                avg_interventions,
+                individual_results: results,
+            },
+            observations,
         })
     }
 }
@@ -450,6 +488,7 @@ mod tests {
                     total_tokens: 0,
                     total_cost_usd: 0.0,
                     interventions: 0,
+                    observation: Default::default(),
                 })
             })
         });

@@ -563,6 +563,14 @@ pub struct AppConfig {
     #[serde(default)]
     pub agent: Option<AgentConfig>,
 
+    /// `[harness]` — the H13 shared settings home for harness operations
+    /// (checkpoint retention, recall limit, verifier selection, capability
+    /// declarations). `None` (no `[harness]` section) keeps today's behavior.
+    /// Additive serde-default only: every pre-existing config loads unchanged
+    /// and needs no schema-version bump. All client/operator-controlled.
+    #[serde(default)]
+    pub harness: Option<HarnessConfig>,
+
     /// ADR-58 `[orchestration]` — the Orchestration Blueprint pipeline.
     ///
     /// `None` (no `[orchestration]` table) keeps the engine's embedded
@@ -665,6 +673,7 @@ impl Default for AppConfig {
             tool_settings: None,
             audit: None,
             agent: None,
+            harness: None,
             orchestration: None,
             resolved_blueprint: None,
             agent_files_authoritative: false,
@@ -902,6 +911,108 @@ pub struct AuditConfig {
     /// readable while `encrypt_at_rest` stays enabled with the same key.
     #[serde(default)]
     pub archive_dir: Option<Utf8PathBuf>,
+}
+
+// ---- [harness]: H13 shared harness operations settings -----------------------
+
+/// `[harness]` — the ONE settings home for the H13 harness operations
+/// (`environment.describe`, `checkpoint.create/inspect/restore`, `verify.run`,
+/// `memory.recall/inspect`).
+///
+/// Additive serde-default only: a config without a `[harness]` section keeps
+/// today's behavior exactly (no automatic checkpoint retention, recall's
+/// built-in 5-chunk default, `verify.run`'s `all` selector, no declared
+/// capabilities), so no schema-version bump is needed.
+///
+/// **Every key here is client/operator-controlled.** None of them feeds the
+/// policy engine, the write gate, or the sandbox ceiling — they tune how much
+/// the local operator's own harness retains and which verifier it prefers.
+/// Security-impacting configuration stays in `[policy]`, `[shell_security]`,
+/// and `project_roots`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct HarnessConfig {
+    /// Days a file-checkpoint byte row is retained before the operator-invoked
+    /// prune collects it. `None` (the default) or `0` keeps every row forever.
+    /// This never runs automatically: it is the window
+    /// `concerto harness checkpoint prune` applies when no explicit
+    /// `--retention-days` overrides it.
+    #[serde(default)]
+    pub checkpoint_retention_days: Option<u64>,
+
+    /// Default `memory.recall` `top_k` when the caller omits one. `None` uses
+    /// the operation's built-in default (5). Validated to `1..=50`, the
+    /// operation's ceiling.
+    #[serde(default)]
+    pub recall_limit: Option<u32>,
+
+    /// Default `verify.run` verifier selector when the caller omits one.
+    /// One of `all`, `project-tests`, `build`, `lsp-diagnostics`,
+    /// `existence` (plus the documented aliases). `None` uses `all`.
+    #[serde(default)]
+    pub verify_selector: Option<String>,
+
+    /// Descriptive capability declarations surfaced by `environment.describe`.
+    /// Purely descriptive labels (e.g. `sandboxed-ci`); they never widen a
+    /// policy decision and are not read by any authorization path.
+    #[serde(default)]
+    pub declared_capabilities: Vec<String>,
+}
+
+impl HarnessConfig {
+    /// Validate at config load time (mirrors `MemoryConfig::validate`).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.recall_limit.is_some_and(|limit| !(1..=50).contains(&limit)) {
+            return Err(ConfigError::InvalidValue(
+                "harness.recall_limit must be between 1 and 50".into(),
+            ));
+        }
+        if self.checkpoint_retention_days.is_some_and(|days| days > 3650) {
+            return Err(ConfigError::InvalidValue(
+                "harness.checkpoint_retention_days must be 0 (keep all) or at most 3650".into(),
+            ));
+        }
+        if let Some(selector) = self.verify_selector.as_deref().map(str::trim) {
+            if !selector.is_empty() {
+                let known = [
+                    "all",
+                    "project-tests",
+                    "project_tests",
+                    "eval",
+                    "build",
+                    "build-check",
+                    "build_check",
+                    "syntax",
+                    "lsp",
+                    "lsp-diagnostics",
+                    "lsp_diagnostics",
+                    "diagnostics",
+                    "existence",
+                    "reference",
+                    "reference-check",
+                    "references",
+                ];
+                if !known.iter().any(|name| name.eq_ignore_ascii_case(selector)) {
+                    return Err(ConfigError::InvalidValue(format!(
+                        "harness.verify_selector '{selector}' is unknown: expected one of all|project-tests|build|lsp-diagnostics|existence"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The effective `memory.recall` `top_k`: the configured value or the
+    /// operation's built-in default (5), clamped to the operation ceiling.
+    #[must_use]
+    pub fn effective_recall_limit(&self) -> u32 {
+        self.recall_limit.unwrap_or(5).clamp(1, 50)
+    }
+
+    /// The effective `verify.run` selector label (trimmed), if configured.
+    #[must_use]
+    pub fn effective_verify_selector(&self) -> Option<&str> {
+        self.verify_selector.as_deref().map(str::trim).filter(|value| !value.is_empty())
+    }
 }
 
 // ---- [agent]: single-agent completion-honesty gate (ADR-82 slice 4) ----------
@@ -2482,6 +2593,51 @@ mod tests {
         encrypted.audit = Some(AuditConfig { encrypt_at_rest: true, ..AuditConfig::default() });
         assert_ne!(base, encrypted, "audit settings must participate in AppConfig equality");
         assert_eq!(base, base.clone());
+    }
+
+    /// `[harness]` is additive: a config without the section has `None`, and a
+    /// bare section parses to defaults.
+    #[test]
+    fn harness_section_is_additive_and_defaults() {
+        let bare: AppConfig = toml::from_str("schema_version = 8\n").expect("must parse");
+        assert_eq!(bare.harness, None, "no [harness] section -> None");
+        let parsed: AppConfig = toml::from_str("schema_version = 8\n[harness]\n").expect("parse");
+        assert_eq!(parsed.harness, Some(HarnessConfig::default()));
+    }
+
+    /// `[harness]` keys round-trip and validation enforces the recall bound and
+    /// a known verifier selector.
+    #[test]
+    fn harness_config_round_trips_and_validates() {
+        let parsed: AppConfig = toml::from_str(
+            "schema_version = 8\n[harness]\ncheckpoint_retention_days = 30\nrecall_limit = 7\n\
+             verify_selector = \"build\"\ndeclared_capabilities = [\"sandboxed-ci\"]\n",
+        )
+        .expect("parse");
+        let harness = parsed.harness.as_ref().expect("[harness] present");
+        assert_eq!(harness.checkpoint_retention_days, Some(30));
+        assert_eq!(harness.effective_recall_limit(), 7);
+        assert_eq!(harness.effective_verify_selector(), Some("build"));
+        assert_eq!(harness.declared_capabilities, vec!["sandboxed-ci".to_string()]);
+        harness.validate().expect("valid harness config");
+
+        let encoded = toml::to_string(&parsed).expect("serialize");
+        let back: AppConfig = toml::from_str(&encoded).expect("reparse");
+        assert_eq!(back, parsed, "[harness] must survive a settings round-trip");
+    }
+
+    #[test]
+    fn harness_config_rejects_out_of_range_and_unknown_selector() {
+        let over = HarnessConfig { recall_limit: Some(51), ..HarnessConfig::default() };
+        assert!(over.validate().is_err(), "recall limit above the operation ceiling is rejected");
+        let zero = HarnessConfig { recall_limit: Some(0), ..HarnessConfig::default() };
+        assert!(zero.validate().is_err(), "a zero recall limit is rejected");
+        let bad_selector =
+            HarnessConfig { verify_selector: Some("nonsense".into()), ..HarnessConfig::default() };
+        assert!(bad_selector.validate().is_err(), "an unknown verifier selector is rejected");
+        let retention =
+            HarnessConfig { checkpoint_retention_days: Some(4000), ..HarnessConfig::default() };
+        assert!(retention.validate().is_err(), "an absurd retention window is rejected");
     }
 
     #[test]

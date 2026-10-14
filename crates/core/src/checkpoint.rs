@@ -682,6 +682,61 @@ pub trait CheckpointStore: Send + Sync {
         missing: Vec<String>,
         cancel: CancellationToken,
     ) -> Result<(), CheckpointStoreError>;
+
+    /// Load the durable per-resource restore progress for `checkpoint_id`
+    /// (the crash-recovery journal, migration 040 on the sessions sidecar).
+    ///
+    /// The default is "no durable progress" (empty): a store without a
+    /// journal degrades to full re-verify — the restore rewrites every
+    /// resource through the normal gated path — never to "assume done".
+    async fn load_restore_progress(
+        &self,
+        _checkpoint_id: &str,
+        _cancel: CancellationToken,
+    ) -> Result<Vec<RestoreProgressEntry>, CheckpointStoreError> {
+        Ok(Vec::new())
+    }
+
+    /// Upsert one resource's restore progress. The durable implementation is
+    /// monotonic (`running` never overwrites `done`; `done` always wins) so
+    /// concurrent duplicate submissions cannot regress a landed write.
+    ///
+    /// Bookkeeping only: failures here must stay fail-soft at the call site
+    /// (warn and continue with the gated restore), never fail-closed — the
+    /// degraded mode is "unknown progress, re-verify", and every write stays
+    /// policy-gated and ownership-checked regardless.
+    async fn record_restore_progress(
+        &self,
+        _checkpoint_id: &str,
+        _entry: &RestoreProgressEntry,
+        _cancel: CancellationToken,
+    ) -> Result<(), CheckpointStoreError> {
+        Ok(())
+    }
+
+    /// Open one restore attempt (`attempt_id` PRIMARY KEY, `INSERT OR
+    /// IGNORE` semantics: re-submitting the same attempt id replays instead
+    /// of forking — the gate's `call_id` dedup contract at attempt
+    /// granularity).
+    async fn begin_restore_attempt(
+        &self,
+        _attempt: &RestoreAttemptInfo,
+        _cancel: CancellationToken,
+    ) -> Result<(), CheckpointStoreError> {
+        Ok(())
+    }
+
+    /// Stamp one attempt's terminal outcome (`restored` | `partial` |
+    /// `failed` | `cancelled`). Bookkeeping like the progress rows above.
+    async fn finish_restore_attempt(
+        &self,
+        _attempt_id: &str,
+        _outcome: RestoreAttemptOutcome,
+        _finished_at_ms: i64,
+        _cancel: CancellationToken,
+    ) -> Result<(), CheckpointStoreError> {
+        Ok(())
+    }
 }
 
 /// Read side of the ownership table for restore: `None` means unowned (the
@@ -720,6 +775,220 @@ pub trait MutationCaptureSink: Send + Sync + std::fmt::Debug {
 }
 
 // ---------------------------------------------------------------------------
+// Recovery journal (H07 crash-recovery half)
+// ---------------------------------------------------------------------------
+
+/// Durable per-resource progress of one checkpoint's restore.
+///
+/// A `done` row is a *candidate* for skipping on resume, never proof: the
+/// resume path skips the gated write only when BOTH halves of the skip
+/// invariant hold — the sidecar still yields the recorded pre-image for the
+/// path (`PreImageBytes::Stored`, self-consistent — never `Absent`,
+/// `HashOnly`, corrupt, or unreadable) AND the live disk re-reads from
+/// `project_dir` hash to `content_hash` with that hash agreeing with the
+/// record's `post_hash` (see [`verify_bytes_on_disk`]). A resource marked
+/// done but modified since is re-restored, never blindly skipped; a resource
+/// whose sidecar rows are gone falls through to the gated path, which
+/// surfaces `missing` → `Partial` — disk coincidence alone never restores
+/// anything. A missing row means "unknown progress" — the restore
+/// re-verifies from scratch — never "assume done".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreProgressEntry {
+    /// Canonical (project-relative) path this row tracks.
+    pub canonical_path: String,
+    /// Where the latest attempt left this resource.
+    pub state: RestoreResourceState,
+    /// Blake3 hex verified when the row moved to `done` (`None` for
+    /// deletion-kind resources, whose restored state is absence).
+    pub content_hash: Option<String>,
+    /// Latest attempt that touched this row (audit trail, not a lock).
+    pub attempt_id: String,
+    /// Agent id of the latest attempt.
+    pub by_agent: String,
+    /// When the row was last written, Unix epoch millis.
+    pub updated_at_ms: i64,
+    /// Human-readable note for `failed`/`missing` rows (why); empty otherwise.
+    pub detail: String,
+}
+
+/// Per-resource restore progress words (durable spellings in parens).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreResourceState {
+    /// Attempted but not yet running (initial row, or reset for retry).
+    Pending,
+    /// A write is in flight (crash here resumes as "unknown, re-verify").
+    Running,
+    /// The gated write landed and its bytes verified.
+    Done,
+    /// The gated write was attempted and failed (retriable, re-verified).
+    Failed,
+    /// No restorable bytes exist (hash-only/absent/corrupt — restores as
+    /// `Partial`, never skipped into a success claim).
+    Missing,
+}
+
+impl RestoreResourceState {
+    /// The durable single-word spelling stored on the journal row.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Missing => "missing",
+        }
+    }
+
+    /// Parse the durable spelling; unknown values read `None` (never a guess —
+    /// an unreadable row degrades to "unknown progress, re-verify").
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "pending" => Some(Self::Pending),
+            "running" => Some(Self::Running),
+            "done" => Some(Self::Done),
+            "failed" => Some(Self::Failed),
+            "missing" => Some(Self::Missing),
+            _ => None,
+        }
+    }
+}
+
+/// One restore attempt's durable envelope (the `checkpoint_restore_attempts`
+/// row): who started which checkpoint's restore when. `attempt_id` is a ULID
+/// minted per `restore_checkpoint` call and is the dedup key — re-submitting
+/// the same id replays instead of forking (the gate's `call_id` contract).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreAttemptInfo {
+    /// Attempt identity + dedup key.
+    pub attempt_id: String,
+    /// The checkpoint under restore.
+    pub checkpoint_id: String,
+    /// Agent id running the restore.
+    pub by_agent: String,
+    /// Attempt start, Unix epoch millis.
+    pub started_at_ms: i64,
+}
+
+/// Terminal words for one restore attempt (durable spellings in parens).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreAttemptOutcome {
+    /// Still in flight.
+    Running,
+    /// Every resource restored (or verified already-restored).
+    Restored,
+    /// Byte-carrying subset restored; the rest reported missing.
+    Partial,
+    /// The attempt errored (policy/ownership/execution/store) — retriable.
+    Failed,
+    /// The attempt was cancelled — retriable.
+    Cancelled,
+}
+
+impl RestoreAttemptOutcome {
+    /// The durable single-word spelling stored on the attempt row.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Restored => "restored",
+            Self::Partial => "partial",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// Parse the durable spelling; unknown values read `None` (never a guess).
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "running" => Some(Self::Running),
+            "restored" => Some(Self::Restored),
+            "partial" => Some(Self::Partial),
+            "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+}
+
+/// One line of an accurate partial-progress report: the journal's durable
+/// state for a checkpointed resource plus whether its CURRENT disk content
+/// verifies (so a reader can tell "done and still exact" from "done but
+/// drifted" without running a restore).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreProgressItem {
+    /// Canonical (project-relative) path.
+    pub canonical_path: String,
+    /// Latest durable journal state (`Pending` when no row exists — unknown
+    /// progress, never assumed done).
+    pub state: RestoreResourceState,
+    /// Expected content hash from the checkpoint record (`None` for
+    /// deletion-kind resources, whose restored state is absence).
+    pub expected_hash: Option<String>,
+    /// Whether the current disk content matches the restored state right
+    /// now (bytes hash to `expected_hash`, or absence for deletions).
+    ///
+    /// A live observation, never a restore claim: this report loads no
+    /// sidecar bytes and gates no write (see
+    /// [`ToolExecutor::restore_progress`](crate::executor::ToolExecutor::restore_progress)),
+    /// so a reader combines it with `state` — `done` + `verified_on_disk`
+    /// means "a prior attempt landed it and disk still matches", nothing
+    /// more.
+    pub verified_on_disk: bool,
+    /// Latest attempt that touched this row (empty when no row exists).
+    pub attempt_id: String,
+}
+
+/// Re-verify a journal-`done` byte resource against disk: read the file from
+/// `project_dir` and require its bytes to hash to `expected_hash` (with the
+/// recorded length agreeing when `expected_len` is known).
+///
+/// Returns `false` on ANY read failure or mismatch — a resource that cannot
+/// be proven exact is re-restored, never skipped. This is the DISK half of
+/// the resume-skip honesty rule: a `done` marker from an earlier run that no
+/// longer matches disk (sibling or user edit since) falls through to a gated
+/// re-write.
+///
+/// Necessary but NOT sufficient on its own: this function never consults the
+/// sidecar, so a pruned sidecar whose bytes happen to still match on disk
+/// returns `true` here. The resume skip additionally requires the recorded
+/// pre-image to still be banked (see [`RestoreProgressEntry`]) — without it
+/// the resource falls through to the gated path and reports
+/// `missing` → `Partial`.
+#[must_use]
+pub fn verify_bytes_on_disk(
+    project_dir: &std::path::Path,
+    canonical_path: &str,
+    expected_hash: &str,
+    expected_len: Option<u64>,
+) -> bool {
+    let bytes = match std::fs::read(project_dir.join(canonical_path)) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    if let Some(len) = expected_len {
+        if bytes.len() as u64 != len {
+            return false;
+        }
+    }
+    blake3::hash(&bytes).to_hex().to_string() == expected_hash
+}
+
+/// Re-verify a journal-`done` deletion resource against disk: the restored
+/// state is absence, so only absence verifies. Any presence (or unreadable
+/// metadata) returns `false` — the path is re-deleted through the gate.
+#[must_use]
+pub fn verify_absent_on_disk(project_dir: &std::path::Path, canonical_path: &str) -> bool {
+    match std::fs::symlink_metadata(project_dir.join(canonical_path)) {
+        Ok(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Restore outcome
 // ---------------------------------------------------------------------------
 
@@ -733,23 +1002,47 @@ pub struct OwnershipConflictInfo {
 }
 
 /// Outcome of [`ToolExecutor::restore_checkpoint`](crate::executor::ToolExecutor::restore_checkpoint).
+///
+/// Every variant carries the [`RestoreMethod`] the restore actually ran
+/// (or would have run) — a `RequiresOperator` outcome names
+/// `Manual`, a `StashRestored` names `GitStash`, and the byte path names
+/// `PreImageStore` — so an operator reading an outcome never has to
+/// reverse-engineer which restore branch ran from the variant alone. The
+/// field is sourced from the checkpoint record's recorded method; it is
+/// never inferred from the outcome shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RestoreOutcome {
     /// Every included resource was restored through gated writes.
     Restored {
+        /// The restore method that ran (always `PreImageStore` here —
+        /// the byte path).
+        method: RestoreMethod,
         /// Canonical paths written back (byte-exact).
         restored: Vec<String>,
         /// Paths recreated (absent at restore time, bytes banked).
         recreated: Vec<String>,
         /// Paths deleted (absent at checkpoint time).
         deleted: Vec<String>,
-        /// Provenance notes (e.g. pre-image-captured bytes) — honest
-        /// packaging, never silently exact.
+        /// Canonical paths NOT rewritten by this call because a journal
+        /// `done` row satisfied BOTH skip conditions: the sidecar still
+        /// yields the recorded pre-image (`Stored`, self-consistent) AND the
+        /// live disk re-verifies byte-exact against the record's `post_hash`
+        /// (absence for deletions) — never a blind skip. They are in the
+        /// restored state, so they also appear in `restored`/`deleted`; this
+        /// list names which ones skipped their write, so a resume's work is
+        /// auditable. A pruned/absent sidecar can never appear here, even
+        /// when disk coincidentally matches.
+        verified_skips: Vec<String>,
+        /// Provenance notes (e.g. pre-image-captured bytes, verified skips) —
+        /// honest packaging, never silently exact.
         notes: Vec<String>,
     },
     /// The checkpoint was already `Restored`: no write ran (recorded no-op;
     /// the first restore's `Restored{at, by}` is the record).
     AlreadyRestored {
+        /// The restore method the FIRST restore ran (carried on the
+        /// recorded outcome, not re-inferred here).
+        method: RestoreMethod,
         /// When the first restore ran, Unix epoch millis.
         at_ms: i64,
         /// Who ran the first restore.
@@ -759,6 +1052,9 @@ pub enum RestoreOutcome {
     /// (their `limitations` explain why). The checkpoint transitioned to
     /// `Partial{missing}`.
     Partial {
+        /// The restore method that ran (always `PreImageStore` here — the
+        /// byte path).
+        method: RestoreMethod,
         /// Canonical paths written back.
         restored: Vec<String>,
         /// Canonical paths without restorable bytes.
@@ -769,11 +1065,15 @@ pub enum RestoreOutcome {
     /// `RestoreMethod::Manual`: nothing was written; the operator follows
     /// `limitations`.
     RequiresOperator {
+        /// The restore method (always `Manual` here).
+        method: RestoreMethod,
         /// Why auto-restore is unavailable.
         limitations: Vec<String>,
     },
     /// `RestoreMethod::GitStash`: the stash pop ran outside the byte path.
     StashRestored {
+        /// The restore method (always `GitStash` here).
+        method: RestoreMethod,
         /// What the stash restorer reported.
         detail: String,
     },
@@ -811,6 +1111,360 @@ pub enum RestoreError {
     /// The checkpoint store failed.
     #[error("restore store failed: {0}")]
     Store(#[from] CheckpointStoreError),
+}
+
+// ---------------------------------------------------------------------------
+// Restore-coverage model (H09): what a rollback can actually reverse
+// ---------------------------------------------------------------------------
+//
+// The file checkpoint above answers "what can THIS checkpoint reverse" for
+// files only. A rollback guarantee for an experiment must answer the same
+// question across EVERY effect kind the run may have produced — files,
+// database rows, processes, shell side-effects, network effects — BEFORE any
+// restore executes. Discovering mid-restore that an effect is unrecoverable
+// is the failure this model exists to prevent.
+//
+// The contract: the caller passes the FULL observed effect list as
+// `requested` (every kind the experiment may have touched — an unlisted kind
+// is out of the guarantee by construction, exactly like an undeclared file
+// exclusion), plus the `offered` coverage assembled from each adapter that
+// claims part of the restore (file checkpoints via
+// [`file_checkpoint_coverage`], the H09 database/process adapters via their
+// own coverage constructors, shell/network always unsupported). The pure
+// [`preflight_rollback_guarantee`] then reports one of three verdicts:
+//
+// * `Guaranteed` — every requested kind is `Supported`: the rollback may run.
+// * `Qualified` — some kind is `Qualified` (restorable with a stated limit,
+//   e.g. restart-only processes): the rollback may run ONLY with the
+//   qualification recorded and acknowledged — never silently.
+// * `Refused` — some kind is `Unsupported`, or NO adapter claims it (a
+//   missing offer is unrecoverable by construction, never assumed): the
+//   rollback must not run under the requested guarantee.
+//
+// This function performs no I/O and mutates nothing: it is the
+// before-execution gate, imitating the experiment promotion's conflict matrix
+// (pure classify-then-report) rather than the restore pipeline.
+
+/// Effect classes a rollback guarantee may be asked to reverse.
+///
+/// `File` is the file-checkpoint domain (byte-exact within budget).
+/// `Database`/`Process` are the H09 adapter domains (scoped + restart-only).
+/// `Shell`/`Network` have no restoring adapter: they are always
+/// [`EffectSupport::Unsupported`], and any requested guarantee covering them
+/// is refused, never partially executed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectKind {
+    /// File content under a checkpoint scope.
+    File,
+    /// Database rows under a declared adapter scope.
+    Database,
+    /// Concerto-owned processes under a managed-process registry.
+    Process,
+    /// Shell side-effects (commands run, files touched outside scope).
+    Shell,
+    /// Network effects (requests sent, remote state changed).
+    Network,
+}
+
+impl EffectKind {
+    /// The durable single-word spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Database => "database",
+            Self::Process => "process",
+            Self::Shell => "shell",
+            Self::Network => "network",
+        }
+    }
+
+    /// Parse the durable spelling; unknown values read `None` (never a guess).
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "file" => Some(Self::File),
+            "database" => Some(Self::Database),
+            "process" => Some(Self::Process),
+            "shell" => Some(Self::Shell),
+            "network" => Some(Self::Network),
+            _ => None,
+        }
+    }
+
+    /// Every effect kind, in deterministic order: the "ALL effect types" set
+    /// a preflight caller iterates when it has no narrower observation.
+    #[must_use]
+    pub fn all() -> &'static [Self] {
+        &[Self::File, Self::Database, Self::Process, Self::Shell, Self::Network]
+    }
+}
+
+/// What one adapter claims about one effect kind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectSupport {
+    /// Fully reversible by the named method (e.g. byte-exact pre-image replay).
+    Supported {
+        /// How the effect is reversed (operator-readable).
+        method: String,
+    },
+    /// Reversible with a stated limit (e.g. process restart without memory
+    /// state): the rollback may proceed only with the limitation recorded.
+    Qualified {
+        /// How the effect is reversed (operator-readable).
+        method: String,
+        /// The limit the rollback inherits (operator-readable).
+        limitation: String,
+    },
+    /// Not reversed by this adapter (or by any adapter): a requested
+    /// guarantee covering the kind is refused.
+    Unsupported {
+        /// Why nothing reverses this (operator-readable).
+        reason: String,
+    },
+}
+
+impl EffectSupport {
+    /// Whether the kind counts as `covered` for a full guarantee (only
+    /// `Supported`; `Qualified` needs acknowledgement, `Unsupported` refuses).
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        matches!(self, Self::Supported { .. })
+    }
+}
+
+/// One adapter's claim about one effect kind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectCoverage {
+    /// The effect kind claimed.
+    pub kind: EffectKind,
+    /// What the adapter promises for it.
+    pub support: EffectSupport,
+}
+
+/// The preflight verdict for a requested rollback guarantee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreflightVerdict {
+    /// Every requested kind is `Supported`: the rollback may run.
+    Guaranteed,
+    /// Some kind is `Qualified`: the rollback may run ONLY with each
+    /// limitation recorded and explicitly acknowledged — never silently.
+    Qualified,
+    /// Some kind is `Unsupported` or unclaimed: the rollback must NOT run
+    /// under the requested guarantee.
+    Refused,
+}
+
+impl PreflightVerdict {
+    /// The durable single-word spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Guaranteed => "guaranteed",
+            Self::Qualified => "qualified",
+            Self::Refused => "refused",
+        }
+    }
+}
+
+/// One requested kind that blocks a full guarantee: qualified or
+/// unsupported/unclaimed, with the operator-readable reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoverageGap {
+    /// The blocking effect kind.
+    pub kind: EffectKind,
+    /// Why it blocks the guarantee (the adapter's limitation/reason, or the
+    /// unclaimed-effect refusal when no adapter covers it).
+    pub reason: String,
+    /// Whether the kind is restorable-with-limits (`true` for `Qualified`) or
+    /// not restorable at all (`false` for `Unsupported`/unclaimed).
+    pub qualified: bool,
+}
+
+/// The before-execution report of [`preflight_rollback_guarantee`].
+///
+/// Returned by value and embedded by callers (the orchestrator rollback
+/// facade) in the durable effects record — the honest-coverage artifact,
+/// mirroring the experiment promotion-report shape (machine record +
+/// operator reasons, never a silent skip). The cross-reference is by name
+/// only (core owns no orchestrator type).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollbackPreflight {
+    /// The verdict: run, run-only-acknowledged, or do-not-run.
+    pub verdict: PreflightVerdict,
+    /// Requested kinds fully covered (`Supported`).
+    #[serde(default)]
+    pub covered: Vec<EffectKind>,
+    /// Requested kinds blocking a full guarantee (qualified first, then
+    /// refused — each in [`EffectKind`] order, deterministic).
+    #[serde(default)]
+    pub gaps: Vec<CoverageGap>,
+    /// Provenance notes (e.g. empty-request or unrequested-adapter remarks).
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+impl RollbackPreflight {
+    /// Whether the rollback may run as requested (no acknowledgement needed).
+    #[must_use]
+    pub fn is_guaranteed(&self) -> bool {
+        self.verdict == PreflightVerdict::Guaranteed
+    }
+}
+
+/// Preflight a requested rollback guarantee against all offered coverage.
+///
+/// Pure (no I/O, no mutation): call BEFORE executing anything. `requested`
+/// must be the FULL observed effect list — every kind the experiment may
+/// have touched. A kind with no offer is `Refused` ("no adapter claims …"),
+/// never assumed recoverable: incomplete coverage is reported here, not
+/// discovered mid-restore.
+///
+/// Verdict rule: any unsupported/unclaimed gap → `Refused`; else any
+/// qualified gap → `Qualified`; else `Guaranteed`. An empty request is
+/// `Guaranteed` with a note (nothing to reverse — vacuously covered).
+pub fn preflight_rollback_guarantee(
+    requested: &[EffectKind],
+    offered: &[EffectCoverage],
+) -> RollbackPreflight {
+    let mut kinds: Vec<EffectKind> = requested.to_vec();
+    kinds.sort();
+    kinds.dedup();
+    if kinds.is_empty() {
+        return RollbackPreflight {
+            verdict: PreflightVerdict::Guaranteed,
+            covered: Vec::new(),
+            gaps: Vec::new(),
+            notes: vec!["no effects observed: nothing to reverse (vacuously covered)".to_string()],
+        };
+    }
+    let mut covered = Vec::new();
+    let mut gaps = Vec::new();
+    for kind in kinds {
+        let offer = offered.iter().find(|entry| entry.kind == kind);
+        match offer.map(|entry| &entry.support) {
+            Some(EffectSupport::Supported { .. }) => covered.push(kind),
+            Some(EffectSupport::Qualified { limitation, .. }) => gaps.push(CoverageGap {
+                kind,
+                reason: limitation.clone(),
+                qualified: true,
+            }),
+            Some(EffectSupport::Unsupported { reason }) => {
+                gaps.push(CoverageGap { kind, reason: reason.clone(), qualified: false });
+            }
+            None => gaps.push(CoverageGap {
+                kind,
+                reason: format!(
+                    "no adapter claims {} effects: unrecoverable by construction (refusing rather than discovering mid-restore)",
+                    kind.as_str()
+                ),
+                qualified: false,
+            }),
+        }
+    }
+    // Deterministic gap order: qualified before refused is NOT needed —
+    // `kinds` is already sorted, and gaps follow it. Keep construction order.
+    let verdict = if gaps.iter().any(|gap| !gap.qualified) {
+        PreflightVerdict::Refused
+    } else if gaps.is_empty() {
+        PreflightVerdict::Guaranteed
+    } else {
+        PreflightVerdict::Qualified
+    };
+    RollbackPreflight { verdict, covered, gaps, notes: Vec::new() }
+}
+
+/// The file checkpoint's share of a preflight's `offered` list: what one
+/// [`CheckpointRecord`] can actually reverse, generalized from its own
+/// exclusions and method so the rollback facade never re-derives it.
+///
+/// * `File`: `Supported` (byte-exact pre-image replay) when the record is
+///   `Active` under `PreImageStore` with no hash-only paths; `Qualified`
+///   naming the real ceiling otherwise (`Partial` hash-only paths, `Manual`
+///   method, or the `GitStash` untracked-file gap).
+/// * `Database`/`Process`/`Shell`/`Network`: `Unsupported` — a file
+///   checkpoint never reverses these (the H09 adapters claim their own kinds;
+///   shell/network stay unclaimed).
+pub fn file_checkpoint_coverage(record: &CheckpointRecord) -> Vec<EffectCoverage> {
+    let file_support = match (&record.status, record.restore_method) {
+        (CheckpointStatus::Active, RestoreMethod::PreImageStore) => {
+            let hash_only: Vec<&str> = record
+                .excluded
+                .iter()
+                .filter(|exclusion| {
+                    matches!(exclusion.class, CheckpointExclusionClass::OversizedFile)
+                })
+                .filter_map(|exclusion| exclusion.path.as_deref())
+                .collect();
+            if hash_only.is_empty() {
+                EffectSupport::Supported {
+                    method: "byte-exact pre-image replay through gated filesystem writes"
+                        .to_string(),
+                }
+            } else {
+                EffectSupport::Qualified {
+                    method: "byte-exact pre-image replay where banked".to_string(),
+                    limitation: format!(
+                        "hash-only paths without restorable bytes ({}): {}",
+                        hash_only.join(", "),
+                        PARTIAL_SCOPE_LIMITATION
+                    ),
+                }
+            }
+        }
+        (CheckpointStatus::Partial { missing }, _) => EffectSupport::Qualified {
+            method: "byte-exact pre-image replay where banked".to_string(),
+            limitation: format!(
+                "hash-only paths without restorable bytes ({}): {}",
+                missing.join(", "),
+                PARTIAL_SCOPE_LIMITATION
+            ),
+        },
+        (_, RestoreMethod::GitStash) => EffectSupport::Qualified {
+            method: "git stash pop".to_string(),
+            limitation: "git-stash restore inherits the untracked-file gap (stash without -u)"
+                .to_string(),
+        },
+        (_, RestoreMethod::Manual) => EffectSupport::Qualified {
+            method: "operator follows the record limitations".to_string(),
+            limitation: record.limitations.first().cloned().unwrap_or_else(|| {
+                "checkpoint restores as Manual: follow the record's excluded entries".to_string()
+            }),
+        },
+        (status, _) => EffectSupport::Unsupported {
+            reason: format!("checkpoint status {} advertises no restorability", status.state_str()),
+        },
+    };
+    vec![
+        EffectCoverage { kind: EffectKind::File, support: file_support },
+        EffectCoverage {
+            kind: EffectKind::Database,
+            support: EffectSupport::Unsupported {
+                reason: "file checkpoints never reverse database effects (rows written outside the file scope)".to_string(),
+            },
+        },
+        EffectCoverage {
+            kind: EffectKind::Process,
+            support: EffectSupport::Unsupported {
+                reason: "file checkpoints never reverse process effects (daemons started, signals sent)".to_string(),
+            },
+        },
+        EffectCoverage {
+            kind: EffectKind::Shell,
+            support: EffectSupport::Unsupported {
+                reason: "shell side-effects are never reversed".to_string(),
+            },
+        },
+        EffectCoverage {
+            kind: EffectKind::Network,
+            support: EffectSupport::Unsupported {
+                reason: "network effects are never reversed".to_string(),
+            },
+        },
+    ]
 }
 
 #[cfg(test)]
@@ -1036,5 +1690,226 @@ mod tests {
         assert!(versioned_fs_targets("shell", &json!({"operation": "write", "path": "a.txt"}))
             .is_empty());
         assert!(versioned_fs_targets("filesystem", &json!({"path": "a.txt"})).is_empty());
+    }
+
+    #[test]
+    fn restore_journal_state_spellings_round_trip() {
+        use RestoreAttemptOutcome as Attempt;
+        use RestoreResourceState as State;
+        for state in [State::Pending, State::Running, State::Done, State::Failed, State::Missing] {
+            assert_eq!(State::parse(state.as_str()), Some(state), "{}", state.as_str());
+        }
+        for outcome in [
+            Attempt::Running,
+            Attempt::Restored,
+            Attempt::Partial,
+            Attempt::Failed,
+            Attempt::Cancelled,
+        ] {
+            assert_eq!(Attempt::parse(outcome.as_str()), Some(outcome), "{}", outcome.as_str());
+        }
+        assert_eq!(State::parse("done-ish"), None, "unknown states never guessed");
+        assert_eq!(Attempt::parse("restored!"), None, "unknown outcomes never guessed");
+    }
+
+    #[test]
+    fn verify_helpers_are_fail_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hash = blake3::hash(b"exact").to_hex().to_string();
+        // Absent file verifies neither bytes nor (trivially) absence-of-write.
+        assert!(!verify_bytes_on_disk(dir.path(), "missing.txt", &hash, Some(5)));
+        assert!(verify_absent_on_disk(dir.path(), "missing.txt"));
+        std::fs::write(dir.path().join("a.txt"), b"exact").expect("write fixture");
+        assert!(verify_bytes_on_disk(dir.path(), "a.txt", &hash, Some(5)));
+        assert!(!verify_bytes_on_disk(dir.path(), "a.txt", &hash, Some(6)), "length must agree");
+        let other_hash = blake3::hash(b"other").to_hex().to_string();
+        assert!(
+            !verify_bytes_on_disk(dir.path(), "a.txt", &other_hash, Some(5)),
+            "hash must agree"
+        );
+        assert!(!verify_absent_on_disk(dir.path(), "a.txt"), "presence never verifies absence");
+        std::fs::write(dir.path().join("a.txt"), b"drifted!").expect("drift fixture");
+        assert!(
+            !verify_bytes_on_disk(dir.path(), "a.txt", &hash, None),
+            "drifted content never verifies, even without a length bound"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Restore-coverage model (H09)
+    // -------------------------------------------------------------------
+
+    fn supported(kind: EffectKind) -> EffectCoverage {
+        EffectCoverage {
+            kind,
+            support: EffectSupport::Supported { method: "test method".to_string() },
+        }
+    }
+
+    #[test]
+    fn effect_kind_spellings_round_trip() {
+        for kind in EffectKind::all() {
+            assert_eq!(EffectKind::parse(kind.as_str()), Some(*kind), "{}", kind.as_str());
+        }
+        assert_eq!(EffectKind::parse("memory-restore"), None, "unknown kinds never guessed");
+        assert_eq!(PreflightVerdict::Guaranteed.as_str(), "guaranteed");
+    }
+
+    #[test]
+    fn preflight_guarantees_fully_supported_requests() {
+        let offered = vec![supported(EffectKind::File), supported(EffectKind::Database)];
+        let report =
+            preflight_rollback_guarantee(&[EffectKind::File, EffectKind::Database], &offered);
+        assert_eq!(report.verdict, PreflightVerdict::Guaranteed);
+        assert!(report.is_guaranteed());
+        assert_eq!(report.covered, vec![EffectKind::File, EffectKind::Database]);
+        assert!(report.gaps.is_empty());
+        // Request order never leaks into the report: deterministic sort.
+        let report =
+            preflight_rollback_guarantee(&[EffectKind::Database, EffectKind::File], &offered);
+        assert_eq!(report.covered, vec![EffectKind::File, EffectKind::Database]);
+    }
+
+    #[test]
+    fn preflight_qualifies_but_never_silently_covers_limits() {
+        let offered = vec![
+            supported(EffectKind::File),
+            EffectCoverage {
+                kind: EffectKind::Process,
+                support: EffectSupport::Qualified {
+                    method: "restart".to_string(),
+                    limitation: "memory state not restored".to_string(),
+                },
+            },
+        ];
+        let report =
+            preflight_rollback_guarantee(&[EffectKind::File, EffectKind::Process], &offered);
+        assert_eq!(report.verdict, PreflightVerdict::Qualified);
+        assert!(!report.is_guaranteed());
+        assert_eq!(report.covered, vec![EffectKind::File]);
+        assert_eq!(report.gaps.len(), 1);
+        assert_eq!(report.gaps[0].kind, EffectKind::Process);
+        assert!(report.gaps[0].qualified);
+        assert!(report.gaps[0].reason.contains("memory state"));
+    }
+
+    #[test]
+    fn preflight_refuses_unsupported_before_any_execution() {
+        // Unsupported dominates qualified: one unrecoverable kind refuses the
+        // whole guarantee even when every other kind is covered.
+        let offered = vec![
+            supported(EffectKind::File),
+            EffectCoverage {
+                kind: EffectKind::Process,
+                support: EffectSupport::Qualified {
+                    method: "restart".to_string(),
+                    limitation: "memory state not restored".to_string(),
+                },
+            },
+            EffectCoverage {
+                kind: EffectKind::Shell,
+                support: EffectSupport::Unsupported {
+                    reason: "shell side-effects are never reversed".to_string(),
+                },
+            },
+        ];
+        let report = preflight_rollback_guarantee(
+            &[EffectKind::File, EffectKind::Process, EffectKind::Shell],
+            &offered,
+        );
+        assert_eq!(report.verdict, PreflightVerdict::Refused);
+        assert_eq!(report.covered, vec![EffectKind::File]);
+        assert_eq!(report.gaps.len(), 2);
+        let shell_gap =
+            report.gaps.iter().find(|gap| gap.kind == EffectKind::Shell).expect("shell gap");
+        assert!(!shell_gap.qualified);
+    }
+
+    #[test]
+    fn preflight_refuses_unclaimed_effects_never_assumes() {
+        // No offer for Database: the preflight refuses rather than assuming
+        // the file checkpoint (or anything else) covers it. This is the
+        // never-discover-mid-restore rule.
+        let offered = vec![supported(EffectKind::File)];
+        let report =
+            preflight_rollback_guarantee(&[EffectKind::File, EffectKind::Database], &offered);
+        assert_eq!(report.verdict, PreflightVerdict::Refused);
+        assert_eq!(report.covered, vec![EffectKind::File]);
+        let gap = report.gaps.iter().find(|gap| gap.kind == EffectKind::Database).expect("db gap");
+        assert!(!gap.qualified);
+        assert!(gap.reason.contains("no adapter claims"));
+    }
+
+    #[test]
+    fn preflight_empty_request_is_vacuously_guaranteed() {
+        let report = preflight_rollback_guarantee(&[], &[supported(EffectKind::File)]);
+        assert_eq!(report.verdict, PreflightVerdict::Guaranteed);
+        assert!(!report.notes.is_empty());
+    }
+
+    #[test]
+    fn preflight_report_round_trips() {
+        let offered = vec![supported(EffectKind::File)];
+        let report =
+            preflight_rollback_guarantee(&[EffectKind::File, EffectKind::Network], &offered);
+        let json = serde_json::to_string(&report).expect("serialize");
+        let back: RollbackPreflight = serde_json::from_str(&json).expect("decode");
+        assert_eq!(report, back);
+        assert_eq!(report.verdict, PreflightVerdict::Refused);
+    }
+
+    #[test]
+    fn file_checkpoint_coverage_is_supported_when_fully_banked() {
+        let record = minimal_record();
+        let offered = file_checkpoint_coverage(&record);
+        assert_eq!(offered.len(), EffectKind::all().len());
+        let file = offered.iter().find(|entry| entry.kind == EffectKind::File).expect("file");
+        assert!(file.support.is_full(), "active pre-image record covers files: {file:?}");
+        for kind in
+            [EffectKind::Database, EffectKind::Process, EffectKind::Shell, EffectKind::Network]
+        {
+            let entry = offered.iter().find(|entry| entry.kind == kind).expect("entry");
+            assert!(
+                matches!(entry.support, EffectSupport::Unsupported { .. }),
+                "file checkpoints never claim {kind:?}"
+            );
+        }
+        // …and a full preflight over file-only effects is guaranteed.
+        let report = preflight_rollback_guarantee(&[EffectKind::File], &offered);
+        assert_eq!(report.verdict, PreflightVerdict::Guaranteed);
+    }
+
+    #[test]
+    fn file_checkpoint_coverage_qualifies_partial_and_stash() {
+        let (checkpoint_id, session_id) = test_ids();
+        let partial = CheckpointRecord::new(
+            checkpoint_id,
+            session_id,
+            CheckpointScope::FilesystemWrites { paths: vec!["big.bin".to_string()] },
+            Vec::new(),
+            vec![CheckpointExclusion {
+                class: CheckpointExclusionClass::OversizedFile,
+                path: Some("big.bin".to_string()),
+                reason: "over budget".to_string(),
+            }],
+            BTreeMap::new(),
+            CheckpointStatus::Partial { missing: vec!["big.bin".to_string()] },
+            RestoreMethod::PreImageStore,
+            Vec::new(),
+            "agent-a".to_string(),
+            1_700_000_000_000,
+            None,
+        )
+        .expect("partial record builds");
+        let offered = file_checkpoint_coverage(&partial);
+        let file = offered.iter().find(|entry| entry.kind == EffectKind::File).expect("file");
+        match &file.support {
+            EffectSupport::Qualified { limitation, .. } => {
+                assert!(limitation.contains("big.bin"), "{limitation}");
+            }
+            other => panic!("partial must qualify, got {other:?}"),
+        }
+        let report = preflight_rollback_guarantee(&[EffectKind::File], &offered);
+        assert_eq!(report.verdict, PreflightVerdict::Qualified);
     }
 }

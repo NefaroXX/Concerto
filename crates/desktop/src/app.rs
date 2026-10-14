@@ -407,6 +407,12 @@ pub enum Message {
     OpenMemoryModal,
     /// Close the Memory explorer modal (close button or backdrop).
     CloseMemoryModal,
+    /// Open the H13 harness modal.
+    OpenHarnessModal,
+    /// Close the H13 harness modal.
+    CloseHarnessModal,
+    /// A harness panel message (input change, control press, completion).
+    Harness(views::harness::Message),
     /// Toggle the terminal bottom panel open/closed.
     ToggleTerminalPanel,
     /// Begin dragging the terminal panel's resize handle.
@@ -510,6 +516,7 @@ pub struct App {
     pub diff: views::diff::State,
     pub memory: views::memory::State,
     pub memory_graph: views::memory_graph::State,
+    pub harness: views::harness::State,
     pub tool_log: views::tool_log::State,
     pub settings: views::settings::State,
     pub agent_graph: views::agent_graph::State,
@@ -620,6 +627,8 @@ pub struct App {
     pub memory_view_open: bool,
     /// Whether the read-only memory graph modal (ADR-69 slice 3) is open.
     pub memory_graph_open: bool,
+    /// Whether the H13 harness modal is open.
+    pub harness_view_open: bool,
     /// Whether the toggleable terminal bottom panel is visible.
     pub terminal_panel_open: bool,
     /// Current height (logical px) of the terminal bottom panel.
@@ -813,6 +822,7 @@ impl App {
             diff: views::diff::State::new(),
             memory: views::memory::State::new(),
             memory_graph: views::memory_graph::State::new(),
+            harness: views::harness::State::new(),
             tool_log: views::tool_log::State::new(),
             settings: {
                 let cfg = global_config.clone();
@@ -858,6 +868,7 @@ impl App {
             quick_panel_open: true,
             memory_view_open: false,
             memory_graph_open: false,
+            harness_view_open: false,
             terminal_panel_open: false,
             terminal_panel_height: 260.0,
             terminal_resizing: false,
@@ -1119,6 +1130,9 @@ impl App {
             | Message::ToggleQuickPanel
             | Message::OpenMemoryModal
             | Message::CloseMemoryModal
+            | Message::OpenHarnessModal
+            | Message::CloseHarnessModal
+            | Message::Harness(_)
             | Message::OpenMemoryGraph
             | Message::CloseMemoryGraph
             | Message::MemoryGraph(_)

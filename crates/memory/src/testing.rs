@@ -19,7 +19,7 @@ use concerto_core::error::MemoryError;
 use concerto_core::memory::{
     ChunkType, EmbeddingRecord, FtsResult, MemoryChunk, MemoryNamespace, ProjectId, VectorResult,
 };
-use concerto_core::RowIndexFact;
+use concerto_core::{ChunkProvenance, RowIndexFact};
 
 // ---------------------------------------------------------------------------
 // InMemoryVectorStore
@@ -140,6 +140,30 @@ impl VectorStore for InMemoryVectorStore {
 
     fn supports_chunk_metadata(&self) -> bool {
         true
+    }
+
+    async fn chunk_provenance(
+        &self,
+        project_id: &ProjectId,
+        chunk_ids: &[String],
+        _cancel: CancellationToken,
+    ) -> Result<std::collections::HashMap<String, ChunkProvenance>, MemoryError> {
+        let map = self.data.lock().unwrap();
+        let Some(records) = map.get(project_id) else {
+            return Ok(std::collections::HashMap::new());
+        };
+        Ok(chunk_ids
+            .iter()
+            .filter_map(|chunk_id| records.iter().find(|record| &record.id == chunk_id))
+            // Test records carry no metadata sidecar — `None` exercises the
+            // unknown-provenance arm, exactly like a row without one.
+            .map(|record| {
+                (
+                    record.id.clone(),
+                    ChunkProvenance { created_at: Some(record.created_at), metadata: None },
+                )
+            })
+            .collect())
     }
 
     async fn tombstone(

@@ -220,6 +220,18 @@ impl App {
                 self.memory_view_open = false;
                 iced::Task::none()
             }
+            Message::OpenHarnessModal => {
+                self.harness_view_open = true;
+                iced::Task::none()
+            }
+            Message::CloseHarnessModal => {
+                self.harness_view_open = false;
+                iced::Task::none()
+            }
+            Message::Harness(msg) => match self.harness.update(msg) {
+                Some(request) => self.run_harness_request(request),
+                None => iced::Task::none(),
+            },
             Message::OpenMemoryGraph => {
                 self.memory_graph_open = true;
                 self.memory_graph = views::memory_graph::State::Loading;
