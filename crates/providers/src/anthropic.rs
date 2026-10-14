@@ -47,7 +47,7 @@ impl AnthropicProvider {
     ///
     /// Builder-style, mirroring the other provider flags (e.g. Ollama's
     /// `with_base_url`). When enabled, each request body is annotated with
-    /// `cache_control` markers for the system prompt and the first user turn
+    /// `cache_control` markers for stable system blocks and the conversation tail
     /// so Anthropic can cache the conversation prefix across consecutive
     /// turns.
     pub fn with_cache_breakpoints(mut self, enabled: bool) -> Self {
@@ -339,6 +339,7 @@ mod tests {
     #[test]
     fn with_cache_breakpoints_toggles_apply() {
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             messages: vec![
                 concerto_core::types::Message {
                     role: concerto_core::types::Role::System,
@@ -375,7 +376,7 @@ mod tests {
         let on = off.with_cache_breakpoints(true);
         assert!(on.cache_breakpoints());
         let body = on.build_body(&request, "claude-4");
-        assert_eq!(body["system"]["cache_control"], serde_json::json!({"type": "ephemeral"}));
+        assert_eq!(body["system"][0]["cache_control"], serde_json::json!({"type": "ephemeral"}));
         assert_eq!(
             body["messages"][0]["content"][0]["cache_control"],
             serde_json::json!({"type": "ephemeral"})

@@ -73,7 +73,7 @@ pub const CLI_COMMAND_HELP: &str =
     Note: protected_paths constrains only the built-in filesystem tool; native
     run commands and container project mounts are not covered.
     projects <list|current|use>
-    sessions <list|show|events|resume|prune>
+    sessions <list|show|events|cache|resume|prune>
     memory <graph|explain>   health [--json]   audit   logs <path|show>
     harness <environment|verify|checkpoint|memory> [--json]
 
@@ -686,9 +686,58 @@ async fn run_prune(
 
 fn run_sessions_subcommand(args: &[String], project_root: &Path) -> anyhow::Result<()> {
     if args.is_empty() {
-        anyhow::bail!("usage: concerto sessions <list|show <id>|events <id>|resume <id>|prune>");
+        anyhow::bail!("usage: concerto sessions <list|show <id>|events <id>|cache <id> [--json]|resume <id>|prune>");
     }
     match args[0].as_str() {
+        "cache" => {
+            if !(args.len() == 2 || (args.len() == 3 && args[2] == "--json")) {
+                anyhow::bail!("usage: concerto sessions cache <id> [--json]");
+            }
+            let session_id = parse_session_id(&args[1])?;
+            let pricing = concerto_config::load_config(
+                concerto_config::default_config_path().as_ref(),
+                Some(project_root),
+            )?
+            .cache_pricing;
+            let mut report = tokio::runtime::Runtime::new()?.block_on(async {
+                let store = concerto_sessions::SqliteSessionStore::connect_shared().await?;
+                use concerto_sessions::SessionStore;
+                if store.load_session(session_id, CancellationToken::new()).await?.is_none() {
+                    return Err(concerto_sessions::SessionError::NotFound(session_id.to_string()));
+                }
+                concerto_sessions::cache::load_cache_report(
+                    &store,
+                    session_id,
+                    CancellationToken::new(),
+                )
+                .await
+            })?;
+            if !pricing.is_empty() {
+                report.reprice(&pricing);
+            }
+            if args.len() == 3 {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("{}", report.caption());
+                for (model, summary) in &report.by_provider_model {
+                    let rate = summary
+                        .cache
+                        .token_hit_rate()
+                        .map(|rate| format!("{:.1}%", rate * 100.0))
+                        .unwrap_or_else(|| "N/A".into());
+                    println!(
+                        "{model}: {rate} token reuse, {} attempts, {} missing usage",
+                        summary.cache.calls, summary.missing_usage_calls
+                    );
+                }
+                println!(
+                    "Estimated cost: {:?}; missing cost calls: {}",
+                    report.summary.complete_estimated_cost_usd(),
+                    report.summary.missing_cost_calls
+                );
+            }
+            return Ok(());
+        }
         "list" => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {

@@ -8,10 +8,12 @@
 pub mod at_rest;
 pub mod audit;
 pub mod audit_retention;
+pub mod cache;
 pub mod file_checkpoints;
 pub mod plan_bindings;
 pub mod plans;
 pub mod query;
+pub mod recording;
 pub mod replay;
 pub mod resource_facts;
 pub mod spend;

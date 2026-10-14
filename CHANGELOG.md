@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Optional provider cache usage and durable per-attempt telemetry, audit-backed
+  benchmark accounting, shared desktop/CLI session cache reports, versioned
+  reporting prices, and opt-in stable Anthropic prompt-cache boundaries.
+  Offline comparison and reviewed dataset exports are documented in
+  `docs/cache-benchmarks.md`.
 - Native editor workspace with session-local file tabs that preserve unsaved
   buffers, cursor positions and undo history; dirty-tab closure requires an
   explicit discard decision. Includes a filterable Explorer, breadcrumbs,

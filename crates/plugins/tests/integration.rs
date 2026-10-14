@@ -723,6 +723,7 @@ async fn provider_plugin_refuses_tool_declarations() {
 
     let provider = PluginBackedProvider::new(plugin, "test", "test-model".into());
     let req = CompletionRequest {
+        stable_system_prefix_bytes: None,
         model: "test-model".into(),
         messages: vec![],
         tools: Some(vec![ToolDefinition {

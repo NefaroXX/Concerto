@@ -329,7 +329,11 @@ fn ollama_line_to_chunks(
             let prompt_tokens = json["prompt_eval_count"].as_u64();
             let completion_tokens = json["eval_count"].as_u64();
             if prompt_tokens.is_some() || completion_tokens.is_some() {
-                *usage = Some(CompletionUsage { prompt_tokens, completion_tokens });
+                *usage = Some(CompletionUsage {
+                    prompt_tokens,
+                    completion_tokens,
+                    ..CompletionUsage::default()
+                });
             }
             if let Some(content) = json["message"]["content"].as_str() {
                 if !content.is_empty() {
@@ -504,7 +508,11 @@ mod tests {
         let terminal = done_chunks.iter().find(|chunk| chunk.is_final).expect("terminal chunk");
         assert_eq!(
             terminal.usage,
-            Some(CompletionUsage { prompt_tokens: Some(42), completion_tokens: Some(7) })
+            Some(CompletionUsage {
+                prompt_tokens: Some(42),
+                completion_tokens: Some(7),
+                ..CompletionUsage::default()
+            })
         );
         assert_eq!(usage, None, "the terminal chunk drains the accumulator");
         let mut all = mid_chunks;

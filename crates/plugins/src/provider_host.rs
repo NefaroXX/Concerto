@@ -422,6 +422,7 @@ mod tests {
     #[test]
     fn build_request_json_structure() {
         let req = CompletionRequest {
+            stable_system_prefix_bytes: None,
             model: "test-model".into(),
             messages: vec![Message {
                 role: Role::User,

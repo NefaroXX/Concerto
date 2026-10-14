@@ -468,6 +468,7 @@ impl TaskPlanner {
         // Build request
         let prompt = self.build_prompt(task, design_doc, agents, skills_section, facade);
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             // Empty means "use the configured model" across all provider
             // implementations. A literal "planner" was sent to provider APIs
             // as a model ID and made real multi-agent planning fail immediately.
@@ -510,6 +511,7 @@ impl TaskPlanner {
         let text = loop {
             attempt += 1;
             let attempt_request = CompletionRequest {
+                stable_system_prefix_bytes: None,
                 max_tokens: Some(if attempt == 1 { 2048 } else { 16384 }),
                 ..request.clone()
             };

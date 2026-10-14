@@ -136,6 +136,7 @@ jobs:
         run: |
           ./target/debug/concerto config help
           ./target/debug/concerto config keys retry
+          python3 scripts/cache-report-smoke.py ./target/debug/concerto
 
       - name: Build single-frontend feature combinations
         run: |
@@ -261,3 +262,6 @@ jobs:
       # theme/ are exempt by design.
       - name: Check for hard-coded colors in desktop UI
         run: bash scripts/check-hardcoded-colors.sh
+
+      - name: Check offline cache reporting and dataset exports
+        run: python3 -m unittest discover -s scripts/tests -v

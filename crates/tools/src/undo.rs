@@ -188,15 +188,29 @@ mod tests {
     /// never flips classification: the same kind with only the bare OS text
     /// yields the identical ledger + envelope disposition.
     #[test]
-    fn commit_spawn_failure_yields_typed_io_with_context() {
-        let mut mgr = UndoManager::new("/concerto_no_such_project_dir_for_undo_test");
-        let error =
-            mgr.commit(Ulid::new(), TaskId::new()).expect_err("missing project dir must fail");
+    fn commit_spawn_failure_yields_typed_io_with_context() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = TempDir::new()?;
+        let missing = dir.path().join("missing-project");
+        let native_error = match Command::new("git")
+            .args(["rev-parse", "--git-dir"])
+            .current_dir(&missing)
+            .output()
+        {
+            Err(error) => error,
+            Ok(_) => panic!("spawn in a missing project dir must fail"),
+        };
+        let mut mgr = UndoManager::new(missing);
+        let error = match mgr.commit(Ulid::new(), TaskId::new()) {
+            Err(error) => error,
+            Ok(_) => panic!("missing project dir must fail"),
+        };
         let kind = match &error {
             ToolError::Io(io) => io.kind(),
             other => panic!("expected typed ToolError::Io, got {other:?}"),
         };
-        assert_eq!(kind, std::io::ErrorKind::NotFound, "the OS verdict is preserved");
+        // Windows reports NotADirectory here; Unix reports NotFound.
+        assert_eq!(kind, native_error.kind(), "the OS verdict is preserved");
         let display = error.to_string();
         assert!(display.contains("git rev-parse failed"), "missing spawn verb: {display}");
         assert!(error.is_deterministic_failure(), "the kind classifies structurally");
@@ -210,10 +224,8 @@ mod tests {
             concerto_core::tool_failure::ToolDisposition::DoNotReIssue,
             "the disposition derives from the kind"
         );
-        let bare = ToolError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "No such file or directory (os error 2)",
-        ));
+        let bare =
+            ToolError::Io(std::io::Error::new(kind, "No such file or directory (os error 2)"));
         assert_eq!(
             error.is_deterministic_failure(),
             bare.is_deterministic_failure(),
@@ -228,6 +240,7 @@ mod tests {
             failure.disposition, bare_failure.disposition,
             "same disposition with and without context text"
         );
+        Ok(())
     }
 
     #[test]

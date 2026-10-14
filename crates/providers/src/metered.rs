@@ -115,6 +115,7 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             model: "test-model".to_string(),
             messages: vec![],
             tools: None,
@@ -198,6 +199,7 @@ mod tests {
         let metered = MeteredProvider::new(Box::new(ChunkedMockProvider));
         let cancel = CancellationToken::new();
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             model: "claude-3-5-sonnet".to_string(),
             messages: vec![],
             tools: None,
@@ -224,6 +226,7 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             model: "idempotent".to_string(),
             messages: vec![],
             tools: None,
@@ -323,6 +326,7 @@ mod tests {
         let metered = MeteredProvider::new(Box::new(CostlyMockProvider));
         let cancel = CancellationToken::new();
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             model: "gpt-4o".to_string(),
             messages: vec![],
             tools: None,

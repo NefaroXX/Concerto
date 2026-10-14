@@ -664,6 +664,7 @@ impl GenericSpecialistAgent {
                     });
                     messages.push(crate::tool_driver::TextToolDriver::repair_message(&reason));
                     let mut request = CompletionRequest {
+                        stable_system_prefix_bytes: None,
                         model: model.to_string(),
                         messages: messages.clone(),
                         tools: None,
@@ -1342,6 +1343,7 @@ impl GenericSpecialistAgent {
             }
 
             let request = CompletionRequest {
+                stable_system_prefix_bytes: None,
                 model: model.to_string(),
                 messages: messages.clone(),
                 tools: Some(request_tools),

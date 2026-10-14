@@ -83,9 +83,9 @@ impl UsageRequest {
 ///
 /// Shared by every connector in the family — OpenAI, OpenRouter, and the
 /// delegating gateways — because the response payload is uniformly
-/// `{prompt_tokens, completion_tokens, ...}`; extra members (OpenRouter's
-/// `cost`/`native_usage`, DeepSeek's `prompt_cache_hit_tokens`, ...) are
-/// ignored.
+/// `{prompt_tokens, completion_tokens, ...}`. Preserve cache and reasoning
+/// details, including DeepSeek's explicit hit/miss counts. Monetary usage
+/// and provider-native diagnostics are outside this token contract.
 ///
 /// Fail-soft contract: `None` when the payload carries no `usage` object,
 /// when the object carries no token counts, or when a count is not a JSON
@@ -95,10 +95,27 @@ pub fn map_usage(payload: &serde_json::Value) -> Option<CompletionUsage> {
     let usage = payload.get("usage")?.as_object()?;
     let prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64());
     let completion_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64());
-    if prompt_tokens.is_none() && completion_tokens.is_none() {
-        return None;
-    }
-    Some(CompletionUsage { prompt_tokens, completion_tokens })
+    let cache_read_tokens = usage
+        .get("prompt_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(|v| v.as_u64())
+        .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(|v| v.as_u64()));
+    let uncached_prompt_tokens =
+        usage.get("prompt_cache_miss_tokens").and_then(|v| v.as_u64()).or_else(|| {
+            prompt_tokens.zip(cache_read_tokens).and_then(|(total, reads)| total.checked_sub(reads))
+        });
+    let normalized = CompletionUsage {
+        prompt_tokens,
+        completion_tokens,
+        uncached_prompt_tokens,
+        cache_read_tokens,
+        reasoning_tokens: usage
+            .get("completion_tokens_details")
+            .and_then(|details| details.get("reasoning_tokens"))
+            .and_then(|v| v.as_u64()),
+        ..CompletionUsage::default()
+    };
+    normalized.has_measurements().then_some(normalized)
 }
 
 /// The OpenAI-compatible chat dialect (`/chat/completions`).
@@ -318,6 +335,7 @@ mod tests {
 
     fn make_test_request_with_tools() -> CompletionRequest {
         CompletionRequest {
+            stable_system_prefix_bytes: None,
             tools: Some(vec![ToolDefinition {
                 name: "test_tool".into(),
                 description: "A test tool".into(),
@@ -384,6 +402,7 @@ mod tests {
     #[test]
     fn assistant_tool_calls_serialize_with_arguments_string() {
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             messages: vec![assistant_message(
                 "",
                 Some(vec![ToolCall {
@@ -422,6 +441,7 @@ mod tests {
     #[test]
     fn tool_result_messages_serialize_with_role_and_tool_call_id() {
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             messages: vec![Message {
                 role: Role::Tool,
                 content: String::new(),
@@ -450,6 +470,7 @@ mod tests {
     #[test]
     fn system_messages_serialize_with_role_system() {
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             messages: vec![Message {
                 role: Role::System,
                 content: "You are a helpful assistant.".into(),
@@ -478,6 +499,7 @@ mod tests {
     #[test]
     fn system_only_request_renders_a_non_system_message() {
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             messages: vec![Message {
                 role: Role::System,
                 content: "You are the coordinator.".into(),
@@ -523,6 +545,7 @@ mod tests {
     #[test]
     fn normal_conversation_is_unchanged_by_the_conversation_floor() {
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             messages: vec![
                 Message {
                     role: Role::System,
@@ -557,6 +580,7 @@ mod tests {
     #[test]
     fn user_messages_serialize_with_role_user() {
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             messages: vec![Message {
                 role: Role::User,
                 content: "Hello!".into(),
@@ -639,6 +663,7 @@ mod tests {
     #[test]
     fn assistant_tool_calls_without_arguments_still_serialize() {
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             messages: vec![assistant_message(
                 "",
                 Some(vec![ToolCall {
@@ -699,6 +724,7 @@ mod tests {
     #[test]
     fn build_result_body_preserves_system_then_user_order() {
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             messages: vec![
                 Message {
                     role: Role::System,
@@ -735,6 +761,7 @@ mod tests {
     #[test]
     fn golden_serialized_body_system_and_user() {
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             messages: vec![
                 Message {
                     role: Role::System,
@@ -775,6 +802,7 @@ mod tests {
     fn submit_design_doc_schema_flows_through_tool_body() {
         let schema = schemars::schema_for!(SubmitDesignDocInput);
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             tools: Some(vec![ToolDefinition {
                 name: "submit_design_doc".into(),
                 description: "Submit a structured design document.".into(),
@@ -800,6 +828,7 @@ mod tests {
     fn tool_choice_required_and_none_render_as_strings() {
         for (choice, expected) in [(ToolChoice::Required, "required"), (ToolChoice::None, "none")] {
             let request = CompletionRequest {
+                stable_system_prefix_bytes: None,
                 tools: Some(vec![ToolDefinition {
                     name: "test_tool".into(),
                     description: "A test tool".into(),
@@ -857,6 +886,7 @@ mod tests {
     #[test]
     fn render_round_trip_carries_reasoning_content() {
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             messages: vec![assistant_message(
                 "answer",
                 Some(vec![ToolCall {
@@ -883,6 +913,7 @@ mod tests {
     #[test]
     fn tool_call_then_results_render_in_order() {
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             messages: vec![
                 assistant_message(
                     "",
@@ -946,6 +977,7 @@ mod tests {
     #[test]
     fn multiple_tool_results_flatten_into_separate_messages() {
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             messages: vec![
                 assistant_message(
                     "",
@@ -1024,6 +1056,7 @@ mod tests {
     #[test]
     fn tool_message_without_results_keeps_content_and_no_call_id() {
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             messages: vec![Message {
                 role: Role::Tool,
                 content: "plain tool output".into(),
@@ -1064,6 +1097,7 @@ mod tests {
     #[test]
     fn apply_cache_breakpoints_is_noop_for_openai_compat() {
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             messages: vec![
                 Message {
                     role: Role::System,
@@ -1107,6 +1141,7 @@ mod tests {
     /// real dialect output, not a synthetic object.
     fn rendered_streaming_body() -> serde_json::Value {
         let request = CompletionRequest {
+            stable_system_prefix_bytes: None,
             stream: true,
             messages: vec![Message {
                 role: Role::User,
@@ -1185,11 +1220,49 @@ mod tests {
     // -- ADR-48 §4: usage mapping ------------------------------------------
 
     #[test]
+    fn cache_usage_preserves_zero_unknown_and_reasoning_subsets() {
+        let payload = serde_json::json!({"usage": {
+            "prompt_tokens": 100, "completion_tokens": 25,
+            "prompt_tokens_details": {"cached_tokens": 80},
+            "completion_tokens_details": {"reasoning_tokens": 10}
+        }});
+        let usage = map_usage(&payload).unwrap();
+        assert_eq!(usage.prompt_tokens, Some(100));
+        assert_eq!(usage.uncached_prompt_tokens, Some(20));
+        assert_eq!(usage.cache_read_tokens, Some(80));
+        assert_eq!(usage.cache_write_tokens, None);
+        assert_eq!(usage.completion_tokens, Some(25));
+        assert_eq!(usage.reasoning_tokens, Some(10));
+        let zero = map_usage(&serde_json::json!({"usage": {
+            "prompt_tokens_details": {"cached_tokens": 0}
+        }}))
+        .unwrap();
+        assert_eq!(zero.cache_read_tokens, Some(0));
+        assert_eq!(zero.prompt_tokens, None);
+        assert_eq!(map_usage(&serde_json::json!({"usage": {}})), None);
+    }
+
+    #[test]
+    fn deepseek_cache_components_are_preserved() {
+        let usage = map_usage(&serde_json::json!({"usage": {
+            "prompt_tokens": 1000, "prompt_cache_hit_tokens": 900,
+            "prompt_cache_miss_tokens": 100
+        }}))
+        .unwrap();
+        assert_eq!(usage.cache_read_tokens, Some(900));
+        assert_eq!(usage.uncached_prompt_tokens, Some(100));
+    }
+
+    #[test]
     fn map_usage_reads_openai_counts() {
         let payload = serde_json::json!({"usage": {"prompt_tokens": 42, "completion_tokens": 7}});
         assert_eq!(
             map_usage(&payload),
-            Some(CompletionUsage { prompt_tokens: Some(42), completion_tokens: Some(7) })
+            Some(CompletionUsage {
+                prompt_tokens: Some(42),
+                completion_tokens: Some(7),
+                ..CompletionUsage::default()
+            })
         );
     }
 
@@ -1208,7 +1281,11 @@ mod tests {
         });
         assert_eq!(
             map_usage(&payload),
-            Some(CompletionUsage { prompt_tokens: Some(5), completion_tokens: Some(0) }),
+            Some(CompletionUsage {
+                prompt_tokens: Some(5),
+                completion_tokens: Some(0),
+                ..CompletionUsage::default()
+            }),
             "0 is a measured value and must survive; extra members must be dropped",
         );
     }
@@ -1239,7 +1316,11 @@ mod tests {
             map_usage(
                 &serde_json::json!({"usage": {"prompt_tokens": null, "completion_tokens": 7}})
             ),
-            Some(CompletionUsage { prompt_tokens: None, completion_tokens: Some(7) }),
+            Some(CompletionUsage {
+                prompt_tokens: None,
+                completion_tokens: Some(7),
+                ..CompletionUsage::default()
+            }),
             "one reported count is enough to surface usage",
         );
     }
