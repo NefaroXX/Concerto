@@ -23,6 +23,17 @@ updates:
     commit-message:
       prefix: "deps"
       include: "scope"
+    # dtolnay/rust-toolchain is pinned deliberately and must not be bumped
+    # automatically. Dependabot misresolves this action's version tags and
+    # has repeatedly proposed releases that do not exist — e.g. PR #289 asked
+    # for 1.120.0 when current stable was 1.99.0 and the tag 404s. The
+    # resulting workflow fails immediately at toolchain resolution. The
+    # toolchain is a fmt/clippy parity baseline, not a version to chase:
+    # it is pinned in rust-toolchain.toml and documented in AGENTS.md.
+    # Bump it deliberately, by hand, in rust-toolchain.toml AND the workflow
+    # files together.
+    ignore:
+      - dependency-name: "dtolnay/rust-toolchain"
     groups:
       actions-minor-and-patch:
         update-types:
