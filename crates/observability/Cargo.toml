@@ -9,17 +9,17 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-tracing-opentelemetry = "0.32"
-opentelemetry = "0.31"
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "trace"] }
-opentelemetry-otlp = { version = "0.31", features = ["http-proto", "reqwest-client"] }
-opentelemetry-langfuse = "0.6.1"
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio", "trace"] }
+opentelemetry-otlp = { version = "0.33", features = ["http-proto", "reqwest-client"] }
+# 0.7.0 is the first release targeting the opentelemetry 0.33 family; 0.6.1
+# pinned ^0.31 and would reintroduce a duplicate opentelemetry major.
+opentelemetry-langfuse = "0.7.0"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18.3"
 tokio = { workspace = true }
 tracing = { workspace = true }
 axum = { workspace = true }
-reqwest = { workspace = true }
 concerto-core = { path = "../core" }
 concerto-config = { path = "../config" }
 

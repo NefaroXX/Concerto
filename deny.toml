@@ -73,6 +73,22 @@ ignore = [
                           # Fixed upstream in >= 36.0.16 / >= 48.0.3 / >= 49.0.1, all of
                           # which require the func_wrap API migration noted above; revisit
                           # if/when wasmtime leaves the 24.0.x line.
+    "RUSTSEC-2026-0363",  # wasmtime component-model handle tables capped only per
+                          # instance, charged to no limit (GHSA-q554-3cjc-rx7p). NOT
+                          # REACHABLE: handle tables are a COMPONENT-MODEL structure;
+                          # the plugin host uses core modules only — Config, Store,
+                          # Module::new, Instance, Linker::new, func_wrap_async over
+                          # linear memory (crates/plugins/src/host.rs, loader.rs,
+                          # active_plugin.rs, host_fns.rs, installer.rs import only
+                          # Engine/Store/Module/Instance/Linker/Caller/ExternType).
+                          # No Component, component::Linker, bindgen!, or Val is ever
+                          # constructed, so no component instance exists to hold a
+                          # handle table.
+                          # Scope: concerto-plugins crate only (crates/plugins/).
+                          # Fixed upstream in wasmtime PR #14732, which requires the
+                          # func_wrap API migration noted above; revisit if/when
+                          # wasmtime leaves the 24.0.x line.
+                          # Added 2026-10-14; tracked for retirement in issue #340.
     # === quick-xml exceptions ===
     # Reason: quick-xml v0.38.4/v0.39.4 constrained by plist (syntect via iced) and
     # wayland-scanner. These are XML parsing DoS vectors that require crafted XML input.
