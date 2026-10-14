@@ -1,6 +1,6 @@
 # Concerto pending work (TODO)
 
-**Last reconciled with the source tree: 2026-10-06** (base: `dev` at `0d07038`)
+**Last reconciled with the source tree: 2026-10-14** (base: `dev` at `04cef56`)
 
 **This file is no longer the outstanding-work register.**
 [`DEFERRED.md`](DEFERRED.md) is. Every deferral lands there with a source, a
@@ -69,6 +69,37 @@ unstarted.
   `None` at `:231`) still has **no TOML key** — only
   `CONCERTO_SHELL_CPU_BUDGET_SECS` (`shell.rs:58`) — and that is what row 45 is
   waiting on. This bullet is kept only as a pointer.
+- **Shell `ls-tree` builtin: no ignore filtering in the walk.** Not started.
+  `TreeCommand` (`crates/shell/src/builtins.rs:164`) builds its walker at
+  `crates/shell/src/builtins.rs:243` as
+  `WalkDir::new(&target).follow_links(false).max_depth(options.depth).sort_by_file_name()`
+  and applies **no ignore filtering at all** — no `.gitignore`, no `target/`,
+  no `node_modules/`. With `MAX_TREE_ENTRIES: usize = 10_000`
+  (`crates/shell/src/builtins.rs:18`; `DEFAULT_TREE_DEPTH = 4` at `:17`,
+  `MAX_TREE_DEPTH = 64` at `:16`) the command is near-useless on any built Rust
+  repo: `find ./target -type f` reports 54 543 files against 4 569 outside
+  `target/` and `.git/` (measured 2026-10-14), so `ls-tree .` spends its entry
+  budget on Cargo build artifacts and returns a truncated `.rlib`/`.rmeta`
+  listing instead of project structure. Intended fix is a `.filter_entry(...)`
+  on the walker; the `ignore` crate is the standard choice and is **not in
+  `Cargo.lock`** (only the unrelated `gix-ignore` is, at `Cargo.lock:3575`), so
+  it is a new dependency under `AGENTS.md:102` ("Add a dependency only for a
+  current, tested need"). Design decision, recorded so it is not re-litigated:
+  the general-purpose `ls-tree` crate (https://github.com/NefaroXX/ls-tree,
+  crates.io `ls-tree` 0.2.0, `generate(root: &Path, out: &mut impl Write,
+  opts: &Options) -> io::Result<TreeStats>`) was evaluated as a replacement and
+  rejected — it has no root confinement, no entry cap, and no
+  `CancellationToken`, and most of its 13 `Options` fields (colour, icons,
+  `show_total_size`, `prune`, `human_readable`, `dirs_only`, `format`) do not
+  apply to a structured-data consumer. The builtin's traversal is ~20 lines
+  (`builtins.rs:242-262`); the rest is repo plumbing (`CommandResult`,
+  `Diagnostic`, effect classification, cancellation) built on
+  `resolve_in_canonical_root` (`crates/shell/src/path.rs:72`) plus
+  `tree_path_error` (`crates/shell/src/builtins.rs:401`), which classify escapes
+  as Blocked and I/O failures as Recoverable — the ADR-62 policy-gate boundary.
+  Conclusion: keep the builtin and take only the ignore-filtering idea; the
+  external crate remains the right tool for any future human-facing tree view
+  and is deliberately not a Concerto dependency.
 
 ## Audit cleanups (`DEFERRED.md` row 34)
 
