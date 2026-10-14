@@ -9,6 +9,7 @@
 //! seed carries an attached [`EvalEngine`](concerto_eval::EvalEngine) and
 //! runs in eval mode (no LLM call).
 
+pub(crate) mod context_packet;
 pub(crate) mod execution_state;
 mod generic;
 pub(crate) mod task_contract;
