@@ -390,16 +390,16 @@ impl HybridRetriever {
                 .await;
         }
 
-        // A tier whose γ cannot move a result is skipped outright rather than
-        // paying for a scoring pass whose output cannot change the order (see
-        // [`tier_can_reorder`]). Ranking is provably unchanged; the empty map
-        // then takes the existing no-reorder path below.
-        let scores = if tier_can_reorder(tier) {
-            let ids: Vec<String> = fused.iter().map(|result| result.chunk_id.clone()).collect();
-            self.score_links(scorer, &ids, config.score_timeout, cancel).await
-        } else {
-            HashMap::new()
-        };
+        let ids: Vec<String> = fused.iter().map(|result| result.chunk_id.clone()).collect();
+        // NOTE: the scoring pass is required even when `tier_can_reorder` says
+        // this tier cannot reorder. `scores` is not only the reorder input —
+        // it is the corroboration axis of `MemoryEvidence::evidence_score`
+        // (`crates/memory/src/evidence.rs`), which reports how much link
+        // support a result has. Skipping scoring at an inert tier was measured
+        // and rejected: it would have zeroed a reported fact ("supported by N
+        // links" → 0.0) to save work, which is exactly the kind of silent
+        // misreport the evidence spine exists to prevent.
+        let scores = self.score_links(scorer, &ids, config.score_timeout, cancel).await;
         if scores.is_empty() {
             return (fused, scores);
         }
@@ -608,7 +608,7 @@ impl HybridRetriever {
 /// At an inert tier the link-scoring pass — a per-recall cost with its own
 /// budget — is computed and discarded, so it is skipped. Ranking is provably
 /// identical either way; the empty map takes the existing no-reorder path.
-fn tier_can_reorder(tier: CascadeTier) -> bool {
+pub fn tier_can_reorder(tier: CascadeTier) -> bool {
     tier.gamma() * LINK_SCORE_MAX > 1.0
 }
 
@@ -1574,8 +1574,8 @@ mod tests {
         assert_eq!(envelope.timeout_ms, 1200);
     }
 
-    /// Counts how many times a scoring pass was actually performed, so the
-    /// inert-tier skip can be observed rather than assumed.
+    /// Counts scoring passes so the "scoring still runs" claim is observed
+    /// rather than assumed.
     struct CountingScorer {
         scores: HashMap<String, f64>,
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -1596,19 +1596,19 @@ mod tests {
         }
     }
 
-    /// The skip must be observed at the call site, not merely derived: an
-    /// inert tier never consults the scorer, a reordering tier always does.
+    /// The scoring pass must still run at an inert tier. Link scores are not
+    /// only the reorder input — they are the corroboration axis of
+    /// `MemoryEvidence::evidence_score`, so skipping them would zero a reported
+    /// fact rather than save work.
     #[tokio::test]
-    async fn cascade_skips_link_scoring_at_an_inert_tier() {
+    async fn an_inert_tier_still_scores_links_for_the_evidence_axis() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let (retriever, pid) = cascade_seeded_retriever();
         let query = cascade_query(pid, 2);
         let scores = HashMap::from([("a_plain".to_string(), 0.0), ("b_linked".to_string(), 10.0)]);
 
-        for (tier, expected_calls) in
-            [(CascadeTier::Mild, 0), (CascadeTier::Aggressive, 0), (CascadeTier::Emergency, 1)]
-        {
+        for tier in [CascadeTier::Mild, CascadeTier::Aggressive, CascadeTier::Emergency] {
             let calls = std::sync::Arc::new(AtomicUsize::new(0));
             let scorer = CountingScorer { scores: scores.clone(), calls: calls.clone() };
             let config = LinkCascadeConfig {
@@ -1616,7 +1616,7 @@ mod tests {
                 start_tier: tier,
                 score_timeout: Duration::from_millis(250),
             };
-            let results = retriever
+            retriever
                 .retrieve_with_cascade(
                     &query,
                     &[0.1; 4],
@@ -1627,36 +1627,43 @@ mod tests {
                     CancellationToken::new(),
                 )
                 .await;
-            assert_eq!(results.len(), 2);
             assert_eq!(
                 calls.load(Ordering::SeqCst),
-                expected_calls,
-                "{tier:?}: scoring pass count"
+                1,
+                "{tier:?}: link scoring runs regardless of reorder reachability"
             );
         }
 
-        // Behaviour is unchanged by the skip: the Mild run still returns both
-        // results in fused rank order, never promoted by link evidence.
-        let calls = std::sync::Arc::new(AtomicUsize::new(0));
-        let scorer = CountingScorer { scores, calls };
+        // And the corroborated chunk's support actually reaches the evidence
+        // axis — the reason the pass cannot be skipped.
+        let scorer = ScriptedScorer(scores);
         let config = LinkCascadeConfig {
             decay_days: Some(90),
             start_tier: CascadeTier::Mild,
             score_timeout: Duration::from_millis(250),
         };
-        let results = retriever
-            .retrieve_with_cascade(
+        let (results, evidence) = retriever
+            .retrieve_with_cascade_evidence(
                 &query,
                 &[0.1; 4],
                 Some(2),
                 config.start_tier,
                 &scorer,
                 &config,
+                1,
                 CancellationToken::new(),
             )
             .await;
-        assert_eq!(results[0].chunk_id, "a_plain", "Mild preserves fused rank order");
-        assert_eq!(results[1].chunk_id, "b_linked");
+        let linked = evidence
+            .iter()
+            .find(|record| record.chunk_id == "b_linked")
+            .expect("the linked chunk is present");
+        assert_eq!(
+            linked.evidence_score.value(),
+            10.0,
+            "link support must reach the evidence axis even at a non-reordering tier"
+        );
+        assert_eq!(results.len(), 2);
     }
 
     /// The reorder is arithmetically impossible below this γ·scale product, so
