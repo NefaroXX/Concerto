@@ -29,6 +29,7 @@ Run locally against Rust 1.96.0 (the pinned CI toolchain):
 - [ ] `cargo +1.96.0 clippy --workspace --all-targets -- -D warnings`
 - [ ] `CONCERTO_TEST_MODE=1 cargo +1.96.0 test --workspace`
 - [ ] `cargo deny check`
+- [ ] `cargo audit`
 
 New tests added or updated:
 

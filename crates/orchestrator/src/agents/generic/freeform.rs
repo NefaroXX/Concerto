@@ -59,6 +59,7 @@ impl GenericSpecialistAgent {
         let mut tokens_out = 0_u64;
         let mut tool_call_count = 0_u32;
         let mut files_modified = Vec::new();
+        let mut verification = verification::restored(task, &context);
         let mut summary = String::new();
         let mut progress = ExecutionState::for_task(task, &context);
 
@@ -107,9 +108,13 @@ impl GenericSpecialistAgent {
             .await;
         }
 
-        for iteration in 0..MAX_TOOL_ITERATIONS {
+        'turns: for iteration in 0..MAX_TOOL_ITERATIONS {
             if cancel.is_cancelled() {
-                return Err(OrchestratorError::Cancelled);
+                if !progress.has_progress() {
+                    return Err(OrchestratorError::Cancelled);
+                }
+                progress.interrupted();
+                break;
             }
             progress.begin_turn();
 
@@ -140,6 +145,10 @@ impl GenericSpecialistAgent {
             let (text, reasoning, tool_calls, usage) =
                 match self.complete_provider_audited(&request, task, &cancel).await {
                     Ok(turn) => turn,
+                    Err(OrchestratorError::Cancelled) if progress.has_progress() => {
+                        progress.interrupted();
+                        break;
+                    }
                     Err(error) => return Err(error),
                 };
             // ADR-66 §4: resolve the turn through the text-fallback driver —
@@ -401,7 +410,7 @@ impl GenericSpecialistAgent {
                         }
                         // ADR-65 §3: record the completed (successful) tool
                         // command with the paths it actually touched.
-                        self.record_tool_fact(
+                        let event_id = self.record_tool_fact(
                             task,
                             &context,
                             &tool_call.name,
@@ -416,6 +425,13 @@ impl GenericSpecialistAgent {
                             &cancel,
                         )
                         .await;
+                        verification::collect(
+                            &mut verification,
+                            &tool_call.name,
+                            canonical_tool.as_deref(),
+                            &output.data,
+                            event_id.as_deref(),
+                        );
                         // ADR-65 §4: cache the exact bytes of a successful plain
                         // read (after the observation above, so the row exists)
                         // so an identical later read can be served. Fail-soft.
@@ -447,7 +463,7 @@ impl GenericSpecialistAgent {
                     Err(error) => {
                         // ADR-65 §3: record the completed (failed) tool
                         // command too — evidence exists either way.
-                        self.record_tool_fact(
+                        let _ = self.record_tool_fact(
                             task,
                             &context,
                             &tool_call.name,
@@ -465,7 +481,12 @@ impl GenericSpecialistAgent {
                         if cancel.is_cancelled()
                             || matches!(error, concerto_core::ToolError::Cancelled)
                         {
-                            return Err(OrchestratorError::Cancelled);
+                            progress.failed(&tool_call.id, &tool_call.name, &arguments, "cancelled");
+                            if !progress.has_progress() {
+                                return Err(OrchestratorError::Cancelled);
+                            }
+                            progress.interrupted();
+                            break 'turns;
                         }
                         if matches!(error, concerto_core::ToolError::PausedAwaitingApproval { .. })
                         {
@@ -520,6 +541,9 @@ impl GenericSpecialistAgent {
 
         let latency_ms = start.elapsed().as_millis() as u64;
         let cost_usd = self.provider.approximate_cost(tokens_in, tokens_out);
+        if verification::has_failure(&verification) {
+            progress.verification_failed();
+        }
         let outcome = progress.outcome(task, &summary);
         if let AgentOutcome::NeedsRevision { reason } = &outcome {
             let detail = display_reason(reason);
@@ -546,7 +570,7 @@ impl GenericSpecialistAgent {
         );
 
         Ok(AgentRunResult {
-            verification: Vec::new(),
+            verification,
             task_id: task.id,
             role: self.id.clone(),
             outcome,

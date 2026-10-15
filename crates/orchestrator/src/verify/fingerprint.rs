@@ -107,7 +107,10 @@ pub async fn checked_fingerprint(
             if !canonical.starts_with(root) {
                 return String::new();
             }
-            std::fs::read(canonical)
+            std::fs::metadata(&canonical)
+                .ok()
+                .filter(|metadata| metadata.len() <= MAX_BYTES)
+                .and_then(|_| std::fs::read(canonical).ok())
                 .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
                 .unwrap_or_default()
         }
@@ -145,7 +148,9 @@ mod tests {
     fn foreign_scope_cannot_gain_a_workspace_fingerprint() -> std::io::Result<()> {
         let root = tempfile::tempdir()?;
         let foreign = tempfile::tempdir()?;
-        assert!(workspace_fingerprint(root.path(), foreign.path(), &CancellationToken::new()).is_none());
+        assert!(
+            workspace_fingerprint(root.path(), foreign.path(), &CancellationToken::new()).is_none()
+        );
         Ok(())
     }
 }

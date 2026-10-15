@@ -1,50 +1,62 @@
 # cargo-audit configuration. Run with: cargo audit
 # Mirrors deny.toml advisory exceptions.
+#
+# THIS LIST IS A MIRROR, NOT AN INDEPENDENT POLICY. deny.toml is the single
+# source of truth: every entry below corresponds 1:1 to an entry there, and
+# every justification, scope note and review date lives in deny.toml. Do not
+# add, remove, or edit an entry here without making the identical change in
+# deny.toml.
+#
+# WHY THE MIRROR MATTERS — these are two separate gates and CI runs both.
+# While the two lists drifted apart, a stale entry here silently suppressed an
+# advisory that deny.toml had deliberately retired: a dependency upgrade into
+# a vulnerable range would FAIL `cargo deny check` but PASS `cargo audit`
+# with no output. That is the dormant-suppression failure mode, and it is the
+# reason this file is kept in lockstep rather than curated on its own.
+#
+# Verify they agree before pushing. Match QUOTED entries only — both files name
+# retired advisory IDs in prose (see History below), and an unquoted grep
+# matches those too, reporting drift that does not exist:
+#   diff <(grep -oE '"RUSTSEC-[0-9]{4}-[0-9]{4}"' deny.toml | tr -d '"' | sort -u) \
+#        <(grep -oE '"RUSTSEC-[0-9]{4}-[0-9]{4}"' .cargo/audit.toml | tr -d '"' | sort -u)
+#
+# History: RUSTSEC-2026-0173 (proc-macro-error2) and RUSTSEC-2023-0071 (rsa)
+# were present here only — never in deny.toml — and were dropped when the two
+# lists were resynchronised. RUSTSEC-2025-0119 and eleven wasmtime advisories
+# were retired from deny.toml in #345 but survived here; RUSTSEC-2026-0002 was
+# retired in #346 when ratatui 0.30 moved the CLI off vulnerable lru 0.12.5.
 
 [advisories]
 # Ignore advisories that are already tracked in deny.toml.
 # See deny.toml for full justification, scope, and review dates.
 ignore = [
-    # rsa — no fix, dead dep from sqlx-mysql (excluded by default-features=false)
-    "RUSTSEC-2023-0071",
     # yaml-rust — unmaintained, used by syntect for syntax highlighting
     "RUSTSEC-2024-0320",
     # instant — unmaintained, transitive dep via iced
     "RUSTSEC-2024-0384",
     # paste — unmaintained, transitive dep
     "RUSTSEC-2024-0436",
-    # number_prefix — unmaintained, transitive dep
-    "RUSTSEC-2025-0119",
     # bincode — unmaintained, transitive dep
     "RUSTSEC-2025-0141",
-    # wasmtime 24.0.13 — pinned for plugin sandbox, see deny.toml for the full
-    # config+version neutralization rationale (Cranelift-only, no pooling, memory64
-    # off via host.rs tripwire, below vulnerable floors)
-    "RUSTSEC-2025-0046",
-    "RUSTSEC-2025-0118",
-    "RUSTSEC-2026-0020",
-    "RUSTSEC-2026-0021",
-    "RUSTSEC-2026-0085",
+    # wasmtime 24.0.13 — pinned for the plugin sandbox. See the deny.toml
+    # wasmtime block for the full config/version neutralization rationale
+    # (memory64 off via host.rs tripwire, no pooling, below vulnerable floors).
     "RUSTSEC-2026-0086",
-    "RUSTSEC-2026-0087",
     "RUSTSEC-2026-0088",
     "RUSTSEC-2026-0089",
-    "RUSTSEC-2026-0091",
-    "RUSTSEC-2026-0092",
-    "RUSTSEC-2026-0093",
     "RUSTSEC-2026-0094",
     "RUSTSEC-2026-0095",
     "RUSTSEC-2026-0096",
-    # wasmtime Linker-clone UAF — unaffected < 43.0.0; 24.0.13 predates the v43 line
-    "RUSTSEC-2026-0090",
-    # quick-xml — constrained by upstream (fix = 0.41.0), DoS requires crafted XML
-    # and this workspace performs no runtime XML parsing; see deny.toml
+    "RUSTSEC-2026-0316",
+    "RUSTSEC-2026-0363",
+    # quick-xml — constrained by upstream, DoS requires crafted XML and this
+    # workspace performs no runtime XML parsing; see deny.toml
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
     # ttf-parser — unmaintained, no security issue
     "RUSTSEC-2026-0192",
-    # proc-macro-error2 — unmaintained, transitive dep
-    "RUSTSEC-2026-0173",
-    # lru — unsound, iterator invalidation, low risk in our usage
-    "RUSTSEC-2026-0002",
+    # lru — unsound `LruCache::pop` (use-after-free under panic), transitive
+    # via iced_wgpu -> cryoglyph, which pins lru ^0.16. The fix (0.18.2) is a
+    # breaking release outside that requirement. Desktop glyph cache only.
+    "RUSTSEC-2026-0253",
 ]

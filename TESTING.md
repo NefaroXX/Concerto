@@ -39,6 +39,7 @@ CARGO_BUILD_JOBS=2 cargo +1.96.0 build --workspace
 CONCERTO_TEST_MODE=1 CARGO_BUILD_JOBS=2 cargo +1.96.0 nextest run --workspace
 CONCERTO_TEST_MODE=1 cargo +1.96.0 test --workspace --doc
 cargo deny check
+cargo audit
 ```
 
 On PowerShell, set environment variables before the commands:
@@ -56,6 +57,7 @@ $env:CONCERTO_TEST_MODE = "1"
 | Nextest workspace tests | | |
 | Documentation tests | | |
 | Cargo deny | | |
+| Cargo audit | | |
 
 ### Acceptance-bar automation (Phase 6, 2026-08-01)
 

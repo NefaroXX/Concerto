@@ -118,7 +118,7 @@ blake3 = "1"
 # bytes through the JSON tool-call boundary (`content_b64` on the filesystem
 # write input): JSON strings are Unicode, so arbitrary bytes ride base64 and
 # are decoded at the tool boundary — never normalized, never text-guessed.
-base64 = "0.22"
+base64 = "0.23"
 
 # ---- Secret material held in RAM (threat model §6 gap #9) ----
 # Already a transitive dependency of the credential stack (keyring, rustls,
@@ -139,8 +139,8 @@ semver = "1"
 iced = { version = "0.14", features = ["tokio", "canvas"] }
 
 # ---- Terminal UI (Phase 3, ADR-07) ----
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 
 # ---- Syntax highlighting for diff viewer (Phase 3) ----
 syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "default-fancy"] }
@@ -166,7 +166,7 @@ utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
 # ---- Indexing / RAG pipeline (Phase 4) ----
 # swiftide = { version = "0.1", features = ["tree-sitter", "fastembed"] }  # Decision (2026-07-07): Ship Feature 4 v1 on entities.rs only. Revisit swiftide or hand-rolled tree-sitter only if entities.rs proves insufficient. See roadmap §3.3 option (c).
 
-tree-sitter = "0.26"
+tree-sitter = "0.27"
 tree-sitter-rust = "0.24"
 tree-sitter-python = "0.25"
 tree-sitter-go = "0.25"
@@ -176,6 +176,10 @@ fastembed = "6"
 
 # ---- Recursive directory walking (Phase 4) ----
 walkdir = "2"
+# Gitignore-aware walking for the shell `ls-tree` builtin, so a built `target/`
+# cannot exhaust its bounded entry budget. `require_git(false)` keeps it
+# effective outside a git repo; see crates/shell/src/builtins.rs.
+ignore = "0.4"
 glob = "0.3"
 
 # ---- Filesystem watch (Phase 4, ADR-06) ----

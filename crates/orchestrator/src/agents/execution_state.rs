@@ -48,6 +48,7 @@ pub(crate) struct ExecutionContinuation {
 #[derive(Debug, Default)]
 pub(crate) struct ExecutionState {
     turns: u32,
+    stop: Option<(&'static str, &'static str)>,
     final_answer: bool,
     unavailable_executor: bool,
     successful_calls: Vec<RecordedCall>,
@@ -98,6 +99,21 @@ impl ExecutionState {
             }
         }
         state
+    }
+
+    pub fn has_progress(&self) -> bool {
+        !self.successful_calls.is_empty() || !self.failures.is_empty()
+            || !self.rejected_arguments.is_empty() || self.omitted_successful_calls > 0
+    }
+
+    pub fn interrupted(&mut self) {
+        self.stop = Some(("specialist-interrupted", "execution was interrupted after observed progress"));
+    }
+
+    pub fn verification_failed(&mut self) {
+        if self.stop.is_none() {
+            self.stop = Some(("specialist-verification-failed", "runtime verification checks remain failed or incomplete"));
+        }
     }
 
     pub fn begin_turn(&mut self) {
@@ -172,7 +188,9 @@ impl ExecutionState {
     /// A final model answer is necessary, but unresolved runtime failures or
     /// a missing executor prevent it from becoming a successful settlement.
     pub fn outcome(&self, task: &SubTask, summary: &str) -> AgentOutcome {
-        let (code, reason) = if self.unavailable_executor {
+        let (code, reason) = if let Some(stop) = self.stop {
+            stop
+        } else if self.unavailable_executor {
             ("specialist-no-executor", "requested tool work has no execution backend")
         } else if !self.final_answer {
             ("specialist-turn-limit", "the execution limit was reached before a final answer")

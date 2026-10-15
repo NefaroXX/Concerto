@@ -1,7 +1,7 @@
 use concerto_config::ObservabilityConfig;
 use concerto_core::error::ObservabilityError;
 use opentelemetry::KeyValue;
-use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
+use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
 
@@ -26,10 +26,15 @@ impl OtelExporter {
         };
 
         // Build the OTLP exporter pipeline using the SDK's batch exporter pattern.
+        // Omit an explicit HTTP client: the `reqwest-client` feature makes OTLP
+        // construct its own reqwest 0.13 client (with the resolved export timeout
+        // applied). Passing `reqwest::Client::new()` from this crate would name the
+        // workspace's reqwest 0.12 type, which no longer implements
+        // `opentelemetry_http::HttpClient` in the 0.33 family. The exporter's own
+        // timeout/deadline semantics are unaffected (enforced in `retry_with_backoff`).
         let exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_http()
             .with_endpoint(endpoint)
-            .with_http_client(reqwest::Client::new())
             .build()
             .map_err(|e| ObservabilityError::OtelInitFailed(e.to_string()))?;
 

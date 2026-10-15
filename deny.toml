@@ -18,7 +18,6 @@ ignore = [
     "RUSTSEC-2024-0320",  # yaml-rust — unmaintained, used by syntect for syntax highlighting
     "RUSTSEC-2024-0384",  # instant — unmaintained, transitive dep via iced
     "RUSTSEC-2024-0436",  # paste — unmaintained, transitive dep
-    "RUSTSEC-2025-0119",  # number_prefix — unmaintained, transitive dep
     "RUSTSEC-2025-0141",  # bincode — unmaintained, transitive dep
     # === wasmtime 24.0.13 exceptions ===
     # Reason: wasmtime pinned to the 24.0.x line (resolved: 24.0.13) for the plugin
@@ -34,34 +33,25 @@ ignore = [
     # tripwire), and 24.0.13 sits below the upstream vulnerable floors
     # (25.0.0 / 28.0.0 / 32.0.0). Any future bump must keep `winch` OFF and memory64
     # FALSE, and re-review 0096 for the shipped aarch64-apple-darwin target.
-    # 0090 is unaffected below 43.0.0 (Linker-clone UAF introduced in the 43 dev line;
-    # fixed 43.0.1).
+    # SCOPE RULE (2026-10-14): this list carries only advisories that actually match
+    # wasmtime 24.0.13 in the current graph. Twelve entries whose vulnerable ranges
+    # start ABOVE 24.0.13 (and one unmaintained-transitive entry, RUSTSEC-2025-0119
+    # number_prefix, no longer matched by any crate) were removed rather than left
+    # as dead suppressions. That is deliberate: a list that silently no longer fires
+    # would wave through a future bump into a vulnerable range. With them gone, any
+    # wasmtime upgrade that lands inside one of those ranges fails `cargo deny check`
+    # and must be re-justified here.
     # Scope: concerto-plugins crate only (crates/plugins/)
     # Review date: 2026-10-01 — reassess wasmtime upgrade feasibility.
     # Upstream: https://github.com/bytecodealliance/wasmtime/security/advisories
-    "RUSTSEC-2025-0046",  # wasmtime fd_renumber panic — DoS in WASI guest
-    "RUSTSEC-2025-0118",  # wasmtime shared linear memory unsound API — sandbox boundary
-    "RUSTSEC-2026-0020",  # wasmtime guest resource exhaustion — DoS in WASI
-    "RUSTSEC-2026-0021",  # wasmtime http/types.fields panic — DoS in guest
-    "RUSTSEC-2026-0085",  # wasmtime flags lift panic — DoS in guest
     "RUSTSEC-2026-0086",  # wasmtime host data leakage Winch — requires Winch backend
-    "RUSTSEC-2026-0087",  # wasmtime f64x2.splat crash — requires specific SIMD guest code
     "RUSTSEC-2026-0088",  # wasmtime pooling allocator leakage — data isolation issue
     "RUSTSEC-2026-0089",  # wasmtime table.fill panic Winch — requires Winch backend
-    "RUSTSEC-2026-0091",  # wasmtime component string OOB — guest-side transcoding
-    "RUSTSEC-2026-0092",  # wasmtime UTF-16 misalign panic — guest-side transcoding
-    "RUSTSEC-2026-0093",  # wasmtime UTF-16 OOB read — guest-side transcoding
     "RUSTSEC-2026-0094",  # wasmtime table.grow mask Winch — requires Winch backend
     "RUSTSEC-2026-0095",  # wasmtime Winch sandbox escape — requires Winch backend
     "RUSTSEC-2026-0096",  # wasmtime aarch64 Cranelift miscompile — HOST sandbox escape;
                           # neutralized: 24.0.13 < 32.0.0 floor + memory64 off (tripwire)
                           # + Cranelift/spectre defaults; aarch64-apple-darwin is shipped
-    "RUSTSEC-2026-0090",  # wasmtime Linker-clone use-after-free — unaffected < 43.0.0;
-                          # 24.0.13 predates the vulnerable line
-    "RUSTSEC-2026-0222",  # wasmtime stores can mix type indices between engines — Low (3.8);
-                          # embedder-only (needs 2 Engines, objects mixed across them), not
-                          # guest-triggerable; PluginHost uses a single shared Engine
-                          # (crates/plugins/src/host.rs), so usage is unaffected
     "RUSTSEC-2026-0316",  # wasmtime dynamic record lifting can allocate beyond the hostcall
                           # fuel limit (GHSA-jqpg-j7w6-42pr). NOT REACHABLE: record lifting
                           # is a COMPONENT-MODEL API (wasmtime::component); the plugin host
@@ -73,6 +63,22 @@ ignore = [
                           # Fixed upstream in >= 36.0.16 / >= 48.0.3 / >= 49.0.1, all of
                           # which require the func_wrap API migration noted above; revisit
                           # if/when wasmtime leaves the 24.0.x line.
+    "RUSTSEC-2026-0363",  # wasmtime component-model handle tables capped only per
+                          # instance, charged to no limit (GHSA-q554-3cjc-rx7p). NOT
+                          # REACHABLE: handle tables are a COMPONENT-MODEL structure;
+                          # the plugin host uses core modules only — Config, Store,
+                          # Module::new, Instance, Linker::new, func_wrap_async over
+                          # linear memory (crates/plugins/src/host.rs, loader.rs,
+                          # active_plugin.rs, host_fns.rs, installer.rs import only
+                          # Engine/Store/Module/Instance/Linker/Caller/ExternType).
+                          # No Component, component::Linker, bindgen!, or Val is ever
+                          # constructed, so no component instance exists to hold a
+                          # handle table.
+                          # Scope: concerto-plugins crate only (crates/plugins/).
+                          # Fixed upstream in wasmtime PR #14732, which requires the
+                          # func_wrap API migration noted above; revisit if/when
+                          # wasmtime leaves the 24.0.x line.
+                          # Added 2026-10-14; tracked for retirement in issue #340.
     # === quick-xml exceptions ===
     # Reason: quick-xml v0.38.4/v0.39.4 constrained by plist (syntect via iced) and
     # wayland-scanner. These are XML parsing DoS vectors that require crafted XML input.
@@ -87,24 +93,28 @@ ignore = [
     # Scope: transitive dep via iced font rendering
     # Review date: 2026-10-01
     "RUSTSEC-2026-0192",  # ttf-parser unmaintained — no security issue, maintenance only
-    # === lru unsoundness (ratatui + iced_wgpu/cryoglyph paths) ===
-    # Reason: two distinct lru advisories on two pinned transitive paths.
-    # - RUSTSEC-2026-0002: lru v0.12.5 Stacked Borrows violation in IterMut,
-    #   via ratatui v0.29.0 (concerto-cli TUI).
+    # === lru unsoundness (iced_wgpu/cryoglyph path) ===
+    # Reason: one lru advisory on one pinned transitive path.
     # - RUSTSEC-2026-0253: lru < 0.18.2 unsoundness in LruCache::pop
     #   (use-after-free under panic in `pop`), via iced_wgpu -> cryoglyph
-    #   (desktop glyph cache). cryoglyph pins `lru = "^0.16"`, and the fix
-    #   (0.18.2) is a breaking release outside that requirement — bumping is
-    #   not selectable until iced/cryoglyph upstream relax the pin.
+    #   (desktop glyph cache), which resolves lru 0.16.4. cryoglyph pins
+    #   `lru = "^0.16"`, and the fix (0.18.2) is a breaking release outside
+    #   that requirement — bumping is not selectable until iced/cryoglyph
+    #   upstream relax the pin.
     # Risk: memory-safety issue that requires the specific call patterns the
-    # advisory describes; both consumers are single-threaded UI caches, not
-    # adversarial-input paths.
-    # Scope: concerto-cli (ratatui path) + concerto-desktop (cryoglyph path).
-    # Note: enforced by `unsound = "transitive"` above — both advisories ARE
-    # detected on their transitive paths and suppressed here.
-    # Review date: 2026-10-01 — re-check ratatui 0.30+ and iced/cryoglyph
-    # releases for relaxed lru pins (>=0.18.2), then drop these ignores.
-    "RUSTSEC-2026-0002",  # lru — unsound IterMut, transitive via ratatui
+    # advisory describes; the consumer is a single-threaded UI cache, not an
+    # adversarial-input path.
+    # Scope: concerto-desktop (cryoglyph path) only.
+    # Note: enforced by `unsound = "transitive"` above — this advisory IS
+    # detected on its transitive path and suppressed here.
+    # RETIRED 2026-10-14 — RUSTSEC-2026-0002 (unsound `IterMut`, Stacked
+    # Borrows violation) was removed from this list because it no longer
+    # matches any crate: the ratatui 0.29.0 -> 0.30.2 bump moved concerto-cli's
+    # lru off the vulnerable 0.12.5 and onto 0.18.5, which is past the fix.
+    # Leaving the entry would have reintroduced the dormant-suppression class
+    # removed in #345 (a stale ignore that silently stops firing).
+    # Review date: 2026-10-14 — re-check iced/cryoglyph releases for a relaxed
+    # lru pin (>=0.18.2), then drop this ignore and close the last lru entry.
     "RUSTSEC-2026-0253",  # lru — unsound pop, transitive via iced_wgpu -> cryoglyph (pinned ^0.16)
 ]
 

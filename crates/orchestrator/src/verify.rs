@@ -467,8 +467,12 @@ pub fn is_file_scope_record(project_root: &Path, record: &VerificationSummary) -
 pub fn fingerprint_matches(project_root: &Path, record: &VerificationSummary) -> bool {
     let resolved = resolve_verification_path(project_root, &record.path);
     if record.content_fingerprint.starts_with(fingerprint::WORKSPACE_PREFIX) {
-        return fingerprint::workspace_fingerprint(project_root, &resolved, &CancellationToken::new())
-            .is_some_and(|value| value == record.content_fingerprint);
+        return fingerprint::workspace_fingerprint(
+            project_root,
+            &resolved,
+            &CancellationToken::new(),
+        )
+        .is_some_and(|value| value == record.content_fingerprint);
     }
     match std::fs::read(&resolved) {
         Ok(bytes) => blake3::hash(&bytes).to_hex().to_string() == record.content_fingerprint,
@@ -728,8 +732,10 @@ pub async fn sweep_record_with_verifier(
     exit_code: Option<i32>,
     verifier: &str,
 ) -> VerificationSummary {
-    let content_fingerprint =
-        fingerprint::checked_fingerprint(project_root, path, &CancellationToken::new()).await;
+    let content_fingerprint = tokio::fs::read(resolve_verification_path(project_root, path))
+        .await
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+        .unwrap_or_default();
     let mut record = VerificationSummary::new(path.clone(), command, outcome, output)
         .with_verifier(verifier)
         .with_scope(path.as_str())
@@ -1875,6 +1881,20 @@ pub enum VerifyError {
 /// (fail-safe: unknown is never clean-disk).
 pub type OverlayPendingSource = Arc<dyn Fn() -> bool + Send + Sync>;
 
+/// Shared late-bound service for seeded specialists and provider rebuilds.
+#[derive(Clone, Default)]
+pub(crate) struct SharedVerifier(Arc<Mutex<Option<Arc<VerifierService>>>>);
+
+impl SharedVerifier {
+    pub(crate) fn set(&self, service: Arc<VerifierService>) {
+        *self.0.lock().unwrap_or_else(|error| error.into_inner()) = Some(service);
+    }
+
+    pub(crate) fn get(&self) -> Option<Arc<VerifierService>> {
+        self.0.lock().unwrap_or_else(|error| error.into_inner()).clone()
+    }
+}
+
 /// The reusable verification service. Owns a per-run [`FreshnessClock`], the
 /// harness engine (upgradable to the governed executor-backed engine once
 /// the run builds one), the spawner seam, and the coalescing caches.
@@ -1992,8 +2012,8 @@ impl VerifierService {
         self.eval_cache.lock().unwrap_or_else(|error| error.into_inner()).clear();
     }
 
-    /// Re-capture the workspace base (fail-soft: a failed capture keeps the
-    /// previous base and every gated check then reports stale).
+    /// Re-capture complete bounded source bytes. Unavailable coverage clears
+    /// the base so previous checks cannot remain trusted.
     ///
     /// When the base moved, the coalescing caches are dropped with it: they
     /// are keyed by generation, so a moved base makes every entry
@@ -2006,17 +2026,15 @@ impl VerifierService {
         let project_dir = self.project_root.clone();
         let token = cancel.clone();
         let captured = tokio::task::spawn_blocking(move || {
-            let entries =
-                crate::workspace_snapshot::capture_workspace_snapshot(&project_dir, &token);
-            crate::workspace_snapshot::generation_for(&entries)
+            fingerprint::workspace_fingerprint(&project_dir, &project_dir, &token)
+                .unwrap_or_default()
         })
         .await
         .unwrap_or_default();
         if captured.is_empty() {
             tracing::warn!(
-                "verify.run: workspace generation capture failed; freshness falls back to the previous base"
+                "verify.run: workspace fingerprint unavailable; verification remains display data"
             );
-            return;
         }
         let base_changed = {
             let mut clock = self.clock.lock().unwrap_or_else(|error| error.into_inner());
@@ -2052,6 +2070,27 @@ impl VerifierService {
         clock.record_freshness(&self.project_root, record)
     }
 
+    /// Check a bounded completion ledger without holding a mutex during disk reads.
+    pub async fn check_ledger(
+        &self,
+        records: &[VerificationSummary],
+        cancel: &CancellationToken,
+    ) -> GateLedger {
+        self.refresh_base(cancel).await;
+        let clock = self.clock.lock().unwrap_or_else(|error| error.into_inner()).clone();
+        let root = self.project_root.clone();
+        let records = records.to_vec();
+        let token = cancel.clone();
+        tokio::task::spawn_blocking(move || {
+            if token.is_cancelled() {
+                return GateLedger::default();
+            }
+            clock.evaluate_ledger(&root, &records)
+        })
+        .await
+        .unwrap_or_default()
+    }
+
     /// Envelope state label: what bytes this run claims to have checked.
     fn checked_state(&self, generation: &str, overlay_pending: bool) -> String {
         if overlay_pending {
@@ -2072,6 +2111,14 @@ impl VerifierService {
         request: &VerifyRequest,
         cancel: &CancellationToken,
     ) -> Result<Vec<VerificationSummary>, VerifyError> {
+        self.verify_with_coverage(request, cancel).await.map(|(records, _)| records)
+    }
+
+    async fn verify_with_coverage(
+        &self,
+        request: &VerifyRequest,
+        cancel: &CancellationToken,
+    ) -> Result<(Vec<VerificationSummary>, usize), VerifyError> {
         if cancel.is_cancelled() {
             return Err(VerifyError::Cancelled);
         }
@@ -2081,11 +2128,26 @@ impl VerifierService {
         }
         let (generation, stamp) = self.snapshot();
         let run = self.run_adapters(request, &generation, &stamp, cancel.clone());
-        match tokio::time::timeout(request.timeout, run).await {
-            Err(_) => Ok(vec![timeout_record(request, &generation)]),
-            Ok(Err(error)) => Err(error),
-            Ok(Ok(records)) => Ok(bound_records(records)),
+        let mut records = match tokio::time::timeout(request.timeout, run).await {
+            Err(_) => vec![timeout_record(request, &generation)],
+            Ok(Err(error)) => return Err(error),
+            Ok(Ok(records)) => records,
+        };
+        // Re-observe complete source bytes after all adapters settle. A check
+        // that raced a write, or lacks bounded coverage, cannot prove those bytes.
+        self.refresh_base(cancel).await;
+        let stable = !generation.is_empty() && generation == self.current_generation()
+            && !cancel.is_cancelled() && !request.overlay_pending;
+        for record in &mut records {
+            if stable {
+                record.content_fingerprint =
+                    fingerprint::checked_fingerprint(&self.project_root, &record.path, cancel).await;
+            } else {
+                record.content_fingerprint.clear();
+            }
         }
+        let total = records.len();
+        Ok((bound_records(records), total))
     }
 
     /// Checked-state label for `request` at `generation` (envelope honesty).
@@ -2236,7 +2298,8 @@ impl VerifierService {
         stamp: &VerificationStamp,
         cancel: &CancellationToken,
     ) -> Result<Vec<VerificationSummary>, VerifyError> {
-        let scope_key = if files.is_empty() { "project".to_string() } else { files[0].to_string() };
+        let eval_dir = EvalEngine::resolve_manifest_root(&self.project_root, files);
+        let scope_key = eval_dir.to_string_lossy().to_string();
         let key = format!("eval:{scope_key}:{generation}");
         let cached =
             self.eval_cache.lock().unwrap_or_else(|error| error.into_inner()).get(&key).cloned();
@@ -2246,7 +2309,6 @@ impl VerifierService {
                 if cancel.is_cancelled() {
                     return Err(VerifyError::Cancelled);
                 }
-                let eval_dir = EvalEngine::resolve_manifest_root(&self.project_root, files);
                 let eval = self.eval.lock().unwrap_or_else(|error| error.into_inner()).clone();
                 match self.spawner.run_eval(&eval, &eval_dir, files, cancel).await {
                     Ok(result) => CachedEvalOutcome::Ran(result),
@@ -2255,11 +2317,13 @@ impl VerifierService {
                 }
             }
         };
-        let mut record = outcome.clone().into_record(record_path);
+        let checked_root = Utf8PathBuf::from_path_buf(eval_dir).unwrap_or_else(|_| record_path.clone());
+        let mut record = outcome.clone().into_record(&checked_root);
+        record.scope = checked_root.to_string();
         record.generation = generation.to_string();
-        // Workspace-scope evidence for harness records (F-WORKSPACE-SUPERSEDE);
-        // the content-fingerprint axis stays empty — a workspace check names
-        // no single file, so harness records remain display-grade by design.
+        // The service binds this workspace check to stable source bytes after
+        // all adapters settle. Backing writes are supplemented by the native
+        // check's ToolExecuted event at the specialist transport boundary.
         record.evidence_ids = stamp.workspace_evidence();
         if self.eval_cache.lock().unwrap_or_else(|error| error.into_inner()).get(&key).is_none() {
             self.eval_cache.lock().unwrap_or_else(|error| error.into_inner()).insert(key, outcome);
@@ -2785,8 +2849,8 @@ impl concerto_core::traits::tool::Tool for VerifyRunTool {
             ToolError::ExecutionFailed { message: format!("invalid verify.run input: {error}") }
         })?;
         let request = self.parse_request(&parsed, session)?;
-        let records = match self.service.verify(&request, &cancel).await {
-            Ok(records) => records,
+        let (records, total_records) = match self.service.verify_with_coverage(&request, &cancel).await {
+            Ok(result) => result,
             Err(VerifyError::Cancelled) => return Err(ToolError::Cancelled),
             Err(VerifyError::Denied(detail)) => {
                 return Err(ToolError::ExecutionFailed {
@@ -2830,8 +2894,8 @@ impl concerto_core::traits::tool::Tool for VerifyRunTool {
             "checked_state": checked_state,
             "overlay_materialized": !request.overlay_pending,
             "records": records,
-            "total_records": records.len(),
-            "truncated_records": false,
+            "total_records": total_records,
+            "truncated_records": total_records > records.len(),
             "adapters": adapter_proves_table(),
             "honesty": VERIFY_HONESTY_NOTE,
         });

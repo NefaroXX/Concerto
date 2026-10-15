@@ -3294,7 +3294,7 @@ async fn run_multi_agent(
         gate_log_pool.clone(),
         // Native validators attach the governed executor using their actual session.
         None,
-    ));
+    ).with_verifier_service(verify_service.clone()));
     // The feed task below resolves implement-stage roles from the registry,
     // so keep a clone before `registry` moves into the coordinator.
     let stage_feed_registry = registry.clone();
@@ -3352,6 +3352,7 @@ async fn run_multi_agent(
         coordinator_provider,
         memory.clone(),
     )
+    .with_strict_verification_gate(services.config.strict_verification_gate())
     .with_memory_writeback(memory_decision_store, memory_task_tree)
     .with_agent_configs(agent_configs)
     .with_skills_section(skills_section)
