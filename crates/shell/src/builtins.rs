@@ -430,6 +430,10 @@ enum TreeWalk {
 ///   result deterministic and rooted at `target`. This is a policy-gated tool,
 ///   so it must not depend on the developer's personal global git config, on
 ///   `.git/info/exclude`, or on ignore rules from above `target`.
+/// - `ignore(false)`: ripgrep-style `.ignore` files are conventionally
+///   untracked, so honouring them would let the tool's output change based on a
+///   file invisible to `git status`/`git diff` review — the same hidden-source
+///   non-determinism the settings above exist to prevent.
 /// - `require_git(false)`: load-bearing — `ignore` defaults this to `true`,
 ///   which disables `.gitignore` entirely outside a git repo and would leave
 ///   plain directories unfiltered.
@@ -453,6 +457,7 @@ fn collect_tree_entries(
         .git_ignore(true)
         .git_global(false)
         .git_exclude(false)
+        .ignore(false)
         .parents(false)
         .require_git(false)
         .build();
@@ -686,6 +691,20 @@ mod tests {
         let paths = entry_paths(&result);
         assert!(paths.contains(&".hidden".to_owned()));
         assert!(paths.contains(&"visible.txt".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn ripgrep_ignore_file_does_not_hide_entries() {
+        let (root, _dir) = temp_root();
+        write_file(&root, ".ignore", "dot-ignore-target.txt\n");
+        write_file(&root, "dot-ignore-target.txt", "still listed");
+
+        let result = run_tree(&root, &[]).await;
+        let paths = entry_paths(&result);
+        // `.ignore(false)`: a ripgrep-style `.ignore` must not alter the result.
+        assert!(paths.contains(&"dot-ignore-target.txt".to_owned()));
+        // The `.ignore` file itself is an ordinary dotfile and stays listed.
+        assert!(paths.contains(&".ignore".to_owned()));
     }
 
     #[test]
