@@ -1,5 +1,6 @@
 //! Shared single‑agent runner used by both CLI and Desktop.
 
+#[path = "runtime_runner/operator_input.rs"]
 mod operator_input;
 
 use std::collections::HashMap;

@@ -699,26 +699,22 @@ async fn run_prune(
 
 fn select_session_for_resume(id: concerto_core::ids::Ulid) -> anyhow::Result<PathBuf> {
     let rt = tokio::runtime::Runtime::new()?;
-            let session_project = rt.block_on(async {
-                use concerto_sessions::SessionStore;
-                let store = concerto_sessions::SqliteSessionStore::connect().await?;
-                let session = store
-                    .load_session(id, CancellationToken::new())
-                    .await?
-                    .ok_or_else(|| concerto_sessions::SessionError::NotFound(id.to_string()))?;
-                store
-                    .set_active_session_for_project(
-                        &session.project_dir,
-                        id,
-                        CancellationToken::new(),
-                    )
-                    .await?;
-                Ok::<camino::Utf8PathBuf, concerto_sessions::SessionError>(session.project_dir)
-            })?;
-            let mut registry = concerto_config::ProjectRegistry::load().unwrap_or_default();
-            registry.select(session_project.as_std_path())?;
-            registry.save()?;
-            Ok(session_project.into_std_path())
+    let session_project = rt.block_on(async {
+        use concerto_sessions::SessionStore;
+        let store = concerto_sessions::SqliteSessionStore::connect().await?;
+        let session = store
+            .load_session(id, CancellationToken::new())
+            .await?
+            .ok_or_else(|| concerto_sessions::SessionError::NotFound(id.to_string()))?;
+        store
+            .set_active_session_for_project(&session.project_dir, id, CancellationToken::new())
+            .await?;
+        Ok::<camino::Utf8PathBuf, concerto_sessions::SessionError>(session.project_dir)
+    })?;
+    let mut registry = concerto_config::ProjectRegistry::load().unwrap_or_default();
+    registry.select(session_project.as_std_path())?;
+    registry.save()?;
+    Ok(session_project.into_std_path())
 }
 
 fn run_sessions_subcommand(args: &[String], project_root: &Path) -> anyhow::Result<()> {
