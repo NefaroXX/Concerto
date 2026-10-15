@@ -273,7 +273,7 @@ fn register_seeded_agents(
                 .with_skills_section(&skills)
                 .with_environment_card(&environment_card)
                 .with_shared_verifier(verifier.clone())
-                    .with_tool_facts(fact_ctx),
+                .with_tool_facts(fact_ctx),
             )
         };
         registry.register_with_factory(factory_id, build(get_provider(id)), Arc::new(build));

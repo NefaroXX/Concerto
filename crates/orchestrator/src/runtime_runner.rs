@@ -1,5 +1,7 @@
 //! Shared single‑agent runner used by both CLI and Desktop.
 
+mod operator_input;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -2496,7 +2498,7 @@ pub async fn run_shared_agent(
                 // migrated in-memory and unknown future schema versions are
                 // rejected cleanly (C-05).
                 match crate::checkpoint::GraphCheckpoint::from_json(checkpoint_json) {
-                    Ok(checkpoint) if resume_requested => {
+                    Ok(mut checkpoint) if resume_requested || checkpoint.pending_user_input.is_some() => {
                         // Explicit "continue" / "resume" — validate scope
                         // before trusting the checkpoint (Finding 2 / #65).
                         // ADR-60 D7 (interrupt-safe resume): the scope is the
@@ -2542,6 +2544,17 @@ pub async fn run_shared_agent(
                             // The checkpoint governs this run: its cursor
                             // anchors the §7 evidence view.
                             resume_cursor = checkpoint.whiteboard_cursor_gate_seq;
+                            if let Some(question) = operator_input::consume(&mut checkpoint, &req.input) {
+                                crate::bypass_decision::record_decision_row(
+                                    Some(executor.as_ref()), gate_log_pool.as_ref(), session_id,
+                                    "operator-answer-received",
+                                    &format!("Consumed operator response to pending question: {}",
+                                        question.chars().take(1_000).collect::<String>()),
+                                ).await;
+                                req.resume_checkpoint_json = Some(serde_json::to_string(&checkpoint)
+                                    .map_err(|error| OrchestratorError::AgentLoopError(error.to_string()))?);
+                            }
+
                         }
                     }
                     Ok(checkpoint) => {
@@ -3275,26 +3288,29 @@ async fn run_multi_agent(
     let merge_seeds = !services.config.owns_agent_roster();
     // All specialists receive the native argv contract and actual host OS.
     let environment_card = crate::prompts::native_environment_card();
-    let registry = Arc::new(AgentRegistry::build_with_roles_for_project_with_facade(
-        role_providers,
-        default_provider,
-        executor.clone(),
-        services.bus.clone(),
-        retry_policy,
-        &req.project_dir,
-        &agent_configs,
-        &skills_section,
-        &environment_card,
-        facade.as_ref(),
-        merge_seeds,
-        // ADR-65 §3: the session-DB pool backs every registered specialist's
-        // tool-evidence writer. The snapshot barrier runs below, so the
-        // writer's per-call `generation` comes from `AgentContext` instead of
-        // being baked here.
-        gate_log_pool.clone(),
-        // Native validators attach the governed executor using their actual session.
-        None,
-    ).with_verifier_service(verify_service.clone()));
+    let registry = Arc::new(
+        AgentRegistry::build_with_roles_for_project_with_facade(
+            role_providers,
+            default_provider,
+            executor.clone(),
+            services.bus.clone(),
+            retry_policy,
+            &req.project_dir,
+            &agent_configs,
+            &skills_section,
+            &environment_card,
+            facade.as_ref(),
+            merge_seeds,
+            // ADR-65 §3: the session-DB pool backs every registered specialist's
+            // tool-evidence writer. The snapshot barrier runs below, so the
+            // writer's per-call `generation` comes from `AgentContext` instead of
+            // being baked here.
+            gate_log_pool.clone(),
+            // Native validators attach the governed executor using their actual session.
+            None,
+        )
+        .with_verifier_service(verify_service.clone()),
+    );
     // The feed task below resolves implement-stage roles from the registry,
     // so keep a clone before `registry` moves into the coordinator.
     let stage_feed_registry = registry.clone();
@@ -3552,6 +3568,15 @@ async fn run_multi_agent(
         None => multi_agent_task_with_history(task.clone(), &req.conversation_history),
     };
     let mut context = AgentContext::new(SessionContext::new(session_id, project_dir.clone()));
+    if let Some(checkpoint) = req.resume_checkpoint_json.as_deref()
+        .and_then(|json| crate::checkpoint::GraphCheckpoint::from_json(json).ok())
+        .filter(|checkpoint| checkpoint.validate_scope(session_id, &context.session.project_id.0).is_ok())
+    {
+        if let Some(memory) = checkpoint.working_memory {
+            context.working_memory = memory;
+        }
+    }
+
     // Run-stage tracking (ADR-55 §9): the coordinator publishes
     // `SubTaskCreated` and gate-cycle (`ReviewCycleStarted` /
     // `ValidationCycleStarted`) events on the bus as the graph progresses, so

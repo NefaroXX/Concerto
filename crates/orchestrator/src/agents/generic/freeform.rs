@@ -145,7 +145,9 @@ impl GenericSpecialistAgent {
             let (text, reasoning, tool_calls, usage) =
                 match self.complete_provider_audited(&request, task, &cancel).await {
                     Ok(turn) => turn,
-                    Err(OrchestratorError::Cancelled) if progress.has_progress() => {
+                    Err(error) if progress.has_progress() && (cancel.is_cancelled()
+                        || matches!(error, OrchestratorError::Cancelled | OrchestratorError::Provider(
+                            concerto_core::error::ProviderError::Cancelled))) => {
                         progress.interrupted();
                         break;
                     }
@@ -410,21 +412,22 @@ impl GenericSpecialistAgent {
                         }
                         // ADR-65 §3: record the completed (successful) tool
                         // command with the paths it actually touched.
-                        let event_id = self.record_tool_fact(
-                            task,
-                            &context,
-                            &tool_call.name,
-                            &arguments,
-                            true,
-                            ToolOutcome::Ok,
-                            Some(&output.data),
-                            is_file_change,
-                            pre_image_hashes.clone(),
-                            canonical_tool.as_deref(),
-                            canonical_operation.as_deref(),
-                            &cancel,
-                        )
-                        .await;
+                        let event_id = self
+                            .record_tool_fact(
+                                task,
+                                &context,
+                                &tool_call.name,
+                                &arguments,
+                                true,
+                                ToolOutcome::Ok,
+                                Some(&output.data),
+                                is_file_change,
+                                pre_image_hashes.clone(),
+                                canonical_tool.as_deref(),
+                                canonical_operation.as_deref(),
+                                &cancel,
+                            )
+                            .await;
                         verification::collect(
                             &mut verification,
                             &tool_call.name,
@@ -463,25 +466,31 @@ impl GenericSpecialistAgent {
                     Err(error) => {
                         // ADR-65 §3: record the completed (failed) tool
                         // command too — evidence exists either way.
-                        let _ = self.record_tool_fact(
-                            task,
-                            &context,
-                            &tool_call.name,
-                            &arguments,
-                            false,
-                            tool_outcome_for_error(&error),
-                            None,
-                            is_file_change,
-                            pre_image_hashes.clone(),
-                            canonical_tool.as_deref(),
-                            canonical_operation.as_deref(),
-                            &cancel,
-                        )
-                        .await;
+                        let _ = self
+                            .record_tool_fact(
+                                task,
+                                &context,
+                                &tool_call.name,
+                                &arguments,
+                                false,
+                                tool_outcome_for_error(&error),
+                                None,
+                                is_file_change,
+                                pre_image_hashes.clone(),
+                                canonical_tool.as_deref(),
+                                canonical_operation.as_deref(),
+                                &cancel,
+                            )
+                            .await;
                         if cancel.is_cancelled()
                             || matches!(error, concerto_core::ToolError::Cancelled)
                         {
-                            progress.failed(&tool_call.id, &tool_call.name, &arguments, "cancelled");
+                            progress.failed(
+                                &tool_call.id,
+                                &tool_call.name,
+                                &arguments,
+                                "cancelled",
+                            );
                             if !progress.has_progress() {
                                 return Err(OrchestratorError::Cancelled);
                             }

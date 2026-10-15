@@ -7133,7 +7133,7 @@ impl CoordinatorAgent {
         // Truthful pause when the session closed without the dispatch the
         // run promised: the guard would fire at the exit anyway, so name the
         // real cause instead of leaving only the guard's verdict to explain it.
-        if !continuing
+        if !continuing && task.execution_mode.is_action_required()
             && !self.implement_stage_dispatch_occurred(&result.graph, &result.action_ledger)
         {
             result.loop_notes.push(
@@ -7171,6 +7171,11 @@ impl CoordinatorAgent {
                     // dispatches the promised work.
                     if self.resume_needs_implement_drive(task, &result)
                         || self.resume_needs_continuation_drive(&result)
+                        || (result.requested_user_input.is_none() && result.pending_approval.is_none()
+                            && context.working_memory.decisions.iter().any(|decision| {
+                                decision.what == "Operator answered the pending question"
+                                    && decision.outcome.as_deref().is_some_and(|answer| task.description.starts_with(answer))
+                            }))
                     {
                         return self
                             .drive_resumed_implement(task, context, cancel, &cp_json, result)
@@ -8478,7 +8483,9 @@ impl CoordinatorAgent {
                 tool_call_count: total_tool_calls,
                 eval_result: None,
                 tool_events: Vec::new(),
-                verification: Vec::new(),
+                verification: crate::agents::generic::verification::merged(
+                    &completed_results.values().collect::<Vec<_>>(),
+                ),
                 project_root: None,
                 completion_status: concerto_core::types::AgentCompletionStatus::Partial,
                 provider_metrics,
@@ -8831,7 +8838,9 @@ impl CoordinatorAgent {
                     tool_call_count: total_tool_calls,
                     eval_result: None,
                     tool_events: Vec::new(),
-                    verification: Vec::new(),
+                    verification: crate::agents::generic::verification::merged(
+                    &completed_results.values().collect::<Vec<_>>(),
+                ),
                     project_root: None,
                     completion_status: concerto_core::types::AgentCompletionStatus::AwaitingUser,
                     provider_metrics,
@@ -9755,14 +9764,17 @@ impl CoordinatorAgent {
             &completed_results.values().collect::<Vec<_>>(),
         );
         if self.strict_verification_gate
-            && matches!(task.execution_mode,
-                TaskExecutionMode::ActionRequired { require_verification: true, .. })
+            && matches!(
+                task.execution_mode,
+                TaskExecutionMode::ActionRequired { require_verification: true, .. }
+            )
         {
             let ledger = match self.registry.verifier_service() {
                 Some(service) => service.check_ledger(&verification, &cancel).await,
                 None => crate::verify::GateLedger::default(),
             };
-            if ledger.fresh == 0 || crate::agents::generic::verification::has_failure(&verification) {
+            if ledger.fresh == 0 || crate::agents::generic::verification::has_failure(&verification)
+            {
                 completion_status = concerto_core::types::AgentCompletionStatus::Partial;
                 let note = format!(
                     "Canonical verification gate: required checks are missing, failed, incomplete or stale \
@@ -9772,20 +9784,24 @@ impl CoordinatorAgent {
                 );
                 // A settle-boundary refusal must remain actionable on Continue.
                 // Hold the latest checking/writing node in its dependency position.
-                let candidate = completed_results.iter()
+                let candidate = completed_results
+                    .iter()
                     .filter(|(id, result)| {
                         graph.get(id).is_some_and(|node| node.status == SubTaskStatus::Completed)
-                            && (!result.verification.is_empty() || !result.files_modified.is_empty())
+                            && (!result.verification.is_empty()
+                                || !result.files_modified.is_empty())
                     })
-                    .max_by_key(|(_, result)| result.verification.iter()
-                        .filter_map(|record| record.checked_at).max())
+                    .max_by_key(|(id, result)| {
+                        (result.verification.iter().filter_map(|record| record.checked_at).max(), id.to_string())
+                    })
                     .map(|(id, _)| *id);
                 if let Some(id) = candidate {
                     if let Some(node) = graph.get_mut(&id) {
                         node.status = SubTaskStatus::NeedsRevision;
                         node.completed_at = None;
                         if let Some(result) = completed_results.get_mut(&id) {
-                            let mut progress = crate::agents::execution_state::ExecutionState::default();
+                            let mut progress =
+                                crate::agents::execution_state::ExecutionState::default();
                             progress.verification_failed();
                             result.outcome = progress.outcome(node, &result.summary);
                             result.summary = format!("{}\n{note}", result.summary);
@@ -9795,8 +9811,11 @@ impl CoordinatorAgent {
                 }
                 recoverable_notes.push(note.clone());
                 self.record_completion_guard_decision(
-                    task.session_id, "completion-blocked-canonical-verification", &note,
-                ).await;
+                    task.session_id,
+                    "completion-blocked-canonical-verification",
+                    &note,
+                )
+                .await;
             }
         }
         // ── Completion-time unfinished-work guards ───────────────────────

@@ -1137,6 +1137,13 @@ impl App {
         Ok(())
     }
 
+    /// Continue the restored session through the ordinary run and approval UI.
+    pub fn continue_active_session(&mut self, rt: &tokio::runtime::Runtime) {
+        if self.session_id.is_some() {
+            self.dispatch_message("Continue".to_string(), rt);
+        }
+    }
+
     fn dispatch_message(&mut self, input: String, rt: &tokio::runtime::Runtime) {
         if self.running || input.trim().is_empty() {
             return;

@@ -130,7 +130,14 @@ pub(crate) fn format_handoffs(task: &SubTask, context: &AgentContext) -> String 
                 "reason": reason,
                 "files_modified": project_paths(&result.files_modified),
                 "omitted_files": result.files_modified.len().saturating_sub(project_paths(&result.files_modified).len()),
-                "verification_state": "not_attested_by_handoff",
+                "verification_state": if result.verification.is_empty() { "not_attested_by_handoff" }
+                    else { "runtime_records_require_freshness_check" },
+                "verification": result.verification.iter().take(4).map(|record| serde_json::json!({
+                    "path": clip(record.path.as_str()), "command": clip(&record.command),
+                    "outcome": record.outcome, "scope": clip(&record.scope),
+                    "generation": clip(&record.generation), "output": compact_text(&record.output, 256),
+                })).collect::<Vec<_>>(),
+                "omitted_verification": result.verification.len().saturating_sub(4),
                 "tool_call_count": result.tool_call_count,
                 "provider": clip(&result.provider),
                 "model": clip(&result.model),

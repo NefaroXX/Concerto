@@ -140,7 +140,16 @@ fn run_cli_inner(
     if explicit_project.is_none() && remaining.first().map(String::as_str) == Some("projects") {
         return run_projects_subcommand(&remaining[1..]);
     }
-    let project_root = resolve_project_dir(explicit_project.as_deref())?;
+    let resume_session = remaining.first().map(String::as_str) == Some("sessions")
+        && remaining.get(1).map(String::as_str) == Some("resume");
+    let project_root = if resume_session {
+        if remaining.len() != 3 {
+            anyhow::bail!("usage: concerto sessions resume <id>");
+        }
+        select_session_for_resume(parse_session_id(&remaining[2])?)?
+    } else {
+        resolve_project_dir(explicit_project.as_deref())?
+    };
 
     // ── Subcommand dispatch ────────────────────────────────────────────
     if !remaining.is_empty() {
@@ -160,6 +169,7 @@ fn run_cli_inner(
             }
             "config" => return run_config_subcommand(&remaining[1..], &project_root),
             "providers" => return run_providers_subcommand(&remaining[1..], &project_root),
+            "sessions" if resume_session => {}
             "sessions" => return run_sessions_subcommand(&remaining[1..], &project_root),
             "projects" => return run_projects_subcommand(&remaining[1..]),
             "plugin" => return run_plugin_subcommand(&remaining[1..]),
@@ -307,6 +317,9 @@ fn run_cli_inner(
     );
     terminal_app.configure(global_config, config, project_root, session_manager);
     terminal_app.restore_active_session(&rt);
+    if resume_session {
+        terminal_app.continue_active_session(&rt);
+    }
     let res = terminal_app.run(&mut terminal, &rt);
 
     terminal.clear()?;
@@ -684,6 +697,30 @@ async fn run_prune(
     Ok(())
 }
 
+fn select_session_for_resume(id: concerto_core::ids::Ulid) -> anyhow::Result<PathBuf> {
+    let rt = tokio::runtime::Runtime::new()?;
+            let session_project = rt.block_on(async {
+                use concerto_sessions::SessionStore;
+                let store = concerto_sessions::SqliteSessionStore::connect().await?;
+                let session = store
+                    .load_session(id, CancellationToken::new())
+                    .await?
+                    .ok_or_else(|| concerto_sessions::SessionError::NotFound(id.to_string()))?;
+                store
+                    .set_active_session_for_project(
+                        &session.project_dir,
+                        id,
+                        CancellationToken::new(),
+                    )
+                    .await?;
+                Ok::<camino::Utf8PathBuf, concerto_sessions::SessionError>(session.project_dir)
+            })?;
+            let mut registry = concerto_config::ProjectRegistry::load().unwrap_or_default();
+            registry.select(session_project.as_std_path())?;
+            registry.save()?;
+            Ok(session_project.into_std_path())
+}
+
 fn run_sessions_subcommand(args: &[String], project_root: &Path) -> anyhow::Result<()> {
     if args.is_empty() {
         anyhow::bail!(
@@ -838,27 +875,8 @@ fn run_sessions_subcommand(args: &[String], project_root: &Path) -> anyhow::Resu
                 anyhow::bail!("usage: concerto sessions resume <session-id>");
             }
             let id = parse_session_id(&args[1])?;
-            let rt = tokio::runtime::Runtime::new()?;
-            let session_project = rt.block_on(async {
-                use concerto_sessions::SessionStore;
-                let store = concerto_sessions::SqliteSessionStore::connect().await?;
-                let session = store
-                    .load_session(id, CancellationToken::new())
-                    .await?
-                    .ok_or_else(|| concerto_sessions::SessionError::NotFound(id.to_string()))?;
-                store
-                    .set_active_session_for_project(
-                        &session.project_dir,
-                        id,
-                        CancellationToken::new(),
-                    )
-                    .await?;
-                println!("Session {id} will resume for {}", session.project_dir);
-                Ok::<camino::Utf8PathBuf, concerto_sessions::SessionError>(session.project_dir)
-            })?;
-            let mut registry = concerto_config::ProjectRegistry::load().unwrap_or_default();
-            registry.select(session_project.as_std_path())?;
-            registry.save()?;
+            let session_project = select_session_for_resume(id)?;
+            println!("Selected session {id} for {}", session_project.display());
         }
         "prune" => {
             let opts = parse_prune_args(&args[1..])?;

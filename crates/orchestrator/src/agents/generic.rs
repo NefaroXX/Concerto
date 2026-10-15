@@ -265,28 +265,29 @@ impl GenericSpecialistAgent {
         let task_id = task.id.0.to_string();
         let paths = crate::tool_facts::extract_affected_paths(arguments, output_data);
         let event_id = if let Some(facts) = &self.tool_facts {
-            facts.record_tool_executed(
-                &ToolExecutedFact {
-                    session_id: &session_id,
-                    task_id: Some(&task_id),
-                    run_id: context.run_id.as_deref(),
-                    generation: context.workspace_generation.as_deref().unwrap_or(""),
-                    project_root: &context.session.project_dir,
-                    tool,
-                    args: arguments,
-                    success,
-                    outcome,
-                    exit_code: None,
-                    paths: &paths,
-                    file_affecting,
-                    pre_image_hashes,
-                    canonical_tool,
-                    canonical_operation,
-                    failure: None,
-                },
-                cancel,
-            )
-            .await
+            facts
+                .record_tool_executed(
+                    &ToolExecutedFact {
+                        session_id: &session_id,
+                        task_id: Some(&task_id),
+                        run_id: context.run_id.as_deref(),
+                        generation: context.workspace_generation.as_deref().unwrap_or(""),
+                        project_root: &context.session.project_dir,
+                        tool,
+                        args: arguments,
+                        success,
+                        outcome,
+                        exit_code: None,
+                        paths: &paths,
+                        file_affecting,
+                        pre_image_hashes,
+                        canonical_tool,
+                        canonical_operation,
+                        failure: None,
+                    },
+                    cancel,
+                )
+                .await
         } else {
             None
         };
@@ -803,39 +804,95 @@ impl GenericSpecialistAgent {
                 let scope = evidence_files.first().map(|path| path.as_str()).unwrap_or("project");
                 let arguments = serde_json::json!({"scope": scope, "verifier": "project-tests",
                     "overlay_pending": false});
-                match executor.execute(crate::verify::VERIFY_RUN_TOOL_NAME, arguments.clone(),
-                    &context.session, cancel.clone()).await {
+                match executor
+                    .execute(
+                        crate::verify::VERIFY_RUN_TOOL_NAME,
+                        arguments.clone(),
+                        &context.session,
+                        cancel.clone(),
+                    )
+                    .await
+                {
                     Ok(output) => {
-                        let event_id = self.record_tool_fact(task, &context,
-                            crate::verify::VERIFY_RUN_TOOL_NAME, &arguments, true, ToolOutcome::Ok,
-                            Some(&output.data), false, HashMap::new(),
-                            Some(crate::verify::VERIFY_RUN_TOOL_NAME), None, &cancel).await;
-                        verification::collect(&mut verification, crate::verify::VERIFY_RUN_TOOL_NAME,
-                            Some(crate::verify::VERIFY_RUN_TOOL_NAME), &output.data, event_id.as_deref());
-                        Some(verification.iter().find_map(|record| record.detail.clone())
-                            .ok_or_else(|| concerto_core::EvalError::TestRunnerFailed(
-                                "native verification returned no harness result".to_string(),
-                            )))
+                        let event_id = self
+                            .record_tool_fact(
+                                task,
+                                &context,
+                                crate::verify::VERIFY_RUN_TOOL_NAME,
+                                &arguments,
+                                true,
+                                ToolOutcome::Ok,
+                                Some(&output.data),
+                                false,
+                                HashMap::new(),
+                                Some(crate::verify::VERIFY_RUN_TOOL_NAME),
+                                None,
+                                &cancel,
+                            )
+                            .await;
+                        verification::collect(
+                            &mut verification,
+                            crate::verify::VERIFY_RUN_TOOL_NAME,
+                            Some(crate::verify::VERIFY_RUN_TOOL_NAME),
+                            &output.data,
+                            event_id.as_deref(),
+                        );
+                        Some(
+                            verification
+                                .iter()
+                                .find_map(|record| record.detail.clone())
+                                .ok_or_else(|| {
+                                    concerto_eval::EvalError::TestRunnerFailed(
+                                        "native verification returned no harness result"
+                                            .to_string(),
+                                    )
+                                }),
+                        )
                     }
                     Err(error) => {
-                        if matches!(error, concerto_core::ToolError::PausedAwaitingApproval { .. }) {
+                        if matches!(error, concerto_core::ToolError::PausedAwaitingApproval { .. })
+                        {
                             return Err(OrchestratorError::Tool(error));
                         }
-                        if cancel.is_cancelled() || matches!(error, concerto_core::ToolError::Cancelled) {
+                        if cancel.is_cancelled()
+                            || matches!(error, concerto_core::ToolError::Cancelled)
+                        {
                             return Err(OrchestratorError::Cancelled);
                         }
-                        let _ = self.record_tool_fact(task, &context,
-                            crate::verify::VERIFY_RUN_TOOL_NAME, &arguments, false,
-                            tool_outcome_for_error(&error), None, false, HashMap::new(),
-                            Some(crate::verify::VERIFY_RUN_TOOL_NAME), None, &cancel).await;
-                        verification.push(concerto_core::types::VerificationSummary::error(
-                            scope, crate::verify::VERIFY_RUN_TOOL_NAME, error.to_string())
-                            .with_verifier(crate::verify::VERIFY_RUN_TOOL_NAME).with_scope(scope));
-                        Some(Err(concerto_core::EvalError::TestRunnerFailed(error.to_string())))
+                        let _ = self
+                            .record_tool_fact(
+                                task,
+                                &context,
+                                crate::verify::VERIFY_RUN_TOOL_NAME,
+                                &arguments,
+                                false,
+                                tool_outcome_for_error(&error),
+                                None,
+                                false,
+                                HashMap::new(),
+                                Some(crate::verify::VERIFY_RUN_TOOL_NAME),
+                                None,
+                                &cancel,
+                            )
+                            .await;
+                        verification.push(
+                            concerto_core::types::VerificationSummary::error(
+                                scope,
+                                crate::verify::VERIFY_RUN_TOOL_NAME,
+                                error.to_string(),
+                            )
+                            .with_verifier(crate::verify::VERIFY_RUN_TOOL_NAME)
+                            .with_scope(scope),
+                        );
+                        Some(Err(concerto_eval::EvalError::TestRunnerFailed(error.to_string())))
                     }
                 }
-            } else { None }
-        } else { None };
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let eval_result = match match observed {
             Some(result) => result,
             None => match &eval_dir {
@@ -1785,21 +1842,22 @@ impl GenericSpecialistAgent {
                                 }
                                 // ADR-65 §3: record the completed
                                 // (successful) tool command.
-                                let event_id = self.record_tool_fact(
-                                    task,
-                                    &context,
-                                    &tool_call.name,
-                                    &arguments,
-                                    true,
-                                    ToolOutcome::Ok,
-                                    Some(&output.data),
-                                    is_file_change,
-                                    pre_image_hashes.clone(),
-                                    canonical_tool.as_deref(),
-                                    canonical_operation.as_deref(),
-                                    &cancel,
-                                )
-                                .await;
+                                let event_id = self
+                                    .record_tool_fact(
+                                        task,
+                                        &context,
+                                        &tool_call.name,
+                                        &arguments,
+                                        true,
+                                        ToolOutcome::Ok,
+                                        Some(&output.data),
+                                        is_file_change,
+                                        pre_image_hashes.clone(),
+                                        canonical_tool.as_deref(),
+                                        canonical_operation.as_deref(),
+                                        &cancel,
+                                    )
+                                    .await;
                                 verification::collect(
                                     &mut verification,
                                     &tool_call.name,
@@ -1838,21 +1896,22 @@ impl GenericSpecialistAgent {
                             Err(error) => {
                                 // ADR-65 §3: record the completed (failed)
                                 // tool command too.
-                                let _ = self.record_tool_fact(
-                                    task,
-                                    &context,
-                                    &tool_call.name,
-                                    &arguments,
-                                    false,
-                                    tool_outcome_for_error(&error),
-                                    None,
-                                    is_file_change,
-                                    pre_image_hashes.clone(),
-                                    canonical_tool.as_deref(),
-                                    canonical_operation.as_deref(),
-                                    &cancel,
-                                )
-                                .await;
+                                let _ = self
+                                    .record_tool_fact(
+                                        task,
+                                        &context,
+                                        &tool_call.name,
+                                        &arguments,
+                                        false,
+                                        tool_outcome_for_error(&error),
+                                        None,
+                                        is_file_change,
+                                        pre_image_hashes.clone(),
+                                        canonical_tool.as_deref(),
+                                        canonical_operation.as_deref(),
+                                        &cancel,
+                                    )
+                                    .await;
                                 let _ = self.bus.publish_for_session(
                                     task.session_id,
                                     task.id.0,
@@ -2176,6 +2235,7 @@ fn guard_coordinator_tool_call(
 #[cfg(test)]
 mod tests {
     mod execution_tests;
+    mod recovery;
     use super::*;
     use concerto_core::traits::provider::CompletionStream;
     use concerto_core::types::{

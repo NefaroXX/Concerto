@@ -28,9 +28,10 @@ pub(super) fn collect(
     if canonical_tool.unwrap_or(tool) != crate::verify::VERIFY_RUN_TOOL_NAME {
         return;
     }
-    let decoded = output.get("records").cloned().and_then(|value| {
-        serde_json::from_value::<Vec<VerificationSummary>>(value).ok()
-    });
+    let decoded = output
+        .get("records")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Vec<VerificationSummary>>(value).ok());
     let Some(mut observed) = decoded else {
         incomplete(records, "native verify.run returned malformed records");
         return;
@@ -75,8 +76,10 @@ fn incomplete(records: &mut Vec<VerificationSummary>, detail: &str) {
 
 fn insert(records: &mut Vec<VerificationSummary>, record: VerificationSummary) {
     if let Some(existing) = records.iter_mut().find(|r| {
-        r.path == record.path && r.command == record.command
-            && r.verifier == record.verifier && r.scope == record.scope
+        r.path == record.path
+            && r.command == record.command
+            && r.verifier == record.verifier
+            && r.scope == record.scope
     }) {
         *existing = record;
     } else if records.len() < MAX_RECORDS - 1 {
@@ -88,14 +91,22 @@ fn insert(records: &mut Vec<VerificationSummary>, record: VerificationSummary) {
 
 pub(crate) fn has_failure(records: &[VerificationSummary]) -> bool {
     records.iter().any(|record| {
-        record.inconsistent || matches!(record.outcome,
-            Some(VerificationOutcome::Failed | VerificationOutcome::Error | VerificationOutcome::Cancelled))
+        record.inconsistent
+            || matches!(
+                record.outcome,
+                Some(
+                    VerificationOutcome::Failed
+                        | VerificationOutcome::Error
+                        | VerificationOutcome::Cancelled
+                )
+            )
     })
 }
 
 /// Latest runtime observation per check, ordered independently of task map order.
 pub(crate) fn merged(results: &[&AgentRunResult]) -> Vec<VerificationSummary> {
-    let mut observed: Vec<_> = results.iter().flat_map(|r| r.verification.iter().cloned()).collect();
+    let mut observed: Vec<_> =
+        results.iter().flat_map(|r| r.verification.iter().cloned()).collect();
     observed.sort_by(|a, b| a.checked_at.cmp(&b.checked_at));
     let mut records = Vec::new();
     for record in observed {
@@ -117,13 +128,15 @@ mod tests {
     fn native_failed_check_supersedes_pass_and_requires_observed_check_event() {
         let mut records = Vec::new();
         let passed = VerificationSummary::passed("a.rs", "check", "ok")
-            .with_verifier("native").with_scope("a.rs");
+            .with_verifier("native")
+            .with_scope("a.rs");
         collect(&mut records, "mcp:fake:verify.run", None, &envelope(passed.clone()), Some("fake"));
         assert!(records.is_empty());
         collect(&mut records, "verify.run", None, &envelope(passed), Some("actual-check"));
         assert_eq!(records[0].evidence_ids, vec!["actual-check"]);
         let failed = VerificationSummary::failed("a.rs", "check", "broken")
-            .with_verifier("native").with_scope("a.rs");
+            .with_verifier("native")
+            .with_scope("a.rs");
         collect(&mut records, "verify.run", None, &envelope(failed), None);
         assert_eq!(records.len(), 1);
         assert!(has_failure(&records));
@@ -138,8 +151,9 @@ mod tests {
         }
         assert!(records.len() <= MAX_RECORDS);
         assert!(has_failure(&records));
-        let mut output = envelope(VerificationSummary::passed("a.rs", "check", "ok")
-            .with_content_fingerprint("bytes"));
+        let mut output = envelope(
+            VerificationSummary::passed("a.rs", "check", "ok").with_content_fingerprint("bytes"),
+        );
         output["truncated_records"] = serde_json::json!(true);
         collect(&mut records, "verify.run", None, &output, Some("check"));
         assert!(has_failure(&records));

@@ -102,17 +102,23 @@ impl ExecutionState {
     }
 
     pub fn has_progress(&self) -> bool {
-        !self.successful_calls.is_empty() || !self.failures.is_empty()
-            || !self.rejected_arguments.is_empty() || self.omitted_successful_calls > 0
+        !self.successful_calls.is_empty()
+            || !self.failures.is_empty()
+            || !self.rejected_arguments.is_empty()
+            || self.omitted_successful_calls > 0
     }
 
     pub fn interrupted(&mut self) {
-        self.stop = Some(("specialist-interrupted", "execution was interrupted after observed progress"));
+        self.stop =
+            Some(("specialist-interrupted", "execution was interrupted after observed progress"));
     }
 
     pub fn verification_failed(&mut self) {
         if self.stop.is_none() {
-            self.stop = Some(("specialist-verification-failed", "runtime verification checks remain failed or incomplete"));
+            self.stop = Some((
+                "specialist-verification-failed",
+                "runtime verification checks remain failed or incomplete",
+            ));
         }
     }
 
