@@ -77,29 +77,33 @@ unstarted.
   no `node_modules/`. With `MAX_TREE_ENTRIES: usize = 10_000`
   (`crates/shell/src/builtins.rs:18`; `DEFAULT_TREE_DEPTH = 4` at `:17`,
   `MAX_TREE_DEPTH = 64` at `:16`) the command is near-useless on any built Rust
-  repo: `find ./target -type f` reports 54 543 files against 4 569 outside
-  `target/` and `.git/` (measured 2026-10-14), so `ls-tree .` spends its entry
-  budget on Cargo build artifacts and returns a truncated `.rlib`/`.rmeta`
-  listing instead of project structure. Intended fix is a `.filter_entry(...)`
-  on the walker; the `ignore` crate is the standard choice and is **not in
-  `Cargo.lock`** (only the unrelated `gix-ignore` is, at `Cargo.lock:3575`), so
-  it is a new dependency under `AGENTS.md:102` ("Add a dependency only for a
-  current, tested need"). Design decision, recorded so it is not re-litigated:
-  the general-purpose `ls-tree` crate (https://github.com/NefaroXX/ls-tree,
-  crates.io `ls-tree` 0.2.0, `generate(root: &Path, out: &mut impl Write,
-  opts: &Options) -> io::Result<TreeStats>`) was evaluated as a replacement and
-  rejected — it has no root confinement, no entry cap, and no
-  `CancellationToken`, and most of its 13 `Options` fields (colour, icons,
-  `show_total_size`, `prune`, `human_readable`, `dirs_only`, `format`) do not
-  apply to a structured-data consumer. The builtin's traversal is ~20 lines
-  (`builtins.rs:242-262`); the rest is repo plumbing (`CommandResult`,
-  `Diagnostic`, effect classification, cancellation) built on
-  `resolve_in_canonical_root` (`crates/shell/src/path.rs:72`) plus
-  `tree_path_error` (`crates/shell/src/builtins.rs:401`), which classify escapes
-  as Blocked and I/O failures as Recoverable — the ADR-62 policy-gate boundary.
-  Conclusion: keep the builtin and take only the ignore-filtering idea; the
-  external crate remains the right tool for any future human-facing tree view
-  and is deliberately not a Concerto dependency.
+  repo: a built `target/` holds roughly ten times the files of the project
+  itself (~54k against ~4.6k outside `target/` and `.git/`, measured
+  2026-10-14), so `ls-tree .` spends its entry budget on Cargo build artifacts
+  and returns a truncated `.rlib`/`.rmeta` listing instead of project
+  structure. Intended fix is a `.filter_entry(...)` on the walker; the `ignore`
+  crate is the standard choice and is **not in `Cargo.lock`** (only the
+  unrelated `gix-ignore` is, at `Cargo.lock:3575`), so it is a new dependency
+  under `AGENTS.md:96` ("Add a dependency only for a current, tested need").
+  Design decision, recorded so it is not re-litigated: the general-purpose
+  `ls-tree` crate (crates.io 0.2.0, MIT, maintained by this repo's owner) was
+  evaluated as a replacement and rejected. It carries no `CancellationToken`;
+  it materializes the whole `TreeNode` tree in memory before writing a byte and
+  has no entry-count or output-size cap, so its `max_depth` bounds depth only
+  and never breadth; `Options::default()` does I/O and reads `NO_COLOR` from
+  stdout, a defect for the Iced GUI; and it is immature — two releases a day
+  apart, ~44 lifetime downloads, 0 reverse dependencies, no declared MSRV
+  against this workspace's 1.88, and 0.x semver. The builtin's own traversal is
+  ~20 lines (`builtins.rs:242-262`); the rest is repo plumbing (effect
+  classification, cancellation, root confinement) built on
+  `resolve_in_canonical_root` (`crates/shell/src/path.rs:82`) and
+  `tree_path_error` (`crates/shell/src/builtins.rs:401`), which classify
+  escapes as Blocked and I/O failures as Recoverable — the ADR-62 policy-gate
+  boundary. Conclusion: keep the builtin and take only the ignore-filtering
+  idea; the external crate is deliberately not a Concerto dependency, and would
+  be acceptable only for a bounded, local, non-interactive render behind an
+  existing `CancellationToken` — never for untrusted roots, large or unbounded
+  directories, or the GUI.
 
 ## Audit cleanups (`DEFERRED.md` row 34)
 
