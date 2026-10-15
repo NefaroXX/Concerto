@@ -238,4 +238,17 @@ async fn supervisor_pushes_one_bounded_slice_and_never_resends_an_unacked_span()
         }
         other => panic!("expected WhiteboardSlice params, got {other:?}"),
     }
+
+    // sqlx spawns one *unjoined* OS thread per connection; dropping the pool
+    // only initiates an asynchronous worker shutdown, so a straggler worker
+    // can still be alive when process exit runs OpenSSL's atexit cleanup
+    // (libcrypto comes in via native-tls ← reqwest — not via SQLCipher).
+    // Racing that cleanup against the worker's final free aborts the test
+    // binary after libtest already printed PASS (`double free or corruption
+    // (fasttop)`). `Pool::close` awaits worker teardown across every clone
+    // (the `fs_gate`/`SubscriptionManager` handles die with the supervisor
+    // below); the DB file must stay alive until that finishes, so close
+    // before `_pool_dir` (the TempDir owning the DB file) drops.
+    drop(supervisor);
+    pool.close().await;
 }
