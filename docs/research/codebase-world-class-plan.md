@@ -97,11 +97,11 @@ Line thresholds are review prompts, not universal pass/fail targets.
 [ci.yml](../../.github/workflows/ci.yml) runs formatting, workspace/all-targets
 Clippy with warnings denied, workspace unit/integration/doc tests via
 `cargo test`, builds, default and single-frontend CLI feature combinations and startup smoke commands,
-benchmark smoke runs, four WASM guest builds, cargo-deny, and palette checks.
-It pins Rust 1.96.0; the workspace declares MSRV 1.88. The old claim that CI
-uses nextest and independently runs cargo-audit is incorrect. An MSRV build,
-mutation enforcement, fuzz execution and measured coverage are not present
-in that workflow. [native-shell.yml](../../.github/workflows/native-shell.yml)
+benchmark smoke runs, four WASM guest builds, cargo-deny, cargo-audit, and
+palette checks. It pins Rust 1.96.0; the workspace declares MSRV 1.88. CI uses
+`cargo test` rather than nextest, and cargo-audit runs as an independent job.
+An MSRV build, mutation enforcement, fuzz execution and measured coverage are
+not present in that workflow. [native-shell.yml](../../.github/workflows/native-shell.yml)
 adds core/config/tools/shell test coverage on Linux, Windows and macOS;
 a successful platform run still does not prove interactive consent or GUI flows.
 

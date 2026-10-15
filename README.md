@@ -240,8 +240,9 @@ of the verified test matrix.
   `test-*-plugin-wasm` crates in the workspace.
 - A C toolchain and the platform development libraries used by SQLite, TLS,
   keyring, protobuf, and Iced/wgpu (X11/Wayland/GL/Vulkan on Linux).
-- `cargo-deny` to reproduce the supply-chain job, and `cargo-nextest` only if
-  you want the faster local test runner [TESTING.md](TESTING.md) uses.
+- `cargo-deny` and `cargo-audit` to reproduce both supply-chain jobs, and
+  `cargo-nextest` only if you want the faster local test runner
+  [TESTING.md](TESTING.md) uses.
 
 CI installs exactly this system set on `ubuntu-latest`:
 
@@ -420,7 +421,7 @@ In multi-agent mode the fallback ladder re-dispatches a failed role on
 
 The GitHub Actions workflow at `.github/workflows/ci.yml` is authoritative. It
 runs on pushes and pull requests to `main` and `dev`, pins the toolchain to
-1.96.0 via `rust-toolchain.toml`, and splits the checks into eight independent
+1.96.0 via `rust-toolchain.toml`, and splits the checks into nine independent
 jobs that deliberately declare no `needs:`, so one failure never masks another:
 
 | Job | What it runs |
@@ -432,6 +433,7 @@ jobs that deliberately declare no `needs:`, so one failure never masks another:
 | `bench` | compiles and smoke-runs every `[[bench]]` target with `--test` (no timing assertion) |
 | `wasm-plugins` | builds the four `test-*-plugin-wasm` crates for `wasm32-wasip2` |
 | `deny` | `cargo deny check` (licenses, bans, advisories — policy in `deny.toml`) |
+| `audit` | `cargo audit` against `Cargo.lock` (advisories — policy in `.cargo/audit.toml`) |
 | `ui-colors` | `scripts/check-hardcoded-colors.sh` — desktop `views/` and `ui/` must use `theme.palette.*`, never `Color::from_rgb`, `Color::{BLACK,WHITE,TRANSPARENT}`, or hex literals |
 
 To reproduce them locally:

@@ -1,7 +1,7 @@
 # Continuous integration for Concerto.
 #
-# fmt, clippy, test, and cargo-deny run as separate, independent jobs (no
-# needs:) so a failure in one never masks another; on GitHub's hosted
+# fmt, clippy, test, cargo-deny, and cargo-audit run as separate, independent
+# jobs (no needs:) so a failure in one never masks another; on GitHub's hosted
 # runners they also execute in parallel.
 #
 # Toolchain note: rust-toolchain.toml at the repo root pins channel 1.96.0,
@@ -248,6 +248,42 @@ jobs:
         with:
           command: check
           rust-version: "1.96.0"
+
+  # cargo-audit scans the raw Cargo.lock, including optional/unactivated
+  # dependencies that cargo-deny's feature-resolved graph cannot see, so the
+  # two supply-chain gates are complementary, not redundant. Advisory ignore
+  # lists live only in .cargo/audit.toml (kept 1:1 with deny.toml); nothing
+  # is passed from here so the gate cannot be weakened via workflow flags.
+  audit:
+    name: Supply chain (cargo-audit)
+    runs-on: ubuntu-latest
+    # The action publishes findings as a commit check on push/PR events, which
+    # needs checks:write; with the workflow-level contents:read alone a finding
+    # on a push fails with an opaque 403 instead of the advisory report.
+    # Fork PRs get a read-only token regardless and fall back to stdout, which
+    # still fails the step on critical advisories.
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Official action from the RustSec maintainers (like cargo-deny-action
+      # above). It has no rust-version input: it shells out to `cargo install
+      # cargo-audit`, which resolves rust-toolchain.toml. Install 1.96.0
+      # explicitly first, matching every other job, instead of relying on
+      # rustup's implicit auto-install of the pinned override.
+      - name: Install Rust toolchain (1.96.0)
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      # Runs `cargo audit` against Cargo.lock and fails the job on any
+      # vulnerability not ignored in .cargo/audit.toml. The action finds that
+      # config automatically because it runs from the workspace root.
+      - name: Run cargo-audit
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   # ------------------------------------------------------- desktop UI palette
   ui-colors:

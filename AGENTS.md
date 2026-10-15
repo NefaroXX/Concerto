@@ -46,10 +46,10 @@ cargo audit
   path under `/tmp`. This environment mounts `/tmp` as a RAM-backed filesystem;
   keep Cargo artifacts in the repository's `target/` directory and use
   disk-backed repository worktrees for isolation.
-- GitHub Actions at `.github/workflows/ci.yml` runs fmt, clippy, test, and
-  deny as separate jobs without `needs:`, so they run in parallel (alongside
-  build/wasm/ui-color jobs). Match `.github/workflows/ci.yml` locally before
-  pushing.
+- GitHub Actions at `.github/workflows/ci.yml` runs fmt, clippy, test, deny,
+  and audit as separate jobs without `needs:`, so they run in parallel
+  (alongside build/wasm/ui-color jobs). Match `.github/workflows/ci.yml` locally
+  before pushing.
 
 - CI sets `RUSTFLAGS="-D warnings"`; treat rustc warnings as errors locally too.
   `[workspace.lints]` already denies `clippy::all` and `unsafe_code`, so never
@@ -91,7 +91,12 @@ cargo audit
   ignored for unmaintained *transitive* deps, and `wasmtime` is pinned to
   the **24.0.x** line (v43+ needs a `func_wrap` API migration). Read
   `deny.toml`
-  justification/scope before changing anything.
+  justification/scope before changing anything. The two supply-chain gates are
+  complementary: `cargo-deny` resolves features and cannot see
+  optional/unactivated lockfile deps (e.g. `quinn-proto` via an unenabled
+  `reqwest` HTTP/3 feature); `cargo-audit` scans the raw `Cargo.lock` and can.
+  Keep both green — audit suppressions live in `.cargo/audit.toml` (1:1 with
+  `deny.toml`).
 - **Dependencies**: historical phase comments are not authorization to retain
   unused crates. Add a dependency only for a current, tested need. Wasmtime is
   pinned to the patched 24.0.x line for the current RustSec advisory; do not

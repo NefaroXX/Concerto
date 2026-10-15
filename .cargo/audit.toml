@@ -14,9 +14,11 @@
 # with no output. That is the dormant-suppression failure mode, and it is the
 # reason this file is kept in lockstep rather than curated on its own.
 #
-# Verify they agree before pushing:
-#   diff <(grep -o 'RUSTSEC-[0-9-]*' deny.toml | sort -u) \
-#        <(grep -o 'RUSTSEC-[0-9-]*' .cargo/audit.toml | sort -u)
+# Verify they agree before pushing. Match QUOTED entries only — both files name
+# retired advisory IDs in prose (see History below), and an unquoted grep
+# matches those too, reporting drift that does not exist:
+#   diff <(grep -oE '"RUSTSEC-[0-9]{4}-[0-9]{4}"' deny.toml | tr -d '"' | sort -u) \
+#        <(grep -oE '"RUSTSEC-[0-9]{4}-[0-9]{4}"' .cargo/audit.toml | tr -d '"' | sort -u)
 #
 # History: RUSTSEC-2026-0173 (proc-macro-error2) and RUSTSEC-2023-0071 (rsa)
 # were present here only — never in deny.toml — and were dropped when the two
