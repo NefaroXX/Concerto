@@ -2029,9 +2029,13 @@ impl VerifierService {
             if token.is_cancelled() {
                 return String::new();
             }
-            let entries = crate::workspace_snapshot::capture_workspace_snapshot(&project_dir, &token);
-            if token.is_cancelled() { String::new() }
-            else { crate::workspace_snapshot::generation_for(&entries) }
+            let entries =
+                crate::workspace_snapshot::capture_workspace_snapshot(&project_dir, &token);
+            if token.is_cancelled() {
+                String::new()
+            } else {
+                crate::workspace_snapshot::generation_for(&entries)
+            }
         })
         .await
         .unwrap_or_default();
@@ -2132,7 +2136,8 @@ impl VerifierService {
         }
         let (generation, stamp) = self.snapshot();
         let root_label = Utf8PathBuf::from(self.project_root.to_string_lossy().as_ref());
-        let before = fingerprint::checked_fingerprint(&self.project_root, &root_label, cancel).await;
+        let before =
+            fingerprint::checked_fingerprint(&self.project_root, &root_label, cancel).await;
         let run = self.run_adapters(request, &generation, &stamp, cancel.clone());
         let mut records = match tokio::time::timeout(request.timeout, run).await {
             Err(_) => vec![timeout_record(request, &generation)],
@@ -2143,7 +2148,9 @@ impl VerifierService {
         // that raced a write, or lacks bounded coverage, cannot prove those bytes.
         self.refresh_base(cancel).await;
         let after = fingerprint::checked_fingerprint(&self.project_root, &root_label, cancel).await;
-        let stable = !generation.is_empty() && !before.is_empty() && before == after
+        let stable = !generation.is_empty()
+            && !before.is_empty()
+            && before == after
             && generation == self.current_generation()
             && !cancel.is_cancelled()
             && !request.overlay_pending;
@@ -2310,11 +2317,14 @@ impl VerifierService {
     ) -> Result<Vec<VerificationSummary>, VerifyError> {
         let eval_dir = EvalEngine::resolve_manifest_root(&self.project_root, files);
         let scope_key = eval_dir.to_string_lossy().to_string();
-        let checked_root = Utf8PathBuf::from_path_buf(eval_dir.clone())
-            .unwrap_or_else(|_| record_path.clone());
-        let bytes = fingerprint::checked_fingerprint(&self.project_root, &checked_root, cancel).await;
+        let checked_root =
+            Utf8PathBuf::from_path_buf(eval_dir.clone()).unwrap_or_else(|_| record_path.clone());
+        let bytes =
+            fingerprint::checked_fingerprint(&self.project_root, &checked_root, cancel).await;
         let key = format!("eval:{scope_key}:{generation}:{bytes}");
-        let cached = if bytes.is_empty() { None } else {
+        let cached = if bytes.is_empty() {
+            None
+        } else {
             self.eval_cache.lock().unwrap_or_else(|error| error.into_inner()).get(&key).cloned()
         };
         let outcome = match cached {
@@ -2338,7 +2348,9 @@ impl VerifierService {
         // all adapters settle. Backing writes are supplemented by the native
         // check's ToolExecuted event at the specialist transport boundary.
         record.evidence_ids = stamp.workspace_evidence();
-        if !bytes.is_empty() && self.eval_cache.lock().unwrap_or_else(|error| error.into_inner()).get(&key).is_none() {
+        if !bytes.is_empty()
+            && self.eval_cache.lock().unwrap_or_else(|error| error.into_inner()).get(&key).is_none()
+        {
             self.eval_cache.lock().unwrap_or_else(|error| error.into_inner()).insert(key, outcome);
         }
         Ok(vec![record])
@@ -2477,9 +2489,8 @@ impl VerifierService {
         let root_label = Utf8PathBuf::from(self.project_root.to_string_lossy().as_ref());
         let bytes = fingerprint::checked_fingerprint(&self.project_root, &root_label, cancel).await;
         let key = format!("{key}:source:{bytes}");
-        let cached = if bytes.is_empty() { None } else {
-            self.build_cache.lock().await.get(&key).cloned()
-        };
+        let cached =
+            if bytes.is_empty() { None } else { self.build_cache.lock().await.get(&key).cloned() };
         if let Some(cached) = cached {
             return Ok(TimedSpawn {
                 success: cached.success,
@@ -2504,13 +2515,13 @@ impl VerifierService {
                 };
                 if !bytes.is_empty() {
                     self.build_cache.lock().await.insert(
-                    key.to_string(),
-                    SpawnOutput {
-                        success: out.success,
-                        stdout: out.stdout,
-                        stderr: out.stderr,
-                        code: out.code,
-                    },
+                        key.to_string(),
+                        SpawnOutput {
+                            success: out.success,
+                            stdout: out.stdout,
+                            stderr: out.stderr,
+                            code: out.code,
+                        },
                     );
                 }
                 Ok(timed)

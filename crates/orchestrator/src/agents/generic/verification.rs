@@ -5,6 +5,7 @@ use concerto_core::types::{VerificationOutcome, VerificationSummary};
 
 const MAX_RECORDS: usize = 128;
 const COVERAGE_COMMAND: &str = "specialist-verification-coverage";
+const BUDGET_COMMAND: &str = "specialist-verification-budget";
 
 pub(super) fn restored(task: &SubTask, context: &AgentContext) -> Vec<VerificationSummary> {
     let mut records = Vec::new();
@@ -28,17 +29,22 @@ pub(super) fn collect(
     if canonical_tool.unwrap_or(tool) != crate::verify::VERIFY_RUN_TOOL_NAME {
         return;
     }
+    let scope = format!("{}:{}", output.get("scope").and_then(|value| value.as_str()).unwrap_or("unknown"),
+        output.get("verifier").and_then(|value| value.as_str()).unwrap_or("unknown"));
     let decoded = output
         .get("records")
         .cloned()
         .and_then(|value| serde_json::from_value::<Vec<VerificationSummary>>(value).ok());
     let Some(mut observed) = decoded else {
-        incomplete(records, "native verify.run returned malformed records");
+        incomplete(records, "native verify.run returned malformed records", &scope, COVERAGE_COMMAND);
         return;
     };
     let complete = output.get("overlay_materialized").and_then(|v| v.as_bool()) == Some(true)
         && output.get("truncated_records").and_then(|v| v.as_bool()) == Some(false)
         && output.get("total_records").and_then(|v| v.as_u64()) == Some(observed.len() as u64);
+    if complete {
+        records.retain(|record| record.command != COVERAGE_COMMAND || record.scope != scope);
+    }
     for record in &mut observed {
         if complete {
             if let Some(id) = event_id.filter(|id| !id.is_empty()) {
@@ -56,15 +62,15 @@ pub(super) fn collect(
         insert(records, record.clone());
     }
     if !complete {
-        incomplete(records, "verify.run coverage was incomplete or overlay state was pending");
+        incomplete(records, "verify.run coverage was incomplete or overlay state was pending", &scope, COVERAGE_COMMAND);
     }
 }
 
-fn incomplete(records: &mut Vec<VerificationSummary>, detail: &str) {
-    let record = VerificationSummary::error("project", COVERAGE_COMMAND, detail)
+fn incomplete(records: &mut Vec<VerificationSummary>, detail: &str, scope: &str, command: &str) {
+    let record = VerificationSummary::error("project", command, detail)
         .with_verifier(crate::verify::VERIFY_RUN_TOOL_NAME)
-        .with_scope("project");
-    if let Some(existing) = records.iter_mut().find(|r| r.command == COVERAGE_COMMAND) {
+        .with_scope(scope);
+    if let Some(existing) = records.iter_mut().find(|r| r.command == command && r.scope == scope) {
         *existing = record;
     } else {
         if records.len() >= MAX_RECORDS {
@@ -85,7 +91,7 @@ fn insert(records: &mut Vec<VerificationSummary>, record: VerificationSummary) {
     } else if records.len() < MAX_RECORDS - 1 {
         records.push(record);
     } else {
-        incomplete(records, "specialist verification ledger exceeded its record budget");
+        incomplete(records, "specialist verification ledger exceeded its record budget", "project", BUDGET_COMMAND);
     }
 }
 
@@ -107,7 +113,7 @@ pub(crate) fn has_failure(records: &[VerificationSummary]) -> bool {
 pub(crate) fn merged(results: &[&AgentRunResult]) -> Vec<VerificationSummary> {
     let mut observed: Vec<_> =
         results.iter().flat_map(|r| r.verification.iter().cloned()).collect();
-    observed.sort_by(|a, b| a.checked_at.cmp(&b.checked_at));
+    observed.sort_by_key(|record| record.checked_at);
     let mut records = Vec::new();
     for record in observed {
         insert(&mut records, record);
@@ -141,6 +147,20 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert!(has_failure(&records));
         assert!(records[0].evidence_ids.is_empty());
+    }
+
+    #[test]
+    fn a_complete_recheck_replaces_the_same_scopes_incomplete_coverage() {
+        let mut records = Vec::new();
+        let mut output = envelope(VerificationSummary::passed("a.rs", "check", "ok"));
+        output["overlay_materialized"] = serde_json::json!(false);
+        collect(&mut records, "verify.run", None, &output, Some("pending-check"));
+        assert!(has_failure(&records));
+        output["overlay_materialized"] = serde_json::json!(true);
+        collect(&mut records, "verify.run", None, &output, Some("materialized-check"));
+        assert!(!has_failure(&records));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].evidence_ids, vec!["materialized-check"]);
     }
 
     #[test]

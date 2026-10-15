@@ -3,6 +3,46 @@
 use super::*;
 use crate::agents::execution_state::{continuation, ExecutionState};
 
+#[tokio::test]
+async fn strict_verification_refusal_keeps_a_settled_node_actionable_on_continue()
+    -> Result<(), Box<dyn std::error::Error>>
+{
+    let (coordinator, mut task, context, mut graph, _ledger, _scope, workspace) =
+        obligation_harness(vec![MockExpertAgent::always_succeed(AgentId::new("coder"), "done")]);
+    let mut coordinator = coordinator.with_strict_verification_gate(true);
+    task.execution_mode = TaskExecutionMode::ACTION_REQUIRED;
+    std::fs::write(workspace.path().join("index.html"), "<html><body>produced</body></html>")?;
+    let mut node = SubTask::new(task.session_id, AgentId::new("coder"), "Produce index.html");
+    node.status = SubTaskStatus::Completed;
+    node.completed_at = Some(time::OffsetDateTime::now_utc());
+    let id = node.id;
+    graph.add_root(node);
+    let result = AgentRunResult {
+        verification: Vec::new(), task_id: id, role: AgentId::new("coder"),
+        outcome: AgentOutcome::Success, summary: "Produced index.html without a check".into(),
+        files_modified: vec![camino::Utf8PathBuf::from("index.html")], tool_call_count: 1,
+        cost_usd: 0.0, latency_ms: 0, provider: "fixture".into(), model: "mock".into(),
+        tokens_in: 0, tokens_out: 0,
+    };
+    let objective = task.description.clone();
+    let objective_hash = blake3::hash(objective.as_bytes()).to_hex().to_string();
+    let (output, _) = coordinator.execute_graph(task, context, CancellationToken::new(), graph,
+        HashMap::from([(id, result)]), 0.0, 1, vec![camino::Utf8PathBuf::from("index.html")],
+        Vec::new(), HashMap::new(), HashMap::new(), HashMap::new(), Vec::new(),
+        objective, objective_hash, Vec::new(), None, None, None).await?;
+    assert_eq!(output.completion_status, concerto_core::types::AgentCompletionStatus::Partial);
+    assert!(output.final_message.contains("Canonical verification gate"));
+    let json = output.checkpoint_json.ok_or_else(|| std::io::Error::other("missing repair checkpoint"))?;
+    let checkpoint = checkpoint::GraphCheckpoint::from_json(&json)?;
+    let graph = checkpoint::restore_graph(&checkpoint)?;
+    assert_eq!(graph.get(&id).map(|node| node.status), Some(SubTaskStatus::NeedsRevision));
+    let held = checkpoint.completed_results.get(&id)
+        .ok_or_else(|| std::io::Error::other("missing held result"))?;
+    assert!(crate::agents::execution_state::unfinished(&held.outcome));
+    assert_eq!(held.files_modified, vec![camino::Utf8PathBuf::from("index.html")]);
+    Ok(())
+}
+
 #[derive(Default)]
 struct ContinuingAgent {
     dispatches: std::sync::Mutex<Vec<(SubTask, AgentContext)>>,

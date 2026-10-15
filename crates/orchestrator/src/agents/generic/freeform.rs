@@ -58,7 +58,9 @@ impl GenericSpecialistAgent {
         let mut tokens_in = 0_u64;
         let mut tokens_out = 0_u64;
         let mut tool_call_count = 0_u32;
-        let mut files_modified = Vec::new();
+        let mut files_modified = context.previous_results.iter().rev()
+            .find(|result| result.task_id == task.id)
+            .map(|result| result.files_modified.clone()).unwrap_or_default();
         let mut verification = verification::restored(task, &context);
         let mut summary = String::new();
         let mut progress = ExecutionState::for_task(task, &context);
@@ -145,9 +147,17 @@ impl GenericSpecialistAgent {
             let (text, reasoning, tool_calls, usage) =
                 match self.complete_provider_audited(&request, task, &cancel).await {
                     Ok(turn) => turn,
-                    Err(error) if progress.has_progress() && (cancel.is_cancelled()
-                        || matches!(error, OrchestratorError::Cancelled | OrchestratorError::Provider(
-                            concerto_core::error::ProviderError::Cancelled))) => {
+                    Err(error)
+                        if progress.has_progress()
+                            && (cancel.is_cancelled()
+                                || matches!(
+                                    error,
+                                    OrchestratorError::Cancelled
+                                        | OrchestratorError::Provider(
+                                            concerto_core::error::ProviderError::Cancelled
+                                        )
+                                )) =>
+                    {
                         progress.interrupted();
                         break;
                     }
@@ -157,7 +167,7 @@ impl GenericSpecialistAgent {
             // structured tool-call blocks parsed from the text, bounded
             // repair on malformed blocks, loud failure on bound exhaustion.
             // Native turns (driver inactive) pass through untouched.
-            let (text, reasoning, tool_calls, usage) = match tool_driver.as_mut() {
+            let driver_turn = match tool_driver.as_mut() {
                 Some(driver) => {
                     self.freeform_driver_turn(
                         driver,
@@ -169,9 +179,19 @@ impl GenericSpecialistAgent {
                         &mut messages,
                         &cancel,
                     )
-                    .await?
+                    .await
                 }
-                None => (text, reasoning, tool_calls, usage),
+                None => Ok((text, reasoning, tool_calls, usage)),
+            };
+            let (text, reasoning, tool_calls, usage) = match driver_turn {
+                Ok(turn) => turn,
+                Err(error) if progress.has_progress() && (cancel.is_cancelled()
+                    || matches!(error, OrchestratorError::Cancelled | OrchestratorError::Provider(
+                        concerto_core::error::ProviderError::Cancelled))) => {
+                    progress.interrupted();
+                    break;
+                }
+                Err(error) => return Err(error),
             };
             // ADR-48 decision 4: provider-reported usage as the source of
             // truth; the byte/4 heuristic is the fallback per dimension.
@@ -292,6 +312,27 @@ impl GenericSpecialistAgent {
                         &arguments,
                     ),
                 };
+                if is_file_change && progress.already_succeeded(
+                    &tool_call.id, &tool_call.name, &arguments,
+                ) {
+                    tool_call_count = tool_call_count.saturating_sub(1);
+                    let output = ToolOutput {
+                        summary: "Skipped replay of a previously successful mutation".into(),
+                        data: serde_json::json!({"status": "already_executed",
+                            "original_call_id": tool_call.id, "fresh_verification": false,
+                            "detail": "This task already executed this exact call. Inspect current state; use a new call identity for intentional new work."}),
+                    };
+                    let _ = self.bus.publish_for_session(task.session_id, task.id.0,
+                        EventKind::AgentThought { agent_id: agent_id.to_string(),
+                            content: output.summary.clone(), kind: ThinkingKind::Detail });
+                    messages.push(Message {
+                        role: Role::Tool, content: String::new(), tool_calls: None,
+                        tool_results: Some(vec![ToolResult { id: tool_call.id,
+                            name: tool_call.name, content: serde_json::to_value(output).unwrap_or_default() }]),
+                        reasoning_content: None, tokens_in: None, tokens_out: None,
+                    });
+                    continue;
+                }
                 // ADR-65 §3: hash the pre-write state of every path this
                 // command will touch before it runs (fail-soft).
                 let pre_image_hashes = match &self.tool_facts {

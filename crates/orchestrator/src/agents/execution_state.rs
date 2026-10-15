@@ -108,6 +108,15 @@ impl ExecutionState {
             || self.omitted_successful_calls > 0
     }
 
+    /// A repeated mutation with the same call identity and operation is a
+    /// replay, not fresh work. Reads and verification are never deduplicated here.
+    pub fn already_succeeded(&self, call_id: &str, tool: &str, args: &Value) -> bool {
+        let hash = operation_hash(tool, args);
+        self.successful_calls.iter().any(|call| {
+            call.call_id == call_id && call.tool == tool && call.operation_hash == hash
+        })
+    }
+
     pub fn interrupted(&mut self) {
         self.stop =
             Some(("specialist-interrupted", "execution was interrupted after observed progress"));

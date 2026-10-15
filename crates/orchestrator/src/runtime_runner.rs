@@ -2499,7 +2499,9 @@ pub async fn run_shared_agent(
                 // migrated in-memory and unknown future schema versions are
                 // rejected cleanly (C-05).
                 match crate::checkpoint::GraphCheckpoint::from_json(checkpoint_json) {
-                    Ok(mut checkpoint) if resume_requested || checkpoint.pending_user_input.is_some() => {
+                    Ok(mut checkpoint)
+                        if resume_requested || checkpoint.pending_user_input.is_some() =>
+                    {
                         // Explicit "continue" / "resume" — validate scope
                         // before trusting the checkpoint (Finding 2 / #65).
                         // ADR-60 D7 (interrupt-safe resume): the scope is the
@@ -2545,17 +2547,25 @@ pub async fn run_shared_agent(
                             // The checkpoint governs this run: its cursor
                             // anchors the §7 evidence view.
                             resume_cursor = checkpoint.whiteboard_cursor_gate_seq;
-                            if let Some(question) = operator_input::consume(&mut checkpoint, &req.input) {
+                            if let Some(question) =
+                                operator_input::consume(&mut checkpoint, &req.input)
+                            {
                                 crate::bypass_decision::record_decision_row(
-                                    Some(executor.as_ref()), gate_log_pool.as_ref(), session_id,
+                                    Some(executor.as_ref()),
+                                    gate_log_pool.as_ref(),
+                                    session_id,
                                     "operator-answer-received",
-                                    &format!("Consumed operator response to pending question: {}",
-                                        question.chars().take(1_000).collect::<String>()),
-                                ).await;
-                                req.resume_checkpoint_json = Some(serde_json::to_string(&checkpoint)
-                                    .map_err(|error| OrchestratorError::AgentLoopError(error.to_string()))?);
+                                    &format!(
+                                        "Consumed operator response to pending question: {}",
+                                        question.chars().take(1_000).collect::<String>()
+                                    ),
+                                )
+                                .await;
+                                req.resume_checkpoint_json =
+                                    Some(serde_json::to_string(&checkpoint).map_err(|error| {
+                                        OrchestratorError::AgentLoopError(error.to_string())
+                                    })?);
                             }
-
                         }
                     }
                     Ok(checkpoint) => {
@@ -3569,9 +3579,13 @@ async fn run_multi_agent(
         None => multi_agent_task_with_history(task.clone(), &req.conversation_history),
     };
     let mut context = AgentContext::new(SessionContext::new(session_id, project_dir.clone()));
-    if let Some(checkpoint) = req.resume_checkpoint_json.as_deref()
+    if let Some(checkpoint) = req
+        .resume_checkpoint_json
+        .as_deref()
         .and_then(|json| crate::checkpoint::GraphCheckpoint::from_json(json).ok())
-        .filter(|checkpoint| checkpoint.validate_scope(session_id, &context.session.project_id.0).is_ok())
+        .filter(|checkpoint| {
+            checkpoint.validate_scope(session_id, &context.session.project_id.0).is_ok()
+        })
     {
         if let Some(memory) = checkpoint.working_memory {
             context.working_memory = memory;

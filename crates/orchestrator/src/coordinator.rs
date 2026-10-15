@@ -7133,7 +7133,8 @@ impl CoordinatorAgent {
         // Truthful pause when the session closed without the dispatch the
         // run promised: the guard would fire at the exit anyway, so name the
         // real cause instead of leaving only the guard's verdict to explain it.
-        if !continuing && task.execution_mode.is_action_required()
+        if !continuing
+            && task.execution_mode.is_action_required()
             && !self.implement_stage_dispatch_occurred(&result.graph, &result.action_ledger)
         {
             result.loop_notes.push(
@@ -7171,6 +7172,8 @@ impl CoordinatorAgent {
                     // dispatches the promised work.
                     if self.resume_needs_implement_drive(task, &result)
                         || self.resume_needs_continuation_drive(&result)
+                        || (result.requested_user_input.is_none() && result.pending_approval.is_none()
+                            && result.action_ledger.iter().any(|action| action.kind == "completion-blocked-canonical-verification"))
                         || (result.requested_user_input.is_none() && result.pending_approval.is_none()
                             && context.working_memory.decisions.iter().any(|decision| {
                                 decision.what == "Operator answered the pending question"
@@ -8839,8 +8842,8 @@ impl CoordinatorAgent {
                     eval_result: None,
                     tool_events: Vec::new(),
                     verification: crate::agents::generic::verification::merged(
-                    &completed_results.values().collect::<Vec<_>>(),
-                ),
+                        &completed_results.values().collect::<Vec<_>>(),
+                    ),
                     project_root: None,
                     completion_status: concerto_core::types::AgentCompletionStatus::AwaitingUser,
                     provider_metrics,
@@ -9792,7 +9795,10 @@ impl CoordinatorAgent {
                                 || !result.files_modified.is_empty())
                     })
                     .max_by_key(|(id, result)| {
-                        (result.verification.iter().filter_map(|record| record.checked_at).max(), id.to_string())
+                        (
+                            result.verification.iter().filter_map(|record| record.checked_at).max(),
+                            id.to_string(),
+                        )
                     })
                     .map(|(id, _)| *id);
                 if let Some(id) = candidate {
@@ -9809,6 +9815,10 @@ impl CoordinatorAgent {
                     }
                     retry_feedback.remove(&id);
                 }
+                action_ledger.push(checkpoint::CheckpointAction {
+                    kind: "completion-blocked-canonical-verification".into(), task_id: Some(task.id),
+                    timestamp: time::OffsetDateTime::now_utc(), evidence: None,
+                });
                 recoverable_notes.push(note.clone());
                 self.record_completion_guard_decision(
                     task.session_id,
