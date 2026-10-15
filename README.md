@@ -240,8 +240,9 @@ of the verified test matrix.
   `test-*-plugin-wasm` crates in the workspace.
 - A C toolchain and the platform development libraries used by SQLite, TLS,
   keyring, protobuf, and Iced/wgpu (X11/Wayland/GL/Vulkan on Linux).
-- `cargo-deny` to reproduce the supply-chain job, and `cargo-nextest` only if
-  you want the faster local test runner [TESTING.md](TESTING.md) uses.
+- `cargo-deny` and `cargo-audit` to reproduce both supply-chain jobs, and
+  `cargo-nextest` only if you want the faster local test runner
+  [TESTING.md](TESTING.md) uses.
 
 CI installs exactly this system set on `ubuntu-latest`:
 

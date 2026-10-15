@@ -66,6 +66,7 @@ cargo build --workspace
 CONCERTO_TEST_MODE=1 cargo nextest run --workspace
 CONCERTO_TEST_MODE=1 cargo test --workspace --doc
 cargo deny check
+cargo audit
 ```
 
 | Check | Result | Notes |
@@ -75,6 +76,7 @@ cargo deny check
 | Workspace Build | | |
 | Nextest + Doc Tests | | |
 | Cargo Deny | | |
+| Cargo Audit | | |
 
 ## Test Outcome
 

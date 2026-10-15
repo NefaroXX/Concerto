@@ -48,7 +48,7 @@ security-sensitive findings.
 
 - `main` is protected: never push to it directly. All changes land through
   pull requests.
-- A pull request must be fmt/clippy/test/deny green locally before it is
+- A pull request must be fmt/clippy/test/deny/audit green locally before it is
   opened (CI re-verifies — see "Required checks" below). Keep PRs focused on
   one logical change.
 - Use a short descriptive branch such as `fix/retry-resume`,
