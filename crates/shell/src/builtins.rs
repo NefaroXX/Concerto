@@ -624,12 +624,15 @@ mod tests {
         TreeCommand::new().execute(&invocation, &context, &services, CancellationToken::new()).await
     }
 
+    // `TreeEntry.path` is rendered with OS-native separators (`src\main.rs` on
+    // Windows), so normalise to `/` here. Assertions stay readable and the tests
+    // stay platform-independent without changing the production payload.
     fn entry_paths(result: &CommandResult) -> Vec<String> {
         result.data["entries"]
             .as_array()
             .expect("entries array")
             .iter()
-            .map(|entry| entry["path"].as_str().expect("entry path").to_owned())
+            .map(|entry| entry["path"].as_str().expect("entry path").replace('\\', "/"))
             .collect()
     }
 
@@ -645,7 +648,7 @@ mod tests {
             .iter()
             .map(|entry| {
                 (
-                    entry["path"].as_str().expect("entry path").to_owned(),
+                    entry["path"].as_str().expect("entry path").replace('\\', "/"),
                     entry["kind"].as_str().expect("entry kind").to_owned(),
                 )
             })
