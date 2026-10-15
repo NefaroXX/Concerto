@@ -29,7 +29,7 @@ this change makes it one.**
 
 | | Enforced today | Advisory (this change) |
 | --- | --- | --- |
-| `CI` jobs (fmt, clippy, test, build, bench, wasm, deny, ui-colors) | unchanged | — |
+| `CI` jobs (fmt, clippy, test, build, bench, wasm, deny, audit, ui-colors) | unchanged | — |
 | `Mutation gate (pilot)` fixtures job | no | **yes** |
 | `Mutation gate (pilot)` pilot job | no | **yes** |
 | Branch protection / required checks | unchanged | unchanged |

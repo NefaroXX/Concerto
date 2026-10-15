@@ -64,9 +64,9 @@ security-sensitive findings.
 ## Required checks
 
 The GitHub Actions workflow at `.github/workflows/ci.yml` is authoritative.
-It runs fmt, clippy, test, and cargo-deny as separate, independent jobs and
-pins the toolchain to Rust 1.96.0 through `rust-toolchain.toml`. The workspace
-MSRV is Rust 1.88.
+It runs fmt, clippy, test, cargo-deny, and cargo-audit as separate,
+independent jobs and pins the toolchain to Rust 1.96.0 through
+`rust-toolchain.toml`. The workspace MSRV is Rust 1.88.
 
 ```bash
 rustup target add wasm32-wasip2
