@@ -200,7 +200,7 @@ async fn real_specialist_recovers_failed_check_from_disk_without_repeating_effec
         .bind(state).execute(&pool).await?;
     drop(first);
     drop(service);
-    pool.close().await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), pool.close()).await?;
 
     let pool = sqlx::pool::PoolOptions::new().max_connections(2).connect_with(options).await?;
     let state: String =
@@ -266,5 +266,8 @@ async fn real_specialist_recovers_failed_check_from_disk_without_repeating_effec
         service.check_ledger(&finished.verification, &CancellationToken::new()).await.fresh,
         0
     );
+    drop(second);
+    drop(service);
+    tokio::time::timeout(std::time::Duration::from_secs(5), pool.close()).await?;
     Ok(())
 }

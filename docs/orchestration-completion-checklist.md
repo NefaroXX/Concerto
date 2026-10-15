@@ -2,8 +2,9 @@
 
 This tracks the six-stage orchestration backlog continued in PR #343. The
 earlier merged runtime and harness work remains the foundation. This branch
-finishes its specialist, completion and client integration. It is awaiting
-the PR's required CI checks; implementation alone is not a validation result.
+finishes its specialist, completion and client integration. The PR's required
+CI checks report validation for its current head; implementation alone is not
+a validation result. Merge remains a separate step.
 
 | Stage | Delivered behavior | Evidence |
 | --- | --- | --- |
