@@ -238,4 +238,30 @@ async fn supervisor_pushes_one_bounded_slice_and_never_resends_an_unacked_span()
         }
         other => panic!("expected WhiteboardSlice params, got {other:?}"),
     }
+
+    // sqlx spawns one *unjoined* OS thread per connection; dropping the pool
+    // only initiates an asynchronous worker shutdown, so a straggler worker
+    // can still be alive when process exit runs OpenSSL's atexit cleanup.
+    // Racing that cleanup against the worker's final free aborts the test
+    // binary after libtest already printed PASS (`double free or corruption
+    // (fasttop)`). `Pool::close` awaits worker teardown across every clone
+    // (the `fs_gate`/`SubscriptionManager` handles die with the supervisor
+    // below); the DB file must stay alive until that finishes, so close
+    // before `_pool_dir` (the TempDir owning the DB file) drops.
+    //
+    // Bound the close: it acquires every pool permit, so it can never finish
+    // while a detached request handler (supervisor.rs's `tokio::spawn`, which
+    // owns `services`) has a connection checked out. This test sets only
+    // `MOCK_AGENT_LOG_FILE`; the mock knobs that spawn detached handlers
+    // (`MOCK_AGENT_TOOL_REQUESTS`, `MOCK_AGENT_PUBLISH`,
+    // `MOCK_AGENT_RETRIEVE`/`_STORE`/`_INVALIDATE`, `MOCK_AGENT_ACK_SLICES`)
+    // are all unset, so no handler exists and the timeout is a safety net
+    // expected never to fire — but a hang here would wedge CI forever, so a
+    // trip must fail loudly and name the suspected cause instead.
+    drop(supervisor);
+    tokio::time::timeout(Duration::from_secs(5), pool.close()).await.expect(
+        "pool.close() timed out: a detached supervisor request handler still holds a \
+         checked-out sqlite connection — only MOCK_AGENT_LOG_FILE is set in this test, \
+         so a handler's existence means the supervisor's spawn path regressed",
+    );
 }
