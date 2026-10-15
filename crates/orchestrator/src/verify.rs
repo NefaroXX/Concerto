@@ -414,7 +414,15 @@ pub fn record_freshness(
     path_write_epoch: &HashMap<String, u64>,
     record: &VerificationSummary,
 ) -> Result<(), FreshnessFailure> {
-    if !record.is_passing_evidence() {
+    record_freshness_with_cancel(project_root, base, epoch, path_write_epoch, record,
+        &CancellationToken::new())
+}
+
+fn record_freshness_with_cancel(
+    project_root: &Path, base: &str, epoch: u64, path_write_epoch: &HashMap<String, u64>,
+    record: &VerificationSummary, cancel: &CancellationToken,
+) -> Result<(), FreshnessFailure> {
+    if cancel.is_cancelled() || !record.is_passing_evidence() {
         return Err(FreshnessFailure::MissingAxes);
     }
     let current = current_generation_for(base, epoch);
@@ -430,7 +438,7 @@ pub fn record_freshness(
             _ => return Err(FreshnessFailure::Generation),
         }
     }
-    if !fingerprint_matches(project_root, record) {
+    if !fingerprint_matches_with_cancel(project_root, record, cancel) {
         return Err(FreshnessFailure::Fingerprint);
     }
     Ok(())
@@ -465,19 +473,19 @@ pub fn is_file_scope_record(project_root: &Path, record: &VerificationSummary) -
 /// Re-stat the checked file and compare its blake3 against the recorded
 /// fingerprint. Any doubt is stale — never fresh.
 pub fn fingerprint_matches(project_root: &Path, record: &VerificationSummary) -> bool {
+    fingerprint_matches_with_cancel(project_root, record, &CancellationToken::new())
+}
+
+fn fingerprint_matches_with_cancel(
+    project_root: &Path, record: &VerificationSummary, cancel: &CancellationToken,
+) -> bool {
     let resolved = resolve_verification_path(project_root, &record.path);
-    if record.content_fingerprint.starts_with(fingerprint::WORKSPACE_PREFIX) {
-        return fingerprint::workspace_fingerprint(
-            project_root,
-            &resolved,
-            &CancellationToken::new(),
-        )
-        .is_some_and(|value| value == record.content_fingerprint);
-    }
-    match std::fs::read(&resolved) {
-        Ok(bytes) => blake3::hash(&bytes).to_hex().to_string() == record.content_fingerprint,
-        Err(_) => false,
-    }
+    let observed = if record.content_fingerprint.starts_with(fingerprint::WORKSPACE_PREFIX) {
+        fingerprint::workspace_fingerprint(project_root, &resolved, cancel)
+    } else {
+        fingerprint::file_fingerprint(project_root, &resolved, cancel)
+    };
+    observed.is_some_and(|value| value == record.content_fingerprint)
 }
 
 /// Evaluate a verification ledger for the gated arm: counts fresh-passing
@@ -2069,13 +2077,16 @@ impl VerifierService {
     /// Freshness verdict for one record against the service clock (live base
     /// re-captured first, so out-of-band mutations invalidate).
     pub async fn check_freshness(
-        &self,
-        record: &VerificationSummary,
-        cancel: &CancellationToken,
+        &self, record: &VerificationSummary, cancel: &CancellationToken,
     ) -> Result<(), FreshnessFailure> {
         self.refresh_base(cancel).await;
-        let clock = self.clock.lock().unwrap_or_else(|error| error.into_inner());
-        clock.record_freshness(&self.project_root, record)
+        let clock = self.clock.lock().unwrap_or_else(|error| error.into_inner()).clone();
+        let root = self.project_root.clone();
+        let record = record.clone();
+        let token = cancel.clone();
+        tokio::task::spawn_blocking(move || record_freshness_with_cancel(
+            &root, &clock.base, clock.epoch, &clock.path_write_epoch, &record, &token,
+        )).await.unwrap_or(Err(FreshnessFailure::MissingAxes))
     }
 
     /// Check a bounded completion ledger without holding a mutex during disk reads.
@@ -2093,7 +2104,19 @@ impl VerifierService {
             if token.is_cancelled() {
                 return GateLedger::default();
             }
-            clock.evaluate_ledger(&root, &records)
+            let mut ledger = GateLedger::default();
+            for record in &records {
+                if token.is_cancelled() { return GateLedger::default(); }
+                if record.outcome != Some(VerificationOutcome::Passed) { continue; }
+                ledger.typed_passes += 1;
+                match record_freshness_with_cancel(&root, &clock.base, clock.epoch,
+                    &clock.path_write_epoch, record, &token) {
+                    Ok(()) => ledger.fresh += 1,
+                    Err(cause) => ledger.stale.push(StaleRecord { path: record.path.to_string(),
+                        command: record.command.clone(), cause }),
+                }
+            }
+            if token.is_cancelled() { GateLedger::default() } else { ledger }
         })
         .await
         .unwrap_or_default()

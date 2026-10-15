@@ -87,6 +87,28 @@ pub fn workspace_fingerprint(
     Some(format!("{WORKSPACE_PREFIX}{}", digest.finalize().to_hex()))
 }
 
+pub fn file_fingerprint(project_root: &Path, path: &Path, cancel: &CancellationToken) -> Option<String> {
+    let root = project_root.canonicalize().ok()?;
+    let path = path.canonicalize().ok()?;
+    let metadata = path.metadata().ok()?;
+    if !path.starts_with(root) || !metadata.is_file() || metadata.len() > MAX_BYTES {
+        return None;
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut digest = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        if cancel.is_cancelled() { return None; }
+        let count = file.read(&mut buffer).ok()?;
+        if count == 0 { break; }
+        total = total.saturating_add(count as u64);
+        if total > MAX_BYTES { return None; }
+        digest.update(&buffer[..count]);
+    }
+    (total == metadata.len()).then(|| digest.finalize().to_hex().to_string())
+}
+
 pub async fn checked_fingerprint(
     project_root: &Path,
     path: &camino::Utf8PathBuf,
@@ -102,17 +124,7 @@ pub async fn checked_fingerprint(
         if resolved.is_dir() {
             workspace_fingerprint(&root, &resolved, &token).unwrap_or_default()
         } else {
-            let Ok(canonical) = resolved.canonicalize() else { return String::new() };
-            let Ok(root) = root.canonicalize() else { return String::new() };
-            if !canonical.starts_with(root) {
-                return String::new();
-            }
-            std::fs::metadata(&canonical)
-                .ok()
-                .filter(|metadata| metadata.len() <= MAX_BYTES)
-                .and_then(|_| std::fs::read(canonical).ok())
-                .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
-                .unwrap_or_default()
+            file_fingerprint(&root, &resolved, &token).unwrap_or_default()
         }
     })
     .await

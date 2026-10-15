@@ -58,9 +58,13 @@ impl GenericSpecialistAgent {
         let mut tokens_in = 0_u64;
         let mut tokens_out = 0_u64;
         let mut tool_call_count = 0_u32;
-        let mut files_modified = context.previous_results.iter().rev()
+        let mut files_modified = context
+            .previous_results
+            .iter()
+            .rev()
             .find(|result| result.task_id == task.id)
-            .map(|result| result.files_modified.clone()).unwrap_or_default();
+            .map(|result| result.files_modified.clone())
+            .unwrap_or_default();
         let mut verification = verification::restored(task, &context);
         let mut summary = String::new();
         let mut progress = ExecutionState::for_task(task, &context);
@@ -185,9 +189,17 @@ impl GenericSpecialistAgent {
             };
             let (text, reasoning, tool_calls, usage) = match driver_turn {
                 Ok(turn) => turn,
-                Err(error) if progress.has_progress() && (cancel.is_cancelled()
-                    || matches!(error, OrchestratorError::Cancelled | OrchestratorError::Provider(
-                        concerto_core::error::ProviderError::Cancelled))) => {
+                Err(error)
+                    if progress.has_progress()
+                        && (cancel.is_cancelled()
+                            || matches!(
+                                error,
+                                OrchestratorError::Cancelled
+                                    | OrchestratorError::Provider(
+                                        concerto_core::error::ProviderError::Cancelled
+                                    )
+                            )) =>
+                {
                     progress.interrupted();
                     break;
                 }
@@ -312,9 +324,9 @@ impl GenericSpecialistAgent {
                         &arguments,
                     ),
                 };
-                if is_file_change && progress.already_succeeded(
-                    &tool_call.id, &tool_call.name, &arguments,
-                ) {
+                if is_file_change
+                    && progress.already_succeeded(&tool_call.id, &tool_call.name, &arguments)
+                {
                     tool_call_count = tool_call_count.saturating_sub(1);
                     let output = ToolOutput {
                         summary: "Skipped replay of a previously successful mutation".into(),
@@ -322,14 +334,27 @@ impl GenericSpecialistAgent {
                             "original_call_id": tool_call.id, "fresh_verification": false,
                             "detail": "This task already executed this exact call. Inspect current state; use a new call identity for intentional new work."}),
                     };
-                    let _ = self.bus.publish_for_session(task.session_id, task.id.0,
-                        EventKind::AgentThought { agent_id: agent_id.to_string(),
-                            content: output.summary.clone(), kind: ThinkingKind::Detail });
+                    let _ = self.bus.publish_for_session(
+                        task.session_id,
+                        task.id.0,
+                        EventKind::AgentThought {
+                            agent_id: agent_id.to_string(),
+                            content: output.summary.clone(),
+                            kind: ThinkingKind::Detail,
+                        },
+                    );
                     messages.push(Message {
-                        role: Role::Tool, content: String::new(), tool_calls: None,
-                        tool_results: Some(vec![ToolResult { id: tool_call.id,
-                            name: tool_call.name, content: serde_json::to_value(output).unwrap_or_default() }]),
-                        reasoning_content: None, tokens_in: None, tokens_out: None,
+                        role: Role::Tool,
+                        content: String::new(),
+                        tool_calls: None,
+                        tool_results: Some(vec![ToolResult {
+                            id: tool_call.id,
+                            name: tool_call.name,
+                            content: serde_json::to_value(output).unwrap_or_default(),
+                        }]),
+                        reasoning_content: None,
+                        tokens_in: None,
+                        tokens_out: None,
                     });
                     continue;
                 }

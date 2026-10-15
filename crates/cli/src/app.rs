@@ -1139,8 +1139,21 @@ impl App {
 
     /// Continue the restored session through the ordinary run and approval UI.
     pub fn continue_active_session(&mut self, rt: &tokio::runtime::Runtime) {
-        if self.session_id.is_some() {
-            self.dispatch_message("Continue".to_string(), rt);
+        let (Some(id), Some(manager)) = (self.session_id, self.session_manager.clone()) else {
+            return;
+        };
+        match rt.block_on(manager.store().load_orchestration_checkpoint(id)) {
+            Ok(Some(record)) if !record.completed => {
+                match concerto_orchestrator::checkpoint::GraphCheckpoint::from_json(&record.state_json) {
+                    Ok(checkpoint) if checkpoint.validate_scope(id,
+                        &concerto_core::types::ProjectId::resolve(&self.project_dir).0).is_ok() => {
+                        self.dispatch_message("Continue".to_string(), rt);
+                    }
+                    _ => self.push_line(Line::from("Saved run could not be resumed: invalid checkpoint or project scope.")),
+                }
+            }
+            Ok(_) => self.push_line(Line::from("Session restored. No unfinished orchestration is waiting to continue.")),
+            Err(error) => self.push_line(Line::from(format!("Could not load saved run: {error}"))),
         }
     }
 
@@ -1241,7 +1254,7 @@ impl App {
                     output.task_id.0,
                     EventKind::AssistantMessage {
                         task_id: output.task_id,
-                        content: output.final_message.clone(),
+                        content: output.summary(),
                     },
                 );
             }

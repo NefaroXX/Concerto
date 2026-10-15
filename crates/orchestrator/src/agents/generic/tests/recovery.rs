@@ -215,12 +215,31 @@ async fn real_specialist_recovers_failed_check_from_disk_without_repeating_effec
     assert_eq!(graph.get(&task.id).map(|node| node.status), Some(SubTaskStatus::NeedsRevision));
     context.previous_results.extend(restored.completed_results.into_values());
     let fixed = "<html><body>retained and repaired</body></html>";
-    let (second, service) = recovery_agent(workspace.path(), pool.clone(), vec![
-        turn("initial-write", "filesystem", serde_json::json!({"operation": "write", "path": "index.html", "content": broken})),
-        turn("repair-write", "filesystem", serde_json::json!({"operation": "write", "path": "index.html", "content": fixed})),
-        check(), CompletionChunk { delta: "Repaired and verified".into(), is_final: true,
-            reasoning: None, tool_call: None, usage: None },
-    ], false)?;
+    let (second, service) = recovery_agent(
+        workspace.path(),
+        pool.clone(),
+        vec![
+            turn(
+                "initial-write",
+                "filesystem",
+                serde_json::json!({"operation": "write", "path": "index.html", "content": broken}),
+            ),
+            turn(
+                "repair-write",
+                "filesystem",
+                serde_json::json!({"operation": "write", "path": "index.html", "content": fixed}),
+            ),
+            check(),
+            CompletionChunk {
+                delta: "Repaired and verified".into(),
+                is_final: true,
+                reasoning: None,
+                tool_call: None,
+                usage: None,
+            },
+        ],
+        false,
+    )?;
     let finished = second.run(&task, context, "mock", CancellationToken::new()).await?;
     assert_eq!(finished.task_id, task.id);
     assert_eq!(finished.outcome, AgentOutcome::Success);
@@ -243,6 +262,9 @@ async fn real_specialist_recovers_failed_check_from_disk_without_repeating_effec
     assert_eq!(events.iter().filter(|event| event.payload["args"]["content"] == broken).count(), 1);
     assert_eq!(events.iter().filter(|event| event.payload["args"]["content"] == fixed).count(), 1);
     std::fs::write(workspace.path().join("index.html"), "changed after check")?;
-    assert_eq!(service.check_ledger(&finished.verification, &CancellationToken::new()).await.fresh, 0);
+    assert_eq!(
+        service.check_ledger(&finished.verification, &CancellationToken::new()).await.fresh,
+        0
+    );
     Ok(())
 }

@@ -7172,12 +7172,19 @@ impl CoordinatorAgent {
                     // dispatches the promised work.
                     if self.resume_needs_implement_drive(task, &result)
                         || self.resume_needs_continuation_drive(&result)
-                        || (result.requested_user_input.is_none() && result.pending_approval.is_none()
-                            && result.action_ledger.iter().any(|action| action.kind == "completion-blocked-canonical-verification"))
-                        || (result.requested_user_input.is_none() && result.pending_approval.is_none()
+                        || (result.requested_user_input.is_none()
+                            && result.pending_approval.is_none()
+                            && result.action_ledger.iter().any(|action| {
+                                action.kind == "completion-blocked-canonical-verification"
+                            }))
+                        || (result.requested_user_input.is_none()
+                            && result.pending_approval.is_none()
                             && context.working_memory.decisions.iter().any(|decision| {
                                 decision.what == "Operator answered the pending question"
-                                    && decision.outcome.as_deref().is_some_and(|answer| task.description.starts_with(answer))
+                                    && decision
+                                        .outcome
+                                        .as_deref()
+                                        .is_some_and(|answer| task.description.starts_with(answer))
                             }))
                     {
                         return self
@@ -9816,8 +9823,10 @@ impl CoordinatorAgent {
                     retry_feedback.remove(&id);
                 }
                 action_ledger.push(checkpoint::CheckpointAction {
-                    kind: "completion-blocked-canonical-verification".into(), task_id: Some(task.id),
-                    timestamp: time::OffsetDateTime::now_utc(), evidence: None,
+                    kind: "completion-blocked-canonical-verification".into(),
+                    task_id: Some(task.id),
+                    timestamp: time::OffsetDateTime::now_utc(),
+                    evidence: None,
                 });
                 recoverable_notes.push(note.clone());
                 self.record_completion_guard_decision(

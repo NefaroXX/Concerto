@@ -714,7 +714,7 @@ fn select_session_for_resume(id: concerto_core::ids::Ulid) -> anyhow::Result<Pat
     let mut registry = concerto_config::ProjectRegistry::load().unwrap_or_default();
     registry.select(session_project.as_std_path())?;
     registry.save()?;
-    Ok(session_project.into_std_path())
+    Ok(session_project.as_std_path().to_path_buf())
 }
 
 fn run_sessions_subcommand(args: &[String], project_root: &Path) -> anyhow::Result<()> {

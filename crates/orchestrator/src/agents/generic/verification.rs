@@ -29,14 +29,22 @@ pub(super) fn collect(
     if canonical_tool.unwrap_or(tool) != crate::verify::VERIFY_RUN_TOOL_NAME {
         return;
     }
-    let scope = format!("{}:{}", output.get("scope").and_then(|value| value.as_str()).unwrap_or("unknown"),
-        output.get("verifier").and_then(|value| value.as_str()).unwrap_or("unknown"));
+    let scope = format!(
+        "{}:{}",
+        output.get("scope").and_then(|value| value.as_str()).unwrap_or("unknown"),
+        output.get("verifier").and_then(|value| value.as_str()).unwrap_or("unknown")
+    );
     let decoded = output
         .get("records")
         .cloned()
         .and_then(|value| serde_json::from_value::<Vec<VerificationSummary>>(value).ok());
     let Some(mut observed) = decoded else {
-        incomplete(records, "native verify.run returned malformed records", &scope, COVERAGE_COMMAND);
+        incomplete(
+            records,
+            "native verify.run returned malformed records",
+            &scope,
+            COVERAGE_COMMAND,
+        );
         return;
     };
     let complete = output.get("overlay_materialized").and_then(|v| v.as_bool()) == Some(true)
@@ -62,7 +70,12 @@ pub(super) fn collect(
         insert(records, record.clone());
     }
     if !complete {
-        incomplete(records, "verify.run coverage was incomplete or overlay state was pending", &scope, COVERAGE_COMMAND);
+        incomplete(
+            records,
+            "verify.run coverage was incomplete or overlay state was pending",
+            &scope,
+            COVERAGE_COMMAND,
+        );
     }
 }
 
@@ -91,7 +104,12 @@ fn insert(records: &mut Vec<VerificationSummary>, record: VerificationSummary) {
     } else if records.len() < MAX_RECORDS - 1 {
         records.push(record);
     } else {
-        incomplete(records, "specialist verification ledger exceeded its record budget", "project", BUDGET_COMMAND);
+        incomplete(
+            records,
+            "specialist verification ledger exceeded its record budget",
+            "project",
+            BUDGET_COMMAND,
+        );
     }
 }
 

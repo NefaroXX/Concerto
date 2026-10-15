@@ -2445,6 +2445,32 @@ pub async fn run_shared_agent(
     let mut resume_updated_at_ms: Option<i64> = None;
     let mut resume_cursor: Option<u64> = None;
     if let Some(ref session_manager) = session_manager {
+        // A restored orchestration owns its execution mode even when a newly
+        // opened client defaults to single-agent mode. New objectives retain
+        // the client's choice; only explicit continuation or a pending question
+        // can select the scoped durable graph here.
+        if req.force_single_agent && !apply_plan && !req.cancel_token.is_cancelled() {
+            let stored = match req.resume_checkpoint_json.clone() {
+                Some(json) => Some(json),
+                None => session_manager.store().load_orchestration_checkpoint(session_id).await
+                    .map_err(|error| OrchestratorError::AgentLoopError(error.to_string()))?
+                    .map(|record| {
+                        resume_updated_at_ms = i64::try_from(record.updated_at.unix_timestamp_nanos() / 1_000_000).ok();
+                        record.state_json
+                    }),
+            };
+            if let Some(json) = stored {
+                if let Ok(checkpoint) = crate::checkpoint::GraphCheckpoint::from_json(&json) {
+                    if !checkpoint.completed
+                        && checkpoint.validate_scope(session_id, &resume_scope_project_id(&req.project_dir)).is_ok()
+                        && (is_resume_request(&req.input) || checkpoint.pending_user_input.is_some())
+                    {
+                        req.force_single_agent = false;
+                        req.resume_checkpoint_json = Some(json);
+                    }
+                }
+            }
+        }
         if !req.force_single_agent {
             let resume_requested = is_resume_request(&req.input);
 

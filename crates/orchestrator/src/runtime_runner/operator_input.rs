@@ -123,6 +123,9 @@ mod tests {
         });
         assert!(consume(&mut checkpoint, "yes").is_none());
         assert_eq!(checkpoint.pending_user_input.as_deref(), Some("Which format?"));
-        assert_eq!(checkpoint.pending_approval.as_ref().map(|approval| approval.correlation_id.as_str()), Some("approval-id"));
+        assert_eq!(
+            checkpoint.pending_approval.as_ref().map(|approval| approval.correlation_id.as_str()),
+            Some("approval-id")
+        );
     }
 }
