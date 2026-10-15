@@ -121,7 +121,8 @@ impl App {
         // The backend can restore a durable checkpoint after a desktop restart,
         // even when this process has no local checkpoint. Preserve session views
         // until ResumeRequested confirms continuation; fresh work resets them.
-        self.pending_task_view_reset = self.active_session_id.is_some();
+        self.pending_task_view_reset = self.active_session_id.is_some()
+            || (self.multi_agent && self.resume_checkpoint_json.is_some());
         if !self.pending_task_view_reset {
             self.agent_graph = views::agent_graph::State::new();
             self.chat.begin_run();
