@@ -2452,18 +2452,26 @@ pub async fn run_shared_agent(
         if req.force_single_agent && !apply_plan && !req.cancel_token.is_cancelled() {
             let stored = match req.resume_checkpoint_json.clone() {
                 Some(json) => Some(json),
-                None => session_manager.store().load_orchestration_checkpoint(session_id).await
+                None => session_manager
+                    .store()
+                    .load_orchestration_checkpoint(session_id)
+                    .await
                     .map_err(|error| OrchestratorError::AgentLoopError(error.to_string()))?
                     .map(|record| {
-                        resume_updated_at_ms = i64::try_from(record.updated_at.unix_timestamp_nanos() / 1_000_000).ok();
+                        resume_updated_at_ms =
+                            i64::try_from(record.updated_at.unix_timestamp_nanos() / 1_000_000)
+                                .ok();
                         record.state_json
                     }),
             };
             if let Some(json) = stored {
                 if let Ok(checkpoint) = crate::checkpoint::GraphCheckpoint::from_json(&json) {
                     if !checkpoint.completed
-                        && checkpoint.validate_scope(session_id, &resume_scope_project_id(&req.project_dir)).is_ok()
-                        && (is_resume_request(&req.input) || checkpoint.pending_user_input.is_some())
+                        && checkpoint
+                            .validate_scope(session_id, &resume_scope_project_id(&req.project_dir))
+                            .is_ok()
+                        && (is_resume_request(&req.input)
+                            || checkpoint.pending_user_input.is_some())
                     {
                         req.force_single_agent = false;
                         req.resume_checkpoint_json = Some(json);
@@ -3249,6 +3257,8 @@ async fn run_multi_agent(
     // (no session-DB pool, missing child binary, empty roster) degrades loudly
     // to the coordinator below rather than failing the run.
     if action_capable
+        && req.resume_checkpoint_json.is_none()
+        && !services.config.strict_verification_gate()
         && services.config.multi_agent.as_ref().is_some_and(|multi| multi.supervisor_enabled)
     {
         // ADR-60 D7 ledger enrichment (Phase 4): a plan-driven run (its
@@ -3882,7 +3892,7 @@ async fn run_multi_agent(
         let (tokens_in, tokens_out) = message_row_usage(&output.provider_metrics);
         let assistant_message = Message {
             role: concerto_core::types::Role::Assistant,
-            content: output.final_message.clone(),
+            content: output.summary(),
             tool_calls: None,
             tool_results: None,
             reasoning_content: None,

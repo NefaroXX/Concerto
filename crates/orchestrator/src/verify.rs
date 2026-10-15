@@ -414,13 +414,23 @@ pub fn record_freshness(
     path_write_epoch: &HashMap<String, u64>,
     record: &VerificationSummary,
 ) -> Result<(), FreshnessFailure> {
-    record_freshness_with_cancel(project_root, base, epoch, path_write_epoch, record,
-        &CancellationToken::new())
+    record_freshness_with_cancel(
+        project_root,
+        base,
+        epoch,
+        path_write_epoch,
+        record,
+        &CancellationToken::new(),
+    )
 }
 
 fn record_freshness_with_cancel(
-    project_root: &Path, base: &str, epoch: u64, path_write_epoch: &HashMap<String, u64>,
-    record: &VerificationSummary, cancel: &CancellationToken,
+    project_root: &Path,
+    base: &str,
+    epoch: u64,
+    path_write_epoch: &HashMap<String, u64>,
+    record: &VerificationSummary,
+    cancel: &CancellationToken,
 ) -> Result<(), FreshnessFailure> {
     if cancel.is_cancelled() || !record.is_passing_evidence() {
         return Err(FreshnessFailure::MissingAxes);
@@ -477,7 +487,9 @@ pub fn fingerprint_matches(project_root: &Path, record: &VerificationSummary) ->
 }
 
 fn fingerprint_matches_with_cancel(
-    project_root: &Path, record: &VerificationSummary, cancel: &CancellationToken,
+    project_root: &Path,
+    record: &VerificationSummary,
+    cancel: &CancellationToken,
 ) -> bool {
     let resolved = resolve_verification_path(project_root, &record.path);
     let observed = if record.content_fingerprint.starts_with(fingerprint::WORKSPACE_PREFIX) {
@@ -2077,16 +2089,27 @@ impl VerifierService {
     /// Freshness verdict for one record against the service clock (live base
     /// re-captured first, so out-of-band mutations invalidate).
     pub async fn check_freshness(
-        &self, record: &VerificationSummary, cancel: &CancellationToken,
+        &self,
+        record: &VerificationSummary,
+        cancel: &CancellationToken,
     ) -> Result<(), FreshnessFailure> {
         self.refresh_base(cancel).await;
         let clock = self.clock.lock().unwrap_or_else(|error| error.into_inner()).clone();
         let root = self.project_root.clone();
         let record = record.clone();
         let token = cancel.clone();
-        tokio::task::spawn_blocking(move || record_freshness_with_cancel(
-            &root, &clock.base, clock.epoch, &clock.path_write_epoch, &record, &token,
-        )).await.unwrap_or(Err(FreshnessFailure::MissingAxes))
+        tokio::task::spawn_blocking(move || {
+            record_freshness_with_cancel(
+                &root,
+                &clock.base,
+                clock.epoch,
+                &clock.path_write_epoch,
+                &record,
+                &token,
+            )
+        })
+        .await
+        .unwrap_or(Err(FreshnessFailure::MissingAxes))
     }
 
     /// Check a bounded completion ledger without holding a mutex during disk reads.
@@ -2106,17 +2129,34 @@ impl VerifierService {
             }
             let mut ledger = GateLedger::default();
             for record in &records {
-                if token.is_cancelled() { return GateLedger::default(); }
-                if record.outcome != Some(VerificationOutcome::Passed) { continue; }
+                if token.is_cancelled() {
+                    return GateLedger::default();
+                }
+                if record.outcome != Some(VerificationOutcome::Passed) {
+                    continue;
+                }
                 ledger.typed_passes += 1;
-                match record_freshness_with_cancel(&root, &clock.base, clock.epoch,
-                    &clock.path_write_epoch, record, &token) {
+                match record_freshness_with_cancel(
+                    &root,
+                    &clock.base,
+                    clock.epoch,
+                    &clock.path_write_epoch,
+                    record,
+                    &token,
+                ) {
                     Ok(()) => ledger.fresh += 1,
-                    Err(cause) => ledger.stale.push(StaleRecord { path: record.path.to_string(),
-                        command: record.command.clone(), cause }),
+                    Err(cause) => ledger.stale.push(StaleRecord {
+                        path: record.path.to_string(),
+                        command: record.command.clone(),
+                        cause,
+                    }),
                 }
             }
-            if token.is_cancelled() { GateLedger::default() } else { ledger }
+            if token.is_cancelled() {
+                GateLedger::default()
+            } else {
+                ledger
+            }
         })
         .await
         .unwrap_or_default()

@@ -87,7 +87,11 @@ pub fn workspace_fingerprint(
     Some(format!("{WORKSPACE_PREFIX}{}", digest.finalize().to_hex()))
 }
 
-pub fn file_fingerprint(project_root: &Path, path: &Path, cancel: &CancellationToken) -> Option<String> {
+pub fn file_fingerprint(
+    project_root: &Path,
+    path: &Path,
+    cancel: &CancellationToken,
+) -> Option<String> {
     let root = project_root.canonicalize().ok()?;
     let path = path.canonicalize().ok()?;
     let metadata = path.metadata().ok()?;
@@ -99,11 +103,17 @@ pub fn file_fingerprint(project_root: &Path, path: &Path, cancel: &CancellationT
     let mut buffer = [0_u8; 64 * 1024];
     let mut total = 0_u64;
     loop {
-        if cancel.is_cancelled() { return None; }
+        if cancel.is_cancelled() {
+            return None;
+        }
         let count = file.read(&mut buffer).ok()?;
-        if count == 0 { break; }
+        if count == 0 {
+            break;
+        }
         total = total.saturating_add(count as u64);
-        if total > MAX_BYTES { return None; }
+        if total > MAX_BYTES {
+            return None;
+        }
         digest.update(&buffer[..count]);
     }
     (total == metadata.len()).then(|| digest.finalize().to_hex().to_string())

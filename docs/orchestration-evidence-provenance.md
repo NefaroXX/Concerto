@@ -28,23 +28,31 @@ successful mutation of a declared deliverable, a recognized successful command,
 or a scoped exemption may support acceptance. A mutation proves production,
 not passing verification. Validator outcomes still use their existing contract.
 
-## Harness handoff and next slice
+## Canonical specialist verification
 
-Codex owns these completion consumers and run attribution. OpenCode owns the
-canonical `VerificationSummary` producers and harness adapters. Multi-agent
-`AgentRunResult` currently carries no canonical verification ledger; changing
-that shared contract requires a coordinated handoff. The next integration must
-transport the existing typed records (including unavailable/skipped/error),
-bind them to the current workspace generation and checked bytes, and invalidate
-passes after later mutations. This patch does not claim those freshness checks.
+PR #343 adds the backward-compatible `AgentRunResult.verification` collection.
+Native `verify.run` observations, including failures, skipped checks and errors,
+travel through specialist settlements, checkpoints and bounded handoffs. The
+actual check's whiteboard event backs a transported record; write evidence alone
+does not establish that a check ran. Pending overlays and truncated envelopes
+remain explicit incomplete coverage. A complete recheck can resolve the same
+scope's incomplete materialization record.
 
-Reserved files: `crates/orchestrator/src/completion_evidence.rs`, the completion
-and run-attribution seams of `coordinator.rs`, and the scoped decision writer in
-`bypass_decision.rs`. Shared core types, configuration, sessions, runtime
-construction, CLI and Studio are untouched. This branch is independent of
-the context/handoff work in PR #312.
+The existing `strict_verification_gate` remains opt-in. When enabled for an
+action-required task requiring verification, the Coordinator checks canonical
+records against the shared verifier clock and current checked bytes. Missing,
+failed, incomplete or stale checks prevent Completed. A refused settle leaves
+work held for continuation and re-enters the Coordinator decision loop on
+resume; it cannot become a permanent all-nodes-complete dead end.
 
-Regression fixtures cover current versus foreign/unscoped facts, contradictory
-outcomes, exit failures, typed failures, misleading command invocations, actual
-dispatch-context attribution through completion, legacy successes, and an
-exemption followed by a fresh run in the same session.
+Workspace checks carry a versioned source-tree fingerprint. The service compares
+complete bounded source bytes before and after checking; check caches also key
+on those bytes. A write during checking removes the record's evidence-grade
+fingerprint. Later mutations invalidate old checks. File and workspace reads are
+bounded, cancellable and reject unknown coverage. Existing run attribution and
+legacy C-06 policy remain in place when strict checking is disabled.
+
+The implementation and acceptance index is
+[`orchestration-completion-checklist.md`](orchestration-completion-checklist.md).
+The PR's CI checks establish validation; the new test uses a production
+specialist and native tools with a scripted provider, not a live-model claim.

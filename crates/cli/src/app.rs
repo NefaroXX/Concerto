@@ -1144,15 +1144,27 @@ impl App {
         };
         match rt.block_on(manager.store().load_orchestration_checkpoint(id)) {
             Ok(Some(record)) if !record.completed => {
-                match concerto_orchestrator::checkpoint::GraphCheckpoint::from_json(&record.state_json) {
-                    Ok(checkpoint) if checkpoint.validate_scope(id,
-                        &concerto_core::types::ProjectId::resolve(&self.project_dir).0).is_ok() => {
+                match concerto_orchestrator::checkpoint::GraphCheckpoint::from_json(
+                    &record.state_json,
+                ) {
+                    Ok(checkpoint)
+                        if checkpoint
+                            .validate_scope(
+                                id,
+                                &concerto_core::types::ProjectId::resolve(&self.project_dir).0,
+                            )
+                            .is_ok() =>
+                    {
                         self.dispatch_message("Continue".to_string(), rt);
                     }
-                    _ => self.push_line(Line::from("Saved run could not be resumed: invalid checkpoint or project scope.")),
+                    _ => self.push_line(Line::from(
+                        "Saved run could not be resumed: invalid checkpoint or project scope.",
+                    )),
                 }
             }
-            Ok(_) => self.push_line(Line::from("Session restored. No unfinished orchestration is waiting to continue.")),
+            Ok(_) => self.push_line(Line::from(
+                "Session restored. No unfinished orchestration is waiting to continue.",
+            )),
             Err(error) => self.push_line(Line::from(format!("Could not load saved run: {error}"))),
         }
     }
