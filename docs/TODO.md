@@ -69,22 +69,28 @@ unstarted.
   `None` at `:231`) still has **no TOML key** — only
   `CONCERTO_SHELL_CPU_BUDGET_SECS` (`shell.rs:58`) — and that is what row 45 is
   waiting on. This bullet is kept only as a pointer.
-- **Shell `ls-tree` builtin: no ignore filtering in the walk.** Not started.
-  `TreeCommand` (`crates/shell/src/builtins.rs:164`) builds its walker at
-  `crates/shell/src/builtins.rs:243` as
-  `WalkDir::new(&target).follow_links(false).max_depth(options.depth).sort_by_file_name()`
-  and applies **no ignore filtering at all** — no `.gitignore`, no `target/`,
-  no `node_modules/`. With `MAX_TREE_ENTRIES: usize = 10_000`
-  (`crates/shell/src/builtins.rs:18`; `DEFAULT_TREE_DEPTH = 4` at `:17`,
-  `MAX_TREE_DEPTH = 64` at `:16`) the command is near-useless on any built Rust
-  repo: a built `target/` holds roughly ten times the files of the project
-  itself (~54k against ~4.6k outside `target/` and `.git/`, measured
-  2026-10-14), so `ls-tree .` spends its entry budget on Cargo build artifacts
-  and returns a truncated `.rlib`/`.rmeta` listing instead of project
-  structure. Intended fix is a `.filter_entry(...)` on the walker; the `ignore`
-  crate is the standard choice and is **not in `Cargo.lock`** (only the
-  unrelated `gix-ignore` is, at `Cargo.lock:3575`), so it is a new dependency
-  under `AGENTS.md:96` ("Add a dependency only for a current, tested need").
+- **Shell `ls-tree` builtin: gitignore-aware walking.** Resolved — the walker
+  moved from `walkdir::WalkDir` to `ignore::WalkBuilder` in
+  `collect_tree_entries` (`crates/shell/src/builtins.rs`), closing the gap where a
+  built `target/` (~54k files against ~4.6k elsewhere, measured 2026-10-14)
+  exhausted the `MAX_TREE_ENTRIES` budget on Cargo artifacts. `.gitignore` is
+  honoured, with `require_git(false)` so it applies outside a git repo too.
+  `follow_links(false)` is retained, so the walk still cannot leave the target and
+  bypass the ADR-62 gate in `resolve_in_canonical_root` / `tree_path_error`;
+  the entry cap, `shell.tree.truncated` diagnostic, per-item cancellation, and
+  symlink-escape → `Blocked` are unchanged. Every ignore source that would make
+  output depend on machine state is off: `git_global(false)`,
+  `git_exclude(false)`, `parents(false)`, and `ignore(false)` — ripgrep
+  `.ignore` files are conventionally untracked, so honouring them would change
+  results invisibly to `git diff` review — while `hidden(false)` preserves the
+  previous dotfile-visible behaviour. `ignore = "0.4"` (+ `globset`) is the only
+  new dependency; `walkdir` was dropped from `crates/shell` (still transitive).
+  **Known limitation:** ignore rules are repo-supplied, so an untrusted
+  `.gitignore` can hide files from this command's output. That is a visibility
+  gap, not a control bypass — nothing consumes this output for a security
+  decision, and the policy-gated `filesystem` tool applies no ignore filtering.
+  `.git/` is still traversed; if a repo ever truncates on `.git` alone, consider
+  pruning VCS metadata.
   Design decision, recorded so it is not re-litigated: the general-purpose
   `ls-tree` crate (crates.io 0.2.0, MIT, maintained by this repo's owner) was
   evaluated as a replacement and rejected. It carries no `CancellationToken`;
@@ -93,15 +99,11 @@ unstarted.
   and never breadth; `Options::default()` does I/O and reads `NO_COLOR` from
   stdout, a defect for the Iced GUI; and it is immature — two releases a day
   apart, ~44 lifetime downloads, 0 reverse dependencies, no declared MSRV
-  against this workspace's 1.88, and 0.x semver. The builtin's own traversal is
-  ~20 lines (`builtins.rs:242-262`); the rest is repo plumbing (effect
-  classification, cancellation, root confinement) built on
-  `resolve_in_canonical_root` (`crates/shell/src/path.rs:82`) and
-  `tree_path_error` (`crates/shell/src/builtins.rs:401`), which classify
-  escapes as Blocked and I/O failures as Recoverable — the ADR-62 policy-gate
-  boundary. Conclusion: keep the builtin and take only the ignore-filtering
-  idea; the external crate is deliberately not a Concerto dependency, and would
-  be acceptable only for a bounded, local, non-interactive render behind an
+  against this workspace's 1.88, and 0.x semver. The builtin's traversal is
+  ~20 lines; the rest is repo plumbing (effect classification, cancellation,
+  root confinement) — the ADR-62 policy-gate boundary. Conclusion: keep the
+  builtin; the external crate is deliberately not a Concerto dependency, and
+  would be acceptable only for a bounded, local, non-interactive render behind an
   existing `CancellationToken` — never for untrusted roots, large or unbounded
   directories, or the GUI.
 

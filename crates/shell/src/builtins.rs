@@ -1,11 +1,12 @@
+use std::ffi::OsStr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use camino::Utf8Path;
 use concerto_core::CancellationToken;
+use ignore::DirEntry;
 use serde::Serialize;
 use serde_json::json;
-use walkdir::WalkDir;
 
 use crate::path::{canonicalize_root, resolve_in_canonical_root, PathError};
 use crate::{
@@ -237,29 +238,11 @@ impl ShellCommand for TreeCommand {
             Err(error) => return tree_path_error(&self.spec.name, requested, error),
         };
 
-        let mut entries = Vec::new();
-        let mut diagnostics = Vec::new();
-        let walker =
-            WalkDir::new(&target).follow_links(false).max_depth(options.depth).sort_by_file_name();
-
-        for item in walker {
-            if cancel.is_cancelled() {
-                return cancelled(&self.spec.name);
-            }
-            if entries.len() == MAX_TREE_ENTRIES {
-                diagnostics.push(Diagnostic::warning(
-                    "shell.tree.truncated",
-                    format!("tree output was limited to {MAX_TREE_ENTRIES} entries"),
-                ));
-                break;
-            }
-
-            match item {
-                Ok(entry) => entries.push(tree_entry(&root, &entry)),
-                Err(error) => diagnostics
-                    .push(Diagnostic::warning("shell.tree.entry-unavailable", error.to_string())),
-            }
-        }
+        let (entries, diagnostics) =
+            match collect_tree_entries(&root, &target, options.depth, MAX_TREE_ENTRIES, &cancel) {
+                TreeWalk::Collected { entries, diagnostics } => (entries, diagnostics),
+                TreeWalk::Cancelled => return cancelled(&self.spec.name),
+            };
 
         let status = if diagnostics.is_empty() {
             CommandStatus::Succeeded
@@ -422,22 +405,107 @@ fn tree_path_error(command: &str, requested: &str, error: PathError) -> CommandR
     }
 }
 
-fn tree_entry(root: &Utf8Path, entry: &walkdir::DirEntry) -> TreeEntry {
+/// Outcome of walking a requested tree.
+enum TreeWalk {
+    /// Entries collected (possibly truncated) plus any per-entry warnings.
+    Collected { entries: Vec<TreeEntry>, diagnostics: Vec<Diagnostic> },
+    /// Cancellation was observed between entries.
+    Cancelled,
+}
+
+/// Walk `target` (contained in `root`) with `.gitignore` filtering applied.
+///
+/// `ignore::WalkBuilder` replaces the previous `walkdir` walker so a built
+/// `target/` (which can hold roughly ten times the files of the project itself)
+/// cannot exhaust `max_entries` on Cargo build artifacts. The configuration
+/// preserves the previous walkdir semantics and fixes the documented gap:
+///
+/// - `follow_links(false)`: symlinks are listed but never followed, so the walk
+///   cannot leave `target` and bypass the root-containment gate in `execute`.
+/// - `hidden(false)`: dotfiles are still listed, exactly as walkdir did;
+///   hiding them would be an unrelated behaviour change.
+/// - `sort_by_file_name(OsStr::cmp)`: deterministic per-directory ordering,
+///   matching walkdir's `sort_by_file_name`.
+/// - `git_global(false)` / `git_exclude(false)` / `parents(false)`: keep the
+///   result deterministic and rooted at `target`. This is a policy-gated tool,
+///   so it must not depend on the developer's personal global git config, on
+///   `.git/info/exclude`, or on ignore rules from above `target`.
+/// - `ignore(false)`: ripgrep-style `.ignore` files are conventionally
+///   untracked, so honouring them would let the tool's output change based on a
+///   file invisible to `git status`/`git diff` review — the same hidden-source
+///   non-determinism the settings above exist to prevent.
+/// - `require_git(false)`: load-bearing — `ignore` defaults this to `true`,
+///   which disables `.gitignore` entirely outside a git repo and would leave
+///   plain directories unfiltered.
+///
+/// The walk stays sequential (`build`, not `build_parallel`) so ordering is
+/// deterministic and each yielded item can be checked against `cancel`.
+fn collect_tree_entries(
+    root: &Utf8Path,
+    target: &Utf8Path,
+    depth: usize,
+    max_entries: usize,
+    cancel: &CancellationToken,
+) -> TreeWalk {
+    let mut entries = Vec::new();
+    let mut diagnostics = Vec::new();
+    let walker = ignore::WalkBuilder::new(target)
+        .follow_links(false)
+        .max_depth(Some(depth))
+        .sort_by_file_name(OsStr::cmp)
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(false)
+        .git_exclude(false)
+        .ignore(false)
+        .parents(false)
+        .require_git(false)
+        .build();
+
+    for item in walker {
+        if cancel.is_cancelled() {
+            return TreeWalk::Cancelled;
+        }
+        if entries.len() == max_entries {
+            diagnostics.push(Diagnostic::warning(
+                "shell.tree.truncated",
+                format!("tree output was limited to {max_entries} entries"),
+            ));
+            break;
+        }
+
+        match item {
+            Ok(entry) => entries.push(tree_entry(root, &entry)),
+            Err(error) => diagnostics
+                .push(Diagnostic::warning("shell.tree.entry-unavailable", error.to_string())),
+        }
+    }
+
+    TreeWalk::Collected { entries, diagnostics }
+}
+
+fn tree_entry(root: &Utf8Path, entry: &DirEntry) -> TreeEntry {
     let relative = entry.path().strip_prefix(root).unwrap_or(entry.path());
     let file_type = entry.file_type();
-    let kind = if file_type.is_dir() {
-        "directory"
-    } else if file_type.is_file() {
-        "file"
-    } else if file_type.is_symlink() {
-        "symlink"
-    } else {
-        "other"
+    let kind = match file_type {
+        Some(file_type) => {
+            if file_type.is_dir() {
+                "directory"
+            } else if file_type.is_file() {
+                "file"
+            } else if file_type.is_symlink() {
+                "symlink"
+            } else {
+                "other"
+            }
+        }
+        None => "other",
     };
-    let size = if file_type.is_file() {
-        entry.metadata().ok().map(|metadata| metadata.len())
-    } else {
-        None
+    let size = match file_type {
+        Some(file_type) if file_type.is_file() => {
+            entry.metadata().ok().map(|metadata| metadata.len())
+        }
+        _ => None,
     };
 
     TreeEntry {
@@ -466,11 +534,18 @@ pub(crate) fn apply_provenance(
 
 #[cfg(test)]
 mod tests {
-    use camino::Utf8PathBuf;
+    use camino::{Utf8Path, Utf8PathBuf};
+    use concerto_core::CancellationToken;
 
-    use super::{parse_tree_options, tree_path_error, DEFAULT_TREE_DEPTH, MAX_TREE_DEPTH};
+    use super::{
+        collect_tree_entries, parse_tree_options, tree_path_error, TreeCommand, TreeWalk,
+        DEFAULT_TREE_DEPTH, MAX_TREE_DEPTH,
+    };
     use crate::path::PathError;
-    use crate::CommandStatus;
+    use crate::{
+        CommandInvocation, CommandRegistry, CommandResult, CommandServices, CommandStatus,
+        ShellCommand, ShellContext, ShellHistory,
+    };
 
     #[test]
     fn parses_tree_options_in_either_order() {
@@ -517,5 +592,206 @@ mod tests {
         );
         assert_eq!(result.status, CommandStatus::RecoverableFailure);
         assert!(result.status.permits_continuation());
+    }
+
+    /// Fresh temp root; returns the canonical root and the guard that keeps it
+    /// alive. `tempfile` honours `TMPDIR` (`/var/tmp` per `.cargo/config.toml`),
+    /// which is not a git repository — so the `.gitignore` tests also prove
+    /// `require_git(false)` is doing its job.
+    fn temp_root() -> (Utf8PathBuf, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 temp path");
+        let root = root.canonicalize_utf8().expect("canonicalize temp root");
+        (root, dir)
+    }
+
+    fn write_file(root: &Utf8Path, relative: &str, contents: &str) {
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent dirs");
+        }
+        std::fs::write(path, contents).expect("write fixture");
+    }
+
+    async fn run_tree(root: &Utf8Path, arguments: &[&str]) -> CommandResult {
+        let context = ShellContext::new(root.to_owned());
+        let invocation = CommandInvocation {
+            command: "ls-tree".to_owned(),
+            arguments: arguments.iter().map(|argument| (*argument).to_owned()).collect(),
+            raw: format!("ls-tree {}", arguments.join(" ")),
+        };
+        let services = CommandServices::new(CommandRegistry::new(), ShellHistory::new(16));
+        TreeCommand::new().execute(&invocation, &context, &services, CancellationToken::new()).await
+    }
+
+    // `TreeEntry.path` is rendered with OS-native separators (`src\main.rs` on
+    // Windows), so normalise to `/` here. Assertions stay readable and the tests
+    // stay platform-independent without changing the production payload.
+    fn entry_paths(result: &CommandResult) -> Vec<String> {
+        result.data["entries"]
+            .as_array()
+            .expect("entries array")
+            .iter()
+            .map(|entry| entry["path"].as_str().expect("entry path").replace('\\', "/"))
+            .collect()
+    }
+
+    // Only the symlink test below consumes this, and that test is unix-only
+    // (creating symlinks on Windows needs elevated privileges). Without a
+    // matching cfg this helper is dead code on Windows, which
+    // `#![deny(dead_code)]` in lib.rs rejects.
+    #[cfg(unix)]
+    fn entry_kinds(result: &CommandResult) -> Vec<(String, String)> {
+        result.data["entries"]
+            .as_array()
+            .expect("entries array")
+            .iter()
+            .map(|entry| {
+                (
+                    entry["path"].as_str().expect("entry path").replace('\\', "/"),
+                    entry["kind"].as_str().expect("entry kind").to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn root_gitignore_hides_target_and_dotfiles_remain_listed() {
+        let (root, _dir) = temp_root();
+        assert!(!root.join(".git").exists(), "fixture must not be a git repo");
+        write_file(&root, ".gitignore", "target/\n");
+        write_file(&root, "src/main.rs", "fn main() {}");
+        write_file(&root, "target/debug/app.rlib", "artifact");
+        write_file(&root, "target/debug/app.rmeta", "artifact");
+
+        let result = run_tree(&root, &[]).await;
+        assert_eq!(result.status, CommandStatus::Succeeded);
+        let paths = entry_paths(&result);
+        assert!(paths.contains(&"src/main.rs".to_owned()));
+        assert!(!paths.iter().any(|path| path.starts_with("target")));
+        // `.hidden(false)`: the `.gitignore` dotfile itself is still listed.
+        assert!(paths.contains(&".gitignore".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn nested_gitignore_applies_only_to_its_subtree() {
+        let (root, _dir) = temp_root();
+        write_file(&root, "app/.gitignore", "generated/\n");
+        write_file(&root, "app/generated/code.rs", "// generated");
+        write_file(&root, "app/src/lib.rs", "pub fn x() {}");
+        write_file(&root, "other/generated/keep.rs", "// kept");
+
+        let result = run_tree(&root, &[]).await;
+        let paths = entry_paths(&result);
+        assert!(!paths.iter().any(|path| path.starts_with("app/generated")));
+        assert!(paths.contains(&"app/src/lib.rs".to_owned()));
+        // A sibling subtree without its own ignore rule is unaffected.
+        assert!(paths.contains(&"other/generated/keep.rs".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn hidden_files_are_still_listed() {
+        let (root, _dir) = temp_root();
+        write_file(&root, ".hidden", "x");
+        write_file(&root, "visible.txt", "y");
+
+        let result = run_tree(&root, &[]).await;
+        let paths = entry_paths(&result);
+        assert!(paths.contains(&".hidden".to_owned()));
+        assert!(paths.contains(&"visible.txt".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn ripgrep_ignore_file_does_not_hide_entries() {
+        let (root, _dir) = temp_root();
+        write_file(&root, ".ignore", "dot-ignore-target.txt\n");
+        write_file(&root, "dot-ignore-target.txt", "still listed");
+
+        let result = run_tree(&root, &[]).await;
+        let paths = entry_paths(&result);
+        // `.ignore(false)`: a ripgrep-style `.ignore` must not alter the result.
+        assert!(paths.contains(&"dot-ignore-target.txt".to_owned()));
+        // The `.ignore` file itself is an ordinary dotfile and stays listed.
+        assert!(paths.contains(&".ignore".to_owned()));
+    }
+
+    #[test]
+    fn ignored_directory_is_pruned_and_does_not_consume_budget() {
+        let (root, _dir) = temp_root();
+        write_file(&root, ".gitignore", "ignored/\n");
+        for index in 0..100 {
+            write_file(&root, &format!("ignored/artifact-{index:03}.rs"), "// ignored");
+        }
+        write_file(&root, "keep-a.rs", "a");
+        write_file(&root, "keep-b.rs", "b");
+
+        // Cap large enough for ".", ".gitignore" and the two kept files, but far
+        // too small for 100 ignored artifacts. Pruning (rather than descending
+        // and post-filtering) is what keeps the ignored files off the budget.
+        let outcome = collect_tree_entries(&root, &root, 8, 8, &CancellationToken::new());
+        let TreeWalk::Collected { entries, diagnostics } = outcome else {
+            panic!("walk must complete without cancellation");
+        };
+        let paths: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
+        assert!(paths.contains(&"keep-a.rs"));
+        assert!(paths.contains(&"keep-b.rs"));
+        assert!(!paths.iter().any(|path| path.starts_with("ignored")));
+        assert!(!diagnostics.iter().any(|diagnostic| diagnostic.code == "shell.tree.truncated"));
+    }
+
+    #[test]
+    fn truncation_warning_fires_for_non_ignored_entries() {
+        let (root, _dir) = temp_root();
+        for index in 0..20 {
+            write_file(&root, &format!("file-{index:02}.rs"), "x");
+        }
+
+        let outcome = collect_tree_entries(&root, &root, 4, 5, &CancellationToken::new());
+        let TreeWalk::Collected { entries, diagnostics } = outcome else {
+            panic!("walk must complete without cancellation");
+        };
+        assert_eq!(entries.len(), 5);
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == "shell.tree.truncated"));
+    }
+
+    #[test]
+    fn cancellation_stops_the_walk() {
+        let (root, _dir) = temp_root();
+        for index in 0..10 {
+            write_file(&root, &format!("file-{index}.rs"), "x");
+        }
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let outcome = collect_tree_entries(&root, &root, 4, 100, &cancel);
+        assert!(matches!(outcome, TreeWalk::Cancelled));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_escape_is_blocked_and_links_are_not_followed() {
+        let (root, _dir) = temp_root();
+        let outside = tempfile::tempdir().expect("outside dir");
+        let outside = Utf8PathBuf::from_path_buf(outside.path().to_path_buf())
+            .expect("utf8 outside path")
+            .canonicalize_utf8()
+            .expect("canonicalize outside");
+        std::fs::write(outside.join("secret.txt"), "secret").expect("write secret");
+        std::os::unix::fs::symlink(&outside, root.join("escape")).expect("symlink");
+        write_file(&root, "inside.txt", "inside");
+
+        // The root-containment gate runs on the requested target first.
+        let blocked = run_tree(&root, &["escape"]).await;
+        assert_eq!(blocked.status, CommandStatus::Blocked);
+
+        // The walk lists the link as a symlink but never follows it out of root.
+        let listed = run_tree(&root, &[]).await;
+        let paths = entry_paths(&listed);
+        assert!(paths.contains(&"escape".to_owned()));
+        assert!(!paths.iter().any(|path| path.starts_with("escape/")));
+        assert!(!paths.iter().any(|path| path.contains("secret.txt")));
+        assert!(paths.contains(&"inside.txt".to_owned()));
+        let kinds = entry_kinds(&listed);
+        assert!(kinds.contains(&("escape".to_owned(), "symlink".to_owned())));
     }
 }

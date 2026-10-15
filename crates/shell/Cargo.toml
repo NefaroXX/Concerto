@@ -16,11 +16,11 @@ concerto-sessions = { path = "../sessions", version = "0.1.0" }
 
 async-trait = { workspace = true }
 camino = { workspace = true }
+ignore = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-walkdir = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"

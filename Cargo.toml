@@ -176,6 +176,10 @@ fastembed = "6"
 
 # ---- Recursive directory walking (Phase 4) ----
 walkdir = "2"
+# Gitignore-aware walking for the shell `ls-tree` builtin, so a built `target/`
+# cannot exhaust its bounded entry budget. `require_git(false)` keeps it
+# effective outside a git repo; see crates/shell/src/builtins.rs.
+ignore = "0.4"
 glob = "0.3"
 
 # ---- Filesystem watch (Phase 4, ADR-06) ----
