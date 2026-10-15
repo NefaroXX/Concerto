@@ -633,6 +633,11 @@ mod tests {
             .collect()
     }
 
+    // Only the symlink test below consumes this, and that test is unix-only
+    // (creating symlinks on Windows needs elevated privileges). Without a
+    // matching cfg this helper is dead code on Windows, which
+    // `#![deny(dead_code)]` in lib.rs rejects.
+    #[cfg(unix)]
     fn entry_kinds(result: &CommandResult) -> Vec<(String, String)> {
         result.data["entries"]
             .as_array()
