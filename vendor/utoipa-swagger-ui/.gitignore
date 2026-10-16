@@ -1,0 +1,4 @@
+# Generated when this vendored crate is used as a path dependency (cargo writes
+# its own lockfile and build artifacts); not source. Do not commit.
+/Cargo.lock
+/target/
