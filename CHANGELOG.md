@@ -600,6 +600,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **Interactive Swagger UI at `/v1/docs` is gone.** Its `utoipa-swagger-ui`
+  dependency dragged in a `zip` build dependency that was yanked on crates.io
+  with no compatible unyanked release, so the docs dependency was dropped rather
+  than weaken the `yanked = "deny"` gate. With `CONCERTO_API_DOCS=1`, the
+  generated OpenAPI spec is still served at `/v1/openapi.json` (inside the auth
+  layer).
 - **Legacy install fallbacks are gone.** Config and data directory lookups,
   the environment prefix, and keyring service reads no longer fall back to
   any older name: only `~/.config/concerto/`, `~/.local/share/concerto/`,
