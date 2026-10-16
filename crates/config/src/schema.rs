@@ -1634,13 +1634,16 @@ impl ProviderConfig {
     /// [`Self::api_key`] is returned, preserving the credential-missing
     /// semantics callers rely on.
     pub fn effective_api_key(&self, store: &CredentialStore) -> Result<SecretString, ConfigError> {
+        // Empty/whitespace keyring entries must not shadow a valid env key:
+        // a stale `Ok("")` used to win and produce a 401 downstream that
+        // looked like "new keys don't work".
         match self.api_key(store) {
-            Ok(key) => Ok(key),
-            Err(error) => {
+            Ok(key) if !key.expose().trim().is_empty() => Ok(key),
+            _ => {
                 let env_key = format!("{}_API_KEY", self.provider.to_uppercase());
                 match std::env::var(env_key) {
-                    Ok(key) => Ok(SecretString::from(key)),
-                    Err(_) => Err(error),
+                    Ok(key) if !key.trim().is_empty() => Ok(SecretString::from(key)),
+                    _ => self.api_key(store),
                 }
             }
         }
