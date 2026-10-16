@@ -109,6 +109,12 @@ cargo audit
   move it to an unpatched release without checking the advisory and API
   (`crates/plugins/src/host.rs` pins `config.wasm_memory64(false)` — keep
   `winch` off on any bump, see deny.toml).
+- **utoipa-swagger-ui is vendored on purpose**: `vendor/utoipa-swagger-ui` is
+  a patched copy of upstream 9.0.2 consumed via `[patch.crates-io]`. Upstream
+  pins the yanked `zip ^3.0` build dependency; the vendored copy uses the only
+  unyanked `zip` (`9.0.3+`, `deflate-flate2-zlib-rs`). Do not "fix" a
+  `cargo deny` yanked failure by deleting the Swagger UI again — update the
+  vendored patch instead. See `vendor/utoipa-swagger-ui/README.vendored.md`.
 - **Policy gates**: every file write / shell / git op is policy-gated, but do
   not read "reversible via git stash/branch rollback" as a universal property:
   there is no automatic rollback pipeline (`ToolExecutor` never calls

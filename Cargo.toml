@@ -1,5 +1,10 @@
 [workspace]
 resolver = "2"
+# `vendor/utoipa-swagger-ui` is third-party source consumed only through the
+# `[patch.crates-io]` entry at the bottom of this file. It is excluded so it is
+# not a workspace member: its dev-dependencies, lints, and formatting are not
+# ours to maintain.
+exclude = ["vendor/utoipa-swagger-ui"]
 members = [
     "crates/core",
     "crates/config",
@@ -161,6 +166,7 @@ tower-http = { version = "0.7", features = ["cors", "trace"] }
 # ---- OpenAPI (Phase 3) ----
 utoipa = { version = "5", features = ["axum_extras"] }
 utoipa-axum = "0.1"
+utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
 
 # ---- Indexing / RAG pipeline (Phase 4) ----
 # swiftide = { version = "0.1", features = ["tree-sitter", "fastembed"] }  # Decision (2026-07-07): Ship Feature 4 v1 on entities.rs only. Revisit swiftide or hand-rolled tree-sitter only if entities.rs proves insufficient. See roadmap §3.3 option (c).
@@ -205,6 +211,20 @@ all = { level = "deny", priority = -1 }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
+
+# ---------------------------------------------------------------------------
+# Vendored patch: utoipa-swagger-ui 9.0.2
+# Upstream 9.0.2 declares `[build-dependencies] zip = "3.0"`, and crates.io has
+# yanked every `zip` release in that range (the newest, 8.6.0, is also yanked).
+# The only unyanked `zip` is 9.0.3, which no utoipa-swagger-ui release accepts
+# (10.x pins yanked `^8.6`). Rather than weaken `yanked = "deny"` in deny.toml,
+# the crate is vendored at `vendor/utoipa-swagger-ui` with the build dependency
+# bumped to the unyanked 9.0.3 and the single 3.x->9.x build-script API change
+# applied. The patch keeps the offline `vendored` Swagger UI assets (no CDN) and
+# utoipa 5 generation untouched.
+# ---------------------------------------------------------------------------
+[patch.crates-io]
+utoipa-swagger-ui = { path = "vendor/utoipa-swagger-ui" }
 
 # NOTE: no [workspace.lints.rustdoc] table here. On toolchains >= ~1.80 the
 # legacy `rustdoc::missing_docs` lint path is gone (renamed to the top-level

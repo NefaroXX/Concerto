@@ -26,6 +26,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Swagger UI restored at `/v1/docs` without weakening `yanked = "deny"`.**
+  Upstream `utoipa-swagger-ui` 9.0.2 pins the yanked `zip ^3.0` build
+  dependency and 10.x pins the yanked `^8.6` range. The crate is now vendored
+  at `vendor/utoipa-swagger-ui` through `[patch.crates-io]`, with its `zip`
+  build dependency bumped to the unyanked `9.0.3+` (`deflate-flate2-zlib-rs`)
+  and the one 3.x→9.x build-script API change applied. The offline `vendored`
+  Swagger UI assets and the utoipa 5 spec are untouched: with
+  `CONCERTO_API_DOCS=1` the interactive UI is served at `/v1/docs` and
+  `/v1/openapi.json` is owned by the same merge, as before it was removed.
+
 - **Extension authorization and lifecycle:** runtime plugin discovery requires
   persisted scope/TTL/binary approvals; startup avoids blocking async mutexes.
   File/shell/HTTP host effects use shared policy and shared file diff/undo tracking, with
@@ -600,12 +610,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
-- **Interactive Swagger UI at `/v1/docs` is gone.** Its `utoipa-swagger-ui`
-  dependency dragged in a `zip` build dependency that was yanked on crates.io
-  with no compatible unyanked release, so the docs dependency was dropped rather
-  than weaken the `yanked = "deny"` gate. With `CONCERTO_API_DOCS=1`, the
-  generated OpenAPI spec is still served at `/v1/openapi.json` (inside the auth
-  layer).
 - **Legacy install fallbacks are gone.** Config and data directory lookups,
   the environment prefix, and keyring service reads no longer fall back to
   any older name: only `~/.config/concerto/`, `~/.local/share/concerto/`,
