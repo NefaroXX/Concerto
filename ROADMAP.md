@@ -45,7 +45,8 @@ lifecycle decisions. What is true on `dev` today:
   topology branching; run shape decided and recorded by the Coordinator via
   `decide_run_shape` / `record_run_shape_decision`).
 - **Provider reach (2026-09-24):** the config-first provider factory covers
-  22 provider ids — the original seven (OpenAI, Anthropic, Google, OpenRouter,
+  22 provider ids [historical — now 23 with `opencode-free`, see
+  `docs/models.md`] — the original seven (OpenAI, Anthropic, Google, OpenRouter,
   Ollama, NIM, OpenCode) plus OpenAI-compatible DeepSeek, Groq, Together,
   Mistral, xAI, Fireworks, Cerebras, Cohere, DeepInfra, Perplexity,
   SambaNova, DashScope, Moonshot, Zhipu, and Novita (`docs/missing-providers.md`
@@ -180,7 +181,7 @@ section keeps only the items that shape the roadmap.
   `crates/memory/src/fts.rs:404-450,458-498`. (2026-08 stub audit #6, removed
   2026-09-28; `DEFERRED.md` closed row 12.)
 - **Provider reach follow-ups:** the named OpenAI-compatible wrappers are
-  implemented (22 provider ids); remaining work is the *flat*/content-embedded
+  implemented (23 provider ids); remaining work is the *flat*/content-embedded
   tool-call parsing for proxies documented in `docs/proxy-tool-call-fix.md`
   (Fixes 1–3 landed; any residual gaps live in `docs/DEFERRED.md`).
 - **Fault-injection tests** for the multi-agent containment boundaries in

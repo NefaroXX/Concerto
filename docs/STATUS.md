@@ -51,8 +51,9 @@ installer packages.
   failures retried with context; exhausted bounded subtask/tool work reported as blocked
   or partially complete instead of a generic internal error.
 - **Providers:** OpenAI, Anthropic, Google Gemini, OpenRouter, Ollama, NVIDIA NIM,
-  OpenCode-compatible endpoints, and a config-first catalog of OpenAI-compatible
-  providers (22 provider ids) through a shared streaming interface.
+  OpenCode Zen / OpenCode Zen (free), and a config-first catalog of
+  OpenAI-compatible providers (23 provider ids) through a shared streaming
+  interface.
 - **Routing:** explicit role assignments and model overrides; otherwise
   compatible budget-aware selection. Researcher, Coder, and Validator require
   tool-call support. Capability tiers have been removed; the Coordinator owns
@@ -221,7 +222,7 @@ The expected manual release checks are maintained in [Testing](../TESTING.md).
   (`coordinator.rs::decide_run_shape` / `record_run_shape_decision`). Under
   full local agency the run envelope is always `RunEnvelope::Acting`
   (`auth.set_read_only(false)`), with deny-class policy rules and the approval
-  sink enforcing boundaries. Provider factory now covers 22 provider ids, and
+  sink enforcing boundaries. Provider factory now covers 22 provider ids [historical — now 23 with `opencode-free`, see `docs/models.md`], and
   the eval-runner and AgentRunExit wildcard stubs were resolved (see the stubs
   section). This status file was reconciled with the source tree on 2026-09-24.
   Verification: fmt/clippy clean, workspace build green.
