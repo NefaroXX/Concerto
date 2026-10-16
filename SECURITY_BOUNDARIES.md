@@ -28,11 +28,12 @@ complete operating-system sandbox.
 - With a configured key, `/v1/health` is public and the other versioned API
   routes pass through bearer authentication. With no key on a loopback bind,
   the middleware permits requests to all versioned routes.
-- The generated OpenAPI spec is served at `/v1/openapi.json` only when
-  `CONCERTO_API_DOCS=1`, and it is mounted inside the auth layer, so it requires
-  the API key when one is configured. The interactive Swagger UI was removed
-  (its `utoipa-swagger-ui` dependency pulled a yanked `zip` build dependency),
-  so `/v1/docs` is no longer a route.
+- OpenAPI/Swagger routes are disabled unless `CONCERTO_API_DOCS=1`. When
+  enabled, the Swagger UI at `/v1/docs` and the `/v1/openapi.json` spec it
+  registers are both mounted on the base router, outside the versioned API's
+  auth layer, so neither requires the API key; treat the spec as public
+  whenever docs are enabled. With docs disabled, `/v1/openapi.json` is served
+  by the in-auth manual route and requires the key when one is set.
 - Request bodies are limited to 1 MiB by default.
 - Legacy redirects lead to versioned routes; do not assume a redirect bypasses
   authentication at the destination.
