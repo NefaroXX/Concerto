@@ -206,6 +206,25 @@ impl ProviderFactory {
                 },
             })?;
 
+        // Fail closed on empty credentials: an empty key used to sail through
+        // to the wire and come back as a generic 401 "provider authentication
+        // failed", hiding the real misconfiguration (stale empty keyring
+        // entry shadowing a valid env key). NB: empty `config.model` is
+        // intentionally allowed here — `resolve_for_role` may supply the
+        // model via `model_override` (e.g. openrouter "" + override
+        // ultra-550b, verified live via Venice), so rejecting it would break
+        // the working override pattern. True 401/403 from the wire still
+        // maps to `AuthFailure` untouched.
+        if key.expose().trim().is_empty() {
+            return Err(ProviderError::CredentialMissing {
+                provider: if config.name.trim().is_empty() {
+                    config.provider.clone()
+                } else {
+                    config.name.clone()
+                },
+            });
+        }
+
         // ADR-46 reasoning echo is a per-config dial for OpenAI-compatible
         // providers: `"always"` forces `reasoning_content` on every assistant
         // message (required by DeepSeek-style endpoints), `"if-present"` (and
