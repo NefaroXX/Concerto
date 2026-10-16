@@ -39,20 +39,16 @@ fn draw_runtime_inspector(frame: &mut Frame, app: &App) {
     let block = panel(" Runtime inspector ", &app.cli_theme);
     let inner = block.inner(frame.area());
     frame.render_widget(block, frame.area());
-    let areas = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(2),
-    ])
-    .split(inner);
+    let areas =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(1), Constraint::Length(2)])
+            .split(inner);
     let inspector = &app.runtime_inspector;
     let heading = format!("{}/7 {}", inspector.view.index() + 1, inspector.view.label());
     frame.render_widget(
         Paragraph::new(heading).style(Style::default().fg(app.cli_theme.warning)),
         areas[0],
     );
-    let body = Paragraph::new(app.runtime_inspector.text.as_str())
-        .wrap(Wrap { trim: false });
+    let body = Paragraph::new(app.runtime_inspector.text.as_str()).wrap(Wrap { trim: false });
     let max_scroll = body.line_count(areas[1].width).saturating_sub(areas[1].height as usize);
     let max_scroll = u16::try_from(max_scroll).unwrap_or(u16::MAX);
     inspector.max_scroll.set(max_scroll);

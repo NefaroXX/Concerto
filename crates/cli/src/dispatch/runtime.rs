@@ -458,12 +458,22 @@ mod tests {
         let mut snapshot = StudioRuntimeSnapshot::default();
         let first = TaskId::new();
         let second = TaskId::new();
-        snapshot.topology.tasks = [first, second].into_iter().map(|id| RuntimeTask {
-            id, parent_id: None, agent: AgentId::new("coder"), description: "task".into(),
-            status: SubTaskStatus::Pending, dependencies: Vec::new(), deliverable: None,
-        }).collect();
+        snapshot.topology.tasks = [first, second]
+            .into_iter()
+            .map(|id| RuntimeTask {
+                id,
+                parent_id: None,
+                agent: AgentId::new("coder"),
+                description: "task".into(),
+                status: SubTaskStatus::Pending,
+                dependencies: Vec::new(),
+                deliverable: None,
+            })
+            .collect();
         snapshot.topology.edges.push(RuntimeDependency {
-            from: first, to: second, kind: Dependency::ProvidesContextFor,
+            from: first,
+            to: second,
+            kind: Dependency::ProvidesContextFor,
         });
         let id = Ulid::new().to_string();
         let options = parse_args(&args(&[&id, "--view", "topology", "--limit", "1"])).unwrap();
@@ -485,21 +495,35 @@ mod tests {
         let mut snapshot = StudioRuntimeSnapshot::default();
         snapshot.world_model = Some(WorldModel {
             facts: vec![WorldFact {
-                ref_id: "fact-1".into(), label: "claim".into(), status: FactStatus::Contradicted,
-                artifact: Some("src/lib.rs".into()), seq: 7,
+                ref_id: "fact-1".into(),
+                label: "claim".into(),
+                status: FactStatus::Contradicted,
+                artifact: Some("src/lib.rs".into()),
+                seq: 7,
                 grounded_by: vec!["observation-1".into()],
-                contradicted_by: Some("failure-1".into()), contradicted_exit_code: Some(1),
+                contradicted_by: Some("failure-1".into()),
+                contradicted_exit_code: Some(1),
             }],
             ..WorldModel::default()
         });
-        snapshot.decisions = ["old", "new"].into_iter().map(|id| CoordinatorDecision {
-            id: id.into(), kind: DecisionKind::SelfExecute, target_agent: None,
-            task_description: "inspect".into(), notes: None,
-            supporting_evidence_ids: vec!["fact-1".into()], expected_artifacts: Vec::new(),
-            transform: None, max_tool_calls: None, wait_record: None,
-            dismissed_question_id: None, created_at: time::OffsetDateTime::UNIX_EPOCH,
-            status: DecisionStatus::Settled,
-        }).collect();
+        snapshot.decisions = ["old", "new"]
+            .into_iter()
+            .map(|id| CoordinatorDecision {
+                id: id.into(),
+                kind: DecisionKind::SelfExecute,
+                target_agent: None,
+                task_description: "inspect".into(),
+                notes: None,
+                supporting_evidence_ids: vec!["fact-1".into()],
+                expected_artifacts: Vec::new(),
+                transform: None,
+                max_tool_calls: None,
+                wait_record: None,
+                dismissed_question_id: None,
+                created_at: time::OffsetDateTime::UNIX_EPOCH,
+                status: DecisionStatus::Settled,
+            })
+            .collect();
         let id = Ulid::new().to_string();
         let options = parse_args(&args(&[&id, "--view", "evidence", "--limit", "1"])).unwrap();
         let value = report(&snapshot, &options);
@@ -523,10 +547,15 @@ mod tests {
         inspector.session_id = Some(id);
         inspector.receiver = Some(receiver);
         inspector.select_view(View::World);
-        sender.send(Ok(StudioRuntimeSnapshot {
-            world_model: Some(WorldModel { objective: Some("inspect".into()), ..WorldModel::default() }),
-            ..StudioRuntimeSnapshot::default()
-        })).unwrap();
+        sender
+            .send(Ok(StudioRuntimeSnapshot {
+                world_model: Some(WorldModel {
+                    objective: Some("inspect".into()),
+                    ..WorldModel::default()
+                }),
+                ..StudioRuntimeSnapshot::default()
+            }))
+            .unwrap();
         inspector.poll(Some(id));
         assert!(inspector.text.contains("World model"));
         assert!(!inspector.text.contains("Decision journal"));

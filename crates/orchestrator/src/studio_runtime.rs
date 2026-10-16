@@ -258,21 +258,25 @@ mod tests {
         let session_id = Ulid::new();
         let first = TaskId::new();
         let second = TaskId::new();
-        let checkpoint = GraphCheckpoint::from_json(&serde_json::json!({
-            "schema_version": 4, "session_id": session_id,
-            "subtasks": [
-                {"id": first, "parent_id": null, "session_id": session_id,
-                 "role": "coder", "description": "implement", "status": "Completed",
-                 "dependencies": [], "deliverable": "src/lib.rs"},
-                {"id": second, "parent_id": first, "session_id": session_id,
-                 "role": "reviewer", "description": "review", "status": "Blocked",
-                 "dependencies": [first], "deliverable": null}
-            ],
-            "edges": [[first, second, "MustFinishBefore"]],
-            "completed_results": {}, "total_cost": 0.0, "total_tool_calls": 0,
-            "provider_metrics": [], "all_files": [], "subtask_attempts": {},
-            "retry_feedback": {}
-        }).to_string()).unwrap();
+        let checkpoint = GraphCheckpoint::from_json(
+            &serde_json::json!({
+                "schema_version": 4, "session_id": session_id,
+                "subtasks": [
+                    {"id": first, "parent_id": null, "session_id": session_id,
+                     "role": "coder", "description": "implement", "status": "Completed",
+                     "dependencies": [], "deliverable": "src/lib.rs"},
+                    {"id": second, "parent_id": first, "session_id": session_id,
+                     "role": "reviewer", "description": "review", "status": "Blocked",
+                     "dependencies": [first], "deliverable": null}
+                ],
+                "edges": [[first, second, "MustFinishBefore"]],
+                "completed_results": {}, "total_cost": 0.0, "total_tool_calls": 0,
+                "provider_metrics": [], "all_files": [], "subtask_attempts": {},
+                "retry_feedback": {}
+            })
+            .to_string(),
+        )
+        .unwrap();
         let snapshot = StudioRuntimeSnapshot::from_checkpoint(&checkpoint);
         assert!(!snapshot.is_empty(), "a graph-only checkpoint has inspectable state");
         assert_eq!(snapshot.topology.tasks[0].status, SubTaskStatus::Completed);
@@ -280,9 +284,10 @@ mod tests {
         assert_eq!(snapshot.topology.tasks[1].status, SubTaskStatus::Blocked);
         assert_eq!(snapshot.topology.tasks[1].parent_id, Some(first));
         assert_eq!(snapshot.topology.tasks[1].dependencies, vec![first]);
-        assert_eq!(snapshot.topology.edges, vec![RuntimeDependency {
-            from: first, to: second, kind: Dependency::MustFinishBefore,
-        }]);
+        assert_eq!(
+            snapshot.topology.edges,
+            vec![RuntimeDependency { from: first, to: second, kind: Dependency::MustFinishBefore }]
+        );
     }
 
     #[tokio::test]

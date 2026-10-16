@@ -1996,17 +1996,23 @@ impl App {
             KeyCode::Tab | KeyCode::Right => self.runtime_inspector.cycle_view(false),
             KeyCode::BackTab | KeyCode::Left => self.runtime_inspector.cycle_view(true),
             KeyCode::Char(number @ '1'..='7') => {
-                self.runtime_inspector.select_view(RuntimeView::ALL[(number as u8 - b'1') as usize]);
+                self.runtime_inspector
+                    .select_view(RuntimeView::ALL[(number as u8 - b'1') as usize]);
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.runtime_inspector.scroll = self.runtime_inspector.scroll
-                    .min(self.runtime_inspector.max_scroll.get()).saturating_sub(1);
+                self.runtime_inspector.scroll = self
+                    .runtime_inspector
+                    .scroll
+                    .min(self.runtime_inspector.max_scroll.get())
+                    .saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.runtime_inspector.scroll_down(1);
             }
             KeyCode::PageUp => {
-                self.runtime_inspector.scroll = self.runtime_inspector.scroll
+                self.runtime_inspector.scroll = self
+                    .runtime_inspector
+                    .scroll
                     .min(self.runtime_inspector.max_scroll.get())
                     .saturating_sub(self.runtime_inspector.page_rows.get());
             }
