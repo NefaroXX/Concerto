@@ -71,6 +71,11 @@ pub enum Message {
     LspClosed,
     /// LSP error occurred.
     LspError(String),
+    /// A background LSP *sync* notification (`didOpen`/`didChange`/`didSave`
+    /// and diagnostics refresh) failed. These are not user-initiated, so the
+    /// error is surfaced in the status bar and logs only — never as a hover
+    /// tooltip — to avoid a popup on every keystroke when the server is down.
+    LspSyncError(String),
     /// Messages from the file tree widget.
     FileTree(file_tree::TreeMessage),
     /// Undo the last edit batch.

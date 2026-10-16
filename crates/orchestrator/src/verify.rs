@@ -1220,13 +1220,21 @@ impl VerifySpawner for SystemSpawner {
         }
         // Fail-soft like every other LSP consumer: a missing server simply
         // yields the (empty) published-diagnostics cache, labeled accordingly.
-        let project_id = concerto_core::types::ProjectId::resolve(project_root);
+        // Path-based manager key: the LSP server's `cwd` is part of its
+        // identity, so it must match the editor/tools key for `project_root`
+        // rather than the session/git-remote `ProjectId::resolve`.
+        let project_id = concerto_lsp::LspManager::key_for_dir(project_root);
         let client = concerto_lsp::LspManager::get_or_start(
             project_id,
             project_root.to_path_buf(),
             cancel.clone(),
         )
-        .await;
+        .await
+        .map_err(|error| {
+            LspQueryError::Unavailable(format!(
+                "lsp diagnostics unavailable: server failed to start: {error}"
+            ))
+        })?;
         if cancel.is_cancelled() {
             return Err(LspQueryError::Cancelled);
         }
