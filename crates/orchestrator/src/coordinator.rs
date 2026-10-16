@@ -1005,6 +1005,7 @@ fn is_model_not_found_error(error: &OrchestratorError) -> bool {
 
 fn failed_attempt_result(task_id: TaskId, role: AgentId, error: String) -> AgentRunResult {
     AgentRunResult {
+        verification: Vec::new(),
         task_id,
         role,
         outcome: AgentOutcome::Failed { error: error.clone() },
@@ -1406,6 +1407,7 @@ fn run_is_stalled(
 /// verdict, so it is never attributed to a specialist role.
 fn acceptance_failure_result(task: &AgentTask, summary: String) -> AgentRunResult {
     AgentRunResult {
+        verification: Vec::new(),
         task_id: task.id,
         role: AgentId::new("coordinator"),
         outcome: AgentOutcome::Failed { error: summary.clone() },
@@ -1953,6 +1955,7 @@ enum ResumeApplication {
 /// The coordinator drives the full multi-agent lifecycle.
 pub struct CoordinatorAgent {
     registry: Arc<AgentRegistry>,
+    strict_verification_gate: bool,
     runner: AgentRunner,
     model_selector: Arc<ModelSelector>,
     spend_tracker: Arc<SpendTracker>,
@@ -3808,6 +3811,12 @@ struct PerHypothesisRecord {
 }
 
 impl CoordinatorAgent {
+    /// Opt into current-state canonical verification for action-required completion.
+    pub fn with_strict_verification_gate(mut self, enabled: bool) -> Self {
+        self.strict_verification_gate = enabled;
+        self
+    }
+
     /// Create a new coordinator with all required subsystems.
     pub fn new(
         registry: Arc<AgentRegistry>,
@@ -3823,6 +3832,7 @@ impl CoordinatorAgent {
             RelationshipManager::defaults_for_agents(&default_agent_kinds(&registry, None));
         Self {
             registry,
+            strict_verification_gate: false,
             runner,
             model_selector,
             spend_tracker,
@@ -7124,6 +7134,7 @@ impl CoordinatorAgent {
         // run promised: the guard would fire at the exit anyway, so name the
         // real cause instead of leaving only the guard's verdict to explain it.
         if !continuing
+            && task.execution_mode.is_action_required()
             && !self.implement_stage_dispatch_occurred(&result.graph, &result.action_ledger)
         {
             result.loop_notes.push(
@@ -7161,6 +7172,20 @@ impl CoordinatorAgent {
                     // dispatches the promised work.
                     if self.resume_needs_implement_drive(task, &result)
                         || self.resume_needs_continuation_drive(&result)
+                        || (result.requested_user_input.is_none()
+                            && result.pending_approval.is_none()
+                            && result.action_ledger.iter().any(|action| {
+                                action.kind == "completion-blocked-canonical-verification"
+                            }))
+                        || (result.requested_user_input.is_none()
+                            && result.pending_approval.is_none()
+                            && context.working_memory.decisions.iter().any(|decision| {
+                                decision.what == "Operator answered the pending question"
+                                    && decision
+                                        .outcome
+                                        .as_deref()
+                                        .is_some_and(|answer| task.description.starts_with(answer))
+                            }))
                     {
                         return self
                             .drive_resumed_implement(task, context, cancel, &cp_json, result)
@@ -8468,7 +8493,9 @@ impl CoordinatorAgent {
                 tool_call_count: total_tool_calls,
                 eval_result: None,
                 tool_events: Vec::new(),
-                verification: Vec::new(),
+                verification: crate::agents::generic::verification::merged(
+                    &completed_results.values().collect::<Vec<_>>(),
+                ),
                 project_root: None,
                 completion_status: concerto_core::types::AgentCompletionStatus::Partial,
                 provider_metrics,
@@ -8821,7 +8848,9 @@ impl CoordinatorAgent {
                     tool_call_count: total_tool_calls,
                     eval_result: None,
                     tool_events: Vec::new(),
-                    verification: Vec::new(),
+                    verification: crate::agents::generic::verification::merged(
+                        &completed_results.values().collect::<Vec<_>>(),
+                    ),
                     project_root: None,
                     completion_status: concerto_core::types::AgentCompletionStatus::AwaitingUser,
                     provider_metrics,
@@ -9741,6 +9770,73 @@ impl CoordinatorAgent {
                 }
             }
         }
+        let verification = crate::agents::generic::verification::merged(
+            &completed_results.values().collect::<Vec<_>>(),
+        );
+        if self.strict_verification_gate
+            && matches!(
+                task.execution_mode,
+                TaskExecutionMode::ActionRequired { require_verification: true, .. }
+            )
+        {
+            let ledger = match self.registry.verifier_service() {
+                Some(service) => service.check_ledger(&verification, &cancel).await,
+                None => crate::verify::GateLedger::default(),
+            };
+            if ledger.fresh == 0 || crate::agents::generic::verification::has_failure(&verification)
+            {
+                completion_status = concerto_core::types::AgentCompletionStatus::Partial;
+                let note = format!(
+                    "Canonical verification gate: required checks are missing, failed, incomplete or stale \
+                     (records={}, fresh={}, stale={}). Continue the held task to repair or verify the \
+                     current workspace; preserve prior successful effects.",
+                    verification.len(), ledger.fresh, ledger.stale.len(),
+                );
+                // A settle-boundary refusal must remain actionable on Continue.
+                // Hold the latest checking/writing node in its dependency position.
+                let candidate = completed_results
+                    .iter()
+                    .filter(|(id, result)| {
+                        graph.get(id).is_some_and(|node| node.status == SubTaskStatus::Completed)
+                            && (!result.verification.is_empty()
+                                || !result.files_modified.is_empty())
+                    })
+                    .max_by_key(|(id, result)| {
+                        (
+                            result.verification.iter().filter_map(|record| record.checked_at).max(),
+                            id.to_string(),
+                        )
+                    })
+                    .map(|(id, _)| *id);
+                if let Some(id) = candidate {
+                    if let Some(node) = graph.get_mut(&id) {
+                        node.status = SubTaskStatus::NeedsRevision;
+                        node.completed_at = None;
+                        if let Some(result) = completed_results.get_mut(&id) {
+                            let mut progress =
+                                crate::agents::execution_state::ExecutionState::default();
+                            progress.verification_failed();
+                            result.outcome = progress.outcome(node, &result.summary);
+                            result.summary = format!("{}\n{note}", result.summary);
+                        }
+                    }
+                    retry_feedback.remove(&id);
+                }
+                action_ledger.push(checkpoint::CheckpointAction {
+                    kind: "completion-blocked-canonical-verification".into(),
+                    task_id: Some(task.id),
+                    timestamp: time::OffsetDateTime::now_utc(),
+                    evidence: None,
+                });
+                recoverable_notes.push(note.clone());
+                self.record_completion_guard_decision(
+                    task.session_id,
+                    "completion-blocked-canonical-verification",
+                    &note,
+                )
+                .await;
+            }
+        }
         // ── Completion-time unfinished-work guards ───────────────────────
         // A Completed claim is only valid when the run actually settled its
         // work. These guards evaluate the run's REAL state after the C-06
@@ -9941,7 +10037,7 @@ impl CoordinatorAgent {
                 tool_call_count: total_tool_calls,
                 eval_result: None,
                 tool_events: Vec::new(),
-                verification: Vec::new(),
+                verification,
                 project_root: None,
                 completion_status,
                 provider_metrics,
@@ -23898,6 +23994,7 @@ mod tests {
 
     fn coder_with_tool_work_for_runs(count: usize) -> MockExpertAgent {
         let result = AgentRunResult {
+            verification: Vec::new(),
             task_id: TaskId::new(),
             role: AgentId::new("coder"),
             outcome: AgentOutcome::Success,
@@ -24461,6 +24558,7 @@ mod tests {
     #[test]
     fn metrics_from_result_aggregates_fields() {
         let result = AgentRunResult {
+            verification: Vec::new(),
             task_id: TaskId::new(),
             role: AgentId::new("coder"),
             outcome: AgentOutcome::Success,
@@ -24766,6 +24864,7 @@ mod tests {
 
     fn ok_result(role: &str, summary: &str) -> Result<AgentRunResult, OrchestratorError> {
         Ok(AgentRunResult {
+            verification: Vec::new(),
             task_id: TaskId::new(),
             role: AgentId::new(role),
             outcome: AgentOutcome::Success,
@@ -24886,6 +24985,7 @@ mod tests {
     /// must route through the ordinary failed-outcome handling.
     fn ok_failed(role: &str, error: &str) -> Result<AgentRunResult, OrchestratorError> {
         Ok(AgentRunResult {
+            verification: Vec::new(),
             task_id: TaskId::new(),
             role: AgentId::new(role),
             outcome: AgentOutcome::Failed { error: error.into() },
@@ -28882,6 +28982,7 @@ mod tests {
                 written_paths.push(path.clone());
             }
             Ok(AgentRunResult {
+                verification: Vec::new(),
                 task_id: task.id,
                 role: self.id.clone(),
                 outcome: AgentOutcome::Success,
@@ -28927,6 +29028,7 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<AgentRunResult, OrchestratorError> {
             Ok(AgentRunResult {
+                verification: Vec::new(),
                 task_id: task.id,
                 role: AgentId::new("reviewer"),
                 outcome: AgentOutcome::NeedsRevision { reason: "needs more work".into() },
@@ -31007,6 +31109,7 @@ mod tests {
         ledger.completed_results.insert(
             completed,
             AgentRunResult {
+                verification: Vec::new(),
                 task_id: completed,
                 role: AgentId::new("coder"),
                 outcome: AgentOutcome::Success,
@@ -37485,6 +37588,7 @@ mod tests {
     /// A successful `AgentRunResult` for the write-back tests.
     fn success_result(task_id: TaskId, role: &str, summary: &str) -> AgentRunResult {
         AgentRunResult {
+            verification: Vec::new(),
             task_id,
             role: AgentId::new(role),
             outcome: AgentOutcome::Success,
@@ -40189,6 +40293,7 @@ mod tests {
             vec![CoordinatorTurn::Text(String::new())],
         );
         let architect_result = AgentRunResult {
+            verification: Vec::new(),
             task_id: TaskId::new(),
             role: AgentId::new("architect"),
             outcome: AgentOutcome::Success,
@@ -40203,6 +40308,7 @@ mod tests {
             tokens_out: 0,
         };
         let coder_result = AgentRunResult {
+            verification: Vec::new(),
             task_id: TaskId::new(),
             role: AgentId::new("coder"),
             outcome: AgentOutcome::Success,
@@ -40252,6 +40358,7 @@ mod tests {
     /// A successful `AgentRunResult` for the phase-marker test.
     fn phase_run_result(role: &str) -> AgentRunResult {
         AgentRunResult {
+            verification: Vec::new(),
             task_id: TaskId::new(),
             role: AgentId::new(role),
             outcome: AgentOutcome::Success,

@@ -326,6 +326,7 @@ mod tests {
 
     fn result(id: TaskId, files: Vec<camino::Utf8PathBuf>) -> AgentRunResult {
         AgentRunResult {
+            verification: Vec::new(),
             task_id: id,
             role: AgentId::new("coder"),
             outcome: AgentOutcome::Success,

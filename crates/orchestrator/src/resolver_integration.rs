@@ -239,6 +239,7 @@ pub fn resolve_batch(
                         {
                             if semantic_key_hex == target_hex && !summary.is_empty() {
                                 return Some(AgentRunResult {
+                                    verification: Vec::new(),
                                     task_id,
                                     role: role.clone(),
                                     outcome: concerto_core::types::AgentOutcome::Success,
@@ -328,6 +329,7 @@ mod tests {
 
     fn make_result(task_id: TaskId, role: &str, summary: &str) -> AgentRunResult {
         AgentRunResult {
+            verification: Vec::new(),
             task_id,
             role: AgentId::new(role),
             outcome: AgentOutcome::Success,

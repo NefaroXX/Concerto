@@ -203,6 +203,7 @@ fn register_seeded_agents(
         let fact_pool_owned = fact_pool.clone();
         let shell_profile_owned = shell_profile.clone();
         let factory_id = id_owned.clone();
+        let verifier = registry.verifier.clone();
         let build = move |provider: Arc<dyn LlmProvider>| -> Arc<dyn ExpertAgent> {
             // ADR-65 §3: stamp the shared pool onto this specific agent's
             // evidence writer (agent identity is never inferred).
@@ -252,6 +253,7 @@ fn register_seeded_agents(
                     .with_eval(eval)
                     .with_skills_section(&skills)
                     .with_environment_card(&environment_card)
+                    .with_shared_verifier(verifier.clone())
                     .with_tool_facts(fact_ctx),
                 );
             }
@@ -270,6 +272,7 @@ fn register_seeded_agents(
                 .with_output_mode(output_mode)
                 .with_skills_section(&skills)
                 .with_environment_card(&environment_card)
+                .with_shared_verifier(verifier.clone())
                 .with_tool_facts(fact_ctx),
             )
         };
@@ -284,6 +287,7 @@ pub type AgentRebuildFactory =
 /// Maps agent IDs to their registered implementations.
 pub struct AgentRegistry {
     agents: HashMap<AgentId, Arc<dyn ExpertAgent>>,
+    verifier: crate::verify::SharedVerifier,
     /// Per-role rebuild factories (ADR-45 tier 1b): reconstruct the same
     /// agent bound to a different provider, so the fallback ladder can
     /// escape a failing provider without re-registering anything.
@@ -299,7 +303,22 @@ pub struct AgentRegistry {
 impl AgentRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
-        Self { agents: HashMap::new(), factories: HashMap::new(), configs: HashMap::new() }
+        Self {
+            agents: HashMap::new(),
+            verifier: crate::verify::SharedVerifier::default(),
+            factories: HashMap::new(),
+            configs: HashMap::new(),
+        }
+    }
+
+    /// Use one native service for registered specialists and provider rebuilds.
+    pub fn with_verifier_service(self, service: Arc<crate::verify::VerifierService>) -> Self {
+        self.verifier.set(service);
+        self
+    }
+
+    pub(crate) fn verifier_service(&self) -> Option<Arc<crate::verify::VerifierService>> {
+        self.verifier.get()
     }
 
     /// Register an agent.
@@ -762,6 +781,7 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<AgentRunResult, OrchestratorError> {
             Ok(AgentRunResult {
+                verification: Vec::new(),
                 task_id: concerto_core::types::TaskId::new(),
                 role: self.id.clone(),
                 outcome: AgentOutcome::Success,

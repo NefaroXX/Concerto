@@ -11,7 +11,7 @@
 
 pub(crate) mod context_packet;
 pub(crate) mod execution_state;
-mod generic;
+pub(crate) mod generic;
 pub(crate) mod task_contract;
 pub(crate) mod tool_blocks;
 

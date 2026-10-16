@@ -33,6 +33,7 @@
 
 mod freeform;
 mod prompt;
+pub(crate) mod verification;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -124,6 +125,7 @@ pub struct GenericSpecialistAgent {
     /// runs on (ADR-66 §3 level 2 / ADR-75). `Some(false)` engages the §4
     /// text-fallback driver; `None` falls through to the optimistic default.
     advertised_tool_support: Option<bool>,
+    verification_service: crate::verify::SharedVerifier,
 }
 
 impl GenericSpecialistAgent {
@@ -165,6 +167,7 @@ impl GenericSpecialistAgent {
             environment_card: String::new(),
             tool_facts: None,
             advertised_tool_support: None,
+            verification_service: crate::verify::SharedVerifier::default(),
         }
     }
 
@@ -223,6 +226,17 @@ impl GenericSpecialistAgent {
         self
     }
 
+    /// Attach the same verification service used by native verify.run.
+    pub fn with_verifier_service(self, service: Arc<crate::verify::VerifierService>) -> Self {
+        self.verification_service.set(service);
+        self
+    }
+
+    pub(crate) fn with_shared_verifier(mut self, shared: crate::verify::SharedVerifier) -> Self {
+        self.verification_service = shared;
+        self
+    }
+
     /// ADR-65 §3: record a completed tool command as a `ToolExecuted`
     /// whiteboard fact. Attribution is real, never inferred: this agent's
     /// `ToolFactContext` carries its own id, and the per-call fact carries the
@@ -246,36 +260,43 @@ impl GenericSpecialistAgent {
         canonical_tool: Option<&str>,
         canonical_operation: Option<&str>,
         cancel: &CancellationToken,
-    ) {
-        let Some(facts) = &self.tool_facts else {
-            return;
-        };
+    ) -> Option<String> {
         let session_id = task.session_id.to_string();
         let task_id = task.id.0.to_string();
         let paths = crate::tool_facts::extract_affected_paths(arguments, output_data);
-        facts
-            .record_tool_executed(
-                &ToolExecutedFact {
-                    session_id: &session_id,
-                    task_id: Some(&task_id),
-                    run_id: context.run_id.as_deref(),
-                    generation: context.workspace_generation.as_deref().unwrap_or(""),
-                    project_root: &context.session.project_dir,
-                    tool,
-                    args: arguments,
-                    success,
-                    outcome,
-                    exit_code: None,
-                    paths: &paths,
-                    file_affecting,
-                    pre_image_hashes,
-                    canonical_tool,
-                    canonical_operation,
-                    failure: None,
-                },
-                cancel,
-            )
-            .await;
+        let event_id = if let Some(facts) = &self.tool_facts {
+            facts
+                .record_tool_executed(
+                    &ToolExecutedFact {
+                        session_id: &session_id,
+                        task_id: Some(&task_id),
+                        run_id: context.run_id.as_deref(),
+                        generation: context.workspace_generation.as_deref().unwrap_or(""),
+                        project_root: &context.session.project_dir,
+                        tool,
+                        args: arguments,
+                        success,
+                        outcome,
+                        exit_code: None,
+                        paths: &paths,
+                        file_affecting,
+                        pre_image_hashes,
+                        canonical_tool,
+                        canonical_operation,
+                        failure: None,
+                    },
+                    cancel,
+                )
+                .await
+        } else {
+            None
+        };
+        if file_affecting && !matches!(outcome, ToolOutcome::Denied) {
+            if let Some(service) = self.verification_service.get() {
+                service.note_write(&paths, event_id.as_deref());
+            }
+        }
+        event_id
     }
 
     /// ADR-65 §4: record a cache-served read as a `ToolExecuted` fact carrying
@@ -775,10 +796,109 @@ impl GenericSpecialistAgent {
             });
         let eval = governed_eval.as_ref().unwrap_or(eval.as_ref());
 
-        // Delegate to EvalEngine — no LLM call needed
-        let eval_result = match match &eval_dir {
-            Some(dir) => eval.run_in_dir(dir, cancel.clone()).await,
-            None => eval.run(cancel.clone()).await,
+        let mut verification = Vec::new();
+        // Production validators use the native service through their ordinary
+        // executor. This records the check itself and preserves the same gates.
+        let observed = if self.verification_service.get().is_some() {
+            if let Some(executor) = &self.tool_executor {
+                let scope = evidence_files.first().map(|path| path.as_str()).unwrap_or("project");
+                let arguments = serde_json::json!({"scope": scope, "verifier": "project-tests",
+                    "overlay_pending": false});
+                match executor
+                    .execute(
+                        crate::verify::VERIFY_RUN_TOOL_NAME,
+                        arguments.clone(),
+                        &context.session,
+                        cancel.clone(),
+                    )
+                    .await
+                {
+                    Ok(output) => {
+                        let event_id = self
+                            .record_tool_fact(
+                                task,
+                                &context,
+                                crate::verify::VERIFY_RUN_TOOL_NAME,
+                                &arguments,
+                                true,
+                                ToolOutcome::Ok,
+                                Some(&output.data),
+                                false,
+                                HashMap::new(),
+                                Some(crate::verify::VERIFY_RUN_TOOL_NAME),
+                                None,
+                                &cancel,
+                            )
+                            .await;
+                        verification::collect(
+                            &mut verification,
+                            crate::verify::VERIFY_RUN_TOOL_NAME,
+                            Some(crate::verify::VERIFY_RUN_TOOL_NAME),
+                            &output.data,
+                            event_id.as_deref(),
+                        );
+                        Some(
+                            verification
+                                .iter()
+                                .find_map(|record| record.detail.clone())
+                                .ok_or_else(|| {
+                                    concerto_eval::EvalError::TestRunnerFailed(
+                                        "native verification returned no harness result"
+                                            .to_string(),
+                                    )
+                                }),
+                        )
+                    }
+                    Err(error) => {
+                        if matches!(error, concerto_core::ToolError::PausedAwaitingApproval { .. })
+                        {
+                            return Err(OrchestratorError::Tool(error));
+                        }
+                        if cancel.is_cancelled()
+                            || matches!(error, concerto_core::ToolError::Cancelled)
+                        {
+                            return Err(OrchestratorError::Cancelled);
+                        }
+                        let _ = self
+                            .record_tool_fact(
+                                task,
+                                &context,
+                                crate::verify::VERIFY_RUN_TOOL_NAME,
+                                &arguments,
+                                false,
+                                tool_outcome_for_error(&error),
+                                None,
+                                false,
+                                HashMap::new(),
+                                Some(crate::verify::VERIFY_RUN_TOOL_NAME),
+                                None,
+                                &cancel,
+                            )
+                            .await;
+                        verification.push(
+                            concerto_core::types::VerificationSummary::error(
+                                scope,
+                                crate::verify::VERIFY_RUN_TOOL_NAME,
+                                error.to_string(),
+                            )
+                            .with_verifier(crate::verify::VERIFY_RUN_TOOL_NAME)
+                            .with_scope(scope),
+                        );
+                        Some(Err(concerto_eval::EvalError::TestRunnerFailed(error.to_string())))
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let eval_result = match match observed {
+            Some(result) => result,
+            None => match &eval_dir {
+                Some(dir) => eval.run_in_dir(dir, cancel.clone()).await,
+                None => eval.run(cancel.clone()).await,
+            },
         } {
             Ok(result) => result,
             Err(e) => {
@@ -793,6 +913,7 @@ impl GenericSpecialistAgent {
                     },
                 );
                 return Ok(AgentRunResult {
+                    verification,
                     task_id: task.id,
                     role: self.id.clone(),
                     outcome: AgentOutcome::Failed { error: format!("EvalEngine failed: {e}") },
@@ -813,7 +934,7 @@ impl GenericSpecialistAgent {
 
         // Apply constraint rules to post-process the eval result.
         let passed = Self::apply_constraints(
-            eval_result.passed,
+            eval_result.passed && !verification::has_failure(&verification),
             &eval_result.output_tail,
             &self.prompt_sections.constraints,
         );
@@ -832,6 +953,7 @@ impl GenericSpecialistAgent {
         );
 
         Ok(AgentRunResult {
+            verification,
             task_id: task.id,
             role: self.id.clone(),
             outcome: if passed {
@@ -1300,6 +1422,7 @@ impl GenericSpecialistAgent {
         let mut closing_notice_sent = false;
         let mut validation_errors: Vec<String> = Vec::new();
         let mut files_modified: Vec<camino::Utf8PathBuf> = Vec::new();
+        let mut verification = verification::restored(task, &context);
         let mut iteration = 0_u32;
         // Per-run corrective-retry streaks for executor tools, mirroring the
         // single-agent loop's `tool_guard_rejects` map (see `run_freeform`).
@@ -1719,21 +1842,29 @@ impl GenericSpecialistAgent {
                                 }
                                 // ADR-65 §3: record the completed
                                 // (successful) tool command.
-                                self.record_tool_fact(
-                                    task,
-                                    &context,
+                                let event_id = self
+                                    .record_tool_fact(
+                                        task,
+                                        &context,
+                                        &tool_call.name,
+                                        &arguments,
+                                        true,
+                                        ToolOutcome::Ok,
+                                        Some(&output.data),
+                                        is_file_change,
+                                        pre_image_hashes.clone(),
+                                        canonical_tool.as_deref(),
+                                        canonical_operation.as_deref(),
+                                        &cancel,
+                                    )
+                                    .await;
+                                verification::collect(
+                                    &mut verification,
                                     &tool_call.name,
-                                    &arguments,
-                                    true,
-                                    ToolOutcome::Ok,
-                                    Some(&output.data),
-                                    is_file_change,
-                                    pre_image_hashes.clone(),
                                     canonical_tool.as_deref(),
-                                    canonical_operation.as_deref(),
-                                    &cancel,
-                                )
-                                .await;
+                                    &output.data,
+                                    event_id.as_deref(),
+                                );
                                 // ADR-65 §4: cache the exact bytes of a
                                 // successful plain read (after the observation
                                 // above). Fail-soft.
@@ -1765,21 +1896,22 @@ impl GenericSpecialistAgent {
                             Err(error) => {
                                 // ADR-65 §3: record the completed (failed)
                                 // tool command too.
-                                self.record_tool_fact(
-                                    task,
-                                    &context,
-                                    &tool_call.name,
-                                    &arguments,
-                                    false,
-                                    tool_outcome_for_error(&error),
-                                    None,
-                                    is_file_change,
-                                    pre_image_hashes.clone(),
-                                    canonical_tool.as_deref(),
-                                    canonical_operation.as_deref(),
-                                    &cancel,
-                                )
-                                .await;
+                                let _ = self
+                                    .record_tool_fact(
+                                        task,
+                                        &context,
+                                        &tool_call.name,
+                                        &arguments,
+                                        false,
+                                        tool_outcome_for_error(&error),
+                                        None,
+                                        is_file_change,
+                                        pre_image_hashes.clone(),
+                                        canonical_tool.as_deref(),
+                                        canonical_operation.as_deref(),
+                                        &cancel,
+                                    )
+                                    .await;
                                 let _ = self.bus.publish_for_session(
                                     task.session_id,
                                     task.id.0,
@@ -1877,6 +2009,7 @@ impl GenericSpecialistAgent {
         );
 
         Ok(AgentRunResult {
+            verification,
             task_id: task.id,
             role: self.id.clone(),
             outcome,
@@ -2102,6 +2235,7 @@ fn guard_coordinator_tool_call(
 #[cfg(test)]
 mod tests {
     mod execution_tests;
+    mod recovery;
     use super::*;
     use concerto_core::traits::provider::CompletionStream;
     use concerto_core::types::{
@@ -4039,6 +4173,7 @@ mod tests {
         };
         let mut context = AgentContext::new(session);
         context.previous_results.push(AgentRunResult {
+            verification: Vec::new(),
             task_id: TaskId::new(),
             role: AgentId::new("coder"),
             outcome: AgentOutcome::Success,
@@ -4378,6 +4513,7 @@ mod tests {
     /// A pre-existing coder result providing the run's write evidence.
     fn evidence_result(relative_paths: &[&str]) -> AgentRunResult {
         AgentRunResult {
+            verification: Vec::new(),
             task_id: TaskId::new(),
             role: AgentId::new("coder"),
             outcome: AgentOutcome::Success,

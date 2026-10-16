@@ -50,6 +50,8 @@
 //! record (own path/scope/fingerprint) from the cached spawn. A changed file
 //! re-scopes to that file's adapters instead of re-running project-wide work.
 
+mod fingerprint;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -412,7 +414,25 @@ pub fn record_freshness(
     path_write_epoch: &HashMap<String, u64>,
     record: &VerificationSummary,
 ) -> Result<(), FreshnessFailure> {
-    if !record.is_passing_evidence() {
+    record_freshness_with_cancel(
+        project_root,
+        base,
+        epoch,
+        path_write_epoch,
+        record,
+        &CancellationToken::new(),
+    )
+}
+
+fn record_freshness_with_cancel(
+    project_root: &Path,
+    base: &str,
+    epoch: u64,
+    path_write_epoch: &HashMap<String, u64>,
+    record: &VerificationSummary,
+    cancel: &CancellationToken,
+) -> Result<(), FreshnessFailure> {
+    if cancel.is_cancelled() || !record.is_passing_evidence() {
         return Err(FreshnessFailure::MissingAxes);
     }
     let current = current_generation_for(base, epoch);
@@ -428,7 +448,7 @@ pub fn record_freshness(
             _ => return Err(FreshnessFailure::Generation),
         }
     }
-    if !fingerprint_matches(project_root, record) {
+    if !fingerprint_matches_with_cancel(project_root, record, cancel) {
         return Err(FreshnessFailure::Fingerprint);
     }
     Ok(())
@@ -463,11 +483,33 @@ pub fn is_file_scope_record(project_root: &Path, record: &VerificationSummary) -
 /// Re-stat the checked file and compare its blake3 against the recorded
 /// fingerprint. Any doubt is stale — never fresh.
 pub fn fingerprint_matches(project_root: &Path, record: &VerificationSummary) -> bool {
+    fingerprint_matches_with_cancel(project_root, record, &CancellationToken::new())
+}
+
+fn fingerprint_matches_with_cancel(
+    project_root: &Path,
+    record: &VerificationSummary,
+    cancel: &CancellationToken,
+) -> bool {
     let resolved = resolve_verification_path(project_root, &record.path);
-    match std::fs::read(&resolved) {
-        Ok(bytes) => blake3::hash(&bytes).to_hex().to_string() == record.content_fingerprint,
-        Err(_) => false,
-    }
+    let observed = if record.content_fingerprint.starts_with(fingerprint::WORKSPACE_PREFIX) {
+        fingerprint::workspace_fingerprint(project_root, &resolved, cancel)
+    } else {
+        fingerprint::file_fingerprint(project_root, &resolved, cancel)
+    };
+    observed.is_some_and(|value| value == record.content_fingerprint)
+}
+
+/// Project and file adapters share a workspace build only for the same bytes.
+/// Unknown coverage bypasses the cache instead of trusting the generation alone.
+async fn source_cache_key(
+    project_root: &Path,
+    key: &str,
+    cancel: &CancellationToken,
+) -> Option<String> {
+    let root_label = Utf8PathBuf::from(project_root.to_string_lossy().as_ref());
+    let bytes = fingerprint::checked_fingerprint(project_root, &root_label, cancel).await;
+    (!bytes.is_empty()).then(|| format!("{key}:source:{bytes}"))
 }
 
 /// Evaluate a verification ledger for the gated arm: counts fresh-passing
@@ -722,11 +764,10 @@ pub async fn sweep_record_with_verifier(
     exit_code: Option<i32>,
     verifier: &str,
 ) -> VerificationSummary {
-    let full = resolve_verification_path(project_root, path);
-    let content_fingerprint = match tokio::fs::read(&full).await {
-        Ok(bytes) => blake3::hash(&bytes).to_hex().to_string(),
-        Err(_) => String::new(),
-    };
+    let content_fingerprint = tokio::fs::read(resolve_verification_path(project_root, path))
+        .await
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+        .unwrap_or_default();
     let mut record = VerificationSummary::new(path.clone(), command, outcome, output)
         .with_verifier(verifier)
         .with_scope(path.as_str())
@@ -1436,16 +1477,19 @@ async fn sweep_one_file(
             }
             // Coalescing: every changed Rust file in one workspace state
             // shares a single `cargo check` spawn.
-            let key = format!("build:cargo-check:{generation}");
+            let build = format!("build:cargo-check:{generation}");
+            let key = source_cache_key(project_root, &build, cancel).await;
             let start = Instant::now();
-            let out = match coalesce.get(&key) {
+            let out = match key.as_ref().and_then(|key| coalesce.get(key)) {
                 Some(cached) => cached.clone(),
                 None => match spawner
                     .spawn("cargo", &["check"], project_root, spawn_timeout, cancel)
                     .await
                 {
                     Ok(out) => {
-                        coalesce.insert(key, out.clone());
+                        if let Some(key) = key {
+                            coalesce.insert(key, out.clone());
+                        }
                         out
                     }
                     Err(SpawnError::Cancelled) => {
@@ -1552,15 +1596,18 @@ async fn sweep_one_file(
                 );
             }
             // `npm test` runs the whole suite: coalesce like `cargo check`.
-            let key = format!("build:npm-test:{generation}");
+            let build = format!("build:npm-test:{generation}");
+            let key = source_cache_key(project_root, &build, cancel).await;
             let start = Instant::now();
-            let out = match coalesce.get(&key) {
+            let out = match key.as_ref().and_then(|key| coalesce.get(key)) {
                 Some(cached) => cached.clone(),
                 None => {
                     match spawner.spawn("npm", &["test"], project_root, spawn_timeout, cancel).await
                     {
                         Ok(out) => {
-                            coalesce.insert(key, out.clone());
+                            if let Some(key) = key {
+                                coalesce.insert(key, out.clone());
+                            }
                             out
                         }
                         Err(SpawnError::Cancelled) => {
@@ -1872,6 +1919,20 @@ pub enum VerifyError {
 /// (fail-safe: unknown is never clean-disk).
 pub type OverlayPendingSource = Arc<dyn Fn() -> bool + Send + Sync>;
 
+/// Shared late-bound service for seeded specialists and provider rebuilds.
+#[derive(Clone, Default)]
+pub(crate) struct SharedVerifier(Arc<Mutex<Option<Arc<VerifierService>>>>);
+
+impl SharedVerifier {
+    pub(crate) fn set(&self, service: Arc<VerifierService>) {
+        *self.0.lock().unwrap_or_else(|error| error.into_inner()) = Some(service);
+    }
+
+    pub(crate) fn get(&self) -> Option<Arc<VerifierService>> {
+        self.0.lock().unwrap_or_else(|error| error.into_inner()).clone()
+    }
+}
+
 /// The reusable verification service. Owns a per-run [`FreshnessClock`], the
 /// harness engine (upgradable to the governed executor-backed engine once
 /// the run builds one), the spawner seam, and the coalescing caches.
@@ -1989,8 +2050,8 @@ impl VerifierService {
         self.eval_cache.lock().unwrap_or_else(|error| error.into_inner()).clear();
     }
 
-    /// Re-capture the workspace base (fail-soft: a failed capture keeps the
-    /// previous base and every gated check then reports stale).
+    /// Re-capture the shared workspace generation. An unavailable capture
+    /// clears the base so previous checks cannot remain trusted.
     ///
     /// When the base moved, the coalescing caches are dropped with it: they
     /// are keyed by generation, so a moved base makes every entry
@@ -2003,17 +2064,23 @@ impl VerifierService {
         let project_dir = self.project_root.clone();
         let token = cancel.clone();
         let captured = tokio::task::spawn_blocking(move || {
+            if token.is_cancelled() {
+                return String::new();
+            }
             let entries =
                 crate::workspace_snapshot::capture_workspace_snapshot(&project_dir, &token);
-            crate::workspace_snapshot::generation_for(&entries)
+            if token.is_cancelled() {
+                String::new()
+            } else {
+                crate::workspace_snapshot::generation_for(&entries)
+            }
         })
         .await
         .unwrap_or_default();
         if captured.is_empty() {
             tracing::warn!(
-                "verify.run: workspace generation capture failed; freshness falls back to the previous base"
+                "verify.run: workspace fingerprint unavailable; verification remains display data"
             );
-            return;
         }
         let base_changed = {
             let mut clock = self.clock.lock().unwrap_or_else(|error| error.into_inner());
@@ -2045,8 +2112,72 @@ impl VerifierService {
         cancel: &CancellationToken,
     ) -> Result<(), FreshnessFailure> {
         self.refresh_base(cancel).await;
-        let clock = self.clock.lock().unwrap_or_else(|error| error.into_inner());
-        clock.record_freshness(&self.project_root, record)
+        let clock = self.clock.lock().unwrap_or_else(|error| error.into_inner()).clone();
+        let root = self.project_root.clone();
+        let record = record.clone();
+        let token = cancel.clone();
+        tokio::task::spawn_blocking(move || {
+            record_freshness_with_cancel(
+                &root,
+                &clock.base,
+                clock.epoch,
+                &clock.path_write_epoch,
+                &record,
+                &token,
+            )
+        })
+        .await
+        .unwrap_or(Err(FreshnessFailure::MissingAxes))
+    }
+
+    /// Check a bounded completion ledger without holding a mutex during disk reads.
+    pub async fn check_ledger(
+        &self,
+        records: &[VerificationSummary],
+        cancel: &CancellationToken,
+    ) -> GateLedger {
+        self.refresh_base(cancel).await;
+        let clock = self.clock.lock().unwrap_or_else(|error| error.into_inner()).clone();
+        let root = self.project_root.clone();
+        let records = records.to_vec();
+        let token = cancel.clone();
+        tokio::task::spawn_blocking(move || {
+            if token.is_cancelled() {
+                return GateLedger::default();
+            }
+            let mut ledger = GateLedger::default();
+            for record in &records {
+                if token.is_cancelled() {
+                    return GateLedger::default();
+                }
+                if record.outcome != Some(VerificationOutcome::Passed) {
+                    continue;
+                }
+                ledger.typed_passes += 1;
+                match record_freshness_with_cancel(
+                    &root,
+                    &clock.base,
+                    clock.epoch,
+                    &clock.path_write_epoch,
+                    record,
+                    &token,
+                ) {
+                    Ok(()) => ledger.fresh += 1,
+                    Err(cause) => ledger.stale.push(StaleRecord {
+                        path: record.path.to_string(),
+                        command: record.command.clone(),
+                        cause,
+                    }),
+                }
+            }
+            if token.is_cancelled() {
+                GateLedger::default()
+            } else {
+                ledger
+            }
+        })
+        .await
+        .unwrap_or_default()
     }
 
     /// Envelope state label: what bytes this run claims to have checked.
@@ -2069,6 +2200,14 @@ impl VerifierService {
         request: &VerifyRequest,
         cancel: &CancellationToken,
     ) -> Result<Vec<VerificationSummary>, VerifyError> {
+        self.verify_with_coverage(request, cancel).await.map(|(records, _)| records)
+    }
+
+    async fn verify_with_coverage(
+        &self,
+        request: &VerifyRequest,
+        cancel: &CancellationToken,
+    ) -> Result<(Vec<VerificationSummary>, usize), VerifyError> {
         if cancel.is_cancelled() {
             return Err(VerifyError::Cancelled);
         }
@@ -2077,12 +2216,36 @@ impl VerifierService {
             return Err(VerifyError::Cancelled);
         }
         let (generation, stamp) = self.snapshot();
+        let root_label = Utf8PathBuf::from(self.project_root.to_string_lossy().as_ref());
+        let before =
+            fingerprint::checked_fingerprint(&self.project_root, &root_label, cancel).await;
         let run = self.run_adapters(request, &generation, &stamp, cancel.clone());
-        match tokio::time::timeout(request.timeout, run).await {
-            Err(_) => Ok(vec![timeout_record(request, &generation)]),
-            Ok(Err(error)) => Err(error),
-            Ok(Ok(records)) => Ok(bound_records(records)),
+        let mut records = match tokio::time::timeout(request.timeout, run).await {
+            Err(_) => vec![timeout_record(request, &generation)],
+            Ok(Err(error)) => return Err(error),
+            Ok(Ok(records)) => records,
+        };
+        // Re-observe complete source bytes after all adapters settle. A check
+        // that raced a write, or lacks bounded coverage, cannot prove those bytes.
+        self.refresh_base(cancel).await;
+        let after = fingerprint::checked_fingerprint(&self.project_root, &root_label, cancel).await;
+        let stable = !generation.is_empty()
+            && !before.is_empty()
+            && before == after
+            && generation == self.current_generation()
+            && !cancel.is_cancelled()
+            && !request.overlay_pending;
+        for record in &mut records {
+            if stable {
+                record.content_fingerprint =
+                    fingerprint::checked_fingerprint(&self.project_root, &record.path, cancel)
+                        .await;
+            } else {
+                record.content_fingerprint.clear();
+            }
         }
+        let total = records.len();
+        Ok((bound_records(records), total))
     }
 
     /// Checked-state label for `request` at `generation` (envelope honesty).
@@ -2233,17 +2396,24 @@ impl VerifierService {
         stamp: &VerificationStamp,
         cancel: &CancellationToken,
     ) -> Result<Vec<VerificationSummary>, VerifyError> {
-        let scope_key = if files.is_empty() { "project".to_string() } else { files[0].to_string() };
-        let key = format!("eval:{scope_key}:{generation}");
-        let cached =
-            self.eval_cache.lock().unwrap_or_else(|error| error.into_inner()).get(&key).cloned();
+        let eval_dir = EvalEngine::resolve_manifest_root(&self.project_root, files);
+        let scope_key = eval_dir.to_string_lossy().to_string();
+        let checked_root =
+            Utf8PathBuf::from_path_buf(eval_dir.clone()).unwrap_or_else(|_| record_path.clone());
+        let bytes =
+            fingerprint::checked_fingerprint(&self.project_root, &checked_root, cancel).await;
+        let key = format!("eval:{scope_key}:{generation}:{bytes}");
+        let cached = if bytes.is_empty() {
+            None
+        } else {
+            self.eval_cache.lock().unwrap_or_else(|error| error.into_inner()).get(&key).cloned()
+        };
         let outcome = match cached {
             Some(outcome) => outcome,
             None => {
                 if cancel.is_cancelled() {
                     return Err(VerifyError::Cancelled);
                 }
-                let eval_dir = EvalEngine::resolve_manifest_root(&self.project_root, files);
                 let eval = self.eval.lock().unwrap_or_else(|error| error.into_inner()).clone();
                 match self.spawner.run_eval(&eval, &eval_dir, files, cancel).await {
                     Ok(result) => CachedEvalOutcome::Ran(result),
@@ -2252,13 +2422,16 @@ impl VerifierService {
                 }
             }
         };
-        let mut record = outcome.clone().into_record(record_path);
+        let mut record = outcome.clone().into_record(&checked_root);
+        record.scope = checked_root.to_string();
         record.generation = generation.to_string();
-        // Workspace-scope evidence for harness records (F-WORKSPACE-SUPERSEDE);
-        // the content-fingerprint axis stays empty — a workspace check names
-        // no single file, so harness records remain display-grade by design.
+        // The service binds this workspace check to stable source bytes after
+        // all adapters settle. Backing writes are supplemented by the native
+        // check's ToolExecuted event at the specialist transport boundary.
         record.evidence_ids = stamp.workspace_evidence();
-        if self.eval_cache.lock().unwrap_or_else(|error| error.into_inner()).get(&key).is_none() {
+        if !bytes.is_empty()
+            && self.eval_cache.lock().unwrap_or_else(|error| error.into_inner()).get(&key).is_none()
+        {
             self.eval_cache.lock().unwrap_or_else(|error| error.into_inner()).insert(key, outcome);
         }
         Ok(vec![record])
@@ -2394,7 +2567,12 @@ impl VerifierService {
         timeout: Duration,
         cancel: &CancellationToken,
     ) -> Result<TimedSpawn, VerifyError> {
-        if let Some(cached) = self.build_cache.lock().await.get(key) {
+        let key = source_cache_key(&self.project_root, key, cancel).await;
+        let cached = match &key {
+            Some(key) => self.build_cache.lock().await.get(key).cloned(),
+            None => None,
+        };
+        if let Some(cached) = cached {
             return Ok(TimedSpawn {
                 success: cached.success,
                 stdout: cached.stdout.clone(),
@@ -2416,15 +2594,17 @@ impl VerifierService {
                     code: out.code,
                     duration_ms: elapsed_ms(start),
                 };
-                self.build_cache.lock().await.insert(
-                    key.to_string(),
-                    SpawnOutput {
-                        success: out.success,
-                        stdout: out.stdout,
-                        stderr: out.stderr,
-                        code: out.code,
-                    },
-                );
+                if let Some(key) = key {
+                    self.build_cache.lock().await.insert(
+                        key,
+                        SpawnOutput {
+                            success: out.success,
+                            stdout: out.stdout,
+                            stderr: out.stderr,
+                            code: out.code,
+                        },
+                    );
+                }
                 Ok(timed)
             }
             Err(SpawnError::Cancelled) => Err(VerifyError::Cancelled),
@@ -2782,8 +2962,12 @@ impl concerto_core::traits::tool::Tool for VerifyRunTool {
             ToolError::ExecutionFailed { message: format!("invalid verify.run input: {error}") }
         })?;
         let request = self.parse_request(&parsed, session)?;
-        let records = match self.service.verify(&request, &cancel).await {
-            Ok(records) => records,
+        let (records, total_records) = match self
+            .service
+            .verify_with_coverage(&request, &cancel)
+            .await
+        {
+            Ok(result) => result,
             Err(VerifyError::Cancelled) => return Err(ToolError::Cancelled),
             Err(VerifyError::Denied(detail)) => {
                 return Err(ToolError::ExecutionFailed {
@@ -2827,8 +3011,8 @@ impl concerto_core::traits::tool::Tool for VerifyRunTool {
             "checked_state": checked_state,
             "overlay_materialized": !request.overlay_pending,
             "records": records,
-            "total_records": records.len(),
-            "truncated_records": false,
+            "total_records": total_records,
+            "truncated_records": total_records > records.len(),
             "adapters": adapter_proves_table(),
             "honesty": VERIFY_HONESTY_NOTE,
         });
@@ -3280,6 +3464,23 @@ mod tests {
             1,
             "both file checks reused the generation's single cargo check spawn"
         );
+
+        // Even if a caller still holds the old generation, changing another
+        // source file invalidates the shared build for the unchanged file.
+        let (_, stamp) = service.snapshot();
+        write_fixture(dir.path(), "src/b.rs", "pub fn changed() {}\n");
+        let mut cache = service.build_cache.lock().await;
+        verify_file_changes_with(
+            &[Utf8PathBuf::from("src/a.rs")],
+            dir.path(),
+            &stamp,
+            service.spawner.as_ref(),
+            Duration::from_secs(30),
+            &mut cache,
+            &cancel,
+        )
+        .await;
+        assert_eq!(counting.spawn_count(), 2, "changed source bytes require a fresh build");
     }
 
     /// The plan's explicit zero target at the gate-ledger level: enumerate the
