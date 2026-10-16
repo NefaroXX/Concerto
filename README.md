@@ -210,7 +210,8 @@ what unblocks it — lives in
 
 ## Architecture
 
-Concerto is a 25-crate Rust workspace. `concerto-core` is the foundation: it
+Concerto is a 25-member Rust workspace — 21 product crates plus four
+`test-*-plugin-wasm` example crates. `concerto-core` is the foundation: it
 owns cross-cutting contracts — events, IDs, provider/tool/policy traits,
 cancellation, the `EventBus`, `SimplePolicyEngine`, and `ToolExecutor` — and
 depends on no other workspace crate. Everything else builds upward from it:
@@ -239,7 +240,7 @@ of the verified test matrix.
 - The `wasm32-wasip2` Rust target — required to build the
   `test-*-plugin-wasm` crates in the workspace.
 - A C toolchain and the platform development libraries used by SQLite, TLS,
-  keyring, protobuf, and Iced/wgpu (X11/Wayland/GL/Vulkan on Linux).
+  keyring, and Iced/wgpu (X11/Wayland/GL/Vulkan on Linux).
 - `cargo-deny` and `cargo-audit` to reproduce both supply-chain jobs, and
   `cargo-nextest` only if you want the faster local test runner
   [TESTING.md](TESTING.md) uses.
@@ -252,8 +253,7 @@ sudo apt-get install -y --no-install-recommends \
 ```
 
 A local full-GUI build additionally needs the X11/Wayland/Vulkan development
-packages wgpu links against, plus a protobuf compiler. Package names vary by
-distribution.
+packages wgpu links against. Package names vary by distribution.
 
 ## Installation
 

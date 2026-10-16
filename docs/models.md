@@ -15,7 +15,8 @@ tests credentials and discovers models where a provider supports discovery.
 | `openrouter` | OpenRouter |
 | `nim` | NVIDIA NIM |
 | `ollama` | Local or remote Ollama |
-| `opencode` | OpenCode-compatible provider |
+| `opencode` | OpenCode Zen |
+| `opencode-free` | OpenCode Zen (free) — the Go relay, static catalog, no model discovery |
 | `deepseek` | DeepSeek |
 | `groq` | Groq |
 | `together` | Together AI |
@@ -33,7 +34,9 @@ tests credentials and discovers models where a provider supports discovery.
 | `novita` | Novita AI |
 
 Provider and model identifiers are case-sensitive API values. Friendly names
-are display labels only.
+are display labels only. `opencode` and `opencode-free` share a connector but
+target distinct relays with independent catalogs (Zen vs. Go); neither catalog
+may be copied to the other.
 
 ## Configuration locations
 

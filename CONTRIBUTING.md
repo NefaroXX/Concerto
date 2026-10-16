@@ -10,11 +10,10 @@ expanding claims or adding speculative dependencies.
   `rust-toolchain.toml`, so a rustup-managed installation resolves the exact CI
   toolchain automatically.
 - The `wasm32-wasip2` target — required by the `test-*-plugin-wasm` crates.
-- A C toolchain and platform development libraries (SQLite, TLS, keyring,
-  protobuf, and Iced/wgpu — X11/Wayland/GL/Vulkan on Linux). On Debian/Ubuntu:
-  `build-essential`, `pkg-config`, `libssl-dev`, `libsqlite3-dev`, `clang`,
-  `protobuf-compiler`.
-- Node.js on `PATH` (verified at the start of every CI job).
+- A C toolchain and platform development libraries (SQLite, TLS, keyring, and
+  Iced/wgpu — X11/Wayland/GL/Vulkan on Linux). On Debian/Ubuntu:
+  `build-essential`, `libdbus-1-dev`, `pkg-config`, `libssl-dev`,
+  `libsqlite3-dev`.
 - `cargo-nextest` and `cargo-deny` to reproduce all CI checks.
 
 ```bash

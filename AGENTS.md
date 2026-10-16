@@ -58,9 +58,17 @@ cargo audit
 
 ## Non-obvious environment requirements
 - **System libraries**: a from-scratch full-workspace build needs a C toolchain
-  and platform development libraries used by protobuf/SQLite/TLS/keyring and
-  Iced/wgpu (X11/Wayland/GL/Vulkan on Linux). The self-hosted runner already has
-  them; package names differ across distributions.
+  and platform development libraries for SQLite, TLS, keyring, and Iced/wgpu
+  (X11/Wayland/GL/Vulkan on Linux) — on Debian/Ubuntu: `build-essential`,
+  `libdbus-1-dev`, `pkg-config`, `libssl-dev`, `libsqlite3-dev` (matching the
+  apt lists in `.github/workflows/ci.yml` and `CONTRIBUTING.md`). No protobuf
+  system library or `protoc` is required: CI installs none, no workspace
+  `Cargo.toml` declares `prost`/`prost-build`/`protobuf-src`, and the only
+  `prost` in `Cargo.lock` is a transitive runtime dependency of
+  `opentelemetry-otlp`'s pre-generated proto code (`http-proto` +
+  `reqwest-client`, `crates/observability/Cargo.toml:14`). The self-hosted
+  runner already has the listed libraries; package names differ across
+  distributions.
 - **WASM target**: CI runs `rustup target add wasm32-wasip2` before building —
   required to compile any `test-*-plugin-wasm` crate. Those crates fail without
   the target.

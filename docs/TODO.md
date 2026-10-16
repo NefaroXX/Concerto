@@ -191,7 +191,7 @@ its authority instead of re-opening the item.
 | Editor integration ("open in editor") | `DEFERRED.md` closed row 26 — **cut**, not deferred. The in-app editor and diff viewer shipped; external-editor launch is a scope cut |
 | Stale parity document | Resolved in place: `docs/desktop-cli-parity.md` now records settings/management parity as shipped (expanded 2026-10-03, PR #189) and states in its header that **interaction parity remains in progress** — the "complete as of 2026-08-03" reading is stale; the remaining staged-review / live-Coordinator / Studio gaps are enumerated there |
 | Flat tool-call parsing for OpenAI-compatible proxies | Fixes 1–3 shipped (`docs/proxy-tool-call-fix.md`, 2026-09-20) plus long-tail hardening `3bc11db` (`DEFERRED.md` closed row 21) |
-| Additional OpenAI-compatible providers | Tier 1 + Tier 2 shipped — 22 provider ids (`DEFERRED.md` closed row 9). Tier 3 is row 6; Doubao/StepFun/Replicate is row 7 |
+| Additional OpenAI-compatible providers | Tier 1 + Tier 2 shipped — 23 provider ids (`DEFERRED.md` closed row 9). Tier 3 is row 6; Doubao/StepFun/Replicate is row 7 |
 | Model metadata / price freshness | `DEFERRED.md` row 27 — the SpendLog UI exists but nothing feeds it fresh prices. Explicit non-goal: no cost-based routing |
 | Un-ignore eval end-to-end test | `DEFERRED.md` closed row 10 |
 | Fault-injection tests for multi-agent containment | Landed — `crates/orchestrator/src/fault_injection.rs:76-92` (C1–C4, `f4bdc4f`) plus the env-gated live leg (`5daf2e7`). Breadth is `DEFERRED.md` row 17 |

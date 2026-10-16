@@ -70,7 +70,7 @@ Retired or superseded, before this register existed:
 6. `ReviewResume` module removal — landed `cbb09b0` (2026-09-24).
 7. Threat sanitizer + grant hash pinning (gaps #2, #8) — closed 2026-09-24.
 8. Proxy tool-call parsing fixes 1–3 — landed (ROADMAP:168); the long tail later closed as row 38.
-9. Tier-1 + Tier-2 providers — landed 2026-09-24 (22 provider ids registered).
+9. Tier-1 + Tier-2 providers — landed 2026-09-24 (22 provider ids registered) [historical — now 23 with `opencode-free`, see `docs/models.md`].
 10. Eval `#[ignore]` un-ignore — resolved 2026-09-24.
 11. Agent-loop wildcard-panic guard — resolved 2026-09-24.
 12. FTS BM25 `rank()` wiring — stale-verified, closed 2026-09-24.

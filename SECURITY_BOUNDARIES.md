@@ -105,11 +105,13 @@ default native tool (which rejects `bypass_shell` and shell-wrapping fields).
   and prefer `bypass_shell: true` for commands that do not need shell
   features.
 
-This is not a container. A permitted compiler, build script, interpreter, or
-shell command can execute arbitrary behavior allowed by the user's OS account.
-Command-pattern approval cannot inspect every transitive action a build tool
-will perform. Keep important repositories backed up and review dependencies and
-scripts before running them.
+By default this is not a container. Unless the opt-in `Containerized` profile
+(ADR-72, Linux/macOS — see the plugin-boundary note and
+[Native shell security](docs/native-shell-security.md)) is selected, a permitted
+compiler, build script, interpreter, or shell command can execute arbitrary
+behavior allowed by the user's OS account. Command-pattern approval cannot
+inspect every transitive action a build tool will perform. Keep important
+repositories backed up and review dependencies and scripts before running them.
 
 Profile executable paths and startup arguments are trusted configuration. A
 malicious replacement executable at that path is outside Concerto's model-level
@@ -144,10 +146,13 @@ to the configured remote provider. "Local-first" does not mean a cloud provider
 receives no data. Ollama can provide a local path, subject to its configured API
 base and model behavior.
 
-Supported provider implementations are OpenAI, Anthropic, Google, OpenRouter,
-Ollama, NVIDIA NIM, and OpenCode-compatible endpoints. OpenAI-compatible proxies
-may differ in streaming/tool-call behavior; protocol normalization is tested but
-cannot guarantee every proxy/model combination.
+Supported provider implementations are the 23 ids registered in
+`PROVIDER_TYPE_IDS`: OpenAI, Anthropic, Google, OpenRouter, Ollama, NVIDIA NIM,
+OpenCode Zen, OpenCode Zen (free), and the OpenAI-compatible catalog
+(DeepSeek, Groq, Together, Mistral, xAI, Fireworks, Cerebras, Cohere,
+DeepInfra, Perplexity, SambaNova, DashScope, Moonshot, Zhipu, Novita).
+OpenAI-compatible proxies may differ in streaming/tool-call behavior; protocol
+normalization is tested but cannot guarantee every proxy/model combination.
 
 ## Plugin boundary
 
@@ -160,8 +165,14 @@ Current limits:
 - This is not full OS-level isolation.
 - Tool, provider, and memory-adapter plugins all execute through the same WASM
   host and are constrained by capability checks, wasmtime fuel/size/time limits,
-  and host-function mediation. OS-level or container sandboxing is deferred.
-- `SandboxProfile::Containerized` is not implemented.
+  and host-function mediation. The WASM host itself has no OS-level isolation.
+- `SandboxProfile::Containerized` **is** implemented and enforced on Linux/macOS
+  (ADR-72): opt-in `docker`/`podman` `PATH` detection, a fail-closed policy
+  admission gate, and shell invocations routed through `<runtime> run` with a
+  required `CommandRouting::Containerized` producer marker. It is a shell
+  boundary, not a plugin sandbox; selection is programmatic only (no user-facing
+  config key), and Windows fails closed. `ReadOnlyFs` and `NetworkIsolated`
+  remain unimplemented stubs.
 - A vulnerability in a granted host function, runtime, or capability resolver
   can cross the intended boundary.
 

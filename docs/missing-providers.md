@@ -2,10 +2,10 @@
 
 Analysis date: 2026-07-24 · Updated: 2026-09-19
 
-## Currently implemented (22 providers)
+## Currently implemented (23 providers)
 
-All 22 named provider types are registered in `provider_defs.rs:346-369`
-(`PROVIDER_TYPE_IDS`). Original 7 + DeepSeek + 7 Tier-1 + 7 Tier-2.
+All 23 named provider types are registered in `provider_defs.rs` as
+`PROVIDER_TYPE_IDS` (`opencode` and `opencode-free` are distinct relays).
 
 | # | Provider | Type ID | API Format |
 |---|---|---|---|
