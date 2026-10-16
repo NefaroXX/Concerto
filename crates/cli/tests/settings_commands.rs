@@ -229,7 +229,10 @@ fn runtime_inspection_reads_saved_state_while_another_frontend_holds_the_lock() 
     let state = serde_json::json!({
         "schema_version": 4,
         "session_id": id,
-        "subtasks": [], "edges": [], "completed_results": {},
+        "subtasks": [{"id": id, "parent_id": null, "session_id": id,
+            "role": "coder", "description": "saved task", "status": "Running",
+            "dependencies": [], "deliverable": null}],
+        "edges": [], "completed_results": {},
         "total_cost": 0.0, "total_tool_calls": 0, "provider_metrics": [],
         "all_files": [], "subtask_attempts": {}, "retry_feedback": {},
         "world_model": {"objective": "portable runtime inspection"}
@@ -257,7 +260,16 @@ fn runtime_inspection_reads_saved_state_while_another_frontend_holds_the_lock() 
     let value: serde_json::Value = serde_json::from_str(&output).unwrap();
     assert_eq!(value["session_id"], id);
     assert_eq!(value["data"]["world_model"]["objective"], "portable runtime inspection");
-    assert_eq!(value["data"].as_object().unwrap().len(), 4);
+    assert_eq!(value["data"].as_object().unwrap().len(), 6);
+    assert_eq!(value["data"]["topology"]["tasks"][0]["status"], "Running");
+    let output = fixture.success(&["sessions", "runtime", &id, "--view", "topology", "--json"]);
+    let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(value["data"].as_object().unwrap().len(), 1);
+    assert_eq!(value["data"]["topology"]["tasks"][0]["id"], id);
+    let output = fixture.success(&["sessions", "runtime", &id, "--view", "evidence", "--json"]);
+    let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(value["data"].as_object().unwrap().len(), 1);
+    assert!(value["data"]["evidence"]["decision_links"].as_array().unwrap().is_empty());
     let output = fixture.success(&["sessions", "runtime", &id, "--view", "world", "--json"]);
     let value: serde_json::Value = serde_json::from_str(&output).unwrap();
     assert_eq!(value["data"].as_object().unwrap().len(), 1);
