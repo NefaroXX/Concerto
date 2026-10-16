@@ -500,6 +500,18 @@ fn fingerprint_matches_with_cancel(
     observed.is_some_and(|value| value == record.content_fingerprint)
 }
 
+/// Project and file adapters share a workspace build only for the same bytes.
+/// Unknown coverage bypasses the cache instead of trusting the generation alone.
+async fn source_cache_key(
+    project_root: &Path,
+    key: &str,
+    cancel: &CancellationToken,
+) -> Option<String> {
+    let root_label = Utf8PathBuf::from(project_root.to_string_lossy().as_ref());
+    let bytes = fingerprint::checked_fingerprint(project_root, &root_label, cancel).await;
+    (!bytes.is_empty()).then(|| format!("{key}:source:{bytes}"))
+}
+
 /// Evaluate a verification ledger for the gated arm: counts fresh-passing
 /// records, typed passes, and collects per-record stale causes.
 pub fn evaluate_gate_ledger(
@@ -1465,16 +1477,19 @@ async fn sweep_one_file(
             }
             // Coalescing: every changed Rust file in one workspace state
             // shares a single `cargo check` spawn.
-            let key = format!("build:cargo-check:{generation}");
+            let build = format!("build:cargo-check:{generation}");
+            let key = source_cache_key(project_root, &build, cancel).await;
             let start = Instant::now();
-            let out = match coalesce.get(&key) {
+            let out = match key.as_ref().and_then(|key| coalesce.get(key)) {
                 Some(cached) => cached.clone(),
                 None => match spawner
                     .spawn("cargo", &["check"], project_root, spawn_timeout, cancel)
                     .await
                 {
                     Ok(out) => {
-                        coalesce.insert(key, out.clone());
+                        if let Some(key) = key {
+                            coalesce.insert(key, out.clone());
+                        }
                         out
                     }
                     Err(SpawnError::Cancelled) => {
@@ -1581,15 +1596,18 @@ async fn sweep_one_file(
                 );
             }
             // `npm test` runs the whole suite: coalesce like `cargo check`.
-            let key = format!("build:npm-test:{generation}");
+            let build = format!("build:npm-test:{generation}");
+            let key = source_cache_key(project_root, &build, cancel).await;
             let start = Instant::now();
-            let out = match coalesce.get(&key) {
+            let out = match key.as_ref().and_then(|key| coalesce.get(key)) {
                 Some(cached) => cached.clone(),
                 None => {
                     match spawner.spawn("npm", &["test"], project_root, spawn_timeout, cancel).await
                     {
                         Ok(out) => {
-                            coalesce.insert(key, out.clone());
+                            if let Some(key) = key {
+                                coalesce.insert(key, out.clone());
+                            }
                             out
                         }
                         Err(SpawnError::Cancelled) => {
@@ -2549,11 +2567,11 @@ impl VerifierService {
         timeout: Duration,
         cancel: &CancellationToken,
     ) -> Result<TimedSpawn, VerifyError> {
-        let root_label = Utf8PathBuf::from(self.project_root.to_string_lossy().as_ref());
-        let bytes = fingerprint::checked_fingerprint(&self.project_root, &root_label, cancel).await;
-        let key = format!("{key}:source:{bytes}");
-        let cached =
-            if bytes.is_empty() { None } else { self.build_cache.lock().await.get(&key).cloned() };
+        let key = source_cache_key(&self.project_root, key, cancel).await;
+        let cached = match &key {
+            Some(key) => self.build_cache.lock().await.get(key).cloned(),
+            None => None,
+        };
         if let Some(cached) = cached {
             return Ok(TimedSpawn {
                 success: cached.success,
@@ -2576,9 +2594,9 @@ impl VerifierService {
                     code: out.code,
                     duration_ms: elapsed_ms(start),
                 };
-                if !bytes.is_empty() {
+                if let Some(key) = key {
                     self.build_cache.lock().await.insert(
-                        key.to_string(),
+                        key,
                         SpawnOutput {
                             success: out.success,
                             stdout: out.stdout,
@@ -3446,6 +3464,23 @@ mod tests {
             1,
             "both file checks reused the generation's single cargo check spawn"
         );
+
+        // Even if a caller still holds the old generation, changing another
+        // source file invalidates the shared build for the unchanged file.
+        let (_, stamp) = service.snapshot();
+        write_fixture(dir.path(), "src/b.rs", "pub fn changed() {}\n");
+        let mut cache = service.build_cache.lock().await;
+        verify_file_changes_with(
+            &[Utf8PathBuf::from("src/a.rs")],
+            dir.path(),
+            &stamp,
+            service.spawner.as_ref(),
+            Duration::from_secs(30),
+            &mut cache,
+            &cancel,
+        )
+        .await;
+        assert_eq!(counting.spawn_count(), 2, "changed source bytes require a fresh build");
     }
 
     /// The plan's explicit zero target at the gate-ledger level: enumerate the
