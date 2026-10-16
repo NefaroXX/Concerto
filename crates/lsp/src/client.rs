@@ -238,6 +238,31 @@ impl LspClient {
     }
 }
 
+/// Test-only process-injection seam for the manager's concurrency tests.
+///
+/// A real successful `start` needs `rust-analyzer`, which CI does not install.
+/// Attaching a harmless long-lived child (`sleep`) lets manager tests assert
+/// that a discarded or drained client really reaps its process, without
+/// speaking the LSP handshake. `stdin` is intentionally left unset so `stop`
+/// skips the request/notification writes and goes straight to the bounded
+/// process-group kill.
+#[cfg(all(test, unix))]
+impl LspClient {
+    pub(crate) fn attach_test_child(&mut self, secs: u64) -> Result<u32, ToolError> {
+        let mut cmd = Command::new("sleep");
+        cmd.arg(secs.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .process_group(0);
+        let child = cmd.spawn().map_err(|e| ToolError::LspError { message: e.to_string() })?;
+        let pid = child.id().unwrap_or(0);
+        self.child = Some(child);
+        Ok(pid)
+    }
+}
+
 /// Read framed LSP messages from the server's stdout until the stream ends,
 /// `cancel` fires, or an in-flight frame exceeds `frame_timeout`.
 ///
@@ -328,10 +353,16 @@ async fn run_reader<R: AsyncRead + Unpin>(
                 pending.remove(&id)
             };
             if let Some(sender) = sender_opt {
-                let result = msg
-                    .get("result")
-                    .cloned()
-                    .ok_or_else(|| ToolError::LspError { message: "Missing result".into() });
+                let result = if let Some(result) = msg.get("result") {
+                    Ok(result.clone())
+                } else if let Some(error) = msg.get("error") {
+                    // A JSON-RPC error response carries no `result`; surface
+                    // the server's error rather than a misleading "Missing
+                    // result".
+                    Err(ToolError::LspError { message: format!("LSP error response: {error}") })
+                } else {
+                    Err(ToolError::LspError { message: "Missing result".into() })
+                };
                 let _ = sender.send(result);
             }
         } else if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
@@ -580,6 +611,47 @@ mod tests {
             .expect("sender must not be dropped")
             .expect("result must be Ok");
         assert_eq!(result, serde_json::json!({"ok": true}));
+        cancel.cancel();
+        timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("reader must exit on cancel")
+            .expect("reader task must not panic");
+    }
+
+    /// Regression test for a JSON-RPC error response: it must reach its
+    /// pending request as the server's error, not as a misleading
+    /// "Missing result".
+    #[tokio::test]
+    async fn reader_delivers_a_json_rpc_error_to_its_pending_request() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (pending, diagnostics) = reader_inputs();
+        let (tx, rx) = oneshot::channel();
+        pending.lock().await.insert(3, tx);
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(run_reader(
+            reader,
+            pending,
+            diagnostics,
+            cancel.clone(),
+            Duration::from_secs(30),
+        ));
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "error": { "code": -32601, "message": "method not found" }
+        })
+        .to_string();
+        let framed = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+        writer.write_all(framed.as_bytes()).await.expect("buffered write");
+        let result = timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("response must arrive within the bound")
+            .expect("sender must not be dropped");
+        let error = result.expect_err("an error response must not be Ok");
+        assert!(
+            error.to_string().contains("method not found"),
+            "the server's error must be surfaced, got: {error}"
+        );
         cancel.cancel();
         timeout(Duration::from_secs(2), handle)
             .await

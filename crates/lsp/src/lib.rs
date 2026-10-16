@@ -16,7 +16,6 @@ pub use tools::*;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 
     #[tokio::test]
@@ -27,22 +26,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_lsp_manager_get_or_start() {
+    async fn test_lsp_manager_get_or_start_surfaces_start_failure() {
         // Serialise against every other test that touches the global manager map.
         let _guard = crate::manager::MANAGER_TEST_LOCK.lock().await;
         let cancel = CancellationToken::new();
 
-        // Create a test project directory
-        let project_dir = std::path::PathBuf::from("/tmp/test_project");
-        let project_id = concerto_core::types::ProjectId::resolve(&project_dir);
+        // A directory that does not exist makes the spawn fail deterministically,
+        // with or without a language server installed on the host.
+        let project_dir = std::path::PathBuf::from("/nonexistent/concerto-lsp/lib-test-project");
+        let project_id = LspManager::key_for_dir(&project_dir);
 
-        // Manager should return a valid Arc<Mutex<LspClient>>
-        let client_arc = LspManager::get_or_start(project_id, project_dir, cancel.clone()).await;
+        let result = LspManager::get_or_start(project_id, project_dir, cancel.clone()).await;
 
-        // Verify the client is usable (not None and can be locked)
-        // This is the public API contract
-        let _locked = client_arc.lock().await;
-        // If we get here without panicking, the client is valid
+        // The failure must propagate instead of yielding a cached broken client.
+        assert!(result.is_err(), "a failed start must be reported to the caller");
     }
 
     #[tokio::test]
@@ -53,9 +50,9 @@ mod tests {
         let _guard = crate::manager::MANAGER_TEST_LOCK.lock().await;
         let cancel = CancellationToken::new();
 
-        // Initialize a client to ensure the manager has content
+        // Seed an entry so `stop_all` is exercised against a non-empty map.
         let project_dir = std::path::PathBuf::from("/tmp/stop_test");
-        let project_id = concerto_core::types::ProjectId::resolve(&project_dir);
+        let project_id = LspManager::key_for_dir(&project_dir);
 
         let _ = LspManager::get_or_start(project_id, project_dir, cancel.clone()).await;
 
@@ -94,25 +91,5 @@ mod tests {
 
         // Should return empty diagnostics since server hasn't started
         assert!(diagnostics.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_lsp_manager_different_projects() {
-        // Serialise against every other test that touches the global manager map.
-        let _guard = crate::manager::MANAGER_TEST_LOCK.lock().await;
-        let cancel = CancellationToken::new();
-
-        // Create two different project directories
-        let project_dir1 = std::path::PathBuf::from("/tmp/project1");
-        let project_dir2 = std::path::PathBuf::from("/tmp/project2");
-
-        let project_id1 = concerto_core::types::ProjectId::resolve(&project_dir1);
-        let project_id2 = concerto_core::types::ProjectId::resolve(&project_dir2);
-
-        let client1 = LspManager::get_or_start(project_id1, project_dir1, cancel.clone()).await;
-        let client2 = LspManager::get_or_start(project_id2, project_dir2, cancel).await;
-
-        // Should be different Arc references for different projects
-        assert!(Arc::as_ptr(&client1) != Arc::as_ptr(&client2));
     }
 }

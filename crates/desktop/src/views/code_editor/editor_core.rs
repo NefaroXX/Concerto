@@ -321,7 +321,7 @@ impl State {
                         async move { lsp_get_diagnostics(project_dir, file_path, cancel).await },
                         |result| match result {
                             Ok(diags) => Message::LspDiagnostics(diags),
-                            Err(e) => Message::LspError(e),
+                            Err(e) => Message::LspSyncError(e),
                         },
                     );
                     return self.scope_task(task, false);
@@ -332,6 +332,15 @@ impl State {
                 tracing::warn!(%error, "editor operation failed");
                 self.lsp_status = "Editor issue".into();
                 self.hover = Some(error);
+                iced::Task::none()
+            }
+            Message::LspSyncError(error) => {
+                // Background LSP sync (didOpen/didChange/didSave/diagnostics
+                // refresh) failed. Surface it in the status bar and logs, but
+                // never as a hover tooltip: a popup on every keystroke when the
+                // server is unavailable is the defect this guards against.
+                tracing::warn!(%error, "LSP background sync failed");
+                self.lsp_status = "LSP unavailable".into();
                 iced::Task::none()
             }
             Message::Undo => {

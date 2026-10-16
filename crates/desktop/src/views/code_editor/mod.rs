@@ -18,7 +18,6 @@ use iced::Color;
 
 use crate::widgets::confirm_modal::ConfirmModal;
 use crate::widgets::file_tree::TreeNode;
-use concerto_core::helpers::ProjectIdHelper;
 use concerto_core::CancellationToken;
 use concerto_lsp::LspManager;
 
@@ -482,7 +481,7 @@ impl State {
             async move { lsp_did_open(project_dir, file_path, content, lang, cancel).await },
             |result| match result {
                 Ok(()) => Message::LspReady,
-                Err(e) => Message::LspError(e),
+                Err(e) => Message::LspSyncError(e),
             },
         );
         self.scope_task(task, false)
@@ -561,7 +560,7 @@ impl State {
             async move { lsp_did_change(project_dir, file_path, content_text, version, cancel).await },
             |result| match result {
                 Ok(()) => Message::LspReady,
-                Err(e) => Message::LspError(e),
+                Err(e) => Message::LspSyncError(e),
             },
         );
         self.scope_task(task, false)
@@ -919,6 +918,26 @@ pub(crate) fn editor_key_binding(
 // LSP async helpers
 // ---------------------------------------------------------------------------
 
+/// Derive the path-based LSP manager key and fetch (starting if needed) the
+/// client.
+///
+/// The key comes from the canonical project directory
+/// ([`LspManager::key_for_dir`]) rather than the session/git-remote project id,
+/// because the LSP server's working directory is part of its identity: two
+/// checkouts of the same remote are two different servers. This keeps one
+/// client per directory across the editor, the `concerto-lsp` tools and the
+/// orchestrator's verify path. A failed start is reported as an error rather
+/// than a cached, half-initialised client.
+async fn lsp_client(
+    project_dir: &Utf8Path,
+    cancel: CancellationToken,
+) -> Result<Arc<tokio::sync::Mutex<concerto_lsp::LspClient>>, String> {
+    let project_id = LspManager::key_for_dir(project_dir.as_std_path());
+    LspManager::get_or_start(project_id, project_dir.as_std_path().to_path_buf(), cancel)
+        .await
+        .map_err(|e| format!("LSP unavailable: {e}"))
+}
+
 /// Send `textDocument/didOpen` to the language server for the given file.
 pub(crate) async fn lsp_did_open(
     project_dir: Utf8PathBuf,
@@ -927,10 +946,7 @@ pub(crate) async fn lsp_did_open(
     lang: &'static str,
     cancel: CancellationToken,
 ) -> Result<(), String> {
-    let project_id = ProjectIdHelper::from_dir(&project_dir)
-        .map_err(|e| format!("Failed to compute project ID: {e}"))?;
-    let client =
-        LspManager::get_or_start(project_id, project_dir.as_std_path().to_path_buf(), cancel).await;
+    let client = lsp_client(&project_dir, cancel).await?;
     let mut client = client.lock().await;
     let uri = format!("file://{}", file_path);
     let params = serde_json::json!({
@@ -954,10 +970,7 @@ pub(crate) async fn lsp_did_close(
     file_path: Utf8PathBuf,
     cancel: CancellationToken,
 ) -> Result<(), String> {
-    let project_id =
-        ProjectIdHelper::from_dir(&project_dir).map_err(|e| format!("Project ID: {e}"))?;
-    let client =
-        LspManager::get_or_start(project_id, project_dir.as_std_path().to_path_buf(), cancel).await;
+    let client = lsp_client(&project_dir, cancel).await?;
     client
         .lock()
         .await
@@ -980,10 +993,7 @@ pub(crate) async fn lsp_did_change(
     version: i32,
     cancel: CancellationToken,
 ) -> Result<(), String> {
-    let project_id = ProjectIdHelper::from_dir(&project_dir)
-        .map_err(|e| format!("Failed to compute project ID: {e}"))?;
-    let client =
-        LspManager::get_or_start(project_id, project_dir.as_std_path().to_path_buf(), cancel).await;
+    let client = lsp_client(&project_dir, cancel).await?;
     let mut client = client.lock().await;
     let uri = format!("file://{}", file_path);
     let params = serde_json::json!({
@@ -1011,10 +1021,7 @@ pub(crate) async fn lsp_did_save(
     content: String,
     cancel: CancellationToken,
 ) -> Result<(), String> {
-    let project_id = ProjectIdHelper::from_dir(&project_dir)
-        .map_err(|e| format!("Failed to compute project ID: {e}"))?;
-    let client =
-        LspManager::get_or_start(project_id, project_dir.as_std_path().to_path_buf(), cancel).await;
+    let client = lsp_client(&project_dir, cancel).await?;
     let mut client = client.lock().await;
     let uri = format!("file://{}", file_path);
     let params = serde_json::json!({
@@ -1034,10 +1041,7 @@ pub(crate) async fn lsp_get_diagnostics(
     file_path: Utf8PathBuf,
     cancel: CancellationToken,
 ) -> Result<Vec<Diagnostic>, String> {
-    let project_id = ProjectIdHelper::from_dir(&project_dir)
-        .map_err(|e| format!("Failed to compute project ID: {e}"))?;
-    let client =
-        LspManager::get_or_start(project_id, project_dir.as_std_path().to_path_buf(), cancel).await;
+    let client = lsp_client(&project_dir, cancel).await?;
     let client = client.lock().await;
     let raw_diags = client.get_diagnostics(file_path.as_str()).await;
 
@@ -1086,26 +1090,24 @@ pub(crate) async fn lsp_request_completion(
     character: usize,
     cancel: CancellationToken,
 ) -> Vec<CompletionItem> {
-    let Ok(project_id) = ProjectIdHelper::from_dir(&project_dir) else {
+    let Ok(client) = lsp_client(&project_dir, cancel).await else {
         return Vec::new();
     };
-    let Ok(client) =
-        LspManager::get_or_start(project_id, project_dir.as_std_path().to_path_buf(), cancel)
-            .await
-            .lock()
-            .await
-            .send_request(
-                "textDocument/completion",
-                serde_json::json!({
-                    "textDocument": { "uri": format!("file://{}", file_path) },
-                    "position": { "line": line, "character": character },
-                }),
-            )
-            .await
+    let Ok(response) = client
+        .lock()
+        .await
+        .send_request(
+            "textDocument/completion",
+            serde_json::json!({
+                "textDocument": { "uri": format!("file://{}", file_path) },
+                "position": { "line": line, "character": character },
+            }),
+        )
+        .await
     else {
         return Vec::new();
     };
-    parse_completion_items(&client)
+    parse_completion_items(&response)
 }
 
 /// Build `textDocument/definition` params and invoke it.
@@ -1116,10 +1118,7 @@ pub(crate) async fn lsp_request_definition(
     character: usize,
     cancel: CancellationToken,
 ) -> Result<Option<(Utf8PathBuf, usize, usize)>, String> {
-    let project_id =
-        ProjectIdHelper::from_dir(&project_dir).map_err(|e| format!("Project ID: {e}"))?;
-    let client =
-        LspManager::get_or_start(project_id, project_dir.as_std_path().to_path_buf(), cancel).await;
+    let client = lsp_client(&project_dir, cancel).await?;
     let mut client = client.lock().await;
     let result = client
         .send_request(
@@ -1142,10 +1141,7 @@ pub(crate) async fn lsp_request_hover(
     character: usize,
     cancel: CancellationToken,
 ) -> Result<String, String> {
-    let project_id =
-        ProjectIdHelper::from_dir(&project_dir).map_err(|e| format!("Project ID: {e}"))?;
-    let client =
-        LspManager::get_or_start(project_id, project_dir.as_std_path().to_path_buf(), cancel).await;
+    let client = lsp_client(&project_dir, cancel).await?;
     let mut client = client.lock().await;
     let result = client
         .send_request(

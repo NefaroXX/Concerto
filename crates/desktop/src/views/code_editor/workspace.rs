@@ -187,7 +187,7 @@ impl State {
             async move { lsp_did_save(project_dir, file_path, text, cancel).await },
             |result| match result {
                 Ok(()) => Message::LspReady,
-                Err(error) => Message::LspError(error),
+                Err(error) => Message::LspSyncError(error),
             },
         );
         Ok(self.scope_task(task, false))
@@ -407,7 +407,7 @@ impl State {
                 async move { super::lsp_did_change(project, path, text, version, cancellation).await },
                 |result| match result {
                     Ok(()) => Message::LspReady,
-                    Err(error) => Message::LspError(error),
+                    Err(error) => Message::LspSyncError(error),
                 },
             );
             self.scope_task(task, false)

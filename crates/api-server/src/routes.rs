@@ -18,7 +18,6 @@ use concerto_core::ids::Ulid;
 use concerto_core::types::TaskId;
 use concerto_core::CancellationToken;
 use utoipa::OpenApi;
-use utoipa_swagger_ui::SwaggerUi;
 
 use crate::auth;
 use crate::rate_limit::{self, RateLimitState};
@@ -57,8 +56,10 @@ impl Drop for RequestCancelGuard {
 
 /// Build the router with /v1/ routes + legacy redirects + API key auth.
 pub fn router(state: AppState) -> Router {
-    // Swagger UI (CONCERTO_API_DOCS=1) registers /v1/openapi.json itself;
-    // registering the manual route too would overlap and panic at startup.
+    // API docs (CONCERTO_API_DOCS=1) expose the generated OpenAPI spec at
+    // /v1/openapi.json, mounted inside the auth layer below. The interactive
+    // Swagger UI was removed: `utoipa-swagger-ui`'s build-time `zip`
+    // dependency was yanked upstream with no compatible unyanked release.
     let docs_enabled = env::var("CONCERTO_API_DOCS").ok().as_deref() == Some("1");
 
     // /v1/ sub-router with all versioned routes, auth middleware, and body limit
@@ -69,7 +70,7 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{id}/tasks", post(create_task))
         .route("/sessions/{id}/tasks/{tid}/stream", get(stream_task_events))
         .route("/sessions/{id}/spend", get(get_spend_summary));
-    if !docs_enabled {
+    if docs_enabled {
         v1_router = v1_router.route("/openapi.json", get(serve_openapi));
     }
     let v1_router = v1_router
@@ -85,13 +86,8 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{id}/tasks/{tid}/stream", get(redirect_to_v1))
         .route("/sessions/{id}/spend", get(redirect_to_v1));
 
-    // Base router with optional Swagger UI based on env var
-    let mut router = Router::new().nest("/v1", v1_router).merge(legacy_routes);
-
-    if docs_enabled {
-        router =
-            router.merge(SwaggerUi::new("/v1/docs").url("/v1/openapi.json", ApiDoc::openapi()));
-    }
+    // Base router: versioned routes + legacy redirects.
+    let router = Router::new().nest("/v1", v1_router).merge(legacy_routes);
 
     // Outermost layer: throttles every route (before auth) by client IP.
     // Disabled by default — see `rate_limit` for the config contract.
@@ -1123,10 +1119,10 @@ mod tests {
     /// Global lock for `CONCERTO_API_DOCS` env var to prevent test races.
     static DOCS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Building the Router without `CONCERTO_API_DOCS` does NOT include
-    /// the Swagger UI endpoint (checked at `/v1/docs/`).
+    /// Building the Router without `CONCERTO_API_DOCS` does NOT mount the docs
+    /// endpoint (checked at `/v1/docs/`, which no longer exists).
     #[tokio::test]
-    async fn router_construction_with_swagger_ui_disabled() {
+    async fn router_construction_with_docs_disabled() {
         let future = {
             let _lock = DOCS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             std::env::remove_var("CONCERTO_API_DOCS");
@@ -1145,11 +1141,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    /// Building the Router with `CONCERTO_API_DOCS=1` must succeed: the manual
-    /// `/v1/openapi.json` route is skipped so `utoipa_swagger_ui`'s `.url()`
-    /// handler does not overlap (previously this panicked at startup).
+    /// Building the Router with `CONCERTO_API_DOCS=1` must succeed; the
+    /// generated spec is mounted manually via `serve_openapi` (the interactive
+    /// Swagger UI was removed), and the handler is covered separately by
+    /// `serve_openapi_returns_valid_json`.
     #[test]
-    fn router_construction_with_swagger_ui_enabled() {
+    fn router_construction_with_docs_enabled() {
         let _lock = DOCS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CONCERTO_API_DOCS", "1");
 
@@ -1159,11 +1156,7 @@ mod tests {
         }));
 
         std::env::remove_var("CONCERTO_API_DOCS");
-        assert!(
-            result.is_ok(),
-            "router() must not panic when CONCERTO_API_DOCS=1: Swagger UI \
-             owns /v1/openapi.json and the manual route is skipped",
-        );
+        assert!(result.is_ok(), "router() must not panic when CONCERTO_API_DOCS=1");
     }
 
     // ==================================================================

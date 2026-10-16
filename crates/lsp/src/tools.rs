@@ -215,12 +215,15 @@ macro_rules! lsp_tool {
                 session: &SessionContext,
                 cancel: CancellationToken,
             ) -> Result<ToolOutput, ToolError> {
+                // LSP identity is path-based: the server's `cwd` is part of its
+                // identity, so the manager key derives from `project_dir`
+                // rather than the session/git-remote `project_id`.
                 let client = LspManager::get_or_start(
-                    session.project_id.clone(),
+                    LspManager::key_for_dir(&session.project_dir),
                     session.project_dir.clone(),
                     cancel,
                 )
-                .await;
+                .await?;
                 let mut client = client.lock().await;
                 let params = ($build_params)(&input)?;
                 let result = client.send_request($method, params).await?;
@@ -258,12 +261,15 @@ macro_rules! lsp_tool {
                 session: &SessionContext,
                 cancel: CancellationToken,
             ) -> Result<ToolOutput, ToolError> {
+                // LSP identity is path-based: the server's `cwd` is part of its
+                // identity, so the manager key derives from `project_dir`
+                // rather than the session/git-remote `project_id`.
                 let client = LspManager::get_or_start(
-                    session.project_id.clone(),
+                    LspManager::key_for_dir(&session.project_dir),
                     session.project_dir.clone(),
                     cancel,
                 )
-                .await;
+                .await?;
                 let mut client = client.lock().await;
                 let params = ($build_params)(&input)?;
                 let raw = client.send_request($method, params).await?;
@@ -376,12 +382,14 @@ impl Tool for GetDiagnostics {
         cancel: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let parsed: LspDocIdInput = coerce_lsp_input(&input)?;
+        // Path-based manager key (see the macro arm above): the LSP server's
+        // identity is its working directory, not the session project id.
         let client = LspManager::get_or_start(
-            session.project_id.clone(),
+            LspManager::key_for_dir(&session.project_dir),
             session.project_dir.clone(),
             cancel,
         )
-        .await;
+        .await?;
         let client = client.lock().await;
         let diags = client.get_diagnostics(&parsed.file_path).await;
         Ok(ToolOutput {

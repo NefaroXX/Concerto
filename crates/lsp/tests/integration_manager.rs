@@ -1,190 +1,186 @@
-//! Integration tests for LSP manager concurrency and singleton behavior.
+//! Integration tests for the `LspManager` start-failure and cooldown contract.
+//!
+//! # Why these do not assert the success path
+//! A *successful* start requires a real `rust-analyzer` binary, which CI does
+//! not install. The happy-path singleton/caching behaviour is therefore covered
+//! deterministically by the unit tests inside `manager.rs`, which can seed the
+//! private `CLIENTS` map directly. This file covers only what is observable
+//! from outside the crate without a language server: start failures propagate
+//! as `Err` (never as a cached, half-initialised client), a recent failure
+//! suppresses re-spawning, and the manager stays race-free and panic-free under
+//! concurrency and `stop_all`.
 //!
 //! # Serialisation
-//! All tests in this file share the global `CLIENTS` static inside
-//! `LspManager`.  Because `stop_all` drains the entire map, tests that call
-//! it would race with tests that assume their entries survive.  We use a
-//! test-level asynchronous mutex (guarded by `TEST_LOCK`) to serialise every
-//! test function that touches the manager — simple, zero new dependencies,
-//! no flaky CI.
+//! All tests here share the process-global `LspManager` state. A test-level
+//! async mutex serialises every test function that touches it — no new
+//! dependencies, no flaky CI.
 
-use concerto_core::types::ProjectId;
 use concerto_core::CancellationToken;
+use concerto_core::ToolError;
 use concerto_lsp::LspManager;
 use once_cell::sync::Lazy;
 use std::path::PathBuf;
-use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
-/// Serialises all tests in this file.  Every [`tokio::test`] acquires this
-/// lock before running and holds it for the full duration, ensuring that
-/// no two tests touch the global `CLIENTS` map concurrently.
+/// Serialises all tests in this file against the global manager state.
 static TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
-/// Test that the manager returns the same client instance for the same project.
-#[tokio::test]
-async fn test_manager_singleton_behavior() {
-    let _guard = TEST_LOCK.lock().await;
-    let project_id = ProjectId("test-project-singleton".to_string());
-    let project_dir = PathBuf::from("/tmp/test-project-singleton");
-    let cancel = CancellationToken::new();
-
-    let client1 =
-        LspManager::get_or_start(project_id.clone(), project_dir.clone(), cancel.clone()).await;
-    let client2 =
-        LspManager::get_or_start(project_id.clone(), project_dir.clone(), cancel.clone()).await;
-
-    // They should be the same Arc (singleton per project)
-    assert!(Arc::ptr_eq(&client1, &client2), "Manager should return same client instance");
+/// A directory that does not exist, so `Command::spawn` fails fast whether or
+/// not a language server is installed.
+fn missing_project_dir(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("concerto-lsp-it-missing-{name}"))
 }
 
-/// Test that different projects get different client instances.
+/// A failed start must surface as an error rather than a cached client.
 #[tokio::test]
-async fn test_manager_different_projects() {
+async fn test_manager_start_failure_propagates() {
     let _guard = TEST_LOCK.lock().await;
-    let project_id1 = ProjectId("test-project-1".to_string());
-    let project_dir1 = PathBuf::from("/tmp/test-project-1");
-    let project_id2 = ProjectId("test-project-2".to_string());
-    let project_dir2 = PathBuf::from("/tmp/test-project-2");
-    let cancel = CancellationToken::new();
+    let project_dir = missing_project_dir("start-failure");
+    let project_id = LspManager::key_for_dir(&project_dir);
 
-    let client1 = LspManager::get_or_start(project_id1, project_dir1, cancel.clone()).await;
-    let client2 = LspManager::get_or_start(project_id2, project_dir2, cancel.clone()).await;
+    let result = LspManager::get_or_start(project_id, project_dir, CancellationToken::new()).await;
 
-    assert!(!Arc::ptr_eq(&client1, &client2), "Different projects should get different clients");
+    assert!(result.is_err(), "a missing project dir must fail the start");
 }
 
-/// Test concurrent access to the manager doesn't cause races.
+/// A failed start must not be cached as a usable client: a second call must
+/// report a failure rather than hand back a half-initialised client.
 #[tokio::test]
-async fn test_manager_concurrent_access() {
+async fn test_manager_failed_start_is_not_cached_as_success() {
     let _guard = TEST_LOCK.lock().await;
-    let project_id = ProjectId("test-project-concurrent".to_string());
-    let project_dir = PathBuf::from("/tmp/test-project-concurrent");
+    let project_dir = missing_project_dir("failed-not-cached");
+    let project_id = LspManager::key_for_dir(&project_dir);
+
+    let first =
+        LspManager::get_or_start(project_id.clone(), project_dir.clone(), CancellationToken::new())
+            .await;
+    let second = LspManager::get_or_start(project_id, project_dir, CancellationToken::new()).await;
+
+    assert!(first.is_err(), "first start attempt must fail");
+    assert!(second.is_err(), "the retry must not receive a cached broken client");
+}
+
+/// Inside the cooldown window a second call is rejected without spawning: the
+/// error is the synthetic suppression, not the raw spawn failure. This is the
+/// retry-storm guard observed from outside the crate.
+#[tokio::test]
+async fn test_manager_cooldown_suppresses_respawn() {
+    let _guard = TEST_LOCK.lock().await;
+    let project_dir = missing_project_dir("cooldown");
+    let project_id = LspManager::key_for_dir(&project_dir);
+
+    let first =
+        LspManager::get_or_start(project_id.clone(), project_dir.clone(), CancellationToken::new())
+            .await
+            .expect_err("the first start must fail");
+    assert!(
+        first.to_string().contains("Failed to spawn"),
+        "the first attempt must reach the spawn: {first}"
+    );
+
+    let second = LspManager::get_or_start(project_id, project_dir, CancellationToken::new())
+        .await
+        .expect_err("the second start must be suppressed");
+    let text = second.to_string();
+    // The suppression branch runs before any spawn, so its presence proves the
+    // second call never reached `LspClient::start`.
+    assert!(
+        text.contains("start suppressed"),
+        "the second attempt must report suppression: {text}"
+    );
+}
+
+/// Concurrent first-callers must all observe a failure without racing,
+/// panicking, or deadlocking.
+#[tokio::test]
+async fn test_manager_concurrent_start_failure_is_stable() {
+    let _guard = TEST_LOCK.lock().await;
+    let project_dir = missing_project_dir("concurrent-failure");
+    let project_id = LspManager::key_for_dir(&project_dir);
 
     let mut join_set = JoinSet::new();
-
-    // Spawn 20 concurrent tasks all requesting the same project
-    for i in 0..20 {
-        let project_id_clone = project_id.clone();
-        let project_dir_clone = project_dir.clone();
+    for _ in 0..20 {
+        let project_id = project_id.clone();
+        let project_dir = project_dir.clone();
         join_set.spawn(async move {
-            let cancel = CancellationToken::new();
-            let client =
-                LspManager::get_or_start(project_id_clone, project_dir_clone, cancel).await;
-            (i, Arc::strong_count(&client))
+            LspManager::get_or_start(project_id, project_dir, CancellationToken::new()).await
         });
     }
 
-    // All should succeed
-    let mut results = vec![];
+    let mut attempted = 0;
     while let Some(result) = join_set.join_next().await {
-        results.push(result.unwrap());
+        let outcome = result.expect("task must not panic");
+        assert!(outcome.is_err(), "every concurrent caller must observe the failure");
+        attempted += 1;
     }
-
-    assert_eq!(results.len(), 20);
-    // All should have gotten the same client (strong count should be consistent)
-    let first_count = results[0].1;
-    for (_, count) in &results {
-        assert_eq!(*count, first_count, "All concurrent requests should get the same client");
-    }
+    assert_eq!(attempted, 20);
 }
 
-/// Test that stopping all clients cleans up properly.
+/// An already-cancelled token fails the start with `Cancelled` and must not
+/// leave a poisoned entry behind.
 #[tokio::test]
-async fn test_manager_stop_all() {
+async fn test_manager_cancelled_start_reports_cancelled() {
     let _guard = TEST_LOCK.lock().await;
-    let project_id1 = ProjectId("test-project-stop-1".to_string());
-    let project_dir1 = PathBuf::from("/tmp/test-project-stop-1");
-    let project_id2 = ProjectId("test-project-stop-2".to_string());
-    let project_dir2 = PathBuf::from("/tmp/test-project-stop-2");
-    let cancel = CancellationToken::new();
+    let project_dir = missing_project_dir("cancelled");
+    let project_id = LspManager::key_for_dir(&project_dir);
 
-    // Start clients for two projects
-    let _ =
-        LspManager::get_or_start(project_id1.clone(), project_dir1.clone(), cancel.clone()).await;
-    let _ =
-        LspManager::get_or_start(project_id2.clone(), project_dir2.clone(), cancel.clone()).await;
-
-    // Stop all should succeed
-    let cancel2 = CancellationToken::new();
-    LspManager::stop_all(cancel2).await;
-
-    // After stop_all, getting a client should create a new one
-    let cancel3 = CancellationToken::new();
-    let client = LspManager::get_or_start(project_id1, project_dir1, cancel3).await;
-    assert!(Arc::strong_count(&client) >= 1, "Should be able to get client after stop_all");
-}
-
-/// Test that cancellation during start is handled gracefully.
-#[tokio::test]
-async fn test_manager_cancellation_during_start() {
-    let _guard = TEST_LOCK.lock().await;
-    let project_id = ProjectId("test-project-cancel".to_string());
-    let project_dir = PathBuf::from("/tmp/test-project-cancel");
-
-    // Create a token and cancel it immediately
     let cancel = CancellationToken::new();
     cancel.cancel();
+    let result = LspManager::get_or_start(project_id, project_dir, cancel).await;
 
-    // Start should handle cancellation gracefully
-    let client = LspManager::get_or_start(project_id, project_dir, cancel).await;
-
-    // Should return a client (even if start failed), not panic
-    assert!(Arc::strong_count(&client) >= 1);
+    assert!(
+        matches!(result, Err(ToolError::Cancelled)),
+        "a pre-cancelled start must report Cancelled"
+    );
 }
 
-/// Test that manager can handle rapid start/stop cycles.
+/// `stop_all` must be safe on an arbitrary manager state and must not panic.
+#[tokio::test]
+async fn test_manager_stop_all_is_safe() {
+    let _guard = TEST_LOCK.lock().await;
+    let project_dir = missing_project_dir("stop-all");
+    let project_id = LspManager::key_for_dir(&project_dir);
+
+    let _ =
+        LspManager::get_or_start(project_id.clone(), project_dir.clone(), CancellationToken::new())
+            .await;
+    LspManager::stop_all(CancellationToken::new()).await;
+
+    // A subsequent request must still behave predictably (and not panic).
+    let after = LspManager::get_or_start(project_id, project_dir, CancellationToken::new()).await;
+    assert!(after.is_err(), "the missing dir still fails after stop_all");
+}
+
+/// Rapid start/stop cycles must not panic or deadlock.
 #[tokio::test]
 async fn test_manager_rapid_cycles() {
     let _guard = TEST_LOCK.lock().await;
-    let project_id = ProjectId("test-project-rapid".to_string());
-    let project_dir = PathBuf::from("/tmp/test-project-rapid");
+    let project_dir = missing_project_dir("rapid");
+    let project_id = LspManager::key_for_dir(&project_dir);
 
     for _ in 0..5 {
-        let cancel = CancellationToken::new();
-        let _ = LspManager::get_or_start(project_id.clone(), project_dir.clone(), cancel).await;
-
-        let cancel2 = CancellationToken::new();
-        LspManager::stop_all(cancel2).await;
+        let _ = LspManager::get_or_start(
+            project_id.clone(),
+            project_dir.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+        LspManager::stop_all(CancellationToken::new()).await;
     }
 
-    // Should not panic or deadlock
-    let cancel = CancellationToken::new();
-    let client = LspManager::get_or_start(project_id, project_dir, cancel).await;
-    assert!(Arc::strong_count(&client) >= 1, "Manager should work after rapid cycles");
+    let result = LspManager::get_or_start(project_id, project_dir, CancellationToken::new()).await;
+    assert!(result.is_err(), "manager still behaves predictably after rapid cycles");
 }
 
-/// Test that multiple threads can safely access the manager.
-#[tokio::test]
-async fn test_manager_thread_safety() {
-    let _guard = TEST_LOCK.lock().await;
-    let project_id = ProjectId("test-project-thread-safety".to_string());
-    let project_dir = PathBuf::from("/tmp/test-project-thread-safety");
+/// The public key function must be deterministic and path-based, so the editor
+/// and the tools resolve one client per directory.
+#[test]
+fn test_manager_key_for_dir_is_path_based() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let first = LspManager::key_for_dir(dir.path());
+    assert_eq!(first, LspManager::key_for_dir(dir.path()), "same path must yield the same key");
 
-    let mut handles = vec![];
-
-    // Spawn 10 tasks that each try to get the client
-    for _ in 0..10 {
-        let project_id_clone = project_id.clone();
-        let project_dir_clone = project_dir.clone();
-        let handle = tokio::spawn(async move {
-            let cancel = CancellationToken::new();
-            LspManager::get_or_start(project_id_clone, project_dir_clone, cancel).await
-        });
-        handles.push(handle);
-    }
-
-    // All should succeed and return the same client
-    let mut clients = vec![];
-    for handle in handles {
-        let client = handle.await.unwrap();
-        clients.push(client);
-    }
-
-    // All should be the same Arc
-    let first = &clients[0];
-    for client in &clients[1..] {
-        assert!(Arc::ptr_eq(first, client), "All threads should get the same client");
-    }
+    let other = tempfile::TempDir::new().expect("temp dir");
+    assert_ne!(first, LspManager::key_for_dir(other.path()), "different paths must differ");
 }
