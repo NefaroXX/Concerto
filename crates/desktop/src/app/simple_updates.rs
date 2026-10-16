@@ -121,6 +121,35 @@ impl App {
                 self.show_help = !self.show_help;
                 iced::Task::none()
             }
+            Message::CloseSettingsModal => {
+                // A form with unsaved edits arms the discard-confirm guard
+                // rather than silently dropping them.
+                if self.settings.settings_dirty {
+                    self.settings_discard_confirm = Some(ConfirmModal::confirm(
+                        "Discard unsaved changes?",
+                        "Your Settings edits have not been saved. Closing now will discard them.",
+                    ));
+                } else {
+                    self.show_settings_modal = false;
+                }
+                iced::Task::none()
+            }
+            Message::SettingsDiscardConfirmed => {
+                self.settings_discard_confirm = None;
+                self.show_settings_modal = false;
+                // Actually discard: reset the dirty flags and re-seed the
+                // config-backed form rows from the live config, so the promise
+                // the guard showed is kept and a later Save cannot publish the
+                // abandoned snapshot [ADR-57 §3d].
+                if let Some(config) = &self.config {
+                    self.settings.discard_edits(config);
+                }
+                iced::Task::none()
+            }
+            Message::SettingsDiscardCancelled => {
+                self.settings_discard_confirm = None;
+                iced::Task::none()
+            }
             // Never routed by the parent dispatcher; documented no-op.
             _ => iced::Task::none(),
         }

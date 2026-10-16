@@ -263,6 +263,15 @@ impl App {
             }
             Shortcut::SubmitInput => self.update(Message::Chat(views::chat::Message::SubmitInput)),
             Shortcut::CancelDialog => {
+                // The Settings discard-confirm guard is the topmost dialog;
+                // then the Settings modal itself (Esc arms the guard when the
+                // form is dirty rather than dropping unsaved edits).
+                if self.settings_discard_confirm.is_some() {
+                    return self.update(Message::SettingsDiscardCancelled);
+                }
+                if self.show_settings_modal {
+                    return self.update(Message::CloseSettingsModal);
+                }
                 self.show_help = false;
                 // Esc also dismisses the Memory explorer modal.
                 self.memory_view_open = false;

@@ -909,6 +909,66 @@ mod tests {
     }
 
     #[test]
+    fn discard_edits_clears_flags_and_reseeds_config_backed_rows() {
+        let live = AppConfig {
+            model_settings: Some(ModelSettings {
+                providers: vec![provider("router", "openrouter", "anthropic/claude-sonnet-4")],
+                global_default_model: Some("anthropic/claude-sonnet-4".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut state = State::from_config(&live);
+
+        // Simulate abandoned edits across every form-owned dirty flag, plus a
+        // default-model pick and a bogus provider row.
+        state.providers.push(provider("discarded", "anthropic", "claude-3-5-sonnet"));
+        state.global_default_model = Some("discarded/model".into());
+        state.settings_dirty = true;
+        state.relationship_dirty = true;
+        state.project_context_dirty = true;
+        state.settings_saved_notice = true;
+        state.editing_key_for = Some(0);
+        state.key_edit_text = "abandoned-secret".into();
+        state.show_form = true;
+        state.form_api_key = "abandoned-form-secret".into();
+
+        state.discard_edits(&live);
+
+        assert!(!state.settings_dirty, "discard must clear settings_dirty");
+        assert!(!state.relationship_dirty, "discard must clear relationship_dirty");
+        assert!(!state.project_context_dirty, "discard must clear project_context_dirty");
+        assert!(!state.settings_saved_notice, "discard must not claim a save just happened");
+        assert!(state.editing_key_for.is_none());
+        assert!(state.key_edit_text.is_empty());
+        assert!(!state.show_form, "an abandoned add-provider form must be closed");
+        assert!(state.form_api_key.is_empty());
+        assert_eq!(
+            state.providers.len(),
+            1,
+            "discarded provider rows must be replaced from the live config"
+        );
+        assert_eq!(state.providers[0].id, "router");
+        assert_eq!(
+            state.global_default_model.as_deref(),
+            Some("anthropic/claude-sonnet-4"),
+            "the default-model pick must be re-seeded from the live config"
+        );
+
+        // The dirty flags are unstuck: a subsequent config-backed refresh now
+        // runs instead of being blocked by a stale flag.
+        let changed = AppConfig {
+            model_settings: Some(ModelSettings {
+                providers: vec![provider("code", "opencode", "opencode/deepseek-v4-flash-free")],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        state.sync_providers_from_config(&changed);
+        assert_eq!(state.providers[0].id, "code");
+    }
+
+    #[test]
     fn all_settings_sections_start_collapsed() {
         let state = State::from_config(&AppConfig::default());
         for section in SectionId::ALL {

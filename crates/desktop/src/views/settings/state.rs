@@ -329,6 +329,72 @@ pub struct State {
     /// save/reload must neither publish the section from this snapshot nor
     /// clobber a newer externally-written section (mirrors `relationship_dirty`).
     pub project_context_dirty: bool,
+
+    // ── Part 3 — additive "Advanced" coverage ────────────────────────────
+    // Every knob below was previously config-file-only. Each is seeded from
+    // the merged config and written back by `to_config`; a blank text field
+    // means "use the crate default". The section is additive and optional:
+    // absent sections stay absent unless the user edits one of their fields.
+    /// `session_spend_cap_usd`; blank = no cap.
+    pub session_spend_cap_usd: String,
+    /// `[tool_settings] git_auto_init`.
+    pub git_auto_init: bool,
+    /// `[agent] strict_verification_gate`.
+    pub strict_verification_gate: bool,
+    /// `[retry] time_to_first_byte_seconds`; blank = default.
+    pub retry_time_to_first_byte_seconds: String,
+    /// `[retry] stream_idle_timeout_seconds`; blank = default.
+    pub retry_stream_idle_timeout_seconds: String,
+    /// `[retry] max_attempts`; blank = default.
+    pub retry_max_attempts: String,
+    /// Whether a `[policy.time_window]` is configured.
+    pub policy_time_window_enabled: bool,
+    pub policy_time_window_start_hour: u8,
+    pub policy_time_window_end_hour: u8,
+    pub policy_time_window_timezone: String,
+    pub policy_time_window_auto_approve_below_usd: String,
+    /// `[memory] exclude_patterns`, one glob per line.
+    pub memory_exclude_patterns: String,
+    /// `[memory] summary_keep_per_session`; blank = default.
+    pub memory_summary_keep_per_session: String,
+    /// `[memory] summary_retention_days`; blank = default.
+    pub memory_summary_retention_days: String,
+    /// `[skills] max_chars` edit buffer; blank = default.
+    pub skills_max_chars_input: String,
+    /// `[project_context] max_bytes` edit buffer; blank = default.
+    pub project_context_max_bytes_input: String,
+    /// `[project_context] update_frequency` edit buffer; blank = default.
+    pub project_context_update_frequency_input: String,
+    /// `[audit] encrypt_at_rest`.
+    pub audit_encrypt_at_rest: bool,
+    /// `[audit] retention_days`; blank = keep forever.
+    pub audit_retention_days: String,
+    /// `[audit] archive_dir`; blank = Concerto data directory.
+    pub audit_archive_dir: String,
+    /// `[observability] prometheus_port`; blank = disabled.
+    pub observability_prometheus_port: String,
+    /// `[observability] otlp_endpoint`; blank = disabled.
+    pub observability_otlp_endpoint: String,
+    /// `[observability] langfuse_host`; blank = disabled.
+    pub observability_langfuse_host: String,
+    /// `[updates] check_on_startup`.
+    pub updates_check_on_startup: bool,
+    /// `[updates] update_endpoint`; blank = crates.io.
+    pub updates_update_endpoint: String,
+    /// `[context] trigger_tokens`; blank = default.
+    pub context_trigger_tokens: String,
+    /// `[context] retain_user_turns`; blank = default.
+    pub context_retain_user_turns: String,
+    /// `[context] minimum_user_turns`; blank = default.
+    pub context_minimum_user_turns: String,
+    /// `[context] cache_stable_prefix`.
+    pub context_cache_stable_prefix: bool,
+    /// `[harness] checkpoint_retention_days`; blank = keep forever.
+    pub harness_checkpoint_retention_days: String,
+    /// `[harness] recall_limit`; blank = default.
+    pub harness_recall_limit: String,
+    /// `[harness] verify_selector`; blank = `all`.
+    pub harness_verify_selector: String,
 }
 
 /// Draft fields for an in-progress MCP server edit (ADR-43 edit/delete).
@@ -455,6 +521,15 @@ impl State {
         let skills = config.skills.clone().unwrap_or_default();
         let mcp = config.mcp.clone().unwrap_or_default();
         let project_context = config.project_context.clone().unwrap_or_default();
+
+        // Part 3 — Advanced coverage seeds. Absent optional sections fall back
+        // to their crate defaults so every field has a well-defined value.
+        let time_window = config.policy.as_ref().and_then(|policy| policy.time_window.as_ref());
+        let audit = config.audit.clone().unwrap_or_default();
+        let observability = config.observability.clone().unwrap_or_default();
+        let updates = config.updates.clone().unwrap_or_default();
+        let context = config.context.clone().unwrap_or_default();
+        let harness = config.harness.clone().unwrap_or_default();
 
         let mut state = Self {
             theme_names,
@@ -602,6 +677,85 @@ impl State {
             project_context_max_bytes: project_context.max_bytes,
             project_context_global_path: project_context.global_path.clone(),
             project_context_dirty: false,
+            // Part 3 — Advanced coverage.
+            session_spend_cap_usd: config
+                .session_spend_cap_usd
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            git_auto_init: config
+                .tool_settings
+                .as_ref()
+                .map(|tool_settings| tool_settings.git_auto_init)
+                .unwrap_or(true),
+            strict_verification_gate: config
+                .agent
+                .as_ref()
+                .map(|agent| agent.strict_verification_gate)
+                .unwrap_or(false),
+            retry_time_to_first_byte_seconds: config.retry.time_to_first_byte_seconds.to_string(),
+            retry_stream_idle_timeout_seconds: config.retry.stream_idle_timeout_seconds.to_string(),
+            retry_max_attempts: config.retry.max_attempts.to_string(),
+            policy_time_window_enabled: time_window.is_some(),
+            policy_time_window_start_hour: time_window.map(|window| window.start_hour).unwrap_or(0),
+            policy_time_window_end_hour: time_window.map(|window| window.end_hour).unwrap_or(6),
+            policy_time_window_timezone: time_window
+                .map(|window| window.timezone.clone())
+                .unwrap_or_else(|| "UTC".to_string()),
+            policy_time_window_auto_approve_below_usd: time_window
+                .map(|window| window.auto_approve_below_usd.to_string())
+                .unwrap_or_default(),
+            memory_exclude_patterns: config.memory.exclude_patterns.join("\n"),
+            memory_summary_keep_per_session: config.memory.summary_keep_per_session.to_string(),
+            memory_summary_retention_days: config.memory.summary_retention_days.to_string(),
+            skills_max_chars_input: skills
+                .max_chars
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            project_context_max_bytes_input: project_context
+                .max_bytes
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            project_context_update_frequency_input: project_context.update_frequency.to_string(),
+            audit_encrypt_at_rest: audit.encrypt_at_rest,
+            audit_retention_days: audit
+                .retention_days
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            audit_archive_dir: audit
+                .archive_dir
+                .as_ref()
+                .map(|path| path.to_string())
+                .unwrap_or_default(),
+            observability_prometheus_port: observability
+                .prometheus_port
+                .map(|port| port.to_string())
+                .unwrap_or_default(),
+            observability_otlp_endpoint: observability.otlp_endpoint.clone().unwrap_or_default(),
+            observability_langfuse_host: observability.langfuse_host.clone().unwrap_or_default(),
+            updates_check_on_startup: updates.check_on_startup,
+            updates_update_endpoint: updates.update_endpoint.clone().unwrap_or_default(),
+            context_trigger_tokens: context
+                .trigger_tokens
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            context_retain_user_turns: context
+                .retain_user_turns
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            context_minimum_user_turns: context
+                .minimum_user_turns
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            context_cache_stable_prefix: context.cache_stable_prefix.unwrap_or(false),
+            harness_checkpoint_retention_days: harness
+                .checkpoint_retention_days
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            harness_recall_limit: harness
+                .recall_limit
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            harness_verify_selector: harness.verify_selector.clone().unwrap_or_default(),
         };
         let shell = config.resolved_shell_settings();
         state.shell_active_profile = shell.selected_profile_id().to_owned();
@@ -1049,6 +1203,13 @@ impl State {
             | Message::RetryRespectAfterToggled(_)
             | Message::RetryJitterToggled(_)
             | Message::RetryMaxElapsedChanged(_)) => self.update_memory(message),
+
+            // Part 3 — Advanced coverage. One grouped helper for the two
+            // field/toggle variants plus the two policy-window hour arms.
+            message @ (Message::AdvancedFieldChanged(..)
+            | Message::AdvancedToggled(..)
+            | Message::AdvancedPolicyTimeWindowStartHour(_)
+            | Message::AdvancedPolicyTimeWindowEndHour(_)) => self.update_coverage(message),
 
             // Save / section navigation. Pure relocation (NORM S36): the
             // `SaveSettings`, `ToggleSection`, and `JumpToSection` arms now live

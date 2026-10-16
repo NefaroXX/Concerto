@@ -5,6 +5,7 @@ use iced::widget::{
 use iced::{Alignment, Background, Border, Element, Length, Shadow, Vector};
 
 use crate::app::{App, Message, Page, RunStatus};
+use crate::views::model_options::{split_model_key, unified_model_options, UnifiedModelOption};
 
 /// Width of the expanded quick panel.
 const PANEL_WIDTH: u16 = 280;
@@ -87,47 +88,48 @@ fn effective_agent_model<'a>(
     non_blank(model_override).or_else(|| non_blank(global_default_model))
 }
 
-/// Union `model` into the picker's option list, prepended when absent, so a
-/// value that belongs to another provider (and is therefore missing from the
-/// active provider's list) still resolves as `selected`. Blank/absent values
-/// are ignored.
-fn union_model_option(options: &mut Vec<String>, model: Option<&String>) {
-    if let Some(model) = non_blank(model) {
-        if !options.iter().any(|option| option == model) {
-            options.insert(0, model.clone());
-        }
-    }
-}
-
 /// Build the per-agent model picker shared by roster and coordinator cards.
 ///
-/// The agent's current override **and** the Settings global default are both
-/// unioned into the shared option list (prepended when absent) so `selected`
-/// resolves to the effective model even when it belongs to another provider
-/// and is therefore missing from the active provider's list. Without the
-/// union the picker silently falls back to the "Default model" placeholder.
-/// Passing an owned `Vec` keeps the list alive inside the widget (no borrow
-/// of the per-frame view).
+/// Options come from the shared cross-provider resolver (every configured
+/// provider's known/extra/discovered models, labelled "model — Provider"), so
+/// an agent can be pinned to any provider's model from the rail. The effective
+/// model (the agent's override, else the Settings global default) is unioned
+/// in when absent so `selected` resolves even for a provider with no cached
+/// models; without the union the picker would silently fall back to the
+/// "Default model" placeholder.
 ///
-/// Display-only: the emitted [`Message::SetAgentModel`] still writes exactly
-/// the per-agent override and never touches `global_default_model`, so
-/// picking a model here cannot silently repoint single-agent chat.
+/// Display-only: the emitted [`Message::SetAgentModel`] writes the per-agent
+/// override (with the owning provider) and never touches `global_default_model`,
+/// so picking a model here cannot silently repoint single-agent chat.
 fn agent_model_picker<'a>(
     app: &App,
     agent_id: &str,
+    provider_id: Option<&String>,
     model_override: Option<&String>,
     global_default_model: Option<&String>,
 ) -> Element<'a, Message> {
     let ts = app.current_theme.type_scale;
-    let mut options = app.chat_model_options.clone();
-    // Global default first so a present override lands ahead of it.
-    union_model_option(&mut options, global_default_model);
-    union_model_option(&mut options, model_override);
-    let selected = effective_agent_model(model_override, global_default_model).cloned();
+    let mut options = unified_model_options(&app.settings.providers);
+    let effective = effective_agent_model(model_override, global_default_model).cloned();
+    if let Some(model) = effective.as_ref() {
+        let owner = non_blank(provider_id).cloned().unwrap_or_default();
+        let key = if owner.is_empty() { model.clone() } else { format!("{owner}|{model}") };
+        if !options.iter().any(|option| option.key == key) {
+            options.insert(0, UnifiedModelOption { key, label: model.clone() });
+        }
+    }
+    let selected = options
+        .iter()
+        .find(|option| split_model_key(&option.key).1.as_deref() == effective.as_deref())
+        .cloned();
     let agent_id = agent_id.to_string();
-    pick_list(options, selected, move |model| Message::SetAgentModel {
-        agent_id: agent_id.clone(),
-        model,
+    pick_list(options, selected, move |option: UnifiedModelOption| {
+        let (provider_id, model) = split_model_key(&option.key);
+        Message::SetAgentModel {
+            agent_id: agent_id.clone(),
+            provider_id: provider_id.unwrap_or_default(),
+            model: model.unwrap_or_else(|| "default".into()),
+        }
     })
     .placeholder("Default model")
     .text_size(ts.caption)
@@ -145,6 +147,7 @@ fn agent_card<'a>(
     id: &'a str,
     name: &'a str,
     role: &'a str,
+    provider_id: Option<&'a String>,
     model_override: Option<&'a String>,
 ) -> Element<'a, Message> {
     let theme = &app.current_theme;
@@ -153,8 +156,13 @@ fn agent_card<'a>(
     let role_color_val = role_color(app, role);
     let running = app.chat.agent_running(role);
 
-    let picker =
-        agent_model_picker(app, id, model_override, app.settings.global_default_model.as_ref());
+    let picker = agent_model_picker(
+        app,
+        id,
+        provider_id,
+        model_override,
+        app.settings.global_default_model.as_ref(),
+    );
 
     container(
         column![
@@ -198,16 +206,17 @@ fn coordinator_card<'a>(
     let theme = &app.current_theme;
     let palette = &theme.palette;
     let sp = &theme.spacing;
-    let (id, name, role, model_override) = match coord {
+    let (id, name, role, provider_id, model_override) = match coord {
         Some(coord) => (
             coord.id.as_str(),
             coord.name.as_str(),
             coord.role.as_str(),
+            coord.provider_id.as_ref(),
             coord.model_override.as_ref(),
         ),
         // Fallback: the frozen definition's identity, so the picker targets
         // exactly the row `set_agent_model_override` creates.
-        None => ("coordinator", "Coordinator", "coordinator", None),
+        None => ("coordinator", "Coordinator", "coordinator", None, None),
     };
     let role_color_val = role_color(app, role);
     // The coordinator is active while the run is in flight and no specialist
@@ -215,7 +224,13 @@ fn coordinator_card<'a>(
     let running =
         coord.is_some() && app.run_status == RunStatus::Running && !app.chat.has_running_subagent();
     let picker = tooltip(
-        agent_model_picker(app, id, model_override, app.settings.global_default_model.as_ref()),
+        agent_model_picker(
+            app,
+            id,
+            provider_id,
+            model_override,
+            app.settings.global_default_model.as_ref(),
+        ),
         text("Engine-owned coordinator model").size(11),
         Position::Left,
     );
@@ -306,6 +321,7 @@ pub fn quick_panel_view(app: &App) -> Element<'_, Message> {
             &agent.id,
             &agent.name,
             &agent.role,
+            agent.provider_id.as_ref(),
             agent.model_override.as_ref(),
         ));
     }
@@ -484,36 +500,15 @@ mod tests {
         assert_eq!(effective.map(|model| model.as_str()), Some("openai/gpt-4.1"));
     }
 
-    /// given: an option list holding only the active provider's models
-    /// then: both the override and the global default are unioned in, and a
-    ///       repeated union never duplicates an entry
+    /// given: the shared resolver produces provider-qualified keys
+    /// then: splitting a selected key recovers the provider + model the picker
+    ///       must persist (the cross-provider quick-swap seam)
     #[test]
-    fn option_list_unions_the_override_and_the_global_default() {
-        let mut options = vec!["openai/gpt-4.1".to_string()];
-        let agent_override = "anthropic/claude-sonnet-4".to_string();
-        let other_global = "google/gemini-2.5-pro".to_string();
-
-        union_model_option(&mut options, Some(&other_global));
-        union_model_option(&mut options, Some(&agent_override));
-
-        // Prepended in union order, so the override (the effective value when
-        // present) sits first.
-        assert_eq!(
-            options,
-            vec![
-                "anthropic/claude-sonnet-4".to_string(),
-                "google/gemini-2.5-pro".to_string(),
-                "openai/gpt-4.1".to_string(),
-            ]
-        );
-
-        union_model_option(&mut options, Some(&agent_override));
-        union_model_option(&mut options, Some(&other_global));
-        assert_eq!(options.len(), 3, "union must be idempotent");
-
-        let blank = "  ".to_string();
-        union_model_option(&mut options, Some(&blank));
-        union_model_option(&mut options, None);
-        assert_eq!(options.len(), 3, "blank/absent values must not be added");
+    fn selected_key_round_trips_to_provider_and_model() {
+        let (provider, model) = split_model_key("p_anthropic|claude-sonnet-4");
+        assert_eq!(provider.as_deref(), Some("p_anthropic"));
+        assert_eq!(model.as_deref(), Some("claude-sonnet-4"));
+        // The empty sentinel ("Default model") yields no provider and no model.
+        assert_eq!(split_model_key(""), (None, None));
     }
 }

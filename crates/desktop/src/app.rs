@@ -8,6 +8,7 @@ use crate::views;
 use crate::widgets::agent_graph::NodeState;
 use crate::widgets::capability_dialog;
 use crate::widgets::circuit_background;
+use crate::widgets::confirm_modal::ConfirmModal;
 use crate::widgets::scanline_overlay;
 
 use crate::services::session_handler::DesktopSessionHandler;
@@ -369,6 +370,13 @@ pub enum Message {
     Editor(views::code_editor::Message),
     ThemeChanged,
     HelpToggled,
+    /// Close the Settings modal (✕ button, Esc, or backdrop click). A form
+    /// with unsaved edits arms the discard-confirm guard instead of closing.
+    CloseSettingsModal,
+    /// Confirm discarding unsaved Settings edits and close the modal.
+    SettingsDiscardConfirmed,
+    /// Cancel the discard-confirm guard and keep the Settings modal open.
+    SettingsDiscardCancelled,
     CapabilityDlg(capability_dialog::Message),
     /// Events from the backend event bus, translated to DesktopEvent.
     DesktopEvent(crate::runtime::DesktopEvent),
@@ -380,9 +388,12 @@ pub enum Message {
     SetActiveModel(String),
     /// Quick-swap one agent's model override from the right toolbar. Persists
     /// to the global config and re-derives runtime state (same seam the Studio
-    /// uses), without opening Settings/Studio.
+    /// uses), without opening Settings/Studio. `provider_id` is empty for the
+    /// "use global default" sentinel; otherwise it names the provider that owns
+    /// the selected cross-provider model.
     SetAgentModel {
         agent_id: String,
+        provider_id: String,
         model: String,
     },
     /// External config files changed on disk — reload and re-derive every
@@ -510,6 +521,14 @@ pub struct App {
     pub page: Page,
     pub current_theme: AppTheme,
     pub show_help: bool,
+    /// Whether the Settings surface is open as a modal overlay (rather than a
+    /// page switch). Opened by the sidebar item, the chat "Settings" affordance,
+    /// and the Studio "Open Model Settings" button.
+    pub show_settings_modal: bool,
+    /// The unsaved-changes guard armed while closing a dirty Settings modal.
+    /// Owned here (rather than built in `view`) so the rendered element can
+    /// borrow it for the duration of the frame. `None` when not closing.
+    pub settings_discard_confirm: Option<ConfirmModal>,
 
     // Per-view state
     pub chat: views::chat::State,
@@ -818,6 +837,8 @@ impl App {
             page: Page::Chat,
             current_theme: theme,
             show_help: false,
+            show_settings_modal: false,
+            settings_discard_confirm: None,
             chat: views::chat::State::new(),
             diff: views::diff::State::new(),
             memory: views::memory::State::new(),
@@ -1070,9 +1091,11 @@ impl App {
             message @ Message::Editor(_) => self.update_editor(message),
             // NORM S30 — prefs-theme reload + help-overlay flip moved to the
             // sibling `simple_updates` submodule.
-            message @ (Message::ThemeChanged | Message::HelpToggled) => {
-                self.update_theme_and_help(message)
-            }
+            message @ (Message::ThemeChanged
+            | Message::HelpToggled
+            | Message::CloseSettingsModal
+            | Message::SettingsDiscardConfirmed
+            | Message::SettingsDiscardCancelled) => self.update_theme_and_help(message),
             // NORM S31 — project-dir picker, root-consent gate, and
             // project-tree arms moved verbatim to the sibling
             // `project_switch` submodule. The full `Message` is

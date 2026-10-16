@@ -53,29 +53,29 @@ impl App {
     pub(super) fn update_navigation(&mut self, message: Message) -> iced::Task<Message> {
         match message {
             Message::Navigate(page) => {
-                self.page = page;
-                if page != Page::Chat {
-                    self.chat.finalize_streaming();
-                    TEXT_FOCUSED.store(false, Ordering::Relaxed);
-                }
+                // Settings is a modal overlay, not a page: opening it never
+                // leaves the current page. Seed the config-derived lists and
+                // run the one-time lazy skill discovery exactly as the old
+                // page-entry path did.
                 if page == Page::Settings {
-                    // The relationship manager and provider list here are
-                    // seeded from config at startup; the studio saves
-                    // `multi_agent.relationships` and external config edits
-                    // may change `model_settings.providers` independently, so
-                    // refresh both on every entry. In-flight edits made here
-                    // are preserved by the states themselves (ADR-57 §3d).
+                    self.show_settings_modal = true;
                     if let Some(config) = &self.config {
                         self.settings.sync_relationships_from_config(config);
                         self.settings.sync_providers_from_config(config);
                     }
                     // ADR-43 — one lazy skill discovery pass the first time the
-                    // page opens. Discovery is blocking filesystem work, so it
-                    // runs inside `Task::perform` (the same pattern as the
+                    // surface opens. Discovery is blocking filesystem work, so
+                    // it runs inside `Task::perform` (the same pattern as the
                     // shell profile test); the Refresh button re-runs it.
                     if self.settings.skills_never_discovered() {
                         return self.settings.start_skill_discovery().map(Message::Settings);
                     }
+                    return iced::Task::none();
+                }
+                self.page = page;
+                if page != Page::Chat {
+                    self.chat.finalize_streaming();
+                    TEXT_FOCUSED.store(false, Ordering::Relaxed);
                 }
                 if page == Page::OrchestrationStudio {
                     // ADR-58/59 (rewritten) Slice 2 (first-run bootstrap), AMENDED

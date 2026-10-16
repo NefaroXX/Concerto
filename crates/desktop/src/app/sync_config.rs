@@ -73,24 +73,30 @@ impl App {
     /// Persist one agent's model override to the global config (right-toolbar
     /// quick swap) and re-derive runtime state. Mirrors the Studio's
     /// `AssignModel` seam: an empty/"default" model removes the assignment so
-    /// the agent falls back to the global default. Provider resolution prefers
-    /// the agent's existing assignment, then the active provider, then the
-    /// first configured provider.
-    pub(super) fn set_agent_model(&mut self, agent_id: String, model: String) {
-        let provider_id = self
-            .runtime_assignments()
-            .iter()
-            .find(|assignment| assignment.agent_role == agent_id)
-            .map(|assignment| assignment.provider_config_id.clone())
-            .filter(|id| !id.is_empty())
-            .unwrap_or_else(|| {
-                if !self.active_provider_id.is_empty() {
-                    self.active_provider_id.clone()
-                } else {
-                    self.runtime_providers().first().map(|p| p.id.clone()).unwrap_or_default()
-                }
-            });
-        let use_default = model.is_empty() || model == "default" || provider_id.is_empty();
+    /// the agent falls back to the global default.
+    ///
+    /// Provider resolution prefers the provider the picker sent (a
+    /// cross-provider model carries its owning provider), then the agent's
+    /// existing assignment, then the active provider, then the first configured
+    /// provider.
+    pub(super) fn set_agent_model(&mut self, agent_id: String, provider_id: String, model: String) {
+        let resolved_provider_id = if provider_id.trim().is_empty() {
+            self.runtime_assignments()
+                .iter()
+                .find(|assignment| assignment.agent_role == agent_id)
+                .map(|assignment| assignment.provider_config_id.clone())
+                .filter(|id| !id.is_empty())
+                .unwrap_or_else(|| {
+                    if !self.active_provider_id.is_empty() {
+                        self.active_provider_id.clone()
+                    } else {
+                        self.runtime_providers().first().map(|p| p.id.clone()).unwrap_or_default()
+                    }
+                })
+        } else {
+            provider_id
+        };
+        let use_default = model.is_empty() || model == "default" || resolved_provider_id.is_empty();
         let mut config = self.global_config.clone();
         let settings = config.model_settings.get_or_insert_with(Default::default);
         if use_default {
@@ -98,12 +104,12 @@ impl App {
         } else if let Some(assignment) =
             settings.agent_assignments.iter_mut().find(|a| a.agent_role == agent_id)
         {
-            assignment.provider_config_id = provider_id;
+            assignment.provider_config_id = resolved_provider_id;
             assignment.model_override = Some(model.clone());
         } else {
             settings.agent_assignments.push(concerto_config::AgentModelAssignment {
                 agent_role: agent_id.clone(),
-                provider_config_id: provider_id,
+                provider_config_id: resolved_provider_id,
                 model_override: Some(model.clone()),
             });
         }
