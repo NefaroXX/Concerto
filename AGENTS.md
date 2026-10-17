@@ -126,7 +126,11 @@ cargo audit
   (2026-10-09). Don't bypass `SimplePolicyEngine` or `VirtualFs`.
 - **OpenCode Zen keyless free tier is a server fingerprint gate** (live-verified
   2026-10-17), not session registration. Keyless requests must `stream: true`,
-  carry an `opencode/*` `User-Agent`, send dev-tree-format `ses_`/`msg_` identity
+  carry an `opencode/*` `User-Agent` whose version **clears the relay's
+  client-version floor** (`≥1.18.0`; a stale `opencode/1.0` now gets
+  `HTTP 426 Upgrade Required` on an otherwise-valid request — found via the
+  audit trail of a live 2026-10-17 session; the shipped UA is
+  `opencode/9.9.9`), send dev-tree-format `ses_`/`msg_` identity
   headers (`x-opencode-session` / `-session-id` / `-request`; one malformed
   session value → 403 `FreeTierError`, the root cause of the reverted 2026-09-30
   port), and declare ≥3 tool names drawn **only** from the opencode builtin set
