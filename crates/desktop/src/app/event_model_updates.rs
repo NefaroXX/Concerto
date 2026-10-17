@@ -143,8 +143,8 @@ impl App {
                 }
                 iced::Task::none()
             }
-            Message::SetAgentModel { agent_id, model } => {
-                self.set_agent_model(agent_id, model);
+            Message::SetAgentModel { agent_id, provider_id, model } => {
+                self.set_agent_model(agent_id, provider_id, model);
                 iced::Task::none()
             }
 

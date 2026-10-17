@@ -61,8 +61,8 @@ pub use schema::{
     CustomAgentConfig, DiscoveryOutcome, DisplayConfig, FewShotExample, IntentConfig, McpConfig,
     McpServerConfig, MemoryConfig, ModelPinConfig, ModelProfileOverride, ModelSettings,
     MultiAgentConfig, ObservabilityConfig, PipelinePreset, PlanBindingSource, PolicyConfig,
-    PolicyRuleDef, ProjectContextConfig, PromptSections, ProviderConfig, RetryConfig, SkillsConfig,
-    ToolSchemaMode, ToolSettings, UpdatesConfig, SCHEMA_VERSION,
+    PolicyRuleDef, PolicyTimeWindowConfig, ProjectContextConfig, PromptSections, ProviderConfig,
+    RetryConfig, SkillsConfig, ToolSchemaMode, ToolSettings, UpdatesConfig, SCHEMA_VERSION,
 };
 pub use setup::{PendingConfig, SetupError, SetupWizard};
 pub use shell::{

@@ -16,6 +16,9 @@ use iced::{Alignment, Color, Element, Length};
 use crate::app::Message;
 use crate::theme::AppTheme;
 use crate::ui::section_card::{section_card, section_card_with_subtitle};
+use crate::views::model_options::{
+    split_model_key, unified_model_options_from_map, UnifiedModelOption,
+};
 use crate::views::studio_runtime::StudioRuntimeSnapshot;
 use crate::widgets::agent_graph::{AgentGraphModel, AgentState, EdgeKind};
 use concerto_config::{
@@ -50,21 +53,6 @@ struct AgentOption {
 }
 
 impl std::fmt::Display for AgentOption {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.label)
-    }
-}
-
-/// Display option for the unified model pick-list: carries a compound `key`
-/// (`"provider_id|model_name"` — empty for "Use global default") while showing
-/// a human `label` (`"model — ProviderName"`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ModelOption {
-    key: String,
-    label: String,
-}
-
-impl std::fmt::Display for ModelOption {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.label)
     }
@@ -4050,25 +4038,13 @@ impl State {
         let sp = &theme.spacing;
         let agent_id = agent.id.clone();
 
-        // Build unified model options: "model — provider" with a "global default"
-        // entry at the top.
-        let mut options: Vec<ModelOption> = Vec::new();
-        options.push(ModelOption { key: String::new(), label: "Use global default".into() });
-
-        let mut pairs: Vec<(String, String)> = Vec::new();
-        for (provider_id, models) in &self.cached_models_by_provider {
-            for model in models {
-                pairs.push((provider_id.clone(), model.clone()));
-            }
-        }
-        pairs.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
-
-        for (provider_id, model) in &pairs {
-            let provider_label = self.provider_labels.get(provider_id).unwrap_or(provider_id);
-            let label = format!("{} — {}", model, provider_label);
-            let key = format!("{}|{}", provider_id, model);
-            options.push(ModelOption { key, label });
-        }
+        // Unified cross-provider model options (shared resolver): "model —
+        // provider" with a "Use global default" sentinel at the top.
+        let mut options: Vec<UnifiedModelOption> =
+            vec![UnifiedModelOption { key: String::new(), label: "Use global default".into() }];
+        options.extend(unified_model_options_from_map(&self.cached_models_by_provider, |id| {
+            self.provider_labels.get(id).cloned().unwrap_or_else(|| id.to_string())
+        }));
 
         // Determine currently-selected option.
         let current_key = agent
@@ -4079,7 +4055,7 @@ impl State {
         // Keep the configured pin visible if a provider is offline or its
         // model cache no longer lists this model. Never silently show default.
         if !options.iter().any(|option| option.key == current_key) {
-            options.push(ModelOption {
+            options.push(UnifiedModelOption {
                 key: current_key.clone(),
                 label: format!(
                     "{} · configured, not in model cache",
@@ -4091,17 +4067,12 @@ impl State {
 
         let model_pick = pick_list(options, selected, {
             let agent_id = agent_id.clone();
-            move |option: ModelOption| {
-                let (provider_id, model) = if option.key.is_empty() {
-                    (String::new(), "default".into())
-                } else {
-                    let parts: Vec<&str> = option.key.splitn(2, '|').collect();
-                    (parts[0].to_string(), parts[1].to_string())
-                };
+            move |option: UnifiedModelOption| {
+                let (provider_id, model) = split_model_key(&option.key);
                 Message::OrchestrationStudio(StudioMessage::AssignModel {
                     agent_id: agent_id.clone(),
-                    provider_id,
-                    model,
+                    provider_id: provider_id.unwrap_or_default(),
+                    model: model.unwrap_or_else(|| "default".into()),
                 })
             }
         })

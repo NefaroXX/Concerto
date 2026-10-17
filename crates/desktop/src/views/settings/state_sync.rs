@@ -20,14 +20,23 @@
 
 use std::path::PathBuf;
 
+use camino::Utf8PathBuf;
+
 use concerto_config::managed::ManagedRuntimeManager;
 use concerto_config::{
-    AppConfig, ManagedEnvConfig, McpConfig, PolicyConfig, ProjectContextConfig, ProviderConfig,
-    ShellSettings, SkillsConfig,
+    AgentConfig, AppConfig, ManagedEnvConfig, McpConfig, PolicyConfig, PolicyTimeWindowConfig,
+    ProjectContextConfig, ProviderConfig, ShellSettings, SkillsConfig, ToolSettings,
 };
 use concerto_providers::provider_defs::picker_model_options;
 
 use super::{readable_provider_label, State, CUSTOM_MODEL_SENTINEL};
+
+/// Trim a text buffer and return `Some` only when non-empty (blank = unset, so
+/// the base/default value survives the save).
+fn non_empty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
 
 impl State {
     /// Refresh the relationship manager list from the live merged config.
@@ -130,6 +139,41 @@ impl State {
         self.project_context_global_path = project_context.global_path.clone();
     }
 
+    /// Drop every in-flight edit and re-seed the config-backed form rows from
+    /// the live config.
+    ///
+    /// Called by the App when the user confirms discarding unsaved Settings
+    /// edits. Clearing every ownership flag first is load-bearing: each
+    /// `sync_*_from_config` refresh is gated on the flag it owns
+    /// ([`Self::sync_providers_from_config`] on `settings_dirty`,
+    /// [`Self::sync_relationships_from_config`] on `relationship_dirty`,
+    /// [`Self::sync_project_context_from_config`] on `project_context_dirty`),
+    /// so a sticky `settings_dirty` would otherwise leave the abandoned
+    /// snapshot in the form and a later `SaveSettings` would publish it
+    /// [ADR-57 §3d]. The unified default-model pick has no `sync_*` helper, so
+    /// it is re-seeded directly (mirroring [`Self::from_config`]) — otherwise a
+    /// discarded default-model change would resurface on the next save. The
+    /// footer notice is cleared too so it cannot report a save that did not
+    /// just happen.
+    pub fn discard_edits(&mut self, config: &AppConfig) {
+        self.settings_dirty = false;
+        self.relationship_dirty = false;
+        self.project_context_dirty = false;
+        self.settings_saved_notice = false;
+        // The credential-edit guard blocks `sync_providers_from_config`; drop
+        // it before the re-seed, along with the in-flight provider form.
+        self.editing_key_for = None;
+        self.key_edit_text.clear();
+        self.show_form = false;
+        self.form_api_key.clear();
+        self.global_default_model =
+            config.model_settings.as_ref().and_then(|ms| ms.global_default_model.clone());
+        self.sync_relationships_from_config(config);
+        self.sync_providers_from_config(config);
+        self.sync_display_from_config(config);
+        self.sync_project_context_from_config(config);
+    }
+
     /// Build the `AppConfig` fragments this page owns, merging onto `base`.
     pub fn to_config(&self, base: &AppConfig) -> AppConfig {
         let mut cfg = base.clone();
@@ -144,9 +188,21 @@ impl State {
         cfg.primary_provider = None;
         cfg.primary_provider_config = None;
 
+        // The auto-approval time window is optional; only publish it when the
+        // user enabled it, so an absent `[policy.time_window]` stays absent.
+        let time_window = self.policy_time_window_enabled.then(|| PolicyTimeWindowConfig {
+            start_hour: self.policy_time_window_start_hour.min(23),
+            end_hour: self.policy_time_window_end_hour.min(23),
+            timezone: self.policy_time_window_timezone.trim().to_string(),
+            auto_approve_below_usd: self
+                .policy_time_window_auto_approve_below_usd
+                .trim()
+                .parse::<f64>()
+                .unwrap_or(0.0),
+        });
         cfg.policy = Some(PolicyConfig {
             rules: self.policy_rules.clone(),
-            time_window: None,
+            time_window,
             approval_timeout_secs: None,
         });
         // Only the studio may publish relationships unless the user explicitly
@@ -170,6 +226,69 @@ impl State {
         cfg.memory.ttl_days = self.memory_ttl_days.round().clamp(1.0, 365.0) as u16;
         cfg.display.reduced_motion = self.reduced_motion;
         cfg.display.scanline_overlay_enabled = self.scanline_overlay_enabled;
+
+        // ── Part 3 — Advanced coverage persistence ───────────────────────
+        // A blank text field preserves the base/default value rather than
+        // forcing one; optional sections are rebuilt from the base so their
+        // non-edited keys survive the save.
+        cfg.session_spend_cap_usd =
+            self.session_spend_cap_usd.trim().parse::<f64>().ok().filter(|value| *value > 0.0);
+        cfg.tool_settings = Some(ToolSettings { git_auto_init: self.git_auto_init });
+        cfg.agent = Some(AgentConfig { strict_verification_gate: self.strict_verification_gate });
+        if let Ok(value) = self.retry_time_to_first_byte_seconds.trim().parse::<u64>() {
+            cfg.retry.time_to_first_byte_seconds = value;
+        }
+        if let Ok(value) = self.retry_stream_idle_timeout_seconds.trim().parse::<u64>() {
+            cfg.retry.stream_idle_timeout_seconds = value;
+        }
+        if let Ok(value) = self.retry_max_attempts.trim().parse::<u32>() {
+            cfg.retry.max_attempts = value;
+        }
+        cfg.memory.exclude_patterns = self
+            .memory_exclude_patterns
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect();
+        if let Ok(value) = self.memory_summary_keep_per_session.trim().parse::<u32>() {
+            cfg.memory.summary_keep_per_session = value;
+        }
+        if let Ok(value) = self.memory_summary_retention_days.trim().parse::<u16>() {
+            cfg.memory.summary_retention_days = value;
+        }
+        let mut audit = base.audit.clone().unwrap_or_default();
+        audit.encrypt_at_rest = self.audit_encrypt_at_rest;
+        audit.retention_days =
+            self.audit_retention_days.trim().parse::<u64>().ok().filter(|v| *v > 0);
+        audit.archive_dir = if self.audit_archive_dir.trim().is_empty() {
+            None
+        } else {
+            Some(Utf8PathBuf::from(self.audit_archive_dir.trim()))
+        };
+        cfg.audit = Some(audit);
+        let mut observability = base.observability.clone().unwrap_or_default();
+        observability.prometheus_port =
+            self.observability_prometheus_port.trim().parse::<u16>().ok();
+        observability.otlp_endpoint = non_empty(&self.observability_otlp_endpoint);
+        observability.langfuse_host = non_empty(&self.observability_langfuse_host);
+        cfg.observability = Some(observability);
+        let mut updates = base.updates.clone().unwrap_or_default();
+        updates.check_on_startup = self.updates_check_on_startup;
+        updates.update_endpoint = non_empty(&self.updates_update_endpoint);
+        cfg.updates = Some(updates);
+        let mut context = base.context.clone().unwrap_or_default();
+        context.trigger_tokens = self.context_trigger_tokens.trim().parse::<u64>().ok();
+        context.retain_user_turns = self.context_retain_user_turns.trim().parse::<usize>().ok();
+        context.minimum_user_turns = self.context_minimum_user_turns.trim().parse::<usize>().ok();
+        context.cache_stable_prefix = Some(self.context_cache_stable_prefix);
+        cfg.context = Some(context);
+        let mut harness = base.harness.clone().unwrap_or_default();
+        harness.checkpoint_retention_days =
+            self.harness_checkpoint_retention_days.trim().parse::<u64>().ok();
+        harness.recall_limit = self.harness_recall_limit.trim().parse::<u32>().ok();
+        harness.verify_selector = non_empty(&self.harness_verify_selector);
+        cfg.harness = Some(harness);
 
         // Persist the canonical shell profile. The managed environment
         // config is mirrored from the live runtime manager (source of truth) so

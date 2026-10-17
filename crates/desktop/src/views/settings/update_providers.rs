@@ -252,6 +252,11 @@ impl State {
             Message::GlobalDefaultModelChanged(model) => {
                 self.global_default_model = model;
                 self.rebuild_cache();
+                // The pick is part of `model_settings`, persisted on Save
+                // Settings. Arm the dirty flag so the modal close guard
+                // engages (rather than silently dropping the pick) and the
+                // footer reports unsaved changes.
+                self.settings_dirty = true;
             }
             _ => {}
         }

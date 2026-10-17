@@ -130,7 +130,9 @@ pub fn sidebar_view(app: &App) -> Element<'_, Message> {
             &app.current_theme,
             Some("⚙"),
             "Settings",
-            app.page == Page::Settings,
+            // Settings is a modal overlay now, so its "selected" state follows
+            // the overlay flag rather than `page`.
+            app.show_settings_modal,
             Message::Navigate(Page::Settings),
         ),
         nav_item(

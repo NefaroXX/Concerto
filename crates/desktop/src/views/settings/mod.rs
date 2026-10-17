@@ -10,7 +10,11 @@ use concerto_providers::provider_defs::{provider_definition, PROVIDER_TYPE_IDS};
 
 use crate::theme::AppTheme;
 use crate::ui::{labeled_slider, segmented, Segment, SPACING_MD, SPACING_SM, SPACING_XS};
+use crate::views::model_options::{
+    split_model_key, unified_model_options_from_map, UnifiedModelOption,
+};
 
+mod coverage;
 mod ext_mcp_view;
 mod ext_plugins_view;
 mod ext_skills_view;
@@ -30,6 +34,8 @@ mod update_skills;
 mod view_policy;
 mod view_providers;
 
+pub use message::AdvancedField;
+pub use message::AdvancedToggle;
 pub use message::ExtensionTab;
 pub use message::Message;
 pub use state::InstalledPluginInfo;
@@ -77,7 +83,7 @@ impl fmt::Display for CreateParentOption {
     }
 }
 
-fn readable_provider_label(provider: &ProviderConfig) -> String {
+pub(crate) fn readable_provider_label(provider: &ProviderConfig) -> String {
     let definition = provider_definition(&provider.provider);
     let configured_name = provider.name.trim();
     if configured_name.is_empty()
@@ -345,56 +351,38 @@ impl State {
         // ── Global Default Model section ───────────────────────────────────
         let palette = &theme.palette;
 
-        // Unified model picker across all providers. Each option is rendered as
-        // "model — provider" and selected stores just the model name.
-        /// Display option for the global default model picker.
-        #[derive(Debug, Clone, PartialEq, Eq)]
-        struct GlobalModelOption {
-            key: String,   // empty for "automatic", otherwise the model name
-            label: String, // display text
-        }
-
-        impl std::fmt::Display for GlobalModelOption {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str(&self.label)
-            }
-        }
-
-        let mut model_options: Vec<GlobalModelOption> = Vec::new();
-        model_options.push(GlobalModelOption {
+        // Unified cross-provider model picker (shared resolver). Each option is
+        // rendered as "model — provider"; selecting stores just the model name
+        // so the persisted `global_default_model` schema is unchanged.
+        let mut model_options: Vec<UnifiedModelOption> = Vec::new();
+        model_options.push(UnifiedModelOption {
             key: String::new(),
             label: "Automatic (first available provider)".into(),
         });
-
-        let mut pairs: Vec<(String, String)> = Vec::new();
-        for (provider_id, models) in &self.cached_models_by_provider {
-            for model in models {
-                pairs.push((provider_id.clone(), model.clone()));
-            }
-        }
-        pairs.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
-
-        for (provider_id, model) in &pairs {
-            let provider_label = self
-                .providers
-                .iter()
-                .find(|provider| provider.id.as_str() == provider_id.as_str())
-                .map(readable_provider_label)
-                .unwrap_or_else(|| provider_id.clone());
-            let label = format!("{model} — {provider_label}");
-            model_options.push(GlobalModelOption { key: model.clone(), label });
-        }
+        model_options.extend(unified_model_options_from_map(
+            &self.cached_models_by_provider,
+            |provider_id| {
+                self.providers
+                    .iter()
+                    .find(|provider| provider.id.as_str() == provider_id)
+                    .map(readable_provider_label)
+                    .unwrap_or_else(|| provider_id.to_string())
+            },
+        ));
 
         let current_model = self.global_default_model.as_deref().unwrap_or("");
         let selected = if current_model.is_empty() {
             model_options.first().cloned()
         } else {
-            model_options.iter().find(|o| o.key == current_model).cloned()
+            model_options
+                .iter()
+                .find(|option| split_model_key(&option.key).1.as_deref() == Some(current_model))
+                .cloned()
         };
 
         let default_pick: Element<'_, Message> =
-            pick_list(model_options, selected, move |option: GlobalModelOption| {
-                let model = if option.key.is_empty() { None } else { Some(option.key.clone()) };
+            pick_list(model_options, selected, move |option: UnifiedModelOption| {
+                let model = split_model_key(&option.key).1;
                 Message::GlobalDefaultModelChanged(model)
             })
             .width(Length::Fixed(400.0))
@@ -535,6 +523,17 @@ impl State {
             self.extensions_section(theme),
         );
 
+        // ── Advanced coverage section (Part 3) ────────────────────────────
+        // Previously config-file-only knobs: spend cap, tooling/agent gate,
+        // recovery timeouts, policy window, memory retention, and the
+        // audit/observability/updates/context/harness sections.
+        let advanced_section = self.collapsible_section(
+            theme,
+            message::SectionId::Advanced,
+            "Advanced",
+            self.advanced_section(theme),
+        );
+
         // ── Sidebar nav ──
         // Quick navigation: each entry jumps to its section (expand + scroll)
         // via `Message::JumpToSection`. Labels intentionally repeat the
@@ -549,6 +548,7 @@ impl State {
             (message::SectionId::Memory, "Memory"),
             (message::SectionId::Shell, "Terminal & Shell"),
             (message::SectionId::Extensions, "Extensions"),
+            (message::SectionId::Advanced, "Advanced"),
         ];
         // Slice 4a (spec §7): with `[orchestration]` present the blueprint's
         // open relationship registry replaces the legacy rule manager, so the
@@ -589,6 +589,7 @@ impl State {
             memory_section,
             shell_section,
             extension_section,
+            advanced_section,
             save_area,
         ]);
         let main_content = column(main_sections).spacing(SPACING_MD).padding(20);

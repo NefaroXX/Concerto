@@ -55,8 +55,137 @@ fn new_creates_initial_state() {
 #[test]
 fn navigate_changes_page() {
     let (mut app, _) = App::new();
+    let _ = app.update(Message::Navigate(Page::ToolLog));
+    assert_eq!(app.page, Page::ToolLog);
+}
+
+/// Settings is a modal overlay (ADR-57 §3d): opening it must not abandon the
+/// current page — it just raises the overlay flag.
+#[test]
+fn navigate_to_settings_opens_modal_without_leaving_page() {
+    let (mut app, _) = App::new();
+    assert_eq!(app.page, Page::Chat);
     let _ = app.update(Message::Navigate(Page::Settings));
-    assert_eq!(app.page, Page::Settings);
+    assert_eq!(app.page, Page::Chat, "Settings must not switch the active page");
+    assert!(app.show_settings_modal, "Settings must open as a modal overlay");
+}
+
+/// The Settings modal and its discard-confirm guard render without panicking
+/// in both the clean and dirty states.
+#[test]
+fn settings_modal_view_renders_in_every_state() {
+    let (mut app, _) = App::new();
+    // Closed: the base page renders.
+    let _ = app.view();
+    // Open, clean.
+    app.show_settings_modal = true;
+    app.settings.settings_dirty = false;
+    let _ = app.view();
+    // Open, dirty, with the guard armed.
+    app.settings.settings_dirty = true;
+    let _ = app.update(Message::CloseSettingsModal);
+    assert!(app.settings_discard_confirm.is_some());
+    let _ = app.view();
+}
+
+/// A clean Settings form closes outright on `CloseSettingsModal`; a dirty one
+/// arms the discard-confirm guard instead, and only the explicit confirm
+/// discards the edits.
+#[test]
+fn close_settings_modal_guards_unsaved_edits() {
+    let (mut app, _) = App::new();
+    app.show_settings_modal = true;
+
+    // Clean form: closes immediately.
+    app.settings.settings_dirty = false;
+    let _ = app.update(Message::CloseSettingsModal);
+    assert!(!app.show_settings_modal);
+    assert!(app.settings_discard_confirm.is_none());
+
+    // Dirty form: the guard is armed, the modal stays open.
+    app.show_settings_modal = true;
+    app.settings.settings_dirty = true;
+    let _ = app.update(Message::CloseSettingsModal);
+    assert!(app.show_settings_modal, "dirty close must not discard silently");
+    assert!(app.settings_discard_confirm.is_some());
+
+    // Cancelling keeps the modal open and clears the guard.
+    let _ = app.update(Message::SettingsDiscardCancelled);
+    assert!(app.show_settings_modal);
+    assert!(app.settings_discard_confirm.is_none());
+
+    // Confirming discards and closes.
+    let _ = app.update(Message::CloseSettingsModal);
+    let _ = app.update(Message::SettingsDiscardConfirmed);
+    assert!(!app.show_settings_modal);
+    assert!(app.settings_discard_confirm.is_none());
+}
+
+/// Confirming a discard must actually discard: it clears every form-owned
+/// dirty flag and re-seeds the config-backed rows from the live config, so the
+/// guard's promise holds and a later Save cannot publish the abandoned
+/// snapshot.
+#[test]
+fn settings_discard_confirmed_resets_flags_and_reseeds_form() {
+    let (mut app, _) = App::new();
+    app.show_settings_modal = true;
+    app.settings.settings_dirty = true;
+    app.settings.relationship_dirty = true;
+    app.settings.project_context_dirty = true;
+    app.settings.global_default_model = Some("discarded/model".into());
+    // A bogus provider row stands in for an abandoned provider edit.
+    app.settings.providers.push(ProviderConfig {
+        id: "discarded".into(),
+        name: "Discarded".into(),
+        ..ProviderConfig::default()
+    });
+
+    let _ = app.update(Message::CloseSettingsModal);
+    let _ = app.update(Message::SettingsDiscardConfirmed);
+
+    assert!(!app.show_settings_modal);
+    assert!(app.settings_discard_confirm.is_none());
+    assert!(!app.settings.settings_dirty, "discard must clear the dirty flag");
+    assert!(!app.settings.relationship_dirty, "discard must clear relationship_dirty");
+    assert!(!app.settings.project_context_dirty, "discard must clear project_context_dirty");
+    assert!(
+        app.settings.providers.iter().all(|p| p.id != "discarded"),
+        "discarded provider rows must be re-seeded from the live config"
+    );
+    let config_default = app
+        .config
+        .as_ref()
+        .and_then(|config| config.model_settings.as_ref())
+        .and_then(|settings| settings.global_default_model.clone());
+    assert_eq!(
+        app.settings.global_default_model, config_default,
+        "the discarded default-model pick must be re-seeded from the live config"
+    );
+}
+
+/// Changing the unified default-model picker is a staged `model_settings`
+/// edit: it must arm the dirty flag so the modal close guard engages and the
+/// footer reports unsaved changes instead of silently dropping the pick.
+#[test]
+fn global_default_model_change_arms_dirty_and_guards_close() {
+    let (mut app, _) = App::new();
+    app.show_settings_modal = true;
+    app.settings.settings_dirty = false;
+
+    let _ = app.update(Message::Settings(SettingsMessage::GlobalDefaultModelChanged(Some(
+        "openai/gpt-4o".into(),
+    ))));
+
+    assert!(app.settings.settings_dirty, "a default-model change must arm the dirty flag");
+    assert_eq!(app.settings.global_default_model.as_deref(), Some("openai/gpt-4o"));
+
+    // The close guard now engages rather than closing silently.
+    let _ = app.update(Message::CloseSettingsModal);
+    assert!(
+        app.show_settings_modal,
+        "a pending default-model pick must not close the modal silently"
+    );
+    assert!(app.settings_discard_confirm.is_some());
 }
 
 /// The read-only Studio runtime snapshot is applied only for the active
@@ -4188,6 +4317,7 @@ fn set_agent_model_persists_and_clears_override() {
     };
     let _ = app.update(Message::SetAgentModel {
         agent_id: agent_id.clone(),
+        provider_id: "test-provider".into(),
         model: "test-model-x".into(),
     });
     assert!(
@@ -4204,8 +4334,11 @@ fn set_agent_model_persists_and_clears_override() {
         Some("gpt-4o-mini"),
         "picking an agent model must leave the Settings global default alone"
     );
-    let _ =
-        app.update(Message::SetAgentModel { agent_id: agent_id.clone(), model: "default".into() });
+    let _ = app.update(Message::SetAgentModel {
+        agent_id: agent_id.clone(),
+        provider_id: String::new(),
+        model: "default".into(),
+    });
     assert!(
         !app.runtime_assignments().iter().any(|a| a.agent_role == agent_id),
         "clearing must drop the assignment"

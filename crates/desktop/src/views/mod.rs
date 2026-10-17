@@ -6,6 +6,7 @@ pub mod diff;
 pub mod harness;
 pub mod memory;
 pub mod memory_graph;
+pub mod model_options;
 pub mod nav;
 pub mod orchestration_studio;
 pub mod quick_panel;
