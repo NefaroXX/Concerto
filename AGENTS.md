@@ -12,7 +12,7 @@ is **no TypeScript/Bun code** despite earlier plans — don't look for it.
 ## Workspace layout (25 crates)
 All members live under `crates/` and depend upward on `concerto-core`.
 - `core` — traits, `EventBus`, `SimplePolicyEngine`, `ToolExecutor`, error taxonomy
-- `providers` — LLM providers + factory/routing: OpenAI, Anthropic, Google, OpenRouter, Ollama, Nvidia NIM, OpenCode Zen
+- `providers` — LLM providers + factory/routing: OpenAI, Anthropic, Google, OpenRouter, Ollama, Nvidia NIM, OpenCode Zen (keyless free tier supported)
 - `orchestrator` — `AgentLoop` (single-agent) + `CoordinatorAgent` (multi-agent, 5 specialists, write gates)
 - `tools` — `VirtualFs` overlay + shell/git tools (all policy-gated)
 - `shell` — typed AI-native command runtime consuming canonical shell profiles
@@ -124,6 +124,20 @@ cargo audit
   (`crates/tools/src/filesystem.rs:450`), and git-stash undo omits untracked
   files (no `-u`; `crates/tools/src/undo.rs:56-57`) — see the ADR-62 amendment
   (2026-10-09). Don't bypass `SimplePolicyEngine` or `VirtualFs`.
+- **OpenCode Zen keyless free tier is a server fingerprint gate** (live-verified
+  2026-10-17), not session registration. Keyless requests must `stream: true`,
+  carry an `opencode/*` `User-Agent`, send dev-tree-format `ses_`/`msg_` identity
+  headers (`x-opencode-session` / `-session-id` / `-request`; one malformed
+  session value → 403 `FreeTierError`, the root cause of the reverted 2026-09-30
+  port), and declare ≥3 tool names drawn **only** from the opencode builtin set
+  (unknown names mixed in fail; schemas are not checked). Mint + gate live in
+  `crates/providers/src/opencode.rs`; `crates/core/src/executor.rs`
+  `resolve_wire_builtin` maps `bash`→`shell` and `read`/`edit`→`filesystem` —
+  **never a general alias mechanism, keep it exactly that small**. Keyless
+  fail-open exists **only** for provider type `opencode` (Zen); `opencode-free`
+  (Go relay) stays fail-closed `CredentialMissing`. Full spec:
+  `/mnt/Temp/zen-free-tier-investigation.md` (mirror into the repo if plans
+  change — prefer in-place facts over a `/tmp` path that may vanish).
 
 ## Key entrypoints (start reading here)
 - Single-agent loop: `crates/orchestrator/src/agent_loop.rs`

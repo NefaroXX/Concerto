@@ -183,6 +183,19 @@ pub fn classify_provider_error(error: &ProviderError) -> RetryDecision {
             reason: "request cancelled".into(),
         },
 
+        // A keyless free-tier refusal is a fingerprint/quota verdict. It is
+        // deliberately non-retryable: the client fingerprint cannot change
+        // within one process, and the anonymous quota is time-windowed (a
+        // backoff would only burn attempts). The relay's `Retry-After`, when
+        // present, is still surfaced as a hint so a caller can hold and retry
+        // after the window if it chooses.
+        ProviderError::FreeTierRefused { retry_after, message, .. } => RetryDecision {
+            retryable: false,
+            class: None,
+            provider_delay: *retry_after,
+            reason: format!("opencode free tier refused: {message}"),
+        },
+
         _ => RetryDecision {
             retryable: false,
             class: None,
@@ -559,6 +572,40 @@ pub fn map_http_error(
             retry_after: None,
             message: format!("API error {status}: {body}"),
         },
+    }
+}
+
+/// Map an HTTP error from an OpenCode relay leg, preserving the anonymous
+/// free-tier causes verbatim.
+///
+/// The generic [`map_http_error`] collapses `401`/`403` to a bare
+/// [`ProviderError::AuthFailure`] (which discards the body) and `429` to a
+/// retryable [`ProviderError::RateLimit`]. For a **keyless** `opencode` call
+/// neither is right: the relay's `403 FreeTierError`, `410 ModelDeprecated`,
+/// and `429` (anonymous per-IP quota) all carry the actionable cause in the
+/// body, and none of them heal on a short backoff. Those statuses therefore
+/// map to [`ProviderError::FreeTierRefused`] with the body preserved.
+///
+/// Every other status, and every authenticated (paid) call, delegates to
+/// [`map_http_error`] unchanged, so paid wire behavior is untouched.
+pub fn map_opencode_http_error(
+    status: StatusCode,
+    body: &str,
+    retry_after: Option<Duration>,
+    keyless: bool,
+) -> ProviderError {
+    if !keyless {
+        return map_http_error(status, body, retry_after);
+    }
+    match status.as_u16() {
+        // The fingerprint gate (403), a retired-but-still-listed free model
+        // (410), and the anonymous quota cap (429) are all free-tier verdicts.
+        403 | 410 | 429 => ProviderError::FreeTierRefused {
+            status: status.as_u16(),
+            retry_after,
+            message: body.to_string(),
+        },
+        _ => map_http_error(status, body, retry_after),
     }
 }
 
@@ -1001,6 +1048,108 @@ mod tests {
             !error.is_throttle_exhaustion(),
             "a network exhaustion must not recover: {error:?}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // OpenCode free-tier HTTP mapping
+    // -----------------------------------------------------------------
+
+    fn http_status(code: u16) -> StatusCode {
+        StatusCode::from_u16(code).expect("a valid test status code")
+    }
+
+    /// Keyless 403 with a `FreeTierError` JSON body maps to `FreeTierRefused`
+    /// with the relay body preserved verbatim.
+    #[test]
+    fn keyless_403_free_tier_body_is_preserved() {
+        let body = r#"{"error":{"type":"FreeTierError","message":"fingerprint mismatch"}}"#;
+        match map_opencode_http_error(http_status(403), body, None, true) {
+            ProviderError::FreeTierRefused { status, retry_after, message } => {
+                assert_eq!(status, 403);
+                assert_eq!(retry_after, None);
+                assert_eq!(message, body, "the relay body must survive verbatim");
+            }
+            other => panic!("expected FreeTierRefused, got {other:?}"),
+        }
+    }
+
+    /// Keyless 410 (deprecated model) and 429 (anonymous quota) both map to
+    /// `FreeTierRefused`; the 429 keeps its `Retry-After` hint.
+    #[test]
+    fn keyless_410_and_429_map_to_free_tier_refused() {
+        match map_opencode_http_error(http_status(410), "ModelDeprecated", None, true) {
+            ProviderError::FreeTierRefused { status, message, .. } => {
+                assert_eq!(status, 410);
+                assert_eq!(message, "ModelDeprecated");
+            }
+            other => panic!("expected FreeTierRefused for 410, got {other:?}"),
+        }
+
+        match map_opencode_http_error(
+            http_status(429),
+            "quota exhausted",
+            Some(Duration::from_secs(42)),
+            true,
+        ) {
+            ProviderError::FreeTierRefused { status, retry_after, .. } => {
+                assert_eq!(status, 429);
+                assert_eq!(retry_after, Some(Duration::from_secs(42)), "the hint survives");
+            }
+            other => panic!("expected FreeTierRefused for 429, got {other:?}"),
+        }
+    }
+
+    /// A keyless status outside the free-tier set delegates to the generic
+    /// mapper unchanged (representative: 400 → non-retryable `HttpStatus`).
+    #[test]
+    fn keyless_other_status_delegates_to_generic_mapper() {
+        match map_opencode_http_error(http_status(400), "bad request", None, true) {
+            ProviderError::HttpStatus { status, message, .. } => {
+                assert_eq!(status, 400);
+                assert!(message.contains("bad request"));
+            }
+            other => panic!("expected the generic HttpStatus mapping, got {other:?}"),
+        }
+    }
+
+    /// A paid (`keyless = false`) 403/429 keeps today's behavior exactly: the
+    /// auth collapse and the retryable `RateLimit`, never `FreeTierRefused`.
+    #[test]
+    fn paid_statuses_delegate_to_generic_mapper() {
+        assert!(
+            matches!(
+                map_opencode_http_error(http_status(403), "forbidden", None, false),
+                ProviderError::AuthFailure
+            ),
+            "a paid 403 must stay AuthFailure"
+        );
+        match map_opencode_http_error(
+            http_status(429),
+            "slow down",
+            Some(Duration::from_secs(3)),
+            false,
+        ) {
+            ProviderError::RateLimit { retry_after } => {
+                assert_eq!(retry_after, Duration::from_secs(3));
+            }
+            other => panic!("a paid 429 must stay RateLimit, got {other:?}"),
+        }
+    }
+
+    /// The classifier arm: `FreeTierRefused` is non-retryable, carries no
+    /// retry class, and surfaces the relay `Retry-After` as the designated
+    /// delay/hint rather than an automatic backoff.
+    #[test]
+    fn free_tier_refused_classifies_non_retryable_with_hint() {
+        let decision = classify_provider_error(&ProviderError::FreeTierRefused {
+            status: 429,
+            retry_after: Some(Duration::from_secs(42)),
+            message: "anonymous quota".into(),
+        });
+        assert!(!decision.retryable, "a free-tier refusal must not auto-retry");
+        assert_eq!(decision.class, None);
+        assert_eq!(decision.provider_delay, Some(Duration::from_secs(42)));
+        assert!(decision.reason.contains("anonymous quota"));
     }
 
     /// Drive a single transient failure through the retry loop with a

@@ -262,7 +262,9 @@ impl App {
                 "Concerto could not load its configuration. Open Settings, configure a provider, and save the settings before starting a task."
                     .to_string(),
             ));
-            self.page = Page::Settings;
+            // Settings is a modal overlay: open it over the current page
+            // instead of switching away from it.
+            self.show_settings_modal = true;
             iced::Task::none()
         }
     }

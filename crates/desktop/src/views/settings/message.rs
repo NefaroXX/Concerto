@@ -341,6 +341,18 @@ pub enum Message {
     /// (`project_context.auto_update_agents_md`).
     ProjectContextNudgeToggled(bool),
 
+    // Part 3 — Advanced coverage. One text-edit and one toggle variant carry
+    // every previously config-file-only knob, keyed by the field enum, so the
+    // section adds two update arms instead of ~30.
+    /// Edit one Advanced text field (value is the raw string buffer).
+    AdvancedFieldChanged(AdvancedField, String),
+    /// Flip one Advanced boolean toggle.
+    AdvancedToggled(AdvancedToggle, bool),
+    /// Change the policy auto-approval window start hour (`0..=23`).
+    AdvancedPolicyTimeWindowStartHour(u8),
+    /// Change the policy auto-approval window end hour (`0..=23`).
+    AdvancedPolicyTimeWindowEndHour(u8),
+
     SaveSettings,
     /// Toggle a collapsible section open/closed.
     #[allow(private_interfaces)]
@@ -363,6 +375,47 @@ pub enum ExtensionTab {
     ProjectContext,
 }
 
+/// A text-editable knob in the Advanced coverage section. One variant per
+/// previously config-file-only string/number field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdvancedField {
+    SessionSpendCapUsd,
+    RetryTimeToFirstByteSeconds,
+    RetryStreamIdleTimeoutSeconds,
+    RetryMaxAttempts,
+    PolicyTimeWindowTimezone,
+    PolicyTimeWindowAutoApproveBelowUsd,
+    MemoryExcludePatterns,
+    MemorySummaryKeepPerSession,
+    MemorySummaryRetentionDays,
+    SkillsMaxChars,
+    ProjectContextMaxBytes,
+    ProjectContextUpdateFrequency,
+    AuditRetentionDays,
+    AuditArchiveDir,
+    ObservabilityPrometheusPort,
+    ObservabilityOtlpEndpoint,
+    ObservabilityLangfuseHost,
+    UpdatesUpdateEndpoint,
+    ContextTriggerTokens,
+    ContextRetainUserTurns,
+    ContextMinimumUserTurns,
+    HarnessCheckpointRetentionDays,
+    HarnessRecallLimit,
+    HarnessVerifySelector,
+}
+
+/// A boolean toggle in the Advanced coverage section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdvancedToggle {
+    GitAutoInit,
+    StrictVerificationGate,
+    PolicyTimeWindowEnabled,
+    AuditEncryptAtRest,
+    UpdatesCheckOnStartup,
+    ContextCacheStablePrefix,
+}
+
 /// Identifies a collapsible section in the Settings view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SectionId {
@@ -377,6 +430,10 @@ pub(crate) enum SectionId {
     /// Unified Extensions hub (ADR-37/43/70): Skills, MCP servers, Plugins,
     /// and project context share one collapsible section with sub-tabs.
     Extensions,
+    /// Additive coverage of previously config-file-only knobs (spend cap,
+    /// tooling, agent gate, recovery timeouts, policy window, memory
+    /// retention, audit/observability/updates/context/harness).
+    Advanced,
 }
 
 impl SectionId {
@@ -386,7 +443,7 @@ impl SectionId {
     /// the Relationships section is currently hidden (`[orchestration]`-gated),
     /// because the resulting fractional offset stays within one section height
     /// either way.
-    pub(crate) const ALL: [SectionId; 9] = [
+    pub(crate) const ALL: [SectionId; 10] = [
         SectionId::Theme,
         SectionId::Providers,
         SectionId::Assignments,
@@ -396,5 +453,6 @@ impl SectionId {
         SectionId::Memory,
         SectionId::Shell,
         SectionId::Extensions,
+        SectionId::Advanced,
     ];
 }

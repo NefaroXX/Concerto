@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **OpenCode Zen keyless free tier.** The `opencode` provider type now builds
+  and streams without an API key against Zen's anonymous free tier
+  (`stream: true`, an `opencode/*` User-Agent, dev-tree-format `ses_`/`msg_`
+  identity headers, and ≥3 opencode builtin tool names mapped onto the native
+  shell/filesystem tools). A refused keyless request surfaces as non-retryable
+  `FreeTierRefused` with the relay body preserved; `opencode-free` (Go) and other
+  providers stay credential-required, and the paid path is unchanged.
 - Optional provider cache usage and durable per-attempt telemetry, audit-backed
   benchmark accounting, shared desktop/CLI session cache reports, versioned
   reporting prices, and opt-in stable Anthropic prompt-cache boundaries.

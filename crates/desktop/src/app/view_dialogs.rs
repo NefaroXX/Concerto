@@ -22,6 +22,8 @@ use super::*;
 // prelude's `column!` (Rust 1.96), which otherwise collide as ambiguous.
 use iced::widget::column;
 
+use crate::widgets::confirm_modal::ConfirmMessage;
+
 impl App {
     /// V6 — system-level dialogs (shown above subviews): exactly one modal
     /// card (or none) stacked over `after_subview`, in priority order.
@@ -30,7 +32,25 @@ impl App {
         after_subview: Element<'a, Message>,
     ) -> Element<'a, Message> {
         // ── System-level dialogs (shown above subviews) ──
-        if let Some(pending) = &self.pending_root_consent {
+        // Topmost: the unsaved-changes guard armed while closing a dirty
+        // Settings modal. It is a small centered confirm card over a dimmed
+        // backdrop; confirming discards the edits and closes Settings.
+        if let Some(confirm) = &self.settings_discard_confirm {
+            let backdrop = container(confirm.view().map(|message| match message {
+                ConfirmMessage::Confirm => Message::SettingsDiscardConfirmed,
+                ConfirmMessage::Cancel => Message::SettingsDiscardCancelled,
+            }))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_theme: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(iced::Color {
+                    a: 0.55,
+                    ..self.current_theme.palette.background
+                })),
+                ..container::Style::default()
+            });
+            stack![after_subview, backdrop].into()
+        } else if let Some(pending) = &self.pending_root_consent {
             // ADR-44 §4 consent gate: top of the system-dialog stack so it
             // blocks all interaction until the user decides. Composed via
             // the same pattern as the Memory modal (PR #120): a centered
@@ -261,6 +281,64 @@ impl App {
                 .height(Length::Fill)
                 .center_x(Length::Fill)
                 .center_y(Length::Fill)
+                .style(|_theme: &iced::Theme| container::Style {
+                    background: Some(iced::Background::Color(iced::Color {
+                        a: 0.55,
+                        ..self.current_theme.palette.background
+                    })),
+                    ..container::Style::default()
+                });
+            stack![after_subview, backdrop].into()
+        } else if self.show_settings_modal {
+            // Settings modal (ADR-57 §3d): the same `settings::State::view`
+            // page body, hosted as a centered overlay card instead of a page
+            // switch, so opening it never abandons in-progress chat/studio
+            // work. A dirty form shows an "Unsaved changes" badge; closing via
+            // ✕ / Esc / backdrop arms the discard guard above.
+            let hide_relationships =
+                self.config.as_ref().is_some_and(orchestration_hides_relationships);
+            let dirty = self.settings.settings_dirty;
+            let header = row![
+                text("Settings").size(18).width(Length::Fill),
+                if dirty {
+                    text("Unsaved changes").size(12).color(self.current_theme.palette.warning)
+                } else {
+                    text("").size(12)
+                },
+                button(text("✕").size(14))
+                    .style(crate::ui::button::secondary)
+                    .on_press(Message::CloseSettingsModal),
+            ]
+            .spacing(12)
+            .align_y(iced::Alignment::Center);
+            let body = container(
+                self.settings.view(&self.current_theme, hide_relationships).map(Message::Settings),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill);
+            let modal =
+                container(column![header, body].spacing(12).padding(16).width(Length::Fill))
+                    .width(Length::Fill)
+                    .max_width(860.0)
+                    .height(Length::FillPortion(2))
+                    .style(crate::ui::container::modal);
+            // The dim layer is a `mouse_area` stacked *under* the card, so a
+            // click on empty backdrop space closes the modal while clicks on
+            // the card itself do not fall through.
+            let dim = mouse_area(
+                container(iced::widget::space::Space::new())
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            )
+            .on_press(Message::CloseSettingsModal);
+            let centered_card = container(modal)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill);
+            let backdrop = container(stack![dim, centered_card])
+                .width(Length::Fill)
+                .height(Length::Fill)
                 .style(|_theme: &iced::Theme| container::Style {
                     background: Some(iced::Background::Color(iced::Color {
                         a: 0.55,

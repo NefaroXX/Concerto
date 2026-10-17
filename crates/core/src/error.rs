@@ -286,6 +286,30 @@ pub enum ProviderError {
         /// The missing capability (always `"tool_calling"` today).
         capability: String,
     },
+
+    /// An anonymous (keyless) OpenCode Zen request was refused by the relay.
+    ///
+    /// The Zen free tier is a courtesy, keyless endpoint gated by a
+    /// client-fingerprint check (session-id format, accepted `User-Agent`, a
+    /// streaming tool-bearing body). The relay can refuse a request with
+    /// `403 FreeTierError` (fingerprint mismatch), `410 ModelDeprecated` (a
+    /// retired free model still listed in the catalog), or `429` (anonymous
+    /// per-IP quota exhausted). None of these heal on a short retry — the
+    /// fingerprint does not change and the quota is time-windowed — so this is
+    /// deliberately non-transient. The relay's own body text carries the
+    /// actionable cause and is preserved verbatim rather than collapsing to a
+    /// bare [`Self::AuthFailure`]. Configure a real credential to use the paid
+    /// tier.
+    #[error("opencode free tier refused the request (HTTP {status}): {message}")]
+    FreeTierRefused {
+        /// HTTP status from the relay (403 fingerprint gate, 410 deprecated
+        /// model, 429 anonymous quota).
+        status: u16,
+        /// Relay `Retry-After` hint when one was present (429 quota windows).
+        retry_after: Option<Duration>,
+        /// Relay response body text, preserved verbatim for the user.
+        message: String,
+    },
 }
 
 impl ProviderError {
@@ -315,6 +339,10 @@ impl ProviderError {
             // A capability refusal is a permanent wire-path fact — retrying
             // cannot add a capability the path lacks (ADR-66).
             ProviderError::CapabilityRefused { .. } => false,
+            // A keyless free-tier refusal is a fingerprint/quota verdict, not
+            // a transient fault: the fingerprint will not change and the
+            // anonymous quota is time-windowed, so backoff cannot help.
+            ProviderError::FreeTierRefused { .. } => false,
             // Everything below here is configuration, auth, or cancellation
             ProviderError::NotConfigured
             | ProviderError::CredentialMissing { .. }
@@ -348,6 +376,7 @@ impl ProviderError {
         match self {
             ProviderError::RateLimit { retry_after } => Some(*retry_after),
             ProviderError::HttpStatus { retry_after, .. } => *retry_after,
+            ProviderError::FreeTierRefused { retry_after, .. } => *retry_after,
             ProviderError::RetryExhausted { retry_after, .. } => *retry_after,
             _ => None,
         }
