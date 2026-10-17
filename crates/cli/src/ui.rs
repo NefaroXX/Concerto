@@ -40,14 +40,13 @@ fn draw_runtime_inspector(frame: &mut Frame, app: &App) {
     let inner = block.inner(frame.area());
     frame.render_widget(block, frame.area());
     let evidence_view = app.runtime_inspector.view == crate::dispatch::runtime::View::Evidence;
-    let areas =
-        Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(u16::from(evidence_view)),
-            Constraint::Min(1),
-            Constraint::Length(2),
-        ])
-            .split(inner);
+    let areas = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(u16::from(evidence_view)),
+        Constraint::Min(1),
+        Constraint::Length(2),
+    ])
+    .split(inner);
     let inspector = &app.runtime_inspector;
     let heading = format!("{}/7 {}", inspector.view.index() + 1, inspector.view.label());
     frame.render_widget(
@@ -56,7 +55,12 @@ fn draw_runtime_inspector(frame: &mut Frame, app: &App) {
     );
     if evidence_view {
         let selected = match inspector.evidence.selected() {
-            Some(id) => format!("{}/{} {}", inspector.evidence.index + 1, inspector.evidence.ids.len(), serde_json::json!(id)),
+            Some(id) => format!(
+                "{}/{} {}",
+                inspector.evidence.index + 1,
+                inspector.evidence.ids.len(),
+                serde_json::json!(id)
+            ),
             None => "No event references".into(),
         };
         frame.render_widget(
@@ -1755,7 +1759,8 @@ mod tests {
             app.runtime_inspector.select_view(crate::dispatch::runtime::View::Evidence);
             app.runtime_inspector.evidence.ids = vec!["event-1".into(), "event-2".into()];
             app.runtime_inspector.evidence.index = 1;
-            app.runtime_inspector.evidence.text = Some(format!("Stored event\n{}End of payload", "line\n".repeat(50)));
+            app.runtime_inspector.evidence.text =
+                Some(format!("Stored event\n{}End of payload", "line\n".repeat(50)));
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal.draw(|frame| super::draw(frame, &app)).unwrap();
             let text = buffer_text(&terminal);

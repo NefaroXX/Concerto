@@ -290,7 +290,9 @@ fn runtime_inspection_reads_saved_state_while_another_frontend_holds_the_lock() 
     assert_eq!(value["event"]["session_id"], id);
     assert_eq!(value["event"]["payload"]["nested"]["exit_code"], 0);
     assert_eq!(value["event"]["causation"], "prior-event");
-    assert!(fixture.success(&["sessions", "runtime", &id, "--event", "my-evidence"]).contains("full stored evidence"));
+    assert!(fixture
+        .success(&["sessions", "runtime", &id, "--event", "my-evidence"])
+        .contains("full stored evidence"));
     for event_id in ["missing", "foreign-evidence"] {
         let output = fixture.success(&["sessions", "runtime", &id, "--event", event_id, "--json"]);
         let value: serde_json::Value = serde_json::from_str(&output).unwrap();

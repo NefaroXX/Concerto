@@ -885,18 +885,43 @@ mod tests {
             load_session_event(&pool, "session-1", "evidence-1", cancel.clone()).await.unwrap(),
             Some(stored.clone())
         );
-        assert!(load_session_event(&pool, "session-2", "evidence-1", cancel.clone()).await.unwrap().is_none());
-        assert!(load_session_event(&pool, "session-1", "missing", cancel.clone()).await.unwrap().is_none());
-        assert!(load_session_event(&pool, "session-1", "' OR 1=1 --", cancel.clone()).await.unwrap().is_none());
+        assert!(load_session_event(&pool, "session-2", "evidence-1", cancel.clone())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(load_session_event(&pool, "session-1", "missing", cancel.clone())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(load_session_event(&pool, "session-1", "' OR 1=1 --", cancel.clone())
+            .await
+            .unwrap()
+            .is_none());
         // A malformed foreign row must not even be decoded by the lookup.
         sqlx::query("UPDATE whiteboard_events SET payload = 'invalid' WHERE event_id = ?")
-            .bind("evidence-1").execute(&pool).await.unwrap();
-        assert!(load_session_event(&pool, "session-2", "evidence-1", cancel.clone()).await.unwrap().is_none());
-        assert!(load_session_event(&pool, "session-1", "evidence-1", cancel.clone()).await.is_err());
+            .bind("evidence-1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(load_session_event(&pool, "session-2", "evidence-1", cancel.clone())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(load_session_event(&pool, "session-1", "evidence-1", cancel.clone())
+            .await
+            .is_err());
         sqlx::query("UPDATE whiteboard_events SET payload = ? WHERE event_id = ?")
-            .bind(stored.payload.to_string()).bind("evidence-1").execute(&pool).await.unwrap();
+            .bind(stored.payload.to_string())
+            .bind("evidence-1")
+            .execute(&pool)
+            .await
+            .unwrap();
         cancel.cancel();
-        assert!(load_session_event(&pool, "session-1", "evidence-1", cancel).await.unwrap_err().to_string().contains("cancelled"));
+        assert!(load_session_event(&pool, "session-1", "evidence-1", cancel)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled"));
         assert_eq!(load_whiteboard_event(&pool, "evidence-1").await.unwrap(), stored);
         pool.close().await;
     }

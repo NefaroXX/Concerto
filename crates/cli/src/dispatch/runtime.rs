@@ -68,7 +68,8 @@ fn parse_args(args: &[String]) -> anyhow::Result<Options> {
     let id = args.first().ok_or_else(|| anyhow::anyhow!(USAGE))?;
     let session_id =
         id.parse().map_err(|_| anyhow::anyhow!("invalid session id '{id}'; {USAGE}"))?;
-    let mut options = Options { session_id, view: View::All, limit: DEFAULT_LIMIT, json: false, event_id: None };
+    let mut options =
+        Options { session_id, view: View::All, limit: DEFAULT_LIMIT, json: false, event_id: None };
     let mut checkpoint_options = false;
     let mut index = 1;
     while index < args.len() {
@@ -76,7 +77,9 @@ fn parse_args(args: &[String]) -> anyhow::Result<Options> {
             "--json" => options.json = true,
             "--event" => {
                 index += 1;
-                let value = args.get(index).filter(|id| !id.trim().is_empty() && !id.starts_with("--"))
+                let value = args
+                    .get(index)
+                    .filter(|id| !id.trim().is_empty() && !id.starts_with("--"))
                     .ok_or_else(|| anyhow::anyhow!("--event requires an event id; {USAGE}"))?;
                 if options.event_id.is_some() {
                     anyhow::bail!("--event may only be supplied once; {USAGE}");
@@ -367,7 +370,13 @@ impl RuntimeInspector {
         let (Some(snapshot), Some(session_id)) = (&self.snapshot, self.session_id) else {
             return;
         };
-        let options = Options { session_id, view: self.view, limit: DEFAULT_LIMIT, json: false, event_id: None };
+        let options = Options {
+            session_id,
+            view: self.view,
+            limit: DEFAULT_LIMIT,
+            json: false,
+            event_id: None,
+        };
         self.text = render_text(&report(snapshot, &options))
             .unwrap_or_else(|error| format!("Runtime inspection unavailable: {error}"));
     }
@@ -459,8 +468,13 @@ mod tests {
             }),
             ..StudioRuntimeSnapshot::default()
         };
-        let options =
-            Options { session_id: Ulid::new(), view: View::Diagnoses, limit: 1, json: true, event_id: None };
+        let options = Options {
+            session_id: Ulid::new(),
+            view: View::Diagnoses,
+            limit: 1,
+            json: true,
+            event_id: None,
+        };
         let value = report(&snapshot, &options);
         assert_eq!(value["totals"]["diagnoses"], 2);
         assert_eq!(value["data"]["diagnoses"].as_array().unwrap().len(), 1);

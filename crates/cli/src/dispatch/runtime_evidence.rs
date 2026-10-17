@@ -68,9 +68,13 @@ pub(crate) struct EvidenceDetails {
 impl EvidenceDetails {
     pub(super) fn new(session_id: Ulid, store: Arc<dyn SessionStore>) -> Self {
         Self {
-            ids: Vec::new(), index: 0, text: None,
-            session_id: Some(session_id), store: Some(store),
-            cancel: CancellationToken::new(), receiver: None,
+            ids: Vec::new(),
+            index: 0,
+            text: None,
+            session_id: Some(session_id),
+            store: Some(store),
+            cancel: CancellationToken::new(),
+            receiver: None,
         }
     }
 
@@ -101,7 +105,8 @@ impl EvidenceDetails {
             return;
         };
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            self.text = Some("Evidence inspection is unavailable outside the terminal runtime.".into());
+            self.text =
+                Some("Evidence inspection is unavailable outside the terminal runtime.".into());
             return;
         };
         self.text = Some(format!("Loading evidence {}…", json!(event_id)));
@@ -129,7 +134,9 @@ impl EvidenceDetails {
         let result = match receiver.try_recv() {
             Ok(result) => result,
             Err(mpsc::TryRecvError::Empty) => return,
-            Err(mpsc::TryRecvError::Disconnected) => Err("Evidence load interrupted; press r to retry.".into()),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("Evidence load interrupted; press r to retry.".into())
+            }
         };
         self.receiver = None;
         self.text = Some(match result {
@@ -161,10 +168,14 @@ mod tests {
         let snapshot = StudioRuntimeSnapshot {
             world_model: Some(WorldModel {
                 facts: vec![WorldFact {
-                    ref_id: "fact".into(), label: "not-an-event-id".into(),
-                    status: FactStatus::Contradicted, artifact: None, seq: 2,
+                    ref_id: "fact".into(),
+                    label: "not-an-event-id".into(),
+                    status: FactStatus::Contradicted,
+                    artifact: None,
+                    seq: 2,
                     grounded_by: vec!["grounding".into(), "fact".into(), "".into()],
-                    contradicted_by: Some("contradiction".into()), contradicted_exit_code: Some(1),
+                    contradicted_by: Some("contradiction".into()),
+                    contradicted_exit_code: Some(1),
                 }],
                 ..WorldModel::default()
             }),
@@ -204,11 +215,19 @@ mod tests {
     #[test]
     fn report_preserves_payload_provenance_and_escapes_terminal_controls() {
         let event = WhiteboardEvent {
-            event_id: "event-1".into(), gate_seq: 12, agent_id: "coder".into(), agent_seq: 3,
-            kind: concerto_sessions::WhiteboardKind::Finding, scope: "src".into(),
-            session_id: Some("session".into()), plan_id: Some("plan".into()),
-            causation: Some("event-0".into()), payload: json!({"text": "\u{1b}[31m\nresult"}),
-            content_hash: "hash".into(), pre_image_hash: None, created_at: 42,
+            event_id: "event-1".into(),
+            gate_seq: 12,
+            agent_id: "coder".into(),
+            agent_seq: 3,
+            kind: concerto_sessions::WhiteboardKind::Finding,
+            scope: "src".into(),
+            session_id: Some("session".into()),
+            plan_id: Some("plan".into()),
+            causation: Some("event-0".into()),
+            payload: json!({"text": "\u{1b}[31m\nresult"}),
+            content_hash: "hash".into(),
+            pre_image_hash: None,
+            created_at: 42,
         };
         let value = report(Ulid::new(), "event-1", Some(event.clone()));
         assert_eq!(value["event"], json!(event));
