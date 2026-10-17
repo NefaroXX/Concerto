@@ -51,7 +51,7 @@ installer packages.
   failures retried with context; exhausted bounded subtask/tool work reported as blocked
   or partially complete instead of a generic internal error.
 - **Providers:** OpenAI, Anthropic, Google Gemini, OpenRouter, Ollama, NVIDIA NIM,
-  OpenCode Zen / OpenCode Zen (free), and a config-first catalog of
+  OpenCode Zen / OpenCode Zen (Go relay), and a config-first catalog of
   OpenAI-compatible providers (23 provider ids) through a shared streaming
   interface.
 - **Routing:** explicit role assignments and model overrides; otherwise

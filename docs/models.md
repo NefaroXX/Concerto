@@ -16,7 +16,7 @@ tests credentials and discovers models where a provider supports discovery.
 | `nim` | NVIDIA NIM |
 | `ollama` | Local or remote Ollama |
 | `opencode` | OpenCode Zen |
-| `opencode-free` | OpenCode Zen (free) — the Go relay, static catalog, no model discovery |
+| `opencode-free` | OpenCode Zen (Go relay) — static catalog, no model discovery |
 | `deepseek` | DeepSeek |
 | `groq` | Groq |
 | `together` | Together AI |

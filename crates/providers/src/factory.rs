@@ -1648,7 +1648,7 @@ mod tests {
     fn uncredentialed_opencode_free_config() -> ProviderConfig {
         ProviderConfig {
             id: "opencode-free-main".into(),
-            name: "OpenCode Zen (free)".into(),
+            name: "OpenCode Zen (Go relay)".into(),
             provider: "opencode-free".into(),
             model: "minimax-m3".into(),
             keyring_key: "test-uncredentialed-opencode-free/api_key".into(),

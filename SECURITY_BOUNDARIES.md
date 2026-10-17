@@ -151,7 +151,7 @@ base and model behavior.
 
 Supported provider implementations are the 23 ids registered in
 `PROVIDER_TYPE_IDS`: OpenAI, Anthropic, Google, OpenRouter, Ollama, NVIDIA NIM,
-OpenCode Zen, OpenCode Zen (free), and the OpenAI-compatible catalog
+OpenCode Zen, OpenCode Zen (Go relay), and the OpenAI-compatible catalog
 (DeepSeek, Groq, Together, Mistral, xAI, Fireworks, Cerebras, Cohere,
 DeepInfra, Perplexity, SambaNova, DashScope, Moonshot, Zhipu, Novita).
 OpenAI-compatible proxies may differ in streaming/tool-call behavior; protocol

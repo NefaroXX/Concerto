@@ -151,7 +151,7 @@ See [Multi-agent Collaboration](agent-collaboration.md).
 `LlmProvider` defines provider identity, streaming completion, connection
 testing, and model metadata. `concerto-providers` implements a config-first
 factory (`factory.rs`) covering OpenAI, Anthropic, Google, OpenRouter, Ollama,
-NVIDIA NIM, OpenCode Zen, OpenCode Zen (free), and a catalog of
+NVIDIA NIM, OpenCode Zen, OpenCode Zen (Go relay), and a catalog of
 OpenAI-compatible providers (DeepSeek, Groq, Together, Mistral, xAI, Fireworks,
 Cerebras, Cohere, DeepInfra, Perplexity, SambaNova, DashScope, Moonshot, Zhipu,
 Novita). It also
