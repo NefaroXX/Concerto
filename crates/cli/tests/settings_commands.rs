@@ -248,6 +248,15 @@ fn runtime_inspection_reads_saved_state_while_another_frontend_holds_the_lock() 
             .bind(&id).execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO orchestration_checkpoints (session_id, run_id, root_task_id, project_id, objective_hash, schema_version, sequence_num, state_json, completed, updated_at) VALUES (?, ?, ?, 'test', 'test', 4, 1, ?, 0, 1)")
             .bind(&id).bind(&id).bind(&id).bind(&state).execute(&pool).await.unwrap();
+        for (event_id, session_id) in [("my-evidence", id.clone()), ("foreign-evidence", ulid::Ulid::new().to_string())] {
+            concerto_sessions::whiteboard::append_whiteboard_event(&pool, &concerto_sessions::NewWhiteboardEvent {
+                event_id: event_id.into(), agent_id: "coder".into(),
+                kind: concerto_sessions::WhiteboardKind::Finding, scope: "src/lib.rs".into(),
+                session_id: Some(session_id), plan_id: None, causation: Some("prior-event".into()),
+                payload: serde_json::json!({"detail": "full stored evidence", "nested": {"exit_code": 0}}),
+                pre_image_hash: None, created_at: 123,
+            }).await.unwrap();
+        }
         pool.close().await;
     });
     let _lock = concerto_core::lock::acquire_data_dir_lock(
@@ -274,6 +283,21 @@ fn runtime_inspection_reads_saved_state_while_another_frontend_holds_the_lock() 
     let value: serde_json::Value = serde_json::from_str(&output).unwrap();
     assert_eq!(value["data"].as_object().unwrap().len(), 1);
     assert!(fixture.success(&["sessions", "runtime", &id]).contains("World model"));
+    let output = fixture.success(&["sessions", "runtime", &id, "--event", "my-evidence", "--json"]);
+    let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(value["found"], true);
+    assert_eq!(value["source"], "whiteboard_event");
+    assert_eq!(value["event"]["session_id"], id);
+    assert_eq!(value["event"]["payload"]["nested"]["exit_code"], 0);
+    assert_eq!(value["event"]["causation"], "prior-event");
+    assert!(fixture.success(&["sessions", "runtime", &id, "--event", "my-evidence"]).contains("full stored evidence"));
+    for event_id in ["missing", "foreign-evidence"] {
+        let output = fixture.success(&["sessions", "runtime", &id, "--event", event_id, "--json"]);
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["found"], false);
+        assert!(value["event"].is_null());
+        assert!(!output.contains("full stored evidence"));
+    }
     assert!(!fixture.command(&["sessions", "runtime", &id, "--limit", "0"]).status.success());
     let unknown = ulid::Ulid::new().to_string();
     assert!(!fixture.command(&["sessions", "runtime", &unknown, "--json"]).status.success());

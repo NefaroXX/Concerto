@@ -1,5 +1,8 @@
 //! Portable Coordinator inspection, shared by command mode and the TUI.
 
+#[path = "runtime_evidence.rs"]
+mod evidence;
+
 use std::cell::Cell;
 use std::sync::{mpsc, Arc};
 
@@ -10,7 +13,7 @@ use concerto_orchestrator::studio_runtime::{
 use concerto_sessions::SessionStore;
 use serde_json::{json, Value};
 
-const USAGE: &str = "usage: concerto sessions runtime <session-id> [--view all|topology|decisions|evidence|world|diagnoses|suitability] [--limit 1..1000] [--json]";
+const USAGE: &str = "usage: concerto sessions runtime <session-id> [--view all|topology|decisions|evidence|world|diagnoses|suitability] [--limit 1..1000] [--json]\n       concerto sessions runtime <session-id> --event <event-id> [--json]";
 const DEFAULT_LIMIT: usize = 50;
 const SOURCE_NOTE: &str = "Persisted checkpoint; refresh to reload. This is not live run state.\nCompleted or cleared checkpoints may be unavailable.";
 
@@ -58,18 +61,30 @@ struct Options {
     view: View,
     limit: usize,
     json: bool,
+    event_id: Option<String>,
 }
 
 fn parse_args(args: &[String]) -> anyhow::Result<Options> {
     let id = args.first().ok_or_else(|| anyhow::anyhow!(USAGE))?;
     let session_id =
         id.parse().map_err(|_| anyhow::anyhow!("invalid session id '{id}'; {USAGE}"))?;
-    let mut options = Options { session_id, view: View::All, limit: DEFAULT_LIMIT, json: false };
+    let mut options = Options { session_id, view: View::All, limit: DEFAULT_LIMIT, json: false, event_id: None };
+    let mut checkpoint_options = false;
     let mut index = 1;
     while index < args.len() {
         match args[index].as_str() {
             "--json" => options.json = true,
+            "--event" => {
+                index += 1;
+                let value = args.get(index).filter(|id| !id.trim().is_empty() && !id.starts_with("--"))
+                    .ok_or_else(|| anyhow::anyhow!("--event requires an event id; {USAGE}"))?;
+                if options.event_id.is_some() {
+                    anyhow::bail!("--event may only be supplied once; {USAGE}");
+                }
+                options.event_id = Some(value.clone());
+            }
             "--view" | "--limit" => {
+                checkpoint_options = true;
                 let flag = args[index].as_str();
                 index += 1;
                 let value = args
@@ -98,6 +113,9 @@ fn parse_args(args: &[String]) -> anyhow::Result<Options> {
         }
         index += 1;
     }
+    if options.event_id.is_some() && checkpoint_options {
+        anyhow::bail!("--event cannot be combined with --view or --limit; {USAGE}");
+    }
     Ok(options)
 }
 
@@ -108,7 +126,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<()> {
     }
     let options = parse_args(args)?;
     let rt = tokio::runtime::Runtime::new()?;
-    let snapshot = rt.block_on(async {
+    let report = rt.block_on(async {
         let cancel = CancellationToken::new();
         tokio::select! {
             result = async {
@@ -116,8 +134,13 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<()> {
                 if store.load_session(options.session_id, cancel.clone()).await?.is_none() {
                     anyhow::bail!("session {} not found", options.session_id);
                 }
+                if let Some(event_id) = &options.event_id {
+                    let event = store.load_evidence_event(options.session_id, event_id, cancel.clone()).await?;
+                    return Ok::<_, anyhow::Error>(evidence::report(options.session_id, event_id, event));
+                }
                 let reader = CheckpointStudioRuntimeReader::new(store);
-                Ok::<_, anyhow::Error>(reader.load(options.session_id, cancel.clone()).await?)
+                let snapshot = reader.load(options.session_id, cancel.clone()).await?;
+                Ok::<_, anyhow::Error>(report(&snapshot, &options))
             } => result,
             _ = tokio::signal::ctrl_c() => {
                 cancel.cancel();
@@ -125,9 +148,10 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<()> {
             }
         }
     })?;
-    let report = report(&snapshot, &options);
     if options.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if options.event_id.is_some() {
+        println!("{}", evidence::render_report(&report)?);
     } else {
         println!("{}", render_text(&report)?);
     }
@@ -239,6 +263,7 @@ fn render_text(report: &Value) -> anyhow::Result<String> {
 /// One cancellable, non-blocking TUI load. A refresh drops the previous
 /// receiver, so late results can never overwrite a newer session's view.
 pub(crate) struct RuntimeInspector {
+    pub(crate) evidence: evidence::EvidenceDetails,
     pub(crate) text: String,
     pub(crate) scroll: u16,
     pub(crate) max_scroll: Cell<u16>,
@@ -253,6 +278,7 @@ pub(crate) struct RuntimeInspector {
 impl Default for RuntimeInspector {
     fn default() -> Self {
         Self {
+            evidence: evidence::EvidenceDetails::default(),
             text: "No active session. Start or resume a session to inspect it.".into(),
             scroll: 0,
             max_scroll: Cell::new(0),
@@ -274,6 +300,7 @@ impl RuntimeInspector {
         self.view = view;
         let (Some(id), Some(store)) = (session_id, store) else { return };
         self.session_id = Some(id);
+        self.evidence = evidence::EvidenceDetails::new(id, store.clone());
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             self.text = "Runtime inspection is unavailable outside the terminal runtime.".into();
             return;
@@ -303,6 +330,7 @@ impl RuntimeInspector {
                     self.receiver = None;
                     match result {
                         Ok(snapshot) => {
+                            self.evidence.set_snapshot(&snapshot);
                             self.snapshot = Some(snapshot);
                             self.render_snapshot();
                         }
@@ -318,9 +346,11 @@ impl RuntimeInspector {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
+        self.evidence.poll();
     }
 
     pub(crate) fn select_view(&mut self, view: View) {
+        self.evidence.close();
         self.view = view;
         self.scroll = 0;
         self.max_scroll.set(0);
@@ -337,13 +367,22 @@ impl RuntimeInspector {
         let (Some(snapshot), Some(session_id)) = (&self.snapshot, self.session_id) else {
             return;
         };
-        let options = Options { session_id, view: self.view, limit: DEFAULT_LIMIT, json: false };
+        let options = Options { session_id, view: self.view, limit: DEFAULT_LIMIT, json: false, event_id: None };
         self.text = render_text(&report(snapshot, &options))
             .unwrap_or_else(|error| format!("Runtime inspection unavailable: {error}"));
     }
 
     pub(crate) fn scroll_down(&mut self, rows: u16) {
         self.scroll = self.scroll.saturating_add(rows).min(self.max_scroll.get());
+    }
+
+    pub(crate) fn display_text(&self) -> &str {
+        self.evidence.text.as_deref().unwrap_or(&self.text)
+    }
+
+    pub(crate) fn reset_scroll(&mut self) {
+        self.scroll = 0;
+        self.max_scroll.set(0);
     }
 }
 
@@ -376,6 +415,12 @@ mod tests {
             vec![&id, "--view", "live"],
             vec![&id, "--unknown"],
             vec![&id, "extra"],
+            vec![&id, "--event"],
+            vec![&id, "--event", ""],
+            vec![&id, "--event", "--json"],
+            vec![&id, "--event", "first", "--event", "second"],
+            vec![&id, "--event", "event-1", "--view", "all"],
+            vec![&id, "--limit", "1", "--event", "event-1"],
         ] {
             assert!(parse_args(&args(&values)).is_err(), "{values:?}");
         }
@@ -384,6 +429,9 @@ mod tests {
         assert!(options.json);
         assert_eq!(options.view, View::World);
         assert_eq!(options.limit, 3);
+        let options = parse_args(&args(&[&id, "--event", "event-1", "--json"])).unwrap();
+        assert_eq!(options.event_id.as_deref(), Some("event-1"));
+        assert!(options.json);
     }
 
     #[test]
@@ -412,7 +460,7 @@ mod tests {
             ..StudioRuntimeSnapshot::default()
         };
         let options =
-            Options { session_id: Ulid::new(), view: View::Diagnoses, limit: 1, json: true };
+            Options { session_id: Ulid::new(), view: View::Diagnoses, limit: 1, json: true, event_id: None };
         let value = report(&snapshot, &options);
         assert_eq!(value["totals"]["diagnoses"], 2);
         assert_eq!(value["data"]["diagnoses"].as_array().unwrap().len(), 1);

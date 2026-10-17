@@ -71,11 +71,22 @@ These are real gaps, not GUI-only exclusions.
 |---|---|---|
 | Done on current dev | Staged change review | TUI unified diff and accept/reject through the shared overlay; narrow-terminal checks |
 | P1 | Live Coordinator pause/resume/decisions | Same in-process control handles and checkpoint semantics; cross-process control requires a shared authenticated API |
-| Partial | Runtime Studio inspection | Checkpoint topology, world model, decisions, evidence references, diagnoses and suitability have text/JSON and selectable TUI views. Full evidence-event drill-down and live state remain. |
+| Partial | Runtime Studio inspection | Checkpoint topology, world model, decisions, evidence references, diagnoses and suitability have text/JSON and selectable TUI views. Full evidence records are available through `--event ID` and the TUI reference picker. Live state remains. |
 | P2 | Rich memory explorer | Search/detail/delete through the shared memory service; graph/explain commands cover only part of Desktop |
 | P2 | Structured TUI editors | Roster/provider/policy/MCP inspectors and multiline prompts backed by validated command services |
 | P2 | Editor operations | File/context selection, search, diagnostics, patch/review, attachments and external-editor integration |
 | P2 | Terminal workflow | Launch selected profile with the same toolchain/environment; only terminal-page layout is exempt |
+
+### Evidence record inspection (2026-10-17)
+
+`sessions runtime ID --event EVENT_ID [--json]` and the TUI evidence picker
+resolve full durable log records through a shared, cancellable, session-scoped
+lookup. Missing or foreign-session IDs are explicit empty results. Lookup does
+not alter checkpoints, approvals, or verification state. The TUI cancels and
+discards old results when the user navigates away. Validation includes scoped
+reads, missing/malformed records, cancellation, payload/provenance preservation,
+held-lock command execution, and narrow-terminal rendering. CI status is
+recorded in the PR; live Coordinator controls remain separate work.
 
 ### Runtime inspection navigation (2026-10-16)
 

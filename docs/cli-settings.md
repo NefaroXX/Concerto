@@ -145,6 +145,7 @@ concerto sessions runtime SESSION_ID --view diagnoses
 concerto sessions runtime SESSION_ID --view suitability
 concerto sessions runtime SESSION_ID --view topology --json
 concerto sessions runtime SESSION_ID --view evidence
+concerto sessions runtime SESSION_ID --event EVENT_ID --json
 ```
 
 Open the TUI inspector with **F1, then i** (or **Esc, then i**) for the active
@@ -154,6 +155,13 @@ Switching views reuses the loaded checkpoint; `r` reloads it and keeps the
 selected view. Use Up/Down or `j/k` to scroll, Page Up/Down to move one visible
 page, Home/End to reach the start/end, and Esc to return to chat. Scrolling is
 clamped to the report, including after terminal resize.
+
+In the evidence view, `[` and `]` select a referenced event and Enter opens its
+full stored record. The picker deduplicates and sorts decision citations,
+fact/grounding/contradiction IDs, and artifact/question references. The selected
+ID stays visible above the detail. Esc returns to the reference view; `r` reloads
+an open event. Closing, changing selection/view/session, or refreshing cancels
+the previous lookup so late results cannot replace the new selection.
 
 Both frontends use the shared checkpoint projection and suitability ranking.
 This shows **persisted checkpoint data**, not live Coordinator state; completed
@@ -176,6 +184,16 @@ is currently running. Evidence links include fact summaries with their original
 status, grounding and contradiction references, artifact/question references,
 and decision citations. These are checkpoint references; full whiteboard event
 bodies are not loaded or independently verified by this view.
+
+Use `--event EVENT_ID` (without `--view` or `--limit`) to resolve a full record
+on demand. It reads the durable whiteboard event log through the same read-only
+connection, scoped to `SESSION_ID`. JSON returns `source: "whiteboard_event"`,
+`found`, and `event`, including payload, kind, agent, sequence numbers, causation,
+hashes and timestamp. Missing IDs, references that identify decisions instead
+of log events, and IDs belonging to another session return `found: false` with
+`event: null` (successful lookup, no matching record). Storage failures and
+unknown sessions still exit nonzero. Details can be read without a checkpoint;
+a stored event can be newer than the checkpoint and is not a fresh verification.
 
 JSON schema version 1 gains additive `topology` and `evidence` data sections and
 task/edge/evidence-decision totals. Existing sections remain unchanged. JSON

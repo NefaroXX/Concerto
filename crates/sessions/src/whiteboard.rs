@@ -495,6 +495,31 @@ pub async fn load_newest_session_events(
     Ok(events)
 }
 
+/// Resolve a single event without reading another session's payload. Session
+/// scope is part of the SQL predicate, including for malformed foreign rows.
+pub async fn load_session_event(
+    pool: &sqlx::SqlitePool,
+    session_id: &str,
+    event_id: &str,
+    cancel: concerto_core::CancellationToken,
+) -> Result<Option<WhiteboardEvent>, SessionError> {
+    let sql = format!(
+        "SELECT {EVENT_COLUMNS} FROM whiteboard_events WHERE session_id = ? AND event_id = ?"
+    );
+    // AUDITED (sqlx 0.9): static columns and SQL; both caller values are bound.
+    let row = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            return Err(SessionError::Database("evidence lookup cancelled".into()));
+        }
+        result = query_as::<_, WhiteboardEventRow>(AssertSqlSafe(sql))
+            .bind(session_id)
+            .bind(event_id)
+            .fetch_optional(pool) => result?,
+    };
+    row.map(WhiteboardEvent::try_from).transpose()
+}
+
 /// Current head of the log: the largest assigned `gate_seq`, or `0` when the
 /// log is empty. This is the natural boundary for "checkpoint at the current
 /// gate" ([`load_whiteboard_events_up_to`] takes it as its inclusive bound).
@@ -847,6 +872,33 @@ mod tests {
             pre_image_hash: None,
             created_at: 1_700_000_000_000 + event_id.len() as i64,
         }
+    }
+
+    #[tokio::test]
+    async fn evidence_lookup_is_scoped_cancellable_and_read_only() {
+        let (_dir, pool) = test_pool(1).await;
+        let mut event = new_event("evidence-1", "coder", WhiteboardKind::Finding);
+        event.session_id = Some("session-1".into());
+        let stored = append_whiteboard_event(&pool, &event).await.unwrap();
+        let cancel = concerto_core::CancellationToken::new();
+        assert_eq!(
+            load_session_event(&pool, "session-1", "evidence-1", cancel.clone()).await.unwrap(),
+            Some(stored.clone())
+        );
+        assert!(load_session_event(&pool, "session-2", "evidence-1", cancel.clone()).await.unwrap().is_none());
+        assert!(load_session_event(&pool, "session-1", "missing", cancel.clone()).await.unwrap().is_none());
+        assert!(load_session_event(&pool, "session-1", "' OR 1=1 --", cancel.clone()).await.unwrap().is_none());
+        // A malformed foreign row must not even be decoded by the lookup.
+        sqlx::query("UPDATE whiteboard_events SET payload = 'invalid' WHERE event_id = ?")
+            .bind("evidence-1").execute(&pool).await.unwrap();
+        assert!(load_session_event(&pool, "session-2", "evidence-1", cancel.clone()).await.unwrap().is_none());
+        assert!(load_session_event(&pool, "session-1", "evidence-1", cancel.clone()).await.is_err());
+        sqlx::query("UPDATE whiteboard_events SET payload = ? WHERE event_id = ?")
+            .bind(stored.payload.to_string()).bind("evidence-1").execute(&pool).await.unwrap();
+        cancel.cancel();
+        assert!(load_session_event(&pool, "session-1", "evidence-1", cancel).await.unwrap_err().to_string().contains("cancelled"));
+        assert_eq!(load_whiteboard_event(&pool, "evidence-1").await.unwrap(), stored);
+        pool.close().await;
     }
 
     #[tokio::test]

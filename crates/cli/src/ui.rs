@@ -39,8 +39,14 @@ fn draw_runtime_inspector(frame: &mut Frame, app: &App) {
     let block = panel(" Runtime inspector ", &app.cli_theme);
     let inner = block.inner(frame.area());
     frame.render_widget(block, frame.area());
+    let evidence_view = app.runtime_inspector.view == crate::dispatch::runtime::View::Evidence;
     let areas =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(1), Constraint::Length(2)])
+        Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(u16::from(evidence_view)),
+            Constraint::Min(1),
+            Constraint::Length(2),
+        ])
             .split(inner);
     let inspector = &app.runtime_inspector;
     let heading = format!("{}/7 {}", inspector.view.index() + 1, inspector.view.label());
@@ -48,13 +54,27 @@ fn draw_runtime_inspector(frame: &mut Frame, app: &App) {
         Paragraph::new(heading).style(Style::default().fg(app.cli_theme.warning)),
         areas[0],
     );
-    let body = Paragraph::new(app.runtime_inspector.text.as_str()).wrap(Wrap { trim: false });
-    let max_scroll = body.line_count(areas[1].width).saturating_sub(areas[1].height as usize);
+    if evidence_view {
+        let selected = match inspector.evidence.selected() {
+            Some(id) => format!("{}/{} {}", inspector.evidence.index + 1, inspector.evidence.ids.len(), serde_json::json!(id)),
+            None => "No event references".into(),
+        };
+        frame.render_widget(
+            Paragraph::new(selected).style(Style::default().fg(app.cli_theme.user)),
+            areas[1],
+        );
+    }
+    let body = Paragraph::new(inspector.display_text()).wrap(Wrap { trim: false });
+    let max_scroll = body.line_count(areas[2].width).saturating_sub(areas[2].height as usize);
     let max_scroll = u16::try_from(max_scroll).unwrap_or(u16::MAX);
     inspector.max_scroll.set(max_scroll);
-    inspector.page_rows.set(areas[1].height.max(1));
-    frame.render_widget(body.scroll((inspector.scroll.min(max_scroll), 0)), areas[1]);
-    let hints = if inner.width < 60 {
+    inspector.page_rows.set(areas[2].height.max(1));
+    frame.render_widget(body.scroll((inspector.scroll.min(max_scroll), 0)), areas[2]);
+    let hints = if evidence_view && inner.width < 76 {
+        "[/] pick | Enter open\nr refresh | Esc back"
+    } else if evidence_view {
+        "[/] reference | Enter open | Tab view | r refresh | Esc back\nj/k scroll | PgUp/PgDn page | Home/End"
+    } else if inner.width < 60 {
         "Tab view | r refresh\nEsc back | j/k scroll"
     } else {
         "Tab/Shift+Tab or 1–7: view | r refresh | Esc back\nj/k scroll | PgUp/PgDn page | Home/End"
@@ -62,7 +82,7 @@ fn draw_runtime_inspector(frame: &mut Frame, app: &App) {
     let help = Paragraph::new(hints)
         .style(Style::default().fg(app.cli_theme.muted))
         .wrap(Wrap { trim: false });
-    frame.render_widget(help, areas[2]);
+    frame.render_widget(help, areas[3]);
 }
 
 /// Shared menu labels and their existing command-mode shortcuts.
@@ -1724,6 +1744,27 @@ mod tests {
                 terminal.draw(|frame| super::draw(frame, &app)).unwrap();
                 assert!(buffer_text(&terminal).contains(view.label()));
             }
+        }
+    }
+
+    #[test]
+    fn evidence_picker_and_detail_fit_supported_terminal_sizes() {
+        for (width, height) in [(24, 8), (40, 12), (80, 24), (120, 40)] {
+            let mut app = App::new();
+            app.screen = Screen::RuntimeInspector;
+            app.runtime_inspector.select_view(crate::dispatch::runtime::View::Evidence);
+            app.runtime_inspector.evidence.ids = vec!["event-1".into(), "event-2".into()];
+            app.runtime_inspector.evidence.index = 1;
+            app.runtime_inspector.evidence.text = Some(format!("Stored event\n{}End of payload", "line\n".repeat(50)));
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| super::draw(frame, &app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(text.contains("2/2 \"event-2\""));
+            assert!(text.contains("Stored event"));
+            assert!(text.contains("Enter open"));
+            app.runtime_inspector.scroll = u16::MAX;
+            terminal.draw(|frame| super::draw(frame, &app)).unwrap();
+            assert!(buffer_text(&terminal).contains("End of payload"));
         }
     }
 
