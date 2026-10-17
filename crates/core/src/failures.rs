@@ -288,6 +288,15 @@ impl From<OrchestratorError> for ClassifiedFailure {
                          does not support the '{capability}' capability. Choose a tool-capable \
                          model for this task."
                     );
+                }
+                ProviderError::FreeTierRefused { status, message, .. } => {
+                    audience = FailureAudience::User;
+                    code = "PROVIDER_FREE_TIER_REFUSED".to_string();
+                    user_message = format!(
+                        "The OpenCode free tier refused the request (HTTP {status}): {message} \
+                         Configure an OpenCode credential to use the paid tier, or try a different \
+                         free model later."
+                    );
                 } // No `_` arm on purpose (ADR-54): every current variant maps to
                   // a specific code, and adding a new variant must fail
                   // compilation so its classification is decided consciously.
@@ -583,6 +592,16 @@ mod tests {
                 last_error: "timeout".into(),
                 throttled: false,
                 retry_after: None,
+            },
+            ProviderError::CapabilityRefused {
+                provider: "opencode".into(),
+                model: "big-pickle".into(),
+                capability: "tool_calling".into(),
+            },
+            ProviderError::FreeTierRefused {
+                status: 403,
+                retry_after: None,
+                message: "OpenCode's free tier can only be used from within OpenCode.".into(),
             },
         ];
         for error in errors {

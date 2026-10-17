@@ -486,6 +486,11 @@ pub fn diagnose_provider(error: &concerto_core::error::ProviderError) -> Failure
         ProviderError::CapabilityRefused { .. } => {
             (FailureKind::Provider, "capability-refused".to_owned())
         }
+        // The relay refused the keyless free tier (403/410/429): not retryable,
+        // and the fix is a real credential — point the operator at auth.
+        ProviderError::FreeTierRefused { .. } => {
+            (FailureKind::Provider, "provider-free-tier-refused".to_owned())
+        }
         // A broken wire format will not heal on retry.
         ProviderError::Serialization(_) | ProviderError::InvalidResponse(_) => {
             (FailureKind::Provider, "malformed-provider-response".to_owned())
@@ -1353,6 +1358,19 @@ mod tests {
         }));
         assert_eq!(capability.code, "capability-refused");
         assert!(!capability.same_agent_viable && capability.alternate_agent_viable);
+
+        // A refused free tier is permanent and fixable only by a real key.
+        let free_tier = diagnose(&OrchestratorError::Provider(ProviderError::FreeTierRefused {
+            status: 403,
+            retry_after: None,
+            message: "free tier refused".into(),
+        }));
+        assert_eq!(free_tier.code, "provider-free-tier-refused");
+        assert_eq!(free_tier.kind, FailureKind::Provider);
+        assert!(
+            !free_tier.transient && !free_tier.retryable && !free_tier.same_agent_viable,
+            "a refused free tier must not be retried on the same agent"
+        );
     }
 
     #[test]

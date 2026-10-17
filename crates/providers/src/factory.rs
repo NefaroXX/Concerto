@@ -191,38 +191,43 @@ impl ProviderFactory {
         // keyring error is remapped to the pre-existing CredentialMissing
         // variant so downstream behavior is unchanged.
         //
-        // `opencode-free` deliberately takes this path too: the Go relay
+        // `opencode-free` deliberately takes the strict path: the Go relay
         // answers `401 AuthError "Missing API key."` when no `Authorization`
         // header is sent, so a build with an empty credential would produce a
-        // provider that can never complete a request. It used to short-circuit
-        // *before* this resolution with an empty credential — that is exactly
-        // the silent-unusable failure this resolution prevents.
-        let key =
-            config.effective_api_key(creds).map_err(|_| ProviderError::CredentialMissing {
-                provider: if config.name.trim().is_empty() {
-                    config.provider.clone()
-                } else {
-                    config.name.clone()
-                },
-            })?;
+        // provider that can never complete a request.
+        //
+        // `opencode` (the **Zen** relay) is the one provider type that is
+        // legitimately keyless: with no credential it runs on the anonymous
+        // free tier, sending the relay's `Bearer public` sentinel and
+        // satisfying its client-fingerprint gate (see `crate::opencode`). So a
+        // missing/empty key resolves to an empty secret here and the
+        // connector substitutes the sentinel; the fingerprint, not a
+        // credential, is what the relay checks.
+        let provider_label = if config.name.trim().is_empty() {
+            config.provider.clone()
+        } else {
+            config.name.clone()
+        };
+        let key = match config.effective_api_key(creds) {
+            Ok(key) => key,
+            Err(_) if config.provider == "opencode" => {
+                concerto_core::SecretString::from(String::new())
+            }
+            Err(_) => return Err(ProviderError::CredentialMissing { provider: provider_label }),
+        };
 
-        // Fail closed on empty credentials: an empty key used to sail through
-        // to the wire and come back as a generic 401 "provider authentication
-        // failed", hiding the real misconfiguration (stale empty keyring
-        // entry shadowing a valid env key). NB: empty `config.model` is
-        // intentionally allowed here — `resolve_for_role` may supply the
-        // model via `model_override` (e.g. openrouter "" + override
-        // ultra-550b, verified live via Venice), so rejecting it would break
-        // the working override pattern. True 401/403 from the wire still
-        // maps to `AuthFailure` untouched.
-        if key.expose().trim().is_empty() {
-            return Err(ProviderError::CredentialMissing {
-                provider: if config.name.trim().is_empty() {
-                    config.provider.clone()
-                } else {
-                    config.name.clone()
-                },
-            });
+        // Fail closed on empty credentials for every type except the keyless
+        // Zen path: an empty key used to sail through to the wire and come
+        // back as a generic 401 "provider authentication failed", hiding the
+        // real misconfiguration (stale empty keyring entry shadowing a valid
+        // env key). NB: empty `config.model` is intentionally allowed here —
+        // `resolve_for_role` may supply the model via `model_override` (e.g.
+        // openrouter "" + override ultra-550b, verified live via Venice), so
+        // rejecting it would break the working override pattern. True 401/403
+        // from the wire still maps to `AuthFailure` untouched (or, keyless, to
+        // a body-preserving free-tier refusal).
+        if key.expose().trim().is_empty() && config.provider != "opencode" {
+            return Err(ProviderError::CredentialMissing { provider: provider_label });
         }
 
         // ADR-46 reasoning echo is a per-config dial for OpenAI-compatible
@@ -1590,6 +1595,10 @@ mod tests {
     /// (concerto-cli).
     static OPENCODE_FREE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    /// Serializes the tests that mutate the `opencode` (Zen) env fallback.
+    /// Same rationale as [`OPENCODE_FREE_ENV_LOCK`].
+    static OPENCODE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// Remove `name` for the duration of a test and restore whatever was
     /// there afterwards, even across a panic — env vars are process-global,
     /// so a leaked edit would race with tests running in parallel.
@@ -1639,7 +1648,7 @@ mod tests {
     fn uncredentialed_opencode_free_config() -> ProviderConfig {
         ProviderConfig {
             id: "opencode-free-main".into(),
-            name: "OpenCode Zen (free)".into(),
+            name: "OpenCode Zen (Go relay)".into(),
             provider: "opencode-free".into(),
             model: "minimax-m3".into(),
             keyring_key: "test-uncredentialed-opencode-free/api_key".into(),
@@ -1738,9 +1747,63 @@ mod tests {
         );
     }
 
+    /// A credential-less `opencode` (Zen) config builds as the anonymous free
+    /// tier: no key resolves, yet the build succeeds and the wire carries the
+    /// relay's `Bearer public` sentinel plus the full client-identity header
+    /// set — the counterpart to the `opencode-free` fail-closed test.
+    #[tokio::test]
+    async fn build_opencode_without_credential_is_keyless() {
+        let _env = OPENCODE_ENV_LOCK.lock().await;
+        let _restored = RestoreEnvVar::without("OPENCODE_API_KEY");
+        // `test_connection` issues exactly one `GET /models`, which the mock
+        // captures.
+        let (base, req_rx) = crate::testing::mock_server::spawn(String::new());
+        let config = ProviderConfig {
+            id: "opencode-keyless".into(),
+            name: "OpenCode Zen".into(),
+            provider: "opencode".into(),
+            model: "big-pickle".into(),
+            keyring_key: "test-keyless-opencode/api_key".into(),
+            api_base: Some(base.clone()),
+            ..ProviderConfig::default()
+        };
+        let creds = test_creds();
+
+        assert!(config.effective_api_key(&creds).is_err(), "no key may resolve for this config");
+
+        let provider = ProviderFactory::build(&config, &creds)
+            .expect("a credential-less opencode (Zen) config must build keyless");
+        assert_eq!(provider.provider_name(), "opencode");
+
+        provider
+            .test_connection(concerto_core::CancellationToken::new())
+            .await
+            .expect("the keyless connection test must reach the overridden api_base");
+
+        let raw = req_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the mock endpoint must capture exactly one request");
+        let headers = crate::testing::mock_server::request_headers(&raw);
+
+        assert!(
+            headers.starts_with("get /models http/1.1"),
+            "the config api_base must be honored, got request line: {headers}"
+        );
+        assert!(
+            headers.contains("authorization: bearer public"),
+            "the keyless build must send the anonymous sentinel: {headers}"
+        );
+        assert!(
+            headers.contains("x-opencode-session:")
+                && headers.contains("x-opencode-session-id:")
+                && headers.contains("x-opencode-request:"),
+            "every keyless OpenCode request must carry the full identity header set: {headers}"
+        );
+    }
+
     /// Credential enforcement does not narrow to OpenCode: a `zhipu` config
     /// with no resolvable key still fails closed with `CredentialMissing`
-    /// (`ollama` remains the only keyless type).
+    /// (`ollama` and keyless `opencode`/Zen are the only key-optional types).
     #[test]
     fn keyless_non_opencode_provider_still_requires_credential() {
         let _restored = RestoreEnvVar::without("ZHIPU_API_KEY");

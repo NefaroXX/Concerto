@@ -100,6 +100,55 @@ fn canonical_effect_of(tool: &dyn Tool, input: &serde_json::Value) -> CanonicalE
     CanonicalEffect { policy_name, policy_input, operation }
 }
 
+/// Resolve an OpenCode **wire-builtin** tool name to the canonical registered
+/// Concerto tool that should execute it.
+///
+/// Some provider wire gates require the outgoing `tools` array to carry
+/// OpenCode's builtin names (`bash`, `read`, `edit`, `write`) rather than
+/// Concerto's native registry names. A model served through such a gate emits
+/// those builtin names back, so the executor must map them onto the real tools.
+/// This is the compat table for that mapping:
+///
+/// - `bash`  → the shell tool (`shell`)
+/// - `read`  → `filesystem` with `operation: "read"`
+/// - `edit`  → `filesystem` with `operation: "write"`
+/// - `write` → registered natively (the existing filesystem-write alias), so it
+///   never needs translation here
+///
+/// **Never a reroute of a real tool.** The map fires only when `name` is *not*
+/// registered (a registered tool always wins) and only when the target itself
+/// is registered (so a deployment with a different registry simply keeps the
+/// ordinary "tool not found" refusal). It therefore cannot shadow a native
+/// declaration on the paid/native wire paths, where these names never appear.
+fn resolve_wire_builtin(
+    registry: &ToolRegistry,
+    name: &str,
+    input: &serde_json::Value,
+) -> Option<(&'static str, serde_json::Value)> {
+    if registry.get(name).is_some() {
+        return None;
+    }
+    let target = match name {
+        "bash" => "shell",
+        "read" | "edit" => "filesystem",
+        _ => return None,
+    };
+    // Presence check only: the mapped target must exist, or the ordinary
+    // "tool not found" refusal is preserved.
+    registry.get(target)?;
+    let mut input = input.clone();
+    if name != "bash" {
+        if let serde_json::Value::Object(map) = &mut input {
+            // `read`/`edit` carry no operation on the wire; the filesystem tool
+            // requires one. Supply the preset only when the model omitted it.
+            map.entry("operation".to_string()).or_insert_with(|| {
+                serde_json::Value::String(if name == "read" { "read" } else { "write" }.to_string())
+            });
+        }
+    }
+    Some((target, input))
+}
+
 /// Construct the policy action for a tool call, shared by the executing path
 /// and the ADR-65 F1a serve gate so both evaluate the *exact* same action.
 fn build_action<'a>(
@@ -345,8 +394,16 @@ impl ToolExecutor {
         tool_name: &str,
         input: &serde_json::Value,
     ) -> Option<CanonicalEffect> {
-        let tool = self.registry.get(tool_name)?;
-        Some(canonical_effect_of(tool, input))
+        if let Some(tool) = self.registry.get(tool_name) {
+            return Some(canonical_effect_of(tool, input));
+        }
+        // A wire-builtin name (`bash`/`read`/`edit`) has no registered schema
+        // of its own, but it executes as a real tool — account it under that
+        // tool's canonical effect so policy attribution and mutation capture
+        // stay coherent (see [`resolve_wire_builtin`]).
+        let (target, mapped) = resolve_wire_builtin(&self.registry, tool_name, input)?;
+        let tool = self.registry.get(target)?;
+        Some(canonical_effect_of(tool, &mapped))
     }
 
     async fn execute_allowed(
@@ -941,6 +998,14 @@ impl ToolExecutor {
         cancel: CancellationToken,
         orchestrator_authority: bool,
     ) -> Result<ToolOutput, ToolError> {
+        // Translate an OpenCode wire-builtin name onto the real tool before
+        // lookup, so a keyless-gate-declared `bash`/`read`/`edit` executes the
+        // shell/filesystem tools (see [`resolve_wire_builtin`]). A registered
+        // name is never touched, so every native path is byte-identical.
+        let (tool_name, input) = match resolve_wire_builtin(&self.registry, tool_name, &input) {
+            Some((target, mapped)) => (target, mapped),
+            None => (tool_name, input),
+        };
         let tool = self.registry.get(tool_name).ok_or_else(|| ToolError::ExecutionFailed {
             message: format!("tool not found: {tool_name}"),
         })?;
@@ -2854,6 +2919,91 @@ mod tests {
         assert_eq!(entries[1].canonical_tool.as_deref(), Some("filesystem"));
         assert_eq!(entries[1].canonical_operation.as_deref(), Some("write"));
         assert_eq!(entries[0].correlation_id, entries[1].correlation_id);
+    }
+
+    /// A tool that reports an arbitrary registered name, for exercising the
+    /// opencode wire-builtin fallback.
+    struct NamedTestTool {
+        name: &'static str,
+    }
+
+    #[async_trait]
+    impl Tool for NamedTestTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "named test tool"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn capability_requirements(&self) -> CapabilitySet {
+            CapabilitySet::default()
+        }
+        async fn execute(
+            &self,
+            input: serde_json::Value,
+            _policy: &dyn PolicyEngine,
+            _session: &SessionContext,
+            _cancel: CancellationToken,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput { summary: String::new(), data: input })
+        }
+    }
+
+    /// The opencode wire-builtin names resolve onto the native tools with the
+    /// right operation preset, and never shadow a registered name.
+    #[test]
+    fn wire_builtin_names_resolve_to_native_tools() {
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(NamedTestTool { name: "shell" }));
+        registry.register(Box::new(NamedTestTool { name: "filesystem" }));
+
+        // bash -> shell, input passed through verbatim.
+        let (target, input) =
+            resolve_wire_builtin(&registry, "bash", &serde_json::json!({"command": "ls"}))
+                .expect("bash resolves to the shell tool");
+        assert_eq!(target, "shell");
+        assert_eq!(input, serde_json::json!({"command": "ls"}));
+
+        // read -> filesystem with `operation: "read"`.
+        let (target, input) =
+            resolve_wire_builtin(&registry, "read", &serde_json::json!({"path": "a"}))
+                .expect("read resolves to filesystem");
+        assert_eq!(target, "filesystem");
+        assert_eq!(input, serde_json::json!({"path": "a", "operation": "read"}));
+
+        // edit -> filesystem with `operation: "write"`.
+        let (target, input) = resolve_wire_builtin(
+            &registry,
+            "edit",
+            &serde_json::json!({"path": "a", "content": "x"}),
+        )
+        .expect("edit resolves to filesystem");
+        assert_eq!(target, "filesystem");
+        assert_eq!(input.get("operation").and_then(|v| v.as_str()), Some("write"));
+
+        // An unmapped unknown name stays unmapped.
+        assert!(resolve_wire_builtin(&registry, "frobnicate", &serde_json::json!({})).is_none());
+    }
+
+    /// A *registered* name always wins — a real `bash` tool is never rerouted
+    /// — and the fallback is inert when the native target is absent, so the
+    /// ordinary "tool not found" refusal survives.
+    #[test]
+    fn wire_builtin_fallback_never_shadows_or_invents_tools() {
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(NamedTestTool { name: "bash" }));
+        assert!(
+            resolve_wire_builtin(&registry, "bash", &serde_json::json!({})).is_none(),
+            "a registered tool is never shadowed"
+        );
+
+        let empty = ToolRegistry::default();
+        assert!(resolve_wire_builtin(&empty, "bash", &serde_json::json!({})).is_none());
+        assert!(resolve_wire_builtin(&empty, "read", &serde_json::json!({})).is_none());
+        assert!(resolve_wire_builtin(&empty, "edit", &serde_json::json!({})).is_none());
     }
 
     /// A path-shaped tool's structured facts reach both the policy decision row

@@ -117,6 +117,7 @@ under `nextest` in CI and are good references when a manual scenario fails:
 | First launch | App opens without panic; setup clearly requests missing provider details | |
 | Project selection | Selected root is displayed and remains inside the intended project | |
 | Provider test | Configured provider reports a useful success or sanitized error | |
+| Keyless OpenCode Zen | Desktop/CLI `opencode` provider entry with **no API key** and model `big-pickle` streams keylessly; a 403 FreeTierError surfaces as the actionable "free tier can only be used from within OpenCode" message via FreeTierRefused | |
 | Model selection | Active provider/model labels match the selection after navigation and restart | |
 | Empty chat | Quick actions seed (but do not submit) the composer; recent sessions resume on click | |
 | Quick panel | Run/provider/model, agent assignments, Git state, and active view are accurate | |

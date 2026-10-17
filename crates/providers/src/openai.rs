@@ -51,9 +51,17 @@ pub struct OpenAiProvider {
     /// (model listing, connection test, and `/chat/completions`), in insertion
     /// order. Empty by default, so every other provider's wire output stays
     /// byte-identical. Wrappers set it for relay-specific client-identity
-    /// headers — `OpenCodeZenProvider` uses it for `x-opencode-session`
-    /// (backend/prompt-cache affinity, see `crate::opencode`).
+    /// headers — `OpenCodeZenProvider` uses it for `x-opencode-session`,
+    /// `x-opencode-session-id`, and `x-opencode-request` (client-fingerprint /
+    /// prompt-cache affinity, see `crate::opencode`).
     extra_headers: Vec<(String, String)>,
+    /// Whether this connector may be running anonymously against a relay's
+    /// free tier. Set only by the OpenCode wrapper (see `crate::opencode`);
+    /// `false` by default, so every other connector maps 401/403/429 exactly
+    /// as before. When `true`, 403/410/429 responses preserve the relay's
+    /// body via [`crate::retry::map_opencode_http_error`] instead of
+    /// collapsing to `AuthFailure`/`RateLimit`.
+    keyless: bool,
     dialect: OpenAiChatDialect,
 }
 
@@ -69,6 +77,7 @@ impl OpenAiProvider {
             advertised_tool_support: None,
             usage_request: UsageRequest::Off,
             extra_headers: Vec::new(),
+            keyless: false,
             dialect: OpenAiChatDialect,
         }
     }
@@ -154,6 +163,18 @@ impl OpenAiProvider {
         value: impl Into<String>,
     ) -> Self {
         self.extra_headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Mark this connector as possibly running against a relay's anonymous
+    /// free tier.
+    ///
+    /// Crate-private: only the OpenCode wrapper calls it, for the keyless Zen
+    /// path (see `crate::opencode`). When set, HTTP 403/410/429 responses keep
+    /// the relay's body text (as `FreeTierRefused`) instead of collapsing to
+    /// the body-less `AuthFailure`/`RateLimit` used by the paid path.
+    pub(crate) fn with_keyless(mut self, keyless: bool) -> Self {
+        self.keyless = keyless;
         self
     }
 
@@ -767,6 +788,12 @@ impl LlmProvider for OpenAiProvider {
         // body AND request the completion non-streamed so tool-call
         // arguments arrive whole. Strict models are untouched — their wire
         // output stays byte-identical (streamed).
+        //
+        // The keyless OpenCode Zen path is the one exception: its fingerprint
+        // gate refuses `stream: false` outright, so the weak-tier transport
+        // downgrade must never apply there. Streaming stays on and tool-call
+        // arguments rely on the existing `tool_args` repair machinery — which
+        // is exactly why streaming repair exists.
         let mut request = request;
         let resolved_mode = crate::capability::resolve_tool_schema_mode(
             self.provider_name(),
@@ -774,8 +801,8 @@ impl LlmProvider for OpenAiProvider {
             self.tool_schema_mode,
             self.advertised_tool_support,
         );
-        let tool_adapted =
-            crate::adapters::schema_loose::non_streaming_transport_active(resolved_mode, &model);
+        let tool_adapted = !self.keyless
+            && crate::adapters::schema_loose::non_streaming_transport_active(resolved_mode, &model);
         if tool_adapted {
             if let Some(tools) = request.tools.as_mut() {
                 crate::adapters::schema_loose::adapt_tool_definitions(tools);
@@ -815,7 +842,12 @@ impl LlmProvider for OpenAiProvider {
             let status = response.status();
             let retry_after = crate::retry::parse_retry_after(response.headers());
             let text = response.text().await.unwrap_or_default();
-            return Err(crate::retry::map_http_error(status, &text, retry_after));
+            return Err(crate::retry::map_opencode_http_error(
+                status,
+                &text,
+                retry_after,
+                self.keyless,
+            ));
         }
 
         let mut state = OpenAiStreamState::new();

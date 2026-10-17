@@ -59,4 +59,9 @@ ignore = [
     # via iced_wgpu -> cryoglyph, which pins lru ^0.16. The fix (0.18.2) is a
     # breaking release outside that requirement. Desktop glyph cache only.
     "RUSTSEC-2026-0253",
+    # zbus family — unmaintained, merged upstream into zbus 6.0.0 (2026-10-16);
+    # transitives behind the keyring D-Bus backend only; see deny.toml
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
 ]

@@ -117,7 +117,7 @@ build-then-accept/reject cycle on disk, tracked in `docs/DEFERRED.md` row 34.)
 
 **Provider support.** **23 provider ids** are registered in `PROVIDER_TYPE_IDS`
 (`crates/providers/src/provider_defs.rs`): Anthropic, OpenAI, Google,
-OpenRouter, NIM, Ollama, OpenCode Zen, OpenCode Zen (free), DeepSeek, Groq,
+OpenRouter, NIM, Ollama, OpenCode Zen, OpenCode Zen (Go relay), DeepSeek, Groq,
 Together, Mistral, xAI, Fireworks, Cerebras, Cohere, DeepInfra, Perplexity,
 SambaNova, DashScope, Moonshot, Zhipu, and Novita — all reachable from one
 config-first catalog through a shared streaming interface with retry/backoff
