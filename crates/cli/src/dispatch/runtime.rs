@@ -1,5 +1,9 @@
 //! Portable Coordinator inspection, shared by command mode and the TUI.
 
+#[path = "runtime_evidence.rs"]
+mod evidence;
+
+use std::cell::Cell;
 use std::sync::{mpsc, Arc};
 
 use concerto_core::{ids::Ulid, CancellationToken};
@@ -9,17 +13,47 @@ use concerto_orchestrator::studio_runtime::{
 use concerto_sessions::SessionStore;
 use serde_json::{json, Value};
 
-const USAGE: &str = "usage: concerto sessions runtime <session-id> [--view all|decisions|world|diagnoses|suitability] [--limit 1..1000] [--json]";
+const USAGE: &str = "usage: concerto sessions runtime <session-id> [--view all|topology|decisions|evidence|world|diagnoses|suitability] [--limit 1..1000] [--json]\n       concerto sessions runtime <session-id> --event <event-id> [--json]";
 const DEFAULT_LIMIT: usize = 50;
 const SOURCE_NOTE: &str = "Persisted checkpoint; refresh to reload. This is not live run state.\nCompleted or cleared checkpoints may be unavailable.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum View {
+pub(crate) enum View {
     All,
+    Topology,
     Decisions,
+    Evidence,
     World,
     Diagnoses,
     Suitability,
+}
+
+impl View {
+    pub(crate) const ALL: [Self; 7] = [
+        Self::All,
+        Self::Topology,
+        Self::Decisions,
+        Self::Evidence,
+        Self::World,
+        Self::Diagnoses,
+        Self::Suitability,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::All => "Overview",
+            Self::Topology => "Topology",
+            Self::Decisions => "Decisions",
+            Self::Evidence => "Evidence links",
+            Self::World => "World model",
+            Self::Diagnoses => "Diagnoses",
+            Self::Suitability => "Suitability",
+        }
+    }
+
+    pub(crate) fn index(self) -> usize {
+        Self::ALL.iter().position(|view| *view == self).unwrap_or(0)
+    }
 }
 
 struct Options {
@@ -27,18 +61,33 @@ struct Options {
     view: View,
     limit: usize,
     json: bool,
+    event_id: Option<String>,
 }
 
 fn parse_args(args: &[String]) -> anyhow::Result<Options> {
     let id = args.first().ok_or_else(|| anyhow::anyhow!(USAGE))?;
     let session_id =
         id.parse().map_err(|_| anyhow::anyhow!("invalid session id '{id}'; {USAGE}"))?;
-    let mut options = Options { session_id, view: View::All, limit: DEFAULT_LIMIT, json: false };
+    let mut options =
+        Options { session_id, view: View::All, limit: DEFAULT_LIMIT, json: false, event_id: None };
+    let mut checkpoint_options = false;
     let mut index = 1;
     while index < args.len() {
         match args[index].as_str() {
             "--json" => options.json = true,
+            "--event" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .filter(|id| !id.trim().is_empty() && !id.starts_with("--"))
+                    .ok_or_else(|| anyhow::anyhow!("--event requires an event id; {USAGE}"))?;
+                if options.event_id.is_some() {
+                    anyhow::bail!("--event may only be supplied once; {USAGE}");
+                }
+                options.event_id = Some(value.clone());
+            }
             "--view" | "--limit" => {
+                checkpoint_options = true;
                 let flag = args[index].as_str();
                 index += 1;
                 let value = args
@@ -47,7 +96,9 @@ fn parse_args(args: &[String]) -> anyhow::Result<Options> {
                 if flag == "--view" {
                     options.view = match value.as_str() {
                         "all" => View::All,
+                        "topology" => View::Topology,
                         "decisions" => View::Decisions,
+                        "evidence" => View::Evidence,
                         "world" => View::World,
                         "diagnoses" => View::Diagnoses,
                         "suitability" => View::Suitability,
@@ -65,6 +116,9 @@ fn parse_args(args: &[String]) -> anyhow::Result<Options> {
         }
         index += 1;
     }
+    if options.event_id.is_some() && checkpoint_options {
+        anyhow::bail!("--event cannot be combined with --view or --limit; {USAGE}");
+    }
     Ok(options)
 }
 
@@ -75,7 +129,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<()> {
     }
     let options = parse_args(args)?;
     let rt = tokio::runtime::Runtime::new()?;
-    let snapshot = rt.block_on(async {
+    let report = rt.block_on(async {
         let cancel = CancellationToken::new();
         tokio::select! {
             result = async {
@@ -83,8 +137,13 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<()> {
                 if store.load_session(options.session_id, cancel.clone()).await?.is_none() {
                     anyhow::bail!("session {} not found", options.session_id);
                 }
+                if let Some(event_id) = &options.event_id {
+                    let event = store.load_evidence_event(options.session_id, event_id, cancel.clone()).await?;
+                    return Ok::<_, anyhow::Error>(evidence::report(options.session_id, event_id, event));
+                }
                 let reader = CheckpointStudioRuntimeReader::new(store);
-                Ok::<_, anyhow::Error>(reader.load(options.session_id, cancel.clone()).await?)
+                let snapshot = reader.load(options.session_id, cancel.clone()).await?;
+                Ok::<_, anyhow::Error>(report(&snapshot, &options))
             } => result,
             _ = tokio::signal::ctrl_c() => {
                 cancel.cancel();
@@ -92,9 +151,10 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<()> {
             }
         }
     })?;
-    let report = report(&snapshot, &options);
     if options.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if options.event_id.is_some() {
+        println!("{}", evidence::render_report(&report)?);
     } else {
         println!("{}", render_text(&report)?);
     }
@@ -105,6 +165,12 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<()> {
 /// model, including evidence references; do not silently drop nested fields.
 fn report(snapshot: &StudioRuntimeSnapshot, options: &Options) -> Value {
     let mut data = serde_json::Map::new();
+    if matches!(options.view, View::All | View::Topology) {
+        data.insert("topology".into(), json!(snapshot.topology));
+    }
+    if matches!(options.view, View::All | View::Evidence) {
+        data.insert("evidence".into(), evidence_report(snapshot, options.limit));
+    }
     if matches!(options.view, View::All | View::Decisions) {
         data.insert(
             "decisions".into(),
@@ -135,6 +201,10 @@ fn report(snapshot: &StudioRuntimeSnapshot, options: &Options) -> Value {
         "empty": snapshot.is_empty(),
         "limit": options.limit,
         "totals": {
+            "tasks": snapshot.topology.tasks.len(),
+            "edges": snapshot.topology.edges.len(),
+            "evidence_decisions": snapshot.decisions.iter()
+                .filter(|decision| !decision.supporting_evidence_ids.is_empty()).count(),
             "decisions": snapshot.decisions.len(),
             "diagnoses": snapshot.diagnoses.len(),
             "suitability": snapshot.suitability.iter().map(|ranking| json!({
@@ -146,6 +216,28 @@ fn report(snapshot: &StudioRuntimeSnapshot, options: &Options) -> Value {
     })
 }
 
+/// References and fact summaries already present in the checkpoint. Do not
+/// imply these are resolved whiteboard event bodies or newly verified facts.
+fn evidence_report(snapshot: &StudioRuntimeSnapshot, limit: usize) -> Value {
+    let world = snapshot.world_model.as_ref();
+    json!({
+        "note": "Checkpoint references and fact summaries only; full evidence events are not loaded.",
+        "facts": world.map(|model| model.facts.as_slice()).unwrap_or_default(),
+        "artifacts": world.map(|model| model.artifacts.as_slice()).unwrap_or_default(),
+        "questions": world.map(|model| model.questions.as_slice()).unwrap_or_default(),
+        "decision_links": snapshot.decisions.iter().rev()
+            .filter(|decision| !decision.supporting_evidence_ids.is_empty())
+            .take(limit)
+            .map(|decision| json!({
+                "decision_id": decision.id,
+                "kind": decision.kind,
+                "status": decision.status,
+                "supporting_evidence_ids": decision.supporting_evidence_ids,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
 fn render_text(report: &Value) -> anyhow::Result<String> {
     let mut text =
         format!("Session {}\n{SOURCE_NOTE}\n", report["session_id"].as_str().unwrap_or("unknown"));
@@ -153,7 +245,9 @@ fn render_text(report: &Value) -> anyhow::Result<String> {
         text.push_str("\nNo Coordinator inspection data in the available checkpoint.\n");
     }
     for (key, title) in [
+        ("topology", "Task topology (saved state; edges: prerequisite -> consumer)"),
         ("decisions", "Decision journal (newest first)"),
+        ("evidence", "Evidence links (checkpoint references)"),
         ("world_model", "World model"),
         ("diagnoses", "Failure diagnoses (newest first)"),
         ("suitability", "Agent suitability (best first per task class)"),
@@ -163,7 +257,7 @@ fn render_text(report: &Value) -> anyhow::Result<String> {
         }
     }
     text.push_str(&format!(
-        "\nLimit: {} rows per history / agents per task class. Totals: {}\n",
+        "\nLimit: {} rows per history / agents per task class. Topology and world facts are complete. Totals: {}\n",
         report["limit"], report["totals"]
     ));
     Ok(text)
@@ -172,18 +266,28 @@ fn render_text(report: &Value) -> anyhow::Result<String> {
 /// One cancellable, non-blocking TUI load. A refresh drops the previous
 /// receiver, so late results can never overwrite a newer session's view.
 pub(crate) struct RuntimeInspector {
+    pub(crate) evidence: evidence::EvidenceDetails,
     pub(crate) text: String,
     pub(crate) scroll: u16,
+    pub(crate) max_scroll: Cell<u16>,
+    pub(crate) page_rows: Cell<u16>,
+    pub(crate) view: View,
+    snapshot: Option<StudioRuntimeSnapshot>,
     session_id: Option<Ulid>,
     cancel: CancellationToken,
-    receiver: Option<mpsc::Receiver<String>>,
+    receiver: Option<mpsc::Receiver<Result<StudioRuntimeSnapshot, String>>>,
 }
 
 impl Default for RuntimeInspector {
     fn default() -> Self {
         Self {
+            evidence: evidence::EvidenceDetails::default(),
             text: "No active session. Start or resume a session to inspect it.".into(),
             scroll: 0,
+            max_scroll: Cell::new(0),
+            page_rows: Cell::new(1),
+            view: View::All,
+            snapshot: None,
             session_id: None,
             cancel: CancellationToken::new(),
             receiver: None,
@@ -193,10 +297,13 @@ impl Default for RuntimeInspector {
 
 impl RuntimeInspector {
     pub(crate) fn load(&mut self, session_id: Option<Ulid>, store: Option<Arc<dyn SessionStore>>) {
+        let view = if self.session_id == session_id { self.view } else { View::All };
         self.cancel.cancel();
         *self = Self::default();
+        self.view = view;
         let (Some(id), Some(store)) = (session_id, store) else { return };
         self.session_id = Some(id);
+        self.evidence = evidence::EvidenceDetails::new(id, store.clone());
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             self.text = "Runtime inspection is unavailable outside the terminal runtime.".into();
             return;
@@ -207,17 +314,9 @@ impl RuntimeInspector {
         self.receiver = Some(receiver);
         runtime.spawn(async move {
             let reader = CheckpointStudioRuntimeReader::new(store);
-            let result = async {
-                let snapshot = reader.load(id, cancel.clone()).await?;
-                let options =
-                    Options { session_id: id, view: View::All, limit: DEFAULT_LIMIT, json: false };
-                render_text(&report(&snapshot, &options))
-            }
-            .await;
+            let result = reader.load(id, cancel.clone()).await.map_err(|error| error.to_string());
             if !cancel.is_cancelled() {
-                let text = result
-                    .unwrap_or_else(|error| format!("Runtime inspection unavailable: {error}"));
-                let _ = sender.send(text);
+                let _ = sender.send(result);
             }
         });
     }
@@ -230,9 +329,18 @@ impl RuntimeInspector {
         }
         if let Some(receiver) = &self.receiver {
             match receiver.try_recv() {
-                Ok(text) => {
-                    self.text = text;
+                Ok(result) => {
                     self.receiver = None;
+                    match result {
+                        Ok(snapshot) => {
+                            self.evidence.set_snapshot(&snapshot);
+                            self.snapshot = Some(snapshot);
+                            self.render_snapshot();
+                        }
+                        Err(error) => {
+                            self.text = format!("Runtime inspection unavailable: {error}");
+                        }
+                    }
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.text = "Runtime inspection interrupted. Press r to retry.".into();
@@ -241,6 +349,49 @@ impl RuntimeInspector {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
+        self.evidence.poll();
+    }
+
+    pub(crate) fn select_view(&mut self, view: View) {
+        self.evidence.close();
+        self.view = view;
+        self.scroll = 0;
+        self.max_scroll.set(0);
+        self.render_snapshot();
+    }
+
+    pub(crate) fn cycle_view(&mut self, backwards: bool) {
+        let count = View::ALL.len();
+        let step = if backwards { count - 1 } else { 1 };
+        self.select_view(View::ALL[(self.view.index() + step) % count]);
+    }
+
+    fn render_snapshot(&mut self) {
+        let (Some(snapshot), Some(session_id)) = (&self.snapshot, self.session_id) else {
+            return;
+        };
+        let options = Options {
+            session_id,
+            view: self.view,
+            limit: DEFAULT_LIMIT,
+            json: false,
+            event_id: None,
+        };
+        self.text = render_text(&report(snapshot, &options))
+            .unwrap_or_else(|error| format!("Runtime inspection unavailable: {error}"));
+    }
+
+    pub(crate) fn scroll_down(&mut self, rows: u16) {
+        self.scroll = self.scroll.saturating_add(rows).min(self.max_scroll.get());
+    }
+
+    pub(crate) fn display_text(&self) -> &str {
+        self.evidence.text.as_deref().unwrap_or(&self.text)
+    }
+
+    pub(crate) fn reset_scroll(&mut self) {
+        self.scroll = 0;
+        self.max_scroll.set(0);
     }
 }
 
@@ -273,6 +424,12 @@ mod tests {
             vec![&id, "--view", "live"],
             vec![&id, "--unknown"],
             vec![&id, "extra"],
+            vec![&id, "--event"],
+            vec![&id, "--event", ""],
+            vec![&id, "--event", "--json"],
+            vec![&id, "--event", "first", "--event", "second"],
+            vec![&id, "--event", "event-1", "--view", "all"],
+            vec![&id, "--limit", "1", "--event", "event-1"],
         ] {
             assert!(parse_args(&args(&values)).is_err(), "{values:?}");
         }
@@ -281,6 +438,9 @@ mod tests {
         assert!(options.json);
         assert_eq!(options.view, View::World);
         assert_eq!(options.limit, 3);
+        let options = parse_args(&args(&[&id, "--event", "event-1", "--json"])).unwrap();
+        assert_eq!(options.event_id.as_deref(), Some("event-1"));
+        assert!(options.json);
     }
 
     #[test]
@@ -308,8 +468,13 @@ mod tests {
             }),
             ..StudioRuntimeSnapshot::default()
         };
-        let options =
-            Options { session_id: Ulid::new(), view: View::Diagnoses, limit: 1, json: true };
+        let options = Options {
+            session_id: Ulid::new(),
+            view: View::Diagnoses,
+            limit: 1,
+            json: true,
+            event_id: None,
+        };
         let value = report(&snapshot, &options);
         assert_eq!(value["totals"]["diagnoses"], 2);
         assert_eq!(value["data"]["diagnoses"].as_array().unwrap().len(), 1);
@@ -328,7 +493,7 @@ mod tests {
         inspector.session_id = Some(Ulid::new());
         inspector.receiver = Some(receiver);
         let cancel = inspector.cancel.clone();
-        sender.send("other session's state".into()).unwrap();
+        sender.send(Err("other session's state".into())).unwrap();
         inspector.poll(Some(Ulid::new()));
         assert!(cancel.is_cancelled());
         assert!(!inspector.text.contains("other session"));
@@ -344,5 +509,129 @@ mod tests {
         let current = inspector.cancel.clone();
         drop(inspector);
         assert!(current.is_cancelled());
+    }
+
+    #[test]
+    fn topology_limits_never_sever_dependency_edges() {
+        use concerto_core::types::{AgentId, SubTaskStatus, TaskId};
+        use concerto_orchestrator::graph::Dependency;
+        use concerto_orchestrator::studio_runtime::{RuntimeDependency, RuntimeTask};
+
+        let mut snapshot = StudioRuntimeSnapshot::default();
+        let first = TaskId::new();
+        let second = TaskId::new();
+        snapshot.topology.tasks = [first, second]
+            .into_iter()
+            .map(|id| RuntimeTask {
+                id,
+                parent_id: None,
+                agent: AgentId::new("coder"),
+                description: "task".into(),
+                status: SubTaskStatus::Pending,
+                dependencies: Vec::new(),
+                deliverable: None,
+            })
+            .collect();
+        snapshot.topology.edges.push(RuntimeDependency {
+            from: first,
+            to: second,
+            kind: Dependency::ProvidesContextFor,
+        });
+        let id = Ulid::new().to_string();
+        let options = parse_args(&args(&[&id, "--view", "topology", "--limit", "1"])).unwrap();
+        let value = report(&snapshot, &options);
+        assert_eq!(value["data"].as_object().unwrap().len(), 1);
+        assert_eq!(value["data"]["topology"]["tasks"].as_array().unwrap().len(), 2);
+        assert_eq!(value["data"]["topology"]["edges"][0]["from"], first.to_string());
+        assert_eq!(value["data"]["topology"]["edges"][0]["to"], second.to_string());
+        assert_eq!(value["totals"]["tasks"], 2);
+        assert_eq!(value["totals"]["edges"], 1);
+        assert_eq!(value["empty"], false);
+    }
+
+    #[test]
+    fn evidence_view_preserves_provenance_and_limits_only_decision_history() {
+        use concerto_orchestrator::decisions::{CoordinatorDecision, DecisionKind, DecisionStatus};
+        use concerto_orchestrator::world_model::{FactStatus, WorldFact};
+
+        let world_model = Some(WorldModel {
+            facts: vec![WorldFact {
+                ref_id: "fact-1".into(),
+                label: "claim".into(),
+                status: FactStatus::Contradicted,
+                artifact: Some("src/lib.rs".into()),
+                seq: 7,
+                grounded_by: vec!["observation-1".into()],
+                contradicted_by: Some("failure-1".into()),
+                contradicted_exit_code: Some(1),
+            }],
+            ..WorldModel::default()
+        });
+        let decisions = ["old", "new"]
+            .into_iter()
+            .map(|id| CoordinatorDecision {
+                id: id.into(),
+                kind: DecisionKind::SelfExecute,
+                target_agent: None,
+                task_description: "inspect".into(),
+                notes: None,
+                supporting_evidence_ids: vec!["fact-1".into()],
+                expected_artifacts: Vec::new(),
+                transform: None,
+                max_tool_calls: None,
+                wait_record: None,
+                dismissed_question_id: None,
+                created_at: time::OffsetDateTime::UNIX_EPOCH,
+                status: DecisionStatus::Settled,
+            })
+            .collect();
+        let snapshot =
+            StudioRuntimeSnapshot { world_model, decisions, ..StudioRuntimeSnapshot::default() };
+        let id = Ulid::new().to_string();
+        let options = parse_args(&args(&[&id, "--view", "evidence", "--limit", "1"])).unwrap();
+        let value = report(&snapshot, &options);
+        let evidence = &value["data"]["evidence"];
+        assert_eq!(value["data"].as_object().unwrap().len(), 1);
+        assert_eq!(evidence["facts"][0]["status"], "contradicted");
+        assert_eq!(evidence["facts"][0]["grounded_by"][0], "observation-1");
+        assert_eq!(evidence["facts"][0]["contradicted_by"], "failure-1");
+        assert_eq!(evidence["decision_links"].as_array().unwrap().len(), 1);
+        assert_eq!(evidence["decision_links"][0]["decision_id"], "new");
+        assert_eq!(evidence["decision_links"][0]["supporting_evidence_ids"][0], "fact-1");
+        assert_eq!(value["totals"]["evidence_decisions"], 2);
+        assert!(render_text(&value).unwrap().contains("full evidence events are not loaded"));
+    }
+
+    #[test]
+    fn view_selected_during_load_is_used_when_result_arrives() {
+        let id = Ulid::new();
+        let (sender, receiver) = mpsc::channel();
+        let mut inspector = RuntimeInspector::default();
+        inspector.session_id = Some(id);
+        inspector.receiver = Some(receiver);
+        inspector.select_view(View::World);
+        sender
+            .send(Ok(StudioRuntimeSnapshot {
+                world_model: Some(WorldModel {
+                    objective: Some("inspect".into()),
+                    ..WorldModel::default()
+                }),
+                ..StudioRuntimeSnapshot::default()
+            }))
+            .unwrap();
+        inspector.poll(Some(id));
+        assert!(inspector.text.contains("World model"));
+        assert!(!inspector.text.contains("Decision journal"));
+        inspector.scroll = 20;
+        inspector.select_view(View::Topology);
+        assert!(inspector.text.contains("Task topology"));
+        assert!(!inspector.text.contains("World model"));
+        assert_eq!(inspector.scroll, 0);
+        assert!(inspector.receiver.is_none(), "view changes reuse the loaded snapshot");
+        inspector.select_view(View::All);
+        inspector.cycle_view(true);
+        assert_eq!(inspector.view, View::Suitability);
+        inspector.cycle_view(false);
+        assert_eq!(inspector.view, View::All);
     }
 }

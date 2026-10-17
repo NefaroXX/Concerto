@@ -99,6 +99,7 @@ pub mod runtime_runner;
 mod runtime_runner_impl;
 pub mod services;
 pub mod session_manager;
+pub mod memory_explorer;
 pub mod testing;
 
 // Issue #55: the coordinator fault-injection and recovery evaluation

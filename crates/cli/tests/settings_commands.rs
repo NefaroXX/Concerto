@@ -61,6 +61,27 @@ fn scoped_edits_and_dry_runs_validate_without_setup_or_provider() {
 }
 
 #[test]
+fn memory_commands_validate_and_run_without_a_provider() {
+    let fixture = Fixture::new();
+    let output = fixture.command(&["memory", "delete", "chunk"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--yes"));
+    assert!(!fixture.dir.path().join("data/concerto/memory/memory.db").exists());
+    fixture.success(&["config", "set", "memory.enabled", "false"]);
+    let output = fixture.command(&["memory", "list", "--json"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("disabled"));
+    fixture.success(&["config", "set", "memory.enabled", "true"]);
+    let result: serde_json::Value = serde_json::from_str(&fixture.success(&["memory", "reindex", "--json"])).unwrap();
+    assert_eq!(result["indexed_chunks"], 0);
+    let result: serde_json::Value = serde_json::from_str(&fixture.success(&["memory", "list", "--json"])).unwrap();
+    assert_eq!(result["entries"], serde_json::json!([]));
+    let result: serde_json::Value = serde_json::from_str(&fixture.success(&["memory", "show", "absent", "--json"])).unwrap();
+    assert_eq!(result["found"], false);
+    assert!(result["entry"].is_null());
+}
+
+#[test]
 fn agent_edits_clone_and_removal_use_the_authoritative_roster() {
     let fixture = Fixture::new();
     fixture.success(&["agents", "set", "coder", "capabilities.shell", "false"]);
@@ -229,7 +250,10 @@ fn runtime_inspection_reads_saved_state_while_another_frontend_holds_the_lock() 
     let state = serde_json::json!({
         "schema_version": 4,
         "session_id": id,
-        "subtasks": [], "edges": [], "completed_results": {},
+        "subtasks": [{"id": id, "parent_id": null, "session_id": id,
+            "role": "coder", "description": "saved task", "status": "Running",
+            "dependencies": [], "deliverable": null}],
+        "edges": [], "completed_results": {},
         "total_cost": 0.0, "total_tool_calls": 0, "provider_metrics": [],
         "all_files": [], "subtask_attempts": {}, "retry_feedback": {},
         "world_model": {"objective": "portable runtime inspection"}
@@ -245,6 +269,15 @@ fn runtime_inspection_reads_saved_state_while_another_frontend_holds_the_lock() 
             .bind(&id).execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO orchestration_checkpoints (session_id, run_id, root_task_id, project_id, objective_hash, schema_version, sequence_num, state_json, completed, updated_at) VALUES (?, ?, ?, 'test', 'test', 4, 1, ?, 0, 1)")
             .bind(&id).bind(&id).bind(&id).bind(&state).execute(&pool).await.unwrap();
+        for (event_id, session_id) in [("my-evidence", id.clone()), ("foreign-evidence", ulid::Ulid::new().to_string())] {
+            concerto_sessions::whiteboard::append_whiteboard_event(&pool, &concerto_sessions::NewWhiteboardEvent {
+                event_id: event_id.into(), agent_id: "coder".into(),
+                kind: concerto_sessions::WhiteboardKind::Finding, scope: "src/lib.rs".into(),
+                session_id: Some(session_id), plan_id: None, causation: Some("prior-event".into()),
+                payload: serde_json::json!({"detail": "full stored evidence", "nested": {"exit_code": 0}}),
+                pre_image_hash: None, created_at: 123,
+            }).await.unwrap();
+        }
         pool.close().await;
     });
     let _lock = concerto_core::lock::acquire_data_dir_lock(
@@ -257,11 +290,37 @@ fn runtime_inspection_reads_saved_state_while_another_frontend_holds_the_lock() 
     let value: serde_json::Value = serde_json::from_str(&output).unwrap();
     assert_eq!(value["session_id"], id);
     assert_eq!(value["data"]["world_model"]["objective"], "portable runtime inspection");
-    assert_eq!(value["data"].as_object().unwrap().len(), 4);
+    assert_eq!(value["data"].as_object().unwrap().len(), 6);
+    assert_eq!(value["data"]["topology"]["tasks"][0]["status"], "Running");
+    let output = fixture.success(&["sessions", "runtime", &id, "--view", "topology", "--json"]);
+    let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(value["data"].as_object().unwrap().len(), 1);
+    assert_eq!(value["data"]["topology"]["tasks"][0]["id"], id);
+    let output = fixture.success(&["sessions", "runtime", &id, "--view", "evidence", "--json"]);
+    let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(value["data"].as_object().unwrap().len(), 1);
+    assert!(value["data"]["evidence"]["decision_links"].as_array().unwrap().is_empty());
     let output = fixture.success(&["sessions", "runtime", &id, "--view", "world", "--json"]);
     let value: serde_json::Value = serde_json::from_str(&output).unwrap();
     assert_eq!(value["data"].as_object().unwrap().len(), 1);
     assert!(fixture.success(&["sessions", "runtime", &id]).contains("World model"));
+    let output = fixture.success(&["sessions", "runtime", &id, "--event", "my-evidence", "--json"]);
+    let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(value["found"], true);
+    assert_eq!(value["source"], "whiteboard_event");
+    assert_eq!(value["event"]["session_id"], id);
+    assert_eq!(value["event"]["payload"]["nested"]["exit_code"], 0);
+    assert_eq!(value["event"]["causation"], "prior-event");
+    assert!(fixture
+        .success(&["sessions", "runtime", &id, "--event", "my-evidence"])
+        .contains("full stored evidence"));
+    for event_id in ["missing", "foreign-evidence"] {
+        let output = fixture.success(&["sessions", "runtime", &id, "--event", event_id, "--json"]);
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["found"], false);
+        assert!(value["event"].is_null());
+        assert!(!output.contains("full stored evidence"));
+    }
     assert!(!fixture.command(&["sessions", "runtime", &id, "--limit", "0"]).status.success());
     let unknown = ulid::Ulid::new().to_string();
     assert!(!fixture.command(&["sessions", "runtime", &unknown, "--json"]).status.success());

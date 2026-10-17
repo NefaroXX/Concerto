@@ -5,6 +5,7 @@
 pub mod app;
 pub mod approval;
 mod dispatch;
+mod memory_explorer;
 pub mod extensions;
 pub mod health;
 pub mod plugin_approval;

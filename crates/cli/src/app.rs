@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use crate::approval::{
     ApprovalPrompt, CliApprovalSink, CliApprovalState, IntentPrompt, PlanPrompt,
 };
-use crate::dispatch::runtime::RuntimeInspector;
+use crate::dispatch::runtime::{RuntimeInspector, View as RuntimeView};
 use crate::theme::CliTheme;
 use crate::ui::{self, chat_line_with_theme, ChatRole};
 use concerto_api_types::diff::DiffResult;
@@ -145,6 +145,7 @@ pub enum Screen {
     DiffReview,
     /// Read-only persisted Coordinator state, shared with Desktop.
     RuntimeInspector,
+    MemoryExplorer,
 }
 
 /// Outcome of a per-file review decision on the staged-diff screen.
@@ -542,6 +543,7 @@ pub struct App {
     /// Staged unified-diff review screen state (P02).
     pub(crate) diff_review: DiffReviewState,
     pub(crate) runtime_inspector: RuntimeInspector,
+    pub(crate) memory_screen: crate::memory_explorer::MemoryScreen,
 }
 
 impl Default for App {
@@ -615,6 +617,7 @@ impl App {
             vfs: Arc::new(Mutex::new(VirtualFs::new())),
             diff_review: DiffReviewState::default(),
             runtime_inspector: RuntimeInspector::default(),
+            memory_screen: crate::memory_explorer::MemoryScreen::default(),
         }
     }
 
@@ -1113,6 +1116,7 @@ impl App {
             }
 
             self.runtime_inspector.poll(self.session_id);
+            self.memory_screen.poll();
             terminal.draw(|frame| ui::draw(frame, self))?;
             // While a reveal is animating, poll at the typewriter cadence so
             // each tick can redraw a longer prefix; idle stays at the original
@@ -1543,6 +1547,10 @@ impl App {
 
     pub(crate) fn handle_key(&mut self, event: Event) -> Action {
         if let Event::Paste(text) = event {
+            if self.screen == Screen::MemoryExplorer && !self.is_awaiting_approval() {
+                self.memory_screen.paste(&text);
+                return Action::None;
+            }
             if self.screen == Screen::Chat
                 && (self.input_mode || self.project_picker_mode)
                 && self.command_menu.is_none()
@@ -1709,6 +1717,10 @@ impl App {
             Screen::AgentAssignments => self.handle_agent_assignments_key(key.code),
             Screen::DiffReview => self.handle_diff_review_key(key.code),
             Screen::RuntimeInspector => self.handle_runtime_key(key.code),
+            Screen::MemoryExplorer => {
+                if self.memory_screen.key(key.code) { self.screen = Screen::Chat; }
+                Action::None
+            }
         }
     }
 
@@ -1845,6 +1857,19 @@ impl App {
             KeyCode::Char('i') if !self.input_mode => {
                 self.refresh_runtime_inspector();
                 self.screen = Screen::RuntimeInspector;
+            }
+            KeyCode::Char('e') if !self.input_mode => {
+                let config = self.config.clone().unwrap_or_default();
+                let existing = {
+                    let memory = self.memory.lock().unwrap_or_else(|e| e.into_inner());
+                    match memory.as_ref() {
+                        Some(active) => concerto_orchestrator::memory_explorer::MemoryExplorer::from_active(active, &self.project_dir, &config).map(Some),
+                        None if self.running => Err("Memory is not initialized for this run. Reopen after the run finishes.".into()),
+                        None => Ok(None),
+                    }
+                };
+                self.memory_screen.open(self.project_dir.clone(), config, self.bus.clone(), existing);
+                self.screen = Screen::MemoryExplorer;
             }
             KeyCode::Char('n') if !self.input_mode => return Action::NewSession,
             KeyCode::Char('p') if !self.input_mode => {
@@ -1988,24 +2013,57 @@ impl App {
 
     fn handle_runtime_key(&mut self, key: KeyCode) -> Action {
         match key {
+            KeyCode::Esc if self.runtime_inspector.evidence.text.is_some() => {
+                self.runtime_inspector.evidence.close();
+                self.runtime_inspector.reset_scroll();
+            }
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.runtime_inspector = RuntimeInspector::default();
                 self.screen = Screen::Chat;
             }
+            KeyCode::Char('r') if self.runtime_inspector.evidence.text.is_some() => {
+                self.runtime_inspector.evidence.open();
+                self.runtime_inspector.reset_scroll();
+            }
             KeyCode::Char('r') => self.refresh_runtime_inspector(),
+            KeyCode::Enter if self.runtime_inspector.view == RuntimeView::Evidence => {
+                self.runtime_inspector.evidence.open();
+                self.runtime_inspector.reset_scroll();
+            }
+            KeyCode::Char(bracket @ ('[' | ']'))
+                if self.runtime_inspector.view == RuntimeView::Evidence =>
+            {
+                self.runtime_inspector.evidence.select_next(bracket == '[');
+                self.runtime_inspector.reset_scroll();
+            }
+            KeyCode::Tab | KeyCode::Right => self.runtime_inspector.cycle_view(false),
+            KeyCode::BackTab | KeyCode::Left => self.runtime_inspector.cycle_view(true),
+            KeyCode::Char(number @ '1'..='7') => {
+                self.runtime_inspector
+                    .select_view(RuntimeView::ALL[(number as u8 - b'1') as usize]);
+            }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.runtime_inspector.scroll = self.runtime_inspector.scroll.saturating_sub(1);
+                self.runtime_inspector.scroll = self
+                    .runtime_inspector
+                    .scroll
+                    .min(self.runtime_inspector.max_scroll.get())
+                    .saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.runtime_inspector.scroll = self.runtime_inspector.scroll.saturating_add(1);
+                self.runtime_inspector.scroll_down(1);
             }
             KeyCode::PageUp => {
-                self.runtime_inspector.scroll = self.runtime_inspector.scroll.saturating_sub(10);
+                self.runtime_inspector.scroll = self
+                    .runtime_inspector
+                    .scroll
+                    .min(self.runtime_inspector.max_scroll.get())
+                    .saturating_sub(self.runtime_inspector.page_rows.get());
             }
             KeyCode::PageDown => {
-                self.runtime_inspector.scroll = self.runtime_inspector.scroll.saturating_add(10);
+                self.runtime_inspector.scroll_down(self.runtime_inspector.page_rows.get());
             }
             KeyCode::Home => self.runtime_inspector.scroll = 0,
+            KeyCode::End => self.runtime_inspector.scroll = self.runtime_inspector.max_scroll.get(),
             _ => {}
         }
         Action::None
@@ -4574,10 +4632,31 @@ mod tests {
         app.handle_key(key_event(KeyCode::Char('i'), KeyModifiers::empty()));
         assert_eq!(app.screen, Screen::RuntimeInspector);
         assert!(app.runtime_inspector.text.contains("No active session"));
+        app.runtime_inspector.max_scroll.set(12);
+        app.runtime_inspector.page_rows.set(5);
         app.handle_key(key_event(KeyCode::PageDown, KeyModifiers::empty()));
-        assert_eq!(app.runtime_inspector.scroll, 10);
+        assert_eq!(app.runtime_inspector.scroll, 5);
+        app.handle_key(key_event(KeyCode::End, KeyModifiers::empty()));
+        app.handle_key(key_event(KeyCode::Down, KeyModifiers::empty()));
+        assert_eq!(app.runtime_inspector.scroll, 12);
+        app.handle_key(key_event(KeyCode::Tab, KeyModifiers::empty()));
+        assert_eq!(app.runtime_inspector.view, RuntimeView::Topology);
+        assert_eq!(app.runtime_inspector.scroll, 0);
+        app.handle_key(key_event(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(app.runtime_inspector.view, RuntimeView::All);
+        app.handle_key(key_event(KeyCode::Char('4'), KeyModifiers::empty()));
+        assert_eq!(app.runtime_inspector.view, RuntimeView::Evidence);
+        app.runtime_inspector.evidence.ids = vec!["first".into(), "second".into()];
+        app.handle_key(key_event(KeyCode::Char(']'), KeyModifiers::empty()));
+        assert_eq!(app.runtime_inspector.evidence.selected(), Some("second"));
+        app.runtime_inspector.evidence.text = Some("Event payload".into());
+        app.handle_key(key_event(KeyCode::Esc, KeyModifiers::empty()));
+        assert_eq!(app.screen, Screen::RuntimeInspector);
+        assert!(app.runtime_inspector.evidence.text.is_none());
+        assert_eq!(app.runtime_inspector.evidence.selected(), Some("second"));
         app.handle_key(key_event(KeyCode::Char('r'), KeyModifiers::empty()));
         assert_eq!(app.runtime_inspector.scroll, 0);
+        assert_eq!(app.runtime_inspector.view, RuntimeView::Evidence);
         app.handle_key(key_event(KeyCode::Esc, KeyModifiers::empty()));
         assert_eq!(app.screen, Screen::Chat);
     }
