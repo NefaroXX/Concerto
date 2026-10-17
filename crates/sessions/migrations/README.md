@@ -6,6 +6,13 @@ SQLite migrations for the sessions crate, applied by `sqlx::migrate!` (see
 records applied files in the `_sqlx_migrations` table, so files are never
 re-run and must not be edited once they have shipped.
 
+**The checksum covers the whole file — comments included.** A doc-only
+edit (e.g. repointing an ADR reference in a header comment) changes the
+sha384 sqlx records, and every database created before the edit then
+fails validation with "migration NNN was previously applied but has been
+modified", bricking the session store. Repoint stale comments from a
+scratch-notes file or the codebase docs, never from shipped SQL.
+
 ## Numbering convention
 
 - `NNN_description.sql`, zero-padded to three digits.
