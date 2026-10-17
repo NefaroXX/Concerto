@@ -84,7 +84,17 @@ pub(crate) const DEFAULT_TIMEOUT_SECS: u64 = 15;
 /// account. The 429 is client-identification, not pool exhaustion. Do not
 /// replace this with `concerto/<version>`; the free pilots will stop
 /// serving.
-const DEFAULT_USER_AGENT: &str = "opencode/1.0";
+///
+/// Updated 2026-10-17 from `opencode/1.0` to `opencode/9.9.9`: the relay now
+/// ALSO enforces a client-version floor on the keyless free tier —
+/// `HTTP 426 Upgrade Required: OpenCode 1.18.0 or newer is required to use
+/// the free tier` (caught via the audit trail of a live session; the
+/// request's identity headers had already passed, so this is purely the UA
+/// version being too old). `9.9.9` is the alpha-ablation-verified value from
+/// the 2026-10-17 fingerprint investigation (`opencode/9.9.9` → HTTP 200
+/// with all other headers in place) and clears any foreseeable floor bump
+/// without pretending to be a specific released build.
+const DEFAULT_USER_AGENT: &str = "opencode/9.9.9";
 
 /// Build a `reqwest::Client` with a bounded connect timeout.
 ///
