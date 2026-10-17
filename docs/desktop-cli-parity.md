@@ -72,7 +72,7 @@ These are real gaps, not GUI-only exclusions.
 | Done on current dev | Staged change review | TUI unified diff and accept/reject through the shared overlay; narrow-terminal checks |
 | P1 | Live Coordinator pause/resume/decisions | Same in-process control handles and checkpoint semantics; cross-process control requires a shared authenticated API |
 | Partial | Runtime Studio inspection | Checkpoint topology, world model, decisions, evidence references, diagnoses and suitability have text/JSON and selectable TUI views. Full evidence records are available through `--event ID` and the TUI reference picker. Live state remains. |
-| P2 | Rich memory explorer | Search/detail/delete through the shared memory service; graph/explain commands cover only part of Desktop |
+| Implemented; validation in progress | Rich memory explorer | `memory list/search/show/delete/reindex` plus graph/explain; TUI search, type filters, full details, confirmed deletion, refresh/re-index and bounded navigation through the shared memory service |
 | P2 | Structured TUI editors | Roster/provider/policy/MCP inspectors and multiline prompts backed by validated command services |
 | P2 | Editor operations | File/context selection, search, diagnostics, patch/review, attachments and external-editor integration |
 | P2 | Terminal workflow | Launch selected profile with the same toolchain/environment; only terminal-page layout is exempt |

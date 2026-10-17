@@ -22,6 +22,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Screen::AgentAssignments => draw_agent_assignments_screen(frame, app),
         Screen::DiffReview => draw_diff_review_screen(frame, app),
         Screen::RuntimeInspector => draw_runtime_inspector(frame, app),
+        Screen::MemoryExplorer => app.memory_screen.draw(frame, &app.cli_theme),
     }
     if let Some(prompt) = app.approval_prompt() {
         draw_approval_modal(frame, frame.area(), &prompt, &app.cli_theme);
@@ -96,6 +97,7 @@ pub(crate) const CHAT_COMMANDS: &[(char, &str)] = &[
     ('t', "Tool history"),
     ('d', "Review changes"),
     ('i', "Runtime"),
+    ('e', "Memory explorer"),
     ('p', "Switch project"),
     ('n', "New session"),
 ];

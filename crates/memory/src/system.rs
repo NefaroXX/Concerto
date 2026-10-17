@@ -1085,6 +1085,35 @@ impl MemoryStore for MemorySystem {
             .await
             .map_err(|e| CoreMemoryError::Persistence(format!("failed to invalidate memory: {e}")))
     }
+
+    async fn inspect_project_chunk(
+        &self,
+        project_id: &ProjectId,
+        id: &str,
+        cancel: CancellationToken,
+    ) -> Result<Option<MemoryChunk>, CoreMemoryError> {
+        if project_id != &self.project_id {
+            return Err(CoreMemoryError::CrossProjectLeakage);
+        }
+        if cancel.is_cancelled() {
+            return Err(CoreMemoryError::RetrievalFailed("memory operation cancelled".into()));
+        }
+        self.retriever.load_chunks(project_id, &[id.to_string()], cancel).await
+            .map(|chunks| chunks.into_iter().next())
+    }
+
+    async fn invalidate_project_chunk(
+        &self,
+        project_id: &ProjectId,
+        id: &str,
+        cancel: CancellationToken,
+    ) -> Result<(), CoreMemoryError> {
+        if self.inspect_project_chunk(project_id, id, cancel.clone()).await?.is_none() {
+            return Err(CoreMemoryError::NotFound(id.to_string()));
+        }
+        self.sync.tombstone(id, project_id, cancel).await
+            .map_err(|e| CoreMemoryError::Persistence(format!("failed to invalidate memory: {e}")))
+    }
 }
 
 fn validate_scope(
@@ -1563,6 +1592,42 @@ mod tests {
             expires_at: None,
             created_at: OffsetDateTime::now_utc(),
         }
+    }
+
+    #[tokio::test]
+    async fn project_inspection_and_deletion_preserve_global_and_foreign_entries() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let global = Arc::new(GlobalMemoryStore::new(pool.clone()).await.unwrap());
+        let vectors = Arc::new(InMemoryVectorStore::new());
+        let fts = Arc::new(InMemoryFullTextStore::new());
+        let project = ProjectId("test".into());
+        let other = ProjectId("other".into());
+        let id = ulid::Ulid::new();
+        let text = "complete project content\n".repeat(50);
+        dedup_seed(&project, &id.to_string(), &text, vectors.clone(), fts.clone()).await;
+        dedup_seed(&other, "foreign", "foreign content", vectors.clone(), fts.clone()).await;
+        let system = MemorySystem::new(vectors.clone(), fts, Arc::new(DecisionStore::new()), Arc::new(TaskTreeStore::new()), None, project.clone(), Some(global));
+        let mut entry = dedup_entry("global preference");
+        entry.id = MemoryId(id);
+        entry.project_id = ProjectId("user".into());
+        entry.namespace = MemoryNamespace::Global { user_id_hash: "user".into() };
+        system.store(entry, CancellationToken::new()).await.unwrap();
+        let chunk = system.inspect_project_chunk(&project, &id.to_string(), CancellationToken::new()).await.unwrap().unwrap();
+        assert_eq!(chunk.content, text);
+        assert!(system.inspect_project_chunk(&project, "foreign", CancellationToken::new()).await.unwrap().is_none());
+        assert!(matches!(system.invalidate_project_chunk(&other, "foreign", CancellationToken::new()).await, Err(MemoryError::CrossProjectLeakage)));
+        assert!(matches!(system.invalidate_project_chunk(&project, "missing", CancellationToken::new()).await, Err(MemoryError::NotFound(_))));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(system.invalidate_project_chunk(&project, &id.to_string(), cancel).await.is_err());
+        assert!(system.inspect_project_chunk(&project, &id.to_string(), CancellationToken::new()).await.unwrap().is_some());
+        system.invalidate_project_chunk(&project, &id.to_string(), CancellationToken::new()).await.unwrap();
+        assert!(system.inspect_project_chunk(&project, &id.to_string(), CancellationToken::new()).await.unwrap().is_none());
+        assert_eq!(stored_records(&vectors, &other).await.len(), 1);
+        let mut query = make_query("global preference");
+        query.namespace = MemoryNamespace::Global { user_id_hash: "user".into() };
+        assert_eq!(system.retrieve(&query, CancellationToken::new()).await.unwrap().len(), 1);
+        pool.close().await;
     }
 
     async fn stored_records(

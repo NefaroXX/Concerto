@@ -145,6 +145,7 @@ pub enum Screen {
     DiffReview,
     /// Read-only persisted Coordinator state, shared with Desktop.
     RuntimeInspector,
+    MemoryExplorer,
 }
 
 /// Outcome of a per-file review decision on the staged-diff screen.
@@ -542,6 +543,7 @@ pub struct App {
     /// Staged unified-diff review screen state (P02).
     pub(crate) diff_review: DiffReviewState,
     pub(crate) runtime_inspector: RuntimeInspector,
+    pub(crate) memory_screen: crate::memory_explorer::MemoryScreen,
 }
 
 impl Default for App {
@@ -615,6 +617,7 @@ impl App {
             vfs: Arc::new(Mutex::new(VirtualFs::new())),
             diff_review: DiffReviewState::default(),
             runtime_inspector: RuntimeInspector::default(),
+            memory_screen: crate::memory_explorer::MemoryScreen::default(),
         }
     }
 
@@ -1113,6 +1116,7 @@ impl App {
             }
 
             self.runtime_inspector.poll(self.session_id);
+            self.memory_screen.poll();
             terminal.draw(|frame| ui::draw(frame, self))?;
             // While a reveal is animating, poll at the typewriter cadence so
             // each tick can redraw a longer prefix; idle stays at the original
@@ -1543,6 +1547,10 @@ impl App {
 
     pub(crate) fn handle_key(&mut self, event: Event) -> Action {
         if let Event::Paste(text) = event {
+            if self.screen == Screen::MemoryExplorer && !self.is_awaiting_approval() {
+                self.memory_screen.paste(&text);
+                return Action::None;
+            }
             if self.screen == Screen::Chat
                 && (self.input_mode || self.project_picker_mode)
                 && self.command_menu.is_none()
@@ -1709,6 +1717,10 @@ impl App {
             Screen::AgentAssignments => self.handle_agent_assignments_key(key.code),
             Screen::DiffReview => self.handle_diff_review_key(key.code),
             Screen::RuntimeInspector => self.handle_runtime_key(key.code),
+            Screen::MemoryExplorer => {
+                if self.memory_screen.key(key.code) { self.screen = Screen::Chat; }
+                Action::None
+            }
         }
     }
 
@@ -1845,6 +1857,19 @@ impl App {
             KeyCode::Char('i') if !self.input_mode => {
                 self.refresh_runtime_inspector();
                 self.screen = Screen::RuntimeInspector;
+            }
+            KeyCode::Char('e') if !self.input_mode => {
+                let config = self.config.clone().unwrap_or_default();
+                let existing = {
+                    let memory = self.memory.lock().unwrap_or_else(|e| e.into_inner());
+                    match memory.as_ref() {
+                        Some(active) => concerto_orchestrator::memory_explorer::MemoryExplorer::from_active(active, &self.project_dir, &config).map(Some),
+                        None if self.running => Err("Memory is not initialized for this run. Reopen after the run finishes.".into()),
+                        None => Ok(None),
+                    }
+                };
+                self.memory_screen.open(self.project_dir.clone(), config, self.bus.clone(), existing);
+                self.screen = Screen::MemoryExplorer;
             }
             KeyCode::Char('n') if !self.input_mode => return Action::NewSession,
             KeyCode::Char('p') if !self.input_mode => {

@@ -86,7 +86,36 @@ For an existing route, read its `keyring_key` rather than assuming an account.
 Remove agent/fallback assignments before removing a provider; deleting its
 configuration does not delete its keychain credential.
 
-## Extensions and shell
+## Project memory
+
+```sh
+concerto memory list --json
+concerto memory search "authentication" --type function --limit 50 --json
+concerto memory show CHUNK_ID --json
+concerto memory delete CHUNK_ID --yes
+concerto memory reindex
+concerto memory graph
+concerto memory explain CHUNK_ID
+```
+
+The TUI command menu (F1/Ctrl+P) includes **Memory explorer**; command mode
+also opens it with `e`. `/` edits a search, Enter applies it, Tab/Shift+Tab
+cycles entry types, and Enter on a row opens its full content and metadata.
+Use paging or Home/End in details. `d` asks for confirmation bound to the
+selected chunk ID; only `y` deletes, while `n`/Esc cancels. `r` refreshes and
+`R` re-indexes with the configured project exclusions. Esc returns to the list
+and then chat, preserving the chat draft.
+
+Search uses the same memory retrieval service as Desktop. Inspection and
+deletion are explicitly project-scoped, including when a global memory entry
+has the same ID. Re-indexing can restore file-backed chunks previously deleted
+from retrieval. Memory must be enabled; standalone commands initialize the
+normal memory subsystem, may start indexing, and obey its instance lock. The
+TUI reuses a running project's initialized store. Closing cancels pending
+work and discards late results. JSON returns full content with escaped control
+characters; `--limit` is bounded to 1–1000 and defaults to 200.
+
+## Extension and shell commands
 
 ```sh
 concerto extensions skills list

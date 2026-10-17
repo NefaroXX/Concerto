@@ -61,6 +61,27 @@ fn scoped_edits_and_dry_runs_validate_without_setup_or_provider() {
 }
 
 #[test]
+fn memory_commands_validate_and_run_without_a_provider() {
+    let fixture = Fixture::new();
+    let output = fixture.command(&["memory", "delete", "chunk"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--yes"));
+    assert!(!fixture.dir.path().join("data/concerto/memory/memory.db").exists());
+    fixture.success(&["config", "set", "memory.enabled", "false"]);
+    let output = fixture.command(&["memory", "list", "--json"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("disabled"));
+    fixture.success(&["config", "set", "memory.enabled", "true"]);
+    let result: serde_json::Value = serde_json::from_str(&fixture.success(&["memory", "reindex", "--json"])).unwrap();
+    assert_eq!(result["indexed_chunks"], 0);
+    let result: serde_json::Value = serde_json::from_str(&fixture.success(&["memory", "list", "--json"])).unwrap();
+    assert_eq!(result["entries"], serde_json::json!([]));
+    let result: serde_json::Value = serde_json::from_str(&fixture.success(&["memory", "show", "absent", "--json"])).unwrap();
+    assert_eq!(result["found"], false);
+    assert!(result["entry"].is_null());
+}
+
+#[test]
 fn agent_edits_clone_and_removal_use_the_authoritative_roster() {
     let fixture = Fixture::new();
     fixture.success(&["agents", "set", "coder", "capabilities.shell", "false"]);

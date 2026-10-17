@@ -69,6 +69,24 @@ pub trait MemoryStore: Send + Sync {
         entry: MemoryEntry,
         cancel: CancellationToken,
     ) -> Result<MemoryId, MemoryError>;
+    /// Load one indexed project chunk without searching or truncating its content.
+    async fn inspect_project_chunk(
+        &self,
+        _project_id: &ProjectId,
+        _id: &str,
+        _cancel: CancellationToken,
+    ) -> Result<Option<MemoryChunk>, MemoryError> {
+        Err(MemoryError::RetrievalFailed("project chunk inspection is unsupported".into()))
+    }
+    /// Invalidate only a project chunk, never a global entry sharing its ID.
+    async fn invalidate_project_chunk(
+        &self,
+        _project_id: &ProjectId,
+        _id: &str,
+        _cancel: CancellationToken,
+    ) -> Result<(), MemoryError> {
+        Err(MemoryError::Persistence("project chunk deletion is unsupported".into()))
+    }
     async fn invalidate(&self, id: MemoryId, cancel: CancellationToken) -> Result<(), MemoryError>;
     /// Invalidate an indexed chunk whose identifier may not be a ULID.
     async fn invalidate_chunk(
