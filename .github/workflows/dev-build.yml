@@ -1,4 +1,5 @@
-# Dev artifact builder: fresh Windows smoke-test binary without local builds.
+# Dev artifact builder: fresh Windows/Linux smoke-test binaries without local
+# builds.
 #
 # Triggers on every push to `dev` (docs-only changes excluded) and manually
 # via workflow_dispatch. Builds the `concerto` entry binary (default features
@@ -8,12 +9,17 @@
 # traceable to its exact commit (no more stale-binary questions: the SHA is
 # the version).
 #
-# Download: Actions tab → "Dev Windows build" → latest green run →
-# Artifacts → concerto-windows-dev (contains concerto-dev-<sha>-*.exe).
+# Download: Actions tab → "Dev builds" → latest green run → Artifacts →
+# concerto-windows-dev (concerto-dev-<sha>-x86_64-pc-windows-msvc.exe) or
+# concerto-linux-dev (concerto-dev-<sha>-x86_64-unknown-linux-gnu).
 # Retention is deliberately short; tagged releases remain the durable
 # artifacts (see release.yml).
+#
+# Why an explicit --target triple on both jobs: it puts the binary in a
+# target-triple directory (no ambiguity with mixed-target caches) and makes
+# the artifact filename self-describing without platform-specific branching.
 
-name: Dev Windows build
+name: Dev builds
 
 on:
   push:
@@ -33,7 +39,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: dev-windows-build-${{ github.ref }}
+  group: dev-build-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -71,5 +77,51 @@ jobs:
         with:
           name: concerto-windows-dev
           path: concerto-dev-${{ env.SHORT_SHA }}-x86_64-pc-windows-msvc.exe
+          if-no-files-found: error
+          retention-days: 14
+
+  build-linux-dev:
+    name: Linux dev binary
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.96.0)
+        uses: dtolnay/rust-toolchain@1.96.0
+
+      # Matches the apt list in ci.yml: the concerto binary with default
+      # features (desktop included) compiles on hosted Ubuntu with exactly
+      # these, so no X11/Wayland/GL packages are needed to build.
+      - name: Install system dependencies (dbus, ssl, sqlite, pkg-config)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config libssl-dev libsqlite3-dev
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-dev
+
+      - name: Build debug binary
+        run: cargo build --target x86_64-unknown-linux-gnu -p concerto
+
+      # Unlike the Windows job (headless runner, GUI app), the Linux CLI
+      # subcommands run headless — prove the artifact starts before upload.
+      - name: Smoke-run launcher command
+        run: ./target/x86_64-unknown-linux-gnu/debug/concerto config help
+
+      - name: Stage SHA-named binary
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "SHORT_SHA=${SHORT_SHA}" >> "${GITHUB_ENV}"
+          cp "target/x86_64-unknown-linux-gnu/debug/concerto" \
+             "concerto-dev-${SHORT_SHA}-x86_64-unknown-linux-gnu"
+
+      - name: Upload dev artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: concerto-linux-dev
+          path: concerto-dev-${{ env.SHORT_SHA }}-x86_64-unknown-linux-gnu
           if-no-files-found: error
           retention-days: 14
