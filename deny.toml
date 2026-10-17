@@ -116,6 +116,25 @@ ignore = [
     # Review date: 2026-10-14 — re-check iced/cryoglyph releases for a relaxed
     # lru pin (>=0.18.2), then drop this ignore and close the last lru entry.
     "RUSTSEC-2026-0253",  # lru — unsound pop, transitive via iced_wgpu -> cryoglyph (pinned ^0.16)
+    # === zbus family unmaintained (merged upstream into zbus 6.0.0) ===
+    # Reason: RUSTSEC-2026-0370 (zvariant), RUSTSEC-2026-0371 (zbus_names) and
+    # RUSTSEC-2026-0372 (zvariant_derive), all published 2026-10-16, are
+    # maintenance-only notices: the three standalone crates were absorbed into
+    # zbus 6.0.0 (wire format, `names` module, and derive macros respectively).
+    # No vulnerability in any of them; the advisories fire because the
+    # standalone crates will see no further releases.
+    # The workspace currently resolves zbus 5.16.0 with the standalone crates
+    # as its transitives, pulled in exclusively behind the keyring stack
+    # (keyring -> D-Bus Secret Service backend on Linux). Migrating the stack
+    # to zbus 6.0.0 is an upstream keyring collaboration, not a selectable
+    # bump from this workspace — suppressing is the correct interim measure
+    # until that upgrade lands; any zbus/keyring bump re-fires `cargo deny
+    # check` here if these crates resurface, forcing re-review.
+    # Scope: transitive deps only (keyring D-Bus backend).
+    # Review date: 2026-10-17 — revisit when keyring or zbus versions move.
+    "RUSTSEC-2026-0370",  # zvariant unmaintained — merged into zbus 6.0.0 (wire module)
+    "RUSTSEC-2026-0371",  # zbus_names unmaintained — merged into zbus 6.0.0 (names module)
+    "RUSTSEC-2026-0372",  # zvariant_derive unmaintained — derives now provided by zbus 6.0.0
 ]
 
 [licenses]
