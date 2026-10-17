@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use concerto_core::ids::Ulid;
+use concerto_core::types::{AgentId, SubTaskStatus, TaskId};
 use concerto_core::CancellationToken;
 use concerto_sessions::SessionStore;
 use time::OffsetDateTime;
@@ -14,6 +15,7 @@ use time::OffsetDateTime;
 use crate::checkpoint::GraphCheckpoint;
 use crate::decisions::CoordinatorDecision;
 use crate::failure_diagnosis::FailureDiagnosis;
+use crate::graph::Dependency;
 use crate::suitability::{AgentSuitability, SuitabilityIndex, SuitabilityState, TaskClass};
 use crate::world_model::WorldModel;
 
@@ -24,9 +26,38 @@ pub struct TaskClassSuitability {
     pub agents: Vec<AgentSuitability>,
 }
 
+/// Saved task state. This is a projection, never a live scheduler handle.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RuntimeTask {
+    pub id: TaskId,
+    pub parent_id: Option<TaskId>,
+    pub agent: AgentId,
+    pub description: String,
+    pub status: SubTaskStatus,
+    pub dependencies: Vec<TaskId>,
+    pub deliverable: Option<String>,
+}
+
+/// A directed edge from the prerequisite/context provider to its consumer.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RuntimeDependency {
+    pub from: TaskId,
+    pub to: TaskId,
+    pub kind: Dependency,
+}
+
+/// Keep the complete graph together so display limits cannot sever its edges.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct RuntimeTopology {
+    pub tasks: Vec<RuntimeTask>,
+    pub edges: Vec<RuntimeDependency>,
+}
+
 /// The bounded, read-only Coordinator 2.0 runtime snapshot the panels render.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct StudioRuntimeSnapshot {
+    /// Task identities, saved statuses, and directed dependency edges.
+    pub topology: RuntimeTopology,
     /// The typed decision journal (whiteboard Decision events reconciled in the
     /// persisted `decision_journal`).
     pub decisions: Vec<CoordinatorDecision>,
@@ -45,13 +76,34 @@ impl StudioRuntimeSnapshot {
     /// Extract the snapshot from a persisted checkpoint. Pure; reads only the
     /// existing additive Coordinator fields — no new sources, no runtime APIs.
     pub fn from_checkpoint(checkpoint: &GraphCheckpoint) -> Self {
-        Self::from_parts(
+        let mut snapshot = Self::from_parts(
             &checkpoint.decision_journal,
             &checkpoint.failure_diagnoses,
             &checkpoint.world_model,
             &checkpoint.suitability,
             OffsetDateTime::now_utc(),
-        )
+        );
+        snapshot.topology = RuntimeTopology {
+            tasks: checkpoint
+                .subtasks
+                .iter()
+                .map(|task| RuntimeTask {
+                    id: task.id,
+                    parent_id: task.parent_id,
+                    agent: task.role.clone(),
+                    description: task.description.clone(),
+                    status: task.status,
+                    dependencies: task.dependencies.clone(),
+                    deliverable: task.deliverable.clone(),
+                })
+                .collect(),
+            edges: checkpoint
+                .edges
+                .iter()
+                .map(|(from, to, kind)| RuntimeDependency { from: *from, to: *to, kind: *kind })
+                .collect(),
+        };
+        snapshot
     }
 
     /// The testable extraction core: `now` is injected so suitability rankings
@@ -64,6 +116,7 @@ impl StudioRuntimeSnapshot {
         now: OffsetDateTime,
     ) -> Self {
         Self {
+            topology: RuntimeTopology::default(),
             decisions: decision_journal.to_vec(),
             world_model: world_model_present(world_model),
             diagnoses: failure_diagnoses.to_vec(),
@@ -81,6 +134,8 @@ impl StudioRuntimeSnapshot {
     /// Whether the snapshot holds any Coordinator 2.0 state to display.
     pub fn is_empty(&self) -> bool {
         self.decisions.is_empty()
+            && self.topology.tasks.is_empty()
+            && self.topology.edges.is_empty()
             && self.world_model.is_none()
             && self.diagnoses.is_empty()
             && self.suitability.is_empty()
@@ -197,6 +252,43 @@ mod tests {
     use super::*;
     use concerto_core::types::TaskId;
     use concerto_sessions::{OrchestrationCheckpointRecord, SqliteSessionStore};
+
+    #[test]
+    fn topology_preserves_saved_statuses_and_dependency_direction() {
+        let session_id = Ulid::new();
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let checkpoint = GraphCheckpoint::from_json(
+            &serde_json::json!({
+                "schema_version": 4, "session_id": session_id,
+                "subtasks": [
+                    {"id": first, "parent_id": null, "session_id": session_id,
+                     "role": "coder", "description": "implement", "status": "Completed",
+                     "dependencies": [], "deliverable": "src/lib.rs"},
+                    {"id": second, "parent_id": first, "session_id": session_id,
+                     "role": "reviewer", "description": "review", "status": "Blocked",
+                     "dependencies": [first], "deliverable": null}
+                ],
+                "edges": [[first, second, "MustFinishBefore"]],
+                "completed_results": {}, "total_cost": 0.0, "total_tool_calls": 0,
+                "provider_metrics": [], "all_files": [], "subtask_attempts": {},
+                "retry_feedback": {}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let snapshot = StudioRuntimeSnapshot::from_checkpoint(&checkpoint);
+        assert!(!snapshot.is_empty(), "a graph-only checkpoint has inspectable state");
+        assert_eq!(snapshot.topology.tasks[0].status, SubTaskStatus::Completed);
+        assert_eq!(snapshot.topology.tasks[0].deliverable.as_deref(), Some("src/lib.rs"));
+        assert_eq!(snapshot.topology.tasks[1].status, SubTaskStatus::Blocked);
+        assert_eq!(snapshot.topology.tasks[1].parent_id, Some(first));
+        assert_eq!(snapshot.topology.tasks[1].dependencies, vec![first]);
+        assert_eq!(
+            snapshot.topology.edges,
+            vec![RuntimeDependency { from: first, to: second, kind: Dependency::MustFinishBefore }]
+        );
+    }
 
     #[tokio::test]
     async fn reader_loads_checkpoint_without_changing_stored_state() {

@@ -39,15 +39,30 @@ fn draw_runtime_inspector(frame: &mut Frame, app: &App) {
     let block = panel(" Runtime inspector ", &app.cli_theme);
     let inner = block.inner(frame.area());
     frame.render_widget(block, frame.area());
-    let areas = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(inner);
-    let body = Paragraph::new(app.runtime_inspector.text.as_str())
-        .wrap(Wrap { trim: false })
-        .scroll((app.runtime_inspector.scroll, 0));
-    frame.render_widget(body, areas[0]);
-    let help = Paragraph::new("r refresh | Esc back | j/k scroll | PgUp/PgDn | Home")
+    let areas =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(1), Constraint::Length(2)])
+            .split(inner);
+    let inspector = &app.runtime_inspector;
+    let heading = format!("{}/7 {}", inspector.view.index() + 1, inspector.view.label());
+    frame.render_widget(
+        Paragraph::new(heading).style(Style::default().fg(app.cli_theme.warning)),
+        areas[0],
+    );
+    let body = Paragraph::new(app.runtime_inspector.text.as_str()).wrap(Wrap { trim: false });
+    let max_scroll = body.line_count(areas[1].width).saturating_sub(areas[1].height as usize);
+    let max_scroll = u16::try_from(max_scroll).unwrap_or(u16::MAX);
+    inspector.max_scroll.set(max_scroll);
+    inspector.page_rows.set(areas[1].height.max(1));
+    frame.render_widget(body.scroll((inspector.scroll.min(max_scroll), 0)), areas[1]);
+    let hints = if inner.width < 60 {
+        "Tab view | r refresh\nEsc back | j/k scroll"
+    } else {
+        "Tab/Shift+Tab or 1–7: view | r refresh | Esc back\nj/k scroll | PgUp/PgDn page | Home/End"
+    };
+    let help = Paragraph::new(hints)
         .style(Style::default().fg(app.cli_theme.muted))
         .wrap(Wrap { trim: false });
-    frame.render_widget(help, areas[1]);
+    frame.render_widget(help, areas[2]);
 }
 
 /// Shared menu labels and their existing command-mode shortcuts.
@@ -1684,20 +1699,31 @@ mod tests {
         for (width, height) in [(24, 8), (40, 12), (80, 24), (120, 40)] {
             let mut app = App::new();
             app.screen = Screen::RuntimeInspector;
-            app.runtime_inspector.text =
-                "Saved checkpoint\nDecision journal\nWorld model\nFailure diagnoses\nSuitability"
-                    .into();
+            app.runtime_inspector.text = format!(
+                "Saved checkpoint\nDecision journal\nWorld model\nFailure diagnoses\nSuitability{}Last saved task",
+                "\n".repeat(50)
+            );
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal.draw(|frame| super::draw(frame, &app)).unwrap();
             let text = buffer_text(&terminal);
             assert!(text.contains("Runtime inspector"), "{width}x{height}: {text}");
             assert!(text.contains("Saved checkpoint"));
             assert!(text.contains("r refresh"));
+            assert!(text.contains("1/7 Overview"));
+            assert!(app.runtime_inspector.max_scroll.get() > 0);
             app.runtime_inspector.scroll = 2;
             terminal.draw(|frame| super::draw(frame, &app)).unwrap();
             let text = buffer_text(&terminal);
             assert!(!text.contains("Saved checkpoint"));
             assert!(text.contains("World model"));
+            app.runtime_inspector.scroll = u16::MAX;
+            terminal.draw(|frame| super::draw(frame, &app)).unwrap();
+            assert!(buffer_text(&terminal).contains("Last saved task"));
+            for view in crate::dispatch::runtime::View::ALL {
+                app.runtime_inspector.select_view(view);
+                terminal.draw(|frame| super::draw(frame, &app)).unwrap();
+                assert!(buffer_text(&terminal).contains(view.label()));
+            }
         }
     }
 
