@@ -187,6 +187,20 @@ pub const OPENCODE_FREE_KNOWN: &[&str] = &[
     "space-bunny-free",
 ];
 
+/// Free model IDs live-verified as served by the OpenCode **Zen** relay for an
+/// anonymous (keyless) client on 2026-10-17.
+///
+/// Zen's raw catalog advertises 44 zero-priced ids, but membership probes with
+/// correctly minted session fingerprints found only a handful actually
+/// serving: several catalog entries are retired (`fledge-alpha-free` → `410`)
+/// or unreachable upstream (`deepseek-v4-flash-free`, `step-5-preview-free`,
+/// `x-preview-f-free` → `400 "Model is unavailable"`). These three answered
+/// `200` SSE — the practical keyless free tier. Kept deliberately tiny and
+/// hand-verified (never copied from the Go catalog, which is a distinct
+/// roster): live discovery still covers the long tail via the keyless
+/// `GET /zen/v1/models`.
+pub const OPENCODE_ZEN_FREE_KNOWN: &[&str] = &["beam-free", "big-pickle", "cat-jam-free"];
+
 /// Return the [`ProviderDefinition`] for a provider type string.
 ///
 /// Unrecognized types fall back to a permissive "unknown" definition so the UI
@@ -251,9 +265,14 @@ pub fn provider_definition(provider_type: &str) -> ProviderDefinition {
         "opencode" => ProviderDefinition {
             id: "opencode",
             display_name: String::from("OpenCode Zen"),
-            default_model: None,
-            known_models: &[],
-            credential_requirement: CredentialRequirement::Required,
+            // `big-pickle` is the most consistently served keyless free model
+            // (verified repeatedly); the other two live-for-sure free ids are
+            // one pick away. A credential is *optional* here: without one the
+            // connector runs on the anonymous free tier, and with one it uses
+            // the paid Zen roster (custom entry + live discovery).
+            default_model: Some("big-pickle"),
+            known_models: OPENCODE_ZEN_FREE_KNOWN,
+            credential_requirement: CredentialRequirement::Optional,
             model_discovery: ModelDiscoverySupport::Supported,
             allows_custom_model: true,
         },

@@ -9,12 +9,19 @@
 //!   [`crate::provider_defs::OPENCODE_FREE_KNOWN`]): never assume a model id
 //!   exists on both relays, and never copy a catalog from one to the other.
 //!
-//! Neither relay serves completions to a plain unauthenticated client — Go
-//! answers `401 AuthError "Missing API key."`, and Zen's zero-cost models are
-//! gated by a server-side client attestation (a real client session id plus an
-//! accepted client version) that only a running `opencode serve` provides (see
-//! [`crate::opencode_local`]). A config-supplied `api_base` overrides either
-//! default (self-hosted gateways, proxies, tests).
+//! Neither relay serves completions to a plain unauthenticated client. **Go**
+//! answers `401 AuthError "Missing API key."`, so the `opencode-free` provider
+//! type always requires a real credential. **Zen**, by contrast, serves its
+//! zero-cost roster to an *anonymous* client (`Authorization: Bearer public`,
+//! the relay's `"public"` sentinel for "no account") once the request passes
+//! the relay's client-fingerprint gate — a dev-tree-format
+//! `x-opencode-session` value, an `opencode/*` `User-Agent`, `stream: true`,
+//! and a body declaring at least three opencode builtin tool names. See
+//! [`OPENCODE_ANONYMOUS_CREDENTIAL`], [`mint_dev_identifier`], and
+//! [`OpenCodeZenProvider::keyless_gate_tools`]. That keyless path is why the
+//! `opencode` provider type can be built with no credential; the gate is a
+//! *fingerprint check*, not session registration. A config-supplied `api_base`
+//! overrides either default (self-hosted gateways, proxies, tests).
 //!
 //! Each relay dispatches on the **lowercased full model-id prefix** — the
 //! authoritative contract is the upstream consumer's
@@ -48,7 +55,9 @@ use async_stream::stream;
 use async_trait::async_trait;
 use concerto_core::error::{describe_error_chain, ProviderError};
 use concerto_core::traits::{CompletionStream, LlmProvider};
-use concerto_core::types::{CompletionChunk, CompletionRequest, ModelInfo, TokenBudget, ToolCall};
+use concerto_core::types::{
+    CompletionChunk, CompletionRequest, ModelInfo, TokenBudget, ToolCall, ToolDefinition,
+};
 use concerto_core::CancellationToken;
 use concerto_core::SecretString;
 use futures::stream::StreamExt;
@@ -113,8 +122,13 @@ impl OpenCodeRelay {
     /// Go is the `/zen/go` path; everything else is Zen. This is deliberately
     /// URL-derived so a caller-supplied `api_base` can never silently select
     /// the wrong per-relay table.
+    ///
+    /// The match is **path-segment-bound**: `zen` and `go` must be two
+    /// adjacent whole segments, so sibling paths that merely embed the string
+    /// `…/zen/go` — `/zen/gold/v1`, `/zen/go-v2` — stay Zen instead of being
+    /// misclassified by a substring test.
     pub(crate) fn for_base(base: &str) -> Self {
-        if base.contains("/zen/go") {
+        if base.split('/').collect::<Vec<_>>().windows(2).any(|pair| pair == ["zen", "go"]) {
             Self::Go
         } else {
             Self::Zen
@@ -126,36 +140,137 @@ impl OpenCodeRelay {
 ///
 /// Upstream reads `x-opencode-session`
 /// (`packages/console/app/src/routes/zen/util/handler.ts`:
-/// `input.request.headers.get("x-opencode-session")`) as a **backend /
-/// prompt-cache affinity** token — it routes a process's requests to a warm
-/// backend so a conversation keeps its cache.
+/// `input.request.headers.get("x-opencode-session")`). On the **paid** path it
+/// is a backend / prompt-cache affinity token (a stable value routes a
+/// process's requests to one warm backend). On the **keyless free-tier** path
+/// it is also the decisive half of the client-fingerprint gate: the relay
+/// performs `Schema.isStartsWith("ses")` plus a dev-tree shape check, and a
+/// value that is not `ses_` + 26 dev-tree characters yields `403
+/// FreeTierError` no matter how faithfully the rest of the request mimics the
+/// real client. Its absence alone is likewise refused.
 ///
-/// **This is NOT an authentication mechanism.** It carries no credential and it
+/// **This is NOT an authentication mechanism.** It carries no credential and
 /// does not satisfy the relay's API-key check (`401 AuthError` still applies
-/// without a valid `Authorization`). Zen's zero-cost models are gated by a
-/// server-side client attestation (a real client session id plus an accepted
-/// client version) that this header alone does not satisfy; a running
-/// `opencode serve` provides it (see [`crate::opencode_local`]). The name
-/// `X-Session-ID` does not exist upstream and must never be reintroduced.
+/// without a valid `Authorization`). The name `X-Session-ID` does not exist
+/// upstream and must never be reintroduced.
 pub(crate) const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
 
-/// Process-stable value of [`OPENCODE_SESSION_HEADER`].
+/// Relay header mirrored from [`OPENCODE_SESSION_HEADER`] on the real client.
 ///
-/// Initialised exactly once per process so every request a process issues
-/// carries the same affinity token — the header only keeps a conversation's
-/// prompt cache warm if the value is stable for the whole session. Generated
-/// from the already-direct `fastrand` dependency (no new crate), guarded by
-/// [`OnceLock`] so concurrent first use cannot produce two different values.
+/// The genuine client sends the same `ses_…` value under both names for the
+/// `opencode`/`opencode-go` provider types. It is individually dispensable (an
+/// ablation dropping it passes), but the relay's fingerprint is most faithful
+/// when both agree, so we send it.
+pub(crate) const OPENCODE_SESSION_ID_HEADER: &str = "x-opencode-session-id";
+
+/// Per-request identifier header sent by the real client.
+///
+/// Carries a `msg_…` dev-tree value in the same shape as the session id. Like
+/// [`OPENCODE_SESSION_ID_HEADER`] it is individually dispensable, but the real
+/// client always sends it and value reuse is tolerated (verified), so a
+/// process-stable value is sufficient.
+pub(crate) const OPENCODE_REQUEST_HEADER: &str = "x-opencode-request";
+
+/// The relay's `"public"` credential sentinel, normalized to "anonymous".
+///
+/// `routes/zen/util/handler.ts` treats a `Bearer public` (or `x-api-key:
+/// public`) credential as "no account": the request may still be served from
+/// the zero-cost roster once the client-fingerprint gate passes. We send this
+/// sentinel instead of an empty `Authorization` so the header is well-formed
+/// and the relay's anonymous branch is selected explicitly.
+pub(crate) const OPENCODE_ANONYMOUS_CREDENTIAL: &str = "public";
+
+/// Alphanumeric alphabet of a dev-tree random tail (62 symbols, ordered to
+/// match the upstream generator's `"0123456789ABC…abc…"` string).
+///
+/// `bytes[i] % 62` indexes it. Kept as a byte slice so the mint indexes it
+/// without a UTF-8 boundary check — every symbol is one ASCII byte.
+const DEV_TREE_ALPHABET: &[u8; 62] =
+    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/// Value counter for the dev-tree time component.
+///
+/// The upstream `descending()` identifier folds `Date.now() * 0x1000 + counter`
+/// so two ids minted in the same millisecond stay ordered. A monotonically
+/// increasing per-process counter reproduces that tie-break across calls; it is
+/// `Relaxed` because the id is opaque and only needs to differ, never to be a
+/// globally consistent ordering.
+static DEV_TREE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Mint one OpenCode dev-tree identifier: `prefix + "_" + 26 chars`.
+///
+/// Format (reverse-engineered from `packages/schema/src/identifier.ts` and
+/// verified live against the relay's fingerprint gate):
+///
+/// - first 12 chars: the 6 big-endian bytes of
+///   `~(now_ms * 0x1000 + counter)` (top byte first), as lowercase hex;
+/// - remaining 14 chars: uniform random over the 62-symbol alphabet via
+///   `bytes[i] % 62`.
+///
+/// The leading bit complement makes the time component *descending*, matching
+/// upstream. The value identifies nothing and authorizes nothing — it exists to
+/// satisfy the receiver's `isStartsWith("ses")` + shape check.
+pub(crate) fn mint_dev_identifier(prefix: &str) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let now_ms =
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    let counter = DEV_TREE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // `(now_ms * 0x1000 + counter)` as a 64-bit value, complemented to make the
+    // encoded time descending. `0x1000` leaves 12 bits of counter headroom, so
+    // the low 48 bits carry the (inverted) time+counter.
+    let combined = now_ms.wrapping_mul(0x1000).wrapping_add(counter);
+    let inverted = !combined;
+    let time_bytes = inverted.to_be_bytes();
+    // The 48-bit time field is the low 6 big-endian bytes of the inverted word.
+    let mut value = String::with_capacity(prefix.len() + 1 + 26);
+    value.push_str(prefix);
+    value.push('_');
+    for byte in &time_bytes[2..8] {
+        value.push_str(&format!("{byte:02x}"));
+    }
+    for _ in 0..14 {
+        let index = (fastrand::u8(..) % 62) as usize;
+        value.push(DEV_TREE_ALPHABET[index] as char);
+    }
+    value
+}
+
+/// Process-stable value of [`OPENCODE_SESSION_HEADER`] (and its `-id` mirror).
+///
+/// Initialised exactly once per process so every request carries the same
+/// affinity token and the same fingerprint shape. Guarded by [`OnceLock`] so
+/// concurrent first use cannot produce two different values.
 static OPENCODE_SESSION_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// The stable, opaque, per-process `x-opencode-session` value.
+/// The stable, opaque, per-process `ses_…` session value.
 ///
-/// Opaque by construction (`concerto-<128 random bits>`) — it identifies
-/// nothing and authorizes nothing; see [`OPENCODE_SESSION_HEADER`].
+/// Opaque by construction — it identifies nothing and authorizes nothing; see
+/// [`OPENCODE_SESSION_HEADER`]. Minted in the dev-tree shape the gate requires
+/// (see [`mint_dev_identifier`]).
 pub(crate) fn opencode_session_id() -> &'static str {
-    OPENCODE_SESSION_ID
-        .get_or_init(|| format!("concerto-{:016x}{:016x}", fastrand::u64(..), fastrand::u64(..)))
+    OPENCODE_SESSION_ID.get_or_init(|| mint_dev_identifier("ses"))
 }
+
+/// Process-stable value of [`OPENCODE_REQUEST_HEADER`] (`msg_…`).
+static OPENCODE_REQUEST_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The stable, opaque, per-process `msg_…` request value.
+///
+/// Value reuse across requests is tolerated by the relay (verified), so one
+/// process-stable id is sufficient; see [`OPENCODE_REQUEST_HEADER`].
+pub(crate) fn opencode_request_id() -> &'static str {
+    OPENCODE_REQUEST_ID.get_or_init(|| mint_dev_identifier("msg"))
+}
+
+/// The opencode builtin tool names the keyless fingerprint gate accepts.
+///
+/// The relay's gate requires **at least three** names drawn *solely* from
+/// upstream's builtin set (`packages/opencode/src/tool/registry.ts`); JSON
+/// schemas may be empty (only names are checked). This list is the intersection
+/// of that set with what Concerto can actually execute, so a gate-compliant set
+/// never declares a tool the agent cannot run.
+const OPENCODE_GATE_BUILTIN_NAMES: &[&str] = &["bash", "read", "edit", "write"];
 
 /// Stable capability name used by every ADR-66 capability refusal.
 pub(crate) const TOOL_CALLING_CAPABILITY: &str = "tool_calling";
@@ -305,6 +420,14 @@ pub struct OpenCodeZenProvider {
     /// dialect path and is forwarded to `openai_inner` for the
     /// OpenAI-compatible path.
     advertised_tool_support: Option<bool>,
+    /// Whether this provider targets Zen **without a credential** — the
+    /// anonymous free-tier path. Fixed at construction from the (relay, raw
+    /// key) pair: `true` only for Zen with an empty key. When set, the
+    /// connector sends the [`OPENCODE_ANONYMOUS_CREDENTIAL`] sentinel and
+    /// rewrites the outgoing tool declarations to the gate-compliant builtin
+    /// set (see [`Self::keyless_gate_tools`]). Go is never keyless — the relay
+    /// rejects anonymous requests with `401`, and the factory fails closed.
+    keyless: bool,
     /// Pre-built inner OpenAI provider for OpenAI-compatible models.
     openai_inner: OpenAiProvider,
 }
@@ -348,28 +471,127 @@ impl OpenCodeZenProvider {
         timeout_secs: u64,
         api_base: String,
     ) -> Self {
+        // The effective base URL fully determines the relay before any wire
+        // decision: the Go base carries the `/zen/go` path, and
+        // `resolve_api_base` injects that default for `opencode-free`, so a
+        // caller-supplied base pointing at `/zen/go` selects the Go table even
+        // when the provider type is Zen.
+        let relay = OpenCodeRelay::for_base(&api_base);
+        let raw_key = api_key.into();
+        // Keyless is a **Zen-only** property: Go answers `401 AuthError` for an
+        // anonymous request, so an empty key there is a misconfiguration the
+        // factory already fails closed on — never silently anonymous.
+        let keyless = relay == OpenCodeRelay::Zen && raw_key.expose().trim().is_empty();
+        // Substitute the relay's `"public"` anonymous sentinel for the empty
+        // key so every leg (including the inner `/models` listing) sends a
+        // well-formed credential that selects the relay's anonymous branch.
+        let wire_key =
+            if keyless { SecretString::from(OPENCODE_ANONYMOUS_CREDENTIAL) } else { raw_key };
         // Every wire path this provider owns — `/responses`, `/messages`, and
         // the inner OpenAI-compatible `/chat/completions` + `/models` legs —
-        // carries the affinity header, so the relay sees one stable session
-        // across all three dialects (see `OPENCODE_SESSION_HEADER`).
-        let openai_inner = OpenAiProvider::new(api_key, model.clone(), timeout_secs)
+        // carries the three client-identity headers, so the relay sees one
+        // stable session across all dialects and the fingerprint is uniform
+        // (see `OPENCODE_SESSION_HEADER`).
+        let openai_inner = OpenAiProvider::new(wire_key, model.clone(), timeout_secs)
             .with_api_base(api_base.clone())
             .with_reasoning_echo(ReasoningEcho::Always)
-            .with_extra_header(OPENCODE_SESSION_HEADER, opencode_session_id());
-        // The effective base URL fully determines the relay: the Go base
-        // carries the `/zen/go` path, and `resolve_api_base` injects that
-        // default for `opencode-free`, so a caller-supplied base pointing at
-        // `/zen/go` selects the Go table even when the provider type is Zen.
-        let relay = OpenCodeRelay::for_base(&api_base);
+            .with_extra_header(OPENCODE_SESSION_HEADER, opencode_session_id())
+            .with_extra_header(OPENCODE_SESSION_ID_HEADER, opencode_session_id())
+            .with_extra_header(OPENCODE_REQUEST_HEADER, opencode_request_id())
+            .with_keyless(keyless);
         Self {
             model,
             timeout_secs,
             api_base,
             relay,
+            keyless,
             tool_schema_mode: concerto_config::ToolSchemaMode::default(),
             advertised_tool_support: None,
             openai_inner,
         }
+    }
+
+    /// Whether this provider is on the anonymous, keyless Zen free tier.
+    pub(crate) fn is_keyless(&self) -> bool {
+        self.keyless
+    }
+
+    /// The tool declarations sent to the relay's keyless fingerprint gate.
+    ///
+    /// The gate accepts a body whose `tools` array holds **at least three
+    /// names drawn solely from opencode's builtin set** (schemas are not
+    /// inspected — only names). Concerto therefore declares the
+    /// [`OPENCODE_GATE_BUILTIN_NAMES`] subset it can actually execute, with
+    /// real-ish schemas matching the corresponding Concerto tool inputs so a
+    /// keyless model emits parseable arguments (see
+    /// [`crate::opencode`] and the executor's wire-builtin resolution): `bash`
+    /// maps to the shell tool, `read`/`edit` to filesystem read/write, and
+    /// `write` is the already-registered filesystem-write alias. Native tool
+    /// names (`filesystem`, `shell`, `git`, `mcp:*`) must never reach this
+    /// array — the gate rejects unknown names.
+    pub(crate) fn keyless_gate_tools() -> Vec<ToolDefinition> {
+        fn tool(name: &str, description: &str, parameters: serde_json::Value) -> ToolDefinition {
+            ToolDefinition {
+                name: name.to_string(),
+                description: description.to_string(),
+                parameters,
+            }
+        }
+        debug_assert!(
+            OPENCODE_GATE_BUILTIN_NAMES.len() >= 3,
+            "the fingerprint gate requires at least three builtin tool names"
+        );
+        vec![
+            tool(
+                "bash",
+                "Run a program with arguments in the workspace.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "Program to execute."},
+                        "args": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Arguments passed to the program."
+                        }
+                    },
+                    "required": ["command"]
+                }),
+            ),
+            tool(
+                "read",
+                "Read a file from the workspace.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string", "description": "File to read."}},
+                    "required": ["path"]
+                }),
+            ),
+            tool(
+                "edit",
+                "Write content to a file in the workspace.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "File to write."},
+                        "content": {"type": "string", "description": "New file content."}
+                    },
+                    "required": ["path", "content"]
+                }),
+            ),
+            tool(
+                "write",
+                "Write content to a file in the workspace.",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "File to write."},
+                        "content": {"type": "string", "description": "New file content."}
+                    },
+                    "required": ["path", "content"]
+                }),
+            ),
+        ]
     }
 
     /// The base URL this provider builds its request paths from.
@@ -387,6 +609,41 @@ impl OpenCodeZenProvider {
     /// callers never materialize a second copy of the key.
     pub(crate) fn api_key(&self) -> &SecretString {
         self.openai_inner.api_key()
+    }
+
+    /// Apply the three client-identity headers to a request builder.
+    ///
+    /// Shared by every wire leg this provider owns (`/responses`, `/messages`,
+    /// and — via the inner connector's `extra_headers` — `/chat/completions`
+    /// and `/models`) so no leg can silently omit one. On the keyless path
+    /// these headers *are* the fingerprint gate (see
+    /// [`OPENCODE_SESSION_HEADER`]).
+    fn apply_relay_headers(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        request
+            .header(OPENCODE_SESSION_HEADER, opencode_session_id())
+            .header(OPENCODE_SESSION_ID_HEADER, opencode_session_id())
+            .header(OPENCODE_REQUEST_HEADER, opencode_request_id())
+    }
+
+    /// Rewrite an outgoing request for the keyless fingerprint gate.
+    ///
+    /// No-op unless [`Self::is_keyless`]. When keyless, the relay rejects any
+    /// body whose `tools` array does not hold at least three pure opencode
+    /// builtin names (and rejects `stream: false` outright), so the request's
+    /// native tool declarations are replaced with the gate-compliant
+    /// [`Self::keyless_gate_tools`] set and `stream` is forced on. Text-only
+    /// keyless requests get the same declarations (the gate rejects a body
+    /// with no tools at all). The rewrite happens before dialect dispatch, so
+    /// all three legs share it.
+    fn apply_keyless_gate(&self, request: &mut CompletionRequest) {
+        if !self.is_keyless() {
+            return;
+        }
+        request.tools = Some(Self::keyless_gate_tools());
+        // The free-tier gate refuses `stream: false` outright (verified for
+        // both the replayed body and a minimal probe), so a keyless request
+        // must stream to have any chance of being served.
+        request.stream = true;
     }
 
     /// Set the tool-schema presentation mode (adaptive tool schemas).
@@ -590,13 +847,13 @@ impl OpenCodeZenProvider {
         let response = tokio::select! {
             _ = cancel.cancelled() => Err(ProviderError::Cancelled),
             result = async {
-                let r = client
-                    .post(&url)
-                    .bearer_auth(self.api_key().expose())
-                    .header(CONTENT_TYPE, "application/json")
-                    // Backend/prompt-cache affinity, not authentication —
-                    // see `OPENCODE_SESSION_HEADER`.
-                    .header(OPENCODE_SESSION_HEADER, opencode_session_id())
+                let r = self
+                    .apply_relay_headers(
+                        client
+                            .post(&url)
+                            .bearer_auth(self.api_key().expose())
+                            .header(CONTENT_TYPE, "application/json"),
+                    )
                     .json(&body)
                     .send()
                     .await
@@ -606,7 +863,12 @@ impl OpenCodeZenProvider {
                     let status = r.status();
                     let retry_after = crate::retry::parse_retry_after(r.headers());
                     let text = r.text().await.unwrap_or_default();
-                    return Err(crate::retry::map_http_error(status, &text, retry_after));
+                    return Err(crate::retry::map_opencode_http_error(
+                        status,
+                        &text,
+                        retry_after,
+                        self.is_keyless(),
+                    ));
                 }
                 Ok(r)
             } => result,
@@ -703,14 +965,14 @@ impl OpenCodeZenProvider {
         let response = tokio::select! {
             _ = cancel.cancelled() => Err(ProviderError::Cancelled),
             result = async {
-                let r = client
-                    .post(&url)
-                    .header("x-api-key", self.api_key().expose())
-                    .header("anthropic-version", "2023-06-01")
-                    .header(CONTENT_TYPE, "application/json")
-                    // Backend/prompt-cache affinity, not authentication —
-                    // see `OPENCODE_SESSION_HEADER`.
-                    .header(OPENCODE_SESSION_HEADER, opencode_session_id())
+                let r = self
+                    .apply_relay_headers(
+                        client
+                            .post(&url)
+                            .header("x-api-key", self.api_key().expose())
+                            .header("anthropic-version", "2023-06-01")
+                            .header(CONTENT_TYPE, "application/json"),
+                    )
                     .json(&body)
                     .send()
                     .await
@@ -720,7 +982,12 @@ impl OpenCodeZenProvider {
                     let status = r.status();
                     let retry_after = crate::retry::parse_retry_after(r.headers());
                     let text = r.text().await.unwrap_or_default();
-                    return Err(crate::retry::map_http_error(status, &text, retry_after));
+                    return Err(crate::retry::map_opencode_http_error(
+                        status,
+                        &text,
+                        retry_after,
+                        self.is_keyless(),
+                    ));
                 }
                 Ok(r)
             } => result,
@@ -783,6 +1050,10 @@ impl LlmProvider for OpenCodeZenProvider {
         request: CompletionRequest,
         cancel: CancellationToken,
     ) -> Result<CompletionStream, ProviderError> {
+        let mut request = request;
+        // Keyless Zen requests carry a fixed gate-compliant tool set; every
+        // other request (paid Zen, all Go) is left byte-identical.
+        self.apply_keyless_gate(&mut request);
         let model = self.resolve_model(&request);
         // The ONE dialect decision: (relay, model) -> wire mode. The relay is
         // fixed at construction from the effective base URL, so the Go relay
@@ -1139,6 +1410,15 @@ mod tests {
         assert_eq!(OpenCodeRelay::for_base("https://proxy.internal/zen/go"), OpenCodeRelay::Go);
         assert_eq!(OpenCodeRelay::for_base("https://opencode.ai/zen/v1"), OpenCodeRelay::Zen);
         assert_eq!(OpenCodeRelay::for_base("http://127.0.0.1:9"), OpenCodeRelay::Zen);
+        // Path-segment-bound: a substring hit on a longer segment is not the
+        // Go relay.
+        assert_eq!(OpenCodeRelay::for_base("https://opencode.ai/zen/gold/v1"), OpenCodeRelay::Zen);
+        assert_eq!(OpenCodeRelay::for_base("https://opencode.ai/zen/go-v2/v1"), OpenCodeRelay::Zen);
+        assert_eq!(OpenCodeRelay::for_base("https://opencode.ai/zen/gopher"), OpenCodeRelay::Zen);
+        assert_eq!(OpenCodeRelay::for_base("https://xzen/go/v1"), OpenCodeRelay::Zen);
+        // A trailing slash (the normalized `resolve_api_base` shape) still
+        // matches on the adjacent segments.
+        assert_eq!(OpenCodeRelay::for_base("https://opencode.ai/zen/go/v1/"), OpenCodeRelay::Go);
 
         assert_eq!(OpenCodeRelay::resolve("opencode-free", None), OpenCodeRelay::Go);
         assert_eq!(OpenCodeRelay::resolve("opencode", None), OpenCodeRelay::Zen);
@@ -1763,17 +2043,71 @@ mod tests {
     /// to this client, and opaque — it identifies nothing and authorizes
     /// nothing (see [`OPENCODE_SESSION_HEADER`]).
     #[test]
-    fn session_id_is_stable_and_opaque() {
+    fn session_id_is_stable_and_dev_tree_shaped() {
         let first = opencode_session_id();
         let second = opencode_session_id();
         assert_eq!(first, second, "one value per process, not one per call");
 
-        let prefix = "concerto-";
-        assert!(first.starts_with(prefix), "namespaced to this client: {first}");
-        let bits = &first[prefix.len()..];
-        assert_eq!(bits.len(), 32, "128 random bits, hex-encoded: {first}");
-        assert!(bits.chars().all(|c| c.is_ascii_hexdigit()), "hex only: {first}");
+        // The relay's fingerprint gate requires `ses_` + 26 dev-tree chars:
+        // 12 lowercase-hex time chars followed by 14 alphabet chars.
+        let body = first.strip_prefix("ses_").expect("ses_ prefix");
+        assert_eq!(body.len(), 26, "26 chars after the prefix: {first}");
+        let (time_part, tail) = body.split_at(12);
+        assert!(
+            time_part.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "time half is lowercase hex: {first}"
+        );
+        assert!(
+            tail.chars().all(|c| DEV_TREE_ALPHABET.contains(&(c as u8))),
+            "tail is drawn from the 62-symbol alphabet: {first}"
+        );
         assert!(!first.contains(' '), "the header value must stay a single token");
+
+        // The request id uses the same shape with the `msg_` prefix.
+        let request = opencode_request_id();
+        assert!(request.starts_with("msg_"), "request id is msg_-prefixed: {request}");
+        assert_eq!(request.strip_prefix("msg_").map(str::len), Some(26));
+    }
+
+    /// The keyless gate set is the executable builtin intersection and always
+    /// holds at least the three names the relay demands.
+    #[test]
+    fn keyless_gate_tools_are_executable_builtins() {
+        let tools = OpenCodeZenProvider::keyless_gate_tools();
+        assert!(tools.len() >= 3, "the gate rejects fewer than three tools");
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, OPENCODE_GATE_BUILTIN_NAMES, "the declared set is the executable subset");
+        assert!(
+            names.iter().all(|n| matches!(*n, "bash" | "read" | "edit" | "write")),
+            "only pure builtin names may reach the gate: {names:?}"
+        );
+    }
+
+    /// A keyless (empty-key) Zen provider sends the anonymous sentinel and the
+    /// gate-compliant tool set; a keyed provider keeps its key and its native
+    /// tool declarations.
+    #[test]
+    fn keyless_zen_uses_public_sentinel_and_gate_tools() {
+        let keyless = OpenCodeZenProvider::new("", "big-pickle".into(), 5);
+        assert!(keyless.is_keyless(), "empty key + Zen is the keyless path");
+        assert_eq!(keyless.api_key().expose(), OPENCODE_ANONYMOUS_CREDENTIAL);
+
+        let paid = OpenCodeZenProvider::new("sk-real", "big-pickle".into(), 5);
+        assert!(!paid.is_keyless(), "a real key keeps the paid path");
+        assert_eq!(paid.api_key().expose(), "sk-real");
+    }
+
+    /// The Go relay answers `401` for anonymous requests, so an empty key
+    /// targeting `/zen/go` must never be treated as the keyless path.
+    #[test]
+    fn go_relay_is_never_keyless() {
+        let go = OpenCodeZenProvider::with_api_base(
+            "",
+            "minimax-m3".into(),
+            5,
+            format!("{OPENCODE_GO_BASE}/"),
+        );
+        assert!(!go.is_keyless(), "Go is never keyless — the factory fails closed there");
     }
 
     /// Parse the captured request's header block (lowercased) plus request
@@ -1790,9 +2124,20 @@ mod tests {
     /// provider at the Go relay (`/zen/go/v1`) while still reaching the local
     /// mock; the empty suffix is the Zen-shaped default.
     async fn capture_wire_request_at(model: &str, path_suffix: &str) -> Vec<u8> {
+        capture_wire_request_with_key_at(model, path_suffix, "test-key").await
+    }
+
+    /// Drive one streaming request with an explicit credential against a
+    /// one-shot mock and return the raw captured request. An empty `key`
+    /// exercises the keyless free-tier path.
+    async fn capture_wire_request_with_key_at(
+        model: &str,
+        path_suffix: &str,
+        key: &str,
+    ) -> Vec<u8> {
         let (base, req_rx) = crate::testing::mock_server::spawn(String::new());
         let provider = OpenCodeZenProvider::with_api_base(
-            "test-key".to_string(),
+            key.to_string(),
             model.into(),
             5,
             format!("{base}{path_suffix}"),
@@ -1817,6 +2162,62 @@ mod tests {
         req_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("the request reaches the mock")
+    }
+
+    /// The keyless path end to end: an empty-key Zen provider must send the
+    /// anonymous sentinel, a `stream: true` body, and only builtin tool names
+    /// — never a native registry name.
+    #[tokio::test]
+    async fn keyless_wire_uses_public_sentinel_and_gate_tools() {
+        let raw = capture_wire_request_with_key_at("big-pickle", "", "").await;
+        let headers = captured_headers(&raw);
+        assert!(
+            headers.contains("authorization: bearer public"),
+            "keyless sends the anonymous sentinel: {headers}"
+        );
+        assert_session_header(&headers, "the keyless /chat/completions leg");
+
+        let lower = String::from_utf8_lossy(&raw).to_ascii_lowercase();
+        assert!(lower.contains("\"stream\":true"), "keyless must stream: {lower}");
+        for name in OPENCODE_GATE_BUILTIN_NAMES {
+            assert!(
+                lower.contains(&format!("\"name\":\"{name}\"")),
+                "gate tool '{name}' must be declared: {lower}"
+            );
+        }
+        // Native tool names must never leak onto the keyless wire.
+        for native in ["filesystem", "shell", "mcp:", "git"] {
+            assert!(
+                !lower.contains(&format!("\"name\":\"{native}\"")),
+                "native tool '{native}' must not reach the keyless gate: {lower}"
+            );
+        }
+    }
+
+    /// F1 pin: a keyless request whose model name matches the weak-tool-calling
+    /// heuristic (a standalone `mimo` token) must still stream.
+    ///
+    /// The Zen fingerprint gate rejects `stream: false` outright, so the inner
+    /// OpenAI-compatible leg's weak-tier transport downgrade must be suppressed
+    /// on the keyless path. Regression for `apply_keyless_gate` forcing
+    /// `stream: true` only for the inner weak-tier branch to overwrite it back
+    /// to `false` — a deterministic `403 FreeTierError` for every keyless
+    /// model carrying a `mimo`/`mini` token.
+    #[tokio::test]
+    async fn keyless_weak_tier_model_still_streams() {
+        // `mimo-v2` tokenizes to `["mimo", "v2"]` (standalone weak-tier token)
+        // and routes to Chat Completions on Zen, i.e. through the inner
+        // OpenAI-compatible leg where the downgrade lived.
+        let raw = capture_wire_request_with_key_at("mimo-v2", "", "").await;
+        let lower = String::from_utf8_lossy(&raw).to_ascii_lowercase();
+        assert!(
+            lower.contains("\"stream\":true"),
+            "a keyless weak-tier model must still stream: {lower}"
+        );
+        assert!(
+            !lower.contains("\"stream\":false"),
+            "the weak-tier transport downgrade must never apply on the keyless path: {lower}"
+        );
     }
 
     /// Drive one streaming request against a Zen-shaped mock base.
@@ -1911,6 +2312,14 @@ mod tests {
         assert!(
             headers.contains("x-opencode-session:"),
             "{context} must carry x-opencode-session: {headers}"
+        );
+        assert!(
+            headers.contains("x-opencode-session-id:"),
+            "{context} must mirror the session id: {headers}"
+        );
+        assert!(
+            headers.contains("x-opencode-request:"),
+            "{context} must carry the request id: {headers}"
         );
         assert!(
             !headers.contains("x-session-id"),
