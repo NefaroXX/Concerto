@@ -492,8 +492,7 @@ mod tests {
         use concerto_orchestrator::decisions::{CoordinatorDecision, DecisionKind, DecisionStatus};
         use concerto_orchestrator::world_model::{FactStatus, WorldFact};
 
-        let mut snapshot = StudioRuntimeSnapshot::default();
-        snapshot.world_model = Some(WorldModel {
+        let world_model = Some(WorldModel {
             facts: vec![WorldFact {
                 ref_id: "fact-1".into(),
                 label: "claim".into(),
@@ -506,7 +505,7 @@ mod tests {
             }],
             ..WorldModel::default()
         });
-        snapshot.decisions = ["old", "new"]
+        let decisions = ["old", "new"]
             .into_iter()
             .map(|id| CoordinatorDecision {
                 id: id.into(),
@@ -524,6 +523,8 @@ mod tests {
                 status: DecisionStatus::Settled,
             })
             .collect();
+        let snapshot =
+            StudioRuntimeSnapshot { world_model, decisions, ..StudioRuntimeSnapshot::default() };
         let id = Ulid::new().to_string();
         let options = parse_args(&args(&[&id, "--view", "evidence", "--limit", "1"])).unwrap();
         let value = report(&snapshot, &options);
