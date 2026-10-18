@@ -557,15 +557,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let global = dir.path().join("config.toml");
         let original = document(&global, dir.path(), false).unwrap();
-        let agent = &original["agents"][0];
-        let field = agent
-            .as_object()
-            .unwrap()
-            .iter()
-            .find(|(key, value)| key.contains("prompt") && value.is_string())
-            .unwrap()
-            .0;
-        let path = format!("agents.0.{field}");
+        let path = "agents.0.prompt_sections.system_instructions".to_string();
         let prompt = Value::String("First line\nUnicode 世界\nThird line".into());
         save(&global, dir.path(), false, &original, &path, prompt.clone()).unwrap();
         let saved = document(&global, dir.path(), false).unwrap();
