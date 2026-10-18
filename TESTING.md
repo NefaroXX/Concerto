@@ -118,7 +118,6 @@ under `nextest` in CI and are good references when a manual scenario fails:
 | Project selection | Selected root is displayed and remains inside the intended project | |
 | Provider test | Configured provider reports a useful success or sanitized error | |
 | Anonymous OpenCode Zen | Desktop/CLI `opencode` provider entry with **no API key** and model `big-pickle` streams anonymously (real `opencode/*` UA + session/request/client headers, caller's real tools on the wire); a 403 refusal surfaces the relay's "free tier can only be used from within OpenCode" body via FreeTierRefused | |
-| Anonymous Zen wire probe | `CONCERTO_ZEN_PROBE_MODEL=big-pickle cargo test -p concerto-providers live_zen_anonymous -- --ignored --nocapture` (ignored live test; model defaults to `big-pickle`) prints two evidence lines — attempt 1 with a fresh ULID session id, attempt 2 session-less — each with the model, elapsed ms, and the success text or the exact `ProviderError` variant + message | |
 | Model selection | Active provider/model labels match the selection after navigation and restart | |
 | Empty chat | Quick actions seed (but do not submit) the composer; recent sessions resume on click | |
 | Quick panel | Run/provider/model, agent assignments, Git state, and active view are accurate | |
