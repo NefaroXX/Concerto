@@ -400,7 +400,10 @@ impl App {
                     .map(|m| m.store.clone())
                     .ok_or_else(|| "Memory is not initialized yet.".to_string())?;
                 let cancel = concerto_core::CancellationToken::new();
-                store.invalidate_project_chunk(&project_id, &id, cancel).await.map_err(|error| error.to_string())
+                store
+                    .invalidate_project_chunk(&project_id, &id, cancel)
+                    .await
+                    .map_err(|error| error.to_string())
             },
             move |result| Message::MemoryEntryDeleted { id: result_id.clone(), result },
         )

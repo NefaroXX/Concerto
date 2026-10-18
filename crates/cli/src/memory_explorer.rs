@@ -37,28 +37,43 @@ pub(crate) struct MemoryScreen {
 }
 
 const KINDS: &[(&str, Option<ChunkType>)] = &[
-    ("All", None), ("Code / window", Some(ChunkType::SlidingWindow)),
-    ("Session summary", Some(ChunkType::SessionSummary)), ("Fact", Some(ChunkType::Fact)),
-    ("Function", Some(ChunkType::Function)), ("Struct", Some(ChunkType::Struct)),
-    ("Trait", Some(ChunkType::Trait)), ("Impl", Some(ChunkType::Impl)),
-    ("Enum", Some(ChunkType::Enum)), ("Module", Some(ChunkType::Module)),
+    ("All", None),
+    ("Code / window", Some(ChunkType::SlidingWindow)),
+    ("Session summary", Some(ChunkType::SessionSummary)),
+    ("Fact", Some(ChunkType::Fact)),
+    ("Function", Some(ChunkType::Function)),
+    ("Struct", Some(ChunkType::Struct)),
+    ("Trait", Some(ChunkType::Trait)),
+    ("Impl", Some(ChunkType::Impl)),
+    ("Enum", Some(ChunkType::Enum)),
+    ("Module", Some(ChunkType::Module)),
     ("Test", Some(ChunkType::Test)),
 ];
 
 impl Drop for MemoryScreen {
-    fn drop(&mut self) { self.close(); }
+    fn drop(&mut self) {
+        self.close();
+    }
 }
 
 impl MemoryScreen {
     pub(crate) fn close(&mut self) {
-        if let Some(cancel) = self.cancel.take() { cancel.cancel(); }
+        if let Some(cancel) = self.cancel.take() {
+            cancel.cancel();
+        }
         self.receiver = None;
         self.explorer = None;
         self.pending_delete = None;
         self.editing_query = false;
     }
 
-    pub(crate) fn open(&mut self, project: PathBuf, config: AppConfig, bus: EventBus, existing: Result<Option<MemoryExplorer>, String>) {
+    pub(crate) fn open(
+        &mut self,
+        project: PathBuf,
+        config: AppConfig,
+        bus: EventBus,
+        existing: Result<Option<MemoryExplorer>, String>,
+    ) {
         self.close();
         self.entries.clear();
         self.selected = 0;
@@ -66,7 +81,10 @@ impl MemoryScreen {
         self.scroll = 0;
         let existing = match existing {
             Ok(existing) => existing,
-            Err(error) => { self.status = error; return; }
+            Err(error) => {
+                self.status = error;
+                return;
+            }
         };
         if !config.memory.enabled {
             self.status = "Memory is disabled. Enable memory.enabled in Settings.".into();
@@ -98,11 +116,15 @@ impl MemoryScreen {
     }
 
     pub(crate) fn poll(&mut self) {
-        let Some(receiver) = &self.receiver else { return; };
+        let Some(receiver) = &self.receiver else {
+            return;
+        };
         let result = match receiver.try_recv() {
             Ok(result) => result,
             Err(mpsc::TryRecvError::Empty) => return,
-            Err(mpsc::TryRecvError::Disconnected) => Err("Memory operation stopped; reopen the explorer to retry.".into()),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("Memory operation stopped; reopen the explorer to retry.".into())
+            }
         };
         self.receiver = None;
         self.cancel = None;
@@ -119,12 +141,21 @@ impl MemoryScreen {
     }
 
     fn reload(&mut self, delete: Option<String>, reindex: bool) {
-        let Some(explorer) = self.explorer.clone() else { return; };
+        let Some(explorer) = self.explorer.clone() else {
+            return;
+        };
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
         let cancel = CancellationToken::new();
         self.cancel = Some(cancel.clone());
-        self.status = if delete.is_some() { "Deleting confirmed entry…" } else if reindex { "Re-indexing project…" } else { "Searching…" }.into();
+        self.status = if delete.is_some() {
+            "Deleting confirmed entry…"
+        } else if reindex {
+            "Re-indexing project…"
+        } else {
+            "Searching…"
+        }
+        .into();
         let query = self.query.clone();
         let kind = KINDS[self.kind].1;
         tokio::spawn(async move {
@@ -134,7 +165,9 @@ impl MemoryScreen {
                     format!("Deleted {}", serde_json::json!(id))
                 } else if reindex {
                     format!("Indexed {} chunks", explorer.reindex(cancel.clone()).await?)
-                } else { "Up to 200 matching entries".into() };
+                } else {
+                    "Up to 200 matching entries".into()
+                };
                 let entries = explorer.search(&query, kind, 200, cancel.clone()).await?;
                 Ok((explorer, entries, status))
             };
@@ -170,35 +203,76 @@ impl MemoryScreen {
         if self.editing_query {
             match key {
                 KeyCode::Esc => self.editing_query = false,
-                KeyCode::Enter => { self.editing_query = false; self.selected = 0; self.reload(None, false); }
-                KeyCode::Backspace => { self.query.pop(); }
+                KeyCode::Enter => {
+                    self.editing_query = false;
+                    self.selected = 0;
+                    self.reload(None, false);
+                }
+                KeyCode::Backspace => {
+                    self.query.pop();
+                }
                 KeyCode::Char(c) if !c.is_control() => self.query.push(c),
                 _ => {}
             }
             return false;
         }
         if self.receiver.is_some() {
-            if key == KeyCode::Esc { self.close(); return true; }
+            if key == KeyCode::Esc {
+                self.close();
+                return true;
+            }
             return false;
         }
         match key {
-            KeyCode::Esc if self.detail => { self.detail = false; self.scroll = 0; }
-            KeyCode::Esc | KeyCode::Char('q') => { self.close(); return true; }
-            KeyCode::Char('/') => { self.editing_query = true; self.detail = false; }
-            KeyCode::Tab => { self.kind = (self.kind + 1) % KINDS.len(); self.selected = 0; self.detail = false; self.reload(None, false); }
-            KeyCode::BackTab => { self.kind = (self.kind + KINDS.len() - 1) % KINDS.len(); self.selected = 0; self.detail = false; self.reload(None, false); }
+            KeyCode::Esc if self.detail => {
+                self.detail = false;
+                self.scroll = 0;
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.close();
+                return true;
+            }
+            KeyCode::Char('/') => {
+                self.editing_query = true;
+                self.detail = false;
+            }
+            KeyCode::Tab => {
+                self.kind = (self.kind + 1) % KINDS.len();
+                self.selected = 0;
+                self.detail = false;
+                self.reload(None, false);
+            }
+            KeyCode::BackTab => {
+                self.kind = (self.kind + KINDS.len() - 1) % KINDS.len();
+                self.selected = 0;
+                self.detail = false;
+                self.reload(None, false);
+            }
             KeyCode::Char('r') => self.reload(None, false),
             KeyCode::Char('R') => self.reload(None, true),
             KeyCode::Char('d') if self.explorer.is_some() => {
                 self.pending_delete = self.entries.get(self.selected).map(|chunk| chunk.id.clone());
             }
-            KeyCode::Enter if !self.entries.is_empty() => { self.detail = true; self.scroll = 0; }
+            KeyCode::Enter if !self.entries.is_empty() => {
+                self.detail = true;
+                self.scroll = 0;
+            }
             KeyCode::Down | KeyCode::Char('j') => self.move_by(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_by(-1),
             KeyCode::PageDown => self.move_by(i32::from(self.page.get().max(1))),
             KeyCode::PageUp => self.move_by(-i32::from(self.page.get().max(1))),
-            KeyCode::Home => { self.scroll = 0; if !self.detail { self.selected = 0; } }
-            KeyCode::End => { self.scroll = self.max_scroll.get(); if !self.detail { self.selected = self.entries.len().saturating_sub(1); } }
+            KeyCode::Home => {
+                self.scroll = 0;
+                if !self.detail {
+                    self.selected = 0;
+                }
+            }
+            KeyCode::End => {
+                self.scroll = self.max_scroll.get();
+                if !self.detail {
+                    self.selected = self.entries.len().saturating_sub(1);
+                }
+            }
             _ => {}
         }
         false
@@ -206,25 +280,51 @@ impl MemoryScreen {
 
     fn move_by(&mut self, delta: i32) {
         if self.detail {
-            self.scroll = (i32::from(self.scroll) + delta).clamp(0, i32::from(self.max_scroll.get())) as u16;
+            self.scroll =
+                (i32::from(self.scroll) + delta).clamp(0, i32::from(self.max_scroll.get())) as u16;
         } else {
-            self.selected = self.selected.saturating_add_signed(delta as isize).min(self.entries.len().saturating_sub(1));
+            self.selected = self
+                .selected
+                .saturating_add_signed(delta as isize)
+                .min(self.entries.len().saturating_sub(1));
         }
     }
 
     pub(crate) fn draw(&self, frame: &mut Frame, theme: &CliTheme) {
-        let block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
-            .title(" Memory ").border_style(Style::default().fg(theme.border));
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title(" Memory ")
+            .border_style(Style::default().fg(theme.border));
         let inner = block.inner(frame.area());
         frame.render_widget(block, frame.area());
-        let areas = Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0), Constraint::Length(2)]).split(inner);
-        let query = format!("{} {} | {}", if self.editing_query { "Search>" } else { "/ search:" }, serde_json::json!(self.query), KINDS[self.kind].0);
+        let areas = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+        let query = format!(
+            "{} {} | {}",
+            if self.editing_query { "Search>" } else { "/ search:" },
+            serde_json::json!(self.query),
+            KINDS[self.kind].0
+        );
         frame.render_widget(Paragraph::new(query).style(Style::default().fg(theme.user)), areas[0]);
-        frame.render_widget(Paragraph::new(self.status.as_str()).style(Style::default().fg(theme.muted)), areas[1]);
+        frame.render_widget(
+            Paragraph::new(self.status.as_str()).style(Style::default().fg(theme.muted)),
+            areas[1],
+        );
         self.page.set(areas[2].height.max(1));
         if let Some(id) = &self.pending_delete {
             let content = format!("Delete {} from project memory?\nThis removes it from retrieval. Re-indexing can restore file-backed entries.\nPress y to delete; n or Esc to cancel.", serde_json::json!(id));
-            frame.render_widget(Paragraph::new(content).wrap(Wrap { trim: false }).style(Style::default().fg(theme.warning)), areas[2]);
+            frame.render_widget(
+                Paragraph::new(content)
+                    .wrap(Wrap { trim: false })
+                    .style(Style::default().fg(theme.warning)),
+                areas[2],
+            );
         } else if self.detail {
             if let Some(chunk) = self.entries.get(self.selected) {
                 let text = serde_json::to_string_pretty(chunk).unwrap_or_else(|e| e.to_string());
@@ -235,17 +335,38 @@ impl MemoryScreen {
                 frame.render_widget(body.scroll((self.scroll.min(max), 0)), areas[2]);
             }
         } else if self.entries.is_empty() {
-            frame.render_widget(Paragraph::new("No matching entries. r refresh | R re-index").wrap(Wrap { trim: false }), areas[2]);
+            frame.render_widget(
+                Paragraph::new("No matching entries. r refresh | R re-index")
+                    .wrap(Wrap { trim: false }),
+                areas[2],
+            );
         } else {
-            let items: Vec<ListItem> = self.entries.iter().map(|chunk| {
-                let preview: String = chunk.content.chars().take(100).collect();
-                ListItem::new(format!("{}{} {}", if chunk.stale { "[stale] " } else { "" }, serde_json::json!(chunk.id), serde_json::json!(preview)))
-            }).collect();
-            let list = List::new(items).highlight_symbol("› ").highlight_style(Style::default().fg(theme.user).add_modifier(Modifier::BOLD));
+            let items: Vec<ListItem> = self
+                .entries
+                .iter()
+                .map(|chunk| {
+                    let preview: String = chunk.content.chars().take(100).collect();
+                    ListItem::new(format!(
+                        "{}{} {}",
+                        if chunk.stale { "[stale] " } else { "" },
+                        serde_json::json!(chunk.id),
+                        serde_json::json!(preview)
+                    ))
+                })
+                .collect();
+            let list = List::new(items)
+                .highlight_symbol("› ")
+                .highlight_style(Style::default().fg(theme.user).add_modifier(Modifier::BOLD));
             let mut state = ListState::default().with_selected(Some(self.selected));
             frame.render_stateful_widget(list, areas[2], &mut state);
         }
-        let help = if self.detail { "j/k PgUp/PgDn Home/End\nEsc list | d delete" } else if inner.width < 60 { "/ search | Tab type\nEnter view | d delete | Esc" } else { "/ search | Tab/Shift+Tab type | Enter full entry | d delete\nj/k select | r refresh | R re-index | Esc back" };
+        let help = if self.detail {
+            "j/k PgUp/PgDn Home/End\nEsc list | d delete"
+        } else if inner.width < 60 {
+            "/ search | Tab type\nEnter view | d delete | Esc"
+        } else {
+            "/ search | Tab/Shift+Tab type | Enter full entry | d delete\nj/k select | r refresh | R re-index | Esc back"
+        };
         frame.render_widget(Paragraph::new(help).style(Style::default().fg(theme.muted)), areas[3]);
     }
 }
@@ -258,15 +379,22 @@ mod tests {
     use ratatui::Terminal;
 
     fn entries() -> Vec<MemoryChunk> {
-        (0..20).map(|index| MemoryChunk {
-            id: format!("chunk-{index}"),
-            project_id: ProjectId("project".into()),
-            namespace: MemoryNamespace::Project(ProjectId("project".into())),
-            content: "full content\n\u{1b}[2J".repeat(30),
-            file_path: Some("src/lib.rs".into()), start_line: Some(1), end_line: Some(30),
-            chunk_type: ChunkType::Fact, score: 0.5, model_id: "model".into(),
-            model_version: "v1".into(), stale: false,
-        }).collect()
+        (0..20)
+            .map(|index| MemoryChunk {
+                id: format!("chunk-{index}"),
+                project_id: ProjectId("project".into()),
+                namespace: MemoryNamespace::Project(ProjectId("project".into())),
+                content: "full content\n\u{1b}[2J".repeat(30),
+                file_path: Some("src/lib.rs".into()),
+                start_line: Some(1),
+                end_line: Some(30),
+                chunk_type: ChunkType::Fact,
+                score: 0.5,
+                model_id: "model".into(),
+                model_version: "v1".into(),
+                stale: false,
+            })
+            .collect()
     }
 
     #[test]
@@ -319,7 +447,15 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             let theme = CliTheme::by_name("Midnight");
             terminal.draw(|frame| screen.draw(frame, &theme)).unwrap();
-            let dump = |terminal: &Terminal<TestBackend>| terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect::<String>();
+            let dump = |terminal: &Terminal<TestBackend>| {
+                terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+            };
             assert!(dump(&terminal).contains("chunk-19"), "{width}x{height}");
             assert!(!dump(&terminal).contains('\u{1b}'));
             screen.key(KeyCode::Enter);

@@ -1718,7 +1718,9 @@ impl App {
             Screen::DiffReview => self.handle_diff_review_key(key.code),
             Screen::RuntimeInspector => self.handle_runtime_key(key.code),
             Screen::MemoryExplorer => {
-                if self.memory_screen.key(key.code) { self.screen = Screen::Chat; }
+                if self.memory_screen.key(key.code) {
+                    self.screen = Screen::Chat;
+                }
                 Action::None
             }
         }
@@ -1868,7 +1870,12 @@ impl App {
                         None => Ok(None),
                     }
                 };
-                self.memory_screen.open(self.project_dir.clone(), config, self.bus.clone(), existing);
+                self.memory_screen.open(
+                    self.project_dir.clone(),
+                    config,
+                    self.bus.clone(),
+                    existing,
+                );
                 self.screen = Screen::MemoryExplorer;
             }
             KeyCode::Char('n') if !self.input_mode => return Action::NewSession,

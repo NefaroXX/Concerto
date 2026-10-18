@@ -93,13 +93,13 @@ mod working_memory;
 pub mod workspace_snapshot;
 pub mod world_model;
 
+pub mod memory_explorer;
 #[path = "runtime_runner_persistent.rs"]
 pub mod runtime_runner;
 #[path = "runtime_runner.rs"]
 mod runtime_runner_impl;
 pub mod services;
 pub mod session_manager;
-pub mod memory_explorer;
 pub mod testing;
 
 // Issue #55: the coordinator fault-injection and recovery evaluation

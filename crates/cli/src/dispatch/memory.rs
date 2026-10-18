@@ -69,7 +69,8 @@ struct ExplorerOptions {
 
 fn parse_explorer(args: &[String]) -> anyhow::Result<ExplorerOptions> {
     let operation = args.first().ok_or_else(|| anyhow::anyhow!(EXPLORER_USAGE))?.clone();
-    let mut options = ExplorerOptions { operation, value: String::new(), kind: None, limit: 200, json: false };
+    let mut options =
+        ExplorerOptions { operation, value: String::new(), kind: None, limit: 200, json: false };
     let search = matches!(options.operation.as_str(), "list" | "search");
     let mut positional = None;
     let mut confirmed = false;
@@ -80,15 +81,27 @@ fn parse_explorer(args: &[String]) -> anyhow::Result<ExplorerOptions> {
             "--yes" if options.operation == "delete" && !confirmed => confirmed = true,
             "--type" if search && options.kind.is_none() => {
                 index += 1;
-                let raw = args.get(index).ok_or_else(|| anyhow::anyhow!("missing type; {EXPLORER_USAGE}"))?;
+                let raw = args
+                    .get(index)
+                    .ok_or_else(|| anyhow::anyhow!("missing type; {EXPLORER_USAGE}"))?;
                 options.kind = Some(parse_kind(raw)?);
             }
             "--limit" if search => {
                 index += 1;
-                options.limit = args.get(index).ok_or_else(|| anyhow::anyhow!("missing limit"))?.parse()?;
-                anyhow::ensure!((1..=1000).contains(&options.limit), "limit must be between 1 and 1000");
+                options.limit =
+                    args.get(index).ok_or_else(|| anyhow::anyhow!("missing limit"))?.parse()?;
+                anyhow::ensure!(
+                    (1..=1000).contains(&options.limit),
+                    "limit must be between 1 and 1000"
+                );
             }
-            value if !value.starts_with('-') && positional.is_none() && options.operation != "reindex" => positional = Some(value.to_string()),
+            value
+                if !value.starts_with('-')
+                    && positional.is_none()
+                    && options.operation != "reindex" =>
+            {
+                positional = Some(value.to_string())
+            }
             other => anyhow::bail!("unexpected argument '{other}'; {EXPLORER_USAGE}"),
         }
         index += 1;
@@ -97,7 +110,10 @@ fn parse_explorer(args: &[String]) -> anyhow::Result<ExplorerOptions> {
     if matches!(options.operation.as_str(), "show" | "delete") {
         anyhow::ensure!(!options.value.trim().is_empty(), "chunk ID is required; {EXPLORER_USAGE}");
     }
-    anyhow::ensure!(options.operation != "delete" || confirmed, "Deletion requires --yes after inspecting the chunk; {EXPLORER_USAGE}");
+    anyhow::ensure!(
+        options.operation != "delete" || confirmed,
+        "Deletion requires --yes after inspecting the chunk; {EXPLORER_USAGE}"
+    );
     Ok(options)
 }
 
@@ -131,7 +147,7 @@ fn run_explorer(args: &[String], project_root: &Path) -> anyhow::Result<()> {
         });
         let result = async {
             let explorer = concerto_orchestrator::memory_explorer::MemoryExplorer::open(
-                &project, &config, concerto_core::EventBus::new(256), cancel.clone(),
+                &project, &config, concerto_core::event::EventBus::new(256), cancel.clone(),
             ).await?;
             let value = match options.operation.as_str() {
                 "list" | "search" => serde_json::json!({"schema_version": 1, "entries": explorer.search(&options.value, options.kind, options.limit, cancel.clone()).await?}),
@@ -247,11 +263,22 @@ mod tests {
 
     #[test]
     fn explorer_parser_validates_before_opening_memory() {
-        let parse = |args: &[&str]| parse_explorer(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-        for args in [vec!["delete", "chunk"], vec!["delete", "--yes"], vec!["show"], vec!["search", "--limit", "0"], vec!["search", "--limit", "1001"], vec!["search", "--type", "bogus"], vec!["reindex", "unexpected"], vec!["show", "id", "--yes"]] {
+        let parse =
+            |args: &[&str]| parse_explorer(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        for args in [
+            vec!["delete", "chunk"],
+            vec!["delete", "--yes"],
+            vec!["show"],
+            vec!["search", "--limit", "0"],
+            vec!["search", "--limit", "1001"],
+            vec!["search", "--type", "bogus"],
+            vec!["reindex", "unexpected"],
+            vec!["show", "id", "--yes"],
+        ] {
             assert!(parse(&args).is_err(), "{args:?}");
         }
-        let options = parse(&["search", "my query", "--type", "fact", "--limit", "20", "--json"]).unwrap();
+        let options =
+            parse(&["search", "my query", "--type", "fact", "--limit", "20", "--json"]).unwrap();
         assert_eq!(options.value, "my query");
         assert_eq!(options.kind, Some(concerto_core::memory::ChunkType::Fact));
         assert_eq!(options.limit, 20);

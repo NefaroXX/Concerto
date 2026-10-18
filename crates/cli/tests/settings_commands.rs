@@ -72,11 +72,14 @@ fn memory_commands_validate_and_run_without_a_provider() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("disabled"));
     fixture.success(&["config", "set", "memory.enabled", "true"]);
-    let result: serde_json::Value = serde_json::from_str(&fixture.success(&["memory", "reindex", "--json"])).unwrap();
+    let result: serde_json::Value =
+        serde_json::from_str(&fixture.success(&["memory", "reindex", "--json"])).unwrap();
     assert_eq!(result["indexed_chunks"], 0);
-    let result: serde_json::Value = serde_json::from_str(&fixture.success(&["memory", "list", "--json"])).unwrap();
+    let result: serde_json::Value =
+        serde_json::from_str(&fixture.success(&["memory", "list", "--json"])).unwrap();
     assert_eq!(result["entries"], serde_json::json!([]));
-    let result: serde_json::Value = serde_json::from_str(&fixture.success(&["memory", "show", "absent", "--json"])).unwrap();
+    let result: serde_json::Value =
+        serde_json::from_str(&fixture.success(&["memory", "show", "absent", "--json"])).unwrap();
     assert_eq!(result["found"], false);
     assert!(result["entry"].is_null());
 }
