@@ -140,11 +140,16 @@ cargo audit
   **never a general alias mechanism, keep it exactly that small**. Keyless
   fail-open exists **only** for provider type `opencode` (Zen); `opencode-free`
   (Go relay) stays fail-closed `CredentialMissing`. Keyless **429**
-  `FreeUsageLimitError` is a **transient shared-pool throttle**, not a
-  permanent refusal (live-verified bursts recover within seconds): it maps to
-  the retryable `ProviderError::FreeTierThrottled` and the single-agent loop
-  retries it with backoff, honoring `Retry-After`; the **403** fingerprint-gate
-  and **410** deprecated-model verdicts stay terminal `ProviderError::FreeTierRefused`.
+  `FreeUsageLimitError` is a **per-model quota window** (live-verified
+  2026-10-18 01:22–04:05 UTC: an exhausted free model 429s *every* client for
+  the rest of the ~hour window while sibling free models keep serving, then
+  recovers at rollover): it maps to the retryable
+  `ProviderError::FreeTierThrottled` and the single-agent loop retries it with
+  backoff, honoring `Retry-After`; the **403** fingerprint-gate and **410**
+  deprecated-model verdicts stay terminal `ProviderError::FreeTierRefused`.
+  The free roster itself churns; `OPENCODE_ZEN_FREE_KNOWN`
+  (`crates/providers/src/provider_defs.rs`) holds the last hand-verified set
+  and live discovery (`GET /zen/v1/models`) covers the rest.
   Full spec:
   `/mnt/Temp/zen-free-tier-investigation.md` (mirror into the repo if plans
   change — prefer in-place facts over a `/tmp` path that may vanish).
