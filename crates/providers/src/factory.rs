@@ -1886,9 +1886,11 @@ mod tests {
     /// [`CredentialStore::from_env`], a unique keyring account no `CONCERTO_*`
     /// env var can satisfy, and `OPENCODE_API_KEY` cleared for the duration) —
     /// so the build takes the anonymous free-tier arm, then makes at most TWO
-    /// completion attempts: (a) with a fresh ULID session id, (b) with
-    /// `session_id: None`. Each attempt prints model, success text OR the
-    /// exact `ProviderError` variant + message, and elapsed ms. The verdict is
+    /// completion attempts: (a) with a caller-supplied session id, (b) with
+    /// `session_id: None`. The anonymous path mints the opencode-format wire
+    /// session identity for both, so both are valid credential-less request
+    /// shapes. Each attempt prints model, success text OR the exact
+    /// `ProviderError` variant + message, and elapsed ms. The verdict is
     /// recorded verbatim and never asserted, retried, or worked around — the
     /// relay decides; this probe only observes.
     ///
@@ -1933,7 +1935,8 @@ mod tests {
             .expect("a credential-less opencode (Zen) config must build anonymously");
 
         eprintln!(
-            "probe: base={} model={model} attempts=2 (fresh-ULID session, then session-less)",
+            "probe: base={} model={model} attempts=2 (caller session id, then session-less; \
+             the wire identity is minted for both)",
             crate::opencode::OPENCODE_ZEN_BASE
         );
         probe_attempt(&provider, &model, Some(concerto_core::ids::new_id()), "1/2").await;

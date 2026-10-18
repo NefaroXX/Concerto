@@ -217,6 +217,42 @@ pub(crate) fn next_request_id() -> String {
     concerto_core::ids::new_id().to_string()
 }
 
+/// Mint one opencode-format `ses_` **wire** session id.
+///
+/// The anonymous free-tier relay validates the session identity the way the
+/// real client mints it (`packages/opencode/src/id/id.ts`): a `ses_` prefix,
+/// six hex bytes of a millisecond timestamp shifted left 12 bits and inverted
+/// for descending order (plus a within-millisecond counter), and fourteen
+/// base62 suffix characters. The caller's orchestration ULID cannot go on the
+/// anonymous wire — the relay refuses raw ULIDs — so one fresh wire id is
+/// minted per completion instead (live-verified 2026-10-18).
+pub(crate) fn mint_wire_session_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const BASE62: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    // The low 48 bits — the same window `id.ts` extracts for the hex block.
+    const TIMESTAMP_MASK: u64 = 0xFFFF_FFFF_FFFF;
+
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64);
+    if LAST_MS.load(Ordering::Relaxed) != ms {
+        // Mirrors the client's per-millisecond counter reset.
+        LAST_MS.store(ms, Ordering::Relaxed);
+        COUNTER.store(0, Ordering::Relaxed);
+    }
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let descending = !(ms.wrapping_mul(0x1000).wrapping_add(counter));
+    let mut id = format!("ses_{:012x}", descending & TIMESTAMP_MASK);
+    for _ in 0..14 {
+        id.push(BASE62[fastrand::usize(0..62)] as char);
+    }
+    id
+}
+
 /// Stable capability name used by every ADR-66 capability refusal.
 pub(crate) const TOOL_CALLING_CAPABILITY: &str = "tool_calling";
 
@@ -462,17 +498,29 @@ impl OpenCodeZenProvider {
     /// The per-request OpenCode identity headers for one completion.
     ///
     /// Returns the session identity (mirrored under both spellings the real
-    /// client uses) when the request carries an orchestration session, plus a
-    /// fresh per-request id. The client-surface header is a
-    /// construction-time property and rides the connector's static extra
-    /// headers instead (see [`OPENCODE_CLIENT_HEADER`]). Returns an empty list
-    /// for a session-less request so discovery/test legs invent nothing.
+    /// client uses) plus a fresh per-request id. The client-surface header is
+    /// a construction-time property and rides the connector's static extra
+    /// headers instead (see [`OPENCODE_CLIENT_HEADER`]).
+    ///
+    /// **Anonymous** completions always mint a fresh opencode-format `ses_`
+    /// wire id ([`mint_wire_session_id`]) — the free-tier relay validates the
+    /// session identity against the client's own format and refuses raw
+    /// orchestration ULIDs, and it refuses credential-less completions with no
+    /// session identity at all (both live-verified 2026-10-18). Keyed
+    /// requests mirror the caller's real session id when one is supplied and
+    /// omit the session headers otherwise — byte-identical to the pre-patch
+    /// keyed wire.
     pub(crate) fn per_request_headers(
         session_id: Option<&str>,
         request_id: &str,
+        anonymous: bool,
     ) -> Vec<(String, String)> {
         let mut headers = Vec::with_capacity(3);
-        if let Some(session) = session_id {
+        if anonymous {
+            let wire_session = mint_wire_session_id();
+            headers.push((OPENCODE_SESSION_HEADER.to_string(), wire_session.clone()));
+            headers.push((OPENCODE_SESSION_ID_HEADER.to_string(), wire_session));
+        } else if let Some(session) = session_id {
             headers.push((OPENCODE_SESSION_HEADER.to_string(), session.to_string()));
             headers.push((OPENCODE_SESSION_ID_HEADER.to_string(), session.to_string()));
         }
@@ -932,12 +980,18 @@ impl LlmProvider for OpenCodeZenProvider {
             request.stream = true;
         }
         let model = self.resolve_model(&request);
-        // One fresh per-request id, and the run's real session id when the
-        // caller supplied one (omitted — never invented — for session-less
-        // discovery/test legs). See `per_request_headers`.
+        // One fresh per-request id, plus the session identity: keyed requests
+        // mirror the run's real session id when the caller supplied one
+        // (session-less keyed legs omit it), while anonymous requests mint a
+        // client-format wire session id because the free-tier relay validates
+        // that identity and refuses raw ULIDs. See `per_request_headers`.
         let request_id = next_request_id();
         let session_id = request.session_id.map(|id| id.to_string());
-        let per_request = Self::per_request_headers(session_id.as_deref(), request_id.as_str());
+        let per_request = Self::per_request_headers(
+            session_id.as_deref(),
+            request_id.as_str(),
+            self.is_anonymous(),
+        );
         // The ONE dialect decision: (relay, model) -> wire mode. The relay is
         // fixed at construction from the effective base URL, so the Go relay
         // can never be routed with Zen's table (the 400 bug this fixes).
@@ -1934,12 +1988,14 @@ mod tests {
         assert_eq!(overridden.api_base(), "http://127.0.0.1:9");
     }
 
-    /// The per-request identity header builder mirrors the real client: a
-    /// session borrowed under both spellings when the request carries one, and
-    /// a fresh request id always. A session-less request invents nothing.
+    /// The per-request identity header builder mirrors the real client: keyed
+    /// requests borrow the caller's session under both spellings (and invent
+    /// nothing when the caller has none), while anonymous requests always mint
+    /// a fresh opencode-format `ses_` wire id — the free-tier relay refuses
+    /// raw ULIDs and session-less completions alike (live-verified 2026-10-18).
     #[test]
     fn per_request_headers_mirror_the_client() {
-        let headers = OpenCodeZenProvider::per_request_headers(Some("ses_abc"), "msg_xyz");
+        let headers = OpenCodeZenProvider::per_request_headers(Some("ses_abc"), "msg_xyz", false);
         let pairs: Vec<(&str, &str)> =
             headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         assert_eq!(
@@ -1949,16 +2005,35 @@ mod tests {
                 (OPENCODE_SESSION_ID_HEADER, "ses_abc"),
                 (OPENCODE_REQUEST_HEADER, "msg_xyz"),
             ],
-            "the session id is mirrored under both spellings and the request id is sent"
+            "keyed: the session id is mirrored under both spellings and the request id is sent"
         );
 
-        let anonymous = OpenCodeZenProvider::per_request_headers(None, "msg_xyz");
-        let names: Vec<&str> = anonymous.iter().map(|(k, _)| k.as_str()).collect();
+        let session_less = OpenCodeZenProvider::per_request_headers(None, "msg_xyz", false);
+        let names: Vec<&str> = session_less.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
             names,
             vec![OPENCODE_REQUEST_HEADER],
-            "a session-less request omits the session headers rather than inventing one"
+            "keyed, session-less: no session headers are invented"
         );
+
+        for caller_session in [Some("01M57FZD52MN7P652C63EEJXM0"), None] {
+            let anonymous =
+                OpenCodeZenProvider::per_request_headers(caller_session, "msg_xyz", true);
+            let names: Vec<&str> = anonymous.iter().map(|(k, _)| k.as_str()).collect();
+            assert_eq!(
+                names,
+                vec![OPENCODE_SESSION_HEADER, OPENCODE_SESSION_ID_HEADER, OPENCODE_REQUEST_HEADER],
+                "anonymous: the session identity is always present"
+            );
+            let wire = anonymous[0].1.as_str();
+            assert_eq!(wire, anonymous[1].1, "anonymous: both spellings mirror ONE wire id");
+            assert_wire_session_format(wire, "the anonymous minted session id");
+            assert_ne!(
+                Some(wire),
+                caller_session,
+                "anonymous: the caller's orchestration ULID never goes on the wire"
+            );
+        }
     }
 
     /// Each call mints a distinct per-request id, so two requests never share
@@ -1969,6 +2044,34 @@ mod tests {
         let second = next_request_id();
         assert!(!first.is_empty(), "the request id must be non-empty");
         assert_ne!(first, second, "each request gets a fresh id");
+    }
+
+    /// The minted wire session id carries the client's exact `ses_` shape
+    /// (`id.ts`): twelve hex chars of a descending millisecond timestamp plus
+    /// a fourteen-char base62 suffix; each call is fresh.
+    #[test]
+    fn mint_wire_session_id_has_client_shape_and_is_fresh() {
+        let first = mint_wire_session_id();
+        let second = mint_wire_session_id();
+        assert_ne!(first, second, "each completion gets a fresh wire session id");
+        assert_wire_session_format(&first, "the minted wire session id");
+
+        // Decode the timestamp block back: it is `~((ms << 12) | counter)`
+        // masked to the low 48 bits, so undoing the mask yields the low 36
+        // bits of the minting instant's milliseconds.
+        let suffix = first.strip_prefix("ses_").expect("the ses_ prefix");
+        let encoded = u64::from_str_radix(&suffix[..12], 16).expect("a hex timestamp block");
+        let minted_ms_low = (!encoded & 0xFFFF_FFFF_FFFF) >> 12;
+        let now_ms_low = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_millis() as u64
+            & 0xF_FFFF_FFFF;
+        assert!(
+            minted_ms_low.abs_diff(now_ms_low) <= 5,
+            "the timestamp block must encode the current time: minted={minted_ms_low} \
+             now={now_ms_low}"
+        );
     }
 
     /// A keyed provider keeps its key; only an empty-key Zen provider is
@@ -2052,11 +2155,13 @@ mod tests {
 
     /// Drive one streaming request with an explicit credential against a
     /// one-shot mock and return the raw captured request. An empty `key`
-    /// exercises the anonymous free-tier path.
+    /// exercises the anonymous free-tier path (which mints the wire session
+    /// identity, so the caller's ULID never reaches the wire).
     ///
     /// The request carries a real session id and a real tool declaration, so
     /// tests can assert the actual identity headers and the *real* tool set on
-    /// the wire (the connector no longer substitutes anything).
+    /// the wire (the keyed connector substitutes nothing; the anonymous path
+    /// only appends `read` and mints the session id).
     async fn capture_wire_request_with_key_at(
         model: &str,
         path_suffix: &str,
@@ -2114,10 +2219,11 @@ mod tests {
     }
 
     /// The anonymous path end to end: an empty-key Zen provider sends the
-    /// `"public"` sentinel, a `stream: true` body, the run's real session and
-    /// request identity headers, and the caller's *real* tool declarations —
-    /// the connector rewrites nothing. The session headers carry the exact
-    /// ULID handed to the request.
+    /// `"public"` sentinel, a `stream: true` body, a minted opencode-format
+    /// `ses_` session identity plus the request id, and the caller's *real*
+    /// tool declarations alongside the injected `read`. The exact ULID handed
+    /// to the request must never reach the wire: the free-tier relay refuses
+    /// raw ULIDs (live-verified 2026-10-18).
     #[tokio::test]
     async fn anonymous_wire_sends_public_sentinel_and_real_tools() {
         let session = concerto_core::ids::new_id();
@@ -2128,7 +2234,18 @@ mod tests {
             "anonymous sends the anonymous sentinel: {headers}"
         );
         assert_session_header(&headers, "the anonymous /chat/completions leg");
-        assert_session_header_value(&raw, session, "the anonymous /chat/completions leg");
+        let wire_session = captured_header_value(&raw, OPENCODE_SESSION_HEADER);
+        assert_wire_session_format(&wire_session, "the anonymous /chat/completions leg");
+        assert_eq!(
+            wire_session,
+            captured_header_value(&raw, OPENCODE_SESSION_ID_HEADER),
+            "both session spellings mirror one minted wire id"
+        );
+        assert_ne!(
+            wire_session,
+            session.to_string(),
+            "the caller's orchestration ULID must never go on the anonymous wire"
+        );
 
         let lower = String::from_utf8_lossy(&raw).to_ascii_lowercase();
         assert!(lower.contains("\"stream\":true"), "the anonymous path must stream: {lower}");
@@ -2136,12 +2253,17 @@ mod tests {
             lower.contains("\"name\":\"filesystem\""),
             "the caller's real tool declaration must reach the wire: {lower}"
         );
+        assert!(
+            lower.contains("\"name\":\"read\""),
+            "the injected read declaration must reach the anonymous wire: {lower}"
+        );
     }
 
-    /// A session-less request still sends the request id and the client
-    /// surface, but omits the session headers rather than inventing one.
+    /// A session-less KEYED request still sends the request id and the client
+    /// surface, but omits the session headers rather than inventing one —
+    /// unchanged by the anonymous-path wire work.
     #[tokio::test]
-    async fn session_less_request_omits_session_headers() {
+    async fn session_less_keyed_request_omits_session_headers() {
         let raw = capture_request_with_key_at("big-pickle", "", "test-key", None).await;
         let headers = captured_headers(&raw);
         assert!(
@@ -2159,6 +2281,49 @@ mod tests {
         assert!(
             !headers.contains("x-opencode-session-id:"),
             "no mirrored session header when the request has no session: {headers}"
+        );
+    }
+
+    /// Assert a header value has the opencode wire session-id shape: a `ses_`
+    /// prefix, twelve hex chars of the masked, inverted `(ms << 12) | counter`
+    /// timestamp encoding `id.ts` mints, and fourteen base62 suffix chars.
+    fn assert_wire_session_format(value: &str, context: &str) {
+        let suffix = value
+            .strip_prefix("ses_")
+            .unwrap_or_else(|| panic!("{context}: the wire session id must carry ses_: {value}"));
+        assert_eq!(suffix.len(), 26, "{context}: 12 hex + 14 base62 expected: {value}");
+        assert!(
+            suffix[..12].chars().all(|c| c.is_ascii_hexdigit()),
+            "{context}: the timestamp block must be hex: {value}"
+        );
+        assert!(
+            suffix[12..].chars().all(|c| c.is_ascii_alphanumeric()),
+            "{context}: the suffix must be base62: {value}"
+        );
+    }
+
+    /// A session-less ANONYMOUS completion still carries the session identity:
+    /// the free-tier relay refuses credential-less completions without one
+    /// (live-verified 2026-10-18), so the anonymous path mints a fresh
+    /// opencode-format wire id even when the caller has no session.
+    #[tokio::test]
+    async fn anonymous_session_less_request_mints_session_headers() {
+        let raw = capture_request_with_key_at("big-pickle", "", "", None).await;
+        let headers = captured_headers(&raw);
+        assert!(
+            headers.contains("authorization: bearer public"),
+            "still the anonymous sentinel: {headers}"
+        );
+        assert!(
+            headers.contains("x-opencode-session:"),
+            "the anonymous path mints a session identity: {headers}"
+        );
+        let wire_session = captured_header_value(&raw, OPENCODE_SESSION_HEADER);
+        assert_wire_session_format(&wire_session, "the session-less anonymous leg");
+        assert_eq!(
+            wire_session,
+            captured_header_value(&raw, OPENCODE_SESSION_ID_HEADER),
+            "both session spellings mirror one minted wire id"
         );
     }
 

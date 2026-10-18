@@ -4,6 +4,7 @@ use concerto_core::error::{describe_error_chain, ProviderError};
 use concerto_core::traits::{CompletionStream, LlmProvider};
 use concerto_core::types::{
     CompletionChunk, CompletionRequest, CompletionUsage, ModelInfo, TokenBudget, ToolCall,
+    ToolDefinition,
 };
 use concerto_core::CancellationToken;
 use concerto_core::SecretString;
@@ -179,6 +180,42 @@ impl OpenAiProvider {
     pub(crate) fn with_anonymous(mut self, anonymous: bool) -> Self {
         self.anonymous = anonymous;
         self
+    }
+
+    /// Ensure an anonymous OpenCode Zen request declares a tool named `read`.
+    ///
+    /// The relay's free-tier branch accepts a credential-less completion only
+    /// when the request's `tools` include a function named `read` — a
+    /// name-only check (schema content is ignored) that the real OpenCode
+    /// client always satisfies by declaring its builtin `read` (live-verified
+    /// 2026-10-18: `read` alone passes; `bash`/`edit`/`glob`/`grep`/`write` do
+    /// not unlock it, and extra tools are tolerated). The declaration is only
+    /// injected on the anonymous path: keyed requests keep exactly the
+    /// caller's tool surface. A model that emits `read(...)` executes as the
+    /// native `filesystem` tool with `operation: "read"` through
+    /// `concerto_core::executor::resolve_wire_builtin`.
+    fn ensure_anonymous_read_tool(&self, request: &mut CompletionRequest) {
+        if !self.anonymous {
+            return;
+        }
+        let tools = request.tools.get_or_insert_with(Vec::new);
+        if tools.iter().any(|tool| tool.name == "read") {
+            return;
+        }
+        tools.push(ToolDefinition {
+            name: "read".to_string(),
+            description: "Read a file from the filesystem before editing it.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file to read (relative to the project root, or absolute)."
+                    }
+                },
+                "required": ["path"]
+            }),
+        });
     }
 
     /// Fold the configured extra headers and any per-request headers into a
@@ -779,6 +816,7 @@ impl OpenAiProvider {
         // tool-call arguments rely on the existing `tool_args` repair
         // machinery — which is exactly why streaming repair exists.
         let mut request = request;
+        self.ensure_anonymous_read_tool(&mut request);
         let resolved_mode = crate::capability::resolve_tool_schema_mode(
             self.provider_name(),
             &model,
@@ -1533,6 +1571,76 @@ mod tests {
         let default = OpenAiProvider::new("test-key".to_string(), "test-model".into(), 15);
         let body = default.render_body(&streamed, "test-model");
         assert!(body.get("stream_options").is_none(), "the default policy writes nothing");
+    }
+
+    // -- Anonymous OpenCode Zen `read` tool declaration ---------------------
+
+    /// Anonymous OpenCode Zen requests must declare a tool named `read`: the
+    /// relay's free-tier branch rejects credential-less completions whose
+    /// `tools` lack it (name-only check — live-verified 2026-10-18). The
+    /// injected declaration mirrors the real client's builtin `read`; a model
+    /// that emits `read(...)` executes as `filesystem` `operation: "read"`
+    /// through `resolve_wire_builtin`.
+    #[test]
+    fn anonymous_request_gains_read_tool() {
+        let provider =
+            OpenAiProvider::new("public".to_string(), "big-pickle".into(), 15).with_anonymous(true);
+        let mut request = CompletionRequest { messages: vec![], ..Default::default() };
+        provider.ensure_anonymous_read_tool(&mut request);
+        let body = provider.render_body(&request, "big-pickle");
+        let tools = body["tools"].as_array().expect("the injected read tool is rendered");
+        assert_eq!(tools.len(), 1, "only the injected declaration is present");
+        assert_eq!(tools[0]["function"]["name"], "read");
+        assert_eq!(tools[0]["function"]["parameters"]["required"][0], "path");
+    }
+
+    /// The injection appends, never duplicates: a caller that already declares
+    /// `read` keeps its own declaration byte-for-byte, and other tools are
+    /// retained alongside the injected one.
+    #[test]
+    fn anonymous_read_tool_injection_appends_without_duplicating() {
+        let provider =
+            OpenAiProvider::new("public".to_string(), "big-pickle".into(), 15).with_anonymous(true);
+        let caller_read = ToolDefinition {
+            name: "read".to_string(),
+            description: "the caller's own read".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        };
+        let filesystem = ToolDefinition {
+            name: "filesystem".to_string(),
+            description: "native filesystem".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        };
+        let mut with_read = CompletionRequest {
+            messages: vec![],
+            tools: Some(vec![caller_read.clone()]),
+            ..Default::default()
+        };
+        provider.ensure_anonymous_read_tool(&mut with_read);
+        let tools = with_read.tools.as_ref().expect("tools present");
+        assert_eq!(tools.len(), 1, "no duplicate read injected");
+        assert_eq!(tools[0], caller_read);
+
+        let mut without_read = CompletionRequest {
+            messages: vec![],
+            tools: Some(vec![filesystem.clone()]),
+            ..Default::default()
+        };
+        provider.ensure_anonymous_read_tool(&mut without_read);
+        let tools = without_read.tools.as_ref().expect("tools present");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0], filesystem);
+        assert_eq!(tools[1].name, "read");
+    }
+
+    /// Keyed (non-anonymous) requests keep exactly the caller's tool surface:
+    /// the relay gate only applies to the credential-less free tier.
+    #[test]
+    fn keyed_request_has_no_injected_read_tool() {
+        let provider = OpenAiProvider::new("test-key".to_string(), "test-model".into(), 15);
+        let mut request = CompletionRequest { messages: vec![], ..Default::default() };
+        provider.ensure_anonymous_read_tool(&mut request);
+        assert!(request.tools.is_none(), "keyed requests are untouched");
     }
 
     /// A non-streamed completion body (`stream: false`, the weak-model

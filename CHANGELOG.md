@@ -49,6 +49,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Anonymous OpenCode Zen requests now present the client identity the relay
+  requires.** The free-tier branch rejects credential-less completions whose
+  `tools` lack a function named `read` (name-only check) and whose session
+  identity does not match the client's own `ses_` format — raw orchestration
+  ULIDs and session-less completions are refused (all live-verified
+  2026-10-18; `read` alone suffices and extras are tolerated). Anonymous
+  `opencode` completions now append a `read` declaration (mapped by
+  `resolve_wire_builtin` to the native `filesystem` read) alongside the
+  caller's real tool declarations, and mint a fresh client-format `ses_` wire
+  session id per completion in place of the raw ULID; keyed requests are
+  unchanged.
+
 - **Swagger UI restored at `/v1/docs` without weakening `yanked = "deny"`.**
   Upstream `utoipa-swagger-ui` 9.0.2 pins the yanked `zip ^3.0` build
   dependency and 10.x pins the yanked `^8.6` range. The crate is now vendored

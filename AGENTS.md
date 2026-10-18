@@ -131,15 +131,27 @@ cargo audit
   Concerto presents exactly the identity the real OpenCode client presents: an
   `opencode/<version>` `User-Agent` (shipped: `opencode/1.19.3`, mirroring a
   released build; bump it only to track the upstream contract) and, on each
-  completion, the run's real orchestration session id mirrored under
-  `x-opencode-session` + `x-opencode-session-id`, a fresh per-request
-  `x-opencode-request`, and a construction-time `x-opencode-client`
-  (`cli` default; the desktop app sets `desktop`). Anonymous requests must
-  `stream: true`. There is **no** dev-tree `ses_`/`msg_` minting, no
-  builtin-tool gate, and no tool rewriting: the caller's **real** tool
-  declarations go on the wire. Session-less discovery/test legs omit the
-  session headers rather than inventing one. The identity plumbing lives in
-  `crates/providers/src/opencode.rs` and
+  anonymous completion, a fresh opencode-format `ses_` wire session id minted
+  by `mint_wire_session_id` and mirrored under `x-opencode-session` +
+  `x-opencode-session-id`, a fresh per-request `x-opencode-request`, and a
+  construction-time `x-opencode-client` (`cli` default; the desktop app sets
+  `desktop`). The relay validates that session identity against the client's
+  own format: raw orchestration ULIDs and session-less completions are refused
+  (live-verified 2026-10-18), so the caller's real ULID never goes on the
+  anonymous wire; keyed Zen requests still mirror the run's real session id
+  when present (and omit the headers when absent), byte-identical to the
+  pre-patch wire. Anonymous requests must `stream: true` **and** declare a
+  tool named `read`: the free-tier branch rejects credential-less completions
+  whose `tools` lack it (name-only check; schema content ignored —
+  live-verified 2026-10-18: `read` alone suffices,
+  `bash`/`edit`/`glob`/`grep`/`write` do not unlock it, extras are tolerated,
+  and the title prompt is accepted only on tool-less requests). Concerto
+  mirrors the client with `ensure_anonymous_read_tool` in
+  `crates/providers/src/openai.rs` — appended to the caller's declarations,
+  never duplicating one. There is **no** tool rewriting: the caller's
+  **real** tool declarations go on the wire. The identity plumbing lives in
+  `crates/providers/src/opencode.rs` (`per_request_headers`,
+  `mint_wire_session_id`) and
   `crates/providers/src/openai.rs`
   (`stream_completion_with_extra_headers`); `crates/core/src/executor.rs`
   `resolve_wire_builtin` still maps `bash`→`shell` and `read`/`edit`→`filesystem`
