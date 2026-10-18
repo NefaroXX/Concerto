@@ -139,7 +139,13 @@ cargo audit
   `resolve_wire_builtin` maps `bash`→`shell` and `read`/`edit`→`filesystem` —
   **never a general alias mechanism, keep it exactly that small**. Keyless
   fail-open exists **only** for provider type `opencode` (Zen); `opencode-free`
-  (Go relay) stays fail-closed `CredentialMissing`. Full spec:
+  (Go relay) stays fail-closed `CredentialMissing`. Keyless **429**
+  `FreeUsageLimitError` is a **transient shared-pool throttle**, not a
+  permanent refusal (live-verified bursts recover within seconds): it maps to
+  the retryable `ProviderError::FreeTierThrottled` and the single-agent loop
+  retries it with backoff, honoring `Retry-After`; the **403** fingerprint-gate
+  and **410** deprecated-model verdicts stay terminal `ProviderError::FreeTierRefused`.
+  Full spec:
   `/mnt/Temp/zen-free-tier-investigation.md` (mirror into the repo if plans
   change — prefer in-place facts over a `/tmp` path that may vanish).
 
