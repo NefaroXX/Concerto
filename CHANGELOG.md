@@ -13,9 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and streams without an API key against Zen's anonymous free tier
   (`stream: true`, an `opencode/*` User-Agent, dev-tree-format `ses_`/`msg_`
   identity headers, and ≥3 opencode builtin tool names mapped onto the native
-  shell/filesystem tools). A refused keyless request surfaces as non-retryable
-  `FreeTierRefused` with the relay body preserved; `opencode-free` (Go) and other
-  providers stay credential-required, and the paid path is unchanged.
+  shell/filesystem tools). A keyless refusal (403/410) surfaces as non-retryable
+  `FreeTierRefused`, while a per-model quota window (429) surfaces as
+  the retryable `FreeTierThrottled`; both preserve the relay body. The default
+  free model set (`OPENCODE_ZEN_FREE_KNOWN`) was refreshed against the
+  2026-10-18 relay roster (`beam-free`, `big-pickle`, `cat-jam-free`,
+  `glm-5.3-flash-free`). `opencode-free`
+  (Go) and other providers stay credential-required, and the paid path is
+  unchanged.
 - Optional provider cache usage and durable per-attempt telemetry, audit-backed
   benchmark accounting, shared desktop/CLI session cache reports, versioned
   reporting prices, and opt-in stable Anthropic prompt-cache boundaries.

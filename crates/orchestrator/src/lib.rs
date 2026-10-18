@@ -91,6 +91,7 @@ pub mod verify;
 pub mod wait;
 mod working_memory;
 pub mod workspace_snapshot;
+pub mod workspace_files;
 pub mod world_model;
 
 pub mod memory_explorer;

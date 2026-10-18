@@ -329,3 +329,27 @@ fn runtime_inspection_reads_saved_state_while_another_frontend_holds_the_lock() 
     assert!(!fixture.command(&["sessions", "runtime", &unknown, "--json"]).status.success());
     assert!(!fixture.config_path().exists(), "inspection must not launch setup");
 }
+
+
+#[test]
+fn workspace_reads_search_context_and_guarded_delete_need_no_provider() {
+    let fixture = Fixture::new();
+    let file = fixture.dir.path().join("project/example.rs");
+    std::fs::write(&file, "fn main() {\n    // 世界 needle\n}\n").unwrap();
+    let document: serde_json::Value = serde_json::from_str(&fixture.success(&["workspace", "read", "example.rs", "--json"])).unwrap();
+    assert_eq!(document["content"], std::fs::read_to_string(&file).unwrap());
+    let revision = document["revision"].as_str().unwrap();
+    let found: serde_json::Value = serde_json::from_str(&fixture.success(&["workspace", "search", "needle", "example.rs", "--json"])).unwrap();
+    assert_eq!(found["matches"][0]["line"], 2);
+    let context: serde_json::Value = serde_json::from_str(&fixture.success(&["workspace", "context", "example.rs", "--json"])).unwrap();
+    assert_eq!(context["documents"][0], document);
+    assert_eq!(fixture.success(&["workspace", "read", "example.rs", "--raw"]), document["content"].as_str().unwrap());
+    assert!(!fixture.command(&["workspace", "delete", "example.rs", "--expect", revision]).status.success());
+    std::fs::write(&file, "changed").unwrap();
+    assert!(!fixture.command(&["workspace", "delete", "example.rs", "--expect", revision, "--yes"]).status.success());
+    assert!(file.exists());
+    let document: serde_json::Value = serde_json::from_str(&fixture.success(&["workspace", "read", "example.rs", "--json"])).unwrap();
+    fixture.success(&["workspace", "delete", "example.rs", "--expect", document["revision"].as_str().unwrap(), "--yes"]);
+    assert!(!file.exists());
+    assert!(fixture.success(&["workspace", "--help"]).contains("--expect"));
+}

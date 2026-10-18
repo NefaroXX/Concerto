@@ -314,7 +314,7 @@ impl HarnessService {
         }
     }
 
-    async fn invoke_executor(
+    pub(crate) async fn invoke_executor(
         &self,
         tool_name: &str,
         input: serde_json::Value,

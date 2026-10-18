@@ -126,7 +126,11 @@ cargo audit
   (2026-10-09). Don't bypass `SimplePolicyEngine` or `VirtualFs`.
 - **OpenCode Zen keyless free tier is a server fingerprint gate** (live-verified
   2026-10-17), not session registration. Keyless requests must `stream: true`,
-  carry an `opencode/*` `User-Agent`, send dev-tree-format `ses_`/`msg_` identity
+  carry an `opencode/*` `User-Agent` whose version **clears the relay's
+  client-version floor** (`≥1.18.0`; a stale `opencode/1.0` now gets
+  `HTTP 426 Upgrade Required` on an otherwise-valid request — found via the
+  audit trail of a live 2026-10-17 session; the shipped UA is
+  `opencode/9.9.9`), send dev-tree-format `ses_`/`msg_` identity
   headers (`x-opencode-session` / `-session-id` / `-request`; one malformed
   session value → 403 `FreeTierError`, the root cause of the reverted 2026-09-30
   port), and declare ≥3 tool names drawn **only** from the opencode builtin set
@@ -135,7 +139,18 @@ cargo audit
   `resolve_wire_builtin` maps `bash`→`shell` and `read`/`edit`→`filesystem` —
   **never a general alias mechanism, keep it exactly that small**. Keyless
   fail-open exists **only** for provider type `opencode` (Zen); `opencode-free`
-  (Go relay) stays fail-closed `CredentialMissing`. Full spec:
+  (Go relay) stays fail-closed `CredentialMissing`. Keyless **429**
+  `FreeUsageLimitError` is a **per-model quota window** (live-verified
+  2026-10-18 01:22–04:05 UTC: an exhausted free model 429s *every* client for
+  the rest of the ~hour window while sibling free models keep serving, then
+  recovers at rollover): it maps to the retryable
+  `ProviderError::FreeTierThrottled` and the single-agent loop retries it with
+  backoff, honoring `Retry-After`; the **403** fingerprint-gate and **410**
+  deprecated-model verdicts stay terminal `ProviderError::FreeTierRefused`.
+  The free roster itself churns; `OPENCODE_ZEN_FREE_KNOWN`
+  (`crates/providers/src/provider_defs.rs`) holds the last hand-verified set
+  and live discovery (`GET /zen/v1/models`) covers the rest.
+  Full spec:
   `/mnt/Temp/zen-free-tier-investigation.md` (mirror into the repo if plans
   change — prefer in-place facts over a `/tmp` path that may vanish).
 

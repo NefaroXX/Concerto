@@ -46,6 +46,7 @@ pub fn has_cli_subcommand(args: &[String]) -> bool {
                         | "health"
                         | "harness"
                         | "memory"
+                        | "workspace"
                         | "audit"
                         | "logs"
                         | "agents"
@@ -76,7 +77,9 @@ pub const CLI_COMMAND_HELP: &str =
     run commands and container project mounts are not covered.
     projects <list|current|use>
     sessions <list|show|events|cache|runtime|resume|prune>
-    memory <graph|explain>   health [--json]   audit   logs <path|show>
+    memory <list|search|show|delete|reindex|graph|explain>
+    workspace <list|read|context|search|write|delete|help>
+    health [--json]   audit   logs <path|show>
     harness <environment|verify|checkpoint|memory> [--json]
 
 SETTINGS EXAMPLES:
@@ -181,6 +184,7 @@ fn run_cli_inner(
                 return dispatch::harness::run_harness_subcommand(&remaining[1..], &project_root)
             }
             "memory" => return run_memory_subcommand(&remaining[1..], &project_root),
+            "workspace" => return dispatch::workspace::run(&remaining[1..], &project_root),
             "audit" => return run_audit_subcommand(&remaining[1..]),
             "agents" => return settings::run_agents(&remaining[1..], &project_root),
             "blueprint" => return settings::run_blueprint(&remaining[1..], &project_root),
@@ -1527,7 +1531,7 @@ pub fn startup_arguments(args: &[String]) -> &[String] {
     while index < args.len() {
         match args[index].as_str() {
             "--project" | "-p" | "--theme" => index += 2,
-            "shell" | "sessions" => return &args[..index],
+            "shell" | "sessions" | "workspace" => return &args[..index],
             value if value.starts_with('-') => index += 1,
             _ => break,
         }
@@ -1543,7 +1547,7 @@ fn invocation_args(args: &[String]) -> anyhow::Result<(Vec<String>, Option<PathB
         match args[index].as_str() {
             // Native program operands may contain -p/--project and startup
             // flags. Only parse Concerto flags before the shell subcommand.
-            "shell" if remaining.is_empty() => {
+            "shell" | "workspace" if remaining.is_empty() => {
                 remaining.extend_from_slice(&args[index..]);
                 break;
             }
@@ -2828,3 +2832,4 @@ keyring_key = "providers/openai-1/api_key"
         assert_eq!(entries[0].result_facts.as_deref(), Some("exists=false"));
     }
 }
+
