@@ -25,8 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`OPENCODE_ZEN_FREE_KNOWN`) was refreshed against the 2026-10-18 relay roster
   (`beam-free`, `big-pickle`, `cat-jam-free`, `glm-5.3-flash-free`).
   `opencode-free`
-  (Go) and other providers stay credential-required, and the paid path is
-  unchanged.
+  (Go) and other providers stay credential-required. On the paid path, body
+  rendering and error treatment are unchanged; paid Zen requests now carry the
+  run's real session id under `x-opencode-session`/`x-opencode-session-id` and
+  a fresh per-request `x-opencode-request` (replacing the retired static
+  dev-tree-minted values), plus the `x-opencode-client` surface header, and
+  prompt-cache/backend affinity granularity shifts from a per-process constant
+  to per-run.
 - Optional provider cache usage and durable per-attempt telemetry, audit-backed
   benchmark accounting, shared desktop/CLI session cache reports, versioned
   reporting prices, and opt-in stable Anthropic prompt-cache boundaries.
