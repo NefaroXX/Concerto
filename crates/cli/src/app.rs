@@ -1650,10 +1650,15 @@ impl App {
         }
 
         if self.screen == Screen::Management {
-            if self.running && key.code == KeyCode::Char('c') && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+            if self.running
+                && key.code == KeyCode::Char('c')
+                && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+            {
                 return Action::Cancel;
             }
-            if self.management.key(key) { self.screen = Screen::Chat; }
+            if self.management.key(key) {
+                self.screen = Screen::Chat;
+            }
             return Action::None;
         }
 

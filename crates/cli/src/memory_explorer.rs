@@ -384,7 +384,7 @@ mod tests {
                 id: format!("chunk-{index}"),
                 project_id: ProjectId("project".into()),
                 namespace: MemoryNamespace::Project(ProjectId("project".into())),
-                content: "full content\n\u{1b}[2J".repeat(30),
+                content: "full content\n\u{1b}[2J".repeat(300),
                 file_path: Some("src/lib.rs".into()),
                 start_line: Some(1),
                 end_line: Some(30),
