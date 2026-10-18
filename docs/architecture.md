@@ -165,15 +165,18 @@ dev-tree-format `x-opencode-session`/`-session-id`/`-request` headers, and ≥3
 opencode builtin tool names), which `resolve_wire_builtin` maps onto the native
 `shell`/`filesystem` tools. `OPENCODE_ZEN_FREE_KNOWN` (`beam-free`,
 `big-pickle`, `cat-jam-free`, `glm-5.3-flash-free`) is the 2026-10-18
-live-verified usable set; the anonymous free tier is quota-windowed **per
-model** (an exhausted model answers 429 to every client for the rest of its
-~hour window while sibling models keep serving), and the live catalog is
-volatile (several zero-priced ids answer 410/400 upstream), so catalog drift
-is expected, not a code bug. A
+live-verified usable set, and the live catalog is volatile (several zero-priced
+ids answer 410/400 upstream), so catalog drift is expected, not a code bug. A
 keyless *refusal* (403 fingerprint gate / 410 deprecated model) surfaces as
-non-retryable `ProviderError::FreeTierRefused`, while a 429 per-model quota
-window surfaces as the retryable `ProviderError::FreeTierThrottled`; both
-preserve the relay body. `opencode-free` (Go) and all other providers remain
+non-retryable `ProviderError::FreeTierRefused` and preserves the relay body; a
+keyless `429`, by contrast, is an ordinary rate limit: the relay maps every
+`RateLimitError`/`FreeUsageLimitError`/`GoUsageLimitError`/`BlackUsageLimitError`
+to a plain `429` with a `Retry-After` header, and on the keyless tier it is a
+**shared, IP-keyed daily bucket** (free models with no explicit per-model
+`rateLimit` share one bucket per IP; TTL = seconds to the next UTC midnight),
+so there is **no per-model quota**. It flows through the existing generic
+retryable `ProviderError::RateLimit { retry_after }`, which honors
+`Retry-After`. `opencode-free` (Go) and all other providers remain
 credential-required, and the paid `opencode` path is unchanged.
 
 The selected provider and model form a pair. Explicit session/role selection
