@@ -219,7 +219,11 @@ impl LspClient {
             // tokio's orphan reaper finishes the job if we time out here.
             let _ = timeout(KILL_WAIT_TIMEOUT, child.wait()).await;
         }
-        if cancel.is_cancelled() { Err(ToolError::Cancelled) } else { Ok(()) }
+        if cancel.is_cancelled() {
+            Err(ToolError::Cancelled)
+        } else {
+            Ok(())
+        }
     }
 
     pub async fn get_diagnostics(&self, file_path: &str) -> Vec<serde_json::Value> {

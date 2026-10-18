@@ -9,6 +9,7 @@ pub mod extensions;
 pub mod health;
 mod management;
 mod memory_explorer;
+mod workspace_browser;
 pub mod plugin_approval;
 pub mod settings;
 mod shell;
@@ -78,7 +79,7 @@ pub const CLI_COMMAND_HELP: &str =
     projects <list|current|use>
     sessions <list|show|events|cache|runtime|resume|prune>
     memory <list|search|show|delete|reindex|graph|explain>
-    workspace <list|read|context|search|write|delete|help>
+    workspace <list|read|context|search|write|delete|diagnostics|hover|definition|completion|references|help>
     health [--json]   audit   logs <path|show>
     harness <environment|verify|checkpoint|memory> [--json]
 
@@ -193,7 +194,7 @@ fn run_cli_inner(
             other => {
                 eprintln!("error: unknown subcommand '{other}'");
                 eprintln!(
-                    "available subcommands: config, providers, sessions, projects, plugin, extensions, health, memory, audit, logs, agents, blueprint, credentials, shell, preferences"
+                    "available subcommands: config, providers, sessions, projects, plugin, extensions, health, harness, memory, workspace, audit, logs, agents, blueprint, credentials, shell, preferences"
                 );
                 std::process::exit(1);
             }

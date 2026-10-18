@@ -1,4 +1,4 @@
-//! `concerto memory <graph|explain>` — read-only memory evidence views (ADR-69).
+//! Project memory exploration and read-only graph/evidence views.
 //!
 //! `graph` renders the project's memory chunks + links as Mermaid `flowchart
 //! TD` source; `explain <chunk-id>` prints one chunk's links and score. Both
@@ -44,14 +44,14 @@ fn parse_memory_graph_args(args: &[String]) -> anyhow::Result<(usize, usize, usi
 /// `concerto memory <graph|explain <chunk-id>>`.
 pub(crate) fn run_memory_subcommand(args: &[String], project_root: &Path) -> anyhow::Result<()> {
     if args.is_empty() {
-        anyhow::bail!("usage: concerto memory <graph|explain <chunk-id>>");
+        anyhow::bail!("usage: concerto memory <list|search|show|delete|reindex|graph|explain>; memory delete requires --yes");
     }
     match args[0].as_str() {
         "list" | "search" | "show" | "delete" | "reindex" => run_explorer(args, project_root),
         "graph" => run_memory_graph(&args[1..], project_root),
         "explain" => run_memory_explain(&args[1..], project_root),
         other => anyhow::bail!(
-            "unknown memory subcommand '{other}'; usage: concerto memory <graph|explain <chunk-id>>"
+            "unknown memory subcommand '{other}'; use list, search, show, delete, reindex, graph or explain"
         ),
     }
 }

@@ -2,7 +2,8 @@
 
 **Status: settings and configuration parity expanded 2026-10-03; checkpoint
 runtime inspection added 2026-10-10; topology/evidence-reference views and TUI
-navigation added 2026-10-16; interaction parity remains in progress.** The August R2–R4/P1–P7 checklist below is a
+navigation added 2026-10-16; memory/structured management validated 2026-10-18;
+file/context and language workflows implemented, final integration validation in progress.** The August R2–R4/P1–P7 checklist below is a
 historical milestone, not proof of complete parity. [ADR-80](adrs/ADR-80-cli-settings-and-studio-parity.md)
 corrects the former blanket exclusions. See [CLI settings reference](cli-settings.md).
 
@@ -63,19 +64,45 @@ mode without a setup wizard or provider. CLI-only builds remain available via
   concurrency limits remain a separate runtime issue. Agent capabilities are
   access requests, not policy grants. Policy and write gates remain authoritative.
 
-## Remaining portable interaction work
+## Portable interaction checklist
 
-These are real gaps, not GUI-only exclusions.
+These capabilities are evaluated against current Desktop behavior. Presentation
+differences do not exclude their underlying data or actions.
 
 | Priority | Capability | Planned CLI acceptance |
 |---|---|---|
 | Done on current dev | Staged change review | TUI unified diff and accept/reject through the shared overlay; narrow-terminal checks |
 | Current Desktop behavior covered | Coordinator controls | Both frontends cancel through the run token, resume durable checkpoints, and resolve intent/plan/tool approval prompts through shared sinks. Neither current frontend exposes a generic pause handle or authenticated remote run control. |
 | Current Desktop behavior covered | Runtime Studio inspection | Desktop loads persisted snapshots on opening Runtime/Studio. CLI exposes the same checkpoint reader with topology, world model, decisions, evidence, diagnoses and suitability in text/JSON and selectable TUI views. `--event ID` and the TUI picker resolve full evidence records. Neither frontend exposes a separate continuously live inspector. |
-| Implemented; validation in progress | Rich memory explorer | `memory list/search/show/delete/reindex` plus graph/explain; TUI search, type filters, full details, confirmed deletion, refresh/re-index and bounded navigation through the shared memory service |
-| Implemented; validation in progress | Structured TUI editors | Hierarchical config/provider/policy/MCP and canonical-agent inspection; multiline strings and JSON edits, scope selection, validated saves, stale-draft rejection and discard confirmation. Roster membership and hidden environment edits use existing CLI lifecycle commands. |
-| P2 | Editor operations | File/context selection, search, diagnostics, patch/review, attachments and external-editor integration |
+| Validated | Rich memory explorer | `memory list/search/show/delete/reindex` plus graph/explain; TUI search, type filters, full details, confirmed deletion, refresh/re-index and bounded navigation through the shared memory service |
+| Validated | Structured TUI editors | Hierarchical config/provider/policy/MCP and canonical-agent inspection; multiline strings and JSON edits, scope selection, validated saves, stale-draft rejection and discard confirmation. Roster membership and hidden environment edits use existing CLI lifecycle commands. |
+| Implemented; final validation in progress | Editor operations | `workspace list/read/search/context/write/delete`; revision-checked external-editor import; Rust diagnostics, hover, definition, completion and references; TUI file preview/filter and explicit context insertion. Existing TUI diff review handles agent changes. Text editing, replace, undo/redo and local editor navigation use the external-editor workflow. |
 | Current Desktop behavior covered | Terminal workflow | Both current frontends use `concerto_shell::client::open` for the native audited console. CLI exposes interactive `shell`, `shell exec` and security settings; neither Desktop's current terminal nor CLI starts a PTY/system shell. Profile selection still configures agent execution separately. |
+
+### File and context workflows (2026-10-18)
+
+`workspace` commands use the shared filesystem executor, policy and audit path,
+without provider setup. Complete UTF-8 reads return a revision; writes preserve
+bytes and require either `--create` or the displayed `--expect REVISION`, plus
+`--stdin --yes`. Deletes also require the revision and confirmation. Stale edits
+are rejected before mutation; this is not a cross-process atomic compare-and-swap.
+Files are limited to 1 MiB, selected context to 4 MiB/32 files, and literal search
+to 1,000 matching lines. Truncation and failures are explicit. Writes materialize
+through the existing VFS tool and do not promise automatic undo.
+
+F1/Ctrl+P → Workspace files and context (command-mode `b`) opens the TUI file
+browser. Enter opens directories or previews a file, `/` filters names, left/backspace
+returns to the parent, and `a` inserts the previewed snapshot into the existing
+chat draft. It never submits the draft. Previews/context are capped at 64 KiB;
+combined drafts at 128 KiB. Escape cancels outstanding loads and ignores late results.
+
+Rust language queries use the existing `LspClient` and an operation-owned
+`rust-analyzer` process. Diagnostics wait for a publication and report `pending`
+with a null diagnostic list if none arrives; missing tooling is an error.
+Navigation positions are zero-based UTF-16 offsets. No query executes code actions
+or applies LSP workspace edits. General text editing, find/replace and undo/redo
+remain available through any external editor using the revision-checked export/import
+workflow in [CLI settings reference](cli-settings.md#workspace-files-and-context).
 
 ### Evidence record inspection (2026-10-17)
 
@@ -86,7 +113,7 @@ not alter checkpoints, approvals, or verification state. The TUI cancels and
 discards old results when the user navigates away. Validation includes scoped
 reads, missing/malformed records, cancellation, payload/provenance preservation,
 held-lock command execution, and narrow-terminal rendering. CI status is
-recorded in the PR; live Coordinator controls remain separate work.
+recorded in the PR; the control comparison above describes the current Desktop contract.
 
 ### Runtime inspection navigation (2026-10-16)
 
@@ -207,10 +234,10 @@ project picker invoked from the status screen (`:654`).
 | Feature | Reason |
 |---------|--------|
 | `AgentGraph` canvas | Canvas layout is graphical; topology/status data remains portable |
-| `DiffViewer` side-by-side layout | Unified terminal diffs/review actions remain portable and planned |
-| `Terminal` panel | Embedded layout differs; configured profile/environment operations remain portable |
-| `OrchestrationStudio` layout | Agent and blueprint commands implemented; live inspectors planned |
-| `Editor` layout | File/search/diagnostic/context operations remain portable and planned |
+| `DiffViewer` side-by-side layout | Unified terminal diffs and review actions implemented |
+| `Terminal` panel | Both frontends use the native audited console; profile/environment configuration remains portable |
+| `OrchestrationStudio` layout | Agent/blueprint commands and persisted runtime inspection implemented |
+| `Editor` layout | File/context/search and Rust language queries implemented; external editors supply text editing and undo/redo |
 | Dashboard CSV export (removed) | Dropped with the Dashboard page (ADR-41): CSV export no longer exists in the desktop UI, so file export is CLI shell piping — the original parity note now describes reality |
 | Theme switching / font size | Both configurable in CLI; desktop font size affects Desktop |
 | Screenshot capture | Not applicable to terminal |
@@ -244,3 +271,4 @@ All steps are merged on `dev` except R1, which is tracked on a separate branch:
   benefit both frontends simultaneously.
 - All changes in this plan must preserve `cargo test --workspace` passing.
 - Every complete step gets its own atomic commit.
+

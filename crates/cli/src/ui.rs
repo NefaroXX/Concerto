@@ -24,6 +24,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Screen::RuntimeInspector => draw_runtime_inspector(frame, app),
         Screen::MemoryExplorer => app.memory_screen.draw(frame, &app.cli_theme),
         Screen::Management => app.management.draw(frame, &app.cli_theme),
+        Screen::WorkspaceFiles => app.workspace_browser.draw(frame, &app.cli_theme),
     }
     if let Some(prompt) = app.approval_prompt() {
         draw_approval_modal(frame, frame.area(), &prompt, &app.cli_theme);
@@ -100,6 +101,7 @@ pub(crate) const CHAT_COMMANDS: &[(char, &str)] = &[
     ('d', "Review changes"),
     ('i', "Runtime"),
     ('e', "Memory explorer"),
+    ('b', "Workspace files and context"),
     ('p', "Switch project"),
     ('n', "New session"),
 ];
@@ -1926,3 +1928,4 @@ mod tests {
         assert!(line_text(&lines[0]).contains("No textual change"));
     }
 }
+

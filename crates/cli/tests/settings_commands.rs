@@ -393,12 +393,19 @@ fn workspace_stdin_edits_are_exact_and_bad_language_targets_are_explicit() {
         .env_remove("CONCERTO_PROJECT_ROOTS")
         .args(["--project", fixture.dir.path().join("project").to_str().unwrap()])
         .args(["workspace", "write", "notes.txt", "--stdin", "--create", "--yes", "--json"])
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
     let text = "“Human edit”\r\n\t世界\r\n";
     child.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    assert_eq!(std::fs::read(fixture.dir.path().join("project/notes.txt")).unwrap(), text.as_bytes());
+    assert_eq!(
+        std::fs::read(fixture.dir.path().join("project/notes.txt")).unwrap(),
+        text.as_bytes()
+    );
     let output = fixture.command(&["workspace", "diagnostics", "notes.txt", "--json"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Rust (.rs)"));

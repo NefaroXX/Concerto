@@ -147,6 +147,7 @@ pub enum Screen {
     RuntimeInspector,
     MemoryExplorer,
     Management,
+    WorkspaceFiles,
 }
 
 /// Outcome of a per-file review decision on the staged-diff screen.
@@ -546,6 +547,7 @@ pub struct App {
     pub(crate) runtime_inspector: RuntimeInspector,
     pub(crate) memory_screen: crate::memory_explorer::MemoryScreen,
     pub(crate) management: crate::management::Management,
+    pub(crate) workspace_browser: crate::workspace_browser::WorkspaceBrowser,
 }
 
 impl Default for App {
@@ -621,6 +623,7 @@ impl App {
             runtime_inspector: RuntimeInspector::default(),
             memory_screen: crate::memory_explorer::MemoryScreen::default(),
             management: crate::management::Management::default(),
+            workspace_browser: crate::workspace_browser::WorkspaceBrowser::default(),
         }
     }
 
@@ -1120,6 +1123,7 @@ impl App {
 
             self.runtime_inspector.poll(self.session_id);
             self.memory_screen.poll();
+            self.workspace_browser.poll();
             terminal.draw(|frame| ui::draw(frame, self))?;
             // While a reveal is animating, poll at the typewriter cadence so
             // each tick can redraw a longer prefix; idle stays at the original
@@ -1550,6 +1554,10 @@ impl App {
 
     pub(crate) fn handle_key(&mut self, event: Event) -> Action {
         if let Event::Paste(text) = event {
+            if self.screen == Screen::WorkspaceFiles && !self.is_awaiting_approval() {
+                self.workspace_browser.paste(&text);
+                return Action::None;
+            }
             if self.screen == Screen::Management && !self.is_awaiting_approval() {
                 self.management.paste(&text);
                 return Action::None;
@@ -1738,6 +1746,23 @@ impl App {
             Screen::DiffReview => self.handle_diff_review_key(key.code),
             Screen::RuntimeInspector => self.handle_runtime_key(key.code),
             Screen::Management => Action::None,
+            Screen::WorkspaceFiles => {
+                match self.workspace_browser.key(key.code) {
+                    crate::workspace_browser::BrowserAction::Stay => {},
+                    crate::workspace_browser::BrowserAction::Close => self.screen = Screen::Chat,
+                    crate::workspace_browser::BrowserAction::Attach(text) => {
+                        if self.input.len() + text.len() <= 128 * 1024 {
+                            self.insert_input(&text);
+                            self.input_mode = true;
+                            self.screen = Screen::Chat;
+                        } else {
+                            self.messages.push(Line::from("Context was not added: the chat draft would exceed 128 KiB."));
+                            self.screen = Screen::Chat;
+                        }
+                    },
+                }
+                Action::None
+            }
             Screen::MemoryExplorer => {
                 if self.memory_screen.key(key.code) {
                     self.screen = Screen::Chat;
@@ -1867,6 +1892,10 @@ impl App {
             KeyCode::Char('o') if !self.input_mode => {
                 self.management.open(self.project_dir.clone());
                 self.screen = Screen::Management;
+            }
+            KeyCode::Char('b') if !self.input_mode => {
+                self.workspace_browser.open(self.project_dir.clone());
+                self.screen = Screen::WorkspaceFiles;
             }
             KeyCode::Char('l') if !self.input_mode => {
                 self.screen = Screen::Sessions;
@@ -4925,3 +4954,4 @@ mod tests {
         assert_eq!(app.diff_review.results[0].path, a);
     }
 }
+

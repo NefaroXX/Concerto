@@ -38,7 +38,20 @@ struct Options {
 fn parse(args: &[String]) -> anyhow::Result<Options> {
     let operation = args.first().ok_or_else(|| anyhow::anyhow!(USAGE))?.clone();
     anyhow::ensure!(
-        matches!(operation.as_str(), "list" | "read" | "context" | "search" | "write" | "delete" | "diagnostics" | "hover" | "definition" | "completion" | "references"),
+        matches!(
+            operation.as_str(),
+            "list"
+                | "read"
+                | "context"
+                | "search"
+                | "write"
+                | "delete"
+                | "diagnostics"
+                | "hover"
+                | "definition"
+                | "completion"
+                | "references"
+        ),
         "{USAGE}"
     );
     let mut options = Options {

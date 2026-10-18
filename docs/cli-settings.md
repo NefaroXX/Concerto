@@ -299,3 +299,66 @@ Concerto instance before editing a locked preferences store.
 Changes follow existing next-run/startup semantics. Project/env/startup flags
 may override saved values. See [the capability plan](desktop-cli-parity.md)
 for remaining interaction work and the runtime boundaries.
+
+
+## Workspace files and context
+
+These commands require no provider. Put startup options such as `--project DIR`
+before `workspace`; its operands, including `--`, belong to the command.
+
+```text
+concerto --project DIR workspace list [SUBDIRECTORY] --json
+concerto workspace read src/main.rs --json
+concerto workspace read src/main.rs --raw > edited.rs
+concerto workspace search "TODO" src/main.rs src/lib.rs --json
+concerto workspace context src/main.rs src/lib.rs --json
+concerto workspace write new.rs --stdin --create --yes < edited.rs
+concerto workspace write src/main.rs --stdin --expect REVISION --yes < edited.rs
+concerto workspace delete obsolete.rs --expect REVISION --yes
+concerto workspace diagnostics src/main.rs --json
+concerto workspace hover src/main.rs 10 4 --json
+concerto workspace definition src/main.rs 10 4 --json
+concerto workspace completion src/main.rs 10 4 --json
+concerto workspace references src/main.rs 10 4 --json
+```
+
+For external editing, retain the `revision` returned by `read --json`, export
+with `read --raw`, then open the exported buffer in your preferred editor. Its
+find/replace, undo/redo, indentation and navigation work normally. Review the
+edited buffer and import it with `write --stdin --expect REVISION --yes`. A
+changed original is rejected; reload and reconcile before retrying. `--raw`
+requires redirected stdout; JSON safely escapes terminal controls. Keep the
+buffer until the write succeeds. Concerto does not launch an ambient `$EDITOR`
+command, and no shell-string parsing is involved in the import.
+
+All workspace file operations go through the shared policy/executor and audit
+path. Explicit mutation commands supply operator approval, while policy denials
+remain binding. Writes use the byte-preserving VFS channel and materialize to
+disk; there is no automatic undo. Revision checks detect stale buffers but are
+not an atomic compare-and-swap against other processes; coordinate concurrent
+writers. Agent-staged changes still use the existing TUI Review changes screen.
+
+Reads fail instead of truncating editable text above 1 MiB or accepting non-UTF-8
+files. Context accepts 1–32 explicit paths and at most 4 MiB total; search is
+literal and case-sensitive over selected files, with one-based human line/column
+locations and an explicit truncation flag at 1,000 matching lines. Directory
+listings retain the filesystem service's 500-entry limit/truncation flag.
+Use `--` before filenames or queries that start with a dash.
+
+Language queries currently support Rust, matching the shared backend's
+`rust-analyzer` integration. Install that executable on PATH. Navigation accepts
+zero-based line and UTF-16 character offsets. Each command opens its document in
+a fresh client and reaps that owned process on completion, failure or cancellation.
+A diagnostic response with `state: pending` means no publication arrived within
+15 seconds; it is not a clean result. The complete query is bounded to 60 seconds,
+followed by bounded process cleanup. Other languages and missing tooling produce
+explicit errors. Returned edits/completions are inspection data; no LSP code action
+is executed or automatically applied.
+
+In the TUI, choose **Workspace files and context** from F1/Ctrl+P, or press `b`
+in command mode. Enter opens a directory/file, `/` filters filenames, left/backspace
+goes up, and `r` refreshes. File previews support arrows, Home/End and PageUp/PageDown.
+Press `a` to insert the previewed snapshot (including its path and revision) into
+your existing chat draft; it is not sent until you submit. Preview/context files
+are capped at 64 KiB and combined drafts at 128 KiB. Escape returns or cancels a
+pending load. Use the CLI export/import workflow for editing the selected file.
