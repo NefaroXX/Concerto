@@ -2003,6 +2003,42 @@ mod tests {
         crate::testing::mock_server::request_headers(raw)
     }
 
+    /// Extract one captured request header's EXACT value (case-insensitive
+    /// name match, value verbatim).
+    ///
+    /// Unlike [`captured_headers`], which lowercases the whole block so plain
+    /// `contains` checks stay ergonomic, this preserves case — required to pin
+    /// a header *value* to the exact ULID handed to
+    /// `CompletionRequest::session_id` (ULIDs are uppercase).
+    fn captured_header_value(raw: &[u8], name: &str) -> String {
+        let header_end = raw
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("captured request has a header block");
+        let headers = String::from_utf8_lossy(&raw[..header_end]);
+        headers
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.trim().eq_ignore_ascii_case(name).then(|| value.trim().to_string())
+            })
+            .unwrap_or_else(|| panic!("captured request must carry the {name} header"))
+    }
+
+    /// Value-fidelity companion to [`assert_session_header`]: BOTH session
+    /// spellings must carry exactly the ULID the request passed as
+    /// `CompletionRequest::session_id` — not merely *a* value.
+    fn assert_session_header_value(raw: &[u8], expected: concerto_core::ids::Ulid, context: &str) {
+        let expected = expected.to_string();
+        for name in [OPENCODE_SESSION_HEADER, OPENCODE_SESSION_ID_HEADER] {
+            let actual = captured_header_value(raw, name);
+            assert_eq!(
+                actual, expected,
+                "{context}: {name} must equal the exact ULID passed as session_id"
+            );
+        }
+    }
+
     /// Drive one streaming request against a one-shot mock and return the raw
     /// captured request. The canned response is irrelevant: the assertion
     /// target is the OUTBOUND request, so any completed body works.
@@ -2080,16 +2116,19 @@ mod tests {
     /// The anonymous path end to end: an empty-key Zen provider sends the
     /// `"public"` sentinel, a `stream: true` body, the run's real session and
     /// request identity headers, and the caller's *real* tool declarations —
-    /// the connector rewrites nothing.
+    /// the connector rewrites nothing. The session headers carry the exact
+    /// ULID handed to the request.
     #[tokio::test]
     async fn anonymous_wire_sends_public_sentinel_and_real_tools() {
-        let raw = capture_wire_request_with_key_at("big-pickle", "", "").await;
+        let session = concerto_core::ids::new_id();
+        let raw = capture_request_with_key_at("big-pickle", "", "", Some(session)).await;
         let headers = captured_headers(&raw);
         assert!(
             headers.contains("authorization: bearer public"),
             "anonymous sends the anonymous sentinel: {headers}"
         );
         assert_session_header(&headers, "the anonymous /chat/completions leg");
+        assert_session_header_value(&raw, session, "the anonymous /chat/completions leg");
 
         let lower = String::from_utf8_lossy(&raw).to_ascii_lowercase();
         assert!(lower.contains("\"stream\":true"), "the anonymous path must stream: {lower}");
@@ -2198,38 +2237,85 @@ mod tests {
 
     /// Every wire leg this provider owns carries the affinity header, and the
     /// upstream-nonexistent `X-Session-ID` never appears on any of them.
+    ///
+    /// Full-path value fidelity: each leg runs with its own caller-chosen
+    /// session ULID, and both session spellings must carry that exact value —
+    /// plus every leg's per-call `x-opencode-request` id must be distinct, so
+    /// three requests can never share one identifier.
     #[tokio::test]
     async fn every_wire_leg_carries_the_session_header() {
+        let chat_session = concerto_core::ids::new_id();
+        let responses_session = concerto_core::ids::new_id();
+        let anthropic_session = concerto_core::ids::new_id();
+
         // OpenAI-compatible `/chat/completions` (inner provider delegation).
-        let openai_compat = captured_headers(&capture_wire_request("minimax-m3").await);
+        let chat_raw =
+            capture_request_with_key_at("minimax-m3", "", "test-key", Some(chat_session)).await;
+        let openai_compat = captured_headers(&chat_raw);
         assert!(
             openai_compat.starts_with("post /chat/completions http/1.1"),
             "the OpenAI-compat leg must hit /chat/completions: {openai_compat}"
         );
         assert_session_header(&openai_compat, "the /chat/completions leg");
+        assert_session_header_value(&chat_raw, chat_session, "the /chat/completions leg");
 
         // OpenAI Responses `/responses`.
-        let responses = captured_headers(&capture_wire_request("muse-v2").await);
+        let responses_raw =
+            capture_request_with_key_at("muse-v2", "", "test-key", Some(responses_session)).await;
+        let responses = captured_headers(&responses_raw);
         assert!(
             responses.starts_with("post /responses http/1.1"),
             "the Responses leg must hit /responses: {responses}"
         );
         assert_session_header(&responses, "the /responses leg");
+        assert_session_header_value(&responses_raw, responses_session, "the /responses leg");
         assert!(
             responses.contains("authorization: bearer test-key"),
             "the /responses leg authenticates with the resolved key: {responses}"
         );
 
         // Anthropic Messages `/messages` (x-api-key instead of Bearer).
-        let anthropic = captured_headers(&capture_wire_request("claude-3-5-sonnet").await);
+        let anthropic_raw = capture_request_with_key_at(
+            "claude-3-5-sonnet",
+            "",
+            "test-key",
+            Some(anthropic_session),
+        )
+        .await;
+        let anthropic = captured_headers(&anthropic_raw);
         assert!(
             anthropic.starts_with("post /messages http/1.1"),
             "the Anthropic leg must hit /messages: {anthropic}"
         );
         assert_session_header(&anthropic, "the /messages leg");
+        assert_session_header_value(&anthropic_raw, anthropic_session, "the /messages leg");
         assert!(
             anthropic.contains("x-api-key: test-key"),
             "the /messages leg authenticates with the resolved key: {anthropic}"
+        );
+
+        // Per-call request ids: each leg mints its own fresh id, so the three
+        // captured values are pairwise distinct (and never the session id).
+        let request_ids = [
+            captured_header_value(&chat_raw, OPENCODE_REQUEST_HEADER),
+            captured_header_value(&responses_raw, OPENCODE_REQUEST_HEADER),
+            captured_header_value(&anthropic_raw, OPENCODE_REQUEST_HEADER),
+        ];
+        for (leg, id) in ["chat/completions", "responses", "messages"].into_iter().zip(&request_ids)
+        {
+            assert!(!id.is_empty(), "the {leg} leg must send a non-empty request id");
+        }
+        assert_ne!(
+            request_ids[0], request_ids[1],
+            "the chat and responses legs must mint distinct request ids"
+        );
+        assert_ne!(
+            request_ids[0], request_ids[2],
+            "the chat and messages legs must mint distinct request ids"
+        );
+        assert_ne!(
+            request_ids[1], request_ids[2],
+            "the responses and messages legs must mint distinct request ids"
         );
     }
 
