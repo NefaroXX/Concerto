@@ -999,9 +999,10 @@ impl ToolExecutor {
         orchestrator_authority: bool,
     ) -> Result<ToolOutput, ToolError> {
         // Translate an OpenCode wire-builtin name onto the real tool before
-        // lookup, so a keyless-gate-declared `bash`/`read`/`edit` executes the
-        // shell/filesystem tools (see [`resolve_wire_builtin`]). A registered
-        // name is never touched, so every native path is byte-identical.
+        // lookup, so a model that emits opencode's builtin `bash`/`read`/`edit`
+        // names executes the shell/filesystem tools (see
+        // [`resolve_wire_builtin`]). A registered name is never touched, so
+        // every native path is byte-identical.
         let (tool_name, input) = match resolve_wire_builtin(&self.registry, tool_name, &input) {
             Some((target, mapped)) => (target, mapped),
             None => (tool_name, input),

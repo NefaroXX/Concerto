@@ -70,31 +70,23 @@ pub mod mock;
 // Re-export ModelInfo for convenience
 pub use concerto_core::types::ModelInfo;
 
+pub use opencode::set_opencode_client_surface;
+
 /// Default HTTP connect timeout (seconds) used where no per-provider config exists.
 pub(crate) const DEFAULT_TIMEOUT_SECS: u64 = 15;
 
 /// User-Agent presented to upstream APIs.
 ///
-/// MUST stay opencode-shaped (`opencode/<version>`). Verified 2026-08-13:
-/// the OpenCode Zen gateway UA-gates its free-tier pilot models — an
-/// anonymous request with `User-Agent: opencode/1.0` gets HTTP 200 for
-/// `deepseek-v4-flash-free`/`big-pickle` while the exact same request with a
-/// `reqwest`/`curl`/absent UA gets `429 FreeUsageLimitError: Error from
-/// provider (Console): Rate limit exceeded` — regardless of API key or
-/// account. The 429 is client-identification, not pool exhaustion. Do not
-/// replace this with `concerto/<version>`; the free pilots will stop
-/// serving.
+/// OpenCode-shaped (`opencode/<version>`), mirroring the released upstream
+/// client: the relays present Concerto as an OpenCode client, so the UA must
+/// match a real client build rather than a Concerto-specific string. Verified
+/// 2026-10-17 against a live anonymous request (`opencode/1.19.3` → HTTP 200);
+/// the relays fingerprint the caller, they do not gate on this version.
 ///
-/// Updated 2026-10-17 from `opencode/1.0` to `opencode/9.9.9`: the relay now
-/// ALSO enforces a client-version floor on the keyless free tier —
-/// `HTTP 426 Upgrade Required: OpenCode 1.18.0 or newer is required to use
-/// the free tier` (caught via the audit trail of a live session; the
-/// request's identity headers had already passed, so this is purely the UA
-/// version being too old). `9.9.9` is the alpha-ablation-verified value from
-/// the 2026-10-17 fingerprint investigation (`opencode/9.9.9` → HTTP 200
-/// with all other headers in place) and clears any foreseeable floor bump
-/// without pretending to be a specific released build.
-const DEFAULT_USER_AGENT: &str = "opencode/9.9.9";
+/// Bump only to track the upstream client contract; keep the shape
+/// `opencode/<semver>`. Do not replace this with `concerto/<version>` — the
+/// relays classify an unknown UA differently from a real client.
+const DEFAULT_USER_AGENT: &str = "opencode/1.19.3";
 
 /// Build a `reqwest::Client` with a bounded connect timeout.
 ///

@@ -486,8 +486,8 @@ pub fn diagnose_provider(error: &concerto_core::error::ProviderError) -> Failure
         ProviderError::CapabilityRefused { .. } => {
             (FailureKind::Provider, "capability-refused".to_owned())
         }
-        // The relay refused the keyless free tier permanently (403 fingerprint
-        // gate / 410 retired model): not retryable, and the fix is a real
+        // The relay refused the anonymous free tier permanently (403 refused
+        // request / 410 retired model): not retryable, and the fix is a real
         // credential — point the operator at auth.
         ProviderError::FreeTierRefused { .. } => {
             (FailureKind::Provider, "provider-free-tier-refused".to_owned())
