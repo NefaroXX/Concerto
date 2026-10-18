@@ -12,7 +12,7 @@ is **no TypeScript/Bun code** despite earlier plans — don't look for it.
 ## Workspace layout (25 crates)
 All members live under `crates/` and depend upward on `concerto-core`.
 - `core` — traits, `EventBus`, `SimplePolicyEngine`, `ToolExecutor`, error taxonomy
-- `providers` — LLM providers + factory/routing: OpenAI, Anthropic, Google, OpenRouter, Ollama, Nvidia NIM, OpenCode Zen (keyless free tier supported)
+- `providers` — LLM providers + factory/routing: OpenAI, Anthropic, Google, OpenRouter, Ollama, Nvidia NIM, OpenCode Zen (anonymous free tier supported)
 - `orchestrator` — `AgentLoop` (single-agent) + `CoordinatorAgent` (multi-agent, 5 specialists, write gates)
 - `tools` — `VirtualFs` overlay + shell/git tools (all policy-gated)
 - `shell` — typed AI-native command runtime consuming canonical shell profiles
@@ -20,7 +20,7 @@ All members live under `crates/` and depend upward on `concerto-core`.
 - `memory` — SQLite FTS5+vector hybrid search, local embeddings, re-index watcher
 - `config` — layered `figment` config + keyring credential storage
 - `desktop` — Iced 0.14 GUI (chat, diffs, agent graph)
-- `cli` — `ratatui` TUI
+- `cli` — `ratatui` TUI + headless one-shot `concerto run` (JSON contract, exit codes)
 - `plugins` / `plugin-sdk` — WASM plugin host ABI + capability manager + guest SDK
 - `skills` — local instruction-pack discovery/loading (`SkillManager`); never executes code
 - `mcp` — MCP stdio client + `McpManager` + `McpTool` bridge
@@ -124,35 +124,55 @@ cargo audit
   (`crates/tools/src/filesystem.rs:450`), and git-stash undo omits untracked
   files (no `-u`; `crates/tools/src/undo.rs:56-57`) — see the ADR-62 amendment
   (2026-10-09). Don't bypass `SimplePolicyEngine` or `VirtualFs`.
-- **OpenCode Zen keyless free tier is a server fingerprint gate** (live-verified
-  2026-10-17), not session registration. Keyless requests must `stream: true`,
-  carry an `opencode/*` `User-Agent` whose version **clears the relay's
-  client-version floor** (`≥1.18.0`; a stale `opencode/1.0` now gets
-  `HTTP 426 Upgrade Required` on an otherwise-valid request — found via the
-  audit trail of a live 2026-10-17 session; the shipped UA is
-  `opencode/9.9.9`), send dev-tree-format `ses_`/`msg_` identity
-  headers (`x-opencode-session` / `-session-id` / `-request`; one malformed
-  session value → 403 `FreeTierError`, the root cause of the reverted 2026-09-30
-  port), and declare ≥3 tool names drawn **only** from the opencode builtin set
-  (unknown names mixed in fail; schemas are not checked). Mint + gate live in
-  `crates/providers/src/opencode.rs`; `crates/core/src/executor.rs`
-  `resolve_wire_builtin` maps `bash`→`shell` and `read`/`edit`→`filesystem` —
-  **never a general alias mechanism, keep it exactly that small**. Keyless
-  fail-open exists **only** for provider type `opencode` (Zen); `opencode-free`
-  (Go relay) stays fail-closed `CredentialMissing`. Keyless **429**
-  `FreeUsageLimitError` is a **per-model quota window** (live-verified
-  2026-10-18 01:22–04:05 UTC: an exhausted free model 429s *every* client for
-  the rest of the ~hour window while sibling free models keep serving, then
-  recovers at rollover): it maps to the retryable
-  `ProviderError::FreeTierThrottled` and the single-agent loop retries it with
-  backoff, honoring `Retry-After`; the **403** fingerprint-gate and **410**
-  deprecated-model verdicts stay terminal `ProviderError::FreeTierRefused`.
+- **OpenCode Zen anonymous free tier is a client-identity mirror**, not a
+  fingerprint gate and not session registration (corrected 2026-10-18 after the
+  upstream client was read directly:
+  `~/Projects/opencode/packages/opencode/src/session/llm/request.ts:187-206`).
+  Concerto presents exactly the identity the real OpenCode client presents: an
+  `opencode/<version>` `User-Agent` (shipped: `opencode/1.19.3`, mirroring a
+  released build; bump it only to track the upstream contract) and, on each
+  anonymous completion, a fresh opencode-format `ses_` wire session id minted
+  by `mint_wire_session_id` and mirrored under `x-opencode-session` +
+  `x-opencode-session-id`, a fresh per-request `x-opencode-request`, and a
+  construction-time `x-opencode-client` (`cli` default; the desktop app sets
+  `desktop`). The relay validates that session identity against the client's
+  own format: raw orchestration ULIDs and session-less completions are refused
+  (live-verified 2026-10-18), so the caller's real ULID never goes on the
+  anonymous wire; keyed Zen requests still mirror the run's real session id
+  when present (and omit the headers when absent), byte-identical to the
+  pre-patch wire. Anonymous requests must `stream: true` **and** declare a
+  tool named `read`: the free-tier branch rejects credential-less completions
+  whose `tools` lack it (name-only check; schema content ignored —
+  live-verified 2026-10-18: `read` alone suffices,
+  `bash`/`edit`/`glob`/`grep`/`write` do not unlock it, extras are tolerated,
+  and the title prompt is accepted only on tool-less requests). Concerto
+  mirrors the client with `ensure_anonymous_read_tool` in
+  `crates/providers/src/openai.rs` — appended to the caller's declarations,
+  never duplicating one. There is **no** tool rewriting: the caller's
+  **real** tool declarations go on the wire. The identity plumbing lives in
+  `crates/providers/src/opencode.rs` (`per_request_headers`,
+  `mint_wire_session_id`) and
+  `crates/providers/src/openai.rs`
+  (`stream_completion_with_extra_headers`); `crates/core/src/executor.rs`
+  `resolve_wire_builtin` still maps `bash`→`shell` and `read`/`edit`→`filesystem`
+  so a model that emits opencode's builtin names executes real tools — **never a
+  general alias mechanism, keep it exactly that small**. Anonymous fail-open
+  exists **only** for provider type `opencode` (Zen); `opencode-free` (Go relay)
+  stays fail-closed `CredentialMissing`. An anonymous **429** is an **ordinary
+  rate limit**, not special free-tier gating: the Zen relay maps every
+  `RateLimitError`/`FreeUsageLimitError`/`GoUsageLimitError`/
+  `BlackUsageLimitError` to a plain `429` with a `Retry-After` header and an
+  `{type:"error",error:{type:<Class>,message}}` body. On the anonymous tier it
+  is a **shared, IP-keyed daily bucket** — free models with no explicit
+  per-model `rateLimit` share one bucket per IP (TTL/`Retry-After` = seconds
+  to the next UTC midnight) — so there is **no per-model quota**: it flows
+  through the existing generic retryable `ProviderError::RateLimit
+  { retry_after }` and the single-agent loop retries it with backoff, honoring
+  `Retry-After`; the **403** (refused request) and **410** deprecated-model
+  verdicts stay terminal `ProviderError::FreeTierRefused`.
   The free roster itself churns; `OPENCODE_ZEN_FREE_KNOWN`
   (`crates/providers/src/provider_defs.rs`) holds the last hand-verified set
   and live discovery (`GET /zen/v1/models`) covers the rest.
-  Full spec:
-  `/mnt/Temp/zen-free-tier-investigation.md` (mirror into the repo if plans
-  change — prefer in-place facts over a `/tmp` path that may vanish).
 
 ## Key entrypoints (start reading here)
 - Single-agent loop: `crates/orchestrator/src/agent_loop.rs`
@@ -179,6 +199,7 @@ cargo audit
 - MCP stdio client: `crates/mcp/src/client.rs` (`McpClient`); runtime manager: `crates/mcp/src/manager.rs` (`McpManager`); tool bridge: `crates/mcp/src/tool_bridge.rs`
 - Skill injection into prompts: `crates/orchestrator/src/skills_context.rs` (`SkillsContext`)
 - App roots: `crates/desktop/src/app.rs` (Iced), `crates/cli/src/` (ratatui)
+- Headless one-shot CLI run: `crates/cli/src/dispatch/run.rs` (`concerto run`: prompt/JSON/exit-code contract, `--approvals`)
 - Event bus (everything flows through it): `crates/core/src/event.rs`
 
 ## Plugin system (WASM)

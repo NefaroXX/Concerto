@@ -635,6 +635,7 @@ async fn host_completion(
 
     // 2. Map to the core CompletionRequest.
     let request = CompletionRequest {
+        session_id: None,
         stable_system_prefix_bytes: None,
         model: guest_req.model,
         messages: guest_req.messages,

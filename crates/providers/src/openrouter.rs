@@ -63,6 +63,7 @@ mod tests {
 
     fn streamed_request() -> CompletionRequest {
         CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![Message {
                 role: Role::User,

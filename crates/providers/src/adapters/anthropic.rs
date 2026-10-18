@@ -213,6 +213,7 @@ mod tests {
     /// a follow-up user turn, plus a tool list and a forced tool choice.
     fn fixture_request() -> CompletionRequest {
         CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             model: String::new(),
             messages: vec![
@@ -433,6 +434,7 @@ mod tests {
             ),
         ] {
             let request = CompletionRequest {
+                session_id: None,
                 stable_system_prefix_bytes: None,
                 tools: Some(vec![ToolDefinition {
                     name: "submit_design_doc".into(),
@@ -461,6 +463,7 @@ mod tests {
     #[test]
     fn golden_serialized_body_system_and_user() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![
                 Message {
@@ -588,6 +591,7 @@ mod tests {
     #[test]
     fn multiple_tool_results_fold_into_one_user_message() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![Message {
                 role: Role::Tool,
@@ -645,6 +649,7 @@ mod tests {
     #[test]
     fn tool_message_without_results_renders_empty_user_message() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![Message {
                 role: Role::Tool,
@@ -681,6 +686,7 @@ mod tests {
     #[test]
     fn last_system_message_wins() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![
                 Message {
@@ -730,6 +736,7 @@ mod tests {
     fn stable_prefix_boundary_is_independent_of_changing_memory() {
         let mut request = CompletionRequest {
             messages: vec![msg(Role::System, "stable instructions\n\nvolatile memory")],
+            session_id: None,
             stable_system_prefix_bytes: Some("stable instructions".len()),
             ..Default::default()
         };

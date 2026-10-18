@@ -309,6 +309,7 @@ impl PromptBuilder {
         all_messages.extend_from_slice(messages);
 
         CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes,
             model: String::new(), // filled in by the caller or provider context guard
             messages: all_messages,

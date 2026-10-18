@@ -13,15 +13,16 @@
 //! answers `401 AuthError "Missing API key."`, so the `opencode-free` provider
 //! type always requires a real credential. **Zen**, by contrast, serves its
 //! zero-cost roster to an *anonymous* client (`Authorization: Bearer public`,
-//! the relay's `"public"` sentinel for "no account") once the request passes
-//! the relay's client-fingerprint gate — a dev-tree-format
-//! `x-opencode-session` value, an `opencode/*` `User-Agent`, `stream: true`,
-//! and a body declaring at least three opencode builtin tool names. See
-//! [`OPENCODE_ANONYMOUS_CREDENTIAL`], [`mint_dev_identifier`], and
-//! [`OpenCodeZenProvider::keyless_gate_tools`]. That keyless path is why the
-//! `opencode` provider type can be built with no credential; the gate is a
-//! *fingerprint check*, not session registration. A config-supplied `api_base`
-//! overrides either default (self-hosted gateways, proxies, tests).
+//! the relay's `"public"` sentinel for "no account"). We present exactly the
+//! client identity the real OpenCode client presents — the same
+//! `x-opencode-*` identity headers and `opencode/<version>` User-Agent — so the
+//! relay classifies Concerto as an OpenCode client instead of manufacturing a
+//! fingerprint mismatch. See [`OPENCODE_ANONYMOUS_CREDENTIAL`],
+//! [`OPENCODE_SESSION_HEADER`], and [`OpenCodeZenProvider::per_request_headers`].
+//! That anonymous path is why the `opencode` provider type can be built with no
+//! credential; it is client *identity*, not session registration. A
+//! config-supplied `api_base` overrides either default (self-hosted gateways,
+//! proxies, tests).
 //!
 //! Each relay dispatches on the **lowercased full model-id prefix** — the
 //! authoritative contract is the upstream consumer's
@@ -55,9 +56,7 @@ use async_stream::stream;
 use async_trait::async_trait;
 use concerto_core::error::{describe_error_chain, ProviderError};
 use concerto_core::traits::{CompletionStream, LlmProvider};
-use concerto_core::types::{
-    CompletionChunk, CompletionRequest, ModelInfo, TokenBudget, ToolCall, ToolDefinition,
-};
+use concerto_core::types::{CompletionChunk, CompletionRequest, ModelInfo, TokenBudget, ToolCall};
 use concerto_core::CancellationToken;
 use concerto_core::SecretString;
 use futures::stream::StreamExt;
@@ -82,7 +81,7 @@ pub(crate) const OPENCODE_ZEN_BASE: &str = "https://opencode.ai/zen/v1";
 /// path alias of Zen (`/zen`): `GET https://opencode.ai/zen/go/v1/models`
 /// returns a roster that shares no assumptions with Zen's. Completions on Go
 /// answer `401 AuthError` without a valid API key, so `opencode-free` is *not*
-/// a keyless provider type. Kept as a constant so a future relay correction is
+/// an anonymous provider type. Kept as a constant so a future relay correction is
 /// a one-line change, never a scattered edit.
 pub(crate) const OPENCODE_GO_BASE: &str = "https://opencode.ai/zen/go/v1";
 
@@ -136,141 +135,123 @@ impl OpenCodeRelay {
     }
 }
 
-/// Client-identity header OpenCode's relay reads on every request.
+/// Client-identity header the real OpenCode client sends on every request.
 ///
-/// Upstream reads `x-opencode-session`
-/// (`packages/console/app/src/routes/zen/util/handler.ts`:
-/// `input.request.headers.get("x-opencode-session")`). On the **paid** path it
-/// is a backend / prompt-cache affinity token (a stable value routes a
-/// process's requests to one warm backend). On the **keyless free-tier** path
-/// it is also the decisive half of the client-fingerprint gate: the relay
-/// performs `Schema.isStartsWith("ses")` plus a dev-tree shape check, and a
-/// value that is not `ses_` + 26 dev-tree characters yields `403
-/// FreeTierError` no matter how faithfully the rest of the request mimics the
-/// real client. Its absence alone is likewise refused.
-///
-/// **This is NOT an authentication mechanism.** It carries no credential and
-/// does not satisfy the relay's API-key check (`401 AuthError` still applies
-/// without a valid `Authorization`). The name `X-Session-ID` does not exist
-/// upstream and must never be reintroduced.
+/// Upstream reads it (`packages/console/app/src/routes/zen/util/handler.ts`:
+/// `input.request.headers.get("x-opencode-session")`) as a session identity;
+/// on the paid path it doubles as prompt-cache / backend affinity. Concerto
+/// mirrors it from the run's real orchestration session id
+/// ([`CompletionRequest::session_id`]). It is **not** an authentication
+/// mechanism and authorizes nothing: without a valid `Authorization` the relay
+/// still answers `401 AuthError`. When there is no orchestration session
+/// (discovery, tests, standalone legs) the header is omitted entirely rather
+/// than filled with an invented value.
 pub(crate) const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
 
-/// Relay header mirrored from [`OPENCODE_SESSION_HEADER`] on the real client.
+/// Second session-identity spelling the real client sends alongside
+/// [`OPENCODE_SESSION_HEADER`].
 ///
-/// The genuine client sends the same `ses_…` value under both names for the
-/// `opencode`/`opencode-go` provider types. It is individually dispensable (an
-/// ablation dropping it passes), but the relay's fingerprint is most faithful
-/// when both agree, so we send it.
+/// The genuine client sends the same session value under both names for the
+/// `opencode`/`opencode-go` provider types; Concerto mirrors both so the
+/// request is indistinguishable from a real client's.
 pub(crate) const OPENCODE_SESSION_ID_HEADER: &str = "x-opencode-session-id";
 
-/// Per-request identifier header sent by the real client.
+/// Per-request identifier header the real client sends.
 ///
-/// Carries a `msg_…` dev-tree value in the same shape as the session id. Like
-/// [`OPENCODE_SESSION_ID_HEADER`] it is individually dispensable, but the real
-/// client always sends it and value reuse is tolerated (verified), so a
-/// process-stable value is sufficient.
+/// Upstream sets `x-opencode-request` to the user message id for the turn
+/// (`session/llm/request.ts`). Concerto mints one fresh id per outgoing
+/// request; it identifies the request, not the caller, and gates nothing.
 pub(crate) const OPENCODE_REQUEST_HEADER: &str = "x-opencode-request";
+
+/// Surface header identifying which OpenCode client is calling.
+///
+/// Upstream sets `x-opencode-client` from `input.flags.client` — `"cli"` for
+/// the terminal client, `"desktop"` for the desktop app. This is a
+/// construction-time property of the running binary, not per-request
+/// identity; see [`set_opencode_client_surface`].
+pub(crate) const OPENCODE_CLIENT_HEADER: &str = "x-opencode-client";
+
+/// Surface assumed when the host binary has not declared one.
+///
+/// The CLI and headless entrypoints keep this; the desktop app calls
+/// [`set_opencode_client_surface`] early in startup.
+pub(crate) const DEFAULT_OPENCODE_CLIENT: &str = "cli";
 
 /// The relay's `"public"` credential sentinel, normalized to "anonymous".
 ///
 /// `routes/zen/util/handler.ts` treats a `Bearer public` (or `x-api-key:
-/// public`) credential as "no account": the request may still be served from
-/// the zero-cost roster once the client-fingerprint gate passes. We send this
-/// sentinel instead of an empty `Authorization` so the header is well-formed
-/// and the relay's anonymous branch is selected explicitly.
+/// public`) credential as "no account": the request is then served from the
+/// zero-cost roster. We send this sentinel instead of an empty `Authorization`
+/// so the header is well-formed and the relay's anonymous branch is selected
+/// explicitly.
 pub(crate) const OPENCODE_ANONYMOUS_CREDENTIAL: &str = "public";
 
-/// Alphanumeric alphabet of a dev-tree random tail (62 symbols, ordered to
-/// match the upstream generator's `"0123456789ABC…abc…"` string).
+/// Process-wide client surface reported through [`OPENCODE_CLIENT_HEADER`].
 ///
-/// `bytes[i] % 62` indexes it. Kept as a byte slice so the mint indexes it
-/// without a UTF-8 boundary check — every symbol is one ASCII byte.
-const DEV_TREE_ALPHABET: &[u8; 62] =
-    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+/// Set once at startup by the host binary (see
+/// [`set_opencode_client_surface`]); defaults to
+/// [`DEFAULT_OPENCODE_CLIENT`] so headless/CLI callers need no extra setup.
+static OPENCODE_CLIENT_SURFACE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-/// Value counter for the dev-tree time component.
+/// Declare which OpenCode client surface the running binary presents.
 ///
-/// The upstream `descending()` identifier folds `Date.now() * 0x1000 + counter`
-/// so two ids minted in the same millisecond stay ordered. A monotonically
-/// increasing per-process counter reproduces that tie-break across calls; it is
-/// `Relaxed` because the id is opaque and only needs to differ, never to be a
-/// globally consistent ordering.
-static DEV_TREE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Call once, before any provider is constructed. The value is process-global
+/// because the surface is a property of the binary, not of a request or a
+/// provider instance. Subsequent calls are ignored (first write wins) so an
+/// embedding host can never be silently overridden by a later component.
+pub fn set_opencode_client_surface(surface: &str) {
+    let _ = OPENCODE_CLIENT_SURFACE.set(surface.to_string());
+}
 
-/// Mint one OpenCode dev-tree identifier: `prefix + "_" + 26 chars`.
-///
-/// Format (reverse-engineered from `packages/schema/src/identifier.ts` and
-/// verified live against the relay's fingerprint gate):
-///
-/// - first 12 chars: the 6 big-endian bytes of
-///   `~(now_ms * 0x1000 + counter)` (top byte first), as lowercase hex;
-/// - remaining 14 chars: uniform random over the 62-symbol alphabet via
-///   `bytes[i] % 62`.
-///
-/// The leading bit complement makes the time component *descending*, matching
-/// upstream. The value identifies nothing and authorizes nothing — it exists to
-/// satisfy the receiver's `isStartsWith("ses")` + shape check.
-pub(crate) fn mint_dev_identifier(prefix: &str) -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
+/// The effective client surface, borrowed for the process lifetime.
+pub(crate) fn opencode_client_surface() -> &'static str {
+    OPENCODE_CLIENT_SURFACE.get().map(String::as_str).unwrap_or(DEFAULT_OPENCODE_CLIENT)
+}
 
-    let now_ms =
-        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
-    let counter = DEV_TREE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // `(now_ms * 0x1000 + counter)` as a 64-bit value, complemented to make the
-    // encoded time descending. `0x1000` leaves 12 bits of counter headroom, so
-    // the low 48 bits carry the (inverted) time+counter.
-    let combined = now_ms.wrapping_mul(0x1000).wrapping_add(counter);
-    let inverted = !combined;
-    let time_bytes = inverted.to_be_bytes();
-    // The 48-bit time field is the low 6 big-endian bytes of the inverted word.
-    let mut value = String::with_capacity(prefix.len() + 1 + 26);
-    value.push_str(prefix);
-    value.push('_');
-    for byte in &time_bytes[2..8] {
-        value.push_str(&format!("{byte:02x}"));
+/// Mint one fresh per-request identifier for [`OPENCODE_REQUEST_HEADER`].
+///
+/// Uses the workspace ULID generator: globally unique, time-ordered, and
+/// opaque. The relay treats the value as an opaque message id and gates
+/// nothing on it, so no OpenCode-specific shape is required.
+pub(crate) fn next_request_id() -> String {
+    concerto_core::ids::new_id().to_string()
+}
+
+/// Mint one opencode-format `ses_` **wire** session id.
+///
+/// The anonymous free-tier relay validates the session identity the way the
+/// real client mints it (`packages/opencode/src/id/id.ts`): a `ses_` prefix,
+/// six hex bytes of a millisecond timestamp shifted left 12 bits and inverted
+/// for descending order (plus a within-millisecond counter), and fourteen
+/// base62 suffix characters. The caller's orchestration ULID cannot go on the
+/// anonymous wire — the relay refuses raw ULIDs — so one fresh wire id is
+/// minted per completion instead (live-verified 2026-10-18).
+pub(crate) fn mint_wire_session_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const BASE62: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    // The low 48 bits — the same window `id.ts` extracts for the hex block.
+    const TIMESTAMP_MASK: u64 = 0xFFFF_FFFF_FFFF;
+
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64);
+    if LAST_MS.load(Ordering::Relaxed) != ms {
+        // Mirrors the client's per-millisecond counter reset.
+        LAST_MS.store(ms, Ordering::Relaxed);
+        COUNTER.store(0, Ordering::Relaxed);
     }
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let descending = !(ms.wrapping_mul(0x1000).wrapping_add(counter));
+    let mut id = format!("ses_{:012x}", descending & TIMESTAMP_MASK);
     for _ in 0..14 {
-        let index = (fastrand::u8(..) % 62) as usize;
-        value.push(DEV_TREE_ALPHABET[index] as char);
+        id.push(BASE62[fastrand::usize(0..62)] as char);
     }
-    value
+    id
 }
-
-/// Process-stable value of [`OPENCODE_SESSION_HEADER`] (and its `-id` mirror).
-///
-/// Initialised exactly once per process so every request carries the same
-/// affinity token and the same fingerprint shape. Guarded by [`OnceLock`] so
-/// concurrent first use cannot produce two different values.
-static OPENCODE_SESSION_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-/// The stable, opaque, per-process `ses_…` session value.
-///
-/// Opaque by construction — it identifies nothing and authorizes nothing; see
-/// [`OPENCODE_SESSION_HEADER`]. Minted in the dev-tree shape the gate requires
-/// (see [`mint_dev_identifier`]).
-pub(crate) fn opencode_session_id() -> &'static str {
-    OPENCODE_SESSION_ID.get_or_init(|| mint_dev_identifier("ses"))
-}
-
-/// Process-stable value of [`OPENCODE_REQUEST_HEADER`] (`msg_…`).
-static OPENCODE_REQUEST_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-/// The stable, opaque, per-process `msg_…` request value.
-///
-/// Value reuse across requests is tolerated by the relay (verified), so one
-/// process-stable id is sufficient; see [`OPENCODE_REQUEST_HEADER`].
-pub(crate) fn opencode_request_id() -> &'static str {
-    OPENCODE_REQUEST_ID.get_or_init(|| mint_dev_identifier("msg"))
-}
-
-/// The opencode builtin tool names the keyless fingerprint gate accepts.
-///
-/// The relay's gate requires **at least three** names drawn *solely* from
-/// upstream's builtin set (`packages/opencode/src/tool/registry.ts`); JSON
-/// schemas may be empty (only names are checked). This list is the intersection
-/// of that set with what Concerto can actually execute, so a gate-compliant set
-/// never declares a tool the agent cannot run.
-const OPENCODE_GATE_BUILTIN_NAMES: &[&str] = &["bash", "read", "edit", "write"];
 
 /// Stable capability name used by every ADR-66 capability refusal.
 pub(crate) const TOOL_CALLING_CAPABILITY: &str = "tool_calling";
@@ -424,10 +405,10 @@ pub struct OpenCodeZenProvider {
     /// anonymous free-tier path. Fixed at construction from the (relay, raw
     /// key) pair: `true` only for Zen with an empty key. When set, the
     /// connector sends the [`OPENCODE_ANONYMOUS_CREDENTIAL`] sentinel and
-    /// rewrites the outgoing tool declarations to the gate-compliant builtin
-    /// set (see [`Self::keyless_gate_tools`]). Go is never keyless — the relay
-    /// rejects anonymous requests with `401`, and the factory fails closed.
-    keyless: bool,
+    /// forces `stream: true` (the relay's anonymous branch serves only
+    /// streamed completions). Go is never anonymous — the relay rejects
+    /// anonymous requests with `401`, and the factory fails closed.
+    anonymous: bool,
     /// Pre-built inner OpenAI provider for OpenAI-compatible models.
     openai_inner: OpenAiProvider,
 }
@@ -478,120 +459,73 @@ impl OpenCodeZenProvider {
         // when the provider type is Zen.
         let relay = OpenCodeRelay::for_base(&api_base);
         let raw_key = api_key.into();
-        // Keyless is a **Zen-only** property: Go answers `401 AuthError` for an
-        // anonymous request, so an empty key there is a misconfiguration the
+        // Anonymous is a **Zen-only** property: Go answers `401 AuthError` for
+        // an anonymous request, so an empty key there is a misconfiguration the
         // factory already fails closed on — never silently anonymous.
-        let keyless = relay == OpenCodeRelay::Zen && raw_key.expose().trim().is_empty();
+        let anonymous = relay == OpenCodeRelay::Zen && raw_key.expose().trim().is_empty();
         // Substitute the relay's `"public"` anonymous sentinel for the empty
         // key so every leg (including the inner `/models` listing) sends a
         // well-formed credential that selects the relay's anonymous branch.
         let wire_key =
-            if keyless { SecretString::from(OPENCODE_ANONYMOUS_CREDENTIAL) } else { raw_key };
-        // Every wire path this provider owns — `/responses`, `/messages`, and
-        // the inner OpenAI-compatible `/chat/completions` + `/models` legs —
-        // carries the three client-identity headers, so the relay sees one
-        // stable session across all dialects and the fingerprint is uniform
-        // (see `OPENCODE_SESSION_HEADER`).
+            if anonymous { SecretString::from(OPENCODE_ANONYMOUS_CREDENTIAL) } else { raw_key };
+        // The inner connector carries the one construction-time identity header
+        // (the client surface); the per-request identity headers are supplied
+        // by `per_request_headers` on the completion call so each request can
+        // carry its own session id (see `stream_completion`).
         let openai_inner = OpenAiProvider::new(wire_key, model.clone(), timeout_secs)
             .with_api_base(api_base.clone())
             .with_reasoning_echo(ReasoningEcho::Always)
-            .with_extra_header(OPENCODE_SESSION_HEADER, opencode_session_id())
-            .with_extra_header(OPENCODE_SESSION_ID_HEADER, opencode_session_id())
-            .with_extra_header(OPENCODE_REQUEST_HEADER, opencode_request_id())
-            .with_keyless(keyless);
+            .with_extra_header(OPENCODE_CLIENT_HEADER, opencode_client_surface())
+            .with_anonymous(anonymous);
         Self {
             model,
             timeout_secs,
             api_base,
             relay,
-            keyless,
+            anonymous,
             tool_schema_mode: concerto_config::ToolSchemaMode::default(),
             advertised_tool_support: None,
             openai_inner,
         }
     }
 
-    /// Whether this provider is on the anonymous, keyless Zen free tier.
-    pub(crate) fn is_keyless(&self) -> bool {
-        self.keyless
+    /// Whether this provider is on the anonymous, credential-less Zen free
+    /// tier.
+    pub(crate) fn is_anonymous(&self) -> bool {
+        self.anonymous
     }
 
-    /// The tool declarations sent to the relay's keyless fingerprint gate.
+    /// The per-request OpenCode identity headers for one completion.
     ///
-    /// The gate accepts a body whose `tools` array holds **at least three
-    /// names drawn solely from opencode's builtin set** (schemas are not
-    /// inspected — only names). Concerto therefore declares the
-    /// [`OPENCODE_GATE_BUILTIN_NAMES`] subset it can actually execute, with
-    /// real-ish schemas matching the corresponding Concerto tool inputs so a
-    /// keyless model emits parseable arguments (see
-    /// [`crate::opencode`] and the executor's wire-builtin resolution): `bash`
-    /// maps to the shell tool, `read`/`edit` to filesystem read/write, and
-    /// `write` is the already-registered filesystem-write alias. Native tool
-    /// names (`filesystem`, `shell`, `git`, `mcp:*`) must never reach this
-    /// array — the gate rejects unknown names.
-    pub(crate) fn keyless_gate_tools() -> Vec<ToolDefinition> {
-        fn tool(name: &str, description: &str, parameters: serde_json::Value) -> ToolDefinition {
-            ToolDefinition {
-                name: name.to_string(),
-                description: description.to_string(),
-                parameters,
-            }
+    /// Returns the session identity (mirrored under both spellings the real
+    /// client uses) plus a fresh per-request id. The client-surface header is
+    /// a construction-time property and rides the connector's static extra
+    /// headers instead (see [`OPENCODE_CLIENT_HEADER`]).
+    ///
+    /// **Anonymous** completions always mint a fresh opencode-format `ses_`
+    /// wire id ([`mint_wire_session_id`]) — the free-tier relay validates the
+    /// session identity against the client's own format and refuses raw
+    /// orchestration ULIDs, and it refuses credential-less completions with no
+    /// session identity at all (both live-verified 2026-10-18). Keyed
+    /// requests mirror the caller's real session id when one is supplied and
+    /// omit the session headers otherwise — byte-identical to the pre-patch
+    /// keyed wire.
+    pub(crate) fn per_request_headers(
+        session_id: Option<&str>,
+        request_id: &str,
+        anonymous: bool,
+    ) -> Vec<(String, String)> {
+        let mut headers = Vec::with_capacity(3);
+        if anonymous {
+            let wire_session = mint_wire_session_id();
+            headers.push((OPENCODE_SESSION_HEADER.to_string(), wire_session.clone()));
+            headers.push((OPENCODE_SESSION_ID_HEADER.to_string(), wire_session));
+        } else if let Some(session) = session_id {
+            headers.push((OPENCODE_SESSION_HEADER.to_string(), session.to_string()));
+            headers.push((OPENCODE_SESSION_ID_HEADER.to_string(), session.to_string()));
         }
-        debug_assert!(
-            OPENCODE_GATE_BUILTIN_NAMES.len() >= 3,
-            "the fingerprint gate requires at least three builtin tool names"
-        );
-        vec![
-            tool(
-                "bash",
-                "Run a program with arguments in the workspace.",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "command": {"type": "string", "description": "Program to execute."},
-                        "args": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Arguments passed to the program."
-                        }
-                    },
-                    "required": ["command"]
-                }),
-            ),
-            tool(
-                "read",
-                "Read a file from the workspace.",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {"path": {"type": "string", "description": "File to read."}},
-                    "required": ["path"]
-                }),
-            ),
-            tool(
-                "edit",
-                "Write content to a file in the workspace.",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "File to write."},
-                        "content": {"type": "string", "description": "New file content."}
-                    },
-                    "required": ["path", "content"]
-                }),
-            ),
-            tool(
-                "write",
-                "Write content to a file in the workspace.",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "File to write."},
-                        "content": {"type": "string", "description": "New file content."}
-                    },
-                    "required": ["path", "content"]
-                }),
-            ),
-        ]
+        headers.push((OPENCODE_REQUEST_HEADER.to_string(), request_id.to_string()));
+        headers
     }
 
     /// The base URL this provider builds its request paths from.
@@ -611,39 +545,23 @@ impl OpenCodeZenProvider {
         self.openai_inner.api_key()
     }
 
-    /// Apply the three client-identity headers to a request builder.
+    /// Apply the client-identity headers to a request builder.
     ///
-    /// Shared by every wire leg this provider owns (`/responses`, `/messages`,
-    /// and — via the inner connector's `extra_headers` — `/chat/completions`
-    /// and `/models`) so no leg can silently omit one. On the keyless path
-    /// these headers *are* the fingerprint gate (see
-    /// [`OPENCODE_SESSION_HEADER`]).
-    fn apply_relay_headers(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        request
-            .header(OPENCODE_SESSION_HEADER, opencode_session_id())
-            .header(OPENCODE_SESSION_ID_HEADER, opencode_session_id())
-            .header(OPENCODE_REQUEST_HEADER, opencode_request_id())
-    }
-
-    /// Rewrite an outgoing request for the keyless fingerprint gate.
-    ///
-    /// No-op unless [`Self::is_keyless`]. When keyless, the relay rejects any
-    /// body whose `tools` array does not hold at least three pure opencode
-    /// builtin names (and rejects `stream: false` outright), so the request's
-    /// native tool declarations are replaced with the gate-compliant
-    /// [`Self::keyless_gate_tools`] set and `stream` is forced on. Text-only
-    /// keyless requests get the same declarations (the gate rejects a body
-    /// with no tools at all). The rewrite happens before dialect dispatch, so
-    /// all three legs share it.
-    fn apply_keyless_gate(&self, request: &mut CompletionRequest) {
-        if !self.is_keyless() {
-            return;
-        }
-        request.tools = Some(Self::keyless_gate_tools());
-        // The free-tier gate refuses `stream: false` outright (verified for
-        // both the replayed body and a minimal probe), so a keyless request
-        // must stream to have any chance of being served.
-        request.stream = true;
+    /// Shared by the two legs this provider owns directly (`/responses`,
+    /// `/messages`); the OpenAI-compatible leg gets the same static client
+    /// header plus the identical per-request set through the inner connector's
+    /// `stream_completion_with_extra_headers`. The client-surface header is
+    /// constant (a property of the binary); the session and request headers
+    /// come from `per_request_headers` for this specific completion.
+    fn apply_relay_headers(
+        &self,
+        request: reqwest::RequestBuilder,
+        per_request: &[(String, String)],
+    ) -> reqwest::RequestBuilder {
+        per_request.iter().fold(
+            request.header(OPENCODE_CLIENT_HEADER, opencode_client_surface()),
+            |builder, (name, value)| builder.header(name.as_str(), value.as_str()),
+        )
     }
 
     /// Set the tool-schema presentation mode (adaptive tool schemas).
@@ -824,6 +742,7 @@ impl OpenCodeZenProvider {
         &self,
         request: CompletionRequest,
         cancel: CancellationToken,
+        per_request: &[(String, String)],
     ) -> Result<CompletionStream, ProviderError> {
         let model = self.resolve_model(&request);
         // The Responses body builder now renders `request.tools` natively
@@ -853,6 +772,7 @@ impl OpenCodeZenProvider {
                             .post(&url)
                             .bearer_auth(self.api_key().expose())
                             .header(CONTENT_TYPE, "application/json"),
+                        per_request,
                     )
                     .json(&body)
                     .send()
@@ -867,7 +787,7 @@ impl OpenCodeZenProvider {
                         status,
                         &text,
                         retry_after,
-                        self.is_keyless(),
+                        self.is_anonymous(),
                     ));
                 }
                 Ok(r)
@@ -928,6 +848,7 @@ impl OpenCodeZenProvider {
         &self,
         request: CompletionRequest,
         cancel: CancellationToken,
+        per_request: &[(String, String)],
     ) -> Result<CompletionStream, ProviderError> {
         let model = self.resolve_model(&request);
         let span = tracing::info_span!(
@@ -972,6 +893,7 @@ impl OpenCodeZenProvider {
                             .header("x-api-key", self.api_key().expose())
                             .header("anthropic-version", "2023-06-01")
                             .header(CONTENT_TYPE, "application/json"),
+                        per_request,
                     )
                     .json(&body)
                     .send()
@@ -986,7 +908,7 @@ impl OpenCodeZenProvider {
                         status,
                         &text,
                         retry_after,
-                        self.is_keyless(),
+                        self.is_anonymous(),
                     ));
                 }
                 Ok(r)
@@ -1051,17 +973,40 @@ impl LlmProvider for OpenCodeZenProvider {
         cancel: CancellationToken,
     ) -> Result<CompletionStream, ProviderError> {
         let mut request = request;
-        // Keyless Zen requests carry a fixed gate-compliant tool set; every
-        // other request (paid Zen, all Go) is left byte-identical.
-        self.apply_keyless_gate(&mut request);
+        // The relay's anonymous branch serves only streamed completions, so an
+        // anonymous Zen request is forced to stream. Paid Zen and Go are left
+        // byte-identical — we send the tools the caller asked for either way.
+        if self.is_anonymous() {
+            request.stream = true;
+        }
         let model = self.resolve_model(&request);
+        // One fresh per-request id, plus the session identity: keyed requests
+        // mirror the run's real session id when the caller supplied one
+        // (session-less keyed legs omit it), while anonymous requests mint a
+        // client-format wire session id because the free-tier relay validates
+        // that identity and refuses raw ULIDs. See `per_request_headers`.
+        let request_id = next_request_id();
+        let session_id = request.session_id.map(|id| id.to_string());
+        let per_request = Self::per_request_headers(
+            session_id.as_deref(),
+            request_id.as_str(),
+            self.is_anonymous(),
+        );
         // The ONE dialect decision: (relay, model) -> wire mode. The relay is
         // fixed at construction from the effective base URL, so the Go relay
         // can never be routed with Zen's table (the 400 bug this fixes).
         match api_mode_for(self.relay, &model) {
-            ApiMode::AnthropicMessages => self.stream_completion_anthropic(request, cancel).await,
-            ApiMode::Responses => self.stream_completion_responses(request, cancel).await,
-            ApiMode::ChatCompletions => self.openai_inner.stream_completion(request, cancel).await,
+            ApiMode::AnthropicMessages => {
+                self.stream_completion_anthropic(request, cancel, &per_request).await
+            }
+            ApiMode::Responses => {
+                self.stream_completion_responses(request, cancel, &per_request).await
+            }
+            ApiMode::ChatCompletions => {
+                self.openai_inner
+                    .stream_completion_with_extra_headers(request, cancel, &per_request)
+                    .await
+            }
         }
     }
 
@@ -1564,6 +1509,7 @@ mod tests {
         // table), so the Anthropic body fixture uses a genuine Anthropic id.
         let p = OpenCodeZenProvider::new("key".to_string(), "claude-3-5-sonnet".into(), 30);
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![concerto_core::types::Message {
                 role: concerto_core::types::Role::User,
@@ -1609,6 +1555,7 @@ mod tests {
 
     fn tool_request() -> CompletionRequest {
         CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             model: "muse-v2".into(),
             messages: vec![concerto_core::types::Message {
@@ -1654,6 +1601,7 @@ mod tests {
     #[test]
     fn responses_body_omits_tools_key_when_absent() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             model: "muse-v2".into(),
             messages: vec![concerto_core::types::Message {
@@ -1678,6 +1626,7 @@ mod tests {
     #[test]
     fn responses_body_round_trips_tool_call_and_output() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             model: "muse-v2".into(),
             messages: vec![
@@ -1930,6 +1879,7 @@ mod tests {
         // Leg 3 — result back in: the assistant call and its tool result
         // render as function_call / function_call_output items.
         let follow_up = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             model: "muse-v2".into(),
             messages: vec![
@@ -2038,82 +1988,158 @@ mod tests {
         assert_eq!(overridden.api_base(), "http://127.0.0.1:9");
     }
 
-    /// The affinity value is generated exactly once per process: identical on
-    /// every call (cache affinity only works with a stable token), namespaced
-    /// to this client, and opaque — it identifies nothing and authorizes
-    /// nothing (see [`OPENCODE_SESSION_HEADER`]).
+    /// The per-request identity header builder mirrors the real client: keyed
+    /// requests borrow the caller's session under both spellings (and invent
+    /// nothing when the caller has none), while anonymous requests always mint
+    /// a fresh opencode-format `ses_` wire id — the free-tier relay refuses
+    /// raw ULIDs and session-less completions alike (live-verified 2026-10-18).
     #[test]
-    fn session_id_is_stable_and_dev_tree_shaped() {
-        let first = opencode_session_id();
-        let second = opencode_session_id();
-        assert_eq!(first, second, "one value per process, not one per call");
-
-        // The relay's fingerprint gate requires `ses_` + 26 dev-tree chars:
-        // 12 lowercase-hex time chars followed by 14 alphabet chars.
-        let body = first.strip_prefix("ses_").expect("ses_ prefix");
-        assert_eq!(body.len(), 26, "26 chars after the prefix: {first}");
-        let (time_part, tail) = body.split_at(12);
-        assert!(
-            time_part.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
-            "time half is lowercase hex: {first}"
+    fn per_request_headers_mirror_the_client() {
+        let headers = OpenCodeZenProvider::per_request_headers(Some("ses_abc"), "msg_xyz", false);
+        let pairs: Vec<(&str, &str)> =
+            headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(
+            pairs,
+            vec![
+                (OPENCODE_SESSION_HEADER, "ses_abc"),
+                (OPENCODE_SESSION_ID_HEADER, "ses_abc"),
+                (OPENCODE_REQUEST_HEADER, "msg_xyz"),
+            ],
+            "keyed: the session id is mirrored under both spellings and the request id is sent"
         );
-        assert!(
-            tail.chars().all(|c| DEV_TREE_ALPHABET.contains(&(c as u8))),
-            "tail is drawn from the 62-symbol alphabet: {first}"
-        );
-        assert!(!first.contains(' '), "the header value must stay a single token");
 
-        // The request id uses the same shape with the `msg_` prefix.
-        let request = opencode_request_id();
-        assert!(request.starts_with("msg_"), "request id is msg_-prefixed: {request}");
-        assert_eq!(request.strip_prefix("msg_").map(str::len), Some(26));
+        let session_less = OpenCodeZenProvider::per_request_headers(None, "msg_xyz", false);
+        let names: Vec<&str> = session_less.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![OPENCODE_REQUEST_HEADER],
+            "keyed, session-less: no session headers are invented"
+        );
+
+        for caller_session in [Some("01M57FZD52MN7P652C63EEJXM0"), None] {
+            let anonymous =
+                OpenCodeZenProvider::per_request_headers(caller_session, "msg_xyz", true);
+            let names: Vec<&str> = anonymous.iter().map(|(k, _)| k.as_str()).collect();
+            assert_eq!(
+                names,
+                vec![OPENCODE_SESSION_HEADER, OPENCODE_SESSION_ID_HEADER, OPENCODE_REQUEST_HEADER],
+                "anonymous: the session identity is always present"
+            );
+            let wire = anonymous[0].1.as_str();
+            assert_eq!(wire, anonymous[1].1, "anonymous: both spellings mirror ONE wire id");
+            assert_wire_session_format(wire, "the anonymous minted session id");
+            assert_ne!(
+                Some(wire),
+                caller_session,
+                "anonymous: the caller's orchestration ULID never goes on the wire"
+            );
+        }
     }
 
-    /// The keyless gate set is the executable builtin intersection and always
-    /// holds at least the three names the relay demands.
+    /// Each call mints a distinct per-request id, so two requests never share
+    /// one identifier.
     #[test]
-    fn keyless_gate_tools_are_executable_builtins() {
-        let tools = OpenCodeZenProvider::keyless_gate_tools();
-        assert!(tools.len() >= 3, "the gate rejects fewer than three tools");
-        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, OPENCODE_GATE_BUILTIN_NAMES, "the declared set is the executable subset");
+    fn next_request_id_is_unique_per_call() {
+        let first = next_request_id();
+        let second = next_request_id();
+        assert!(!first.is_empty(), "the request id must be non-empty");
+        assert_ne!(first, second, "each request gets a fresh id");
+    }
+
+    /// The minted wire session id carries the client's exact `ses_` shape
+    /// (`id.ts`): twelve hex chars of a descending millisecond timestamp plus
+    /// a fourteen-char base62 suffix; each call is fresh.
+    #[test]
+    fn mint_wire_session_id_has_client_shape_and_is_fresh() {
+        let first = mint_wire_session_id();
+        let second = mint_wire_session_id();
+        assert_ne!(first, second, "each completion gets a fresh wire session id");
+        assert_wire_session_format(&first, "the minted wire session id");
+
+        // Decode the timestamp block back: it is `~((ms << 12) | counter)`
+        // masked to the low 48 bits, so undoing the mask yields the low 36
+        // bits of the minting instant's milliseconds.
+        let suffix = first.strip_prefix("ses_").expect("the ses_ prefix");
+        let encoded = u64::from_str_radix(&suffix[..12], 16).expect("a hex timestamp block");
+        let minted_ms_low = (!encoded & 0xFFFF_FFFF_FFFF) >> 12;
+        let now_ms_low = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_millis() as u64
+            & 0xF_FFFF_FFFF;
         assert!(
-            names.iter().all(|n| matches!(*n, "bash" | "read" | "edit" | "write")),
-            "only pure builtin names may reach the gate: {names:?}"
+            minted_ms_low.abs_diff(now_ms_low) <= 5,
+            "the timestamp block must encode the current time: minted={minted_ms_low} \
+             now={now_ms_low}"
         );
     }
 
-    /// A keyless (empty-key) Zen provider sends the anonymous sentinel and the
-    /// gate-compliant tool set; a keyed provider keeps its key and its native
-    /// tool declarations.
+    /// A keyed provider keeps its key; only an empty-key Zen provider is
+    /// anonymous and sends the relay's `"public"` sentinel.
     #[test]
-    fn keyless_zen_uses_public_sentinel_and_gate_tools() {
-        let keyless = OpenCodeZenProvider::new("", "big-pickle".into(), 5);
-        assert!(keyless.is_keyless(), "empty key + Zen is the keyless path");
-        assert_eq!(keyless.api_key().expose(), OPENCODE_ANONYMOUS_CREDENTIAL);
+    fn anonymous_zen_uses_public_sentinel() {
+        let anonymous = OpenCodeZenProvider::new("", "big-pickle".into(), 5);
+        assert!(anonymous.is_anonymous(), "empty key + Zen is the anonymous path");
+        assert_eq!(anonymous.api_key().expose(), OPENCODE_ANONYMOUS_CREDENTIAL);
 
         let paid = OpenCodeZenProvider::new("sk-real", "big-pickle".into(), 5);
-        assert!(!paid.is_keyless(), "a real key keeps the paid path");
+        assert!(!paid.is_anonymous(), "a real key keeps the paid path");
         assert_eq!(paid.api_key().expose(), "sk-real");
     }
 
     /// The Go relay answers `401` for anonymous requests, so an empty key
-    /// targeting `/zen/go` must never be treated as the keyless path.
+    /// targeting `/zen/go` must never be treated as the anonymous path.
     #[test]
-    fn go_relay_is_never_keyless() {
+    fn go_relay_is_never_anonymous() {
         let go = OpenCodeZenProvider::with_api_base(
             "",
             "minimax-m3".into(),
             5,
             format!("{OPENCODE_GO_BASE}/"),
         );
-        assert!(!go.is_keyless(), "Go is never keyless — the factory fails closed there");
+        assert!(!go.is_anonymous(), "Go is never anonymous — the factory fails closed there");
     }
 
     /// Parse the captured request's header block (lowercased) plus request
     /// line out of raw HTTP bytes.
     fn captured_headers(raw: &[u8]) -> String {
         crate::testing::mock_server::request_headers(raw)
+    }
+
+    /// Extract one captured request header's EXACT value (case-insensitive
+    /// name match, value verbatim).
+    ///
+    /// Unlike [`captured_headers`], which lowercases the whole block so plain
+    /// `contains` checks stay ergonomic, this preserves case — required to pin
+    /// a header *value* to the exact ULID handed to
+    /// `CompletionRequest::session_id` (ULIDs are uppercase).
+    fn captured_header_value(raw: &[u8], name: &str) -> String {
+        let header_end = raw
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("captured request has a header block");
+        let headers = String::from_utf8_lossy(&raw[..header_end]);
+        headers
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.trim().eq_ignore_ascii_case(name).then(|| value.trim().to_string())
+            })
+            .unwrap_or_else(|| panic!("captured request must carry the {name} header"))
+    }
+
+    /// Value-fidelity companion to [`assert_session_header`]: BOTH session
+    /// spellings must carry exactly the ULID the request passed as
+    /// `CompletionRequest::session_id` — not merely *a* value.
+    fn assert_session_header_value(raw: &[u8], expected: concerto_core::ids::Ulid, context: &str) {
+        let expected = expected.to_string();
+        for name in [OPENCODE_SESSION_HEADER, OPENCODE_SESSION_ID_HEADER] {
+            let actual = captured_header_value(raw, name);
+            assert_eq!(
+                actual, expected,
+                "{context}: {name} must equal the exact ULID passed as session_id"
+            );
+        }
     }
 
     /// Drive one streaming request against a one-shot mock and return the raw
@@ -2129,11 +2155,29 @@ mod tests {
 
     /// Drive one streaming request with an explicit credential against a
     /// one-shot mock and return the raw captured request. An empty `key`
-    /// exercises the keyless free-tier path.
+    /// exercises the anonymous free-tier path (which mints the wire session
+    /// identity, so the caller's ULID never reaches the wire).
+    ///
+    /// The request carries a real session id and a real tool declaration, so
+    /// tests can assert the actual identity headers and the *real* tool set on
+    /// the wire (the keyed connector substitutes nothing; the anonymous path
+    /// only appends `read` and mints the session id).
     async fn capture_wire_request_with_key_at(
         model: &str,
         path_suffix: &str,
         key: &str,
+    ) -> Vec<u8> {
+        capture_request_with_key_at(model, path_suffix, key, Some(concerto_core::ids::new_id()))
+            .await
+    }
+
+    /// As [`capture_wire_request_with_key_at`], but with an explicit session
+    /// (or `None` for a session-less discovery-style request).
+    async fn capture_request_with_key_at(
+        model: &str,
+        path_suffix: &str,
+        key: &str,
+        session_id: Option<concerto_core::ids::Ulid>,
     ) -> Vec<u8> {
         let (base, req_rx) = crate::testing::mock_server::spawn(String::new());
         let provider = OpenCodeZenProvider::with_api_base(
@@ -2143,6 +2187,7 @@ mod tests {
             format!("{base}{path_suffix}"),
         );
         let request = CompletionRequest {
+            session_id,
             stable_system_prefix_bytes: None,
             model: model.into(),
             messages: vec![concerto_core::types::Message {
@@ -2154,6 +2199,15 @@ mod tests {
                 tokens_in: None,
                 tokens_out: None,
             }],
+            tools: Some(vec![concerto_core::types::ToolDefinition {
+                name: "filesystem".into(),
+                description: "Read or write a file in the workspace.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                }),
+            }]),
             ..Default::default()
         };
         // A zero-byte SSE body ends the stream immediately; whether the
@@ -2164,47 +2218,125 @@ mod tests {
             .expect("the request reaches the mock")
     }
 
-    /// The keyless path end to end: an empty-key Zen provider must send the
-    /// anonymous sentinel, a `stream: true` body, and only builtin tool names
-    /// — never a native registry name.
+    /// The anonymous path end to end: an empty-key Zen provider sends the
+    /// `"public"` sentinel, a `stream: true` body, a minted opencode-format
+    /// `ses_` session identity plus the request id, and the caller's *real*
+    /// tool declarations alongside the injected `read`. The exact ULID handed
+    /// to the request must never reach the wire: the free-tier relay refuses
+    /// raw ULIDs (live-verified 2026-10-18).
     #[tokio::test]
-    async fn keyless_wire_uses_public_sentinel_and_gate_tools() {
-        let raw = capture_wire_request_with_key_at("big-pickle", "", "").await;
+    async fn anonymous_wire_sends_public_sentinel_and_real_tools() {
+        let session = concerto_core::ids::new_id();
+        let raw = capture_request_with_key_at("big-pickle", "", "", Some(session)).await;
         let headers = captured_headers(&raw);
         assert!(
             headers.contains("authorization: bearer public"),
-            "keyless sends the anonymous sentinel: {headers}"
+            "anonymous sends the anonymous sentinel: {headers}"
         );
-        assert_session_header(&headers, "the keyless /chat/completions leg");
+        assert_session_header(&headers, "the anonymous /chat/completions leg");
+        let wire_session = captured_header_value(&raw, OPENCODE_SESSION_HEADER);
+        assert_wire_session_format(&wire_session, "the anonymous /chat/completions leg");
+        assert_eq!(
+            wire_session,
+            captured_header_value(&raw, OPENCODE_SESSION_ID_HEADER),
+            "both session spellings mirror one minted wire id"
+        );
+        assert_ne!(
+            wire_session,
+            session.to_string(),
+            "the caller's orchestration ULID must never go on the anonymous wire"
+        );
 
         let lower = String::from_utf8_lossy(&raw).to_ascii_lowercase();
-        assert!(lower.contains("\"stream\":true"), "keyless must stream: {lower}");
-        for name in OPENCODE_GATE_BUILTIN_NAMES {
-            assert!(
-                lower.contains(&format!("\"name\":\"{name}\"")),
-                "gate tool '{name}' must be declared: {lower}"
-            );
-        }
-        // Native tool names must never leak onto the keyless wire.
-        for native in ["filesystem", "shell", "mcp:", "git"] {
-            assert!(
-                !lower.contains(&format!("\"name\":\"{native}\"")),
-                "native tool '{native}' must not reach the keyless gate: {lower}"
-            );
-        }
+        assert!(lower.contains("\"stream\":true"), "the anonymous path must stream: {lower}");
+        assert!(
+            lower.contains("\"name\":\"filesystem\""),
+            "the caller's real tool declaration must reach the wire: {lower}"
+        );
+        assert!(
+            lower.contains("\"name\":\"read\""),
+            "the injected read declaration must reach the anonymous wire: {lower}"
+        );
     }
 
-    /// F1 pin: a keyless request whose model name matches the weak-tool-calling
+    /// A session-less KEYED request still sends the request id and the client
+    /// surface, but omits the session headers rather than inventing one —
+    /// unchanged by the anonymous-path wire work.
+    #[tokio::test]
+    async fn session_less_keyed_request_omits_session_headers() {
+        let raw = capture_request_with_key_at("big-pickle", "", "test-key", None).await;
+        let headers = captured_headers(&raw);
+        assert!(
+            headers.contains("x-opencode-request:"),
+            "the request id is always sent: {headers}"
+        );
+        assert!(
+            headers.contains(&format!("x-opencode-client: {DEFAULT_OPENCODE_CLIENT}")),
+            "the client surface is always sent: {headers}"
+        );
+        assert!(
+            !headers.contains("x-opencode-session:"),
+            "no session header when the request has no session: {headers}"
+        );
+        assert!(
+            !headers.contains("x-opencode-session-id:"),
+            "no mirrored session header when the request has no session: {headers}"
+        );
+    }
+
+    /// Assert a header value has the opencode wire session-id shape: a `ses_`
+    /// prefix, twelve hex chars of the masked, inverted `(ms << 12) | counter`
+    /// timestamp encoding `id.ts` mints, and fourteen base62 suffix chars.
+    fn assert_wire_session_format(value: &str, context: &str) {
+        let suffix = value
+            .strip_prefix("ses_")
+            .unwrap_or_else(|| panic!("{context}: the wire session id must carry ses_: {value}"));
+        assert_eq!(suffix.len(), 26, "{context}: 12 hex + 14 base62 expected: {value}");
+        assert!(
+            suffix[..12].chars().all(|c| c.is_ascii_hexdigit()),
+            "{context}: the timestamp block must be hex: {value}"
+        );
+        assert!(
+            suffix[12..].chars().all(|c| c.is_ascii_alphanumeric()),
+            "{context}: the suffix must be base62: {value}"
+        );
+    }
+
+    /// A session-less ANONYMOUS completion still carries the session identity:
+    /// the free-tier relay refuses credential-less completions without one
+    /// (live-verified 2026-10-18), so the anonymous path mints a fresh
+    /// opencode-format wire id even when the caller has no session.
+    #[tokio::test]
+    async fn anonymous_session_less_request_mints_session_headers() {
+        let raw = capture_request_with_key_at("big-pickle", "", "", None).await;
+        let headers = captured_headers(&raw);
+        assert!(
+            headers.contains("authorization: bearer public"),
+            "still the anonymous sentinel: {headers}"
+        );
+        assert!(
+            headers.contains("x-opencode-session:"),
+            "the anonymous path mints a session identity: {headers}"
+        );
+        let wire_session = captured_header_value(&raw, OPENCODE_SESSION_HEADER);
+        assert_wire_session_format(&wire_session, "the session-less anonymous leg");
+        assert_eq!(
+            wire_session,
+            captured_header_value(&raw, OPENCODE_SESSION_ID_HEADER),
+            "both session spellings mirror one minted wire id"
+        );
+    }
+
+    /// F1 pin: an anonymous request whose model name matches the weak-tool-calling
     /// heuristic (a standalone `mimo` token) must still stream.
     ///
-    /// The Zen fingerprint gate rejects `stream: false` outright, so the inner
-    /// OpenAI-compatible leg's weak-tier transport downgrade must be suppressed
-    /// on the keyless path. Regression for `apply_keyless_gate` forcing
-    /// `stream: true` only for the inner weak-tier branch to overwrite it back
-    /// to `false` — a deterministic `403 FreeTierError` for every keyless
-    /// model carrying a `mimo`/`mini` token.
+    /// The relay's anonymous branch serves only streamed completions, so the
+    /// inner OpenAI-compatible leg's weak-tier transport downgrade must be
+    /// suppressed on the anonymous path (the connector forces `stream: true`
+    /// before dispatch). Without that, a model carrying a `mimo`/`mini` token
+    /// would be downgraded to `stream: false` and refused.
     #[tokio::test]
-    async fn keyless_weak_tier_model_still_streams() {
+    async fn anonymous_weak_tier_model_still_streams() {
         // `mimo-v2` tokenizes to `["mimo", "v2"]` (standalone weak-tier token)
         // and routes to Chat Completions on Zen, i.e. through the inner
         // OpenAI-compatible leg where the downgrade lived.
@@ -2212,11 +2344,11 @@ mod tests {
         let lower = String::from_utf8_lossy(&raw).to_ascii_lowercase();
         assert!(
             lower.contains("\"stream\":true"),
-            "a keyless weak-tier model must still stream: {lower}"
+            "an anonymous weak-tier model must still stream: {lower}"
         );
         assert!(
             !lower.contains("\"stream\":false"),
-            "the weak-tier transport downgrade must never apply on the keyless path: {lower}"
+            "the weak-tier transport downgrade must never apply on the anonymous path: {lower}"
         );
     }
 
@@ -2270,44 +2402,91 @@ mod tests {
 
     /// Every wire leg this provider owns carries the affinity header, and the
     /// upstream-nonexistent `X-Session-ID` never appears on any of them.
+    ///
+    /// Full-path value fidelity: each leg runs with its own caller-chosen
+    /// session ULID, and both session spellings must carry that exact value —
+    /// plus every leg's per-call `x-opencode-request` id must be distinct, so
+    /// three requests can never share one identifier.
     #[tokio::test]
     async fn every_wire_leg_carries_the_session_header() {
+        let chat_session = concerto_core::ids::new_id();
+        let responses_session = concerto_core::ids::new_id();
+        let anthropic_session = concerto_core::ids::new_id();
+
         // OpenAI-compatible `/chat/completions` (inner provider delegation).
-        let openai_compat = captured_headers(&capture_wire_request("minimax-m3").await);
+        let chat_raw =
+            capture_request_with_key_at("minimax-m3", "", "test-key", Some(chat_session)).await;
+        let openai_compat = captured_headers(&chat_raw);
         assert!(
             openai_compat.starts_with("post /chat/completions http/1.1"),
             "the OpenAI-compat leg must hit /chat/completions: {openai_compat}"
         );
         assert_session_header(&openai_compat, "the /chat/completions leg");
+        assert_session_header_value(&chat_raw, chat_session, "the /chat/completions leg");
 
         // OpenAI Responses `/responses`.
-        let responses = captured_headers(&capture_wire_request("muse-v2").await);
+        let responses_raw =
+            capture_request_with_key_at("muse-v2", "", "test-key", Some(responses_session)).await;
+        let responses = captured_headers(&responses_raw);
         assert!(
             responses.starts_with("post /responses http/1.1"),
             "the Responses leg must hit /responses: {responses}"
         );
         assert_session_header(&responses, "the /responses leg");
+        assert_session_header_value(&responses_raw, responses_session, "the /responses leg");
         assert!(
             responses.contains("authorization: bearer test-key"),
             "the /responses leg authenticates with the resolved key: {responses}"
         );
 
         // Anthropic Messages `/messages` (x-api-key instead of Bearer).
-        let anthropic = captured_headers(&capture_wire_request("claude-3-5-sonnet").await);
+        let anthropic_raw = capture_request_with_key_at(
+            "claude-3-5-sonnet",
+            "",
+            "test-key",
+            Some(anthropic_session),
+        )
+        .await;
+        let anthropic = captured_headers(&anthropic_raw);
         assert!(
             anthropic.starts_with("post /messages http/1.1"),
             "the Anthropic leg must hit /messages: {anthropic}"
         );
         assert_session_header(&anthropic, "the /messages leg");
+        assert_session_header_value(&anthropic_raw, anthropic_session, "the /messages leg");
         assert!(
             anthropic.contains("x-api-key: test-key"),
             "the /messages leg authenticates with the resolved key: {anthropic}"
         );
+
+        // Per-call request ids: each leg mints its own fresh id, so the three
+        // captured values are pairwise distinct (and never the session id).
+        let request_ids = [
+            captured_header_value(&chat_raw, OPENCODE_REQUEST_HEADER),
+            captured_header_value(&responses_raw, OPENCODE_REQUEST_HEADER),
+            captured_header_value(&anthropic_raw, OPENCODE_REQUEST_HEADER),
+        ];
+        for (leg, id) in ["chat/completions", "responses", "messages"].into_iter().zip(&request_ids)
+        {
+            assert!(!id.is_empty(), "the {leg} leg must send a non-empty request id");
+        }
+        assert_ne!(
+            request_ids[0], request_ids[1],
+            "the chat and responses legs must mint distinct request ids"
+        );
+        assert_ne!(
+            request_ids[0], request_ids[2],
+            "the chat and messages legs must mint distinct request ids"
+        );
+        assert_ne!(
+            request_ids[1], request_ids[2],
+            "the responses and messages legs must mint distinct request ids"
+        );
     }
 
-    /// Shared request contract for [`assert_session_header`]: the affinity
-    /// header is present and `X-Session-ID` — which does not exist upstream —
-    /// is absent.
+    /// Shared request contract for [`assert_session_header`]: the mirrored
+    /// session headers, the request id, and the client-surface header are
+    /// present, and `X-Session-ID` — which does not exist upstream — is absent.
     fn assert_session_header(headers: &str, context: &str) {
         assert!(
             headers.contains("x-opencode-session:"),
@@ -2320,6 +2499,10 @@ mod tests {
         assert!(
             headers.contains("x-opencode-request:"),
             "{context} must carry the request id: {headers}"
+        );
+        assert!(
+            headers.contains(&format!("x-opencode-client: {DEFAULT_OPENCODE_CLIENT}")),
+            "{context} must carry the client surface: {headers}"
         );
         assert!(
             !headers.contains("x-session-id"),

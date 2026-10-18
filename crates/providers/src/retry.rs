@@ -33,13 +33,6 @@ pub enum RetryClass {
     ConnectionReset,
     RequestTimeout,
     StreamIdleTimeout,
-    /// An anonymous (keyless) OpenCode Zen shared free-tier pool momentarily
-    /// throttled the request (HTTP 429 `FreeUsageLimitError`). Transient: the
-    /// shared pool refuses in bursts and recovers within seconds, so it is
-    /// retried with backoff, honoring the relay's `Retry-After` when present.
-    /// Distinct from a permanent free-tier refusal (403 fingerprint gate / 410
-    /// retired model), which is not retried at all.
-    FreeTierThrottle,
 }
 
 /// Structured outcome of classifying a [`ProviderError`].
@@ -78,8 +71,7 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 /// `RequestTimeout`, and `StreamIdleTimeout`: a transport-unknown or
 /// timeout cause is not evidence that another provider would succeed, so the
 /// coordinator keeps its conservative skip for those. Mirrors the rate-limit /
-/// overload / 5xx family the task's recovery allowlist names, plus the shared
-/// anonymous free-tier pool throttle (429), which is the same transient shape.
+/// overload / 5xx family the task's recovery allowlist names.
 fn is_throttle_class(class: Option<RetryClass>) -> bool {
     matches!(
         class,
@@ -88,7 +80,6 @@ fn is_throttle_class(class: Option<RetryClass>) -> bool {
                 | RetryClass::Overloaded
                 | RetryClass::ServiceUnavailable
                 | RetryClass::GatewayFailure
-                | RetryClass::FreeTierThrottle
         )
     )
 }
@@ -192,30 +183,18 @@ pub fn classify_provider_error(error: &ProviderError) -> RetryDecision {
             reason: "request cancelled".into(),
         },
 
-        // A keyless free-tier refusal is a permanent relay verdict: the 403
-        // fingerprint gate cannot change within one process, and a 410
+        // An anonymous free-tier refusal is a permanent relay verdict: a
+        // refused request cannot change within one process, and a 410
         // deprecated model never heals. Deliberately non-retryable. (A 429
-        // shared-pool throttle is NOT this variant — see
-        // `FreeTierThrottled`.) The relay's `Retry-After`, when present, is
-        // still surfaced as a hint so a caller can hold and retry after the
-        // window if it chooses.
+        // from the relay is NOT this variant — it is an ordinary rate limit on
+        // the shared IP-keyed daily bucket and flows through `RateLimit`.) The
+        // relay's `Retry-After`, when present, is still surfaced as a hint so a
+        // caller can hold and retry after the window if it chooses.
         ProviderError::FreeTierRefused { retry_after, message, .. } => RetryDecision {
             retryable: false,
             class: None,
             provider_delay: *retry_after,
             reason: format!("opencode free tier refused: {message}"),
-        },
-
-        // A keyless shared-pool throttle (429) is transient: live evidence
-        // shows the pool refuses in bursts and recovers within seconds, so the
-        // same request slots in on retry. `retry_after` is the relay's own wait
-        // hint; when absent the policy falls back to the standard backoff,
-        // exactly like the RateLimit path.
-        ProviderError::FreeTierThrottled { retry_after, message, .. } => RetryDecision {
-            retryable: true,
-            class: Some(RetryClass::FreeTierThrottle),
-            provider_delay: *retry_after,
-            reason: format!("opencode free tier throttled: {message}"),
         },
 
         _ => RetryDecision {
@@ -601,16 +580,19 @@ pub fn map_http_error(
 /// free-tier causes verbatim.
 ///
 /// The generic [`map_http_error`] collapses `401`/`403` to a bare
-/// [`ProviderError::AuthFailure`] (which discards the body) and `429` to a
-/// retryable [`ProviderError::RateLimit`]. For a **keyless** `opencode` call
-/// the relay's verdicts carry the actionable cause in the body:
+/// [`ProviderError::AuthFailure`] (which discards the body). For an **anonymous**
+/// `opencode` call the relay's verdicts carry the actionable cause in the body:
 ///
-/// * `403 FreeTierError` (client-fingerprint gate) and `410 ModelDeprecated`
+/// * `403` (the relay refuses this anonymous/free-tier request) and `410`
 ///   (retired free model) are permanent verdicts, mapped to
 ///   [`ProviderError::FreeTierRefused`] (never auto-retried).
-/// * `429 FreeUsageLimitError` (shared anonymous pool) is a *transient*
-///   throttle — live evidence shows the pool recovers within seconds — so it
-///   maps to the retryable [`ProviderError::FreeTierThrottled`].
+/// * `429` is an *ordinary* rate limit — the relay maps every
+///   `FreeUsageLimitError`/`RateLimitError`/`GoUsageLimitError`/
+///   `BlackUsageLimitError` to a plain `429` plus a `Retry-After` header. On the
+///   anonymous tier it is a shared, IP-keyed daily bucket (seconds to the next
+///   UTC midnight), not a per-model quota, so it maps to the same retryable
+///   [`ProviderError::RateLimit`] used for any other 429 and honors the relay's
+///   `Retry-After`.
 ///
 /// Every other status, and every authenticated (paid) call, delegates to
 /// [`map_http_error`] unchanged, so paid wire behavior is untouched.
@@ -618,25 +600,22 @@ pub fn map_opencode_http_error(
     status: StatusCode,
     body: &str,
     retry_after: Option<Duration>,
-    keyless: bool,
+    anonymous: bool,
 ) -> ProviderError {
-    if !keyless {
+    if !anonymous {
         return map_http_error(status, body, retry_after);
     }
     match status.as_u16() {
-        // The fingerprint gate (403) and a retired-but-still-listed free model
-        // (410) are permanent free-tier verdicts.
+        // A refused anonymous request (403) and a retired-but-still-listed free
+        // model (410) are permanent free-tier verdicts.
         403 | 410 => ProviderError::FreeTierRefused {
             status: status.as_u16(),
             retry_after,
             message: body.to_string(),
         },
-        // The shared anonymous pool throttling a burst: transient, retried.
-        429 => ProviderError::FreeTierThrottled {
-            status: status.as_u16(),
-            retry_after,
-            message: body.to_string(),
-        },
+        // Any anonymous 429 is an ordinary rate limit on the shared IP-keyed
+        // daily bucket — delegate to the generic 429 shape (retryable
+        // `RateLimit`, `Retry-After` honored, 5s fallback).
         _ => map_http_error(status, body, retry_after),
     }
 }
@@ -1023,7 +1002,6 @@ mod tests {
         assert!(is_throttle_class(Some(RetryClass::Overloaded)));
         assert!(is_throttle_class(Some(RetryClass::ServiceUnavailable)));
         assert!(is_throttle_class(Some(RetryClass::GatewayFailure)));
-        assert!(is_throttle_class(Some(RetryClass::FreeTierThrottle)));
         assert!(!is_throttle_class(Some(RetryClass::Network)));
         assert!(!is_throttle_class(Some(RetryClass::ConnectionReset)));
         assert!(!is_throttle_class(Some(RetryClass::StreamTransport)));
@@ -1045,20 +1023,22 @@ mod tests {
         assert!(error.is_throttle_exhaustion());
     }
 
-    /// A keyless free-tier throttle exhaustion retains the throttle cause, so
-    /// the coordinator can hold retry or recover onto an alternate pipe —
-    /// same semantics as the 429 `RateLimit` ceiling.
+    /// A anonymous Zen 429 exhaustion retains the throttle cause, so the
+    /// coordinator can hold retry or recover onto an alternate pipe — same
+    /// semantics as any other 429 `RateLimit` ceiling, because the anonymous 429
+    /// maps to the very same generic retryable shape.
     #[tokio::test]
-    async fn exhausted_free_tier_throttle_carries_throttled_cause() {
-        let error = exhaust(ProviderError::FreeTierThrottled {
-            status: 429,
-            retry_after: Some(Duration::from_secs(1)),
-            message: "Rate limit exceeded. Please try again later.".into(),
-        })
+    async fn exhausted_anonymous_429_carries_throttled_cause() {
+        let error = exhaust(map_opencode_http_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Rate limit exceeded. Please try again later.",
+            Some(Duration::from_secs(1)),
+            true,
+        ))
         .await;
         assert!(
             matches!(&error, ProviderError::RetryExhausted { throttled: true, .. }),
-            "a free-tier throttle exhaustion must retain the throttle cause: {error:?}"
+            "an anonymous 429 exhaustion must retain the throttle cause: {error:?}"
         );
         assert!(error.is_throttle_exhaustion());
     }
@@ -1109,11 +1089,11 @@ mod tests {
         StatusCode::from_u16(code).expect("a valid test status code")
     }
 
-    /// Keyless 403 with a `FreeTierError` JSON body maps to `FreeTierRefused`
+    /// Anonymous 403 with a `FreeTierError` JSON body maps to `FreeTierRefused`
     /// with the relay body preserved verbatim.
     #[test]
-    fn keyless_403_free_tier_body_is_preserved() {
-        let body = r#"{"error":{"type":"FreeTierError","message":"fingerprint mismatch"}}"#;
+    fn anonymous_403_free_tier_body_is_preserved() {
+        let body = r#"{"error":{"type":"FreeTierError","message":"request refused"}}"#;
         match map_opencode_http_error(http_status(403), body, None, true) {
             ProviderError::FreeTierRefused { status, retry_after, message } => {
                 assert_eq!(status, 403);
@@ -1124,11 +1104,12 @@ mod tests {
         }
     }
 
-    /// Keyless 410 (deprecated model) maps to the permanent `FreeTierRefused`,
-    /// while keyless 429 (shared-pool throttle) maps to the retryable
-    /// `FreeTierThrottled` and keeps its `Retry-After` hint.
+    /// Anonymous 410 (deprecated model) maps to the permanent `FreeTierRefused`,
+    /// while an anonymous 429 maps to the *ordinary* retryable `RateLimit` (the
+    /// shared IP-keyed daily bucket is not a per-model quota) and keeps its
+    /// `Retry-After` hint.
     #[test]
-    fn keyless_410_refused_and_429_throttled_map_distinctly() {
+    fn anonymous_410_refused_and_429_is_generic_rate_limit() {
         match map_opencode_http_error(http_status(410), "ModelDeprecated", None, true) {
             ProviderError::FreeTierRefused { status, message, .. } => {
                 assert_eq!(status, 410);
@@ -1143,18 +1124,29 @@ mod tests {
             Some(Duration::from_secs(42)),
             true,
         ) {
-            ProviderError::FreeTierThrottled { status, retry_after, .. } => {
-                assert_eq!(status, 429);
-                assert_eq!(retry_after, Some(Duration::from_secs(42)), "the hint survives");
+            ProviderError::RateLimit { retry_after } => {
+                assert_eq!(retry_after, Duration::from_secs(42), "the hint survives");
             }
-            other => panic!("expected FreeTierThrottled for 429, got {other:?}"),
+            other => panic!("expected the generic RateLimit for an anonymous 429, got {other:?}"),
         }
     }
 
-    /// A keyless status outside the free-tier set delegates to the generic
+    /// A anonymous 429 without a `Retry-After` header falls back to the same 5s
+    /// default the generic mapper uses for any 429.
+    #[test]
+    fn anonymous_429_without_hint_uses_generic_fallback() {
+        match map_opencode_http_error(http_status(429), "slow down", None, true) {
+            ProviderError::RateLimit { retry_after } => {
+                assert_eq!(retry_after, Duration::from_secs(5));
+            }
+            other => panic!("expected the generic RateLimit fallback, got {other:?}"),
+        }
+    }
+
+    /// A anonymous status outside the free-tier set delegates to the generic
     /// mapper unchanged (representative: 400 → non-retryable `HttpStatus`).
     #[test]
-    fn keyless_other_status_delegates_to_generic_mapper() {
+    fn anonymous_other_status_delegates_to_generic_mapper() {
         match map_opencode_http_error(http_status(400), "bad request", None, true) {
             ProviderError::HttpStatus { status, message, .. } => {
                 assert_eq!(status, 400);
@@ -1164,7 +1156,7 @@ mod tests {
         }
     }
 
-    /// A paid (`keyless = false`) 403/429 keeps today's behavior exactly: the
+    /// A paid (`anonymous = false`) 403/429 keeps today's behavior exactly: the
     /// auth collapse and the retryable `RateLimit`, never `FreeTierRefused`.
     #[test]
     fn paid_statuses_delegate_to_generic_mapper() {
@@ -1188,7 +1180,7 @@ mod tests {
         }
     }
 
-    /// The classifier arm: a permanent `FreeTierRefused` (403 fingerprint gate
+    /// The classifier arm: a permanent `FreeTierRefused` (403 refused request
     /// / 410 retired model) is non-retryable, carries no retry class, and
     /// surfaces the relay `Retry-After` as the designated delay/hint rather
     /// than an automatic backoff.
@@ -1197,35 +1189,35 @@ mod tests {
         let decision = classify_provider_error(&ProviderError::FreeTierRefused {
             status: 403,
             retry_after: Some(Duration::from_secs(42)),
-            message: "fingerprint mismatch".into(),
+            message: "request refused".into(),
         });
         assert!(!decision.retryable, "a free-tier refusal must not auto-retry");
         assert_eq!(decision.class, None);
         assert_eq!(decision.provider_delay, Some(Duration::from_secs(42)));
-        assert!(decision.reason.contains("fingerprint mismatch"));
+        assert!(decision.reason.contains("request refused"));
     }
 
-    /// The classifier arm: a keyless 429 shared-pool throttle
-    /// (`FreeTierThrottled`) IS retryable, with the dedicated throttle class,
-    /// and surfaces the relay `Retry-After` when present.
+    /// The classifier arm: an anonymous 429 (`RateLimit`) IS retryable with the
+    /// shared `RateLimited` class, and surfaces the relay `Retry-After` when
+    /// present.
     #[test]
-    fn free_tier_throttled_classifies_retryable_with_class() {
-        let decision = classify_provider_error(&ProviderError::FreeTierThrottled {
-            status: 429,
-            retry_after: Some(Duration::from_secs(2)),
-            message: "Rate limit exceeded. Please try again later.".into(),
-        });
-        assert!(decision.retryable, "a free-tier throttle must auto-retry");
-        assert_eq!(decision.class, Some(RetryClass::FreeTierThrottle));
+    fn anonymous_429_classifies_retryable_with_rate_limited_class() {
+        let error = map_opencode_http_error(
+            http_status(429),
+            "Rate limit exceeded. Please try again later.",
+            Some(Duration::from_secs(2)),
+            true,
+        );
+        let decision = classify_provider_error(&error);
+        assert!(decision.retryable, "an anonymous 429 must auto-retry");
+        assert_eq!(decision.class, Some(RetryClass::RateLimited));
         assert_eq!(decision.provider_delay, Some(Duration::from_secs(2)));
-        assert!(decision.reason.contains("Rate limit exceeded"));
     }
 
-    /// A 429 shared-pool throttle carrying `Retry-After` honors the provider
-    /// delay (mirrors the RateLimit path), overriding a configured fixed
-    /// delay.
+    /// A anonymous 429 carrying `Retry-After` honors the provider delay (mirrors
+    /// the generic RateLimit path), overriding a configured fixed delay.
     #[test]
-    fn free_tier_throttled_honors_retry_after() {
+    fn anonymous_429_honors_retry_after() {
         let policy = RetryPolicy::new(RetryConfig {
             fixed_delay_ms: Some(10_000),
             respect_retry_after: true,
@@ -1233,13 +1225,15 @@ mod tests {
             ..RetryConfig::default()
         });
         let state = RetryState { attempt: 1, started_at: Instant::now() };
-        let decision = classify_provider_error(&ProviderError::FreeTierThrottled {
-            status: 429,
-            retry_after: Some(Duration::from_secs(3)),
-            message: "Rate limit exceeded. Please try again later.".into(),
-        });
+        let error = map_opencode_http_error(
+            http_status(429),
+            "Rate limit exceeded. Please try again later.",
+            Some(Duration::from_secs(3)),
+            true,
+        );
+        let decision = classify_provider_error(&error);
         assert!(decision.retryable);
-        assert_eq!(decision.class, Some(RetryClass::FreeTierThrottle));
+        assert_eq!(decision.class, Some(RetryClass::RateLimited));
         match policy.evaluate(&state, &decision) {
             RetryOutcome::RetryAfter { delay, source, .. } => {
                 assert_eq!(delay, Duration::from_secs(3));

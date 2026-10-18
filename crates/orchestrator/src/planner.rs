@@ -468,6 +468,7 @@ impl TaskPlanner {
         // Build request
         let prompt = self.build_prompt(task, design_doc, agents, skills_section, facade);
         let request = CompletionRequest {
+            session_id: Some(task.session_id),
             stable_system_prefix_bytes: None,
             // Empty means "use the configured model" across all provider
             // implementations. A literal "planner" was sent to provider APIs

@@ -593,7 +593,8 @@ impl AgentLoop {
                 }
                 AgentRunExit::NeedsUser { reason, partial } => {
                     let mut output = partial;
-                    output.final_message = format!("User input required: {reason}");
+                    output.final_message =
+                        format!("{} {reason}", concerto_core::types::USER_INPUT_REQUIRED_PREFIX);
                     output.completion_status = concerto_core::types::AgentCompletionStatus::Partial;
                     // Supremacy invariant: the exit is a Coordinator Decision
                     // row, not a silent return. Control flow is unchanged —
@@ -768,8 +769,10 @@ impl AgentLoop {
             provider_metrics: self.provider_metrics(),
             checkpoint_json: None,
         });
-        partial.final_message =
-            format!("Blocked: reached maximum continuation rounds ({MAX_CONTINUATION_ROUNDS}).");
+        partial.final_message = format!(
+            "{} ({MAX_CONTINUATION_ROUNDS}).",
+            concerto_core::types::MAX_CONTINUATION_ROUNDS_PREFIX
+        );
         partial.completion_status = concerto_core::types::AgentCompletionStatus::Partial;
         self.tool_executor
             .record_coordinator_decision(
@@ -893,7 +896,7 @@ impl AgentLoop {
             }
 
             // Phase 3: Build provider request
-            let request = self.build_provider_request(
+            let mut request = self.build_provider_request(
                 &task.description,
                 iteration,
                 &messages,
@@ -902,6 +905,10 @@ impl AgentLoop {
                 &verification,
                 &retrieved_memory_block,
             );
+            // Carry the run's real orchestration session id on the request so a
+            // relay connector (OpenCode) can mirror it as its client-identity
+            // header. Every other provider ignores it.
+            request.session_id = Some(task.session_id);
 
             // ADR-66 §4: the universal text-fallback driver engages
             // automatically when the provider lacks native tool support
@@ -911,7 +918,6 @@ impl AgentLoop {
             // section replaces them. First engagement is audited once per
             // run and labeled in the event stream.
             let mut tool_driver = self.resolve_tool_driver();
-            let mut request = request;
             if let Some(driver) = tool_driver.as_ref() {
                 driver.augment_request(&mut request);
                 if iteration == 1 {
@@ -1530,6 +1536,7 @@ impl AgentLoop {
                         verification,
                         retrieved_memory_block,
                     );
+                    request.session_id = Some(task.session_id);
                     driver.augment_request(&mut request);
                     let (repaired_text, repaired_reasoning, _, repaired_usage) = self
                         .call_provider_with_retry(&request, task.session_id, task.id, cancel)

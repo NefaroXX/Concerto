@@ -103,11 +103,9 @@ fn canonical_effect_of(tool: &dyn Tool, input: &serde_json::Value) -> CanonicalE
 /// Resolve an OpenCode **wire-builtin** tool name to the canonical registered
 /// Concerto tool that should execute it.
 ///
-/// Some provider wire gates require the outgoing `tools` array to carry
-/// OpenCode's builtin names (`bash`, `read`, `edit`, `write`) rather than
-/// Concerto's native registry names. A model served through such a gate emits
-/// those builtin names back, so the executor must map them onto the real tools.
-/// This is the compat table for that mapping:
+/// A model can emit OpenCode's builtin tool names (`bash`, `read`, `edit`,
+/// `write`) back in a tool call. This is the compat table that maps that small,
+/// closed set onto the real registered tools so such a call executes:
 ///
 /// - `bash`  → the shell tool (`shell`)
 /// - `read`  → `filesystem` with `operation: "read"`
@@ -115,11 +113,14 @@ fn canonical_effect_of(tool: &dyn Tool, input: &serde_json::Value) -> CanonicalE
 /// - `write` → registered natively (the existing filesystem-write alias), so it
 ///   never needs translation here
 ///
-/// **Never a reroute of a real tool.** The map fires only when `name` is *not*
-/// registered (a registered tool always wins) and only when the target itself
-/// is registered (so a deployment with a different registry simply keeps the
-/// ordinary "tool not found" refusal). It therefore cannot shadow a native
-/// declaration on the paid/native wire paths, where these names never appear.
+/// **A narrow compatibility shim — not a gate, and deliberately not a general
+/// alias mechanism.** The map fires only when `name` is *not* registered (a
+/// registered tool always wins) and only when the target itself is registered
+/// (so a deployment with a different registry simply keeps the ordinary "tool
+/// not found" refusal), so it can never shadow a native declaration on any
+/// path. It admits and refuses nothing: policy still decides exactly as it
+/// does for any other tool name, and extending the set is a code change, never
+/// a configuration.
 fn resolve_wire_builtin(
     registry: &ToolRegistry,
     name: &str,
@@ -999,9 +1000,10 @@ impl ToolExecutor {
         orchestrator_authority: bool,
     ) -> Result<ToolOutput, ToolError> {
         // Translate an OpenCode wire-builtin name onto the real tool before
-        // lookup, so a keyless-gate-declared `bash`/`read`/`edit` executes the
-        // shell/filesystem tools (see [`resolve_wire_builtin`]). A registered
-        // name is never touched, so every native path is byte-identical.
+        // lookup, so a model that emits opencode's builtin `bash`/`read`/`edit`
+        // names executes the shell/filesystem tools (see
+        // [`resolve_wire_builtin`]). A registered name is never touched, so
+        // every native path is byte-identical.
         let (tool_name, input) = match resolve_wire_builtin(&self.registry, tool_name, &input) {
             Some((target, mapped)) => (target, mapped),
             None => (tool_name, input),

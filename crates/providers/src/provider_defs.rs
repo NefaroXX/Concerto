@@ -188,15 +188,16 @@ pub const OPENCODE_FREE_KNOWN: &[&str] = &[
 ];
 
 /// Free model IDs live-verified as served by the OpenCode **Zen** relay for an
-/// anonymous (keyless) client, probed **2026-10-18 03:58–04:05 UTC** with
-/// freshly minted session fingerprints.
+/// anonymous client, probed **2026-10-18 03:58–04:05 UTC** while mirroring the
+/// OpenCode client identity.
 ///
 /// Notes from the same probe session (why this list needs care):
-/// * The anonymous free tier enforces a **per-model quota window** (observed
-///   rolling over on ~hour boundaries): an exhausted model answers
-///   `429 FreeUsageLimitError "Rate limit exceeded"` to *every* client for the
-///   rest of the window while other free models keep serving. A 429 therefore
-///   reads model-local, not pool-wide; the whole roster recovers on rollover.
+/// * The anonymous free tier enforces an **IP-keyed daily allowance** at the
+///   relay (per UTC day; no per-model quota — default models share one
+///   bucket). An exhausted bucket answers `429 FreeUsageLimitError
+///   "Rate limit exceeded"` with `Retry-After` = seconds to the next UTC
+///   midnight; treat it as an ordinary rate limit (generic `RateLimit`
+///   handling, retries honored via `Retry-After`).
 /// * `glm-5.3-flash-free` requires each tool function to carry a
 ///   `description` (upstream `400` otherwise); the agent-loop requests always
 ///   send full schemas, so this only matters for minimal test payloads.
@@ -209,13 +210,13 @@ pub const OPENCODE_FREE_KNOWN: &[&str] = &[
 ///   `provider_defs::tests` — shared ids risk wrong-wire-table pickups).
 ///
 /// Zen's raw catalog advertises 44 zero-priced ids, but membership probes with
-/// correctly minted session fingerprints found only a handful actually
+/// the mirrored client identity found only a handful actually
 /// serving: several catalog entries are retired (`fledge-alpha-free` → `410`)
 /// or unreachable upstream (`deepseek-v4-flash-free`, `step-5-preview-free`,
 /// `x-preview-f-free` → `400 "Model is unavailable"`). Kept deliberately tiny
 /// and hand-verified per probe session (never copied from the Go catalog,
 /// which is a distinct roster): live discovery still covers the long tail via
-/// the keyless `GET /zen/v1/models`.
+/// the anonymous `GET /zen/v1/models`.
 pub const OPENCODE_ZEN_FREE_KNOWN: &[&str] =
     &["beam-free", "big-pickle", "cat-jam-free", "glm-5.3-flash-free"];
 
@@ -283,7 +284,7 @@ pub fn provider_definition(provider_type: &str) -> ProviderDefinition {
         "opencode" => ProviderDefinition {
             id: "opencode",
             display_name: String::from("OpenCode Zen"),
-            // `big-pickle` is the most consistently served keyless free model
+            // `big-pickle` is the most consistently served anonymous free model
             // (verified repeatedly); the other two live-for-sure free ids are
             // one pick away. A credential is *optional* here: without one the
             // connector runs on the anonymous free tier, and with one it uses
@@ -299,7 +300,7 @@ pub fn provider_definition(provider_type: &str) -> ProviderDefinition {
         // `opencode` entry keeps its key and its Zen base).
         "opencode-free" => ProviderDefinition {
             id: "opencode-free",
-            // NOT "(free)": the keyless free tier now lives on the plain
+            // NOT "(free)": the anonymous free tier now lives on the plain
             // `opencode` entry, so a "(free)" label here actively misdirects
             // users into a key-required, mostly-paid catalog. Label only — the
             // id string below stays `opencode-free` because keyring keys and
@@ -318,7 +319,7 @@ pub fn provider_definition(provider_type: &str) -> ProviderDefinition {
             known_models: OPENCODE_FREE_KNOWN,
             // The Go relay answers `401 AuthError "Missing API key."` when no
             // `Authorization` header is sent, so this type requires a real
-            // credential exactly like `opencode`; it is not keyless.
+            // credential exactly like `opencode`; it is not anonymous.
             credential_requirement: CredentialRequirement::Required,
             // Live discovery is intentionally unsupported: `GET
             // https://opencode.ai/zen/go/v1/models` is ungated and returns the
@@ -751,8 +752,8 @@ mod tests {
         assert_eq!(def.id, "opencode-free");
         assert_eq!(def.display_name, "OpenCode Zen (Go relay)");
         assert_eq!(def.default_model, Some("minimax-m3"));
-        // Inverted from the old keyless assertion: the Go relay requires a
-        // real API key, so this type is no more keyless than `opencode`.
+        // Inverted from the old anonymous assertion: the Go relay requires a
+        // real API key, so this type is no more anonymous than `opencode`.
         assert_eq!(def.credential_requirement, CredentialRequirement::Required);
         assert_eq!(def.model_discovery, ModelDiscoverySupport::Unsupported);
         assert!(def.allows_custom_model);
@@ -814,10 +815,10 @@ mod tests {
         assert_eq!(expected.len(), 43, "the Go relay advertises exactly 43 models");
     }
 
-    /// The Zen keyless catalog and the Go catalog must share **no** model id,
+    /// The Zen anonymous catalog and the Go catalog must share **no** model id,
     /// and each definition must stay wired to its own catalog.
     ///
-    /// WHY separation matters: `OPENCODE_ZEN_FREE_KNOWN` is the keyless,
+    /// WHY separation matters: `OPENCODE_ZEN_FREE_KNOWN` is the anonymous,
     /// fingerprint-gated free tier behind the plain `opencode` entry
     /// (`Authorization: Bearer public` + `x-opencode-session`), while
     /// `OPENCODE_FREE_KNOWN` is the Go relay's roster behind `opencode-free`,
@@ -846,7 +847,7 @@ mod tests {
         for zen_id in OPENCODE_ZEN_FREE_KNOWN {
             assert!(
                 !OPENCODE_FREE_KNOWN.contains(zen_id),
-                "Zen keyless id `{zen_id}` also appears in the Go catalog — the two \
+                "Zen anonymous id `{zen_id}` also appears in the Go catalog — the two \
                  catalogs must stay disjoint (different relay, different wire table)"
             );
         }
@@ -859,7 +860,7 @@ mod tests {
         let zen = provider_definition("opencode");
         assert_eq!(
             zen.known_models, OPENCODE_ZEN_FREE_KNOWN,
-            "opencode must be wired to the Zen keyless catalog, not Go's"
+            "opencode must be wired to the Zen anonymous catalog, not Go's"
         );
         let go = provider_definition("opencode-free");
         assert_eq!(
@@ -873,20 +874,20 @@ mod tests {
         );
     }
 
-    /// The metadata split across the two opencode entries: keyless-with-a-free
+    /// The metadata split across the two opencode entries: anonymous-with-a-free
     /// default on `opencode`, credential-required-with-its-own default on
     /// `opencode-free`. The factory enforces the same pairing at build time
-    /// (Zen builds keyless, Go fails closed) — this pins the declaration-level
+    /// (Zen builds anonymous, Go fails closed) — this pins the declaration-level
     /// contract that backs it, including both defaults so the split is
     /// self-documenting in one place.
     #[test]
-    fn opencode_entries_split_keyless_and_credential_required() {
+    fn opencode_entries_split_anonymous_and_credential_required() {
         let zen = provider_definition("opencode");
         assert_eq!(zen.default_model, Some("big-pickle"));
         assert_eq!(
             zen.credential_requirement,
             CredentialRequirement::Optional,
-            "opencode is the keyless free-tier entry"
+            "opencode is the anonymous free-tier entry"
         );
 
         let go = provider_definition("opencode-free");
