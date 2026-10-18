@@ -507,10 +507,7 @@ mod tests {
         #[cfg(windows)]
         {
             assert_eq!(file_uri(Path::new(r"C:\work\a.rs")).unwrap(), "file:///C:/work/a.rs");
-            assert_eq!(
-                file_uri(Path::new(r"\\?\C:\work\a.rs")).unwrap(),
-                "file:///C:/work/a.rs"
-            );
+            assert_eq!(file_uri(Path::new(r"\\?\C:\work\a.rs")).unwrap(), "file:///C:/work/a.rs");
             assert_eq!(
                 file_uri(Path::new(r"\\?\UNC\server\share\a.rs")).unwrap(),
                 "file://server/share/a.rs"
