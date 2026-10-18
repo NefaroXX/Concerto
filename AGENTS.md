@@ -199,7 +199,7 @@ cargo audit
 - MCP stdio client: `crates/mcp/src/client.rs` (`McpClient`); runtime manager: `crates/mcp/src/manager.rs` (`McpManager`); tool bridge: `crates/mcp/src/tool_bridge.rs`
 - Skill injection into prompts: `crates/orchestrator/src/skills_context.rs` (`SkillsContext`)
 - App roots: `crates/desktop/src/app.rs` (Iced), `crates/cli/src/` (ratatui)
-- Headless one-shot CLI run: `crates/cli/src/dispatch/run.rs` (`concerto run`: prompt/JSON/exit-code contract, `--approvals`)
+- Headless one-shot CLI run: `crates/cli/src/dispatch/run.rs` (`concerto run`: prompt/JSON/exit-code contract, `--approvals`, `--timeout`, observability flags `--run-id`/`--events-json`/`--report-path`)
 - Event bus (everything flows through it): `crates/core/src/event.rs`
 
 ## Plugin system (WASM)

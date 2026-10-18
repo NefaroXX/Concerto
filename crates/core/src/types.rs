@@ -1295,6 +1295,16 @@ pub struct AgentOutput {
     /// dispatched through `CoordinatorAgent`.  On "Continue" this is passed
     /// back to `CoordinatorAgent::run_with_checkpoint` to skip re-architecting.
     pub checkpoint_json: Option<String>,
+    /// Stable provider-error class code when the run ended *because of a
+    /// provider failure* rather than a clean completion (e.g.
+    /// `"PROVIDER_RETRIES_EXHAUSTED"`). Mirrors the `ClassifiedFailure::code`
+    /// vocabulary so a headless caller can branch on the same machine-readable
+    /// string the error path publishes. `None` on success and on failures that
+    /// never reached a provider.
+    ///
+    /// Additive: consumers that do not read this field are unaffected, and the
+    /// only producer today is the single-agent loop's retry-exhausted arm.
+    pub provider_error_class: Option<String>,
 }
 
 /// Completion state carried with output so the UI cannot render preserved
@@ -3105,6 +3115,7 @@ mod tests {
             completion_status: AgentCompletionStatus::Completed,
             provider_metrics: vec![],
             checkpoint_json: None,
+            provider_error_class: None,
         };
         assert_eq!(output.summary(), "hello");
     }
@@ -3124,6 +3135,7 @@ mod tests {
             completion_status: AgentCompletionStatus::Completed,
             provider_metrics: vec![],
             checkpoint_json: None,
+            provider_error_class: None,
         };
         let s = output.summary();
         assert!(s.contains("Completed"));
@@ -3228,6 +3240,7 @@ mod tests {
             completion_status: AgentCompletionStatus::Completed,
             provider_metrics: vec![],
             checkpoint_json: None,
+            provider_error_class: None,
         };
         match AgentRunExit::Done(output) {
             AgentRunExit::Done(_) => {}
@@ -3549,6 +3562,7 @@ mod tests {
             completion_status: AgentCompletionStatus::Completed,
             provider_metrics: vec![],
             checkpoint_json: None,
+            provider_error_class: None,
         };
         let summary = output.summary();
         assert!(summary.contains("py_compile passed"), "{summary}");

@@ -1551,6 +1551,31 @@ mod tests {
         assert_eq!(bus.durable_health().max_pending, 0);
     }
 
+    /// The `--events-json` writer relies on `subscribe_durable`, so a plain
+    /// broadcast `publish()` (not just the record-only variant) must reach a
+    /// durable subscriber and preserve publish order.
+    #[test]
+    fn durable_subscriber_sees_broadcast_publishes_in_order() {
+        let bus = EventBus::default();
+        let mut durable = bus.subscribe_durable();
+        for i in 0..5u64 {
+            bus.publish(Event::new(
+                new_id(),
+                new_id(),
+                EventKind::TokenUsed { tokens_in: i, tokens_out: 0 },
+            ))
+            .unwrap();
+        }
+        for expected in 0..5u64 {
+            let event = durable.try_recv().unwrap();
+            let EventKind::TokenUsed { tokens_in, .. } = &event.kind else {
+                panic!("unexpected event kind");
+            };
+            assert_eq!(*tokens_in, expected);
+        }
+        assert!(durable.try_recv().is_err(), "no extra events expected");
+    }
+
     /// The observability counter tracks how many events are actually buffered
     /// for a subscriber: rises with publishes, drops back to zero once drained.
     #[test]

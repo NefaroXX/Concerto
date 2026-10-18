@@ -12,14 +12,14 @@
 //! `auto` is the explicit opt-in for trusted, non-interactive environments and
 //! still flows through `SimplePolicyEngine` and the audit log.
 
-use std::io::{IsTerminal, Read};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use concerto_config::AppConfig;
-use concerto_core::event::EventBus;
+use concerto_core::event::{DurableEventReceiver, Event, EventBus};
 use concerto_core::ids::Ulid;
 use concerto_core::traits::approval::{ApprovalDecision, ApprovalSink};
 use concerto_core::types::{
@@ -35,6 +35,14 @@ use concerto_orchestrator::services::{RequestBuilder, ServicesBuilder};
 use concerto_orchestrator::session_manager::{ProjectSessionManager, SessionManagerConfig};
 use futures::future::BoxFuture;
 use serde_json::{json, Value};
+use time::format_description::well_known::Rfc3339;
+
+/// Heartbeat cadence for the `--events-json` progress file (fixed contract
+/// constant: one heartbeat line every 10s while the run is active).
+const EVENTS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Maximum accepted length of a `--run-id` label, in `char`s.
+const RUN_ID_MAX_CHARS: usize = 128;
 
 /// Exit codes the `run` interface contract promises to an external caller.
 pub(crate) const EXIT_DONE: i32 = 0;
@@ -73,6 +81,11 @@ pub(crate) struct RunOptions {
     pub(crate) json: bool,
     pub(crate) approvals: ApprovalMode,
     pub(crate) timeout: Option<Duration>,
+    /// `--run-id` correlation label (already validated/trimmed), echoed into
+    /// stdout JSON, the report file, and every events line (`null` when unset).
+    pub(crate) run_id: Option<String>,
+    /// `--events-json` live NDJSON progress file, truncate-created at run start.
+    pub(crate) events_json: Option<PathBuf>,
 }
 
 /// Parsed but prompt-unresolved request.
@@ -85,6 +98,9 @@ struct RunRequest {
     json: bool,
     approvals: ApprovalMode,
     timeout: Option<Duration>,
+    run_id: Option<String>,
+    events_json: Option<PathBuf>,
+    report_path: Option<PathBuf>,
 }
 
 /// Parse outcome: either a help request or a runnable request.
@@ -110,7 +126,10 @@ fn usage() -> String {
          \x20   -m, --multi-agent        Use coordinator multi-agent orchestration\n\
          \x20   -f, --fast               Skip memory retrieval for trivial tasks\n\
          \x20       --approvals <MODE>   deny (default, fail-closed) | auto\n\
-         \x20       --timeout <SECS>     Wall-clock limit; on expiry exit {EXIT_TIMEOUT}\n\
+         \x20       --timeout <SECS>     Bounds the agent loop after startup; exit {EXIT_TIMEOUT}\n\
+         \x20       --run-id <LABEL>     Correlation id echoed into all run outputs\n\
+         \x20       --events-json <PATH> Live NDJSON progress file (one JSON object/line)\n\
+         \x20       --report-path <PATH> End-of-run extended JSON report file\n\
          \x20       --json               Emit one JSON object on stdout\n\
          \x20   -h, --help               Print this help\n\
          \n\
@@ -121,7 +140,25 @@ fn usage() -> String {
          NOTES:\n\
          \x20   `run`'s options must follow `run` (e.g. `concerto run --json`).\n\
          \x20   With `--json`, stdout is a single JSON object; a well-formed error\n\
-         \x20   object is NOT guaranteed when argument parsing itself fails."
+         \x20   object is NOT guaranteed when argument parsing itself fails.\n\
+         \x20   `--events-json` writes one flushed JSON object per line to PATH (not\n\
+         \x20   stdout: `-` is rejected). Each line carries seq (strictly monotonic),\n\
+         \x20   ts (RFC3339 UTC), run_id (null when unset), and event; a heartbeat\n\
+         \x20   line is written every 10s, and a final run_finished line closes the\n\
+         \x20   file on every outcome (success, timeout, error).\n\
+    \x20   Run events: {{\"seq\",\"ts\",\"run_id\",\"event\":{{<Variant>:...}}}}; synthetic\x20\n\
+    \x20   heartbeat\x20{{\"seq\",\"ts\",\"run_id\",\"event\":\"heartbeat\",\"elapsed_ms\":N}}\n\
+    \x20   \x20(plain-string event); {{\"seq\",\"ts\",\"run_id\",\"event\":\"run_finished\",\n\
+    \x20   \"status\":...,\"exit_code\":...,\"session_id\":...}}\x20\n\
+    \x20   ends the file — nothing follows; a hard kill may truncate it.\n\
+         \x20   `--report-path` writes the stdout JSON object plus a `tool_calls`\n\
+         \x20   array (ordered). Multi-agent runs and error/timeout outcomes report\n\
+         \x20   `tool_calls: []`; use `--events-json` for multi-agent tool traces.\n\
+\x20   `--run-id` is trimmed to a non-empty label of at most 128 characters\n\
+\x20   with no control characters; it is echoed as `run_id` (null if unset).\n\
+\x20   JSON/report `provider_error_class` is populated for provider-family\n\
+\x20   failures and is null for other terminal errors (e.g. missing provider\n\
+\x20   configuration), whose detail remains in `final_message`."
     )
 }
 
@@ -140,9 +177,12 @@ pub(crate) fn run_run_subcommand(
         ParsedRun::Options(request) => *request,
     };
     // Captured before the request is consumed so a post-parse failure can still
-    // honour `--json` and report through the same single-object contract.
+    // honour `--json` and report through the same single-object contract, and
+    // so the report path is available at this choke point on every outcome.
     let mode = if request.multi_agent { "multi" } else { "single" };
     let json_mode = request.json;
+    let run_id = request.run_id.clone();
+    let report_path = request.report_path.clone();
 
     // Everything after a successful parse flows through `emit`, so failures
     // here (empty prompt, runtime creation, config/session/provider resolution)
@@ -151,8 +191,9 @@ pub(crate) fn run_run_subcommand(
     // cannot be promised when the flags themselves were unparseable.
     let outcome = match run_request(request) {
         Ok(outcome) => outcome,
-        Err(error) => error_outcome(json_mode, mode, &error),
+        Err(error) => error_outcome(json_mode, mode, run_id.as_deref(), &error),
     };
+    write_report_if_requested(report_path.as_deref(), &outcome);
     emit(&outcome);
     std::process::exit(outcome.exit_code);
 }
@@ -168,9 +209,20 @@ fn run_request(request: RunRequest) -> anyhow::Result<RunOutcome> {
         json: request.json,
         approvals: request.approvals,
         timeout: request.timeout,
+        run_id: request.run_id,
+        events_json: request.events_json,
     };
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(execute(options))
+    let outcome = rt.block_on(execute(options));
+    // Memory (fastembed) initialization runs on a `spawn_blocking` worker that
+    // can park indefinitely on a stalled model download. Dropping the runtime
+    // here would join that worker and hang the process after a `--timeout`
+    // fire, so report writing / emit / exit would never run. The outcome is
+    // already captured; shut the runtime down in the background (no join) so
+    // the timeout contract always reaches the caller. This is the only runtime
+    // created on the `run_request` path.
+    rt.shutdown_background();
+    outcome
 }
 
 /// Parse `run`'s own options. Returns [`ParsedRun::Help`] for `-h/--help`.
@@ -181,6 +233,9 @@ fn parse_run_args(args: &[String], default_project: Option<&Path>) -> anyhow::Re
     let mut json = false;
     let mut approvals = ApprovalMode::Deny;
     let mut timeout: Option<Duration> = None;
+    let mut run_id: Option<String> = None;
+    let mut events_json: Option<PathBuf> = None;
+    let mut report_path: Option<PathBuf> = None;
     let mut positionals: Vec<String> = Vec::new();
 
     let mut index = 0;
@@ -223,6 +278,40 @@ fn parse_run_args(args: &[String], default_project: Option<&Path>) -> anyhow::Re
                 }
                 timeout = Some(Duration::from_secs(secs));
             }
+            "--run-id" => {
+                index += 1;
+                // A value that is missing OR looks like the next flag (leading
+                // `-`, including a bare `-`) must fail like the flag-last form;
+                // otherwise a mid-form gap would silently swallow the following
+                // flag as the label.
+                let Some(value) = args.get(index).filter(|value| !value.starts_with('-')) else {
+                    anyhow::bail!("--run-id requires a label");
+                };
+                run_id = Some(parse_run_id(value)?);
+            }
+            "--events-json" => {
+                index += 1;
+                let value = args.get(index);
+                if value.is_some_and(|value| value == "-") {
+                    anyhow::bail!(
+                        "--events-json requires a file path; '-' is not allowed \
+                         (stdout is reserved for the single JSON object)"
+                    );
+                }
+                let Some(value) = value.filter(|value| !value.starts_with('-')) else {
+                    anyhow::bail!("--events-json requires a file path");
+                };
+                events_json = Some(PathBuf::from(value));
+            }
+            "--report-path" => {
+                index += 1;
+                // As above: a leading-dash value (bare `-` included) is
+                // pathological for a path and is rejected consistently.
+                let Some(value) = args.get(index).filter(|value| !value.starts_with('-')) else {
+                    anyhow::bail!("--report-path requires a file path");
+                };
+                report_path = Some(PathBuf::from(value));
+            }
             "-" => {}
             value if value.starts_with('-') => {
                 anyhow::bail!("unknown option '{value}'\n{}", usage())
@@ -253,7 +342,28 @@ fn parse_run_args(args: &[String], default_project: Option<&Path>) -> anyhow::Re
         json,
         approvals,
         timeout,
+        run_id,
+        events_json,
+        report_path,
     })))
+}
+
+/// Validate a `--run-id` label. The value is trimmed; empty, over-long
+/// (> [`RUN_ID_MAX_CHARS`] chars), or control-character-bearing values are
+/// rejected so the id is always safe to echo into JSON (and, once serialized,
+/// a JSON string never needs to escape a raw newline/control byte).
+fn parse_run_id(value: &str) -> anyhow::Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("--run-id must not be empty");
+    }
+    if trimmed.chars().count() > RUN_ID_MAX_CHARS {
+        anyhow::bail!("--run-id must be at most {RUN_ID_MAX_CHARS} characters");
+    }
+    if trimmed.chars().any(char::is_control) {
+        anyhow::bail!("--run-id must not contain control characters");
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Read the prompt from stdin when the caller did not supply one literally.
@@ -326,7 +436,14 @@ pub(crate) struct RunOutcome {
     /// from the fields. Composed here so tests can assert the content without
     /// capturing process streams.
     pub(crate) text_summary: Vec<String>,
+    /// The exact object printed on stdout under `--json`.
     pub(crate) json: Value,
+    /// The same object plus a `tool_calls` array — what `--report-path`
+    /// serialises. Composed alongside `json` so both channels cannot drift.
+    pub(crate) report_json: Value,
+    /// Session id when a run reached an agent loop (used for the terminal
+    /// `run_finished` events line); `None` for error/timeout outcomes.
+    pub(crate) session_id: Option<Ulid>,
     pub(crate) stderr: Vec<String>,
 }
 
@@ -421,6 +538,36 @@ pub(crate) async fn execute_with_runner(
     };
 
     let bus = EventBus::new(1024);
+    // `--events-json`: subscribe to the bus we are about to hand to the
+    // runtime BEFORE the run starts, so the file captures the whole run. The
+    // durable (lossless, FIFO) subscription is used so no event is dropped and
+    // ordering is preserved — see `durable_subscriber_sees_broadcast_publishes_in_order`
+    // in `concerto-core`.
+    let events_writer = match options.events_json.as_deref() {
+        Some(path) => match EventsWriter::spawn(
+            path.to_path_buf(),
+            options.run_id.clone(),
+            bus.subscribe_durable(),
+        ) {
+            Ok(writer) => Some(writer),
+            Err(error) => {
+                return error_outcome(
+                    options.json,
+                    mode,
+                    options.run_id.as_deref(),
+                    &anyhow::anyhow!(
+                        "could not open --events-json file '{}': {error}",
+                        path.display()
+                    ),
+                );
+            }
+        },
+        None => None,
+    };
+    // Keep the bus (and therefore the durable sender) alive until the writer
+    // has emitted its terminal line, so the receiver never observes a closed
+    // channel before `run_finished`.
+    let bus_keepalive = bus.clone();
     let mut services_builder = ServicesBuilder::new(bus, config.clone(), sink);
     if let Some(manager) = session_manager {
         services_builder = services_builder.with_session_manager(manager);
@@ -451,42 +598,66 @@ pub(crate) async fn execute_with_runner(
         task.abort();
     }
 
-    if timed_out.load(Ordering::SeqCst) {
-        return outcome_from(
+    let outcome = if timed_out.load(Ordering::SeqCst) {
+        outcome_from(
             EXIT_TIMEOUT,
             "timeout",
             &options,
             mode,
             None,
+            None,
             "run exceeded the configured --timeout",
             diagnostics(&mut stderr, &denied, &first_action),
-        );
-    }
-
-    match result {
-        Ok(output) => {
-            let (status, exit_code) = classify(&output, denied.load(Ordering::SeqCst));
-            let message = output.summary();
-            outcome_from(
-                exit_code,
-                status,
-                &options,
-                mode,
-                Some(&output),
-                &message,
-                diagnostics(&mut stderr, &denied, &first_action),
-            )
+        )
+    } else {
+        match result {
+            Ok(output) => {
+                let (status, exit_code) = classify(&output, denied.load(Ordering::SeqCst));
+                let message = output.summary();
+                let provider_error_class = output.provider_error_class.clone();
+                outcome_from(
+                    exit_code,
+                    status,
+                    &options,
+                    mode,
+                    Some(&output),
+                    provider_error_class,
+                    &message,
+                    diagnostics(&mut stderr, &denied, &first_action),
+                )
+            }
+            Err(error) => {
+                // Only provider failures carry a stable class code; everything
+                // else (config/session/agent-loop errors) reports `null`.
+                let is_provider = matches!(&error, OrchestratorError::Provider(_));
+                let message = error.to_string();
+                let provider_error_class = if is_provider {
+                    Some(concerto_core::failures::ClassifiedFailure::from(error).code)
+                } else {
+                    None
+                };
+                outcome_from(
+                    EXIT_ERROR,
+                    "error",
+                    &options,
+                    mode,
+                    None,
+                    provider_error_class,
+                    &message,
+                    diagnostics(&mut stderr, &denied, &first_action),
+                )
+            }
         }
-        Err(error) => outcome_from(
-            EXIT_ERROR,
-            "error",
-            &options,
-            mode,
-            None,
-            &error.to_string(),
-            diagnostics(&mut stderr, &denied, &first_action),
-        ),
+    };
+
+    // Terminal events line on EVERY outcome path, then join so the last line
+    // is flushed before the caller returns.
+    if let Some(writer) = events_writer {
+        writer.finish(outcome.status, outcome.exit_code, outcome.session_id).await;
     }
+    drop(bus_keepalive);
+
+    outcome
 }
 
 /// Append a diagnostic naming the first refused action; leave stderr unchanged
@@ -517,11 +688,21 @@ fn outcome_from(
     options: &RunOptions,
     mode: &str,
     output: Option<&AgentOutput>,
+    provider_error_class: Option<String>,
     message: &str,
     stderr: Vec<String>,
 ) -> RunOutcome {
     let session_id = output.map(|output| output.session_id);
-    let json = build_json(mode, status, session_id, message, output);
+    let json = build_json(
+        mode,
+        status,
+        session_id,
+        message,
+        output,
+        options.run_id.as_deref(),
+        provider_error_class.as_deref(),
+    );
+    let report_json = with_tool_calls(&json, output);
     RunOutcome {
         exit_code,
         json_mode: options.json,
@@ -529,6 +710,8 @@ fn outcome_from(
         message: message.to_string(),
         text_summary: text_summary(session_id, output),
         json,
+        report_json,
+        session_id,
         stderr,
     }
 }
@@ -557,9 +740,15 @@ fn text_summary(session_id: Option<Ulid>, output: Option<&AgentOutput>) -> Vec<S
 /// Convert a post-parse failure into a reportable outcome. Under `--json` this
 /// yields the same single-object contract as a completed run, with
 /// `status:"error"` and exit 1.
-fn error_outcome(json_mode: bool, mode: &str, error: &anyhow::Error) -> RunOutcome {
+fn error_outcome(
+    json_mode: bool,
+    mode: &str,
+    run_id: Option<&str>,
+    error: &anyhow::Error,
+) -> RunOutcome {
     let message = error.to_string();
-    let json = build_json(mode, "error", None, &message, None);
+    let json = build_json(mode, "error", None, &message, None, run_id, None);
+    let report_json = with_tool_calls(&json, None);
     RunOutcome {
         exit_code: EXIT_ERROR,
         json_mode,
@@ -567,6 +756,8 @@ fn error_outcome(json_mode: bool, mode: &str, error: &anyhow::Error) -> RunOutco
         message,
         text_summary: text_summary(None, None),
         json,
+        report_json,
+        session_id: None,
         stderr: Vec::new(),
     }
 }
@@ -599,12 +790,18 @@ fn classify(output: &AgentOutput, denied: bool) -> (&'static str, i32) {
 }
 
 /// Compose the published JSON object. `output` is absent for error/timeout.
+///
+/// `run_id` and `provider_error_class` are always present (`null` when N/A) so
+/// the schema is stable across every outcome.
+#[allow(clippy::too_many_arguments)]
 fn build_json(
     mode: &str,
     status: &str,
     session_id: Option<Ulid>,
     final_message: &str,
     output: Option<&AgentOutput>,
+    run_id: Option<&str>,
+    provider_error_class: Option<&str>,
 ) -> Value {
     let (files, tools, tokens_in, tokens_out, cost) = match output {
         Some(output) => (
@@ -622,6 +819,8 @@ fn build_json(
         "mode": mode,
         "status": status,
         "session_id": session_id.map(|id| id.to_string()),
+        "run_id": run_id,
+        "provider_error_class": provider_error_class,
         "final_message": final_message,
         "files_modified": files,
         "tool_call_count": tools,
@@ -629,6 +828,54 @@ fn build_json(
         "tokens_out": tokens_out,
         "cost_usd": cost,
     })
+}
+
+/// The report object: the stdout JSON plus an ordered `tool_calls` array.
+///
+/// `tool_calls` is populated only for the live single-agent path (the only
+/// producer of `AgentOutput::tool_events`); multi-agent runs and error/timeout
+/// outcomes report `[]`. Multi-agent tool traces are available via
+/// `--events-json` instead.
+fn with_tool_calls(base: &Value, output: Option<&AgentOutput>) -> Value {
+    let mut report = base.clone();
+    if let Value::Object(map) = &mut report {
+        map.insert("tool_calls".to_string(), tool_calls_json(output));
+    }
+    report
+}
+
+/// Map `AgentOutput::tool_events` to JSON. `failure` embeds the typed
+/// `ToolFailure` envelope (`serde`-friendly); `at` is RFC3339 UTC or `null`.
+fn tool_calls_json(output: Option<&AgentOutput>) -> Value {
+    let events = output.map(|output| output.tool_events.as_slice()).unwrap_or(&[]);
+    Value::Array(
+        events
+            .iter()
+            .map(|event| {
+                json!({
+                    "name": event.tool_name,
+                    "operation": event.operation,
+                    "path": event.path.as_ref().map(|path| path.to_string()),
+                    "success": event.success,
+                    "summary": event.summary,
+                    "canonical_tool": event.canonical_tool,
+                    "canonical_operation": event.canonical_operation,
+                    "failure": event
+                        .failure
+                        .as_ref()
+                        .and_then(|failure| serde_json::to_value(failure).ok()),
+                    "at": event.at.and_then(fmt_rfc3339),
+                    "input_fingerprint": event.input_fingerprint,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Format a UTC timestamp as RFC3339; an out-of-range value degrades to `None`
+/// rather than panicking.
+fn fmt_rfc3339(timestamp: time::OffsetDateTime) -> Option<String> {
+    timestamp.format(&Rfc3339).ok()
 }
 
 /// Write the outcome to stdout/stderr: JSON stays a single object; diagnostics
@@ -651,6 +898,203 @@ fn emit(outcome: &RunOutcome) {
     for line in &outcome.stderr {
         eprintln!("{line}");
     }
+}
+
+// ── `--events-json` progress writer ─────────────────────────────────────────
+
+/// Terminal payload handed to the events writer at the end of a run.
+struct EventsFinish {
+    status: &'static str,
+    exit_code: i32,
+    session_id: Option<Ulid>,
+}
+
+/// Live NDJSON progress writer for `--events-json`.
+///
+/// Owns a spawned task that selects over the durable event stream, a 10s
+/// heartbeat interval, and the finish signal. [`EventsWriter::finish`] drains
+/// any events still queued before writing the terminal `run_finished` line and
+/// joining the task, so the last line is always flushed and no published event
+/// is silently dropped.
+struct EventsWriter {
+    finish_tx: tokio::sync::oneshot::Sender<EventsFinish>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl EventsWriter {
+    /// Truncate-create `path` (mode 0600 on unix) and spawn the writer task.
+    fn spawn(
+        path: PathBuf,
+        run_id: Option<String>,
+        receiver: DurableEventReceiver,
+    ) -> std::io::Result<Self> {
+        let file = open_private(&path)?;
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(writer_loop(file, run_id, receiver, finish_rx));
+        Ok(Self { finish_tx, handle })
+    }
+
+    /// Send the terminal fields and wait for the writer to flush. A dropped
+    /// task (panic) is tolerated: the run's outcome must not change because
+    /// progress capture failed.
+    async fn finish(self, status: &'static str, exit_code: i32, session_id: Option<Ulid>) {
+        let _ = self.finish_tx.send(EventsFinish { status, exit_code, session_id });
+        if self.handle.await.is_err() {
+            eprintln!("warning: --events-json writer task ended unexpectedly");
+        }
+    }
+}
+
+/// Writer task body: relay events, heartbeats, and the terminal line as NDJSON.
+async fn writer_loop(
+    file: std::fs::File,
+    run_id: Option<String>,
+    mut receiver: DurableEventReceiver,
+    mut finish_rx: tokio::sync::oneshot::Receiver<EventsFinish>,
+) {
+    let mut writer = std::io::BufWriter::new(file);
+    let mut seq: u64 = 0;
+    let started = std::time::Instant::now();
+    let mut heartbeat = tokio::time::interval(EVENTS_HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // `interval`'s first tick completes immediately; consume it so the first
+    // heartbeat fires at 10s, not at t=0.
+    heartbeat.tick().await;
+
+    loop {
+        tokio::select! {
+            maybe_event = receiver.recv() => {
+                match maybe_event {
+                    Some(event) => {
+                        seq += 1;
+                        let line = event_line(seq, run_id.as_deref(), &event);
+                        if !write_line(&mut writer, &line) {
+                            return;
+                        }
+                    }
+                    // Bus fully dropped: no more events can arrive, so wait for
+                    // the finish signal rather than closing without a terminal
+                    // line. (The caller keeps the bus alive until `finish`, so
+                    // this is a defensive path.)
+                    None => {
+                        if let Ok(finish) = finish_rx.await {
+                            seq += 1;
+                            let line = finish_line(seq, run_id.as_deref(), &finish);
+                            let _ = write_line(&mut writer, &line);
+                        }
+                        return;
+                    }
+                }
+            }
+            _ = heartbeat.tick() => {
+                seq += 1;
+                let line = json!({
+                    "seq": seq,
+                    "ts": time::OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default(),
+                    "run_id": run_id.as_deref(),
+                    "event": "heartbeat",
+                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                });
+                if !write_line(&mut writer, &line) {
+                    return;
+                }
+            }
+            finish = &mut finish_rx => {
+                // Everything published before `runner.run` returned is already
+                // queued; drain it so no event is lost and the terminal line is
+                // last.
+                while let Ok(event) = receiver.try_recv() {
+                    seq += 1;
+                    let line = event_line(seq, run_id.as_deref(), &event);
+                    if !write_line(&mut writer, &line) {
+                        return;
+                    }
+                }
+                let finish = match finish {
+                    Ok(finish) => finish,
+                    Err(_) => return,
+                };
+                seq += 1;
+                let line = finish_line(seq, run_id.as_deref(), &finish);
+                let _ = write_line(&mut writer, &line);
+                return;
+            }
+        }
+    }
+}
+
+/// One progress line: `{seq, ts, run_id, event: {<EventKind>: {...}}}`.
+fn event_line(seq: u64, run_id: Option<&str>, event: &Event) -> Value {
+    // `EventKind` is externally tagged, so this yields `{"<Variant>": {...}}`.
+    let kind = serde_json::to_value(&event.kind)
+        .unwrap_or_else(|_| Value::String("<unserializable event>".to_string()));
+    json!({
+        "seq": seq,
+        "ts": event.timestamp.format(&Rfc3339).unwrap_or_default(),
+        "run_id": run_id,
+        "event": kind,
+    })
+}
+
+/// The terminal line written on every outcome path.
+fn finish_line(seq: u64, run_id: Option<&str>, finish: &EventsFinish) -> Value {
+    json!({
+        "seq": seq,
+        "ts": time::OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default(),
+        "run_id": run_id,
+        "event": "run_finished",
+        "status": finish.status,
+        "exit_code": finish.exit_code,
+        "session_id": finish.session_id.map(|id| id.to_string()),
+    })
+}
+
+/// Serialize one JSON object per line and flush immediately (kill-safe partial
+/// capture). Returns `false` once writing fails, so the writer stops.
+fn write_line(writer: &mut impl Write, value: &Value) -> bool {
+    if writeln!(writer, "{value}").is_err() || writer.flush().is_err() {
+        eprintln!("warning: could not write --events-json progress; stopping capture");
+        return false;
+    }
+    true
+}
+
+// ── `--report-path` ────────────────────────────────────────────────────────
+
+/// Write the extended report at the run choke point. A write failure is a
+/// stderr warning only: the exit code is unaffected, matching the guarantee
+/// level of the stdout object.
+fn write_report_if_requested(path: Option<&Path>, outcome: &RunOutcome) {
+    let Some(path) = path else {
+        return;
+    };
+    if let Err(error) = write_json_private(path, &outcome.report_json) {
+        eprintln!("warning: could not write --report-path '{}': {error}", path.display());
+    }
+}
+
+// ── Shared private-file helpers ─────────────────────────────────────────────
+
+/// Open `path` for truncate-create-write with restrictive (0600) permissions
+/// on unix. A missing parent directory surfaces as an ordinary `io::Error`.
+fn open_private(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+/// Serialize `value` as pretty JSON to `path` (truncate-create, 0600 on unix).
+fn write_json_private(path: &Path, value: &Value) -> std::io::Result<()> {
+    let mut file = open_private(path)?;
+    let text = serde_json::to_string_pretty(value).map_err(std::io::Error::other)?;
+    file.write_all(text.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.flush()
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -889,6 +1333,20 @@ mod tests {
         }
     }
 
+    /// Runner returning a provider error — drives the classified failure path
+    /// that populates `provider_error_class` in the JSON/report.
+    struct FailingRunner;
+
+    impl AgentRunner for FailingRunner {
+        fn run(
+            &self,
+            _request: AgentRunRequest,
+            _services: SharedServices,
+        ) -> BoxFuture<'_, Result<AgentOutput, OrchestratorError>> {
+            Box::pin(async move { Err(OrchestratorError::Provider(ProviderError::AuthFailure)) })
+        }
+    }
+
     fn options(project: &Path, prompt: &str, json: bool) -> RunOptions {
         RunOptions {
             prompt: prompt.to_string(),
@@ -898,6 +1356,8 @@ mod tests {
             json,
             approvals: ApprovalMode::Deny,
             timeout: None,
+            run_id: None,
+            events_json: None,
         }
     }
 
@@ -1052,7 +1512,7 @@ mod tests {
         // M2: post-parse failures must still emit a full JSON object under
         // `--json`, so an external caller never sees empty stdout.
         let error = anyhow::anyhow!("no LLM provider configured");
-        let outcome = error_outcome(true, "single", &error);
+        let outcome = error_outcome(true, "single", None, &error);
         assert_eq!(outcome.exit_code, EXIT_ERROR);
         assert_eq!(outcome.status, "error");
         assert_eq!(outcome.json["status"], "error");
@@ -1062,6 +1522,8 @@ mod tests {
             "mode",
             "status",
             "session_id",
+            "run_id",
+            "provider_error_class",
             "final_message",
             "files_modified",
             "tool_call_count",
@@ -1071,6 +1533,10 @@ mod tests {
         ] {
             assert!(outcome.json.get(key).is_some(), "missing key {key}: {}", outcome.json);
         }
+        // Schema stability: both new keys are present-but-null on the error path.
+        assert_eq!(outcome.json["run_id"], Value::Null);
+        assert_eq!(outcome.json["provider_error_class"], Value::Null);
+        assert_eq!(outcome.report_json["tool_calls"], json!([]));
         assert!(
             outcome.json["final_message"].as_str().is_some_and(|m| m.contains("no LLM provider")),
             "error message missing: {}",
@@ -1170,6 +1636,289 @@ mod tests {
         assert_eq!(classify(&output, true), ("awaiting_approval", EXIT_AWAITING_APPROVAL));
     }
 
+    fn read_ndjson(path: &Path) -> Vec<Value> {
+        let text = std::fs::read_to_string(path).expect("events file");
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("each events line is a JSON object"))
+            .collect()
+    }
+
+    #[test]
+    fn parse_reads_observability_flags() {
+        let dir = TempDir::new().expect("tempdir");
+        let args = vec![
+            "hi".to_string(),
+            "--run-id".to_string(),
+            " nightly-42 ".to_string(),
+            "--events-json".to_string(),
+            "/tmp/events.ndjson".to_string(),
+            "--report-path".to_string(),
+            "/tmp/report.json".to_string(),
+        ];
+        let ParsedRun::Options(request) = parse_run_args(&args, Some(dir.path())).expect("parse")
+        else {
+            panic!("expected options");
+        };
+        // `--run-id` is trimmed before it is echoed.
+        assert_eq!(request.run_id.as_deref(), Some("nightly-42"));
+        assert_eq!(request.events_json.as_deref(), Some(Path::new("/tmp/events.ndjson")));
+        assert_eq!(request.report_path.as_deref(), Some(Path::new("/tmp/report.json")));
+    }
+
+    #[test]
+    fn parse_rejects_invalid_run_id() {
+        for bad in ["", "   ", "has\nnewline", "\u{7}"] {
+            let args = vec!["--run-id".to_string(), bad.to_string()];
+            assert!(parse_run_args(&args, None).is_err(), "must reject run-id {bad:?}");
+        }
+        let dir = TempDir::new().expect("tempdir");
+        let too_long = "x".repeat(RUN_ID_MAX_CHARS + 1);
+        assert!(parse_run_args(&["--run-id".to_string(), too_long], Some(dir.path())).is_err());
+        let at_limit = "x".repeat(RUN_ID_MAX_CHARS);
+        assert!(parse_run_args(&["--run-id".to_string(), at_limit], Some(dir.path())).is_ok());
+    }
+
+    #[test]
+    fn parse_requires_values_for_observability_flags() {
+        for flag in ["--run-id", "--events-json", "--report-path"] {
+            let error =
+                parse_run_args(&[flag.to_string()], None).expect_err("must require a value");
+            assert!(error.to_string().contains("requires"), "{flag}: {error}");
+        }
+    }
+
+    #[test]
+    fn parse_rejects_stdout_for_events_json() {
+        let error = parse_run_args(&["--events-json".to_string(), "-".to_string()], None)
+            .expect_err("'-' must be rejected");
+        assert!(error.to_string().contains("not allowed"), "{error}");
+    }
+
+    #[test]
+    fn parse_rejects_mid_form_missing_value() {
+        // A missing value must not silently swallow the NEXT flag as its value
+        // (e.g. `--events-json --json hi` must not create a file named `--json`
+        // or drop back to text mode).
+        for flag in ["--run-id", "--events-json", "--report-path"] {
+            let args = vec![flag.to_string(), "--json".to_string(), "hi".to_string()];
+            let error = parse_run_args(&args, None).expect_err("must not swallow the next flag");
+            assert!(error.to_string().contains("requires"), "{flag}: {error}");
+        }
+        // A bare `-` is a pathological value for all three and is rejected
+        // consistently (`--events-json` keeps its dedicated stdout message).
+        for flag in ["--run-id", "--events-json", "--report-path"] {
+            let args = vec![flag.to_string(), "-".to_string()];
+            assert!(parse_run_args(&args, None).is_err(), "{flag} must reject '-'");
+        }
+    }
+
+    #[tokio::test]
+    async fn events_json_captures_progress_and_terminal_done() {
+        let dir = TempDir::new().expect("tempdir");
+        let events_path = dir.path().join("events.ndjson");
+        let (manager, audit) = in_memory_manager().await;
+        let provider = TestProvider::tool_call(
+            "filesystem",
+            json!({"operation": "write", "path": "out.txt", "content": "hi"}),
+        );
+        let runner: Arc<dyn AgentRunner> =
+            Arc::new(ScriptedRunner { provider: Arc::new(provider), audit });
+        let mut opts = options(dir.path(), "write a file", true);
+        opts.run_id = Some("run-abc".to_string());
+        opts.events_json = Some(events_path.clone());
+        let outcome = execute_with_runner(opts, runner, AppConfig::default(), Some(manager)).await;
+        assert_eq!(outcome.status, "done", "message: {}", outcome.message);
+
+        let lines = read_ndjson(&events_path);
+        assert!(lines.len() >= 3, "expected progress lines: {lines:?}");
+        // `seq` is strictly monotonic from 1 and `run_id` is echoed on every line.
+        for (index, line) in lines.iter().enumerate() {
+            assert_eq!(line["seq"].as_u64(), Some(index as u64 + 1), "{line}");
+            assert_eq!(line["run_id"], json!("run-abc"), "{line}");
+            assert!(line["ts"].is_string(), "{line}");
+        }
+        let events: Vec<&Value> = lines.iter().map(|line| &line["event"]).collect();
+        assert!(
+            events.iter().any(|event| event.get("ToolExecutionStarted").is_some()),
+            "missing ToolExecutionStarted: {lines:?}"
+        );
+        assert!(
+            events.iter().any(|event| event.get("ToolExecutionFinished").is_some()),
+            "missing ToolExecutionFinished: {lines:?}"
+        );
+        let last = lines.last().expect("terminal line");
+        assert_eq!(last["event"], json!("run_finished"));
+        assert_eq!(last["status"], json!("done"));
+        assert_eq!(last["exit_code"], json!(EXIT_DONE));
+        assert!(last["session_id"].is_string(), "{last}");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&events_path).expect("metadata").permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "events file must be private");
+        }
+    }
+
+    #[tokio::test]
+    async fn events_json_terminal_line_on_timeout() {
+        let dir = TempDir::new().expect("tempdir");
+        let events_path = dir.path().join("events.ndjson");
+        let (manager, _audit) = in_memory_manager().await;
+        let mut opts = options(dir.path(), "hang", true);
+        opts.timeout = Some(Duration::from_millis(50));
+        opts.events_json = Some(events_path.clone());
+        let outcome =
+            execute_with_runner(opts, Arc::new(HangingRunner), AppConfig::default(), Some(manager))
+                .await;
+        assert_eq!(outcome.status, "timeout");
+        let lines = read_ndjson(&events_path);
+        let last = lines.last().expect("terminal line");
+        assert_eq!(last["event"], json!("run_finished"));
+        assert_eq!(last["status"], json!("timeout"));
+        assert_eq!(last["exit_code"], json!(EXIT_TIMEOUT));
+        assert_eq!(last["run_id"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn events_json_open_failure_reports_error_outcome() {
+        let dir = TempDir::new().expect("tempdir");
+        let missing = dir.path().join("no-such-dir").join("events.ndjson");
+        let (manager, _audit) = in_memory_manager().await;
+        let mut opts = options(dir.path(), "hi", true);
+        opts.events_json = Some(missing);
+        let outcome = execute_with_runner(
+            opts,
+            Arc::new(StaticRunner { output: sample_partial() }),
+            AppConfig::default(),
+            Some(manager),
+        )
+        .await;
+        assert_eq!(outcome.exit_code, EXIT_ERROR);
+        assert_eq!(outcome.status, "error");
+        assert!(outcome.message.contains("--events-json"), "{}", outcome.message);
+    }
+
+    #[tokio::test]
+    async fn report_json_includes_tool_calls_on_success() {
+        let dir = TempDir::new().expect("tempdir");
+        let (manager, audit) = in_memory_manager().await;
+        let provider = TestProvider::tool_call(
+            "filesystem",
+            json!({"operation": "write", "path": "out.txt", "content": "hi"}),
+        );
+        let runner: Arc<dyn AgentRunner> =
+            Arc::new(ScriptedRunner { provider: Arc::new(provider), audit });
+        let mut opts = options(dir.path(), "write a file", true);
+        opts.run_id = Some("run-abc".to_string());
+        let outcome = execute_with_runner(opts, runner, AppConfig::default(), Some(manager)).await;
+        assert_eq!(outcome.status, "done", "message: {}", outcome.message);
+        // The report is a superset of the stdout object.
+        assert_eq!(outcome.report_json["status"], outcome.json["status"]);
+        assert_eq!(outcome.report_json["run_id"], json!("run-abc"));
+        assert_eq!(outcome.report_json["provider_error_class"], Value::Null);
+        let calls = outcome.report_json["tool_calls"].as_array().expect("tool_calls array");
+        assert!(!calls.is_empty(), "{}", outcome.report_json);
+        assert_eq!(calls[0]["name"], json!("filesystem"));
+        assert_eq!(calls[0]["operation"], json!("write"));
+        assert_eq!(calls[0]["path"], json!("out.txt"));
+        assert_eq!(calls[0]["success"], json!(true));
+        assert!(calls[0]["at"].is_string(), "{}", calls[0]);
+        assert!(calls[0].get("failure").is_some(), "{}", calls[0]);
+        assert!(calls[0].get("input_fingerprint").is_some(), "{}", calls[0]);
+    }
+
+    #[tokio::test]
+    async fn report_marks_provider_error_class_on_failure() {
+        let dir = TempDir::new().expect("tempdir");
+        let (manager, _audit) = in_memory_manager().await;
+        let mut opts = options(dir.path(), "hi", true);
+        opts.run_id = Some("failed-run".to_string());
+        let outcome =
+            execute_with_runner(opts, Arc::new(FailingRunner), AppConfig::default(), Some(manager))
+                .await;
+        assert_eq!(outcome.exit_code, EXIT_ERROR);
+        assert_eq!(outcome.json["provider_error_class"], json!("PROVIDER_AUTH_FAILURE"));
+        assert_eq!(outcome.json["run_id"], json!("failed-run"));
+        assert_eq!(outcome.report_json["provider_error_class"], json!("PROVIDER_AUTH_FAILURE"));
+        assert_eq!(outcome.report_json["tool_calls"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn report_carries_provider_error_class_on_ok_path_retry_exhaustion() {
+        // Ok-path retry exhaustion: the loop RETURNS (no Err) a Partial output
+        // whose provider_error_class marks the exhausted retries, so the full
+        // composition must still classify it `blocked`/exit 4 and carry the
+        // class into both the stdout JSON and the written report file.
+        let dir = TempDir::new().expect("tempdir");
+        let (manager, _audit) = in_memory_manager().await;
+        let mut output = sample_partial();
+        output.provider_error_class =
+            Some(concerto_core::failures::PROVIDER_RETRIES_EXHAUSTED_CODE.to_string());
+        let mut opts = options(dir.path(), "hi", true);
+        opts.run_id = Some("retries-exhausted".to_string());
+        let outcome = execute_with_runner(
+            opts,
+            Arc::new(StaticRunner { output }),
+            AppConfig::default(),
+            Some(manager),
+        )
+        .await;
+        assert_eq!(outcome.exit_code, EXIT_BLOCKED, "message: {}", outcome.message);
+        assert_eq!(outcome.status, "blocked", "message: {}", outcome.message);
+        assert_eq!(outcome.json["status"], "blocked");
+        let expected = json!(concerto_core::failures::PROVIDER_RETRIES_EXHAUSTED_CODE);
+        assert_eq!(outcome.json["provider_error_class"], expected);
+        assert_eq!(outcome.report_json["provider_error_class"], expected);
+        // The on-disk report file carries the same class as stdout.
+        let path = dir.path().join("report.json");
+        write_report_if_requested(Some(&path), &outcome);
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("report")).expect("json");
+        assert_eq!(written["status"], "blocked");
+        assert_eq!(written["provider_error_class"], expected);
+    }
+
+    #[tokio::test]
+    async fn report_tool_calls_empty_on_timeout() {
+        let dir = TempDir::new().expect("tempdir");
+        let (manager, _audit) = in_memory_manager().await;
+        let mut opts = options(dir.path(), "hang", true);
+        opts.timeout = Some(Duration::from_millis(50));
+        let outcome =
+            execute_with_runner(opts, Arc::new(HangingRunner), AppConfig::default(), Some(manager))
+                .await;
+        assert_eq!(outcome.status, "timeout");
+        assert_eq!(outcome.report_json["tool_calls"], json!([]));
+        assert_eq!(outcome.report_json["provider_error_class"], Value::Null);
+    }
+
+    #[test]
+    fn write_report_if_requested_writes_private_json() {
+        let dir = TempDir::new().expect("tempdir");
+        let outcome = error_outcome(true, "single", Some("rid"), &anyhow::anyhow!("boom"));
+        let path = dir.path().join("report.json");
+        write_report_if_requested(Some(&path), &outcome);
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("report")).expect("json");
+        assert_eq!(written, outcome.report_json);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).expect("metadata").permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "report must be private");
+        }
+    }
+
+    #[test]
+    fn write_report_failure_is_non_fatal() {
+        let outcome = error_outcome(true, "single", None, &anyhow::anyhow!("boom"));
+        // No path is a no-op; an unwritable path only warns (must not panic).
+        write_report_if_requested(None, &outcome);
+        write_report_if_requested(Some(Path::new("/no/such/dir/report.json")), &outcome);
+    }
+
     fn sample_partial() -> AgentOutput {
         AgentOutput {
             task_id: TaskId::new(),
@@ -1184,6 +1933,7 @@ mod tests {
             completion_status: AgentCompletionStatus::Partial,
             provider_metrics: Vec::new(),
             checkpoint_json: None,
+            provider_error_class: None,
         }
     }
 }

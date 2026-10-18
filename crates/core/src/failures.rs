@@ -6,6 +6,15 @@
 
 use crate::error::{OrchestratorError, ProviderError};
 
+/// Single source of truth for the `ProviderError::RetryExhausted` class code.
+///
+/// The agent loop surfaces retry exhaustion as an `Ok(Blocked)` output whose
+/// prose reason is not machine-readable, so it stamps this exact code onto
+/// `AgentOutput::provider_error_class`; the error-path classification below
+/// uses the same constant. Keeping one constant prevents the two channels from
+/// drifting apart.
+pub const PROVIDER_RETRIES_EXHAUSTED_CODE: &str = "PROVIDER_RETRIES_EXHAUSTED";
+
 /// Who should see the failure message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -234,7 +243,7 @@ impl From<OrchestratorError> for ClassifiedFailure {
                 }
                 ProviderError::RetryExhausted { attempts, last_error, .. } => {
                     audience = FailureAudience::User;
-                    code = "PROVIDER_RETRIES_EXHAUSTED".to_string();
+                    code = PROVIDER_RETRIES_EXHAUSTED_CODE.to_string();
                     user_message = format!(
                         "The model provider did not recover after {attempts} attempts: {last_error}. The task can be resumed later."
                     );

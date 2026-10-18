@@ -8500,6 +8500,7 @@ impl CoordinatorAgent {
                 completion_status: concerto_core::types::AgentCompletionStatus::Partial,
                 provider_metrics,
                 checkpoint_json,
+                provider_error_class: None,
             },
             recoverable_notes,
         )
@@ -8855,6 +8856,7 @@ impl CoordinatorAgent {
                     completion_status: concerto_core::types::AgentCompletionStatus::AwaitingUser,
                     provider_metrics,
                     checkpoint_json,
+                    provider_error_class: None,
                 },
                 recoverable_notes,
             ));
@@ -10042,6 +10044,7 @@ impl CoordinatorAgent {
                 completion_status,
                 provider_metrics,
                 checkpoint_json,
+                provider_error_class: None,
             },
             recoverable_notes,
         ))
@@ -10235,6 +10238,7 @@ impl CoordinatorAgent {
                     completion_status: concerto_core::types::AgentCompletionStatus::Partial,
                     provider_metrics: vec![],
                     checkpoint_json: None,
+                    provider_error_class: None,
                 });
             }
         };
@@ -10271,6 +10275,7 @@ impl CoordinatorAgent {
                 completion_status: concerto_core::types::AgentCompletionStatus::Completed,
                 provider_metrics: vec![],
                 checkpoint_json: None,
+                provider_error_class: None,
             });
         }
 

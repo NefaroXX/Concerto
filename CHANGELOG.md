@@ -26,6 +26,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bypasses it. Exit codes: 0 done, 1 error, 2 needs_user, 3 awaiting_approval,
   4 blocked, 5 iteration_cap, 6 timeout. Runs persist to the same
   sessions/audit database as the TUI.
+- **`concerto run` observability flags.** Three opt-in, file-based side
+  channels (stdout stays reserved for the single result object; a value
+  starting with `-` is rejected for all three, and `--events-json -` gets a
+  dedicated message). `--run-id LABEL` is a caller-supplied correlation id
+  (trimmed, non-empty, ≤128 characters, no control characters) echoed as
+  `run_id` in the stdout JSON, the report, and every events line (`null` when
+  unset). `--events-json PATH` streams live NDJSON progress into a
+  truncate-created mode-`0600` file: one flushed
+  `{"seq","ts","run_id","event":…}` object per line with strictly monotonic
+  `seq`, externally tagged run events, a 10 s `heartbeat` line during quiet
+  periods, and a terminal `run_finished` line carrying `status`, `exit_code`
+  and `session_id` on every outcome (a hard kill may truncate the trace).
+  Multi-agent tool activity is visible there even though the report's
+  `tool_calls` is `[]` for multi-agent runs. `--report-path FILE` writes, at
+  the end of every outcome (done/error/needs_user/awaiting_approval/blocked/
+  iteration_cap/timeout), the stdout object plus an ordered `tool_calls`
+  array (`[]` for multi-agent, error and timeout outcomes) to a
+  truncate-created mode-`0600` file; a failed report write warns on stderr
+  and does not change the outcome or exit code. The stdout JSON additionally
+  always carries `run_id` and `provider_error_class` (`null` when not
+  applicable; populated for provider-family terminal failures, e.g.
+  `PROVIDER_RETRIES_EXHAUSTED` when provider retries are exhausted, and `null`
+  for other terminal errors such as missing provider configuration or
+  max-iterations — the human-readable detail stays in `final_message`).
+  `--timeout SECS` bounds the agent loop after startup, so total wall time can
+  exceed the value by startup and teardown. Exit codes are unchanged.
 - **OpenCode Zen anonymous free tier.** The `opencode` provider type now builds
   and streams without an API key against Zen's anonymous free tier by
   mirroring the real OpenCode client identity (`stream: true`, an

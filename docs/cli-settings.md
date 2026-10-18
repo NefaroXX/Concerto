@@ -139,6 +139,8 @@ plugin files through these commands; its runtime manager is retained across runs
 concerto run "fix the failing test" --json --timeout 600
 cat prompt.txt | concerto run - --project /path/to/project
 concerto run -m --approvals auto "refactor the parser"
+concerto run "fix the failing test" --json \
+  --run-id nightly-42 --events-json /tmp/run.ndjson --report-path /tmp/run.json
 ```
 
 `run` executes one agent task without a terminal and exits with a status code
@@ -147,19 +149,55 @@ an external orchestrator can branch on
 (several words are joined), `-`, or omitted — the last two read piped stdin;
 a terminal with no prompt exits 1. Options are `-p/--project DIR`,
 `-m/--multi-agent`, `-f/--fast` (skip memory retrieval), `--json`,
-`--approvals deny|auto`, and `--timeout SECS`; they must follow `run`.
+`--approvals deny|auto`, `--timeout SECS`, `--run-id LABEL`,
+`--events-json PATH`, and `--report-path FILE`; they must follow `run`.
 
 `--json` prints exactly one compact object on stdout with the keys `mode`
-(`single`/`multi`), `status`, `session_id`, `final_message`, `files_modified`,
-`tool_call_count`, `tokens_in`, `tokens_out`, `cost_usd`; diagnostics go to
-stderr. Argument parsing itself — an unknown flag, a bad `--timeout`, or a
+(`single`/`multi`), `status`, `session_id`, `run_id`, `provider_error_class`,
+`final_message`, `files_modified`, `tool_call_count`, `tokens_in`,
+`tokens_out`, `cost_usd`; diagnostics go to stderr. `run_id` echoes the
+`--run-id` label (`null` when not supplied). `provider_error_class` is a
+machine-readable class code for provider-family terminal failures (e.g.
+`PROVIDER_RETRIES_EXHAUSTED` when provider retries are exhausted) and is `null`
+for other terminal errors (e.g. missing provider configuration,
+max-iterations); the human-readable detail stays in `final_message`.
+Argument parsing itself — an unknown flag, a bad `--timeout`, or a
 missing `--project` directory — is the one failure not guaranteed to produce
 that object: the message goes to stderr and the exit code is 1. Text mode
 prints the final message on stdout and `status: … (exit N)` plus the
 session/files summary on stderr.
 
 Exit codes: `0` done · `1` error · `2` needs_user · `3` awaiting_approval ·
-`4` blocked · `5` iteration_cap · `6` timeout.
+`4` blocked · `5` iteration_cap · `6` timeout. `--timeout SECS` bounds the
+agent loop after startup: on expiry the process exits with code 6 shortly
+after, but total wall time can exceed the value by startup plus teardown
+(worst on a cold memory / fastembed model cache).
+
+The three observability flags are opt-in, file-based side channels — stdout
+stays reserved for the single result object. A value starting with `-` is
+rejected for all three (mid-form missing-value guard); `--events-json -` is
+rejected with a dedicated message.
+
+- **`--run-id LABEL`** — caller-supplied correlation id: trimmed, non-empty,
+  at most 128 characters, no control characters. Echoed as `run_id` in the
+  stdout JSON, the report, and every events line; `null` when not supplied.
+- **`--events-json PATH`** — live NDJSON progress while the run executes,
+  truncate-created mode `0600` (unix). Every line is one flushed JSON object
+  `{"seq","ts","run_id","event":…}` with strictly monotonic `seq`; run events
+  are externally tagged (`{"<variant>":…}`), a `heartbeat` line arrives every
+  10 s during quiet periods, and the run always ends with a terminal
+  `run_finished` line carrying `status`, `exit_code`, and `session_id`. A hard
+  kill may truncate the trace mid-file (flushed lines survive; the last line
+  then is not `run_finished`). Multi-agent tool activity is visible here even
+  though the report's `tool_calls` is `[]` for multi-agent runs. An unopenable
+  path is a normal error outcome (exit 1) reported through the usual JSON
+  contract.
+- **`--report-path FILE`** — at the end of *every* run outcome
+  (done/error/needs_user/awaiting_approval/blocked/iteration_cap/timeout),
+  writes a JSON report: the stdout object plus an ordered `tool_calls` array
+  (per-tool-call trace of the single-agent run; `[]` for multi-agent, error
+  and timeout outcomes). Truncate-created mode `0600` (unix). A failed report
+  write warns on stderr and does not change the run outcome or the exit code.
 
 The default `--approvals deny` is fail-closed: any action that reaches the
 approval gate is refused and the run reports `awaiting_approval` (exit 3).
