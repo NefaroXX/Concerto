@@ -9,19 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **OpenCode Zen keyless free tier.** The `opencode` provider type now builds
-  and streams without an API key against Zen's anonymous free tier
-  (`stream: true`, an `opencode/*` User-Agent, dev-tree-format `ses_`/`msg_`
-  identity headers, and ≥3 opencode builtin tool names mapped onto the native
-  shell/filesystem tools). A keyless refusal (403/410) surfaces as non-retryable
-  `FreeTierRefused`, while a keyless 429 is an ordinary rate limit on the
-  relay's shared, IP-keyed daily bucket (no per-model quota) and flows through
-  the generic retryable `RateLimit`, honoring `Retry-After`. The default
-  free model set (`OPENCODE_ZEN_FREE_KNOWN`) was refreshed against the
-  2026-10-18 relay roster (`beam-free`, `big-pickle`, `cat-jam-free`,
-  `glm-5.3-flash-free`). `opencode-free`
-  (Go) and other providers stay credential-required, and the paid path is
-  unchanged.
+- **OpenCode Zen anonymous free tier.** The `opencode` provider type now builds
+  and streams without an API key against Zen's anonymous free tier by
+  mirroring the real OpenCode client identity (`stream: true`, an
+  `opencode/*` User-Agent, the run's real session id under
+  `x-opencode-session`/`x-opencode-session-id`, a fresh per-request
+  `x-opencode-request`, and a construction-time `x-opencode-client` surface).
+  No session ids are minted and the caller's real tool declarations go on the
+  wire (`resolve_wire_builtin` still maps any opencode builtin name a model
+  emits onto the native shell/filesystem tools). An anonymous refusal (403/410)
+  surfaces as non-retryable `FreeTierRefused`, while an anonymous 429 is an
+  ordinary rate limit on the relay's shared, IP-keyed daily bucket (no
+  per-model quota) and flows through the generic retryable `RateLimit`,
+  honoring `Retry-After`. The default free model set
+  (`OPENCODE_ZEN_FREE_KNOWN`) was refreshed against the 2026-10-18 relay roster
+  (`beam-free`, `big-pickle`, `cat-jam-free`, `glm-5.3-flash-free`).
+  `opencode-free`
+  (Go) and other providers stay credential-required. On the paid path, body
+  rendering and error treatment are unchanged; paid Zen requests now carry the
+  run's real session id under `x-opencode-session`/`x-opencode-session-id` and
+  a fresh per-request `x-opencode-request` (replacing the retired static
+  dev-tree-minted values), plus the `x-opencode-client` surface header, and
+  prompt-cache/backend affinity granularity shifts from a per-process constant
+  to per-run.
 - Optional provider cache usage and durable per-attempt telemetry, audit-backed
   benchmark accounting, shared desktop/CLI session cache reports, versioned
   reporting prices, and opt-in stable Anthropic prompt-cache boundaries.
@@ -38,6 +48,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   document revision and cursor.
 
 ### Fixed
+
+- **Anonymous OpenCode Zen requests now present the client identity the relay
+  requires.** The free-tier branch rejects credential-less completions whose
+  `tools` lack a function named `read` (name-only check) and whose session
+  identity does not match the client's own `ses_` format — raw orchestration
+  ULIDs and session-less completions are refused (all live-verified
+  2026-10-18; `read` alone suffices and extras are tolerated). Anonymous
+  `opencode` completions now append a `read` declaration (mapped by
+  `resolve_wire_builtin` to the native `filesystem` read) alongside the
+  caller's real tool declarations, and mint a fresh client-format `ses_` wire
+  session id per completion in place of the raw ULID; keyed requests are
+  unchanged.
 
 - **Swagger UI restored at `/v1/docs` without weakening `yanked = "deny"`.**
   Upstream `utoipa-swagger-ui` 9.0.2 pins the yanked `zip ^3.0` build

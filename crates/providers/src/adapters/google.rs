@@ -563,6 +563,7 @@ mod tests {
     /// plus a tool list and a forced tool choice.
     fn fixture_request() -> CompletionRequest {
         CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             model: String::new(),
             messages: vec![
@@ -723,6 +724,7 @@ mod tests {
     #[test]
     fn assistant_tool_call_replays_thought_signature() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![Message {
                 role: Role::Assistant,
@@ -779,6 +781,7 @@ mod tests {
     #[test]
     fn assistant_tool_call_without_signature_omits_thought_signature_key() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![Message {
                 role: Role::Assistant,
@@ -826,6 +829,7 @@ mod tests {
     #[test]
     fn multi_call_turn_replays_per_part_signature_presence() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![Message {
                 role: Role::Assistant,
@@ -970,6 +974,7 @@ mod tests {
             [(ToolChoice::Auto, "AUTO"), (ToolChoice::None, "NONE"), (ToolChoice::Required, "ANY")]
         {
             let request = CompletionRequest {
+                session_id: None,
                 stable_system_prefix_bytes: None,
                 tools: Some(vec![ToolDefinition {
                     name: "test_tool".into(),
@@ -992,6 +997,7 @@ mod tests {
         // Strictly no other keys for non-forced modes: no allowedFunctionNames,
         // and without temperature/max tokens there is no generationConfig at all.
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             tools: Some(vec![ToolDefinition {
                 name: "test_tool".into(),
@@ -1013,6 +1019,7 @@ mod tests {
 
         // Forced tool pins the allowed function name under ANY.
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             tools: Some(vec![ToolDefinition {
                 name: "submit_design_doc".into(),
@@ -1062,6 +1069,7 @@ mod tests {
     #[test]
     fn golden_serialized_body_system_and_user() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![
                 Message {
@@ -1501,6 +1509,7 @@ mod tests {
     #[test]
     fn multiple_tool_results_flatten_into_entries() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![Message {
                 role: Role::Tool,
@@ -1559,6 +1568,7 @@ mod tests {
     #[test]
     fn tool_message_without_results_emits_no_entry() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![Message {
                 role: Role::Tool,
@@ -1596,6 +1606,7 @@ mod tests {
     #[test]
     fn last_system_message_wins() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![
                 Message {

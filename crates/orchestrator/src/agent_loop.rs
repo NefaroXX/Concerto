@@ -893,7 +893,7 @@ impl AgentLoop {
             }
 
             // Phase 3: Build provider request
-            let request = self.build_provider_request(
+            let mut request = self.build_provider_request(
                 &task.description,
                 iteration,
                 &messages,
@@ -902,6 +902,10 @@ impl AgentLoop {
                 &verification,
                 &retrieved_memory_block,
             );
+            // Carry the run's real orchestration session id on the request so a
+            // relay connector (OpenCode) can mirror it as its client-identity
+            // header. Every other provider ignores it.
+            request.session_id = Some(task.session_id);
 
             // ADR-66 §4: the universal text-fallback driver engages
             // automatically when the provider lacks native tool support
@@ -911,7 +915,6 @@ impl AgentLoop {
             // section replaces them. First engagement is audited once per
             // run and labeled in the event stream.
             let mut tool_driver = self.resolve_tool_driver();
-            let mut request = request;
             if let Some(driver) = tool_driver.as_ref() {
                 driver.augment_request(&mut request);
                 if iteration == 1 {
@@ -1530,6 +1533,7 @@ impl AgentLoop {
                         verification,
                         retrieved_memory_block,
                     );
+                    request.session_id = Some(task.session_id);
                     driver.augment_request(&mut request);
                     let (repaired_text, repaired_reasoning, _, repaired_usage) = self
                         .call_provider_with_retry(&request, task.session_id, task.id, cancel)

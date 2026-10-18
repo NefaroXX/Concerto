@@ -236,6 +236,7 @@ mod tests {
             base,
         );
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             stream: true,
             messages: vec![user_message("list files")],
@@ -279,6 +280,7 @@ mod tests {
             base,
         );
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             stream: true,
             messages: vec![user_message("read the manifest")],
@@ -320,6 +322,7 @@ mod tests {
             base,
         );
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             stream: true,
             messages: vec![

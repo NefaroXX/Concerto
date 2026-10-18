@@ -335,6 +335,7 @@ mod tests {
 
     fn make_test_request_with_tools() -> CompletionRequest {
         CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             tools: Some(vec![ToolDefinition {
                 name: "test_tool".into(),
@@ -402,6 +403,7 @@ mod tests {
     #[test]
     fn assistant_tool_calls_serialize_with_arguments_string() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![assistant_message(
                 "",
@@ -441,6 +443,7 @@ mod tests {
     #[test]
     fn tool_result_messages_serialize_with_role_and_tool_call_id() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![Message {
                 role: Role::Tool,
@@ -470,6 +473,7 @@ mod tests {
     #[test]
     fn system_messages_serialize_with_role_system() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![Message {
                 role: Role::System,
@@ -499,6 +503,7 @@ mod tests {
     #[test]
     fn system_only_request_renders_a_non_system_message() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![Message {
                 role: Role::System,
@@ -545,6 +550,7 @@ mod tests {
     #[test]
     fn normal_conversation_is_unchanged_by_the_conversation_floor() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![
                 Message {
@@ -580,6 +586,7 @@ mod tests {
     #[test]
     fn user_messages_serialize_with_role_user() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![Message {
                 role: Role::User,
@@ -663,6 +670,7 @@ mod tests {
     #[test]
     fn assistant_tool_calls_without_arguments_still_serialize() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![assistant_message(
                 "",
@@ -724,6 +732,7 @@ mod tests {
     #[test]
     fn build_result_body_preserves_system_then_user_order() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![
                 Message {
@@ -761,6 +770,7 @@ mod tests {
     #[test]
     fn golden_serialized_body_system_and_user() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![
                 Message {
@@ -802,6 +812,7 @@ mod tests {
     fn submit_design_doc_schema_flows_through_tool_body() {
         let schema = schemars::schema_for!(SubmitDesignDocInput);
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             tools: Some(vec![ToolDefinition {
                 name: "submit_design_doc".into(),
@@ -828,6 +839,7 @@ mod tests {
     fn tool_choice_required_and_none_render_as_strings() {
         for (choice, expected) in [(ToolChoice::Required, "required"), (ToolChoice::None, "none")] {
             let request = CompletionRequest {
+                session_id: None,
                 stable_system_prefix_bytes: None,
                 tools: Some(vec![ToolDefinition {
                     name: "test_tool".into(),
@@ -886,6 +898,7 @@ mod tests {
     #[test]
     fn render_round_trip_carries_reasoning_content() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![assistant_message(
                 "answer",
@@ -913,6 +926,7 @@ mod tests {
     #[test]
     fn tool_call_then_results_render_in_order() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![
                 assistant_message(
@@ -977,6 +991,7 @@ mod tests {
     #[test]
     fn multiple_tool_results_flatten_into_separate_messages() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![
                 assistant_message(
@@ -1056,6 +1071,7 @@ mod tests {
     #[test]
     fn tool_message_without_results_keeps_content_and_no_call_id() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![Message {
                 role: Role::Tool,
@@ -1097,6 +1113,7 @@ mod tests {
     #[test]
     fn apply_cache_breakpoints_is_noop_for_openai_compat() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![
                 Message {
@@ -1141,6 +1158,7 @@ mod tests {
     /// real dialect output, not a synthetic object.
     fn rendered_streaming_body() -> serde_json::Value {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             stream: true,
             messages: vec![Message {

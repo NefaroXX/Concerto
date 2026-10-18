@@ -139,6 +139,7 @@ mod tests {
 
     fn request() -> CompletionRequest {
         CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             model: "mock-model".to_owned(),
             messages: vec![],

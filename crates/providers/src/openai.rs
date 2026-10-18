@@ -4,6 +4,7 @@ use concerto_core::error::{describe_error_chain, ProviderError};
 use concerto_core::traits::{CompletionStream, LlmProvider};
 use concerto_core::types::{
     CompletionChunk, CompletionRequest, CompletionUsage, ModelInfo, TokenBudget, ToolCall,
+    ToolDefinition,
 };
 use concerto_core::CancellationToken;
 use concerto_core::SecretString;
@@ -61,7 +62,7 @@ pub struct OpenAiProvider {
     /// as before. When `true`, 403/410/429 responses preserve the relay's
     /// body via [`crate::retry::map_opencode_http_error`] instead of
     /// collapsing to `AuthFailure`/`RateLimit`.
-    keyless: bool,
+    anonymous: bool,
     dialect: OpenAiChatDialect,
 }
 
@@ -77,7 +78,7 @@ impl OpenAiProvider {
             advertised_tool_support: None,
             usage_request: UsageRequest::Off,
             extra_headers: Vec::new(),
-            keyless: false,
+            anonymous: false,
             dialect: OpenAiChatDialect,
         }
     }
@@ -169,25 +170,70 @@ impl OpenAiProvider {
     /// Mark this connector as possibly running against a relay's anonymous
     /// free tier.
     ///
-    /// Crate-private: only the OpenCode wrapper calls it, for the keyless Zen
-    /// path (see `crate::opencode`). When set, HTTP 403/410 responses keep the
-    /// relay's body text (as the permanent `FreeTierRefused`), while a 429 —
-    /// an ordinary rate limit on the relay's shared IP-keyed daily bucket —
+    /// Crate-private: only the OpenCode wrapper calls it, for the anonymous
+    /// Zen path (see `crate::opencode`). When set, HTTP 403/410 responses keep
+    /// the relay's body text (as the permanent `FreeTierRefused`), while a 429
+    /// — an ordinary rate limit on the relay's shared IP-keyed daily bucket —
     /// flows through the generic retryable `RateLimit`, which honors the
-    /// relay's `Retry-After`. The paid path's body-less `AuthFailure`/`RateLimit`
-    /// collapse is unchanged for every other status.
-    pub(crate) fn with_keyless(mut self, keyless: bool) -> Self {
-        self.keyless = keyless;
+    /// relay's `Retry-After`. The paid path's body-less
+    /// `AuthFailure`/`RateLimit` collapse is unchanged for every other status.
+    pub(crate) fn with_anonymous(mut self, anonymous: bool) -> Self {
+        self.anonymous = anonymous;
         self
     }
 
-    /// Fold the configured extra headers into a request builder.
+    /// Ensure an anonymous OpenCode Zen request declares a tool named `read`.
     ///
-    /// Applied to every wire call (connection test, model listing, chat
-    /// completion) so a client-identity header never silently skips a leg.
-    fn apply_extra_headers(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    /// The relay's free-tier branch accepts a credential-less completion only
+    /// when the request's `tools` include a function named `read` — a
+    /// name-only check (schema content is ignored) that the real OpenCode
+    /// client always satisfies by declaring its builtin `read` (live-verified
+    /// 2026-10-18: `read` alone passes; `bash`/`edit`/`glob`/`grep`/`write` do
+    /// not unlock it, and extra tools are tolerated). The declaration is only
+    /// injected on the anonymous path: keyed requests keep exactly the
+    /// caller's tool surface. A model that emits `read(...)` executes as the
+    /// native `filesystem` tool with `operation: "read"` through
+    /// `concerto_core::executor::resolve_wire_builtin`.
+    fn ensure_anonymous_read_tool(&self, request: &mut CompletionRequest) {
+        if !self.anonymous {
+            return;
+        }
+        let tools = request.tools.get_or_insert_with(Vec::new);
+        if tools.iter().any(|tool| tool.name == "read") {
+            return;
+        }
+        tools.push(ToolDefinition {
+            name: "read".to_string(),
+            description: "Read a file from the filesystem before editing it.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file to read (relative to the project root, or absolute)."
+                    }
+                },
+                "required": ["path"]
+            }),
+        });
+    }
+
+    /// Fold the configured extra headers and any per-request headers into a
+    /// request builder.
+    ///
+    /// The static `extra_headers` (client surface) apply to every wire call
+    /// (connection test, model listing, chat completion) so a client-identity
+    /// header never silently skips a leg. `per_request` carries the identity
+    /// headers that vary per completion (session, request id); it is empty for
+    /// the non-completion legs and for connectors that have none.
+    fn apply_extra_headers(
+        &self,
+        request: reqwest::RequestBuilder,
+        per_request: &[(String, String)],
+    ) -> reqwest::RequestBuilder {
         self.extra_headers
             .iter()
+            .chain(per_request.iter())
             .fold(request, |builder, (name, value)| builder.header(name.as_str(), value.as_str()))
     }
 
@@ -733,48 +779,20 @@ impl OpenAiStreamState {
     }
 }
 
-#[async_trait]
-impl LlmProvider for OpenAiProvider {
-    async fn test_connection(&self, _cancel: CancellationToken) -> Result<(), ProviderError> {
-        let client = crate::new_client(self.timeout_secs);
-        let url = format!("{}/models", self.api_base);
-        let request = self.apply_extra_headers(client.get(&url).bearer_auth(self.api_key.expose()));
-        crate::probe_connection(request, "openai", &[401], crate::unredacted).await
-    }
-
-    async fn list_models(
-        &self,
-        _cancel: CancellationToken,
-    ) -> Result<Vec<ModelInfo>, ProviderError> {
-        let client = crate::new_client(self.timeout_secs);
-        let url = format!("{}/models", self.api_base);
-        let request = self.apply_extra_headers(client.get(&url).bearer_auth(self.api_key.expose()));
-        crate::list_models_json(request, "openai", crate::unredacted, |json| {
-            json["data"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| {
-                            let id = v["id"].as_str()?.to_string();
-                            let owned_by = v["owned_by"].as_str().map(String::from);
-                            Some(ModelInfo {
-                                id: id.clone(),
-                                name: Some(id),
-                                owned_by,
-                                supports_tool_calling: None,
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default()
-        })
-        .await
-    }
-
-    async fn stream_completion(
+impl OpenAiProvider {
+    /// Stream a Chat Completions call carrying per-request identity headers.
+    ///
+    /// The connection test and model listing send only the connector's
+    /// static extra headers; a completion additionally carries the
+    /// per-request headers its caller supplies (the OpenCode session/request
+    /// identity — see `crate::opencode`). `per_request` is empty for every
+    /// direct caller, so a plain OpenAI-compatible connector's wire output
+    /// is unchanged.
+    pub(crate) async fn stream_completion_with_extra_headers(
         &self,
         request: CompletionRequest,
         cancel: CancellationToken,
+        per_request: &[(String, String)],
     ) -> Result<CompletionStream, ProviderError> {
         let span = tracing::info_span!("openai_stream_completion", model = %self.model);
         let _guard = span.enter();
@@ -792,19 +810,20 @@ impl LlmProvider for OpenAiProvider {
         // arguments arrive whole. Strict models are untouched — their wire
         // output stays byte-identical (streamed).
         //
-        // The keyless OpenCode Zen path is the one exception: its fingerprint
-        // gate refuses `stream: false` outright, so the weak-tier transport
-        // downgrade must never apply there. Streaming stays on and tool-call
-        // arguments rely on the existing `tool_args` repair machinery — which
-        // is exactly why streaming repair exists.
+        // The anonymous OpenCode Zen path is the one exception: the relay's
+        // anonymous branch serves only streamed completions, so the weak-tier
+        // transport downgrade must never apply there. Streaming stays on and
+        // tool-call arguments rely on the existing `tool_args` repair
+        // machinery — which is exactly why streaming repair exists.
         let mut request = request;
+        self.ensure_anonymous_read_tool(&mut request);
         let resolved_mode = crate::capability::resolve_tool_schema_mode(
             self.provider_name(),
             &model,
             self.tool_schema_mode,
             self.advertised_tool_support,
         );
-        let tool_adapted = !self.keyless
+        let tool_adapted = !self.anonymous
             && crate::adapters::schema_loose::non_streaming_transport_active(resolved_mode, &model);
         if tool_adapted {
             if let Some(tools) = request.tools.as_mut() {
@@ -834,6 +853,7 @@ impl LlmProvider for OpenAiProvider {
                         .header("Authorization", format!("Bearer {}", self.api_key.expose()))
                         .header("Content-Type", "application/json")
                         .json(&body),
+                    per_request,
                 )
                 .send()
                 .await
@@ -849,7 +869,7 @@ impl LlmProvider for OpenAiProvider {
                 status,
                 &text,
                 retry_after,
-                self.keyless,
+                self.anonymous,
             ));
         }
 
@@ -933,6 +953,55 @@ impl LlmProvider for OpenAiProvider {
         .boxed();
 
         Ok(s)
+    }
+}
+
+#[async_trait]
+impl LlmProvider for OpenAiProvider {
+    async fn test_connection(&self, _cancel: CancellationToken) -> Result<(), ProviderError> {
+        let client = crate::new_client(self.timeout_secs);
+        let url = format!("{}/models", self.api_base);
+        let request =
+            self.apply_extra_headers(client.get(&url).bearer_auth(self.api_key.expose()), &[]);
+        crate::probe_connection(request, "openai", &[401], crate::unredacted).await
+    }
+
+    async fn list_models(
+        &self,
+        _cancel: CancellationToken,
+    ) -> Result<Vec<ModelInfo>, ProviderError> {
+        let client = crate::new_client(self.timeout_secs);
+        let url = format!("{}/models", self.api_base);
+        let request =
+            self.apply_extra_headers(client.get(&url).bearer_auth(self.api_key.expose()), &[]);
+        crate::list_models_json(request, "openai", crate::unredacted, |json| {
+            json["data"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| {
+                            let id = v["id"].as_str()?.to_string();
+                            let owned_by = v["owned_by"].as_str().map(String::from);
+                            Some(ModelInfo {
+                                id: id.clone(),
+                                name: Some(id),
+                                owned_by,
+                                supports_tool_calling: None,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .await
+    }
+
+    async fn stream_completion(
+        &self,
+        request: CompletionRequest,
+        cancel: CancellationToken,
+    ) -> Result<CompletionStream, ProviderError> {
+        self.stream_completion_with_extra_headers(request, cancel, &[]).await
     }
 
     fn context_capacity(&self, model: &str) -> TokenBudget {
@@ -1502,6 +1571,76 @@ mod tests {
         let default = OpenAiProvider::new("test-key".to_string(), "test-model".into(), 15);
         let body = default.render_body(&streamed, "test-model");
         assert!(body.get("stream_options").is_none(), "the default policy writes nothing");
+    }
+
+    // -- Anonymous OpenCode Zen `read` tool declaration ---------------------
+
+    /// Anonymous OpenCode Zen requests must declare a tool named `read`: the
+    /// relay's free-tier branch rejects credential-less completions whose
+    /// `tools` lack it (name-only check — live-verified 2026-10-18). The
+    /// injected declaration mirrors the real client's builtin `read`; a model
+    /// that emits `read(...)` executes as `filesystem` `operation: "read"`
+    /// through `resolve_wire_builtin`.
+    #[test]
+    fn anonymous_request_gains_read_tool() {
+        let provider =
+            OpenAiProvider::new("public".to_string(), "big-pickle".into(), 15).with_anonymous(true);
+        let mut request = CompletionRequest { messages: vec![], ..Default::default() };
+        provider.ensure_anonymous_read_tool(&mut request);
+        let body = provider.render_body(&request, "big-pickle");
+        let tools = body["tools"].as_array().expect("the injected read tool is rendered");
+        assert_eq!(tools.len(), 1, "only the injected declaration is present");
+        assert_eq!(tools[0]["function"]["name"], "read");
+        assert_eq!(tools[0]["function"]["parameters"]["required"][0], "path");
+    }
+
+    /// The injection appends, never duplicates: a caller that already declares
+    /// `read` keeps its own declaration byte-for-byte, and other tools are
+    /// retained alongside the injected one.
+    #[test]
+    fn anonymous_read_tool_injection_appends_without_duplicating() {
+        let provider =
+            OpenAiProvider::new("public".to_string(), "big-pickle".into(), 15).with_anonymous(true);
+        let caller_read = ToolDefinition {
+            name: "read".to_string(),
+            description: "the caller's own read".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        };
+        let filesystem = ToolDefinition {
+            name: "filesystem".to_string(),
+            description: "native filesystem".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        };
+        let mut with_read = CompletionRequest {
+            messages: vec![],
+            tools: Some(vec![caller_read.clone()]),
+            ..Default::default()
+        };
+        provider.ensure_anonymous_read_tool(&mut with_read);
+        let tools = with_read.tools.as_ref().expect("tools present");
+        assert_eq!(tools.len(), 1, "no duplicate read injected");
+        assert_eq!(tools[0], caller_read);
+
+        let mut without_read = CompletionRequest {
+            messages: vec![],
+            tools: Some(vec![filesystem.clone()]),
+            ..Default::default()
+        };
+        provider.ensure_anonymous_read_tool(&mut without_read);
+        let tools = without_read.tools.as_ref().expect("tools present");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0], filesystem);
+        assert_eq!(tools[1].name, "read");
+    }
+
+    /// Keyed (non-anonymous) requests keep exactly the caller's tool surface:
+    /// the relay gate only applies to the credential-less free tier.
+    #[test]
+    fn keyed_request_has_no_injected_read_tool() {
+        let provider = OpenAiProvider::new("test-key".to_string(), "test-model".into(), 15);
+        let mut request = CompletionRequest { messages: vec![], ..Default::default() };
+        provider.ensure_anonymous_read_tool(&mut request);
+        assert!(request.tools.is_none(), "keyed requests are untouched");
     }
 
     /// A non-streamed completion body (`stream: false`, the weak-model

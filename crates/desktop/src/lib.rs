@@ -45,6 +45,11 @@ pub fn run() -> iced::Result {
         .with_writer(application_log_writer())
         .init();
 
+    // The OpenCode relays mirror the upstream client's surface header. The
+    // desktop app presents itself as the desktop client; the CLI/binary paths
+    // keep the default ("cli"). Set once before any provider is constructed.
+    concerto_providers::set_opencode_client_surface("desktop");
+
     iced::application(
         project_launcher::DesktopApp::new,
         project_launcher::DesktopApp::update,

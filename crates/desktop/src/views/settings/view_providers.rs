@@ -75,7 +75,7 @@ impl State {
                     text("Ready").size(12).color(palette.text_muted).into()
                 };
 
-            // Credential indicator: distinguish required / optional / keyless.
+            // Credential indicator: distinguish required / optional / anonymous.
             let key_text: Element<'_, Message> = match def.credential_requirement {
                 CredentialRequirement::None => {
                     text("Local / no key").size(12).color(palette.text_muted).into()

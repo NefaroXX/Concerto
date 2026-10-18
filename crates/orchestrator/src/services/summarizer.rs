@@ -63,6 +63,7 @@ impl concerto_memory::summarizer::LLMSummarizer for ProviderSummarizer {
         request_messages.extend_from_slice(messages);
 
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             model: self.model.clone(),
             messages: request_messages,
