@@ -137,6 +137,11 @@ CLI SUBCOMMANDS:
     concerto --cli shell <list|test|select|managed ACTION>
     concerto --cli shell [exec COMMAND ARG ...]
     concerto --cli shell security <show|validate FILE|apply FILE>
+    concerto run [PROMPT] [OPTIONS]
+        Run one agent task headlessly (PROMPT or `-` reads stdin) and exit
+        with a status code 0 done | 1 error | 2 needs_user |
+        3 awaiting_approval | 4 blocked | 5 iteration_cap | 6 timeout.
+        See `concerto run --help`.
 
 CLI commands automatically select CLI mode when the 'cli' feature is enabled.
 Run `concerto config help` for settings scopes, typed values, and dry runs.",

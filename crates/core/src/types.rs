@@ -1713,6 +1713,21 @@ impl VerificationSummary {
     }
 }
 
+/// Prefix the single-agent loop writes into [`AgentOutput::final_message`] when
+/// the model signals it needs user input before continuing (`NeedsUser` arm of
+/// the continuation loop). Published so downstream status mapping matches the
+/// producer exactly instead of re-typing the prose: the headless `concerto run`
+/// interface classifies `Partial` outcomes by this prefix to pick
+/// `needs_user` (exit 2).
+pub const USER_INPUT_REQUIRED_PREFIX: &str = "User input required:";
+
+/// Prefix the single-agent loop writes into [`AgentOutput::final_message`] when
+/// the maximum continuation-round cap is reached. Published for the same reason
+/// as [`USER_INPUT_REQUIRED_PREFIX`]: the headless runner maps it to
+/// `iteration_cap` (exit 5). The numeric round count is appended by the producer
+/// as `(<n>)` — this constant covers only the stable prose prefix.
+pub const MAX_CONTINUATION_ROUNDS_PREFIX: &str = "Blocked: reached maximum continuation rounds";
+
 /// Explicit outcome of a single agent run attempt (`AgentLoop::run_once`).
 ///
 /// This replaces the previous "iteration cap = silent success" behavior.

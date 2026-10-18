@@ -593,7 +593,8 @@ impl AgentLoop {
                 }
                 AgentRunExit::NeedsUser { reason, partial } => {
                     let mut output = partial;
-                    output.final_message = format!("User input required: {reason}");
+                    output.final_message =
+                        format!("{} {reason}", concerto_core::types::USER_INPUT_REQUIRED_PREFIX);
                     output.completion_status = concerto_core::types::AgentCompletionStatus::Partial;
                     // Supremacy invariant: the exit is a Coordinator Decision
                     // row, not a silent return. Control flow is unchanged —
@@ -768,8 +769,10 @@ impl AgentLoop {
             provider_metrics: self.provider_metrics(),
             checkpoint_json: None,
         });
-        partial.final_message =
-            format!("Blocked: reached maximum continuation rounds ({MAX_CONTINUATION_ROUNDS}).");
+        partial.final_message = format!(
+            "{} ({MAX_CONTINUATION_ROUNDS}).",
+            concerto_core::types::MAX_CONTINUATION_ROUNDS_PREFIX
+        );
         partial.completion_status = concerto_core::types::AgentCompletionStatus::Partial;
         self.tool_executor
             .record_coordinator_decision(

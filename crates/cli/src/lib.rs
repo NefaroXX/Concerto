@@ -51,6 +51,7 @@ pub fn has_cli_subcommand(args: &[String]) -> bool {
                         | "credentials"
                         | "shell"
                         | "preferences"
+                        | "run"
                 )
             }
         }
@@ -76,6 +77,9 @@ pub const CLI_COMMAND_HELP: &str =
     sessions <list|show|events|cache|runtime|resume|prune>
     memory <graph|explain>   health [--json]   audit   logs <path|show>
     harness <environment|verify|checkpoint|memory> [--json]
+
+    run [PROMPT] [OPTIONS]   Run one agent task headlessly and exit with a
+    status code (see `concerto run --help`); PROMPT or `-` reads stdin.
 
 SETTINGS EXAMPLES:
     concerto config show --global
@@ -106,6 +110,14 @@ fn run_cli_inner(
     reduced_motion: Option<bool>,
     remaining: &[String],
 ) -> anyhow::Result<()> {
+    // `run` is a headless, one-shot subcommand that owns its own flags
+    // (`-m/-f/-p/--json/--approvals/--timeout`). Dispatch it before the
+    // TUI-oriented startup parsing so those flags are not consumed here and no
+    // terminal is ever entered.
+    if let Some(args) = headless_run_args(remaining) {
+        return dispatch::run::run_run_subcommand(args, None);
+    }
+
     // `--no-terminal-title` is a display opt-out handled here (not in
     // `parse_cli_args`) so `run_cli`'s signature stays stable: strip it from
     // the raw args before subcommand dispatch. There is no `--terminal-title`
@@ -184,10 +196,27 @@ fn run_cli_inner(
             "blueprint" => return settings::run_blueprint(&remaining[1..], &project_root),
             "credentials" => return settings::run_credentials(&remaining[1..]),
             "preferences" => return settings::run_preferences(&remaining[1..]),
+            // Reached only when a startup flag preceded `run` (e.g.
+            // `--project X run`): the headless fast path above already handled
+            // the common `run` / `--cli run` forms with their full flag set.
+            "run" => {
+                // Startup flags parsed before `run` (e.g. `concerto -m run ...`)
+                // were stripped by `invocation_args`; re-prepend them so `run`
+                // observes its own flags rather than silently dropping them.
+                let mut run_args: Vec<String> = Vec::new();
+                if multi_agent {
+                    run_args.push("-m".to_string());
+                }
+                if fast {
+                    run_args.push("-f".to_string());
+                }
+                run_args.extend_from_slice(&remaining[1..]);
+                return dispatch::run::run_run_subcommand(&run_args, Some(&project_root));
+            }
             other => {
                 eprintln!("error: unknown subcommand '{other}'");
                 eprintln!(
-                    "available subcommands: config, providers, sessions, projects, plugin, extensions, health, memory, audit, logs, agents, blueprint, credentials, shell, preferences"
+                    "available subcommands: config, providers, sessions, projects, plugin, extensions, health, memory, audit, logs, agents, blueprint, credentials, shell, preferences, run"
                 );
                 std::process::exit(1);
             }
@@ -1525,12 +1554,30 @@ pub fn startup_arguments(args: &[String]) -> &[String] {
     while index < args.len() {
         match args[index].as_str() {
             "--project" | "-p" | "--theme" => index += 2,
-            "shell" | "sessions" => return &args[..index],
+            "shell" | "sessions" | "run" => return &args[..index],
             value if value.starts_with('-') => index += 1,
             _ => break,
         }
     }
     args
+}
+
+/// Recognize the headless `run` command and return its own arguments.
+///
+/// Only a leading `--cli`/`-c` may precede `run`; any other token means this is
+/// not the headless fast path (the caller falls back to normal subcommand
+/// dispatch). `run`'s options are handed over verbatim so `-m`/`-f` are not
+/// swallowed by the TUI startup parser.
+fn headless_run_args(args: &[String]) -> Option<&[String]> {
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--cli" | "-c" => index += 1,
+            "run" => return Some(&args[index + 1..]),
+            _ => return None,
+        }
+    }
+    None
 }
 
 fn invocation_args(args: &[String]) -> anyhow::Result<(Vec<String>, Option<PathBuf>)> {
