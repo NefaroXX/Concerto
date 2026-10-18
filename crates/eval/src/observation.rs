@@ -717,6 +717,7 @@ mod tests {
             completion_status: AgentCompletionStatus::Completed,
             provider_metrics: Vec::new(),
             checkpoint_json: None,
+            provider_error_class: None,
         }
     }
 
@@ -772,6 +773,7 @@ mod tests {
             completion_status: AgentCompletionStatus::Completed,
             provider_metrics: Vec::new(),
             checkpoint_json: None,
+            provider_error_class: None,
         };
         let observation = observe_agent_output(&output, OffsetDateTime::UNIX_EPOCH);
         assert_eq!(observation.verifications.len(), MAX_OBSERVED_VERIFICATIONS);

@@ -166,6 +166,7 @@ mod tests {
             completion_status: AgentCompletionStatus::Partial,
             provider_metrics: vec![],
             checkpoint_json: None,
+            provider_error_class: None,
         }
     }
 

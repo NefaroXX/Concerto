@@ -768,6 +768,7 @@ impl AgentLoop {
             completion_status: concerto_core::types::AgentCompletionStatus::Partial,
             provider_metrics: self.provider_metrics(),
             checkpoint_json: None,
+            provider_error_class: None,
         });
         partial.final_message = format!(
             "{} ({MAX_CONTINUATION_ROUNDS}).",
@@ -989,7 +990,7 @@ impl AgentLoop {
                         "provider retries exhausted after {attempts} attempts \
                          ({elapsed:?}): {last_error}"
                     );
-                    let partial = self.build_agent_output(
+                    let mut partial = self.build_agent_output(
                         &task,
                         &final_message,
                         &files_modified,
@@ -998,6 +999,13 @@ impl AgentLoop {
                         &tool_events,
                         &verification,
                     );
+                    // Surface the failure class structurally on the Ok-path
+                    // `Blocked` output too, using the same single-source
+                    // constant the error-path classification publishes
+                    // (`failures.rs`), so a headless caller can branch on it
+                    // without parsing prose.
+                    partial.provider_error_class =
+                        Some(concerto_core::failures::PROVIDER_RETRIES_EXHAUSTED_CODE.to_string());
                     self.tool_executor
                         .record_coordinator_decision(
                             task.session_id,
@@ -1824,6 +1832,7 @@ impl AgentLoop {
             completion_status: concerto_core::types::AgentCompletionStatus::Partial,
             provider_metrics: self.provider_metrics(),
             checkpoint_json: None,
+            provider_error_class: None,
         }
     }
 
@@ -6746,6 +6755,11 @@ mod tests {
             "final_message should report retries exhausted, got: {}",
             output.final_message
         );
+        assert_eq!(
+            output.provider_error_class.as_deref(),
+            Some(concerto_core::failures::PROVIDER_RETRIES_EXHAUSTED_CODE),
+            "retry exhaustion must stamp the machine-readable failure class"
+        );
     }
 
     /// A provider that records how many times `stream_completion` is called and
@@ -7029,6 +7043,7 @@ mod tests {
             completion_status: concerto_core::types::AgentCompletionStatus::Partial,
             provider_metrics: vec![],
             checkpoint_json: None,
+            provider_error_class: None,
         };
         let fp = ProgressFingerprint::from_output(&output);
         assert_eq!(fp.files_modified, 2, "should count two modified files");
@@ -7143,6 +7158,7 @@ mod tests {
             completion_status: concerto_core::types::AgentCompletionStatus::Partial,
             provider_metrics: vec![],
             checkpoint_json: None,
+            provider_error_class: None,
         }
     }
 

@@ -3338,6 +3338,7 @@ mod tests {
             completion_status: concerto_core::types::AgentCompletionStatus::Completed,
             provider_metrics: vec![],
             checkpoint_json: None,
+            provider_error_class: None,
         }
     }
 

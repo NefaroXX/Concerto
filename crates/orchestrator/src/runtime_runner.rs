@@ -4518,6 +4518,7 @@ async fn drive_supervised_run(
         },
         provider_metrics: Vec::new(),
         checkpoint_json: None,
+        provider_error_class: None,
     })
 }
 

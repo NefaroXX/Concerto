@@ -1483,6 +1483,7 @@ fn run_summary_includes_changed_files() {
         completion_status: concerto_core::types::AgentCompletionStatus::Completed,
         provider_metrics: Vec::new(),
         checkpoint_json: None,
+        provider_error_class: None,
     };
     let summary = super::format_run_summary(&output);
     assert!(summary.contains("src/main.rs"), "summary must list the changed file: {summary}");
@@ -1506,6 +1507,7 @@ fn run_summary_includes_changed_files() {
         completion_status: concerto_core::types::AgentCompletionStatus::Completed,
         provider_metrics: Vec::new(),
         checkpoint_json: None,
+        provider_error_class: None,
     };
     assert_eq!(super::format_run_summary(&plain), "All done");
 }
@@ -1563,6 +1565,7 @@ fn agent_run_completed_clears_run_stage() {
             completion_status: AgentCompletionStatus::Completed,
             provider_metrics: Vec::new(),
             checkpoint_json: None,
+            provider_error_class: None,
         })),
     ));
     assert_eq!(app.run_status, RunStatus::Idle);
@@ -1748,6 +1751,7 @@ fn fresh_completion_without_specialists_clears_candidate_views() -> std::io::Res
             completion_status: AgentCompletionStatus::Completed,
             provider_metrics: vec![],
             checkpoint_json: None,
+            provider_error_class: None,
         })),
     ));
     assert!(app.agent_graph.model.nodes.is_empty());
