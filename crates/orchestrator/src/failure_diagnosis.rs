@@ -492,12 +492,6 @@ pub fn diagnose_provider(error: &concerto_core::error::ProviderError) -> Failure
         ProviderError::FreeTierRefused { .. } => {
             (FailureKind::Provider, "provider-free-tier-refused".to_owned())
         }
-        // The relay throttled the keyless free tier (429 shared anonymous
-        // pool): transient like a rate limit — retry the same agent, and an
-        // alternate pipe is viable if it keeps throttling.
-        ProviderError::FreeTierThrottled { .. } => {
-            (FailureKind::Provider, "provider-free-tier-throttled".to_owned())
-        }
         // A broken wire format will not heal on retry.
         ProviderError::Serialization(_) | ProviderError::InvalidResponse(_) => {
             (FailureKind::Provider, "malformed-provider-response".to_owned())
@@ -507,9 +501,6 @@ pub fn diagnose_provider(error: &concerto_core::error::ProviderError) -> Failure
             let code = match class.class {
                 Some(retry_class) => match retry_class {
                     concerto_providers::retry::RetryClass::RateLimited => "rate-limit".to_owned(),
-                    concerto_providers::retry::RetryClass::FreeTierThrottle => {
-                        "provider-free-tier-throttled".to_owned()
-                    }
                     concerto_providers::retry::RetryClass::Overloaded => {
                         "provider-overloaded".to_owned()
                     }
@@ -1381,26 +1372,6 @@ mod tests {
             !free_tier.transient && !free_tier.retryable && !free_tier.same_agent_viable,
             "a refused free tier must not be retried on the same agent"
         );
-
-        // A *throttled* free tier (429 shared pool) is transient like a rate
-        // limit: the same agent retries, and an alternate pipe is viable.
-        let free_tier_throttled =
-            diagnose(&OrchestratorError::Provider(ProviderError::FreeTierThrottled {
-                status: 429,
-                retry_after: Some(Duration::from_secs(2)),
-                message: "Rate limit exceeded. Please try again later.".into(),
-            }));
-        assert_eq!(free_tier_throttled.code, "provider-free-tier-throttled");
-        assert_eq!(free_tier_throttled.kind, FailureKind::Provider);
-        assert!(
-            free_tier_throttled.transient && free_tier_throttled.retryable,
-            "a throttled free tier must be retryable"
-        );
-        assert!(
-            free_tier_throttled.same_agent_viable && free_tier_throttled.alternate_agent_viable,
-            "a throttled free tier retries the same agent while an alternate pipe stays viable"
-        );
-        assert_eq!(recovery_action(&free_tier_throttled, 0, 3), RecoveryAction::RetrySame);
     }
 
     #[test]

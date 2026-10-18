@@ -192,11 +192,12 @@ pub const OPENCODE_FREE_KNOWN: &[&str] = &[
 /// freshly minted session fingerprints.
 ///
 /// Notes from the same probe session (why this list needs care):
-/// * The anonymous free tier enforces a **per-model quota window** (observed
-///   rolling over on ~hour boundaries): an exhausted model answers
-///   `429 FreeUsageLimitError "Rate limit exceeded"` to *every* client for the
-///   rest of the window while other free models keep serving. A 429 therefore
-///   reads model-local, not pool-wide; the whole roster recovers on rollover.
+/// * The anonymous free tier enforces an **IP-keyed daily allowance** at the
+///   relay (per UTC day; no per-model quota — default models share one
+///   bucket). An exhausted bucket answers `429 FreeUsageLimitError
+///   "Rate limit exceeded"` with `Retry-After` = seconds to the next UTC
+///   midnight; treat it as an ordinary rate limit (generic `RateLimit`
+///   handling, retries honored via `Retry-After`).
 /// * `glm-5.3-flash-free` requires each tool function to carry a
 ///   `description` (upstream `400` otherwise); the agent-loop requests always
 ///   send full schemas, so this only matters for minimal test payloads.

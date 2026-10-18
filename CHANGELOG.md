@@ -14,8 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`stream: true`, an `opencode/*` User-Agent, dev-tree-format `ses_`/`msg_`
   identity headers, and ≥3 opencode builtin tool names mapped onto the native
   shell/filesystem tools). A keyless refusal (403/410) surfaces as non-retryable
-  `FreeTierRefused`, while a per-model quota window (429) surfaces as
-  the retryable `FreeTierThrottled`; both preserve the relay body. The default
+  `FreeTierRefused`, while a keyless 429 is an ordinary rate limit on the
+  relay's shared, IP-keyed daily bucket (no per-model quota) and flows through
+  the generic retryable `RateLimit`, honoring `Retry-After`. The default
   free model set (`OPENCODE_ZEN_FREE_KNOWN`) was refreshed against the
   2026-10-18 relay roster (`beam-free`, `big-pickle`, `cat-jam-free`,
   `glm-5.3-flash-free`). `opencode-free`

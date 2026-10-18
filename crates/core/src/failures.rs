@@ -297,15 +297,6 @@ impl From<OrchestratorError> for ClassifiedFailure {
                          Configure an OpenCode credential to use the paid tier, or try a different \
                          free model later."
                     );
-                }
-                ProviderError::FreeTierThrottled { status, message, .. } => {
-                    audience = FailureAudience::User;
-                    code = "PROVIDER_FREE_TIER_THROTTLED".to_string();
-                    user_message = format!(
-                        "The OpenCode free tier momentarily throttled the request (HTTP {status}): \
-                         {message} This is a shared anonymous pool; a brief wait and retry usually \
-                         clears it. Configure an OpenCode credential to leave the shared pool."
-                    );
                 } // No `_` arm on purpose (ADR-54): every current variant maps to
                   // a specific code, and adding a new variant must fail
                   // compilation so its classification is decided consciously.
@@ -611,11 +602,6 @@ mod tests {
                 status: 403,
                 retry_after: None,
                 message: "OpenCode's free tier can only be used from within OpenCode.".into(),
-            },
-            ProviderError::FreeTierThrottled {
-                status: 429,
-                retry_after: Some(std::time::Duration::from_secs(2)),
-                message: "Rate limit exceeded. Please try again later.".into(),
             },
         ];
         for error in errors {

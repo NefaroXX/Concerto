@@ -296,11 +296,12 @@ pub enum ProviderError {
     /// (fingerprint mismatch) or `410 ModelDeprecated` (a retired free model
     /// still listed in the catalog). Neither heals on a short retry — the
     /// fingerprint does not change and a retired model stays retired — so this
-    /// is deliberately non-transient. A `429` shared-pool throttle is *not*
-    /// this variant; it is the retryable [`Self::FreeTierThrottled`]. The
-    /// relay's own body text carries the actionable cause and is preserved
-    /// verbatim rather than collapsing to a bare [`Self::AuthFailure`].
-    /// Configure a real credential to use the paid tier.
+    /// is deliberately non-transient. A `429` from the relay is *not* this
+    /// variant; it is an ordinary rate limit and flows through the retryable
+    /// [`Self::RateLimit`] path. The relay's own body text carries the
+    /// actionable cause and is preserved verbatim rather than collapsing to a
+    /// bare [`Self::AuthFailure`]. Configure a real credential to use the paid
+    /// tier.
     #[error("opencode free tier refused the request (HTTP {status}): {message}")]
     FreeTierRefused {
         /// HTTP status from the relay (403 fingerprint gate, 410 deprecated
@@ -308,30 +309,6 @@ pub enum ProviderError {
         status: u16,
         /// Relay `Retry-After` hint when one was present (hint only; this
         /// variant is never auto-retried).
-        retry_after: Option<Duration>,
-        /// Relay response body text, preserved verbatim for the user.
-        message: String,
-    },
-
-    /// An anonymous (keyless) OpenCode Zen request was throttled by the
-    /// relay's shared free-tier pool.
-    ///
-    /// The keyless Zen endpoint is fronted by a shared anonymous pool; when
-    /// the pool refuses a burst it answers `429 FreeUsageLimitError`. Live
-    /// evidence (2026-10-17/18: the relay refused in bursts and recovered
-    /// within seconds; the real OpenCode client's own stack auto-retries these
-    /// 429s) shows this is a *transient* throttle, not a permanent verdict —
-    /// the same request slots in on retry. The single-agent loop therefore
-    /// retries it with backoff, honoring the relay's `Retry-After` when
-    /// present and falling back to the standard policy backoff when absent.
-    /// Distinct from the permanent [`Self::FreeTierRefused`] fingerprint gate
-    /// (403) and model deprecation (410). The relay's body text is preserved
-    /// verbatim.
-    #[error("opencode free tier throttled the request (HTTP {status}): {message}")]
-    FreeTierThrottled {
-        /// HTTP status from the relay (429 shared-pool throttle).
-        status: u16,
-        /// Relay `Retry-After` hint when one was present.
         retry_after: Option<Duration>,
         /// Relay response body text, preserved verbatim for the user.
         message: String,
@@ -370,10 +347,6 @@ impl ProviderError {
             // fingerprint will not change and a retired model stays retired,
             // so backoff cannot help.
             ProviderError::FreeTierRefused { .. } => false,
-            // A keyless free-tier *throttle* (429 shared-pool burst) is
-            // transient: live evidence shows the pool recovers within seconds,
-            // so it is retried with backoff (honoring `Retry-After`).
-            ProviderError::FreeTierThrottled { .. } => true,
             // Everything below here is configuration, auth, or cancellation
             ProviderError::NotConfigured
             | ProviderError::CredentialMissing { .. }
@@ -408,7 +381,6 @@ impl ProviderError {
             ProviderError::RateLimit { retry_after } => Some(*retry_after),
             ProviderError::HttpStatus { retry_after, .. } => *retry_after,
             ProviderError::FreeTierRefused { retry_after, .. } => *retry_after,
-            ProviderError::FreeTierThrottled { retry_after, .. } => *retry_after,
             ProviderError::RetryExhausted { retry_after, .. } => *retry_after,
             _ => None,
         }
