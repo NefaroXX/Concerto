@@ -291,21 +291,24 @@ pub enum ProviderError {
     ///
     /// The Zen free tier is a courtesy, keyless endpoint gated by a
     /// client-fingerprint check (session-id format, accepted `User-Agent`, a
-    /// streaming tool-bearing body). The relay can refuse a request with
-    /// `403 FreeTierError` (fingerprint mismatch), `410 ModelDeprecated` (a
-    /// retired free model still listed in the catalog), or `429` (anonymous
-    /// per-IP quota exhausted). None of these heal on a short retry — the
-    /// fingerprint does not change and the quota is time-windowed — so this is
-    /// deliberately non-transient. The relay's own body text carries the
+    /// streaming tool-bearing body), and it lists a small set of zero-priced
+    /// models. The relay can refuse a request with `403 FreeTierError`
+    /// (fingerprint mismatch) or `410 ModelDeprecated` (a retired free model
+    /// still listed in the catalog). Neither heals on a short retry — the
+    /// fingerprint does not change and a retired model stays retired — so this
+    /// is deliberately non-transient. A `429` from the relay is *not* this
+    /// variant; it is an ordinary rate limit and flows through the retryable
+    /// [`Self::RateLimit`] path. The relay's own body text carries the
     /// actionable cause and is preserved verbatim rather than collapsing to a
     /// bare [`Self::AuthFailure`]. Configure a real credential to use the paid
     /// tier.
     #[error("opencode free tier refused the request (HTTP {status}): {message}")]
     FreeTierRefused {
         /// HTTP status from the relay (403 fingerprint gate, 410 deprecated
-        /// model, 429 anonymous quota).
+        /// model).
         status: u16,
-        /// Relay `Retry-After` hint when one was present (429 quota windows).
+        /// Relay `Retry-After` hint when one was present (hint only; this
+        /// variant is never auto-retried).
         retry_after: Option<Duration>,
         /// Relay response body text, preserved verbatim for the user.
         message: String,
@@ -339,9 +342,10 @@ impl ProviderError {
             // A capability refusal is a permanent wire-path fact — retrying
             // cannot add a capability the path lacks (ADR-66).
             ProviderError::CapabilityRefused { .. } => false,
-            // A keyless free-tier refusal is a fingerprint/quota verdict, not
-            // a transient fault: the fingerprint will not change and the
-            // anonymous quota is time-windowed, so backoff cannot help.
+            // A keyless free-tier refusal (403 fingerprint gate / 410 retired
+            // model) is a permanent verdict, not a transient fault: the
+            // fingerprint will not change and a retired model stays retired,
+            // so backoff cannot help.
             ProviderError::FreeTierRefused { .. } => false,
             // Everything below here is configuration, auth, or cancellation
             ProviderError::NotConfigured

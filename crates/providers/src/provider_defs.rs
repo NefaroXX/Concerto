@@ -188,18 +188,37 @@ pub const OPENCODE_FREE_KNOWN: &[&str] = &[
 ];
 
 /// Free model IDs live-verified as served by the OpenCode **Zen** relay for an
-/// anonymous (keyless) client on 2026-10-17.
+/// anonymous (keyless) client, probed **2026-10-18 03:58–04:05 UTC** with
+/// freshly minted session fingerprints.
+///
+/// Notes from the same probe session (why this list needs care):
+/// * The anonymous free tier enforces an **IP-keyed daily allowance** at the
+///   relay (per UTC day; no per-model quota — default models share one
+///   bucket). An exhausted bucket answers `429 FreeUsageLimitError
+///   "Rate limit exceeded"` with `Retry-After` = seconds to the next UTC
+///   midnight; treat it as an ordinary rate limit (generic `RateLimit`
+///   handling, retries honored via `Retry-After`).
+/// * `glm-5.3-flash-free` requires each tool function to carry a
+///   `description` (upstream `400` otherwise); the agent-loop requests always
+///   send full schemas, so this only matters for minimal test payloads.
+/// * `deepseek-v4.1-flash-free` is in the relay catalog but rejected our
+///   minimal tool-trio probe shape (`400`, empty body) — serviceability
+///   unconfirmed, so it is deliberately excluded from defaults.
+/// * `longcat-2.5-preview-free` served `200` on Zen too, but it also appears
+///   in the Go relay's roster; it stays out of this list on purpose so the
+///   two catalogs remain disjoint (see the disjointness guard in
+///   `provider_defs::tests` — shared ids risk wrong-wire-table pickups).
 ///
 /// Zen's raw catalog advertises 44 zero-priced ids, but membership probes with
 /// correctly minted session fingerprints found only a handful actually
 /// serving: several catalog entries are retired (`fledge-alpha-free` → `410`)
 /// or unreachable upstream (`deepseek-v4-flash-free`, `step-5-preview-free`,
-/// `x-preview-f-free` → `400 "Model is unavailable"`). These three answered
-/// `200` SSE — the practical keyless free tier. Kept deliberately tiny and
-/// hand-verified (never copied from the Go catalog, which is a distinct
-/// roster): live discovery still covers the long tail via the keyless
-/// `GET /zen/v1/models`.
-pub const OPENCODE_ZEN_FREE_KNOWN: &[&str] = &["beam-free", "big-pickle", "cat-jam-free"];
+/// `x-preview-f-free` → `400 "Model is unavailable"`). Kept deliberately tiny
+/// and hand-verified per probe session (never copied from the Go catalog,
+/// which is a distinct roster): live discovery still covers the long tail via
+/// the keyless `GET /zen/v1/models`.
+pub const OPENCODE_ZEN_FREE_KNOWN: &[&str] =
+    &["beam-free", "big-pickle", "cat-jam-free", "glm-5.3-flash-free"];
 
 /// Return the [`ProviderDefinition`] for a provider type string.
 ///

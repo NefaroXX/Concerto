@@ -139,7 +139,22 @@ cargo audit
   `resolve_wire_builtin` maps `bash`→`shell` and `read`/`edit`→`filesystem` —
   **never a general alias mechanism, keep it exactly that small**. Keyless
   fail-open exists **only** for provider type `opencode` (Zen); `opencode-free`
-  (Go relay) stays fail-closed `CredentialMissing`. Full spec:
+  (Go relay) stays fail-closed `CredentialMissing`. A keyless **429** is an
+  **ordinary rate limit**, not special free-tier gating: the Zen relay maps
+  every `RateLimitError`/`FreeUsageLimitError`/`GoUsageLimitError`/
+  `BlackUsageLimitError` to a plain `429` with a `Retry-After` header and an
+  `{type:"error",error:{type:<Class>,message}}` body. On the keyless tier it
+  is a **shared, IP-keyed daily bucket** — free models with no explicit
+  per-model `rateLimit` share one bucket per IP (TTL/`Retry-After` = seconds
+  to the next UTC midnight) — so there is **no per-model quota**: it flows
+  through the existing generic retryable `ProviderError::RateLimit
+  { retry_after }` and the single-agent loop retries it with backoff, honoring
+  `Retry-After`; the **403** fingerprint-gate and **410** deprecated-model
+  verdicts stay terminal `ProviderError::FreeTierRefused`.
+  The free roster itself churns; `OPENCODE_ZEN_FREE_KNOWN`
+  (`crates/providers/src/provider_defs.rs`) holds the last hand-verified set
+  and live discovery (`GET /zen/v1/models`) covers the rest.
+  Full spec:
   `/mnt/Temp/zen-free-tier-investigation.md` (mirror into the repo if plans
   change — prefer in-place facts over a `/tmp` path that may vanish).
 

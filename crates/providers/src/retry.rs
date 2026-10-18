@@ -183,12 +183,13 @@ pub fn classify_provider_error(error: &ProviderError) -> RetryDecision {
             reason: "request cancelled".into(),
         },
 
-        // A keyless free-tier refusal is a fingerprint/quota verdict. It is
-        // deliberately non-retryable: the client fingerprint cannot change
-        // within one process, and the anonymous quota is time-windowed (a
-        // backoff would only burn attempts). The relay's `Retry-After`, when
-        // present, is still surfaced as a hint so a caller can hold and retry
-        // after the window if it chooses.
+        // A keyless free-tier refusal is a permanent relay verdict: the 403
+        // fingerprint gate cannot change within one process, and a 410
+        // deprecated model never heals. Deliberately non-retryable. (A 429
+        // from the relay is NOT this variant — it is an ordinary rate limit on
+        // the shared IP-keyed daily bucket and flows through `RateLimit`.) The
+        // relay's `Retry-After`, when present, is still surfaced as a hint so a
+        // caller can hold and retry after the window if it chooses.
         ProviderError::FreeTierRefused { retry_after, message, .. } => RetryDecision {
             retryable: false,
             class: None,
@@ -579,12 +580,19 @@ pub fn map_http_error(
 /// free-tier causes verbatim.
 ///
 /// The generic [`map_http_error`] collapses `401`/`403` to a bare
-/// [`ProviderError::AuthFailure`] (which discards the body) and `429` to a
-/// retryable [`ProviderError::RateLimit`]. For a **keyless** `opencode` call
-/// neither is right: the relay's `403 FreeTierError`, `410 ModelDeprecated`,
-/// and `429` (anonymous per-IP quota) all carry the actionable cause in the
-/// body, and none of them heal on a short backoff. Those statuses therefore
-/// map to [`ProviderError::FreeTierRefused`] with the body preserved.
+/// [`ProviderError::AuthFailure`] (which discards the body). For a **keyless**
+/// `opencode` call the relay's verdicts carry the actionable cause in the body:
+///
+/// * `403 FreeTierError` (client-fingerprint gate) and `410 ModelDeprecated`
+///   (retired free model) are permanent verdicts, mapped to
+///   [`ProviderError::FreeTierRefused`] (never auto-retried).
+/// * `429` is an *ordinary* rate limit — the relay maps every
+///   `FreeUsageLimitError`/`RateLimitError`/`GoUsageLimitError`/
+///   `BlackUsageLimitError` to a plain `429` plus a `Retry-After` header. On the
+///   keyless tier it is a shared, IP-keyed daily bucket (seconds to the next
+///   UTC midnight), not a per-model quota, so it maps to the same retryable
+///   [`ProviderError::RateLimit`] used for any other 429 and honors the relay's
+///   `Retry-After`.
 ///
 /// Every other status, and every authenticated (paid) call, delegates to
 /// [`map_http_error`] unchanged, so paid wire behavior is untouched.
@@ -598,13 +606,16 @@ pub fn map_opencode_http_error(
         return map_http_error(status, body, retry_after);
     }
     match status.as_u16() {
-        // The fingerprint gate (403), a retired-but-still-listed free model
-        // (410), and the anonymous quota cap (429) are all free-tier verdicts.
-        403 | 410 | 429 => ProviderError::FreeTierRefused {
+        // The fingerprint gate (403) and a retired-but-still-listed free model
+        // (410) are permanent free-tier verdicts.
+        403 | 410 => ProviderError::FreeTierRefused {
             status: status.as_u16(),
             retry_after,
             message: body.to_string(),
         },
+        // Any keyless 429 is an ordinary rate limit on the shared IP-keyed
+        // daily bucket — delegate to the generic 429 shape (retryable
+        // `RateLimit`, `Retry-After` honored, 5s fallback).
         _ => map_http_error(status, body, retry_after),
     }
 }
@@ -1012,6 +1023,26 @@ mod tests {
         assert!(error.is_throttle_exhaustion());
     }
 
+    /// A keyless Zen 429 exhaustion retains the throttle cause, so the
+    /// coordinator can hold retry or recover onto an alternate pipe — same
+    /// semantics as any other 429 `RateLimit` ceiling, because the keyless 429
+    /// maps to the very same generic retryable shape.
+    #[tokio::test]
+    async fn exhausted_keyless_429_carries_throttled_cause() {
+        let error = exhaust(map_opencode_http_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Rate limit exceeded. Please try again later.",
+            Some(Duration::from_secs(1)),
+            true,
+        ))
+        .await;
+        assert!(
+            matches!(&error, ProviderError::RetryExhausted { throttled: true, .. }),
+            "a keyless 429 exhaustion must retain the throttle cause: {error:?}"
+        );
+        assert!(error.is_throttle_exhaustion());
+    }
+
     /// A 5xx-ceiling exhaustion is also throttle/transient-5xx — recoverable.
     #[tokio::test]
     async fn exhausted_5xx_carries_throttled_cause() {
@@ -1073,10 +1104,12 @@ mod tests {
         }
     }
 
-    /// Keyless 410 (deprecated model) and 429 (anonymous quota) both map to
-    /// `FreeTierRefused`; the 429 keeps its `Retry-After` hint.
+    /// Keyless 410 (deprecated model) maps to the permanent `FreeTierRefused`,
+    /// while a keyless 429 maps to the *ordinary* retryable `RateLimit` (the
+    /// shared IP-keyed daily bucket is not a per-model quota) and keeps its
+    /// `Retry-After` hint.
     #[test]
-    fn keyless_410_and_429_map_to_free_tier_refused() {
+    fn keyless_410_refused_and_429_is_generic_rate_limit() {
         match map_opencode_http_error(http_status(410), "ModelDeprecated", None, true) {
             ProviderError::FreeTierRefused { status, message, .. } => {
                 assert_eq!(status, 410);
@@ -1091,11 +1124,22 @@ mod tests {
             Some(Duration::from_secs(42)),
             true,
         ) {
-            ProviderError::FreeTierRefused { status, retry_after, .. } => {
-                assert_eq!(status, 429);
-                assert_eq!(retry_after, Some(Duration::from_secs(42)), "the hint survives");
+            ProviderError::RateLimit { retry_after } => {
+                assert_eq!(retry_after, Duration::from_secs(42), "the hint survives");
             }
-            other => panic!("expected FreeTierRefused for 429, got {other:?}"),
+            other => panic!("expected the generic RateLimit for a keyless 429, got {other:?}"),
+        }
+    }
+
+    /// A keyless 429 without a `Retry-After` header falls back to the same 5s
+    /// default the generic mapper uses for any 429.
+    #[test]
+    fn keyless_429_without_hint_uses_generic_fallback() {
+        match map_opencode_http_error(http_status(429), "slow down", None, true) {
+            ProviderError::RateLimit { retry_after } => {
+                assert_eq!(retry_after, Duration::from_secs(5));
+            }
+            other => panic!("expected the generic RateLimit fallback, got {other:?}"),
         }
     }
 
@@ -1136,20 +1180,67 @@ mod tests {
         }
     }
 
-    /// The classifier arm: `FreeTierRefused` is non-retryable, carries no
-    /// retry class, and surfaces the relay `Retry-After` as the designated
-    /// delay/hint rather than an automatic backoff.
+    /// The classifier arm: a permanent `FreeTierRefused` (403 fingerprint gate
+    /// / 410 retired model) is non-retryable, carries no retry class, and
+    /// surfaces the relay `Retry-After` as the designated delay/hint rather
+    /// than an automatic backoff.
     #[test]
     fn free_tier_refused_classifies_non_retryable_with_hint() {
         let decision = classify_provider_error(&ProviderError::FreeTierRefused {
-            status: 429,
+            status: 403,
             retry_after: Some(Duration::from_secs(42)),
-            message: "anonymous quota".into(),
+            message: "fingerprint mismatch".into(),
         });
         assert!(!decision.retryable, "a free-tier refusal must not auto-retry");
         assert_eq!(decision.class, None);
         assert_eq!(decision.provider_delay, Some(Duration::from_secs(42)));
-        assert!(decision.reason.contains("anonymous quota"));
+        assert!(decision.reason.contains("fingerprint mismatch"));
+    }
+
+    /// The classifier arm: a keyless 429 (`RateLimit`) IS retryable with the
+    /// shared `RateLimited` class, and surfaces the relay `Retry-After` when
+    /// present.
+    #[test]
+    fn keyless_429_classifies_retryable_with_rate_limited_class() {
+        let error = map_opencode_http_error(
+            http_status(429),
+            "Rate limit exceeded. Please try again later.",
+            Some(Duration::from_secs(2)),
+            true,
+        );
+        let decision = classify_provider_error(&error);
+        assert!(decision.retryable, "a keyless 429 must auto-retry");
+        assert_eq!(decision.class, Some(RetryClass::RateLimited));
+        assert_eq!(decision.provider_delay, Some(Duration::from_secs(2)));
+    }
+
+    /// A keyless 429 carrying `Retry-After` honors the provider delay (mirrors
+    /// the generic RateLimit path), overriding a configured fixed delay.
+    #[test]
+    fn keyless_429_honors_retry_after() {
+        let policy = RetryPolicy::new(RetryConfig {
+            fixed_delay_ms: Some(10_000),
+            respect_retry_after: true,
+            jitter: false,
+            ..RetryConfig::default()
+        });
+        let state = RetryState { attempt: 1, started_at: Instant::now() };
+        let error = map_opencode_http_error(
+            http_status(429),
+            "Rate limit exceeded. Please try again later.",
+            Some(Duration::from_secs(3)),
+            true,
+        );
+        let decision = classify_provider_error(&error);
+        assert!(decision.retryable);
+        assert_eq!(decision.class, Some(RetryClass::RateLimited));
+        match policy.evaluate(&state, &decision) {
+            RetryOutcome::RetryAfter { delay, source, .. } => {
+                assert_eq!(delay, Duration::from_secs(3));
+                assert_eq!(source, RetryDelaySource::ProviderHeader);
+            }
+            other => panic!("expected retry, got {other:?}"),
+        }
     }
 
     /// Drive a single transient failure through the retry loop with a
