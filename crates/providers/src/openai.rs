@@ -171,10 +171,11 @@ impl OpenAiProvider {
     ///
     /// Crate-private: only the OpenCode wrapper calls it, for the keyless Zen
     /// path (see `crate::opencode`). When set, HTTP 403/410 responses keep the
-    /// relay's body text (as the permanent `FreeTierRefused`) and a 429 shared
-    /// pool throttle keeps it as the retryable `FreeTierThrottled`, instead of
-    /// collapsing to the body-less `AuthFailure`/`RateLimit` used by the paid
-    /// path.
+    /// relay's body text (as the permanent `FreeTierRefused`), while a 429 —
+    /// an ordinary rate limit on the relay's shared IP-keyed daily bucket —
+    /// flows through the generic retryable `RateLimit`, which honors the
+    /// relay's `Retry-After`. The paid path's body-less `AuthFailure`/`RateLimit`
+    /// collapse is unchanged for every other status.
     pub(crate) fn with_keyless(mut self, keyless: bool) -> Self {
         self.keyless = keyless;
         self
