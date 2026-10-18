@@ -15,9 +15,12 @@ const USAGE: &str = "usage: concerto [--project DIR] workspace COMMAND\n\
     search QUERY PATH ... [--json]\n\
     write PATH --stdin (--expect REVISION | --create) --yes [--json]\n\
     delete PATH --expect REVISION --yes [--json]\n\
+    diagnostics PATH.rs [--json]\n\
+    hover|definition|completion|references PATH.rs LINE UTF16_COLUMN [--json]\n\
 Read returns a revision for later write/delete. --raw is for redirected UTF-8\n\
 export to an external editor. Apply its edited text with write --stdin; edits\n\
-go through policy and audit. File size: 1 MiB; context/search: at most 32 files.";
+go through policy and audit. Language positions are zero-based; rust-analyzer\n\
+is required. File size: 1 MiB; context/search: at most 32 files.";
 
 #[derive(Debug, PartialEq, Eq)]
 struct Options {
@@ -28,12 +31,27 @@ struct Options {
     create: bool,
     json: bool,
     raw: bool,
+    line: u32,
+    character: u32,
 }
 
 fn parse(args: &[String]) -> anyhow::Result<Options> {
     let operation = args.first().ok_or_else(|| anyhow::anyhow!(USAGE))?.clone();
-    anyhow::ensure!(matches!(operation.as_str(), "list" | "read" | "context" | "search" | "write" | "delete"), "{USAGE}");
-    let mut options = Options { operation, paths: Vec::new(), query: String::new(), expected: None, create: false, json: false, raw: false };
+    anyhow::ensure!(
+        matches!(operation.as_str(), "list" | "read" | "context" | "search" | "write" | "delete" | "diagnostics" | "hover" | "definition" | "completion" | "references"),
+        "{USAGE}"
+    );
+    let mut options = Options {
+        operation,
+        paths: Vec::new(),
+        query: String::new(),
+        expected: None,
+        create: false,
+        json: false,
+        raw: false,
+        line: 0,
+        character: 0,
+    };
     let mut confirmed = false;
     let mut stdin = false;
     let mut literal = false;
@@ -47,13 +65,27 @@ fn parse(args: &[String]) -> anyhow::Result<Options> {
                 "--" => literal = true,
                 "--json" if !options.json => options.json = true,
                 "--raw" if options.operation == "read" && !options.raw => options.raw = true,
-                "--yes" if matches!(options.operation.as_str(), "write" | "delete") && !confirmed => confirmed = true,
+                "--yes"
+                    if matches!(options.operation.as_str(), "write" | "delete") && !confirmed =>
+                {
+                    confirmed = true
+                }
                 "--stdin" if options.operation == "write" && !stdin => stdin = true,
-                "--create" if options.operation == "write" && !options.create => options.create = true,
-                "--expect" if matches!(options.operation.as_str(), "write" | "delete") && options.expected.is_none() => {
+                "--create" if options.operation == "write" && !options.create => {
+                    options.create = true
+                }
+                "--expect"
+                    if matches!(options.operation.as_str(), "write" | "delete")
+                        && options.expected.is_none() =>
+                {
                     index += 1;
-                    let value = args.get(index).ok_or_else(|| anyhow::anyhow!("--expect requires a revision"))?;
-                    anyhow::ensure!(value.len() == 64 && value.bytes().all(|c| c.is_ascii_hexdigit()), "revision must be the 64-character hash returned by read");
+                    let value = args
+                        .get(index)
+                        .ok_or_else(|| anyhow::anyhow!("--expect requires a revision"))?;
+                    anyhow::ensure!(
+                        value.len() == 64 && value.bytes().all(|c| c.is_ascii_hexdigit()),
+                        "revision must be the 64-character hash returned by read"
+                    );
                     options.expected = Some(value.to_ascii_lowercase());
                 }
                 value if !value.starts_with('-') => options.paths.push(value.to_owned()),
@@ -68,12 +100,26 @@ fn parse(args: &[String]) -> anyhow::Result<Options> {
         options.query = options.paths.remove(0);
         anyhow::ensure!(!options.query.is_empty(), "query cannot be empty");
     }
-    if options.operation == "list" && options.paths.is_empty() { options.paths.push(".".into()); }
+    if options.operation == "list" && options.paths.is_empty() {
+        options.paths.push(".".into());
+    }
+    if matches!(options.operation.as_str(), "hover" | "definition" | "completion" | "references") {
+        anyhow::ensure!(options.paths.len() == 3, "language query requires PATH LINE UTF16_COLUMN");
+        options.line = options.paths[1].parse()?;
+        options.character = options.paths[2].parse()?;
+        options.paths.truncate(1);
+    }
     let multi = matches!(options.operation.as_str(), "search" | "context");
-    anyhow::ensure!(!options.paths.is_empty() && options.paths.len() <= if multi { 32 } else { 1 }, "invalid file count; {USAGE}");
+    anyhow::ensure!(
+        !options.paths.is_empty() && options.paths.len() <= if multi { 32 } else { 1 },
+        "invalid file count; {USAGE}"
+    );
     if matches!(options.operation.as_str(), "write" | "delete") {
         anyhow::ensure!(confirmed, "mutation requires --yes; {USAGE}");
-        anyhow::ensure!(options.create != options.expected.is_some(), "choose exactly one of --create or --expect REVISION");
+        anyhow::ensure!(
+            options.create != options.expected.is_some(),
+            "choose exactly one of --create or --expect REVISION"
+        );
     }
     anyhow::ensure!(options.operation != "write" || stdin, "write requires --stdin");
     Ok(options)
@@ -85,14 +131,22 @@ pub(crate) fn run(args: &[String], project: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
     let options = parse(args)?;
-    anyhow::ensure!(!options.raw || !std::io::stdout().is_terminal(), "--raw requires redirected stdout; use JSON for terminal-safe inspection");
+    anyhow::ensure!(
+        !options.raw || !std::io::stdout().is_terminal(),
+        "--raw requires redirected stdout; use JSON for terminal-safe inspection"
+    );
     let content = if options.operation == "write" {
-        anyhow::ensure!(!std::io::stdin().is_terminal(), "redirect the edited UTF-8 buffer to stdin");
+        anyhow::ensure!(
+            !std::io::stdin().is_terminal(),
+            "redirect the edited UTF-8 buffer to stdin"
+        );
         let mut bytes = Vec::new();
         std::io::stdin().take(MAX_DOCUMENT_BYTES as u64 + 1).read_to_end(&mut bytes)?;
         anyhow::ensure!(bytes.len() <= MAX_DOCUMENT_BYTES, "document exceeds 1 MiB limit");
         Some(String::from_utf8(bytes)?)
-    } else { None };
+    } else {
+        None
+    };
     let project = project.canonicalize()?;
     let config = concerto_config::load_config(None, Some(&project))?;
     let runtime = tokio::runtime::Runtime::new()?;
@@ -110,6 +164,7 @@ pub(crate) fn run(args: &[String], project: &Path) -> anyhow::Result<()> {
             let path = &options.paths[0];
             let value = match options.operation.as_str() {
                 "list" => service.workspace_list(path, cancel.clone()).await?,
+                "diagnostics" | "hover" | "definition" | "completion" | "references" => service.workspace_language(path, &options.operation, options.line, options.character, cancel.clone()).await?,
                 "read" => serde_json::to_value(service.workspace_read(path, cancel.clone()).await?)?,
                 "search" => service.workspace_search(&options.paths, &options.query, cancel.clone()).await?,
                 "context" => {
@@ -133,7 +188,8 @@ pub(crate) fn run(args: &[String], project: &Path) -> anyhow::Result<()> {
         result
     })?;
     if options.raw {
-        let content = value["content"].as_str().ok_or_else(|| anyhow::anyhow!("read returned no text"))?;
+        let content =
+            value["content"].as_str().ok_or_else(|| anyhow::anyhow!("read returned no text"))?;
         std::io::stdout().write_all(content.as_bytes())?;
     } else if options.json {
         println!("{}", serde_json::to_string(&value)?);
@@ -147,7 +203,9 @@ pub(crate) fn run(args: &[String], project: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    fn args(values: &[&str]) -> Vec<String> { values.iter().map(|value| (*value).into()).collect() }
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).into()).collect()
+    }
 
     #[test]
     fn mutations_require_confirmation_and_one_revision_mode() {
@@ -159,11 +217,16 @@ mod tests {
             vec!["write", "a", "--stdin", "--expect", "invalid", "--yes"],
             vec!["read", "a", "--raw", "--json"],
             vec!["search", "", "a"],
-        ] { assert!(parse(&args(&values)).is_err(), "{values:?}"); }
+        ] {
+            assert!(parse(&args(&values)).is_err(), "{values:?}");
+        }
         assert!(parse(&args(&["write", "a", "--stdin", "--create", "--yes"])).is_ok());
         let revision = "a".repeat(64);
         assert!(parse(&args(&["delete", "a", "--expect", &revision, "--yes"])).is_ok());
-        assert!(parse(&args(&["write", "a", "--stdin", "--expect", &revision, "--create", "--yes"])).is_err());
+        assert!(parse(&args(&[
+            "write", "a", "--stdin", "--expect", &revision, "--create", "--yes"
+        ]))
+        .is_err());
     }
 
     #[test]

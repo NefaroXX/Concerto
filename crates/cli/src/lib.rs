@@ -2832,4 +2832,3 @@ keyring_key = "providers/openai-1/api_key"
         assert_eq!(entries[0].result_facts.as_deref(), Some("exists=false"));
     }
 }
-

@@ -26,7 +26,10 @@ impl HarnessService {
         path: &str,
         cancel: CancellationToken,
     ) -> Result<Value, HarnessServiceError> {
-        Ok(self.invoke_executor("filesystem", json!({"operation": "list", "path": path}), cancel).await?.data)
+        Ok(self
+            .invoke_executor("filesystem", json!({"operation": "list", "path": path}), cancel)
+            .await?
+            .data)
     }
 
     /// Read complete UTF-8 text or fail; never return a truncated editable buffer.
@@ -35,10 +38,19 @@ impl HarnessService {
         path: &str,
         cancel: CancellationToken,
     ) -> Result<WorkspaceDocument, HarnessServiceError> {
-        let result = self.invoke_executor("filesystem", json!({
-            "operation": "read", "path": path, "max_bytes": MAX_DOCUMENT_BYTES,
-        }), cancel).await?;
-        let content = result.data["content"].as_str().ok_or_else(|| refused("filesystem returned no text"))?.to_owned();
+        let result = self
+            .invoke_executor(
+                "filesystem",
+                json!({
+                    "operation": "read", "path": path, "max_bytes": MAX_DOCUMENT_BYTES,
+                }),
+                cancel,
+            )
+            .await?;
+        let content = result.data["content"]
+            .as_str()
+            .ok_or_else(|| refused("filesystem returned no text"))?
+            .to_owned();
         let revision = blake3::hash(content.as_bytes()).to_hex().to_string();
         Ok(WorkspaceDocument { path: path.into(), content, revision })
     }
@@ -59,7 +71,13 @@ impl HarnessService {
         match expected {
             Some(revision) => self.workspace_check_revision(path, revision, cancel.clone()).await?,
             None => {
-                let result = self.invoke_executor("filesystem", json!({"operation": "exists", "path": path}), cancel.clone()).await?;
+                let result = self
+                    .invoke_executor(
+                        "filesystem",
+                        json!({"operation": "exists", "path": path}),
+                        cancel.clone(),
+                    )
+                    .await?;
                 if result.data["exists"] != false {
                     return Err(refused("create refused: path already exists"));
                 }
@@ -68,9 +86,16 @@ impl HarnessService {
         // Human edits must retain smart quotes, CRLF and every UTF-8 byte.
         // The model-text channel intentionally normalizes typography.
         let encoded = base64::engine::general_purpose::STANDARD.encode(content.as_bytes());
-        Ok(self.invoke_executor("filesystem", json!({
-            "operation": "write", "path": path, "content_b64": encoded,
-        }), cancel).await?.data)
+        Ok(self
+            .invoke_executor(
+                "filesystem",
+                json!({
+                    "operation": "write", "path": path, "content_b64": encoded,
+                }),
+                cancel,
+            )
+            .await?
+            .data)
     }
 
     pub async fn workspace_delete(
@@ -80,7 +105,10 @@ impl HarnessService {
         cancel: CancellationToken,
     ) -> Result<Value, HarnessServiceError> {
         self.workspace_check_revision(path, expected, cancel.clone()).await?;
-        Ok(self.invoke_executor("filesystem", json!({"operation": "delete", "path": path}), cancel).await?.data)
+        Ok(self
+            .invoke_executor("filesystem", json!({"operation": "delete", "path": path}), cancel)
+            .await?
+            .data)
     }
 
     async fn workspace_check_revision(
@@ -111,7 +139,9 @@ impl HarnessService {
         for path in paths {
             let document = self.workspace_read(path, cancel.clone()).await?;
             for (line, text) in document.content.lines().enumerate() {
-                if cancel.is_cancelled() { return Err(ToolError::Cancelled.into()); }
+                if cancel.is_cancelled() {
+                    return Err(ToolError::Cancelled.into());
+                }
                 if text.contains(query) {
                     if matches.len() == 1000 {
                         return Ok(json!({"matches": matches, "truncated": true}));
@@ -129,26 +159,41 @@ impl HarnessService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use concerto_core::executor::ToolExecutor;
     use concerto_core::policy::SimplePolicyEngine;
     use concerto_core::traits::policy::{AuditEntry, AuditLog};
     use concerto_core::types::{Condition, PolicyRule, SessionContext, ToolRegistry};
     use concerto_tools::filesystem::FilesystemTool;
+    use std::sync::Arc;
 
     struct Audit;
     #[async_trait::async_trait]
     impl AuditLog for Audit {
-        async fn record(&self, _: AuditEntry, _: CancellationToken) -> Result<(), concerto_core::error::PolicyError> { Ok(()) }
+        async fn record(
+            &self,
+            _: AuditEntry,
+            _: CancellationToken,
+        ) -> Result<(), concerto_core::error::PolicyError> {
+            Ok(())
+        }
     }
 
     fn service(root: &std::path::Path, deny: bool) -> HarnessService {
         let mut registry = ToolRegistry::default();
-        registry.register(Box::new(FilesystemTool::new(camino::Utf8PathBuf::from_path_buf(root.to_owned()).unwrap())));
-        let rule = if deny { PolicyRule::Deny(Condition::Always) } else { PolicyRule::AutoApprove(Condition::Always) };
+        registry.register(Box::new(FilesystemTool::new(
+            camino::Utf8PathBuf::from_path_buf(root.to_owned()).unwrap(),
+        )));
+        let rule = if deny {
+            PolicyRule::AutoDeny(Condition::Always)
+        } else {
+            PolicyRule::AutoApprove(Condition::Always)
+        };
         let policy = Arc::new(SimplePolicyEngine::new(vec![rule], Arc::new(Audit)));
         let executor = Arc::new(ToolExecutor::new(Arc::new(registry), policy));
-        HarnessService::new(executor, SessionContext::new(concerto_core::ids::Ulid::new(), root.to_owned()))
+        HarnessService::new(
+            executor,
+            SessionContext::new(concerto_core::ids::Ulid::new(), root.to_owned()),
+        )
     }
 
     #[tokio::test]
@@ -156,23 +201,60 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("file.txt");
         let text = "“Hello” 世界\r\n\tsecond line\r\n";
-        service(dir.path(), false).workspace_write("file.txt", text, None, CancellationToken::new()).await.unwrap();
+        service(dir.path(), false)
+            .workspace_write("file.txt", text, None, CancellationToken::new())
+            .await
+            .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), text.as_bytes());
-        let document = service(dir.path(), false).workspace_read("file.txt", CancellationToken::new()).await.unwrap();
+        let document = service(dir.path(), false)
+            .workspace_read("file.txt", CancellationToken::new())
+            .await
+            .unwrap();
         assert_eq!(document.content, text);
-        assert!(service(dir.path(), false).workspace_write("file.txt", "overwrite", None, CancellationToken::new()).await.is_err());
-        assert!(service(dir.path(), true).workspace_write("file.txt", "denied", Some(&document.revision), CancellationToken::new()).await.is_err());
+        assert!(service(dir.path(), false)
+            .workspace_write("file.txt", "overwrite", None, CancellationToken::new())
+            .await
+            .is_err());
+        assert!(service(dir.path(), true)
+            .workspace_write(
+                "file.txt",
+                "denied",
+                Some(&document.revision),
+                CancellationToken::new()
+            )
+            .await
+            .is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
         std::fs::write(&path, "external edit").unwrap();
-        assert!(service(dir.path(), false).workspace_write("file.txt", "stale", Some(&document.revision), CancellationToken::new()).await.is_err());
-        assert!(service(dir.path(), false).workspace_delete("file.txt", &document.revision, CancellationToken::new()).await.is_err());
+        assert!(service(dir.path(), false)
+            .workspace_write(
+                "file.txt",
+                "stale",
+                Some(&document.revision),
+                CancellationToken::new()
+            )
+            .await
+            .is_err());
+        assert!(service(dir.path(), false)
+            .workspace_delete("file.txt", &document.revision, CancellationToken::new())
+            .await
+            .is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "external edit");
-        let document = service(dir.path(), false).workspace_read("file.txt", CancellationToken::new()).await.unwrap();
+        let document = service(dir.path(), false)
+            .workspace_read("file.txt", CancellationToken::new())
+            .await
+            .unwrap();
         let cancel = CancellationToken::new();
         cancel.cancel();
-        assert!(service(dir.path(), false).workspace_delete("file.txt", &document.revision, cancel).await.is_err());
+        assert!(service(dir.path(), false)
+            .workspace_delete("file.txt", &document.revision, cancel)
+            .await
+            .is_err());
         assert!(path.exists());
-        service(dir.path(), false).workspace_delete("file.txt", &document.revision, CancellationToken::new()).await.unwrap();
+        service(dir.path(), false)
+            .workspace_delete("file.txt", &document.revision, CancellationToken::new())
+            .await
+            .unwrap();
         assert!(!path.exists());
     }
 
@@ -181,7 +263,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a"), "before\n界 match\nlast").unwrap();
         let harness = service(dir.path(), false);
-        let result = harness.workspace_search(&["a".into()], "match", CancellationToken::new()).await.unwrap();
+        let result = harness
+            .workspace_search(&["a".into()], "match", CancellationToken::new())
+            .await
+            .unwrap();
         assert_eq!(result["matches"][0]["line"], 2);
         assert_eq!(result["matches"][0]["column"], 3);
         assert_eq!(result["truncated"], false);
@@ -190,6 +275,9 @@ mod tests {
         std::fs::write(dir.path().join("binary"), [0xff, 0xfe]).unwrap();
         assert!(harness.workspace_read("binary", CancellationToken::new()).await.is_err());
         assert!(harness.workspace_read("../outside", CancellationToken::new()).await.is_err());
-        assert!(harness.workspace_search(&["missing".into()], "match", CancellationToken::new()).await.is_err());
+        assert!(harness
+            .workspace_search(&["missing".into()], "match", CancellationToken::new())
+            .await
+            .is_err());
     }
 }

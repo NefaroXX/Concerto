@@ -196,16 +196,17 @@ impl LspClient {
     /// Returns [`ToolError::Cancelled`] immediately when `cancel` has already
     /// fired, so an already-cancelled stop never touches the process.
     pub async fn stop(&mut self, cancel: CancellationToken) -> Result<(), ToolError> {
-        if cancel.is_cancelled() {
-            return Err(ToolError::Cancelled);
-        }
         // `shutdown` is bounded by `send_request`'s existing 30s response
-        // timeout: a hung server cannot hold stop() open on this line.
-        let _ = self.send_request("shutdown", serde_json::json!({})).await;
-        // `exit` is best-effort; bound the write too, for a server that has
-        // stopped draining stdin (a full pipe would otherwise block here).
-        let _ = timeout(EXIT_WRITE_TIMEOUT, self.send_notification("exit", serde_json::json!({})))
-            .await;
+        // timeout. Cancellation skips graceful shutdown, but must still kill
+        // and reap the process group below instead of abandoning descendants.
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {},
+            _ = async {
+                let _ = self.send_request("shutdown", serde_json::json!({})).await;
+                let _ = timeout(EXIT_WRITE_TIMEOUT, self.send_notification("exit", serde_json::json!({}))).await;
+            } => {},
+        }
         if let Some(mut child) = self.child.take() {
             // SIGKILL the whole process group led by the child, then the
             // direct child — the same escalation concerto-tools'
@@ -218,7 +219,7 @@ impl LspClient {
             // tokio's orphan reaper finishes the job if we time out here.
             let _ = timeout(KILL_WAIT_TIMEOUT, child.wait()).await;
         }
-        Ok(())
+        if cancel.is_cancelled() { Err(ToolError::Cancelled) } else { Ok(()) }
     }
 
     pub async fn get_diagnostics(&self, file_path: &str) -> Vec<serde_json::Value> {
@@ -449,6 +450,18 @@ async fn kill_process_group(child: &mut Child) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_stop_still_reaps_the_owned_child() {
+        let mut client = LspClient::new(std::env::temp_dir(), "unused");
+        client.attach_test_child(60).unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = timeout(Duration::from_secs(10), client.stop(cancel)).await.unwrap();
+        assert!(matches!(result, Err(ToolError::Cancelled)));
+        assert!(client.child.is_none());
+    }
 
     /// Verify that the constructor initialises all fields to their default/empty state.
     #[test]

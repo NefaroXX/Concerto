@@ -90,8 +90,9 @@ mod tool_guard;
 pub mod verify;
 pub mod wait;
 mod working_memory;
-pub mod workspace_snapshot;
 pub mod workspace_files;
+mod workspace_language;
+pub mod workspace_snapshot;
 pub mod world_model;
 
 pub mod memory_explorer;

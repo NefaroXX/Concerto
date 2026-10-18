@@ -528,6 +528,7 @@ pub async fn build_standalone_harness_with_memory(
 
     let bus = EventBus::new(256);
     let mut registry = crate::runtime_runner_impl::build_tool_registry(project_root, &None, config);
+    registry.register(Box::new(crate::workspace_language::WorkspaceLanguageTool));
     let (audit, gate_pool) = crate::runtime_runner_impl::build_audit_sink().await;
 
     // verify.run before environment.describe (describe snapshots tool names).

@@ -2,5 +2,5 @@
 
 pub(crate) mod harness;
 pub(crate) mod memory;
-pub(crate) mod workspace;
 pub(crate) mod runtime;
+pub(crate) mod workspace;

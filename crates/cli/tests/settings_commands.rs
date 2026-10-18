@@ -330,26 +330,78 @@ fn runtime_inspection_reads_saved_state_while_another_frontend_holds_the_lock() 
     assert!(!fixture.config_path().exists(), "inspection must not launch setup");
 }
 
-
 #[test]
 fn workspace_reads_search_context_and_guarded_delete_need_no_provider() {
     let fixture = Fixture::new();
     let file = fixture.dir.path().join("project/example.rs");
     std::fs::write(&file, "fn main() {\n    // 世界 needle\n}\n").unwrap();
-    let document: serde_json::Value = serde_json::from_str(&fixture.success(&["workspace", "read", "example.rs", "--json"])).unwrap();
+    let document: serde_json::Value =
+        serde_json::from_str(&fixture.success(&["workspace", "read", "example.rs", "--json"]))
+            .unwrap();
     assert_eq!(document["content"], std::fs::read_to_string(&file).unwrap());
     let revision = document["revision"].as_str().unwrap();
-    let found: serde_json::Value = serde_json::from_str(&fixture.success(&["workspace", "search", "needle", "example.rs", "--json"])).unwrap();
+    let found: serde_json::Value = serde_json::from_str(&fixture.success(&[
+        "workspace",
+        "search",
+        "needle",
+        "example.rs",
+        "--json",
+    ]))
+    .unwrap();
     assert_eq!(found["matches"][0]["line"], 2);
-    let context: serde_json::Value = serde_json::from_str(&fixture.success(&["workspace", "context", "example.rs", "--json"])).unwrap();
+    let context: serde_json::Value =
+        serde_json::from_str(&fixture.success(&["workspace", "context", "example.rs", "--json"]))
+            .unwrap();
     assert_eq!(context["documents"][0], document);
-    assert_eq!(fixture.success(&["workspace", "read", "example.rs", "--raw"]), document["content"].as_str().unwrap());
-    assert!(!fixture.command(&["workspace", "delete", "example.rs", "--expect", revision]).status.success());
+    assert_eq!(
+        fixture.success(&["workspace", "read", "example.rs", "--raw"]),
+        document["content"].as_str().unwrap()
+    );
+    assert!(!fixture
+        .command(&["workspace", "delete", "example.rs", "--expect", revision])
+        .status
+        .success());
     std::fs::write(&file, "changed").unwrap();
-    assert!(!fixture.command(&["workspace", "delete", "example.rs", "--expect", revision, "--yes"]).status.success());
+    assert!(!fixture
+        .command(&["workspace", "delete", "example.rs", "--expect", revision, "--yes"])
+        .status
+        .success());
     assert!(file.exists());
-    let document: serde_json::Value = serde_json::from_str(&fixture.success(&["workspace", "read", "example.rs", "--json"])).unwrap();
-    fixture.success(&["workspace", "delete", "example.rs", "--expect", document["revision"].as_str().unwrap(), "--yes"]);
+    let document: serde_json::Value =
+        serde_json::from_str(&fixture.success(&["workspace", "read", "example.rs", "--json"]))
+            .unwrap();
+    fixture.success(&[
+        "workspace",
+        "delete",
+        "example.rs",
+        "--expect",
+        document["revision"].as_str().unwrap(),
+        "--yes",
+    ]);
     assert!(!file.exists());
     assert!(fixture.success(&["workspace", "--help"]).contains("--expect"));
+}
+
+#[test]
+fn workspace_stdin_edits_are_exact_and_bad_language_targets_are_explicit() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let fixture = Fixture::new();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_concerto-cli"))
+        .env("XDG_CONFIG_HOME", fixture.dir.path().join("config"))
+        .env("XDG_DATA_HOME", fixture.dir.path().join("data"))
+        .env_remove("CONCERTO_PROJECT_ROOTS")
+        .args(["--project", fixture.dir.path().join("project").to_str().unwrap()])
+        .args(["workspace", "write", "notes.txt", "--stdin", "--create", "--yes", "--json"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let text = "“Human edit”\r\n\t世界\r\n";
+    child.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(std::fs::read(fixture.dir.path().join("project/notes.txt")).unwrap(), text.as_bytes());
+    let output = fixture.command(&["workspace", "diagnostics", "notes.txt", "--json"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Rust (.rs)"));
+    let output = fixture.command(&["workspace", "hover", "notes.txt", "-1", "0"]);
+    assert!(!output.status.success());
 }
