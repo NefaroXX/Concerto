@@ -334,7 +334,8 @@ status code an external orchestrator can branch on
 
 ```bash
 concerto run [PROMPT] [-p|--project DIR] [-m|--multi-agent] [-f|--fast] \
-    [--json] [--approvals deny|auto] [--timeout SECS]
+    [--json] [--approvals deny|auto] [--timeout SECS] [--run-id LABEL] \
+    [--events-json PATH] [--report-path FILE]
 ```
 
 `PROMPT` is one shell-quoted argument (extra words are joined); `-`, or no
@@ -342,8 +343,14 @@ prompt at all, reads piped stdin — a terminal with no prompt fails fast with
 exit 1. `run`'s options must follow `run` (`concerto run --json`).
 
 - **`--json` contract.** Exactly one compact object on stdout, with the keys
-  `mode` (`single`|`multi`), `status`, `session_id`, `final_message`,
-  `files_modified`, `tool_call_count`, `tokens_in`, `tokens_out`, `cost_usd`.
+  `mode` (`single`|`multi`), `status`, `session_id`, `run_id`,
+  `provider_error_class`, `final_message`, `files_modified`,
+  `tool_call_count`, `tokens_in`, `tokens_out`, `cost_usd`. `run_id` echoes
+  the `--run-id` label (`null` when not supplied); `provider_error_class` is a
+  machine-readable class code for provider-family terminal failures (e.g.
+  `PROVIDER_RETRIES_EXHAUSTED` when provider retries are exhausted) and is
+  `null` for other terminal errors (e.g. missing provider configuration,
+  max-iterations) — the human-readable detail stays in `final_message`.
   Nothing else is written to stdout: diagnostics (the `--approvals auto`
   warning, refusal notes) go to stderr. The one failure that is not guaranteed
   to produce the JSON object is argument parsing itself — an unknown flag, a
@@ -352,6 +359,30 @@ exit 1. `run`'s options must follow `run` (`concerto run --json`).
   `status: … (exit N)` plus the session/files summary on stderr.
 - **Exit codes:** `0` done, `1` error, `2` needs_user, `3` awaiting_approval,
   `4` blocked, `5` iteration_cap, `6` timeout.
+- **Observability for orchestrators.** Three opt-in, file-based side channels —
+  stdout stays reserved for the single result object. A value starting with
+  `-` is rejected for all three (mid-form missing-value guard), and
+  `--events-json -` is rejected with a dedicated message:
+  - `--run-id LABEL` — caller-supplied correlation id (trimmed, non-empty, at
+    most 128 characters, no control characters). It is echoed as `run_id` in
+    the stdout JSON, the report, and every events line; `null` when not
+    supplied.
+  - `--events-json PATH` — live NDJSON progress while the run executes,
+    truncate-created mode `0600` (unix). Every line is one flushed JSON object
+    `{"seq","ts","run_id","event":…}` with strictly monotonic `seq`; run
+    events are externally tagged (`{"<variant>":…}`), a `heartbeat` line
+    arrives every 10 s during quiet periods, and the run always ends with a
+    terminal `run_finished` line carrying `status`, `exit_code` and
+    `session_id`. A hard kill (`kill -9`) may truncate the trace mid-file —
+    flushed lines survive, and the last line then simply is not
+    `run_finished`. Multi-agent tool activity is visible here even though the
+    report's `tool_calls` is `[]` for multi-agent runs.
+  - `--report-path FILE` — at the end of *every* run outcome
+    (done/error/needs_user/awaiting_approval/blocked/iteration_cap/timeout) a
+    JSON report: the stdout object plus an ordered `tool_calls` array
+    (per-tool-call trace; `[]` for multi-agent, error, and timeout outcomes).
+    Truncate-created mode `0600` (unix). A failed report write warns on
+    stderr and does not change the run outcome or the exit code.
 - **Approvals.** The default `--approvals deny` is fail-closed: any
   policy-gated action is refused and the run surfaces as `awaiting_approval`
   (exit 3). Under the single-agent authority model ordinary local mutations
@@ -372,7 +403,11 @@ run summary (files changed, verification, notes); on error or timeout
 `session_id` is `null` and the token/cost metrics are zeroed even though a
 session row may exist; a multi-agent coordinator ask-user ends as
 `awaiting_approval` (exit 3), while the single-agent loop's "needs user input"
-continuation ends as `needs_user` (exit 2).
+continuation ends as `needs_user` (exit 2); `--timeout SECS` bounds the agent
+loop after startup — the process exits with code 6 shortly after expiry, but
+total wall time can exceed the value by startup plus teardown (worst on a cold
+memory / fastembed model cache); a multi-agent run reports `tool_calls: []` in
+the report, so use `--events-json` when its tool activity matters.
 
 Example — an external agent driving one run:
 
@@ -383,6 +418,16 @@ case $? in
   2|3) echo "needs input/approval: $(jq -r .final_message <<<"$json")" ;;
   *)   echo "failed ($?): $(jq -r .final_message <<<"$json")" ;;
 esac
+```
+
+Example — the observability flags together:
+
+```bash
+json=$(printf '%s' "$prompt" | concerto run - --json --timeout 600 \
+    --run-id nightly-42 --events-json /tmp/run.ndjson --report-path /tmp/run.json)
+jq -r '.run_id, .provider_error_class' <<<"$json"   # label echo; null unless a provider failed
+tail -n1 /tmp/run.ndjson                            # terminal run_finished line
+jq '.tool_calls | length' /tmp/run.json             # per-call trace ([] for multi-agent)
 ```
 
 ## Configuration
