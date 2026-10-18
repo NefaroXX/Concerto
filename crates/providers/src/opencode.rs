@@ -1564,6 +1564,7 @@ mod tests {
         // table), so the Anthropic body fixture uses a genuine Anthropic id.
         let p = OpenCodeZenProvider::new("key".to_string(), "claude-3-5-sonnet".into(), 30);
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![concerto_core::types::Message {
                 role: concerto_core::types::Role::User,
@@ -1609,6 +1610,7 @@ mod tests {
 
     fn tool_request() -> CompletionRequest {
         CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             model: "muse-v2".into(),
             messages: vec![concerto_core::types::Message {
@@ -1654,6 +1656,7 @@ mod tests {
     #[test]
     fn responses_body_omits_tools_key_when_absent() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             model: "muse-v2".into(),
             messages: vec![concerto_core::types::Message {
@@ -1678,6 +1681,7 @@ mod tests {
     #[test]
     fn responses_body_round_trips_tool_call_and_output() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             model: "muse-v2".into(),
             messages: vec![
@@ -1930,6 +1934,7 @@ mod tests {
         // Leg 3 — result back in: the assistant call and its tool result
         // render as function_call / function_call_output items.
         let follow_up = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             model: "muse-v2".into(),
             messages: vec![
@@ -2143,6 +2148,7 @@ mod tests {
             format!("{base}{path_suffix}"),
         );
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             model: model.into(),
             messages: vec![concerto_core::types::Message {

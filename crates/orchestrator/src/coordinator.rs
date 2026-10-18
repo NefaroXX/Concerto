@@ -13336,6 +13336,7 @@ impl CoordinatorAgent {
     ) -> Result<(String, Option<String>, Vec<concerto_core::types::ToolCall>), OrchestratorError>
     {
         let request = CompletionRequest {
+            session_id: Some(task.session_id),
             stable_system_prefix_bytes: None,
             model: model.to_owned(),
             messages: messages.to_vec(),

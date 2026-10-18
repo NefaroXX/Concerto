@@ -44,6 +44,15 @@ pub struct CompletionRequest {
     /// Prompt assembly supplies this hint; provider renderers validate it.
     /// It changes cache placement only and never grants instruction authority.
     pub stable_system_prefix_bytes: Option<usize>,
+    /// The orchestration session this request belongs to, when one exists.
+    ///
+    /// Threaded from the run's `AgentTask.session_id` at the request-building
+    /// boundary. Connectors that present a client-identity header mirroring
+    /// the upstream client (the OpenCode relays) send it as the session
+    /// identity; every other provider ignores it. `None` on
+    /// discovery/test/standalone legs that have no orchestration session —
+    /// such requests omit the header rather than inventing a value.
+    pub session_id: Option<Ulid>,
     pub model: String,
     pub messages: Vec<Message>,
     pub tools: Option<Vec<ToolDefinition>>,

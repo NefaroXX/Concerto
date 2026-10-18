@@ -339,6 +339,7 @@ mod tests {
     #[test]
     fn with_cache_breakpoints_toggles_apply() {
         let request = CompletionRequest {
+            session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![
                 concerto_core::types::Message {
