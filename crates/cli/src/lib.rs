@@ -9,13 +9,13 @@ pub mod extensions;
 pub mod health;
 mod management;
 mod memory_explorer;
-mod workspace_browser;
 pub mod plugin_approval;
 pub mod settings;
 mod shell;
 pub mod theme;
 pub mod ui;
 pub mod update;
+mod workspace_browser;
 
 use concerto_core::CancellationToken;
 use concerto_sessions::{AuditLogFilter, AuditLogRow};

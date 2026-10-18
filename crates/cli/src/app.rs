@@ -1748,7 +1748,7 @@ impl App {
             Screen::Management => Action::None,
             Screen::WorkspaceFiles => {
                 match self.workspace_browser.key(key.code) {
-                    crate::workspace_browser::BrowserAction::Stay => {},
+                    crate::workspace_browser::BrowserAction::Stay => {}
                     crate::workspace_browser::BrowserAction::Close => self.screen = Screen::Chat,
                     crate::workspace_browser::BrowserAction::Attach(text) => {
                         if self.input.len() + text.len() <= 128 * 1024 {
@@ -1756,10 +1756,12 @@ impl App {
                             self.input_mode = true;
                             self.screen = Screen::Chat;
                         } else {
-                            self.messages.push(Line::from("Context was not added: the chat draft would exceed 128 KiB."));
+                            self.messages.push(Line::from(
+                                "Context was not added: the chat draft would exceed 128 KiB.",
+                            ));
                             self.screen = Screen::Chat;
                         }
-                    },
+                    }
                 }
                 Action::None
             }
@@ -4954,4 +4956,3 @@ mod tests {
         assert_eq!(app.diff_review.results[0].path, a);
     }
 }
-

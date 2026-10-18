@@ -1928,4 +1928,3 @@ mod tests {
         assert!(line_text(&lines[0]).contains("No textual change"));
     }
 }
-

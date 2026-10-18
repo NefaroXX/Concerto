@@ -8,7 +8,7 @@ use concerto_core::traits::tool::Tool;
 use concerto_core::traits::PolicyEngine;
 use concerto_core::types::{CapabilitySet, PathPolicyFacts, SessionContext, ToolOutput};
 use concerto_core::{CancellationToken, ToolError};
-use concerto_lsp::client::LspClient;
+use concerto_lsp::client::{file_uri, LspClient};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -28,22 +28,6 @@ struct Input {
 
 fn error(message: impl Into<String>) -> ToolError {
     ToolError::LspError { message: message.into() }
-}
-
-/// Encode a canonical file path as an LSP URI, preserving slashes/drive colon.
-fn file_uri(path: &str) -> String {
-    let path = path.replace('\\', "/");
-    let path = path.strip_prefix("//?/").unwrap_or(&path);
-    let mut uri = if path.starts_with('/') { "file://".to_owned() } else { "file:///".to_owned() };
-    for byte in path.bytes() {
-        if byte.is_ascii_alphanumeric() || b"/:-._~".contains(&byte) {
-            uri.push(char::from(byte));
-        } else {
-            use std::fmt::Write;
-            let _ = write!(uri, "%{byte:02X}");
-        }
-    }
-    uri
 }
 
 fn request(input: &Input, uri: &str) -> Result<(&'static str, Value), ToolError> {
@@ -168,7 +152,7 @@ async fn query(
     cancel: CancellationToken,
 ) -> Result<Value, ToolError> {
     client.start(cancel).await?;
-    let uri = file_uri(&input.file_path);
+    let uri = file_uri(Path::new(&input.file_path))?;
     client
         .send_notification(
             "textDocument/didOpen",
@@ -205,13 +189,6 @@ async fn query(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn uri_encoding_preserves_drive_and_escapes_document_names() {
-        assert_eq!(file_uri("/tmp/a #界.rs"), "file:///tmp/a%20%23%E7%95%8C.rs");
-        assert_eq!(file_uri("C:\\work\\a.rs"), "file:///C:/work/a.rs");
-        assert_eq!(file_uri("\\\\?\\C:\\work\\a.rs"), "file:///C:/work/a.rs");
-    }
 
     #[test]
     fn navigation_requests_preserve_utf16_positions_and_reference_context() {

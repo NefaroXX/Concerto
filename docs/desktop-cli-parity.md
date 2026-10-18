@@ -3,7 +3,8 @@
 **Status: settings and configuration parity expanded 2026-10-03; checkpoint
 runtime inspection added 2026-10-10; topology/evidence-reference views and TUI
 navigation added 2026-10-16; memory/structured management validated 2026-10-18;
-file/context and language workflows implemented, final integration validation in progress.** The August R2–R4/P1–P7 checklist below is a
+file/context and language workflows implemented 2026-10-18. Final CI results
+are tracked in PR #367.** The August R2–R4/P1–P7 checklist below is a
 historical milestone, not proof of complete parity. [ADR-80](adrs/ADR-80-cli-settings-and-studio-parity.md)
 corrects the former blanket exclusions. See [CLI settings reference](cli-settings.md).
 
@@ -76,7 +77,7 @@ differences do not exclude their underlying data or actions.
 | Current Desktop behavior covered | Runtime Studio inspection | Desktop loads persisted snapshots on opening Runtime/Studio. CLI exposes the same checkpoint reader with topology, world model, decisions, evidence, diagnoses and suitability in text/JSON and selectable TUI views. `--event ID` and the TUI picker resolve full evidence records. Neither frontend exposes a separate continuously live inspector. |
 | Validated | Rich memory explorer | `memory list/search/show/delete/reindex` plus graph/explain; TUI search, type filters, full details, confirmed deletion, refresh/re-index and bounded navigation through the shared memory service |
 | Validated | Structured TUI editors | Hierarchical config/provider/policy/MCP and canonical-agent inspection; multiline strings and JSON edits, scope selection, validated saves, stale-draft rejection and discard confirmation. Roster membership and hidden environment edits use existing CLI lifecycle commands. |
-| Implemented; final validation in progress | Editor operations | `workspace list/read/search/context/write/delete`; revision-checked external-editor import; Rust diagnostics, hover, definition, completion and references; TUI file preview/filter and explicit context insertion. Existing TUI diff review handles agent changes. Text editing, replace, undo/redo and local editor navigation use the external-editor workflow. |
+| Implemented | Editor operations | `workspace list/read/search/context/write/delete`; revision-checked external-editor import; Rust diagnostics, hover, definition, completion and references; TUI file preview/filter and explicit context insertion. Existing TUI diff review handles agent changes. Text editing, replace, undo/redo and local editor navigation use the external-editor workflow. |
 | Current Desktop behavior covered | Terminal workflow | Both current frontends use `concerto_shell::client::open` for the native audited console. CLI exposes interactive `shell`, `shell exec` and security settings; neither Desktop's current terminal nor CLI starts a PTY/system shell. Profile selection still configures agent execution separately. |
 
 ### File and context workflows (2026-10-18)

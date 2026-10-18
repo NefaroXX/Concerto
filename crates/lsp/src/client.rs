@@ -16,6 +16,44 @@ use tokio::time::{timeout, timeout_at, Duration, Instant};
 type PendingMap = HashMap<u64, oneshot::Sender<Result<serde_json::Value, ToolError>>>;
 type DiagMap = HashMap<String, Vec<serde_json::Value>>;
 
+/// Encode an absolute local path for LSP, including spaces and Windows roots.
+pub fn file_uri(path: &Path) -> Result<String, ToolError> {
+    if !path.is_absolute() {
+        return Err(ToolError::LspError { message: "LSP file path must be absolute".into() });
+    }
+    let raw = path
+        .to_str()
+        .ok_or_else(|| ToolError::LspError { message: "LSP file path must be UTF-8".into() })?;
+    #[cfg(windows)]
+    let normalized = {
+        let value = raw.replace('\\', "/");
+        if let Some(unc) = value.strip_prefix("//?/UNC/") {
+            format!("//{unc}")
+        } else {
+            value.strip_prefix("//?/").unwrap_or(&value).to_owned()
+        }
+    };
+    #[cfg(not(windows))]
+    let normalized = raw.to_owned();
+    let prefix = if normalized.starts_with("//") {
+        "file:"
+    } else if normalized.starts_with('/') {
+        "file://"
+    } else {
+        "file:///"
+    };
+    let mut uri = prefix.to_owned();
+    for byte in normalized.bytes() {
+        if byte.is_ascii_alphanumeric() || b"/:-._~".contains(&byte) {
+            uri.push(char::from(byte));
+        } else {
+            use std::fmt::Write;
+            let _ = write!(uri, "%{byte:02X}");
+        }
+    }
+    Ok(uri)
+}
+
 /// Bound on completing one in-flight frame of the server's stdout: from the
 /// first header byte received through the remaining headers and the body.
 ///
@@ -166,7 +204,7 @@ impl LspClient {
             READER_READ_TIMEOUT,
         ));
         // Handshake
-        let uri = lsp_types::Uri::from_str(&format!("file://{}", self.project_dir.display()))
+        let uri = lsp_types::Uri::from_str(&file_uri(&self.project_dir)?)
             .map_err(|e| ToolError::LspError { message: e.to_string() })?;
         let init_params = InitializeParams {
             process_id: Some(std::process::id()),
@@ -193,8 +231,8 @@ impl LspClient {
     /// (already capped by `send_request`'s 30s timeout), best-effort `exit`
     /// notification, then a process-group SIGKILL and a bounded reap.
     ///
-    /// Returns [`ToolError::Cancelled`] immediately when `cancel` has already
-    /// fired, so an already-cancelled stop never touches the process.
+    /// Cancellation skips the graceful exchange, but still kills and reaps the
+    /// owned process group before returning [`ToolError::Cancelled`].
     pub async fn stop(&mut self, cancel: CancellationToken) -> Result<(), ToolError> {
         // `shutdown` is bounded by `send_request`'s existing 30s response
         // timeout. Cancellation skips graceful shutdown, but must still kill
@@ -454,6 +492,31 @@ async fn kill_process_group(child: &mut Child) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_uris_encode_names_and_platform_roots() {
+        assert!(file_uri(Path::new("relative.rs")).is_err());
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                file_uri(Path::new("/tmp/a #界.rs")).unwrap(),
+                "file:///tmp/a%20%23%E7%95%8C.rs"
+            );
+            assert_eq!(file_uri(Path::new("/tmp/a\\b.rs")).unwrap(), "file:///tmp/a%5Cb.rs");
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(file_uri(Path::new(r"C:\work\a.rs")).unwrap(), "file:///C:/work/a.rs");
+            assert_eq!(
+                file_uri(Path::new(r"\\?\C:\work\a.rs")).unwrap(),
+                "file:///C:/work/a.rs"
+            );
+            assert_eq!(
+                file_uri(Path::new(r"\\?\UNC\server\share\a.rs")).unwrap(),
+                "file://server/share/a.rs"
+            );
+        }
+    }
 
     #[cfg(unix)]
     #[tokio::test]

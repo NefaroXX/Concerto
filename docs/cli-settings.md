@@ -298,7 +298,7 @@ Concerto instance before editing a locked preferences store.
 
 Changes follow existing next-run/startup semantics. Project/env/startup flags
 may override saved values. See [the capability plan](desktop-cli-parity.md)
-for remaining interaction work and the runtime boundaries.
+for the interaction checklist and runtime boundaries.
 
 
 ## Workspace files and context
@@ -348,7 +348,8 @@ Use `--` before filenames or queries that start with a dash.
 Language queries currently support Rust, matching the shared backend's
 `rust-analyzer` integration. Install that executable on PATH. Navigation accepts
 zero-based line and UTF-16 character offsets. Each command opens its document in
-a fresh client and reaps that owned process on completion, failure or cancellation.
+a fresh client and reaps that owned process on completion, failure or cancellation
+(including its process group on Unix).
 A diagnostic response with `state: pending` means no publication arrived within
 15 seconds; it is not a clean result. The complete query is bounded to 60 seconds,
 followed by bounded process cleanup. Other languages and missing tooling produce
