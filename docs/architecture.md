@@ -166,10 +166,12 @@ opencode builtin tool names), which `resolve_wire_builtin` maps onto the native
 `shell`/`filesystem` tools. `OPENCODE_ZEN_FREE_KNOWN` (`beam-free`,
 `big-pickle`, `cat-jam-free`) is the 2026-10-17 live-verified usable set; the
 live catalog is volatile (several zero-priced ids answer 410/400 upstream), so
-catalog drift is expected, not a code bug. A refused keyless request surfaces as
-non-retryable `ProviderError::FreeTierRefused`, preserving the relay body;
-`opencode-free` (Go) and all other providers remain credential-required, and the
-paid `opencode` path is unchanged.
+catalog drift is expected, not a code bug. A keyless *refusal* (403 fingerprint
+gate / 410 deprecated model) surfaces as non-retryable
+`ProviderError::FreeTierRefused`, while a transient 429 shared-pool throttle
+surfaces as the retryable `ProviderError::FreeTierThrottled`; both preserve the
+relay body. `opencode-free` (Go) and all other providers remain
+credential-required, and the paid `opencode` path is unchanged.
 
 The selected provider and model form a pair. Explicit session/role selection
 is authoritative; there is no automatic cost- or capability-based model
