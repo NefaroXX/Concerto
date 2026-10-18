@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Headless `concerto run`.** One-shot, non-interactive agent execution for
+  external orchestrators (`crates/cli/src/dispatch/run.rs`): the prompt comes
+  from an argument, `-`, or piped stdin — a terminal with no prompt fails fast
+  — with `-p/--project DIR`, `-m/--multi-agent`, `-f/--fast`,
+  `--timeout SECS`, and `--approvals deny|auto`. The default `deny` posture is
+  fail-closed: any policy-gated action is refused and the run reports
+  `awaiting_approval` (under the single-agent authority model ordinary local
+  mutations are auto-allowed, so only Consequential actions — network egress,
+  destructive filesystem/shell operations, secrets, installs — reach the
+  gate), while `auto` is an explicit opt-in that still flows through the
+  policy engine and the audit log. `--json` emits exactly one compact object
+  on stdout (`mode`, `status`, `session_id`, `final_message`,
+  `files_modified`, `tool_call_count`, `tokens_in`, `tokens_out`, `cost_usd`)
+  with diagnostics on stderr; argument-parse errors are the one path that
+  bypasses it. Exit codes: 0 done, 1 error, 2 needs_user, 3 awaiting_approval,
+  4 blocked, 5 iteration_cap, 6 timeout. Runs persist to the same
+  sessions/audit database as the TUI.
 - **OpenCode Zen anonymous free tier.** The `opencode` provider type now builds
   and streams without an API key against Zen's anonymous free tier by
   mirroring the real OpenCode client identity (`stream: true`, an

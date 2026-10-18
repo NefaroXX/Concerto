@@ -20,7 +20,7 @@ All members live under `crates/` and depend upward on `concerto-core`.
 - `memory` — SQLite FTS5+vector hybrid search, local embeddings, re-index watcher
 - `config` — layered `figment` config + keyring credential storage
 - `desktop` — Iced 0.14 GUI (chat, diffs, agent graph)
-- `cli` — `ratatui` TUI
+- `cli` — `ratatui` TUI + headless one-shot `concerto run` (JSON contract, exit codes)
 - `plugins` / `plugin-sdk` — WASM plugin host ABI + capability manager + guest SDK
 - `skills` — local instruction-pack discovery/loading (`SkillManager`); never executes code
 - `mcp` — MCP stdio client + `McpManager` + `McpTool` bridge
@@ -199,6 +199,7 @@ cargo audit
 - MCP stdio client: `crates/mcp/src/client.rs` (`McpClient`); runtime manager: `crates/mcp/src/manager.rs` (`McpManager`); tool bridge: `crates/mcp/src/tool_bridge.rs`
 - Skill injection into prompts: `crates/orchestrator/src/skills_context.rs` (`SkillsContext`)
 - App roots: `crates/desktop/src/app.rs` (Iced), `crates/cli/src/` (ratatui)
+- Headless one-shot CLI run: `crates/cli/src/dispatch/run.rs` (`concerto run`: prompt/JSON/exit-code contract, `--approvals`)
 - Event bus (everything flows through it): `crates/core/src/event.rs`
 
 ## Plugin system (WASM)

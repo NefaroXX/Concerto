@@ -288,10 +288,11 @@ cargo run -p concerto -- config keys
 cargo run -p concerto -- config set retry.max_attempts 5
 ```
 
-Fifteen subcommands are dispatched by `concerto-cli` — `audit`, `agents`,
-`blueprint`, `config`, `credentials`, `extensions`, `health`, `logs`, `memory`,
-`plugin`, `preferences`, `projects`, `providers`, `sessions`, and `shell` — so a
-default build runs any of them without `--cli`; `--cli` forces the terminal UI.
+Seventeen subcommands are dispatched by `concerto-cli` — `audit`, `agents`,
+`blueprint`, `config`, `credentials`, `extensions`, `harness`, `health`, `logs`,
+`memory`, `plugin`, `preferences`, `projects`, `providers`, `sessions`,
+`shell`, and `run` — so a default build runs any of them without `--cli`;
+`--cli` forces the terminal UI.
 On a build compiled with only the desktop feature, a subcommand such as
 `concerto audit <id>` launches the GUI and ignores the arguments. Run
 `concerto --help` for the per-subcommand action lists, or
@@ -323,7 +324,66 @@ concerto --cli extensions list     # skills and MCP servers actually present
 concerto --cli memory graph        # the project memory graph
 ```
 
-`concerto --help` lists all fifteen subcommands and their actions.
+`concerto --help` prints the top-level options and the CLI subcommand summary.
+
+### Headless runs (automation)
+
+`concerto run` executes one agent task without a terminal and exits with a
+status code an external orchestrator can branch on
+(`crates/cli/src/dispatch/run.rs`):
+
+```bash
+concerto run [PROMPT] [-p|--project DIR] [-m|--multi-agent] [-f|--fast] \
+    [--json] [--approvals deny|auto] [--timeout SECS]
+```
+
+`PROMPT` is one shell-quoted argument (extra words are joined); `-`, or no
+prompt at all, reads piped stdin — a terminal with no prompt fails fast with
+exit 1. `run`'s options must follow `run` (`concerto run --json`).
+
+- **`--json` contract.** Exactly one compact object on stdout, with the keys
+  `mode` (`single`|`multi`), `status`, `session_id`, `final_message`,
+  `files_modified`, `tool_call_count`, `tokens_in`, `tokens_out`, `cost_usd`.
+  Nothing else is written to stdout: diagnostics (the `--approvals auto`
+  warning, refusal notes) go to stderr. The one failure that is not guaranteed
+  to produce the JSON object is argument parsing itself — an unknown flag, a
+  bad `--timeout`, or a missing `--project` directory — which reports on
+  stderr and exits 1. Text mode prints the final message on stdout and
+  `status: … (exit N)` plus the session/files summary on stderr.
+- **Exit codes:** `0` done, `1` error, `2` needs_user, `3` awaiting_approval,
+  `4` blocked, `5` iteration_cap, `6` timeout.
+- **Approvals.** The default `--approvals deny` is fail-closed: any
+  policy-gated action is refused and the run surfaces as `awaiting_approval`
+  (exit 3). Under the single-agent authority model ordinary local mutations
+  are already auto-allowed; only Consequential actions (network egress,
+  destructive filesystem/shell operations, secrets, installs) still reach this
+  gate. `--approvals auto` is the explicit opt-in for trusted non-interactive
+  environments: it warns on stderr and still flows through the policy engine
+  and the audit log.
+- **Configuration.** Providers and settings come from the normal layered
+  configuration (see [Configuration](#configuration)) — no headless-specific
+  setup, and no config editing. Runs persist to the same sessions/audit
+  database the TUI uses, so a run can be inspected afterwards with
+  `concerto sessions show <id>`, `concerto sessions events <id>`, and
+  `concerto audit <id> --json`.
+
+Known v1 semantics: on a completed run `final_message` carries the composed
+run summary (files changed, verification, notes); on error or timeout
+`session_id` is `null` and the token/cost metrics are zeroed even though a
+session row may exist; a multi-agent coordinator ask-user ends as
+`awaiting_approval` (exit 3), while the single-agent loop's "needs user input"
+continuation ends as `needs_user` (exit 2).
+
+Example — an external agent driving one run:
+
+```bash
+json=$(printf '%s' "$prompt" | concerto run - --json --timeout 600)
+case $? in
+  0)   jq -r .final_message <<<"$json" ;;                # done
+  2|3) echo "needs input/approval: $(jq -r .final_message <<<"$json")" ;;
+  *)   echo "failed ($?): $(jq -r .final_message <<<"$json")" ;;
+esac
+```
 
 ## Configuration
 

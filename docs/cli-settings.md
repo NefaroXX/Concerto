@@ -133,6 +133,49 @@ Choose a shell profile ID from `shell list`; detected IDs depend on the host.
 CLI runs build a fresh plugin manager. Restart Desktop after changing installed
 plugin files through these commands; its runtime manager is retained across runs.
 
+## Headless runs
+
+```sh
+concerto run "fix the failing test" --json --timeout 600
+cat prompt.txt | concerto run - --project /path/to/project
+concerto run -m --approvals auto "refactor the parser"
+```
+
+`run` executes one agent task without a terminal and exits with a status code
+an external orchestrator can branch on
+(`crates/cli/src/dispatch/run.rs`). `PROMPT` is one shell-quoted argument
+(several words are joined), `-`, or omitted — the last two read piped stdin;
+a terminal with no prompt exits 1. Options are `-p/--project DIR`,
+`-m/--multi-agent`, `-f/--fast` (skip memory retrieval), `--json`,
+`--approvals deny|auto`, and `--timeout SECS`; they must follow `run`.
+
+`--json` prints exactly one compact object on stdout with the keys `mode`
+(`single`/`multi`), `status`, `session_id`, `final_message`, `files_modified`,
+`tool_call_count`, `tokens_in`, `tokens_out`, `cost_usd`; diagnostics go to
+stderr. Argument parsing itself — an unknown flag, a bad `--timeout`, or a
+missing `--project` directory — is the one failure not guaranteed to produce
+that object: the message goes to stderr and the exit code is 1. Text mode
+prints the final message on stdout and `status: … (exit N)` plus the
+session/files summary on stderr.
+
+Exit codes: `0` done · `1` error · `2` needs_user · `3` awaiting_approval ·
+`4` blocked · `5` iteration_cap · `6` timeout.
+
+The default `--approvals deny` is fail-closed: any action that reaches the
+approval gate is refused and the run reports `awaiting_approval` (exit 3).
+Under the single-agent authority model ordinary local mutations are already
+auto-allowed, so only Consequential actions — network egress, destructive
+filesystem/shell operations, secrets, installs — reach that gate.
+`--approvals auto` is the explicit opt-in for trusted non-interactive
+environments: it warns on stderr and still flows through the policy engine
+and the audit log.
+
+Runs read the layered configuration and write to the same sessions/audit
+database as the TUI, so they can be inspected afterwards with
+`concerto sessions show SESSION_ID`, `concerto sessions events SESSION_ID`,
+`concerto audit SESSION_ID --json`, and
+`concerto sessions runtime SESSION_ID --json`.
+
 ## Runtime inspection
 
 ```sh
