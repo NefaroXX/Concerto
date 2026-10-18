@@ -70,12 +70,12 @@ These are real gaps, not GUI-only exclusions.
 | Priority | Capability | Planned CLI acceptance |
 |---|---|---|
 | Done on current dev | Staged change review | TUI unified diff and accept/reject through the shared overlay; narrow-terminal checks |
-| P1 | Live Coordinator pause/resume/decisions | Same in-process control handles and checkpoint semantics; cross-process control requires a shared authenticated API |
-| Partial | Runtime Studio inspection | Checkpoint topology, world model, decisions, evidence references, diagnoses and suitability have text/JSON and selectable TUI views. Full evidence records are available through `--event ID` and the TUI reference picker. Live state remains. |
+| Current Desktop behavior covered | Coordinator controls | Both frontends cancel through the run token, resume durable checkpoints, and resolve intent/plan/tool approval prompts through shared sinks. Neither current frontend exposes a generic pause handle or authenticated remote run control. |
+| Current Desktop behavior covered | Runtime Studio inspection | Desktop loads persisted snapshots on opening Runtime/Studio. CLI exposes the same checkpoint reader with topology, world model, decisions, evidence, diagnoses and suitability in text/JSON and selectable TUI views. `--event ID` and the TUI picker resolve full evidence records. Neither frontend exposes a separate continuously live inspector. |
 | Implemented; validation in progress | Rich memory explorer | `memory list/search/show/delete/reindex` plus graph/explain; TUI search, type filters, full details, confirmed deletion, refresh/re-index and bounded navigation through the shared memory service |
-| P2 | Structured TUI editors | Roster/provider/policy/MCP inspectors and multiline prompts backed by validated command services |
+| Implemented; validation in progress | Structured TUI editors | Hierarchical config/provider/policy/MCP and canonical-agent inspection; multiline strings and JSON edits, scope selection, validated saves, stale-draft rejection and discard confirmation. Roster membership and hidden environment edits use existing CLI lifecycle commands. |
 | P2 | Editor operations | File/context selection, search, diagnostics, patch/review, attachments and external-editor integration |
-| P2 | Terminal workflow | Launch selected profile with the same toolchain/environment; only terminal-page layout is exempt |
+| Current Desktop behavior covered | Terminal workflow | Both current frontends use `concerto_shell::client::open` for the native audited console. CLI exposes interactive `shell`, `shell exec` and security settings; neither Desktop's current terminal nor CLI starts a PTY/system shell. Profile selection still configures agent execution separately. |
 
 ### Evidence record inspection (2026-10-17)
 

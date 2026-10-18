@@ -86,7 +86,25 @@ For an existing route, read its `keyring_key` rather than assuming an account.
 Remove agent/fallback assignments before removing a provider; deleting its
 configuration does not delete its keychain credential.
 
-## Project memory
+## Structured TUI settings
+
+F1/Ctrl+P → **Manage providers, agents and policy** (or command-mode `o`)
+opens the structured settings browser, including MCP and all config sections.
+Enter opens an object or array; `e` edits the selected value. Strings use a
+plain multiline editor; other values use JSON. Arrow keys, Home/End,
+Backspace/Delete, Enter and bracketed paste edit the draft. Ctrl+S validates
+and saves; Esc asks before discarding it. Validation errors keep the draft.
+
+`g` switches global/project scope; project mode shows effective values and
+saves project overrides. Agent fields remain global and save to canonical
+agent files. Roster membership changes use `agents import/clone/remove`.
+Environment values remain hidden and are changed through CLI commands.
+Refresh with `r` after an external edit: stale drafts are rejected instead of
+overwriting newer settings. Config changes apply to the next run, and project,
+environment or startup overrides may take precedence over a global save.
+Use JSON `null` to remove a config override and restore inheritance.
+
+## Memory commands
 
 ```sh
 concerto memory list --json

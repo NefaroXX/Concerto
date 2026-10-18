@@ -8,6 +8,7 @@ mod dispatch;
 pub mod extensions;
 pub mod health;
 mod memory_explorer;
+mod management;
 pub mod plugin_approval;
 pub mod settings;
 mod shell;

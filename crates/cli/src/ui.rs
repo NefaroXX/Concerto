@@ -23,6 +23,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Screen::DiffReview => draw_diff_review_screen(frame, app),
         Screen::RuntimeInspector => draw_runtime_inspector(frame, app),
         Screen::MemoryExplorer => app.memory_screen.draw(frame, &app.cli_theme),
+        Screen::Management => app.management.draw(frame, &app.cli_theme),
     }
     if let Some(prompt) = app.approval_prompt() {
         draw_approval_modal(frame, frame.area(), &prompt, &app.cli_theme);
@@ -93,6 +94,7 @@ fn draw_runtime_inspector(frame: &mut Frame, app: &App) {
 /// Shared menu labels and their existing command-mode shortcuts.
 pub(crate) const CHAT_COMMANDS: &[(char, &str)] = &[
     ('s', "Settings"),
+    ('o', "Manage providers, agents and policy"),
     ('l', "Sessions"),
     ('t', "Tool history"),
     ('d', "Review changes"),

@@ -146,6 +146,7 @@ pub enum Screen {
     /// Read-only persisted Coordinator state, shared with Desktop.
     RuntimeInspector,
     MemoryExplorer,
+    Management,
 }
 
 /// Outcome of a per-file review decision on the staged-diff screen.
@@ -544,6 +545,7 @@ pub struct App {
     pub(crate) diff_review: DiffReviewState,
     pub(crate) runtime_inspector: RuntimeInspector,
     pub(crate) memory_screen: crate::memory_explorer::MemoryScreen,
+    pub(crate) management: crate::management::Management,
 }
 
 impl Default for App {
@@ -618,6 +620,7 @@ impl App {
             diff_review: DiffReviewState::default(),
             runtime_inspector: RuntimeInspector::default(),
             memory_screen: crate::memory_explorer::MemoryScreen::default(),
+            management: crate::management::Management::default(),
         }
     }
 
@@ -1547,6 +1550,10 @@ impl App {
 
     pub(crate) fn handle_key(&mut self, event: Event) -> Action {
         if let Event::Paste(text) = event {
+            if self.screen == Screen::Management && !self.is_awaiting_approval() {
+                self.management.paste(&text);
+                return Action::None;
+            }
             if self.screen == Screen::MemoryExplorer && !self.is_awaiting_approval() {
                 self.memory_screen.paste(&text);
                 return Action::None;
@@ -1642,6 +1649,14 @@ impl App {
             return Action::None;
         }
 
+        if self.screen == Screen::Management {
+            if self.running && key.code == KeyCode::Char('c') && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+                return Action::Cancel;
+            }
+            if self.management.key(key) { self.screen = Screen::Chat; }
+            return Action::None;
+        }
+
         if key.code == KeyCode::Char('c')
             && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
         {
@@ -1717,6 +1732,7 @@ impl App {
             Screen::AgentAssignments => self.handle_agent_assignments_key(key.code),
             Screen::DiffReview => self.handle_diff_review_key(key.code),
             Screen::RuntimeInspector => self.handle_runtime_key(key.code),
+            Screen::Management => Action::None,
             Screen::MemoryExplorer => {
                 if self.memory_screen.key(key.code) {
                     self.screen = Screen::Chat;
@@ -1842,6 +1858,10 @@ impl App {
             KeyCode::Char('s') if !self.input_mode => {
                 self.screen = Screen::Settings;
                 self.settings_index = 0;
+            }
+            KeyCode::Char('o') if !self.input_mode => {
+                self.management.open(self.project_dir.clone());
+                self.screen = Screen::Management;
             }
             KeyCode::Char('l') if !self.input_mode => {
                 self.screen = Screen::Sessions;
