@@ -712,6 +712,8 @@ fn parse_reasoning_echo(value: Option<&str>) -> Option<ReasoningEcho> {
 mod tests {
     use super::*;
     use concerto_config::AgentModelAssignment;
+    use concerto_core::types::{CompletionRequest, Message, Role};
+    use futures::stream::StreamExt;
 
     fn test_creds() -> CredentialStore {
         CredentialStore::from_env()
@@ -1803,6 +1805,139 @@ mod tests {
             )),
             "the build must present the client surface on the /models leg: {headers}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Live anonymous Zen probe — evidence collection (never CI)
+    // ------------------------------------------------------------------
+
+    /// Drain one completion to its end, concatenating the text deltas.
+    ///
+    /// A failure at stream-open or mid-stream surfaces as the attempt's
+    /// [`ProviderError`] so the probe can record the exact variant.
+    async fn probe_collect(
+        provider: &Arc<dyn LlmProvider>,
+        request: CompletionRequest,
+    ) -> Result<String, ProviderError> {
+        let mut stream =
+            provider.stream_completion(request, concerto_core::CancellationToken::new()).await?;
+        let mut text = String::new();
+        while let Some(chunk) = stream.next().await {
+            text.push_str(&chunk?.delta);
+        }
+        Ok(text)
+    }
+
+    /// One probe completion: a single streamed request against the live relay,
+    /// then the evidence line — model, session, elapsed ms, and the success
+    /// text OR the exact [`ProviderError`] variant + message.
+    ///
+    /// Never retries and never asserts the relay's verdict: a 403/429 here is
+    /// recorded data, not a test failure (evidence collection, not a gate).
+    async fn probe_attempt(
+        provider: &Arc<dyn LlmProvider>,
+        model: &str,
+        session_id: Option<concerto_core::ids::Ulid>,
+        attempt: &str,
+    ) {
+        let request = CompletionRequest {
+            session_id,
+            model: model.to_string(),
+            messages: vec![Message {
+                role: Role::User,
+                content: "Respond with exactly: pong".into(),
+                tool_calls: None,
+                tool_results: None,
+                reasoning_content: None,
+                tokens_in: None,
+                tokens_out: None,
+            }],
+            ..CompletionRequest::default()
+        };
+        let session = session_id.map_or_else(|| "none".to_string(), |id| id.to_string());
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(90),
+            probe_collect(provider, request),
+        )
+        .await;
+        let elapsed_ms = started.elapsed().as_millis();
+        match outcome {
+            Ok(Ok(text)) => eprintln!(
+                "probe {attempt}: model={model} session={session} elapsed_ms={elapsed_ms} \
+                 OK text={text:?}"
+            ),
+            Ok(Err(error)) => eprintln!(
+                "probe {attempt}: model={model} session={session} elapsed_ms={elapsed_ms} \
+                 ERR variant={error:?} message={error}"
+            ),
+            Err(_) => eprintln!(
+                "probe {attempt}: model={model} session={session} elapsed_ms={elapsed_ms} \
+                 TIMEOUT no verdict within 90s"
+            ),
+        }
+    }
+
+    /// LIVE EVIDENCE PROBE (2026-10-18): does Concerto's own reqwest path
+    /// complete keylessly against the real OpenCode Zen relay?
+    ///
+    /// Builds the provider exactly the way production does — provider type
+    /// `opencode` with no credential resolvable anywhere (test-mode
+    /// [`CredentialStore::from_env`], a unique keyring account no `CONCERTO_*`
+    /// env var can satisfy, and `OPENCODE_API_KEY` cleared for the duration) —
+    /// so the build takes the anonymous free-tier arm, then makes at most TWO
+    /// completion attempts: (a) with a fresh ULID session id, (b) with
+    /// `session_id: None`. Each attempt prints model, success text OR the
+    /// exact `ProviderError` variant + message, and elapsed ms. The verdict is
+    /// recorded verbatim and never asserted, retried, or worked around — the
+    /// relay decides; this probe only observes.
+    ///
+    /// Never runs in CI: `#[ignore]` plus the explicit `--ignored`
+    /// invocation (a plain `cargo test` skips it).
+    ///
+    /// ```text
+    /// CONCERTO_ZEN_PROBE_MODEL=big-pickle   # optional (default big-pickle)
+    /// cargo test -p concerto-providers live_zen_anonymous -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "live network: real OpenCode Zen relay, run with --ignored"]
+    async fn live_zen_anonymous_probe() {
+        // The env lock + restore guard mirror `build_opencode_without_credential_is_anonymous`
+        // so a machine with an `OPENCODE_API_KEY` export still probes the
+        // ANONYMOUS path (the credential is cleared, then restored even on
+        // panic) and the two env-mutating tests never race each other.
+        let _env = OPENCODE_ENV_LOCK.lock().await;
+        let _restored = RestoreEnvVar::without("OPENCODE_API_KEY");
+        let model =
+            std::env::var("CONCERTO_ZEN_PROBE_MODEL").unwrap_or_else(|_| "big-pickle".to_string());
+        let config = ProviderConfig {
+            id: "live-zen-anonymous-probe".into(),
+            name: "OpenCode Zen (live anonymous probe)".into(),
+            provider: "opencode".into(),
+            model: model.clone(),
+            // Unique account: no `CONCERTO_*` env credential can satisfy it.
+            keyring_key: "test-live-zen-anonymous-probe/api_key".into(),
+            // No override — the production Zen relay default base URL.
+            api_base: None,
+            // Generous for a live relay (the schema default is 30).
+            timeout_seconds: 60,
+            ..ProviderConfig::default()
+        };
+        let creds = test_creds();
+        assert!(
+            config.effective_api_key(&creds).is_err(),
+            "the probe must be credential-less — a credential resolved, so this build would \
+             not be the anonymous path"
+        );
+        let provider = ProviderFactory::build(&config, &creds)
+            .expect("a credential-less opencode (Zen) config must build anonymously");
+
+        eprintln!(
+            "probe: base={} model={model} attempts=2 (fresh-ULID session, then session-less)",
+            crate::opencode::OPENCODE_ZEN_BASE
+        );
+        probe_attempt(&provider, &model, Some(concerto_core::ids::new_id()), "1/2").await;
+        probe_attempt(&provider, &model, None, "2/2").await;
     }
 
     /// Credential enforcement does not narrow to OpenCode: a `zhipu` config
