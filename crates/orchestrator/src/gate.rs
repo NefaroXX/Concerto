@@ -11,8 +11,12 @@
 //!    (set-once semantics, ADR-60 D4 "dedup by `event_id`"). A
 //!    `write-applied` replay returns the stored outcome with
 //!    `replayed: true`.
-//! 2. **Policy** — `Allow` proceeds; `Deny` / `RequireApproval` / any other
-//!    verdict appends `write-rejected` (event_id = `call_id`) and returns
+//! 2. **Policy** — `Allow` proceeds. An approval-required verdict
+//!    (`RequireApproval` / `RequireApprovalWithTimeout`) first consults the
+//!    run's approval sink, before any permit, lock, pre-image, or WAL work: an
+//!    approve proceeds exactly as `Allow`, while deny / no-sink / sink-error /
+//!    cancellation fall through fail-closed. Any remaining non-`Allow` verdict
+//!    appends `write-rejected` (event_id = `call_id`) and returns
 //!    [`GateError::Denied`].
 //! 3. **Pre-image** — for `filesystem` write/delete/move/copy requests the
 //!    target's current bytes are hashed (blake3) before any terminal decision,
@@ -46,7 +50,9 @@
 //!   and replay instead of re-executing.
 //! - **Per-agent limiter**: every agent has its own FIFO [`Semaphore`]
 //!   (default cap 1, configurable via [`WriteGate::new`]), acquired after
-//!   the claim; agents do not block one another.
+//!   the claim — and, since approval surfacing, after policy evaluation and
+//!   any approval consultation, so a parked approval never holds a permit.
+//!   Agents do not block one another.
 //! - **Cancellation** is honored at every await point (claim lock, limiter,
 //!   policy evaluation), surfacing as [`GateError::Cancelled`] without
 //!   appending a `failure` row.
@@ -124,10 +130,23 @@
 //!   contends for. The WRR mechanism is superseded by per-agent isolation;
 //!   the requirement it served holds (see ADR-60 D4 implementation notes).
 //!
-//! ## Remaining deferred (ADR-60)
+//! ## Approval surfacing (ADR-60 — closed)
 //!
-//! - Interactive approval surfacing — the gate returns [`GateError::Denied`]
-//!   for approval-required verdicts today.
+//! The gate consults the run's approval sink for approval-required verdicts
+//! (deny / no-sink / sink-error / cancellation all fail closed). The consult
+//! runs after the eager verdict — so a hard `Deny` never prompts — and before
+//! the per-agent limiter, any ownership or version lock, pre-image capture, or
+//! WAL work, so a parked desktop approval holds **no permit, no ownership/lock
+//! table entry, and no pre-image or WAL resource**. It does hold the
+//! per-`call_id` claim mutex taken in [`WriteGate::submit_dedup`] — that claim
+//! is exactly what serializes concurrent retries of the same `call_id`, is
+//! scoped to that one call, and is released on completion or cancellation. See
+//! [`WriteGate::run_gated`].
+//!
+//! An approval covers the action as the sink saw it: when three-way hunk
+//! staging (ADR-60 D5) splices the approved write's hunks onto the current
+//! base before execution, only content covered by that approval is carried
+//! into the executed bytes.
 //!
 //! (The other two former "S4" entries are closed: supervisor wiring exists —
 //! `supervisor.rs::handle_execute_tool` and `in_process_gate.rs` both route
@@ -140,6 +159,7 @@ use concerto_core::checkpoint::versioned_fs_targets;
 use concerto_core::error::{PolicyError, ToolError};
 use concerto_core::executor::ToolExecutor;
 use concerto_core::ids::{new_id, Ulid};
+use concerto_core::traits::approval::ApprovalDecision;
 use concerto_core::traits::policy::PolicyEngine;
 use concerto_core::types::{
     CapabilitySet, PolicyAction, PolicyVerdict, SessionContext, ToolDefinition,
@@ -1060,9 +1080,11 @@ impl WriteGate {
     /// Submit a write request for policy evaluation and gated execution.
     ///
     /// Ordering (WAL-before-execute, see module docs): replay check → claim →
-    /// per-agent limiter → policy → pre-image → `write-applied` append →
-    /// execute. Concurrent retries of the same `call_id` serialize behind one
-    /// in-flight claim, and per-agent concurrency is bounded by the limiter.
+    /// authoritative durable re-check → policy → approval consult → per-agent
+    /// limiter → pre-image → `write-applied` append → execute. Concurrent
+    /// retries of the same `call_id` serialize behind one in-flight claim, and
+    /// per-agent concurrency is bounded by the limiter (acquired only after the
+    /// approval consult, so a parked approval holds no permit).
     pub async fn submit(
         &self,
         req: GateRequest,
@@ -1083,8 +1105,13 @@ impl WriteGate {
 
     /// Dedup + serialization around [`Self::run_gated`].
     ///
-    /// Order: durable replay fast-path → in-flight claim → per-agent limiter
-    /// → authoritative replay check under the claim → execute.
+    /// Order: durable replay fast-path → in-flight claim → authoritative replay
+    /// check under the claim → [`Self::run_gated`] (policy → approval consult →
+    /// per-agent limiter → pre-image → WAL → execute). The per-agent permit is
+    /// acquired *inside* `run_gated`, after the approval consultation, so a
+    /// parked approval holds no permit, lock, pre-image, or WAL resource. The
+    /// per-`call_id` claim mutex (taken here) **is** held while parked — it is
+    /// what serializes concurrent retries of the same `call_id`.
     async fn submit_dedup(
         &self,
         req: GateRequest,
@@ -1142,32 +1169,12 @@ impl WriteGate {
             return Err(GateError::Cancelled);
         }
 
-        // Per-agent in-flight limiter (ADR-60 D4), acquired after the claim
-        // so the claim set — not the semaphore — serializes same-`call_id`
-        // retries. tokio's semaphore grants permits in FIFO waiter order;
-        // each agent has its own semaphore created on first use (left in
-        // place, bounded by roster size), so agents never block one another.
-        // The permit is held for the whole gated op and released on drop.
-        let semaphore = {
-            let mut limits = self.limits.lock().map_err(|error| {
-                GateError::Policy(format!("write-gate limiter poisoned: {error}"))
-            })?;
-            limits
-                .entry(req.agent_id.clone())
-                .or_insert_with(|| Arc::new(Semaphore::new(self.max_in_flight_per_agent)))
-                .clone()
-        };
-        let _permit = tokio::select! {
-            permit = semaphore.acquire_owned() => permit.map_err(|error| {
-                GateError::Policy(format!("write-gate limiter closed: {error}"))
-            })?,
-            _ = cancel.cancelled() => return Err(GateError::Cancelled),
-        };
-
         // Re-check the durable log while still holding the claim: the winner
         // may have committed a terminal decision while this submit waited on
-        // the claim lock or the limiter — replay it instead of re-executing
-        // (set-once semantics).
+        // the claim lock — replay it instead of re-executing (set-once
+        // semantics). This precedes policy evaluation (and the per-agent
+        // limiter, now inside `run_gated`) so no audit decision row is written
+        // for a call that already terminated.
         match self.stored_decision(&req.call_id).await? {
             Some(StoredDecision::Applied(gate_seq)) => {
                 return Ok(GateOutcome {
@@ -1313,14 +1320,71 @@ impl WriteGate {
             path_facts: None,
         };
 
-        // Only `Allow` executes. Every other verdict is a durable
-        // `write-rejected` decision (event_id = `call_id`) and surfaces as a
-        // `Denied` error. A cancelled evaluation surfaces as `Cancelled` with
-        // no row appended (the policy engine honors the token itself).
-        let verdict = match self.policy.evaluate(&action, cancel.clone()).await {
+        // Only `Allow` executes (after the approval consultation below). Every
+        // remaining verdict is a durable `write-rejected` decision (event_id =
+        // `call_id`) and surfaces as a `Denied` error. A cancelled evaluation
+        // surfaces as `Cancelled` with no row appended (the policy engine
+        // honors the token itself).
+        let mut verdict = match self.policy.evaluate(&action, cancel.clone()).await {
             Ok(verdict) => verdict,
             Err(PolicyError::Cancelled) => return Err(GateError::Cancelled),
             Err(error) => return Err(GateError::from(error)),
+        };
+
+        // Approval surfacing (ADR-60): an approval-required verdict consults
+        // the run's approval sink NOW — before the per-agent limiter (below),
+        // any lock, pre-image capture, or WAL work — so a parked interactive
+        // approval holds no gate resource. An approve proceeds exactly as
+        // `Allow`; deny, a missing sink, a sink error, or any unknown future
+        // decision keeps the original verdict, which falls through to the
+        // fail-closed `write-rejected` path below. Cancellation while parked
+        // returns `Cancelled` (the sink contract records its own `Denied` audit
+        // row; no row is appended here).
+        if matches!(
+            &verdict,
+            PolicyVerdict::RequireApproval { .. }
+                | PolicyVerdict::RequireApprovalWithTimeout { .. }
+        ) {
+            match self.executor.request_approval(&action, cancel.clone()).await {
+                Ok(ApprovalDecision::Approve | ApprovalDecision::ApproveAllForSession) => {
+                    verdict = PolicyVerdict::Allow;
+                }
+                // Deny (or a future decision variant): fail closed, keep the
+                // original verdict so the rejection row records it.
+                Ok(_) => {}
+                Err(ToolError::Cancelled) => return Err(GateError::Cancelled),
+                Err(error) => {
+                    tracing::warn!(
+                        call_id = %req.call_id,
+                        %error,
+                        "write-gate: approval consultation unavailable; denying fail-closed"
+                    );
+                }
+            }
+        }
+
+        // Per-agent in-flight limiter (ADR-60 D4), acquired after policy and
+        // the approval consultation so a parked approval holds no permit, and
+        // after the claim (in `submit_dedup`) so the claim set — not the
+        // semaphore — serializes same-`call_id` retries. tokio's semaphore
+        // grants permits in FIFO waiter order; each agent has its own semaphore
+        // created on first use (left in place, bounded by roster size), so
+        // agents never block one another. The permit is held for the whole
+        // gated op and released on drop.
+        let semaphore = {
+            let mut limits = self.limits.lock().map_err(|error| {
+                GateError::Policy(format!("write-gate limiter poisoned: {error}"))
+            })?;
+            limits
+                .entry(req.agent_id.clone())
+                .or_insert_with(|| Arc::new(Semaphore::new(self.max_in_flight_per_agent)))
+                .clone()
+        };
+        let _permit = tokio::select! {
+            permit = semaphore.acquire_owned() => permit.map_err(|error| {
+                GateError::Policy(format!("write-gate limiter closed: {error}"))
+            })?,
+            _ = cancel.cancelled() => return Err(GateError::Cancelled),
         };
 
         // ADR-60 D5: capture the current bytes of every attributed path
@@ -1528,22 +1592,25 @@ impl WriteGate {
         // (no `failure` event — the attempt was abandoned, not failed); other
         // errors log a `failure` event causally linked to the applied write.
         //
-        // The executor re-evaluates policy on its own execute path, so an
-        // authority request must go through the executor's authority variant
-        // too — otherwise the gate's `Allow` would be reversed by a second,
-        // non-authoritative evaluation (the exact read-only-intent deny the
-        // authority marker exists to skip).
+        // The gate already evaluated this action (its one policy decision) and,
+        // when the verdict was approval-required, obtained the user's decision.
+        // It therefore executes through the **pre-approved** entry:
+        // `execute` / `execute_with_authority` would re-evaluate the policy,
+        // write a SECOND decision row, and consult the sink a SECOND time. A
+        // second prompt answered deny/cancel would arrive AFTER this
+        // `write-applied` row committed, and a replay of the `call_id` would
+        // report a write that never happened (breaking "applied ⇒ executed or
+        // crash-replay"). The pre-approved entry treats the action as
+        // authorized and cannot return an approval denial for a verdict the
+        // gate already resolved.
         let session_ctx = self.session(session_id);
         let input = req.input.clone(); // keep `req` intact for failure logging below
                                        // ADR-82 slice 1: execute the REGISTERED implementation the caller
                                        // invoked, never the canonical name that only accounts for the call.
                                        // For a non-alias request the two are the same name.
         let exec_tool = req.registered_as.as_deref().unwrap_or(&req.tool);
-        let output = if req.orchestrator_authority {
-            self.executor.execute_with_authority(exec_tool, input, &session_ctx, cancel).await
-        } else {
-            self.executor.execute(exec_tool, input, &session_ctx, cancel).await
-        };
+        let output =
+            self.executor.execute_pre_approved(exec_tool, input, &session_ctx, cancel).await;
         let output = match output {
             Ok(output) => output,
             Err(ToolError::Cancelled) => return Err(GateError::Cancelled),

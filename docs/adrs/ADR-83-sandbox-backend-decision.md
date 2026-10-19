@@ -4,7 +4,7 @@
 **Date:** 2026-10-12
 **Deciders:** Concerto architecture
 **Related crates:** `concerto-core` (capability vocabulary), `concerto-orchestrator`
-(preflight seam, `environment.describe` reporting)
+(preflight seam, `environment_describe` reporting)
 **Supersedes:** nothing. **Extends** ADR-72 (containerized profile enforcement;
 §5 Windows gate in force, untouched) and ADR-82/H01 (contract-surface
 vocabulary; H09 restore-coverage preflight). **Preserves** ADR-71 (no
@@ -143,7 +143,7 @@ cells read `Available` instead — Windows never changes.)
   (`:104`) delegates with an empty share, so every existing verdict is
   byte-identical. The all-`Unsupported` sandbox share can neither upgrade nor
   downgrade another adapter's claim (proven by test).
-- `environment.describe`: every rendering carries the run's descriptor
+- `environment_describe`: every rendering carries the run's descriptor
   (`describe_sandbox_capability`,
   `crates/orchestrator/src/environment_describe.rs:331`) computed pure from
   the registration-time cached probe (`DescribeFacts::sandbox_runtime`,
@@ -154,7 +154,7 @@ cells read `Available` instead — Windows never changes.)
 ## Consequences
 
 - Operators get one bounded, versioned answer to "what is the sandbox doing
-  here" instead of enforcement silence; `environment.describe` is the read
+  here" instead of enforcement silence; `environment_describe` is the read
   path, through the normal policy/audit gate like every other tool.
 - Nothing becomes restorable that was not: preflight verdicts are unchanged,
   the fail-closed container admission gate is untouched, `coordinator.rs` is

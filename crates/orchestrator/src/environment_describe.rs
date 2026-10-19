@@ -1,4 +1,4 @@
-//! ADR-82 H03 — `environment.describe`: agent-callable, read-only access to
+//! ADR-82 H03 — `environment_describe`: agent-callable, read-only access to
 //! the slice-6 [`EnvironmentManifest`].
 //!
 //! An agent calls this through the normal [`ToolExecutor`][concerto_core::executor::ToolExecutor]
@@ -19,7 +19,7 @@
 //! Prompt injection of the manifest digest runs on **both** paths through the
 //! shared [`crate::environment_manifest::format_manifest_block`] shape (the
 //! slice-6 coordinator block plus the single-agent `PromptBuilder` injection);
-//! `environment.describe` remains the on-demand read of the same cached
+//! `environment_describe` remains the on-demand read of the same cached
 //! manifest.
 //!
 //! # Probe discipline: one set per run, never per call
@@ -102,10 +102,10 @@ use crate::environment_manifest::{
     VersionProber,
 };
 
-/// Registry name of the H03 operation. Dotted to read as an operation under
-/// the `environment` namespace (the `mcp:<server>:<tool>` precedent shows
-/// non-alphanumeric names are ordinary registry keys, matched by equality).
-pub const ENVIRONMENT_DESCRIBE_TOOL_NAME: &str = "environment.describe";
+/// Registry name of the H03 operation. Underscore form (never dotted): strict
+/// provider APIs reject function names containing dots, so every H13 wire name
+/// stays within `[A-Za-z0-9_-]{1,64}` (pinned by `harness_service` tests).
+pub const ENVIRONMENT_DESCRIBE_TOOL_NAME: &str = "environment_describe";
 
 /// Default full-detail tool-entry bound: a bounded default payload no matter
 /// how large the registry (plugin/MCP tools included) grows.
@@ -138,7 +138,7 @@ pub enum DescribeDetail {
     Full,
 }
 
-/// Input for the `environment.describe` operation. Every field is
+/// Input for the `environment_describe` operation. Every field is
 /// `#[serde(default)]`-tolerant (R6 wire discipline): `{}` means
 /// "summary with default caps", and newly added fields will never break old
 /// callers.
@@ -439,7 +439,7 @@ pub fn register_describe_tool(
     state
 }
 
-/// The `environment.describe` operation: read-only, descriptive access to the
+/// The `environment_describe` operation: read-only, descriptive access to the
 /// run's cached [`EnvironmentManifest`].
 ///
 /// Empty capability requirements (the LSP/MCP-bridge precedent): every agent
@@ -691,7 +691,7 @@ impl Tool for EnvironmentDescribeTool {
         }
         let parsed: EnvironmentDescribeInput =
             serde_json::from_value(input).map_err(|error| ToolError::ExecutionFailed {
-                message: format!("invalid environment.describe input: {error}"),
+                message: format!("invalid environment_describe input: {error}"),
             })?;
 
         let snapshot = snapshot_state(&self.state);
@@ -738,7 +738,7 @@ impl Tool for EnvironmentDescribeTool {
             // this arm only runs on a lock/representation race. Fail closed
             // rather than serve a synthesized manifest.
             return Err(ToolError::ExecutionFailed {
-                message: "environment.describe cache unavailable".to_string(),
+                message: "environment_describe cache unavailable".to_string(),
             });
         };
 

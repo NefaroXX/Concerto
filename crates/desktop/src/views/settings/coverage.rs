@@ -440,7 +440,7 @@ impl State {
             advanced_text(
                 theme,
                 "Recall limit",
-                "Default `memory.recall` top_k (1..=50); blank = built-in default (5).",
+                "Default `memory_recall` top_k (1..=50); blank = built-in default (5).",
                 "blank = default",
                 self.harness_recall_limit.as_str(),
                 AdvancedField::HarnessRecallLimit,
@@ -448,7 +448,7 @@ impl State {
             advanced_text(
                 theme,
                 "Verify selector",
-                "Default `verify.run` selector; blank = all.",
+                "Default `verify_run` selector; blank = all.",
                 "blank = all",
                 self.harness_verify_selector.as_str(),
                 AdvancedField::HarnessVerifySelector,

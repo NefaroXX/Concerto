@@ -41,7 +41,7 @@ pub(super) fn collect(
     let Some(mut observed) = decoded else {
         incomplete(
             records,
-            "native verify.run returned malformed records",
+            "native verify_run returned malformed records",
             &scope,
             COVERAGE_COMMAND,
         );
@@ -72,7 +72,7 @@ pub(super) fn collect(
     if !complete {
         incomplete(
             records,
-            "verify.run coverage was incomplete or overlay state was pending",
+            "verify_run coverage was incomplete or overlay state was pending",
             &scope,
             COVERAGE_COMMAND,
         );
@@ -156,12 +156,12 @@ mod tests {
             .with_scope("a.rs");
         collect(&mut records, "mcp:fake:verify.run", None, &envelope(passed.clone()), Some("fake"));
         assert!(records.is_empty());
-        collect(&mut records, "verify.run", None, &envelope(passed), Some("actual-check"));
+        collect(&mut records, "verify_run", None, &envelope(passed), Some("actual-check"));
         assert_eq!(records[0].evidence_ids, vec!["actual-check"]);
         let failed = VerificationSummary::failed("a.rs", "check", "broken")
             .with_verifier("native")
             .with_scope("a.rs");
-        collect(&mut records, "verify.run", None, &envelope(failed), None);
+        collect(&mut records, "verify_run", None, &envelope(failed), None);
         assert_eq!(records.len(), 1);
         assert!(has_failure(&records));
         assert!(records[0].evidence_ids.is_empty());
@@ -172,10 +172,10 @@ mod tests {
         let mut records = Vec::new();
         let mut output = envelope(VerificationSummary::passed("a.rs", "check", "ok"));
         output["overlay_materialized"] = serde_json::json!(false);
-        collect(&mut records, "verify.run", None, &output, Some("pending-check"));
+        collect(&mut records, "verify_run", None, &output, Some("pending-check"));
         assert!(has_failure(&records));
         output["overlay_materialized"] = serde_json::json!(true);
-        collect(&mut records, "verify.run", None, &output, Some("materialized-check"));
+        collect(&mut records, "verify_run", None, &output, Some("materialized-check"));
         assert!(!has_failure(&records));
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].evidence_ids, vec!["materialized-check"]);
@@ -193,7 +193,7 @@ mod tests {
             VerificationSummary::passed("a.rs", "check", "ok").with_content_fingerprint("bytes"),
         );
         output["truncated_records"] = serde_json::json!(true);
-        collect(&mut records, "verify.run", None, &output, Some("check"));
+        collect(&mut records, "verify_run", None, &output, Some("check"));
         assert!(has_failure(&records));
     }
 }

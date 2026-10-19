@@ -358,7 +358,7 @@ mod tests {
     #[test]
     fn environment_parses_detail_and_flags_memory_off() {
         let (op, input, memory) = parse_environment(&args(&[])).unwrap();
-        assert_eq!(op, "environment.describe");
+        assert_eq!(op, "environment_describe");
         assert_eq!(input["detail"], "summary");
         assert!(!memory, "environment needs no memory subsystem");
         let (_, input, _) = parse_environment(&args(&["--detail", "full"])).unwrap();
@@ -371,7 +371,7 @@ mod tests {
         assert!(parse_checkpoint(&args(&["create"])).is_err());
         let (op, input, memory) =
             parse_checkpoint(&args(&["create", "--path", "a.rs", "--path", "b.rs"])).unwrap();
-        assert_eq!(op, "checkpoint.create");
+        assert_eq!(op, "checkpoint_create");
         assert_eq!(input["paths"], json!(["a.rs", "b.rs"]));
         assert!(!memory);
     }
@@ -379,17 +379,17 @@ mod tests {
     #[test]
     fn checkpoint_inspect_and_restore_carry_the_id() {
         let (op, input, _) = parse_checkpoint(&args(&["inspect", "cp-1"])).unwrap();
-        assert_eq!(op, "checkpoint.inspect");
+        assert_eq!(op, "checkpoint_inspect");
         assert_eq!(input["checkpoint_id"], "cp-1");
         let (op, _, _) = parse_checkpoint(&args(&["restore", "cp-1"])).unwrap();
-        assert_eq!(op, "checkpoint.restore");
+        assert_eq!(op, "checkpoint_restore");
         assert!(parse_checkpoint(&args(&["restore"])).is_err());
     }
 
     #[test]
     fn memory_recall_enables_memory_and_parses_top_k() {
         let (op, input, memory) = parse_memory(&args(&["recall", "why", "7"])).unwrap();
-        assert_eq!(op, "memory.recall");
+        assert_eq!(op, "memory_recall");
         assert_eq!(input["query"], "why");
         assert_eq!(input["top_k"], 7);
         assert!(memory, "memory commands need the memory subsystem");
@@ -401,7 +401,7 @@ mod tests {
     fn verify_scope_and_verifier_ride_the_input() {
         let (op, input, memory) =
             parse_verify(&args(&["--scope", "src/lib.rs", "--verifier", "build"])).unwrap();
-        assert_eq!(op, "verify.run");
+        assert_eq!(op, "verify_run");
         assert_eq!(input["scope"], "src/lib.rs");
         assert_eq!(input["verifier"], "build");
         assert!(!memory);
@@ -462,7 +462,7 @@ mod tests {
         }
     }
 
-    /// End-to-end CLI adapter: `environment.describe` builds the SAME service
+    /// End-to-end CLI adapter: `environment_describe` builds the SAME service
     /// the desktop/in-process paths use and returns its payload. No memory
     /// subsystem, so this never touches the embedder.
     #[test]
@@ -473,7 +473,7 @@ mod tests {
         let invocation =
             invoke_harness(&args(&["environment", "--detail", "full"]), project.path())
                 .expect("environment describe runs through the service");
-        assert_eq!(invocation.operation, "environment.describe");
+        assert_eq!(invocation.operation, "environment_describe");
         // The `full` detail renders the bounded manifest body: a tool array
         // with truncation flags (the `summary` detail would not).
         assert!(invocation.data["tools"].is_array());
@@ -483,7 +483,7 @@ mod tests {
         // serialization: round-tripping the printed JSON yields the same value.
         let json = serde_json::to_string(&invocation).expect("serializes");
         let value: serde_json::Value = serde_json::from_str(&json).expect("parses");
-        assert_eq!(value["operation"], "environment.describe");
+        assert_eq!(value["operation"], "environment_describe");
         assert_eq!(value["data"], invocation.data);
     }
 
@@ -500,17 +500,17 @@ mod tests {
         let created =
             invoke_harness(&args(&["checkpoint", "create", "--path", "a.txt"]), project.path())
                 .expect("checkpoint create runs through the service");
-        assert_eq!(created.operation, "checkpoint.create");
+        assert_eq!(created.operation, "checkpoint_create");
         assert_eq!(created.data["status"], "active");
         let id = created.data["checkpoint_id"].as_str().expect("checkpoint id").to_string();
 
         let inspected = invoke_harness(&args(&["checkpoint", "inspect", &id]), project.path())
             .expect("checkpoint inspect runs through the service");
-        assert_eq!(inspected.operation, "checkpoint.inspect");
+        assert_eq!(inspected.operation, "checkpoint_inspect");
         assert_eq!(inspected.data["found"], true);
         assert_eq!(inspected.data["record"]["checkpoint_id"].as_str(), Some(id.as_str()));
         // The JSON shape is the service shape, byte-for-byte serializable.
         let json = serde_json::to_string(&inspected).expect("serializes");
-        assert!(json.contains("\"operation\":\"checkpoint.inspect\""));
+        assert!(json.contains("\"operation\":\"checkpoint_inspect\""));
     }
 }

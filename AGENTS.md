@@ -124,6 +124,13 @@ cargo audit
   (`crates/tools/src/filesystem.rs:450`), and git-stash undo omits untracked
   files (no `-u`; `crates/tools/src/undo.rs:56-57`) — see the ADR-62 amendment
   (2026-10-09). Don't bypass `SimplePolicyEngine` or `VirtualFs`.
+- **Write-gate authorization is single-point and `execute_pre_approved` is
+  gate-only.** The in-process `WriteGate` is the one authorization point for
+  gated writes: on an approval-required verdict it consults the run's approval
+  sink once (approve proceeds; deny / no sink / sink error / cancellation fail
+  closed) and then executes via `ToolExecutor::execute_pre_approved`, which
+  skips policy re-evaluation by design so one gated action is one decision.
+  Never call `execute_pre_approved` from any other site.
 - **OpenCode Zen anonymous free tier is a client-identity mirror**, not a
   fingerprint gate and not session registration (corrected 2026-10-18 after the
   upstream client was read directly:

@@ -4,10 +4,10 @@
 //! Covered adapters proven here (see `docs/harness-access.md`):
 //!
 //! - **In-process service** — a [`HarnessService`] over the real executor,
-//!   exercised for `memory.recall`, `environment.describe`, and the checkpoint
+//!   exercised for `memory_recall`, `environment_describe`, and the checkpoint
 //!   lifecycle.
 //! - **Standalone service** (the seam the CLI and desktop both call) — built
-//!   by `build_standalone_harness`; `environment.describe` must be stable
+//!   by `build_standalone_harness`; `environment_describe` must be stable
 //!   across builds and the checkpoint lifecycle must round-trip real bytes.
 //!
 //! The CLI adapter is proven end-to-end in `concerto-cli`'s
@@ -185,7 +185,7 @@ fn fixed_evidence_chunk() -> EvidentChunk {
     }
 }
 
-/// The `memory.recall` service adapter must return exactly what the store's
+/// The `memory_recall` service adapter must return exactly what the store's
 /// evidence-bearing recall returns — no lossy reimplementation, same evidence.
 #[tokio::test]
 async fn memory_recall_service_matches_direct_store_recall() {
@@ -236,7 +236,7 @@ async fn memory_recall_service_matches_direct_store_recall() {
 }
 
 /// The standalone service (CLI/desktop seam) is stable across builds: two
-/// equivalent `environment.describe` requests normalize to the same payload.
+/// equivalent `environment_describe` requests normalize to the same payload.
 #[tokio::test]
 async fn environment_describe_is_equivalent_across_standalone_builds() {
     let _guard = ENV_LOCK.lock().await;

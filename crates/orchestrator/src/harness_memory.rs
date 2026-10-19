@@ -1,9 +1,9 @@
-//! H13 — `memory.recall` / `memory.inspect` operations over the one harness
+//! H13 — `memory_recall` / `memory_inspect` operations over the one harness
 //! service seam.
 //!
-//! `memory.recall` is the evidence-bearing recall (`MemoryStore::retrieve_with_evidence`)
+//! `memory_recall` is the evidence-bearing recall (`MemoryStore::retrieve_with_evidence`)
 //! surfaced as an operation, so every adapter sees the same source/status/why
-//! attribution the single-agent prompt already carries (H11). `memory.inspect`
+//! attribution the single-agent prompt already carries (H11). `memory_inspect`
 //! reads one chunk's links and evidence score through the memory crate's
 //! read-only loader.
 //!
@@ -25,9 +25,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Registry name of the recall operation.
-pub const MEMORY_RECALL_TOOL_NAME: &str = "memory.recall";
+pub const MEMORY_RECALL_TOOL_NAME: &str = "memory_recall";
 /// Registry name of the inspect operation.
-pub const MEMORY_INSPECT_TOOL_NAME: &str = "memory.inspect";
+pub const MEMORY_INSPECT_TOOL_NAME: &str = "memory_inspect";
 
 /// Default recall bound when the caller omits `top_k`.
 pub const MEMORY_RECALL_DEFAULT_TOP_K: u32 = 5;
@@ -35,7 +35,7 @@ pub const MEMORY_RECALL_DEFAULT_TOP_K: u32 = 5;
 /// for more than the default, never for an unbounded dump.
 pub const MEMORY_RECALL_MAX_TOP_K: u32 = 50;
 
-/// Input for `memory.recall`.
+/// Input for `memory_recall`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct MemoryRecallInput {
     /// Free-text query.
@@ -45,7 +45,7 @@ pub struct MemoryRecallInput {
     pub top_k: Option<u32>,
 }
 
-/// Input for `memory.inspect`.
+/// Input for `memory_inspect`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct MemoryInspectInput {
     /// The chunk id to inspect.
@@ -54,7 +54,7 @@ pub struct MemoryInspectInput {
 
 /// Resolves a project's memory store lazily.
 ///
-/// The runtime registers `memory.recall` into the shared registry *before* the
+/// The runtime registers `memory_recall` into the shared registry *before* the
 /// project memory store is initialised (the registry is frozen into the
 /// executor first), so the tool resolves the store from the run's shared
 /// handle at call time. A resolver that finds no store (memory disabled or
@@ -81,7 +81,7 @@ impl RecallSource {
     }
 }
 
-/// The `memory.recall` operation.
+/// The `memory_recall` operation.
 pub struct MemoryRecallTool {
     source: RecallSource,
     project_id: ProjectId,
@@ -155,7 +155,7 @@ impl Tool for MemoryRecallTool {
         cancel: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let parsed: MemoryRecallInput = serde_json::from_value(input).map_err(|error| {
-            ToolError::ExecutionFailed { message: format!("invalid memory.recall input: {error}") }
+            ToolError::ExecutionFailed { message: format!("invalid memory_recall input: {error}") }
         })?;
         let top_k =
             parsed.top_k.unwrap_or(self.default_top_k).clamp(1, MEMORY_RECALL_MAX_TOP_K) as usize;
@@ -163,7 +163,7 @@ impl Tool for MemoryRecallTool {
             // Memory disabled / not yet initialised: an honest empty recall
             // with the reason stated, never a synthesized result.
             return Ok(ToolOutput {
-                summary: "memory.recall unavailable: no project memory store".to_string(),
+                summary: "memory_recall unavailable: no project memory store".to_string(),
                 data: serde_json::json!({
                     "chunks": [],
                     "total": 0,
@@ -181,7 +181,7 @@ impl Tool for MemoryRecallTool {
             filters: Vec::new(),
         };
         let chunks = store.retrieve_with_evidence(&query, cancel).await.map_err(|error| {
-            ToolError::ExecutionFailed { message: format!("memory.recall failed: {error}") }
+            ToolError::ExecutionFailed { message: format!("memory_recall failed: {error}") }
         })?;
         let degraded = chunks.iter().any(|chunk| chunk.degraded);
         let interrupted = chunks.iter().any(|chunk| chunk.interrupted);
@@ -194,7 +194,7 @@ impl Tool for MemoryRecallTool {
         });
         Ok(ToolOutput {
             summary: format!(
-                "memory.recall chunks={total}{}{}",
+                "memory_recall chunks={total}{}{}",
                 if degraded { " degraded" } else { "" },
                 if interrupted { " interrupted" } else { "" },
             ),
@@ -203,7 +203,7 @@ impl Tool for MemoryRecallTool {
     }
 }
 
-/// The `memory.inspect` operation: read one chunk's links and score.
+/// The `memory_inspect` operation: read one chunk's links and score.
 pub struct MemoryInspectTool {
     db_path: PathBuf,
     project_id: ProjectId,
@@ -255,7 +255,7 @@ impl Tool for MemoryInspectTool {
             return Err(ToolError::Cancelled);
         }
         let parsed: MemoryInspectInput = serde_json::from_value(input).map_err(|error| {
-            ToolError::ExecutionFailed { message: format!("invalid memory.inspect input: {error}") }
+            ToolError::ExecutionFailed { message: format!("invalid memory_inspect input: {error}") }
         })?;
         let detail = concerto_memory::mermaid::load_chunk_detail(
             &self.db_path,
@@ -265,12 +265,12 @@ impl Tool for MemoryInspectTool {
         )
         .await
         .map_err(|error| ToolError::ExecutionFailed {
-            message: format!("memory.inspect failed: {error}"),
+            message: format!("memory_inspect failed: {error}"),
         })?;
         match detail {
             Some(detail) => Ok(ToolOutput {
                 summary: format!(
-                    "memory.inspect id={} links_out={} links_in={}",
+                    "memory_inspect id={} links_out={} links_in={}",
                     detail.chunk_id,
                     detail.out_links.len(),
                     detail.in_links.len(),
@@ -287,7 +287,7 @@ impl Tool for MemoryInspectTool {
                 }),
             }),
             None => Ok(ToolOutput {
-                summary: format!("memory.inspect id={} not found", parsed.chunk_id),
+                summary: format!("memory_inspect id={} not found", parsed.chunk_id),
                 data: serde_json::json!({ "found": false, "chunk_id": parsed.chunk_id }),
             }),
         }

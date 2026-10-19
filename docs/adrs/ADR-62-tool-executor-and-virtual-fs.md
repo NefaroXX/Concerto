@@ -199,7 +199,8 @@ gate** for the agent path.
 
 Separate mechanism, not contradicted: the orchestrator write gate (ADR-60)
 captures a pre-image hash and appends a `write-applied` WAL entry **before**
-the tool runs, and refuses denied/approval-required writes before execution
+the tool runs, and refuses denied writes — plus approval-required writes the
+run's approval sink did not approve — before execution
 (`crates/orchestrator/src/gate.rs:14-23`). That is a durability
 and attribution record (plus policy denial before execution); it is not
 overlay staging and not an automatic rollback, and this amendment does not

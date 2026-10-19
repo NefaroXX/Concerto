@@ -473,7 +473,7 @@ impl EnvironmentManifest {
     /// keeps ADR-48's "byte-identical head across runs" promise intact for
     /// `[context].cache_stable_prefix`.
     ///
-    /// Freshness is not lost: `environment.describe` reports it, and the
+    /// Freshness is not lost: `environment_describe` reports it, and the
     /// manifest itself carries `collected_at_ms`/`revision` for any consumer
     /// that needs the exact collection.
     #[must_use]

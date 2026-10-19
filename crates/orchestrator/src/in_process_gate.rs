@@ -348,6 +348,66 @@ mod tests {
         }
     }
 
+    /// Fixed-decision approval sink for tests. `concerto-core`'s
+    /// `ApprovalTestHarness` is `#[cfg(test)]`-gated inside that crate and so
+    /// is not visible to this crate's test build.
+    struct FixedApprovalSink(concerto_core::traits::approval::ApprovalDecision);
+
+    #[async_trait]
+    impl concerto_core::traits::approval::ApprovalSink for FixedApprovalSink {
+        async fn request_approval(
+            &self,
+            _action: &concerto_core::types::PolicyAction<'_>,
+            _cancel: CancellationToken,
+        ) -> concerto_core::traits::approval::ApprovalDecision {
+            self.0
+        }
+
+        async fn approve_all_for_session(&self, _session_id: Ulid, _cancel: CancellationToken) {}
+
+        async fn request_ack(
+            &self,
+            _session_id: Ulid,
+            _message: &str,
+            _cancel: CancellationToken,
+        ) -> bool {
+            true
+        }
+    }
+
+    /// An approval sink that parks until the run is cancelled and signals the
+    /// test that it was entered (so the parked-cancellation path is exercised
+    /// deterministically, not raced at startup).
+    struct ParkingApprovalSink {
+        entered: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl concerto_core::traits::approval::ApprovalSink for ParkingApprovalSink {
+        async fn request_approval(
+            &self,
+            _action: &concerto_core::types::PolicyAction<'_>,
+            cancel: CancellationToken,
+        ) -> concerto_core::traits::approval::ApprovalDecision {
+            self.entered.notify_one();
+            // Park until cancelled; the executor's `biased` select resolves the
+            // race as `Cancelled`, so this return value is unreachable.
+            cancel.cancelled().await;
+            concerto_core::traits::approval::ApprovalDecision::Deny
+        }
+
+        async fn approve_all_for_session(&self, _session_id: Ulid, _cancel: CancellationToken) {}
+
+        async fn request_ack(
+            &self,
+            _session_id: Ulid,
+            _message: &str,
+            _cancel: CancellationToken,
+        ) -> bool {
+            true
+        }
+    }
+
     /// File-backed pool with the same PRAGMAs as production (WAL,
     /// busy_timeout, synchronous=NORMAL) and all sessions migrations applied.
     async fn test_pool() -> (TempDir, sqlx::SqlitePool) {
@@ -402,6 +462,109 @@ mod tests {
             1,
         ));
         (gate, executor)
+    }
+
+    /// Same as [`fs_gate_with_policy`] but with an approval sink attached to the
+    /// executor — the production shape (`setup_policy_and_audit` attaches the
+    /// run's sink before the gate reuses the executor). This is what lets the
+    /// gate consult the run's sink for an approval-required verdict.
+    fn fs_gate_with_policy_and_sink(
+        root: camino::Utf8PathBuf,
+        pool: sqlx::SqlitePool,
+        policy: Arc<SimplePolicyEngine>,
+        sink: Arc<dyn concerto_core::traits::approval::ApprovalSink>,
+    ) -> (Arc<WriteGate>, Arc<ToolExecutor>) {
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(FilesystemTool::new(root.clone())));
+        let executor = Arc::new(
+            ToolExecutor::new(Arc::new(registry), policy.clone()).with_approval_sink(sink),
+        );
+        let gate = Arc::new(WriteGate::new(
+            policy,
+            executor.clone(),
+            pool,
+            Arc::new(crate::gate::FilePreImageReader::new(root.as_std_path().to_path_buf())),
+            root.as_std_path().to_path_buf(),
+            1,
+        ));
+        (gate, executor)
+    }
+
+    /// An approval sink that counts consultations and returns a fixed decision,
+    /// so a test can assert the gate consults it **exactly once** per gated
+    /// action (the double-consult regression: one write must not prompt twice).
+    struct CountingApprovalSink {
+        decision: concerto_core::traits::approval::ApprovalDecision,
+        requests: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingApprovalSink {
+        fn new(decision: concerto_core::traits::approval::ApprovalDecision) -> Self {
+            Self { decision, requests: std::sync::atomic::AtomicUsize::new(0) }
+        }
+
+        fn count(&self) -> usize {
+            self.requests.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl concerto_core::traits::approval::ApprovalSink for CountingApprovalSink {
+        async fn request_approval(
+            &self,
+            _action: &concerto_core::types::PolicyAction<'_>,
+            _cancel: CancellationToken,
+        ) -> concerto_core::traits::approval::ApprovalDecision {
+            self.requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.decision
+        }
+
+        async fn approve_all_for_session(&self, _session_id: Ulid, _cancel: CancellationToken) {}
+
+        async fn request_ack(
+            &self,
+            _session_id: Ulid,
+            _message: &str,
+            _cancel: CancellationToken,
+        ) -> bool {
+            true
+        }
+    }
+
+    /// A gate backed by a [`RecordingAudit`] and the REAL `FilesystemTool`, so a
+    /// test can count policy verdict + approval decision rows. `RecordingAudit`
+    /// (not `TestAudit`, which discards rows) is required to prove
+    /// exactly-once. `shell_security` and `sink` are optional so the
+    /// approve / deny / no-sink shapes share one constructor.
+    fn fs_gate_recording(
+        root: camino::Utf8PathBuf,
+        pool: sqlx::SqlitePool,
+        rules: Vec<PolicyRule>,
+        shell_security: Option<concerto_core::shell_security::ShellSecurity>,
+        sink: Option<Arc<dyn concerto_core::traits::approval::ApprovalSink>>,
+    ) -> (Arc<WriteGate>, Arc<ToolExecutor>, Arc<RecordingAudit>) {
+        let audit = Arc::new(RecordingAudit::default());
+        let mut policy = SimplePolicyEngine::new(rules, audit.clone());
+        if let Some(security) = shell_security {
+            policy = policy.with_shell_security(security, root.as_std_path().to_path_buf());
+        }
+        let policy = Arc::new(policy);
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(FilesystemTool::new(root.clone())));
+        let mut executor = ToolExecutor::new(Arc::new(registry), policy.clone());
+        if let Some(sink) = sink {
+            executor = executor.with_approval_sink(sink);
+        }
+        let executor = Arc::new(executor);
+        let gate = Arc::new(WriteGate::new(
+            policy,
+            executor.clone(),
+            pool,
+            Arc::new(crate::gate::FilePreImageReader::new(root.as_std_path().to_path_buf())),
+            root.as_std_path().to_path_buf(),
+            1,
+        ));
+        (gate, executor, audit)
     }
 
     /// The gate error surface an in-process agent sees must equal what the
@@ -558,6 +721,436 @@ mod tests {
             std::fs::read_to_string(root.path().join("auth.txt")).expect("file on disk"),
             "authoritative",
             "the authority write materialized"
+        );
+    }
+
+    /// A default-rules write (`Allow`) that `apply_shell_security` downgrades
+    /// to `RequireApproval` (the shipped `writes = Ask` ceiling) is APPROVABLE
+    /// through the gate: the gate consults the run's approval sink and, on
+    /// approve, applies the write exactly as `Allow`. Regression for the
+    /// headless `concerto run --approvals auto` hard-deny, exercised on the
+    /// authority path the in-process single-agent loop actually uses.
+    #[tokio::test]
+    async fn approval_required_write_is_consulted_and_applies_on_approve() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let utf8_root =
+            camino::Utf8PathBuf::from_path_buf(root.path().to_path_buf()).expect("utf-8 tempdir");
+        let (_dir, pool) = test_pool().await;
+        std::fs::write(root.path().join("gated.txt"), b"seed").expect("seed the target");
+
+        // Shipped shape: an allow-all rule, then the default shell-security
+        // `writes = Ask` ceiling downgrades the write to RequireApproval.
+        let policy = SimplePolicyEngine::new(
+            vec![PolicyRule::AutoApprove(Condition::Always)],
+            Arc::new(TestAudit),
+        )
+        .with_shell_security(
+            concerto_core::shell_security::ShellSecurity::default(),
+            root.path().to_path_buf(),
+        );
+        let sink: Arc<dyn concerto_core::traits::approval::ApprovalSink> =
+            Arc::new(FixedApprovalSink(concerto_core::traits::approval::ApprovalDecision::Approve));
+        let (gate, executor) =
+            fs_gate_with_policy_and_sink(utf8_root, pool.clone(), Arc::new(policy), sink);
+        let backend = InProcessGateBackend::new(gate, executor, "single-agent");
+        let session = SessionContext::new(Ulid::new(), root.path().to_path_buf());
+
+        backend
+            .execute_with_authority(
+                "filesystem",
+                json!({ "operation": "write", "path": "gated.txt", "content": "approved" }),
+                "call-approve",
+                &session,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("an approved write applies through the gate");
+
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("gated.txt")).expect("file on disk"),
+            "approved",
+            "the approved write materialized"
+        );
+        let events = concerto_sessions::whiteboard::load_whiteboard_events(
+            &pool,
+            &concerto_sessions::whiteboard::WhiteboardLoadOpts::default(),
+        )
+        .await
+        .expect("load events");
+        assert!(
+            events.iter().any(|event| {
+                event.event_id == "call-approve"
+                    && event.kind == concerto_sessions::whiteboard::WhiteboardKind::WriteApplied
+            }),
+            "the WAL recorded the applied write, not a rejection"
+        );
+    }
+
+    /// A sink deny stays fail-closed: no write lands and the durable
+    /// `write-rejected` row is recorded, exactly as the pre-sink gate did.
+    #[tokio::test]
+    async fn approval_required_write_is_denied_when_the_sink_denies() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let utf8_root =
+            camino::Utf8PathBuf::from_path_buf(root.path().to_path_buf()).expect("utf-8 tempdir");
+        let (_dir, pool) = test_pool().await;
+        std::fs::write(root.path().join("gated.txt"), b"seed").expect("seed the target");
+
+        let policy = SimplePolicyEngine::new(
+            vec![PolicyRule::AutoApprove(Condition::Always)],
+            Arc::new(TestAudit),
+        )
+        .with_shell_security(
+            concerto_core::shell_security::ShellSecurity::default(),
+            root.path().to_path_buf(),
+        );
+        let sink: Arc<dyn concerto_core::traits::approval::ApprovalSink> =
+            Arc::new(FixedApprovalSink(concerto_core::traits::approval::ApprovalDecision::Deny));
+        let (gate, executor) =
+            fs_gate_with_policy_and_sink(utf8_root, pool.clone(), Arc::new(policy), sink);
+        let backend = InProcessGateBackend::new(gate, executor, "single-agent");
+        let session = SessionContext::new(Ulid::new(), root.path().to_path_buf());
+
+        backend
+            .execute_with_authority(
+                "filesystem",
+                json!({ "operation": "write", "path": "gated.txt", "content": "denied" }),
+                "call-deny",
+                &session,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a sink deny refuses the write");
+
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("gated.txt")).expect("file on disk"),
+            "seed",
+            "the denied write did not touch disk"
+        );
+        let events = concerto_sessions::whiteboard::load_whiteboard_events(
+            &pool,
+            &concerto_sessions::whiteboard::WhiteboardLoadOpts::default(),
+        )
+        .await
+        .expect("load events");
+        assert!(
+            events.iter().any(|event| {
+                event.event_id == "call-deny"
+                    && event.kind == concerto_sessions::whiteboard::WhiteboardKind::WriteRejected
+            }),
+            "the WAL recorded the rejection"
+        );
+    }
+
+    /// Cancelling the run while the gate is parked on an approval is
+    /// fail-closed: the write does not land, the gate returns a cancellation,
+    /// and no whiteboard row is appended for the abandoned call (the sink
+    /// contract records the `Denied` approval audit row itself).
+    #[tokio::test]
+    async fn cancellation_while_the_approval_is_parked_fails_closed() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let utf8_root =
+            camino::Utf8PathBuf::from_path_buf(root.path().to_path_buf()).expect("utf-8 tempdir");
+        let (_dir, pool) = test_pool().await;
+        std::fs::write(root.path().join("gated.txt"), b"seed").expect("seed the target");
+
+        let policy = SimplePolicyEngine::new(
+            vec![PolicyRule::AutoApprove(Condition::Always)],
+            Arc::new(TestAudit),
+        )
+        .with_shell_security(
+            concerto_core::shell_security::ShellSecurity::default(),
+            root.path().to_path_buf(),
+        );
+        let sink = Arc::new(ParkingApprovalSink { entered: tokio::sync::Notify::new() });
+        let (gate, executor) =
+            fs_gate_with_policy_and_sink(utf8_root, pool.clone(), Arc::new(policy), sink.clone());
+        let backend = InProcessGateBackend::new(gate, executor, "single-agent");
+        let session = SessionContext::new(Ulid::new(), root.path().to_path_buf());
+        let cancel = CancellationToken::new();
+
+        let cancel_for_run = cancel.clone();
+        let running = tokio::spawn(async move {
+            backend
+                .execute_with_authority(
+                    "filesystem",
+                    json!({ "operation": "write", "path": "gated.txt", "content": "cancelled" }),
+                    "call-cancel",
+                    &session,
+                    cancel_for_run,
+                )
+                .await
+        });
+
+        // Wait until the gate has actually parked on the sink, then cancel.
+        sink.entered.notified().await;
+        cancel.cancel();
+
+        let result = running.await.expect("run task joins");
+        assert!(
+            matches!(result, Err(ToolError::Cancelled)),
+            "a parked approval cancelled by the run surfaces as Cancelled"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("gated.txt")).expect("file on disk"),
+            "seed",
+            "the cancelled write did not touch disk"
+        );
+        let events = concerto_sessions::whiteboard::load_whiteboard_events(
+            &pool,
+            &concerto_sessions::whiteboard::WhiteboardLoadOpts::default(),
+        )
+        .await
+        .expect("load events");
+        assert!(
+            events.iter().all(|event| event.event_id != "call-cancel"),
+            "a cancelled call appends no terminal whiteboard row"
+        );
+    }
+
+    /// Regression for the double-consult defect: ONE gated write must consult
+    /// the run's approval sink exactly once and record exactly one approval
+    /// decision. Before the fix the gate consulted the sink and then the
+    /// executor re-evaluated the (still approval-required) action and consulted
+    /// a second time, producing two `RequireApproval` + two `Approved` rows, two
+    /// prompts, and — on a second deny — a post-WAL denial for an already
+    /// committed write. Exercised on the authority path the in-process
+    /// single-agent loop actually uses.
+    #[tokio::test]
+    async fn approved_gate_write_consults_the_sink_exactly_once() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let utf8_root =
+            camino::Utf8PathBuf::from_path_buf(root.path().to_path_buf()).expect("utf-8 tempdir");
+        let (_dir, pool) = test_pool().await;
+        std::fs::write(root.path().join("gated.txt"), b"seed").expect("seed the target");
+
+        let sink = Arc::new(CountingApprovalSink::new(
+            concerto_core::traits::approval::ApprovalDecision::Approve,
+        ));
+        let (gate, executor, audit) = fs_gate_recording(
+            utf8_root,
+            pool.clone(),
+            vec![PolicyRule::AutoApprove(Condition::Always)],
+            Some(concerto_core::shell_security::ShellSecurity::default()),
+            Some(sink.clone()),
+        );
+        let backend = InProcessGateBackend::new(gate, executor, "single-agent");
+        let session = SessionContext::new(Ulid::new(), root.path().to_path_buf());
+
+        backend
+            .execute_with_authority(
+                "filesystem",
+                json!({ "operation": "write", "path": "gated.txt", "content": "approved-once" }),
+                "call-once",
+                &session,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("an approved write applies through the gate");
+
+        assert_eq!(sink.count(), 1, "one gated action consults the sink exactly once");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("gated.txt")).expect("file on disk"),
+            "approved-once",
+            "the approved write materialized"
+        );
+
+        let (verdict_rows, decision_rows) = {
+            let entries = audit.entries.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                entries.iter().filter(|e| e.verdict.starts_with("RequireApproval")).count(),
+                entries
+                    .iter()
+                    .filter(|e| e.rule_matched.as_deref() == Some("user_approval"))
+                    .count(),
+            )
+        };
+        assert_eq!(verdict_rows, 1, "exactly one policy verdict row for one gated action");
+        assert_eq!(decision_rows, 1, "exactly one user-approval decision row");
+
+        let events = concerto_sessions::whiteboard::load_whiteboard_events(
+            &pool,
+            &concerto_sessions::whiteboard::WhiteboardLoadOpts::default(),
+        )
+        .await
+        .expect("load events");
+        let applied = events
+            .iter()
+            .filter(|event| {
+                event.event_id == "call-once"
+                    && event.kind == concerto_sessions::whiteboard::WhiteboardKind::WriteApplied
+            })
+            .count();
+        let rejected = events
+            .iter()
+            .filter(|event| {
+                event.event_id == "call-once"
+                    && event.kind == concerto_sessions::whiteboard::WhiteboardKind::WriteRejected
+            })
+            .count();
+        assert_eq!(applied, 1, "the WAL recorded exactly one applied write");
+        assert_eq!(rejected, 0, "an approved write is never also rejected");
+    }
+
+    /// An `ApproveAllForSession` answer takes the same single-consult path and
+    /// records exactly one decision row — the fix does not special-case the
+    /// decision variant.
+    #[tokio::test]
+    async fn approve_all_gate_write_consults_the_sink_exactly_once() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let utf8_root =
+            camino::Utf8PathBuf::from_path_buf(root.path().to_path_buf()).expect("utf-8 tempdir");
+        let (_dir, pool) = test_pool().await;
+        std::fs::write(root.path().join("gated.txt"), b"seed").expect("seed the target");
+
+        let sink = Arc::new(CountingApprovalSink::new(
+            concerto_core::traits::approval::ApprovalDecision::ApproveAllForSession,
+        ));
+        let (gate, executor, audit) = fs_gate_recording(
+            utf8_root,
+            pool.clone(),
+            vec![PolicyRule::AutoApprove(Condition::Always)],
+            Some(concerto_core::shell_security::ShellSecurity::default()),
+            Some(sink.clone()),
+        );
+        let backend = InProcessGateBackend::new(gate, executor, "single-agent");
+        let session = SessionContext::new(Ulid::new(), root.path().to_path_buf());
+
+        backend
+            .execute_with_authority(
+                "filesystem",
+                json!({ "operation": "write", "path": "gated.txt", "content": "approved-all" }),
+                "call-all",
+                &session,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("an approve-all write applies through the gate");
+
+        assert_eq!(sink.count(), 1, "one gated action consults the sink exactly once");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("gated.txt")).expect("file on disk"),
+            "approved-all",
+            "the approve-all write materialized"
+        );
+        let entries = audit.entries.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            entries.iter().filter(|e| e.rule_matched.as_deref() == Some("user_approval")).count(),
+            1,
+            "exactly one user-approval decision row"
+        );
+        assert_eq!(
+            entries.iter().filter(|e| e.verdict.starts_with("RequireApproval")).count(),
+            1,
+            "exactly one policy verdict row"
+        );
+    }
+
+    /// A hard `Deny` verdict never prompts: the approval sink must not be
+    /// consulted, the write is durably rejected, and nothing touches disk. The
+    /// consult is scoped to approval-required verdicts only.
+    #[tokio::test]
+    async fn hard_deny_never_consults_the_sink() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let utf8_root =
+            camino::Utf8PathBuf::from_path_buf(root.path().to_path_buf()).expect("utf-8 tempdir");
+        let (_dir, pool) = test_pool().await;
+        std::fs::write(root.path().join("gated.txt"), b"seed").expect("seed the target");
+
+        let sink = Arc::new(CountingApprovalSink::new(
+            concerto_core::traits::approval::ApprovalDecision::Approve,
+        ));
+        let (gate, executor, _audit) = fs_gate_recording(
+            utf8_root,
+            pool.clone(),
+            vec![PolicyRule::AutoDeny(Condition::Always)],
+            None,
+            Some(sink.clone()),
+        );
+        let backend = InProcessGateBackend::new(gate, executor, "single-agent");
+        let session = SessionContext::new(Ulid::new(), root.path().to_path_buf());
+
+        backend
+            .execute_with_authority(
+                "filesystem",
+                json!({ "operation": "write", "path": "gated.txt", "content": "denied" }),
+                "call-deny",
+                &session,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a hard-deny verdict refuses the write");
+
+        assert_eq!(sink.count(), 0, "a hard deny must not prompt");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("gated.txt")).expect("file on disk"),
+            "seed",
+            "the denied write did not touch disk"
+        );
+        let events = concerto_sessions::whiteboard::load_whiteboard_events(
+            &pool,
+            &concerto_sessions::whiteboard::WhiteboardLoadOpts::default(),
+        )
+        .await
+        .expect("load events");
+        assert!(
+            events.iter().any(|event| {
+                event.event_id == "call-deny"
+                    && event.kind == concerto_sessions::whiteboard::WhiteboardKind::WriteRejected
+            }),
+            "the WAL recorded the rejection"
+        );
+    }
+
+    /// An approval-required write with **no** sink stays fail-closed: the gate
+    /// rejects it durably and never executes it. The surfacing change must not
+    /// make a sinkless run approvable.
+    #[tokio::test]
+    async fn approval_required_without_a_sink_is_rejected() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let utf8_root =
+            camino::Utf8PathBuf::from_path_buf(root.path().to_path_buf()).expect("utf-8 tempdir");
+        let (_dir, pool) = test_pool().await;
+        std::fs::write(root.path().join("gated.txt"), b"seed").expect("seed the target");
+
+        let (gate, executor, _audit) = fs_gate_recording(
+            utf8_root,
+            pool.clone(),
+            vec![PolicyRule::AutoApprove(Condition::Always)],
+            Some(concerto_core::shell_security::ShellSecurity::default()),
+            None,
+        );
+        let backend = InProcessGateBackend::new(gate, executor, "single-agent");
+        let session = SessionContext::new(Ulid::new(), root.path().to_path_buf());
+
+        backend
+            .execute_with_authority(
+                "filesystem",
+                json!({ "operation": "write", "path": "gated.txt", "content": "no-sink" }),
+                "call-nosink",
+                &session,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("an approval-required write with no sink is refused");
+
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("gated.txt")).expect("file on disk"),
+            "seed",
+            "the sinkless write did not touch disk"
+        );
+        let events = concerto_sessions::whiteboard::load_whiteboard_events(
+            &pool,
+            &concerto_sessions::whiteboard::WhiteboardLoadOpts::default(),
+        )
+        .await
+        .expect("load events");
+        assert!(
+            events.iter().any(|event| {
+                event.event_id == "call-nosink"
+                    && event.kind == concerto_sessions::whiteboard::WhiteboardKind::WriteRejected
+            }),
+            "the WAL recorded the rejection"
         );
     }
 

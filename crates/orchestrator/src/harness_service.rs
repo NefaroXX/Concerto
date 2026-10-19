@@ -1,6 +1,6 @@
-//! H13 — the ONE harness service seam: `environment.describe`,
-//! `checkpoint.create` / `checkpoint.inspect` / `checkpoint.restore`,
-//! `verify.run`, `memory.recall` / `memory.inspect`.
+//! H13 — the ONE harness service seam: `environment_describe`,
+//! `checkpoint_create` / `checkpoint_inspect` / `checkpoint_restore`,
+//! `verify_run`, `memory_recall` / `memory_inspect`.
 //!
 //! # Declared release coverage (H13 §0)
 //!
@@ -10,8 +10,8 @@
 //!
 //! | Adapter path | Status | Where proven |
 //! | --- | --- | --- |
-//! | In-process single-agent | covered except `checkpoint.restore` (operator/frontend-scoped, see below) | `harness_service::tests`, `vertical_slice` |
-//! | In-process coordinator | covered except `checkpoint.restore` (operator/frontend-scoped, see below) | `resume_with_memory_still_grounds` (evidence-bearing recall) |
+//! | In-process single-agent | covered except `checkpoint_restore` (operator/frontend-scoped, see below) | `harness_service::tests`, `vertical_slice` |
+//! | In-process coordinator | covered except `checkpoint_restore` (operator/frontend-scoped, see below) | `resume_with_memory_still_grounds` (evidence-bearing recall) |
 //! | Supervised agents | covered (memory recall) | `ipc` wire + `supervisor` status fields |
 //! | CLI JSON | covered | `concerto-cli` `harness` subcommand tests |
 //! | Desktop | covered | `concerto-desktop` harness view tests |
@@ -72,7 +72,7 @@ pub const EXTERNAL_ACCESS_NON_COVERAGE: &str =
 /// payload every adapter consumes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessInvocation {
-    /// The operation name (e.g. `environment.describe`).
+    /// The operation name (e.g. `environment_describe`).
     pub operation: String,
     /// The tool's bounded human-facing summary.
     pub summary: String,
@@ -124,7 +124,7 @@ pub enum HarnessServiceError {
     #[error("unknown harness operation: {0}")]
     UnknownOperation(String),
     /// The checkpoint state (store/gate/stash) was not wired into this
-    /// service, so `checkpoint.restore` cannot run.
+    /// service, so `checkpoint_restore` cannot run.
     #[error(
         "checkpoint restore is unavailable: no checkpoint store/gate is wired to this service"
     )]
@@ -138,7 +138,7 @@ pub enum HarnessServiceError {
 /// The printer/audit identity used for a restore performed through the service.
 const DEFAULT_RESTORE_AGENT: &str = "harness";
 
-/// Checkpoint state a service needs to run `checkpoint.restore`.
+/// Checkpoint state a service needs to run `checkpoint_restore`.
 pub struct CheckpointAccess {
     store: Arc<FileCheckpointStore>,
     gate: Arc<WriteGate>,
@@ -174,7 +174,7 @@ impl HarnessService {
         Self { executor, session, checkpoint: None }
     }
 
-    /// Attach checkpoint state so `checkpoint.restore` can run.
+    /// Attach checkpoint state so `checkpoint_restore` can run.
     #[must_use]
     pub fn with_checkpoint(mut self, access: CheckpointAccess) -> Self {
         self.checkpoint = Some(access);
@@ -186,7 +186,7 @@ impl HarnessService {
         &self.session
     }
 
-    /// `environment.describe`.
+    /// `environment_describe`.
     pub async fn environment_describe(
         &self,
         input: serde_json::Value,
@@ -195,7 +195,7 @@ impl HarnessService {
         self.invoke_executor(ENVIRONMENT_DESCRIBE_TOOL_NAME, input, cancel).await
     }
 
-    /// `checkpoint.create`.
+    /// `checkpoint_create`.
     pub async fn checkpoint_create(
         &self,
         input: serde_json::Value,
@@ -204,7 +204,7 @@ impl HarnessService {
         self.invoke_executor(CHECKPOINT_CREATE_TOOL_NAME, input, cancel).await
     }
 
-    /// `checkpoint.inspect`.
+    /// `checkpoint_inspect`.
     pub async fn checkpoint_inspect(
         &self,
         input: serde_json::Value,
@@ -213,7 +213,7 @@ impl HarnessService {
         self.invoke_executor(CHECKPOINT_INSPECT_TOOL_NAME, input, cancel).await
     }
 
-    /// `verify.run`.
+    /// `verify_run`.
     pub async fn verify_run(
         &self,
         input: serde_json::Value,
@@ -222,7 +222,7 @@ impl HarnessService {
         self.invoke_executor(VERIFY_RUN_TOOL_NAME, input, cancel).await
     }
 
-    /// `memory.recall`.
+    /// `memory_recall`.
     pub async fn memory_recall(
         &self,
         input: serde_json::Value,
@@ -231,7 +231,7 @@ impl HarnessService {
         self.invoke_executor(MEMORY_RECALL_TOOL_NAME, input, cancel).await
     }
 
-    /// `memory.inspect`.
+    /// `memory_inspect`.
     pub async fn memory_inspect(
         &self,
         input: serde_json::Value,
@@ -240,7 +240,7 @@ impl HarnessService {
         self.invoke_executor(MEMORY_INSPECT_TOOL_NAME, input, cancel).await
     }
 
-    /// `checkpoint.restore`.
+    /// `checkpoint_restore`.
     ///
     /// Restore is service-level (not a nested registered tool) because it must
     /// itself issue gated `filesystem` writes; it runs through
@@ -258,7 +258,7 @@ impl HarnessService {
         let parsed: crate::harness_checkpoint::CheckpointRestoreInput =
             serde_json::from_value(input).map_err(|error| {
                 HarnessServiceError::Execution(ToolError::ExecutionFailed {
-                    message: format!("invalid checkpoint.restore input: {error}"),
+                    message: format!("invalid checkpoint_restore input: {error}"),
                 })
             })?;
         let by_agent = parsed.by_agent.as_deref().unwrap_or(DEFAULT_RESTORE_AGENT);
@@ -281,7 +281,7 @@ impl HarnessService {
         })?;
         let projected: crate::harness_checkpoint::HarnessRestoreOutcome = outcome.into();
         let summary = format!(
-            "checkpoint.restore id={} status={}",
+            "checkpoint_restore id={} status={}",
             parsed.checkpoint_id,
             projected.summary()
         );
@@ -328,32 +328,32 @@ impl HarnessService {
 /// Register the H13 operation tools the runtime/frontend can supply into the
 /// run's shared registry.
 ///
-/// `environment.describe` and `verify.run` are registered by their own
+/// `environment_describe` and `verify_run` are registered by their own
 /// helpers (`register_describe_tool` / `register_verify_tool`) because they
 /// carry run-specific caches; this helper registers the checkpoint and memory
-/// operations. `checkpoint.restore` is service-level and is deliberately not
+/// operations. `checkpoint_restore` is service-level and is deliberately not
 /// registered (see the module docs).
 pub struct HarnessToolRegistration<'a> {
     /// Project root the checkpoint store is anchored to.
     pub project_root: &'a std::path::Path,
     /// Checkpoint sidecar, when the run has a sessions database pool.
     pub checkpoint_store: Option<Arc<FileCheckpointStore>>,
-    /// Project-scoped memory store for `memory.recall`.
+    /// Project-scoped memory store for `memory_recall`.
     pub memory_store: Option<Arc<dyn MemoryStore>>,
-    /// Lazily-resolved memory store for `memory.recall` (runtime registration,
+    /// Lazily-resolved memory store for `memory_recall` (runtime registration,
     /// where the store is initialised after the registry is frozen).
     pub memory_resolver: Option<Arc<dyn MemoryStoreResolver>>,
-    /// Memory database path for `memory.inspect`.
+    /// Memory database path for `memory_inspect`.
     pub memory_db_path: Option<std::path::PathBuf>,
-    /// Default `memory.recall` `top_k` from `[harness].recall_limit`.
+    /// Default `memory_recall` `top_k` from `[harness].recall_limit`.
     pub recall_default_top_k: Option<u32>,
-    /// Project id for `memory.recall` / `memory.inspect`.
+    /// Project id for `memory_recall` / `memory_inspect`.
     pub project_id: ProjectId,
 }
 
 /// Register checkpoint + memory operations into `registry`.
 ///
-/// Call after plugin/MCP registration and before `environment.describe`
+/// Call after plugin/MCP registration and before `environment_describe`
 /// registration (so the describe tool-names snapshot covers them). Missing
 /// dependencies simply skip their operations (a run without a sessions DB has
 /// no checkpoint store; memory disabled has no store), never a broken tool.
@@ -530,7 +530,7 @@ pub async fn build_standalone_harness_with_memory(
     let mut registry = crate::runtime_runner_impl::build_tool_registry(project_root, &None, config);
     let (audit, gate_pool) = crate::runtime_runner_impl::build_audit_sink().await;
 
-    // verify.run before environment.describe (describe snapshots tool names).
+    // verify_run before environment_describe (describe snapshots tool names).
     // `[harness].verify_selector` supplies the default when a call omits it.
     let default_selector = config
         .harness
@@ -597,7 +597,7 @@ pub async fn build_standalone_harness_with_memory(
         },
     );
 
-    // environment.describe LAST so its snapshot covers the tools above.
+    // environment_describe LAST so its snapshot covers the tools above.
     let _describe = crate::environment_describe::register_describe_tool(
         &mut registry,
         project_root,
@@ -726,6 +726,36 @@ mod tests {
         let executor = Arc::new(ToolExecutor::new(Arc::new(registry), policy));
         let session = SessionContext::new(concerto_core::ids::Ulid::new(), std::env::temp_dir());
         HarnessService::new(executor, session)
+    }
+
+    /// Provider function names must match `^[A-Za-z0-9_-]{1,64}$` — no dots.
+    /// Every H13 operation name is sent verbatim to providers as a function
+    /// declaration, and strict upstreams (OpenAI/Anthropic/Zen validation)
+    /// reject a name containing a dot with HTTP 400 ("Function name '…' must
+    /// not contain dots"), breaking every run. This pins all seven wire
+    /// names; it is deliberately not a registry-wide reject — MCP tools
+    /// legitimately use `mcp:<server>:<tool>` names, which are out of scope
+    /// here.
+    #[test]
+    fn harness_tool_names_are_wire_safe_function_names() {
+        const NAMES: &[&str] = &[
+            ENVIRONMENT_DESCRIBE_TOOL_NAME,
+            CHECKPOINT_CREATE_TOOL_NAME,
+            CHECKPOINT_INSPECT_TOOL_NAME,
+            CHECKPOINT_RESTORE_TOOL_NAME,
+            VERIFY_RUN_TOOL_NAME,
+            MEMORY_RECALL_TOOL_NAME,
+            MEMORY_INSPECT_TOOL_NAME,
+        ];
+        assert_eq!(NAMES.len(), 7, "all seven H13 wire names are pinned");
+        for name in NAMES {
+            assert!(!name.contains('.'), "{name} must not contain a dot");
+            assert!(!name.is_empty() && name.len() <= 64, "{name} must be 1..=64 characters");
+            assert!(
+                name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "{name} must match [A-Za-z0-9_-]"
+            );
+        }
     }
 
     #[tokio::test]

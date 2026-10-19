@@ -31,7 +31,7 @@ not passing verification. Validator outcomes still use their existing contract.
 ## Canonical specialist verification
 
 PR #343 adds the backward-compatible `AgentRunResult.verification` collection.
-Native `verify.run` observations, including failures, skipped checks and errors,
+Native `verify_run` observations, including failures, skipped checks and errors,
 travel through specialist settlements, checkpoints and bounded handoffs. The
 actual check's whiteboard event backs a transported record; write evidence alone
 does not establish that a check ran. Pending overlays and truncated envelopes

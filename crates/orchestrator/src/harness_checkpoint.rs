@@ -1,4 +1,4 @@
-//! H13 — `checkpoint.create` / `checkpoint.inspect` / `checkpoint.restore`
+//! H13 — `checkpoint_create` / `checkpoint_inspect` / `checkpoint_restore`
 //! operations over the one harness service seam.
 //!
 //! These turn the existing [`crate::file_checkpoint`] orchestration into
@@ -11,7 +11,7 @@
 //!   registered tools invoked through
 //!   [`ToolExecutor::execute`][concerto_core::executor::ToolExecutor::execute],
 //!   so a request is policy-evaluated and audited like any other tool.
-//! - `checkpoint.restore` is a service-level operation
+//! - `checkpoint_restore` is a service-level operation
 //!   ([`crate::harness_service::HarnessService::checkpoint_restore`]) because a
 //!   restore must itself issue gated `filesystem` writes: it calls
 //!   [`ToolExecutor::restore_checkpoint`][concerto_core::executor::ToolExecutor::restore_checkpoint],
@@ -44,13 +44,13 @@ use concerto_sessions::file_checkpoints::FileCheckpointStore;
 use serde::{Deserialize, Serialize};
 
 /// Registry name of the create operation.
-pub const CHECKPOINT_CREATE_TOOL_NAME: &str = "checkpoint.create";
+pub const CHECKPOINT_CREATE_TOOL_NAME: &str = "checkpoint_create";
 /// Registry name of the inspect operation.
-pub const CHECKPOINT_INSPECT_TOOL_NAME: &str = "checkpoint.inspect";
+pub const CHECKPOINT_INSPECT_TOOL_NAME: &str = "checkpoint_inspect";
 /// Service-level operation name for restore.
-pub const CHECKPOINT_RESTORE_TOOL_NAME: &str = "checkpoint.restore";
+pub const CHECKPOINT_RESTORE_TOOL_NAME: &str = "checkpoint_restore";
 
-/// Input for `checkpoint.create`.
+/// Input for `checkpoint_create`.
 ///
 /// `paths` are canonical project-relative paths. `scope` defaults to
 /// [`CheckpointScope::FilesystemWrites`] over `paths`; a `Task`/`Run` scope is
@@ -77,14 +77,14 @@ pub struct CheckpointCreateInput {
     pub source_revision: Option<String>,
 }
 
-/// Input for `checkpoint.inspect`.
+/// Input for `checkpoint_inspect`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointInspectInput {
     /// The checkpoint id to load.
     pub checkpoint_id: String,
 }
 
-/// Input for `checkpoint.restore`.
+/// Input for `checkpoint_restore`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointRestoreInput {
     /// The checkpoint id to restore.
@@ -195,7 +195,7 @@ impl HarnessRestoreOutcome {
     }
 }
 
-/// The `checkpoint.create` operation.
+/// The `checkpoint_create` operation.
 pub struct CheckpointCreateTool {
     store: Arc<FileCheckpointStore>,
     project_root: PathBuf,
@@ -251,7 +251,7 @@ impl Tool for CheckpointCreateTool {
     }
 
     fn capability_requirements(&self) -> CapabilitySet {
-        // Empty like `environment.describe`: discovery is free; whether a call
+        // Empty like `environment_describe`: discovery is free; whether a call
         // runs is the policy engine's decision through the executor gate.
         CapabilitySet::default()
     }
@@ -268,7 +268,7 @@ impl Tool for CheckpointCreateTool {
         }
         let parsed: CheckpointCreateInput =
             serde_json::from_value(input).map_err(|error| ToolError::ExecutionFailed {
-                message: format!("invalid checkpoint.create input: {error}"),
+                message: format!("invalid checkpoint_create input: {error}"),
             })?;
         let scope = parsed
             .scope
@@ -291,7 +291,7 @@ impl Tool for CheckpointCreateTool {
         let data = record_data(&record);
         Ok(ToolOutput {
             summary: format!(
-                "checkpoint.create id={} status={} included={} excluded={}",
+                "checkpoint_create id={} status={} included={} excluded={}",
                 record.checkpoint_id,
                 record.status.state_str(),
                 record.included.len(),
@@ -302,7 +302,7 @@ impl Tool for CheckpointCreateTool {
     }
 }
 
-/// The `checkpoint.inspect` operation: read one checkpoint record.
+/// The `checkpoint_inspect` operation: read one checkpoint record.
 pub struct CheckpointInspectTool {
     store: Arc<FileCheckpointStore>,
 }
@@ -351,18 +351,18 @@ impl Tool for CheckpointInspectTool {
         }
         let parsed: CheckpointInspectInput =
             serde_json::from_value(input).map_err(|error| ToolError::ExecutionFailed {
-                message: format!("invalid checkpoint.inspect input: {error}"),
+                message: format!("invalid checkpoint_inspect input: {error}"),
             })?;
         let record =
             self.store.load_checkpoint_record(&parsed.checkpoint_id, &cancel).await.map_err(
                 |error| ToolError::ExecutionFailed {
-                    message: format!("checkpoint.inspect store read failed: {error}"),
+                    message: format!("checkpoint_inspect store read failed: {error}"),
                 },
             )?;
         match record {
             Some(record) => Ok(ToolOutput {
                 summary: format!(
-                    "checkpoint.inspect id={} status={}",
+                    "checkpoint_inspect id={} status={}",
                     record.checkpoint_id,
                     record.status.state_str()
                 ),
@@ -372,7 +372,7 @@ impl Tool for CheckpointInspectTool {
                 }),
             }),
             None => Ok(ToolOutput {
-                summary: format!("checkpoint.inspect id={} not found", parsed.checkpoint_id),
+                summary: format!("checkpoint_inspect id={} not found", parsed.checkpoint_id),
                 data: serde_json::json!({ "found": false, "checkpoint_id": parsed.checkpoint_id }),
             }),
         }

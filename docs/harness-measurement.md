@@ -162,11 +162,11 @@ leg's summary. Two honest options, in preference order:
    - *environment-probing calls before the first useful action*: count audit
      rows from run start until the first **successful file-affecting write**
      (`write`/`delete`/`edit`/`filesystem` mutation). Read-only discovery
-     (`read`/`list`/`search`/`environment.describe`) counts as probing.
+     (`read`/`list`/`search`/`environment_describe`) counts as probing.
    - *identical failed-call retries*: count maximal runs of consecutive
      `--failed` rows with the same tool + canonical input, before any success.
    - *elapsed time to fresh passing evidence*: timestamp of the first
-     verification proving the required check (the `verify.run` audit row, or the
+     verification proving the required check (the `verify_run` audit row, or the
      typed `AgentOutput.verification[]` record's `checked_at` when the operator
      can capture the run output) minus run start. If the typed `checked_at`
      and the freshness verdict are not captured, **mark this unmeasured** — the

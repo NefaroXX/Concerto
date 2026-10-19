@@ -124,7 +124,7 @@ async fn real_specialist_recovers_failed_check_from_disk_without_repeating_effec
     let check = || {
         turn(
             "check",
-            "verify.run",
+            "verify_run",
             serde_json::json!({
                 "scope": "index.html", "verifier": "existence", "overlay_pending": false,
             }),
