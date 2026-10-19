@@ -289,7 +289,10 @@ muted_agents = []               # roster ids to grey out in the agent view
 trigger_tokens = 16000
 retain_user_turns = 4
 minimum_user_turns = 6
-cache_stable_prefix = false     # true pins a byte-stable cached prompt head
+cache_stable_prefix = false     # true pins the stable head + task-stable
+                                # context in the system and rides the volatile
+                                # per-iteration state as one trailing user
+                                # turn (single-agent only)
 
 # Shell profiles are normally detected and saved by Settings. The single
 # selected profile is used by agents, validation, and the integrated terminal.

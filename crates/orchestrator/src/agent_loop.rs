@@ -1369,16 +1369,14 @@ impl AgentLoop {
             tool_events,
             verification,
         );
-        let request_memory = if retrieved_memory_block.is_empty() {
-            active_working_memory
-        } else {
-            format!(
-                "{active_working_memory}
-{retrieved_memory_block}"
-            )
-        };
-        let mut request = self.prompt_builder.build(
-            &request_memory,
+        // ADR-48: the builder keeps the task-stable retrieved memory in the
+        // system head and, when `cache_stable_prefix` is on, moves the
+        // per-iteration active state to a trailing user message so the
+        // implicit prompt cache hits across iterations. With the knob off it
+        // reproduces the historical `active\nretrieved` system assembly.
+        let mut request = self.prompt_builder.build_agent_request(
+            retrieved_memory_block,
+            &active_working_memory,
             messages,
             None,
             Some(&self.tool_executor.tool_definitions()),

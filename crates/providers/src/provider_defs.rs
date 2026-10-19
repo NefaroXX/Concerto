@@ -201,9 +201,10 @@ pub const OPENCODE_FREE_KNOWN: &[&str] = &[
 /// * `glm-5.3-flash-free` requires each tool function to carry a
 ///   `description` (upstream `400` otherwise); the agent-loop requests always
 ///   send full schemas, so this only matters for minimal test payloads.
-/// * `deepseek-v4.1-flash-free` is in the relay catalog but rejected our
-///   minimal tool-trio probe shape (`400`, empty body) — serviceability
-///   unconfirmed, so it is deliberately excluded from defaults.
+/// * `deepseek-v4.1-flash-free` is hand-verified 2026-10-19: it streams,
+///   reports usage, and reuses a stable prompt prefix through the mirrored
+///   client identity. It is listed alongside the other verified free ids but
+///   is not a default.
 /// * `longcat-2.5-preview-free` served `200` on Zen too, but it also appears
 ///   in the Go relay's roster; it stays out of this list on purpose so the
 ///   two catalogs remain disjoint (see the disjointness guard in
@@ -218,7 +219,7 @@ pub const OPENCODE_FREE_KNOWN: &[&str] = &[
 /// which is a distinct roster): live discovery still covers the long tail via
 /// the anonymous `GET /zen/v1/models`.
 pub const OPENCODE_ZEN_FREE_KNOWN: &[&str] =
-    &["beam-free", "big-pickle", "cat-jam-free", "glm-5.3-flash-free"];
+    &["beam-free", "big-pickle", "cat-jam-free", "deepseek-v4.1-flash-free", "glm-5.3-flash-free"];
 
 /// Return the [`ProviderDefinition`] for a provider type string.
 ///

@@ -55,18 +55,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **OpenCode Zen anonymous free tier.** The `opencode` provider type now builds
   and streams without an API key against Zen's anonymous free tier by
   mirroring the real OpenCode client identity (`stream: true`, an
-  `opencode/*` User-Agent, the run's real session id under
-  `x-opencode-session`/`x-opencode-session-id`, a fresh per-request
-  `x-opencode-request`, and a construction-time `x-opencode-client` surface).
-  No session ids are minted and the caller's real tool declarations go on the
-  wire (`resolve_wire_builtin` still maps any opencode builtin name a model
-  emits onto the native shell/filesystem tools). An anonymous refusal (403/410)
+  `opencode/*` User-Agent, one minted opencode-format `ses_` wire session id
+  per run under `x-opencode-session`/`x-opencode-session-id`, a fresh
+  per-request `x-opencode-request`, and a construction-time
+  `x-opencode-client` surface). The caller's raw ULID never goes on the
+  anonymous wire — the relay refuses it — so the provider mints one opaque
+  wire id per caller session and reuses it for that run, mirroring the real
+  client's stable session header (which the relay also uses for sticky
+  provider selection); session-less anonymous requests mint one id per
+  completion. The caller's real tool declarations go on the wire
+  (`resolve_wire_builtin` still maps any opencode builtin name a model emits
+  onto the native shell/filesystem tools). An anonymous refusal (403/410)
   surfaces as non-retryable `FreeTierRefused`, while an anonymous 429 is an
   ordinary rate limit on the relay's shared, IP-keyed daily bucket (no
   per-model quota) and flows through the generic retryable `RateLimit`,
   honoring `Retry-After`. The default free model set
   (`OPENCODE_ZEN_FREE_KNOWN`) was refreshed against the 2026-10-18 relay roster
-  (`beam-free`, `big-pickle`, `cat-jam-free`, `glm-5.3-flash-free`).
+  and re-verified 2026-10-19 (`beam-free`, `big-pickle`, `cat-jam-free`,
+  `deepseek-v4.1-flash-free`, `glm-5.3-flash-free`).
   `opencode-free`
   (Go) and other providers stay credential-required. On the paid path, body
   rendering and error treatment are unchanged; paid Zen requests now carry the
@@ -198,6 +204,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Cache-friendly single-agent prompt shape (ADR-48).** With
+  `[context] cache_stable_prefix = true`, the single-agent loop builds its
+  request through `PromptBuilder::build_agent_request`: one system message
+  holds the byte-stable head plus the task-stable retrieved memory, the
+  conversation history follows verbatim, and the volatile per-iteration
+  working memory rides one trailing user turn, so each request extends the
+  cached prefix instead of rewriting its head. With the knob off the
+  assembly stays byte-identical to before, and the coordinator dispatch path
+  is unchanged and out of scope. Live-verified against the free Zen models
+  on 2026-10-19 (DeepSeek 0.74 aggregate token reuse end-to-end; GLM varies
+  with the relay replica) — see `docs/cache-benchmarks.md`.
 - **Supervised agent-process is real.** Children build an actual provider and
   route approvals over IPC to the same approval sink the in-process paths use
   (`d62ebac`, `7859a0a`).

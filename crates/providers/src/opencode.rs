@@ -15,10 +15,12 @@
 //! zero-cost roster to an *anonymous* client (`Authorization: Bearer public`,
 //! the relay's `"public"` sentinel for "no account"). We present exactly the
 //! client identity the real OpenCode client presents — the same
-//! `x-opencode-*` identity headers and `opencode/<version>` User-Agent — so the
-//! relay classifies Concerto as an OpenCode client instead of manufacturing a
-//! fingerprint mismatch. See [`OPENCODE_ANONYMOUS_CREDENTIAL`],
-//! [`OPENCODE_SESSION_HEADER`], and [`OpenCodeZenProvider::per_request_headers`].
+//! `x-opencode-*` identity headers, one stable `ses_` wire session per run
+//! (minted opaquely, never the caller's raw ULID), and `opencode/<version>`
+//! User-Agent — so the relay classifies Concerto as an OpenCode client instead
+//! of manufacturing a fingerprint mismatch. See
+//! [`OPENCODE_ANONYMOUS_CREDENTIAL`], [`OPENCODE_SESSION_HEADER`], and
+//! [`OpenCodeZenProvider::per_request_headers`].
 //! That anonymous path is why the `opencode` provider type can be built with no
 //! credential; it is client *identity*, not session registration. A
 //! config-supplied `api_base` overrides either default (self-hosted gateways,
@@ -140,12 +142,14 @@ impl OpenCodeRelay {
 /// Upstream reads it (`packages/console/app/src/routes/zen/util/handler.ts`:
 /// `input.request.headers.get("x-opencode-session")`) as a session identity;
 /// on the paid path it doubles as prompt-cache / backend affinity. Concerto
-/// mirrors it from the run's real orchestration session id
-/// ([`CompletionRequest::session_id`]). It is **not** an authentication
-/// mechanism and authorizes nothing: without a valid `Authorization` the relay
-/// still answers `401 AuthError`. When there is no orchestration session
-/// (discovery, tests, standalone legs) the header is omitted entirely rather
-/// than filled with an invented value.
+/// mirrors it from the run's real orchestration session id on keyed requests
+/// ([`CompletionRequest::session_id`]); the anonymous free tier mints one
+/// opaque client-format wire id per caller session instead (see
+/// [`OpenCodeZenProvider::per_request_headers`]). It is **not** an
+/// authentication mechanism and authorizes nothing: without a valid
+/// `Authorization` the relay still answers `401 AuthError`. Keyed requests
+/// with no orchestration session (discovery, tests, standalone legs) omit the
+/// header entirely rather than filled with an invented value.
 pub(crate) const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
 
 /// Second session-identity spelling the real client sends alongside
@@ -224,8 +228,10 @@ pub(crate) fn next_request_id() -> String {
 /// six hex bytes of a millisecond timestamp shifted left 12 bits and inverted
 /// for descending order (plus a within-millisecond counter), and fourteen
 /// base62 suffix characters. The caller's orchestration ULID cannot go on the
-/// anonymous wire — the relay refuses raw ULIDs — so one fresh wire id is
-/// minted per completion instead (live-verified 2026-10-18).
+/// anonymous wire — the relay refuses raw ULIDs — so the provider mints an
+/// opaque wire id per caller session and reuses it across that run
+/// ([`OpenCodeZenProvider::per_request_headers`]); session-less anonymous
+/// completions mint one per request.
 pub(crate) fn mint_wire_session_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -377,6 +383,11 @@ fn is_muse_version_segment(segment: &str) -> bool {
     bytes.first() == Some(&b'v') && bytes.get(1).is_some_and(u8::is_ascii_digit)
 }
 
+/// Upper bound on the anonymous wire-session affinity map. A long-lived
+/// provider can serve many runs; cap the retained caller ids so the map stays
+/// small. Eviction is safe: it only forfeits cache affinity for stale runs.
+const ANONYMOUS_WIRE_SESSION_CAP: usize = 256;
+
 /// OpenCode provider (Zen or Go relay) that automatically selects the correct
 /// wire dialect per model family.
 pub struct OpenCodeZenProvider {
@@ -409,6 +420,18 @@ pub struct OpenCodeZenProvider {
     /// streamed completions). Go is never anonymous — the relay rejects
     /// anonymous requests with `401`, and the factory fails closed.
     anonymous: bool,
+    /// Anonymous Zen wire session ids keyed by the caller's orchestration
+    /// session. The real OpenCode client sends one stable `ses_` id for the
+    /// whole session and the relay uses that id for backend/cache affinity
+    /// (upstream `session/llm/request.ts`). Concerto must not put the caller's
+    /// raw ULID on the anonymous wire, so it mints one opaque `ses_` id per
+    /// caller session and reuses it for that run. Session-less anonymous
+    /// requests (discovery, standalone legs) still mint one per completion.
+    ///
+    /// The map is bounded; eviction only causes the next completion for that
+    /// run to mint a new wire session, which is a cache miss, never a
+    /// correctness issue.
+    anonymous_wire_sessions: std::sync::Mutex<HashMap<String, String>>,
     /// Pre-built inner OpenAI provider for OpenAI-compatible models.
     openai_inner: OpenAiProvider,
 }
@@ -483,6 +506,7 @@ impl OpenCodeZenProvider {
             api_base,
             relay,
             anonymous,
+            anonymous_wire_sessions: std::sync::Mutex::new(HashMap::new()),
             tool_schema_mode: concerto_config::ToolSchemaMode::default(),
             advertised_tool_support: None,
             openai_inner,
@@ -502,22 +526,81 @@ impl OpenCodeZenProvider {
     /// a construction-time property and rides the connector's static extra
     /// headers instead (see [`OPENCODE_CLIENT_HEADER`]).
     ///
-    /// **Anonymous** completions always mint a fresh opencode-format `ses_`
-    /// wire id ([`mint_wire_session_id`]) — the free-tier relay validates the
-    /// session identity against the client's own format and refuses raw
-    /// orchestration ULIDs, and it refuses credential-less completions with no
-    /// session identity at all (both live-verified 2026-10-18). Keyed
-    /// requests mirror the caller's real session id when one is supplied and
-    /// omit the session headers otherwise — byte-identical to the pre-patch
-    /// keyed wire.
+    /// **Anonymous** completions never put the caller's orchestration ULID on
+    /// the wire: the relay validates the session identity against the client's
+    /// own format and refuses raw ULIDs, and it refuses credential-less
+    /// completions with no session identity at all (both live-verified
+    /// 2026-10-18). The provider mints one opaque opencode-format `ses_` id
+    /// per caller session and reuses it for every completion in that run,
+    /// mirroring the real client's stable session header (see
+    /// [`OpenCodeZenProvider::anonymous_headers_for`]). This helper mints a
+    /// fresh id for callers that have no provider instance (keyed paths and
+    /// session-less probes never use it for anonymous requests in production).
+    /// Keyed requests mirror the caller's real session id when one is supplied
+    /// and omit the session headers otherwise — byte-identical to the
+    /// pre-patch keyed wire.
     pub(crate) fn per_request_headers(
         session_id: Option<&str>,
         request_id: &str,
         anonymous: bool,
     ) -> Vec<(String, String)> {
+        let wire_session = anonymous.then(mint_wire_session_id);
+        Self::per_request_headers_with_wire_session(
+            session_id,
+            request_id,
+            anonymous,
+            wire_session.as_deref(),
+        )
+    }
+
+    /// The anonymous-path headers for one completion. A caller session gets
+    /// one stable minted wire id for the whole run; a session-less request
+    /// mints an id per completion.
+    fn anonymous_headers_for(
+        &self,
+        session_id: Option<&str>,
+        request_id: &str,
+    ) -> Vec<(String, String)> {
+        let wire_session = session_id.map(|caller| self.anonymous_wire_session(caller));
+        Self::per_request_headers_with_wire_session(
+            session_id,
+            request_id,
+            true,
+            wire_session.as_deref(),
+        )
+    }
+
+    /// Return the stable anonymous wire session id for one caller session,
+    /// minting it on first use. The caller's real ULID is only the in-memory
+    /// lookup key; it never reaches the wire.
+    fn anonymous_wire_session(&self, caller_session: &str) -> String {
+        let mut sessions =
+            self.anonymous_wire_sessions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(id) = sessions.get(caller_session) {
+            return id.clone();
+        }
+        if sessions.len() >= ANONYMOUS_WIRE_SESSION_CAP {
+            sessions.clear();
+        }
+        let id = mint_wire_session_id();
+        sessions.insert(caller_session.to_string(), id.clone());
+        id
+    }
+
+    /// Build the identity headers with an explicit anonymous wire session (or
+    /// `None` to mint one for this call).
+    fn per_request_headers_with_wire_session(
+        session_id: Option<&str>,
+        request_id: &str,
+        anonymous: bool,
+        anonymous_wire_session: Option<&str>,
+    ) -> Vec<(String, String)> {
         let mut headers = Vec::with_capacity(3);
         if anonymous {
-            let wire_session = mint_wire_session_id();
+            let wire_session = match anonymous_wire_session {
+                Some(id) => id.to_string(),
+                None => mint_wire_session_id(),
+            };
             headers.push((OPENCODE_SESSION_HEADER.to_string(), wire_session.clone()));
             headers.push((OPENCODE_SESSION_ID_HEADER.to_string(), wire_session));
         } else if let Some(session) = session_id {
@@ -982,16 +1065,18 @@ impl LlmProvider for OpenCodeZenProvider {
         let model = self.resolve_model(&request);
         // One fresh per-request id, plus the session identity: keyed requests
         // mirror the run's real session id when the caller supplied one
-        // (session-less keyed legs omit it), while anonymous requests mint a
-        // client-format wire session id because the free-tier relay validates
-        // that identity and refuses raw ULIDs. See `per_request_headers`.
+        // (session-less keyed legs omit it), while anonymous requests carry a
+        // minted client-format wire session id because the free-tier relay
+        // validates that identity and refuses raw ULIDs. The anonymous wire id
+        // is stable for the caller's session so the relay can keep backend/cache
+        // affinity across the run, matching the real client.
         let request_id = next_request_id();
         let session_id = request.session_id.map(|id| id.to_string());
-        let per_request = Self::per_request_headers(
-            session_id.as_deref(),
-            request_id.as_str(),
-            self.is_anonymous(),
-        );
+        let per_request = if self.is_anonymous() {
+            self.anonymous_headers_for(session_id.as_deref(), request_id.as_str())
+        } else {
+            Self::per_request_headers(session_id.as_deref(), request_id.as_str(), false)
+        };
         // The ONE dialect decision: (relay, model) -> wire mode. The relay is
         // fixed at construction from the effective base URL, so the Go relay
         // can never be routed with Zen's table (the 400 bug this fixes).
@@ -1990,9 +2075,12 @@ mod tests {
 
     /// The per-request identity header builder mirrors the real client: keyed
     /// requests borrow the caller's session under both spellings (and invent
-    /// nothing when the caller has none), while anonymous requests always mint
-    /// a fresh opencode-format `ses_` wire id — the free-tier relay refuses
-    /// raw ULIDs and session-less completions alike (live-verified 2026-10-18).
+    /// nothing when the caller has none), while anonymous requests always
+    /// carry an opencode-format `ses_` wire id — the free-tier relay refuses
+    /// raw ULIDs and session-less completions alike (live-verified
+    /// 2026-10-18). This static helper mints per call; the provider's
+    /// [`OpenCodeZenProvider::anonymous_headers_for`] reuses one wire id per
+    /// caller session.
     #[test]
     fn per_request_headers_mirror_the_client() {
         let headers = OpenCodeZenProvider::per_request_headers(Some("ses_abc"), "msg_xyz", false);
@@ -2036,6 +2124,38 @@ mod tests {
         }
     }
 
+    /// One caller session gets one stable anonymous wire id across completions
+    /// (mirroring the real client's per-session header), while distinct caller
+    /// sessions stay distinct — and the caller's ULID never appears on the
+    /// wire. Session-less anonymous requests still mint per completion.
+    #[test]
+    fn anonymous_wire_session_is_stable_per_caller_session() {
+        let provider = OpenCodeZenProvider::new(String::new(), "glm-5.3-flash-free".into(), 5);
+        assert!(provider.is_anonymous(), "an empty-key Zen provider is anonymous");
+
+        let caller = "01M57FZD52MN7P652C63EEJXM0";
+        let first = provider.anonymous_headers_for(Some(caller), "msg_one");
+        let second = provider.anonymous_headers_for(Some(caller), "msg_two");
+        let first_wire = first[0].1.clone();
+        assert_eq!(first_wire, first[1].1, "both spellings mirror one wire id");
+        assert_eq!(first_wire, second[0].1, "one caller session reuses one wire id");
+        assert_eq!(second[0].1, second[1].1);
+        assert_wire_session_format(&first_wire, "the anonymous stable wire id");
+        assert_ne!(first_wire, caller, "the caller ULID never goes on the wire");
+        assert_eq!(first[2].1, "msg_one");
+        assert_eq!(second[2].1, "msg_two", "the request id still changes per call");
+
+        let other = provider.anonymous_headers_for(Some("01M57FZD52MN7P652C63EEJXM1"), "msg_three");
+        assert_ne!(other[0].1, first_wire, "distinct caller sessions get distinct wire ids");
+
+        let session_less_a = provider.anonymous_headers_for(None, "msg_four");
+        let session_less_b = provider.anonymous_headers_for(None, "msg_five");
+        assert_ne!(
+            session_less_a[0].1, session_less_b[0].1,
+            "session-less anonymous requests still mint one wire id per completion"
+        );
+    }
+
     /// Each call mints a distinct per-request id, so two requests never share
     /// one identifier.
     #[test]
@@ -2053,7 +2173,7 @@ mod tests {
     fn mint_wire_session_id_has_client_shape_and_is_fresh() {
         let first = mint_wire_session_id();
         let second = mint_wire_session_id();
-        assert_ne!(first, second, "each completion gets a fresh wire session id");
+        assert_ne!(first, second, "each mint is a distinct id");
         assert_wire_session_format(&first, "the minted wire session id");
 
         // Decode the timestamp block back: it is `~((ms << 12) | counter)`

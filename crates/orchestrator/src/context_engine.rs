@@ -17,9 +17,14 @@
 //! `retain_user_turns` 4, `minimum_user_turns` 6), so a config without a
 //! `[context]` section — or with only some knobs set — is byte-identical to
 //! today's runtime. `cache_stable_prefix` resolves to `false` when unset and
-//! is consumed by [`crate::prompts::PromptBuilder`], which pins a byte-stable
-//! system head and appends the volatile working memory after it (see
-//! [`crate::prompts::PromptBuilder::stable_system_head`]).
+//! is consumed by [`crate::prompts::PromptBuilder`]. When enabled, the
+//! single-agent loop uses
+//! [`crate::prompts::PromptBuilder::build_agent_request`]: the system message
+//! is the byte-stable head plus the task-stable retrieved memory, and the
+//! volatile per-iteration working memory rides one trailing user message, so
+//! every request extends the previous prefix instead of rewriting its head.
+//! The coordinator dispatch path keeps the historical single-system-message
+//! assembly ([`crate::prompts::PromptBuilder::build`]).
 
 use std::sync::Arc;
 
@@ -45,14 +50,14 @@ pub struct ContextBudgetPolicy {
     pub retain_user_turns: usize,
     /// Minimum user turns before compaction may fire (default 6).
     pub minimum_user_turns: usize,
-    /// Pin a byte-stable system head and append the volatile working memory
-    /// after it (default `false` = today's byte-identical assembly). Resolved
-    /// from `[context].cache_stable_prefix` and consumed by
+    /// Keep the single-agent request head cache-friendly (default `false` =
+    /// today's byte-identical assembly). Resolved from
+    /// `[context].cache_stable_prefix` and consumed by
     /// [`crate::prompts::PromptBuilder::with_cache_stable_prefix`], which the
-    /// single-agent run wires in `runtime_runner`; the stable head carries the
-    /// system prompt, skills block, project context, environment card and (via
-    /// `CompletionRequest::tools`) the tool schemas, so retrieved chunks and
-    /// per-turn content never sit inside it.
+    /// single-agent run wires in `runtime_runner`. When enabled, the system
+    /// message is the byte-stable head plus task-stable retrieved memory, and
+    /// per-iteration working memory rides one trailing user message; tool
+    /// schemas (sorted by name) stay in `CompletionRequest::tools`.
     pub cache_stable_prefix: bool,
 }
 
