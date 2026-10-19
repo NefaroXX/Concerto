@@ -82,7 +82,7 @@ Closed during reconciliation:
 15. Audit-log at-rest encryption + retention (gap #5) — landed `7351128` with ADR-73 Accepted (2026-09-26); posture is opt-in by design.
 16. ADR-60 S5 agent-process slice — real provider injection `d62ebac` + approval IPC through the shared `ApprovalSink` `7859a0a` (2026-09-26); residual: no `run_id` on the approval wire.
 17. Per-session ack queue — landed `8e3c350` (2026-09-27), `MAX_PENDING_ACKS = 2` FIFO with fail-closed overflow; residual: an overflow refusal audits as `RequestAbort` (the sink returns a bare `bool`).
-18. Row 1 `cache_stable_prefix` — wired into request assembly, `32d6809` (2026-09-25) (`runtime_runner.rs:2146`, `prompts.rs:55`).
+18. Row 1 `cache_stable_prefix` — wired into request assembly, `32d6809` (2026-09-25) (`runtime_runner.rs:1307-1317`, `prompts.rs:84`); the single-agent request split landed 2026-10-19 (`prompts.rs:359`, `build_agent_request` — stable head in the system, per-iteration state as one trailing user turn).
 19. Row 2 per-message token accounting — provider-reported usage persisted to message rows, `22d495b` + `a72741f` (2026-09-25) (`message_row_usage`, `runtime_runner.rs:4567,4695`).
 20. Row 5 recall cost bounds — char-budget allocator + 5000 ms timeout + skip-with-warning, `92b0be4` (2026-09-24) (`RecallCostBounds`, `rag.rs:133,150-151`).
 21. Row 38 proxy parsing long tail — hardened against the remaining forms, `3bc11db` (2026-09-26).

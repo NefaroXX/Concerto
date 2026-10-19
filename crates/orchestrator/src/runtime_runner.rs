@@ -1304,8 +1304,9 @@ async fn execute_agent_loop(
         // Run-scoped project AGENTS.md context (ADR-70): injected between the
         // skills section and the environment card.
         .with_project_context(Some(project_context))
-        // ADR-048: `[context].cache_stable_prefix` pins a byte-stable system
-        // head and appends the volatile working memory after it. Resolved
+        // ADR-048: `[context].cache_stable_prefix` keeps the single-agent
+        // system message byte-stable (head plus task-stable context) and
+        // moves volatile working memory to a trailing user turn. Resolved
         // through the engine's budget policy so the knob's default lives in
         // exactly one place (`ContextBudgetPolicy::from_config`); unset or
         // `false` keeps today's byte-identical assembly.

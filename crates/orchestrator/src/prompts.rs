@@ -14,7 +14,9 @@ use concerto_core::event::EventBus;
 use concerto_core::ids::Ulid;
 use concerto_core::text::normalize_typographic;
 use concerto_core::traits::provider::{CompletionStream, LlmProvider};
-use concerto_core::types::{CompletionRequest, CompletionUsage, Message, Role, ToolCall};
+use concerto_core::types::{
+    CompletionRequest, CompletionUsage, Message, Role, ToolCall, ToolDefinition,
+};
 use concerto_core::{CancellationToken, OrchestratorError, TaskId};
 use concerto_providers::retry::{with_provider_retry, RetryPolicy};
 
@@ -63,12 +65,22 @@ pub struct PromptBuilder {
     native_shell: bool,
     /// ADR-048 prefix discipline (the `[context].cache_stable_prefix` knob).
     ///
-    /// `false` (default) keeps today's byte-identical assembly. `true` pins a
-    /// byte-stable head — template, resolved summary, skills block, project
-    /// AGENTS.md context and environment card — and appends the volatile
-    /// working-memory/retrieved block *after* it, still inside the single
-    /// system message, so a prompt cache keyed on the head survives a churned
-    /// tail. See [`PromptBuilder::stable_system_head`].
+    /// `false` (default) keeps today's byte-identical assembly. `true` makes
+    /// the single-agent request cache-friendly:
+    /// * the system message is the byte-stable head — template, resolved
+    ///   summary, skills block, project AGENTS.md context, environment card —
+    ///   followed by the task-stable retrieved-memory block (fetched once per
+    ///   task in [`crate::agent_loop::AgentLoop::run_once`]). Neither the
+    ///   per-iteration active state nor the growing conversation touches it;
+    /// * the volatile active working memory rides one trailing
+    ///   [`Role::User`] message after the conversation history, so every
+    ///   request extends the previous one instead of rewriting its head.
+    ///
+    /// [`PromptBuilder::build`] keeps its historical single-system-message
+    /// tail for callers that need it (the coordinator dispatch path, which is
+    /// explicitly out of scope in ADR-48). The single-agent loop uses
+    /// [`PromptBuilder::build_agent_request`] instead. See
+    /// [`PromptBuilder::stable_system_head`].
     cache_stable_prefix: bool,
 }
 
@@ -242,22 +254,31 @@ impl PromptBuilder {
     /// a run: the template, the resolved `{summary}`, the skills block (sorted
     /// and deduplicated by [`SkillsContext`]), the project AGENTS.md context,
     /// the environment card, and the run's cached environment-manifest digest
-    /// (collected once per run at the barrier). Tool schemas never enter this string at all —
-    /// they ride `CompletionRequest::tools`, rendered from the executor
-    /// registry in registration order — so they are stable for the same
-    /// reason.
+    /// (collected once per run at the barrier). Tool schemas never enter this
+    /// string at all: they ride `CompletionRequest::tools`, and under
+    /// `cache_stable_prefix` they are name-sorted so registry order cannot
+    /// churn the wire prefix.
     ///
     /// With [`PromptBuilder::with_cache_stable_prefix`] enabled,
     /// [`PromptBuilder::build`] emits exactly these bytes first and appends
     /// the volatile working memory (active state plus retrieved chunks) after
     /// them, inside the same single system message so last-system-wins
     /// adapters (Anthropic, Gemini) still see it while the bytes before it
-    /// never move.
+    /// never move. [`PromptBuilder::build_agent_request`] instead keeps the
+    /// system message limited to this head plus the task-stable context and
+    /// moves the per-iteration state to a trailing user message.
     pub fn stable_system_head(&self, prev_summary: Option<&str>) -> String {
         self.assemble_system("", prev_summary)
     }
 
     /// Build a `CompletionRequest` from the current context.
+    ///
+    /// This is the historical single-system-message assembly. Under
+    /// `cache_stable_prefix` the volatile working memory is appended after the
+    /// stable head *inside* the system message; this remains the coordinator's
+    /// path (ADR-48 scopes the stable-prefix work to the single agent). The
+    /// single-agent loop uses [`PromptBuilder::build_agent_request`], which
+    /// moves that volatile state to a trailing user message.
     ///
     /// * `working_memory_block` — the XML block from `WorkingMemory::to_system_block()`.
     /// * `messages` — the conversation history (short-term memory messages).
@@ -268,7 +289,7 @@ impl PromptBuilder {
         working_memory_block: &str,
         messages: &[Message],
         prev_summary: Option<&str>,
-        tools: Option<&[concerto_core::types::ToolDefinition]>,
+        tools: Option<&[ToolDefinition]>,
     ) -> CompletionRequest {
         let system = if self.cache_stable_prefix {
             // ADR-048: pin the stable head, then append the volatile tail.
@@ -296,16 +317,7 @@ impl PromptBuilder {
             self.cache_stable_prefix.then(|| self.stable_system_head(prev_summary).len());
         let mut all_messages = Vec::with_capacity(messages.len() + 1);
 
-        all_messages.push(Message {
-            role: Role::System,
-            content: system,
-            tool_calls: None,
-            tool_results: None,
-            reasoning_content: None,
-            tokens_in: None,
-            tokens_out: None,
-        });
-
+        all_messages.push(Self::message(Role::System, system));
         all_messages.extend_from_slice(messages);
 
         CompletionRequest {
@@ -313,18 +325,110 @@ impl PromptBuilder {
             stable_system_prefix_bytes,
             model: String::new(), // filled in by the caller or provider context guard
             messages: all_messages,
-            tools: tools.map(|definitions| {
-                let mut tools = definitions.to_vec();
-                if self.cache_stable_prefix {
-                    tools.sort_by(|a, b| a.name.cmp(&b.name));
-                }
-                tools
-            }),
+            tools: self.assembled_tools(tools),
             tool_choice: None,
             temperature: None,
             max_tokens: None,
             stream: true,
         }
+    }
+
+    /// Build the single-agent request, keeping the implicit prompt cache warm
+    /// when `cache_stable_prefix` is enabled.
+    ///
+    /// Under `cache_stable_prefix = true` the request has the
+    /// prompt-cache-friendly shape:
+    ///
+    /// 1. one system message: the byte-stable head plus, when non-empty, the
+    ///    task-stable `stable_context` (retrieved memory, fetched once per
+    ///    task) separated by a blank line;
+    /// 2. the conversation history verbatim and append-only;
+    /// 3. one trailing [`Role::User`] message carrying the volatile
+    ///    per-iteration `volatile_working_memory`, omitted when empty.
+    ///
+    /// The system bytes therefore only change when a run-stable section
+    /// changes, so each iteration reuses the previous prefix instead of
+    /// rewriting the whole system message. `stable_system_prefix_bytes` is
+    /// `None`: the caller is not asking a provider to place an explicit cache
+    /// breakpoint, because the entire system message is already stable.
+    ///
+    /// With `cache_stable_prefix = false` this delegates to
+    /// [`PromptBuilder::build`] with the same `volatile + "\n" + stable`
+    /// combination the single-agent loop has always used, so the default
+    /// assembly is byte-identical to the previous behavior.
+    pub fn build_agent_request(
+        &self,
+        stable_context: &str,
+        volatile_working_memory: &str,
+        messages: &[Message],
+        prev_summary: Option<&str>,
+        tools: Option<&[ToolDefinition]>,
+    ) -> CompletionRequest {
+        if !self.cache_stable_prefix {
+            // Preserve the historical combination exactly: volatile state
+            // first, then a newline and the retrieved-memory block when one
+            // exists (and volatile alone when it does not).
+            let working_memory = if stable_context.is_empty() {
+                volatile_working_memory.to_string()
+            } else {
+                format!("{volatile_working_memory}\n{stable_context}")
+            };
+            return self.build(&working_memory, messages, prev_summary, tools);
+        }
+
+        let mut system = self.stable_system_head(prev_summary);
+        if !stable_context.is_empty() {
+            system.push_str("\n\n");
+            system.push_str(stable_context);
+        }
+
+        let mut all_messages = Vec::with_capacity(messages.len() + 2);
+        all_messages.push(Self::message(Role::System, system));
+        all_messages.extend_from_slice(messages);
+        if !volatile_working_memory.is_empty() {
+            all_messages.push(Self::message(Role::User, volatile_working_memory.to_string()));
+        }
+
+        CompletionRequest {
+            session_id: None,
+            // The whole system message is stable, so there is no explicit
+            // breakpoint to place inside it.
+            stable_system_prefix_bytes: None,
+            model: String::new(), // filled in by the caller or provider context guard
+            messages: all_messages,
+            tools: self.assembled_tools(tools),
+            tool_choice: None,
+            temperature: None,
+            max_tokens: None,
+            stream: true,
+        }
+    }
+
+    /// A single message with no tool, reasoning, or usage payload — the shape
+    /// the orchestrator uses for its system and working-memory turns.
+    fn message(role: Role, content: String) -> Message {
+        Message {
+            role,
+            content,
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: None,
+            tokens_in: None,
+            tokens_out: None,
+        }
+    }
+
+    /// Tool definitions for one request. Under `cache_stable_prefix` they are
+    /// sorted by name so an unordered registry cannot churn the wire prefix;
+    /// otherwise registration order is preserved byte-for-byte.
+    fn assembled_tools(&self, tools: Option<&[ToolDefinition]>) -> Option<Vec<ToolDefinition>> {
+        tools.map(|definitions| {
+            let mut tools = definitions.to_vec();
+            if self.cache_stable_prefix {
+                tools.sort_by(|a, b| a.name.cmp(&b.name));
+            }
+            tools
+        })
     }
 }
 
@@ -1454,6 +1558,197 @@ mod tests {
         let card = system.find("## Environment").expect("environment card present");
         let block = system.find(WORKING_MEMORY_BLOCK).expect("working memory present");
         assert!(block > card, "the volatile tail follows the stable sections");
+    }
+
+    // -- single-agent request shape (cache_stable_prefix tail as user) ------
+
+    /// Two builds with the same task-stable context but different volatile
+    /// state and growing history keep a byte-identical system message, append
+    /// history only, and carry the per-iteration state as one trailing user
+    /// turn that never enters the system message or the history.
+    #[test]
+    fn agent_request_cache_tail_keeps_system_byte_stable_and_history_append_only() {
+        let builder = PromptBuilder::new(
+            "System prompt\nSummary: {summary}\nWM: {working_memory}".to_string(),
+        )
+        .with_cache_stable_prefix(true);
+        let stable_context = "<retrieved_memory>TASK_STABLE_SECRET</retrieved_memory>";
+
+        let history_one = [user_message("turn one")];
+        let history_two = [
+            user_message("turn one"),
+            Message { role: Role::Assistant, ..user_message("answer one") },
+            user_message("turn two"),
+        ];
+
+        let first = builder.build_agent_request(
+            stable_context,
+            "<working_memory>iteration 1 ACTIVE_ONE</working_memory>",
+            &history_one,
+            None,
+            None,
+        );
+        let second = builder.build_agent_request(
+            stable_context,
+            "<working_memory>iteration 2 ACTIVE_TWO</working_memory>",
+            &history_two,
+            None,
+            None,
+        );
+
+        assert_eq!(first.messages[0].role, Role::System);
+        assert_eq!(
+            first.messages[0].content, second.messages[0].content,
+            "the system message must not depend on the volatile state or the history"
+        );
+        let system = &second.messages[0].content;
+        assert!(system.contains(stable_context), "the task-stable context rides the system head");
+        assert!(!system.contains("ACTIVE_ONE"), "volatile state never enters the system");
+        assert!(!system.contains("ACTIVE_TWO"), "volatile state never enters the system");
+        assert!(
+            first.stable_system_prefix_bytes.is_none(),
+            "the whole system is stable, so no explicit breakpoint is needed"
+        );
+
+        for (request, history, active) in [
+            (
+                &first,
+                history_one.as_slice(),
+                "<working_memory>iteration 1 ACTIVE_ONE</working_memory>",
+            ),
+            (
+                &second,
+                history_two.as_slice(),
+                "<working_memory>iteration 2 ACTIVE_TWO</working_memory>",
+            ),
+        ] {
+            assert_eq!(
+                request.messages.len(),
+                1 + history.len() + 1,
+                "one system + history + one trailing working-memory turn"
+            );
+            let trailing = request.messages.last().expect("a trailing message exists");
+            assert_eq!(trailing.role, Role::User, "the volatile tail is a user turn");
+            assert_eq!(trailing.content, active);
+            for (message, expected) in
+                request.messages[1..=history.len()].iter().zip(history.iter())
+            {
+                assert_eq!(message.role, expected.role);
+                assert_eq!(message.content, expected.content);
+                assert!(!message.content.contains("ACTIVE_"), "working memory is not in history");
+            }
+        }
+    }
+
+    /// With the knob off, `build_agent_request` reproduces the single-agent
+    /// loop's historical `volatile + "\n" + stable` system assembly exactly.
+    #[test]
+    fn agent_request_off_path_is_byte_identical_to_build() {
+        let tools = [
+            ToolDefinition {
+                name: "shell".into(),
+                description: "Run commands".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+            ToolDefinition {
+                name: "filesystem".into(),
+                description: "Read and write files".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        ];
+        let builder = PromptBuilder::new("System prompt\nWM: {working_memory}".to_string());
+        assert!(!builder.cache_stable_prefix(), "this must exercise the default path");
+        let history = [user_message("turn one")];
+
+        let agent =
+            builder.build_agent_request("retrieved", "active", &history, None, Some(&tools));
+        let legacy = builder.build("active\nretrieved", &history, None, Some(&tools));
+
+        assert_eq!(agent.messages[0].content, legacy.messages[0].content);
+        assert_eq!(agent.messages.len(), legacy.messages.len());
+        for (agent_message, legacy_message) in agent.messages.iter().zip(legacy.messages.iter()) {
+            assert_eq!(agent_message.role, legacy_message.role);
+            assert_eq!(agent_message.content, legacy_message.content);
+        }
+        assert_eq!(
+            serde_json::to_string(&agent.tools).expect("agent tools serialize"),
+            serde_json::to_string(&legacy.tools).expect("legacy tools serialize"),
+            "tool order and content stay identical off the cache path"
+        );
+        assert_eq!(agent.stable_system_prefix_bytes, legacy.stable_system_prefix_bytes);
+    }
+
+    /// Under the knob, tool declarations are name-sorted so an unordered
+    /// registry cannot churn the wire prefix; the off path keeps registration
+    /// order byte-for-byte.
+    #[test]
+    fn agent_request_sorts_tools_only_on_the_cache_path() {
+        let tools = [
+            ToolDefinition {
+                name: "shell".into(),
+                description: "Run commands".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+            ToolDefinition {
+                name: "filesystem".into(),
+                description: "Read and write files".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+            ToolDefinition {
+                name: "grep".into(),
+                description: "Search files".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        ];
+        let names = |request: &CompletionRequest| -> Vec<String> {
+            request
+                .tools
+                .as_ref()
+                .expect("tools are present")
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect()
+        };
+
+        let cached = PromptBuilder::new("System prompt".to_string())
+            .with_cache_stable_prefix(true)
+            .build_agent_request("", "active", &[], None, Some(&tools));
+        assert_eq!(names(&cached), ["filesystem", "grep", "shell"]);
+
+        let legacy = PromptBuilder::new("System prompt".to_string()).build_agent_request(
+            "",
+            "active",
+            &[],
+            None,
+            Some(&tools),
+        );
+        assert_eq!(
+            names(&legacy),
+            ["shell", "filesystem", "grep"],
+            "registration order is preserved off the cache path"
+        );
+    }
+
+    /// An empty volatile block adds no trailing turn and no separator bytes:
+    /// the system is exactly the head (or head + stable context).
+    #[test]
+    fn agent_request_empty_working_memory_has_no_trailing_message_or_separator() {
+        let builder =
+            PromptBuilder::new("System prompt".to_string()).with_cache_stable_prefix(true);
+        let history = [user_message("turn one")];
+        let head = builder.stable_system_head(None);
+
+        let without_context = builder.build_agent_request("", "", &history, None, None);
+        assert_eq!(without_context.messages.len(), 1 + history.len());
+        assert_eq!(without_context.messages[0].content, head, "no dangling separator");
+
+        let with_context = builder.build_agent_request("retrieved", "", &history, None, None);
+        assert_eq!(with_context.messages.len(), 1 + history.len(), "no empty user turn");
+        assert_eq!(
+            with_context.messages[0].content,
+            format!("{head}\n\nretrieved"),
+            "exactly one separator joins the stable context"
+        );
     }
 
     // -- ADR-82 single-agent environment-manifest injection ------------------

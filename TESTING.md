@@ -109,6 +109,20 @@ under `nextest` in CI and are good references when a manual scenario fails:
   recovery paths: `attempt_dispatch_failover` (`crates/orchestrator/src/coordinator.rs`).
 - **Multi-agent settlement bounds** — `await_run_settlement_bounds_the_wait`
   (`crates/cli/src/app.rs`).
+- **OpenCode Zen free-model cache (live)** — both tests are `#[ignore]`d, so
+  the default suite and CI never run them; `CONCERTO_LIVE_OPENCODE=1` is the
+  only gate (without it each test prints a skip line and returns):
+  `cargo test -p concerto-providers --test opencode_free_cache_live -- --ignored --nocapture`
+  (provider-level prefix-reuse probe: DeepSeek asserts on the first
+  continuation, GLM retries up to 6 bounded attempts and must see one >=50%
+  hit) and
+  `cargo test -p concerto-cli --test opencode_cache_live -- --ignored --nocapture`
+  (end-to-end `concerto run --json` + `sessions cache`: DeepSeek must clear
+  50% aggregate token reuse, GLM at least 2 cached calls and one call reusing
+  >=30% of its prompt). 2026-10-19 results: DeepSeek 15,872/15,988 cached and
+  0.74 aggregate (4/5 calls); GLM 15,232/15,803 at attempt 2/6 and 0.72 warm /
+  0.22 cold relay replica. The anonymous tier is IP-shared; keep live runs
+  sparse (see `docs/cache-benchmarks.md`).
 
 ## Default desktop checks
 

@@ -161,15 +161,19 @@ provider construction, model profiles, and routing.
 The `opencode` provider type (Zen) also supports an **anonymous free tier**:
 with no credential it sends the relay's `public` sentinel and presents exactly
 the identity the real OpenCode client presents — an `opencode/*` User-Agent,
-the run's real session id mirrored under
-`x-opencode-session`/`x-opencode-session-id`, a fresh per-request
-`x-opencode-request`, a construction-time `x-opencode-client` surface, and
-`stream: true`. The caller's real tool declarations go on the wire;
-`resolve_wire_builtin` maps any opencode builtin name a model emits
-(`bash`/`read`/`edit`) onto the native `shell`/`filesystem` tools.
+one minted `ses_` wire session id per run (stable for that caller session)
+mirrored under `x-opencode-session`/`x-opencode-session-id` (the caller's real
+ULID never goes on the wire; the real client also sends one stable `sessionID`
+per session, and the relay uses that header for sticky provider selection), a
+fresh per-request `x-opencode-request`, a construction-time
+`x-opencode-client` surface, and `stream: true`. The caller's real tool
+declarations go on the wire; `resolve_wire_builtin` maps any opencode builtin
+name a model emits (`bash`/`read`/`edit`) onto the native
+`shell`/`filesystem` tools.
 `OPENCODE_ZEN_FREE_KNOWN` (`beam-free`, `big-pickle`, `cat-jam-free`,
-`glm-5.3-flash-free`) is the 2026-10-18
-live-verified usable set, and the live catalog is volatile (several zero-priced
+`deepseek-v4.1-flash-free`, `glm-5.3-flash-free`) is the hand-verified usable
+set (roster probed 2026-10-18, `deepseek-v4.1-flash-free` re-verified
+2026-10-19), and the live catalog is volatile (several zero-priced
 ids answer 410/400 upstream), so catalog drift is expected, not a code bug. An
 anonymous *refusal* (403 refused request / 410 deprecated model) surfaces as
 non-retryable `ProviderError::FreeTierRefused` and preserves the relay body; an

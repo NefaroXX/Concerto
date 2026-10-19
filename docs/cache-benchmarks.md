@@ -54,13 +54,58 @@ provider invoices. Invalid/nonfinite/negative rates produce no estimate.
 ## Opt-in cache boundaries
 
 `[context] cache_stable_prefix = true` preserves stable system instructions ahead
-of volatile state and makes tool ordering deterministic. A typed byte boundary
-hint splits the first system message into native Anthropic text blocks without
-changing instruction roles. Provider `cache_breakpoints = true` enables native
+of volatile state and makes tool ordering deterministic. In the single-agent
+loop the volatile per-iteration state becomes one trailing user turn rather
+than a system-message tail, so each request extends the cached prefix; the
+coordinator dispatch path keeps the single-system-message assembly. A typed byte
+boundary hint splits the first system message into native Anthropic text blocks
+without changing instruction roles. Provider `cache_breakpoints = true` enables native
 Anthropic markers within the four-marker budget, preserving manual markers and
 moving the final eligible conversation boundary through tool-result loops.
 Other routes receive no new unsupported cache fields. Defaults remain off.
 Fingerprints describe changes; they do not prove a provider-side cache miss.
+
+## Live-model verification (2026-10-19)
+
+Two ignored, env-gated probes exercise the free OpenCode Zen models
+end-to-end; both require `CONCERTO_LIVE_OPENCODE=1` (without it each test
+prints a skip line and returns) and make real anonymous completions:
+
+```sh
+CONCERTO_LIVE_OPENCODE=1 cargo test -p concerto-providers \
+  --test opencode_free_cache_live -- --ignored --nocapture
+CONCERTO_LIVE_OPENCODE=1 cargo test -p concerto-cli \
+  --test opencode_cache_live -- --ignored --nocapture
+```
+
+The provider probe sends a seed request then one continuation and reads the
+cache count from the second response's usage; DeepSeek asserts the first
+continuation reuses the prefix, GLM retries up to six times and must show at
+least one continuation with >=50% reuse. The CLI probe runs a real
+`concerto run --json` task and reads the persisted report via
+`concerto sessions cache <id> --json`; DeepSeek must clear 50% aggregate token
+reuse there, while GLM must show at least two cached calls and one call
+reusing >=30% of its prompt.
+
+Measured with `[context] cache_stable_prefix = true`:
+
+- Baseline before the prompt-shape fix (knob on, but the per-iteration working
+  memory still in the system tail): 4 calls, 0 cache reads, `0.0` reuse
+  (DeepSeek, 22,474 measured input tokens).
+- DeepSeek: provider probe 15,872/15,988 cached on the first continuation;
+  CLI run 5 calls, 4 with reads, `0.74095` reuse (46,208/62,363).
+- GLM: provider probe 15,232/15,803 on continuation attempt 2/6; CLI runs
+  `0.7249` (4/5 calls) on a warm relay replica and `0.2202` (3/5, 4,480-token
+  partial prefix) on a cold one.
+
+GLM's anonymous free tier serves from independently cached upstream replicas:
+a stable wire session fixes relay provider selection but cannot coordinate
+replica write-through, so its CLI assertion accepts a per-call reuse threshold
+(>=2 cached calls, best call >=30%) instead of an aggregate rate. Aggregate
+reuse is therefore indicative, not deterministic, for that model. The
+anonymous path is also shared per IP (one daily bucket per relay), so a live
+run can meet a relay-side rate limit; the provider probe retries a 429 up to
+three times and fails on a persistent one, so keep live runs sparse.
 
 ## Benchmark runs and comparison
 

@@ -137,20 +137,29 @@ cargo audit
   `~/Projects/opencode/packages/opencode/src/session/llm/request.ts:187-206`).
   Concerto presents exactly the identity the real OpenCode client presents: an
   `opencode/<version>` `User-Agent` (shipped: `opencode/1.19.3`, mirroring a
-  released build; bump it only to track the upstream contract) and, on each
-  anonymous completion, a fresh opencode-format `ses_` wire session id minted
-  by `mint_wire_session_id` and mirrored under `x-opencode-session` +
-  `x-opencode-session-id`, a fresh per-request `x-opencode-request`, and a
-  construction-time `x-opencode-client` (`cli` default; the desktop app sets
-  `desktop`). The relay validates that session identity against the client's
-  own format: raw orchestration ULIDs and session-less completions are refused
-  (live-verified 2026-10-18), so the caller's real ULID never goes on the
-  anonymous wire; keyed Zen requests still mirror the run's real session id
-  when present (and omit the headers when absent), byte-identical to the
-  pre-patch wire. Anonymous requests must `stream: true` **and** declare a
-  tool named `read`: the free-tier branch rejects credential-less completions
-  whose `tools` lack it (name-only check; schema content ignored —
-  live-verified 2026-10-18: `read` alone suffices,
+  released build; bump it only to track the upstream contract) and, per
+  anonymous run, one opencode-format `ses_` wire session id minted by
+  `mint_wire_session_id` on first use and reused for that caller session (the
+  map is in-memory on the provider instance, capped at 256 entries), mirrored
+  under `x-opencode-session` + `x-opencode-session-id`, plus a fresh
+  per-request `x-opencode-request` and a construction-time
+  `x-opencode-client` (`cli` default; the desktop app sets `desktop`). The
+  real client sends its `sessionID` stably for the whole session, and the
+  relay pins provider selection on that header
+  (`~/Projects/opencode/packages/console/app/src/routes/zen/util/handler.ts`
+  — `stickyId = sessionId` at :129,176-178, the provider picked by hashing the
+  last four chars of the sticky id at :643-650, then pinned after the first
+  HTTP 200 at :307), so the stable minted id is both the faithful mirror and
+  the cache-friendly route; session-less anonymous requests (discovery,
+  probes) still mint one id per completion. The relay validates that session
+  identity against the client's own format: raw orchestration ULIDs and
+  requests with no session identity are refused (live-verified 2026-10-18), so
+  the caller's real ULID never goes on the anonymous wire; keyed Zen requests
+  still mirror the run's real session id when present (and omit the headers
+  when absent), byte-identical to the pre-patch wire. Anonymous requests must
+  `stream: true` **and** declare a tool named `read`: the free-tier branch
+  rejects credential-less completions whose `tools` lack it (name-only check;
+  schema content ignored — live-verified 2026-10-18: `read` alone suffices,
   `bash`/`edit`/`glob`/`grep`/`write` do not unlock it, extras are tolerated,
   and the title prompt is accepted only on tool-less requests). Concerto
   mirrors the client with `ensure_anonymous_read_tool` in

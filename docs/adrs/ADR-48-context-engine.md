@@ -100,6 +100,18 @@ breakpoint markers are an **opt-in extension point**, not in M0.
   must be versioned so a changed seed visibly invalidates the cached prefix
   instead of silently re-rendering a different head.
 
+**Amendment (2026-10-19).** M0 shipped for the single agent only. With
+`cache_stable_prefix = true`, `PromptBuilder::build_agent_request` keeps the
+byte-stable head plus the task-stable retrieved memory in the single system
+message and moves the volatile per-iteration working memory to one trailing
+`Role::User` message; `stable_system_prefix_bytes` stays `None` because the
+whole system message is stable. The coordinator dispatch path keeps the
+original single-system-message assembly and remains out of scope. Live probes
+(`crates/providers/tests/opencode_free_cache_live.rs`,
+`crates/cli/tests/opencode_cache_live.rs`) verified prefix reuse on the free
+DeepSeek/GLM models; measurements and the GLM relay-replica caveat are in
+`docs/cache-benchmarks.md`.
+
 ### 4. Token accounting becomes real
 
 Provider-reported usage (`usage.*`/`tokens_*` from the completion response) is
