@@ -92,6 +92,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The write gate surfaces approvals instead of hard-denying them.**
+  `WriteGate::run_gated` returned `GateError::Denied` for every
+  `RequireApproval` verdict (ADR-60's interactive approval surfacing was
+  deferred), so a gated write could never be approved and headless
+  `concerto run --approvals auto` was inert — the common case under the
+  default policy, where `[shell_security] writes = Ask` downgrades an
+  intent-granted write to `RequireApproval`. The gate now consults the run's
+  approval sink once for an approval-required verdict: approve proceeds
+  exactly as `Allow`, while deny, a missing sink, a sink error, or
+  cancellation fail closed. Approved writes then execute through the new
+  gate-only `ToolExecutor::execute_pre_approved`, which skips policy
+  re-evaluation by design so one gated action yields one consult and one
+  decision row. Verified live against the OpenCode Zen relay
+  (`concerto run --approvals auto` wrote and exited `0`) and by the workspace
+  test suite.
+
 - **Harness tool names are wire-safe (underscore form).** The seven H13
   operation names were renamed from dotted to underscore form so strict
   provider APIs accept the tool declarations: `environment.describe` →

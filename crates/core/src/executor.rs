@@ -48,6 +48,26 @@ struct ExecutionAuditContext {
     canonical_operation: Option<String>,
 }
 
+/// How [`ToolExecutor::execute_resolved`] obtains authorization for an action.
+///
+/// The distinction exists so a caller that has **already** evaluated the action
+/// (the write gate) can execute it without a second evaluation — avoiding a
+/// duplicate policy decision row and, for approval-required actions, a second
+/// approval consultation.
+#[derive(Debug, Clone, Copy)]
+enum Evaluation {
+    /// Evaluate the action through the policy engine — every ordinary entry
+    /// point. `orchestrator_authority` rides onto [`PolicyAction`].
+    Policy {
+        /// Sets [`PolicyAction::orchestrator_authority`] for the evaluation.
+        orchestrator_authority: bool,
+    },
+    /// The caller already evaluated the action and obtained whatever
+    /// authorization it required; skip evaluation entirely and treat the action
+    /// as authorized. Gate-only (see [`ToolExecutor::execute_pre_approved`]).
+    PreApproved,
+}
+
 /// The canonical **policy-view effect** of one tool call (ADR-82 slice 1).
 ///
 /// The executor owns the registry, so it is the single producer of this
@@ -967,7 +987,14 @@ impl ToolExecutor {
         session: &SessionContext,
         cancel: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
-        self.execute_inner(tool_name, input, session, cancel, false).await
+        self.execute_inner(
+            tool_name,
+            input,
+            session,
+            cancel,
+            Evaluation::Policy { orchestrator_authority: false },
+        )
+        .await
     }
 
     /// Orchestrator-authority execute: identical to [`Self::execute`], but the
@@ -988,7 +1015,97 @@ impl ToolExecutor {
         session: &SessionContext,
         cancel: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
-        self.execute_inner(tool_name, input, session, cancel, true).await
+        self.execute_inner(
+            tool_name,
+            input,
+            session,
+            cancel,
+            Evaluation::Policy { orchestrator_authority: true },
+        )
+        .await
+    }
+
+    /// Execute an action the caller has **already** evaluated and authorized,
+    /// without a second policy evaluation.
+    ///
+    /// TRUST BOUNDARY — gate-only. The write gate is the sole caller: it
+    /// evaluates the action (its one policy decision), consults the run's
+    /// approval sink when that verdict is approval-required, and only then
+    /// routes the action here. Every other caller MUST use [`Self::execute`] /
+    /// [`Self::execute_with_authority`] / [`Self::execute_read_only`] so the
+    /// action is evaluated exactly once by the policy engine.
+    ///
+    /// Why skip evaluation: re-evaluating would write a **second** policy
+    /// decision row and, for the default shape (`ShellSecurity::writes = Ask`
+    /// downgrades an `Allow` write to `RequireApproval`), consult the approval
+    /// sink a **second** time — two `RequireApproval` + two `Approved` audit
+    /// rows and, on a desktop sink, two prompts for one write. Worse, a second
+    /// prompt answered with deny/cancel would arrive *after* the gate already
+    /// committed its `write-applied` WAL row, so a replayed `call_id` would
+    /// report a write that never happened (module contract: applied ⇒ executed
+    /// or crash-replayed). Skipping evaluation makes the gate's approval the
+    /// single authorization decision for the action.
+    ///
+    /// The action is still prepared ([`Tool::prepare_input`], audited on
+    /// refusal), checkpoint-banked (`note_mutation_targets`), executed, and
+    /// given its one completion row — byte-identical to the policy-`Allow` arm
+    /// of [`Self::execute_resolved`]. Hard-deny fail-closed is preserved at the
+    /// gate: it never routes a `Deny` verdict here.
+    pub async fn execute_pre_approved(
+        &self,
+        tool_name: &str,
+        input: serde_json::Value,
+        session: &SessionContext,
+        cancel: CancellationToken,
+    ) -> Result<ToolOutput, ToolError> {
+        self.execute_inner(tool_name, input, session, cancel, Evaluation::PreApproved).await
+    }
+
+    /// Consult the run's approval sink for a policy-`RequireApproval` action.
+    ///
+    /// This is the single approval-consultation primitive shared by the
+    /// executor's own [`Self::execute`] path and the write gate: given an
+    /// action the policy already deemed approval-required, it emits the
+    /// `ApprovalRequested` / `ApprovalResolved` lifecycle events, parks on the
+    /// attached [`ApprovalSink`], records the user's decision as exactly one
+    /// audit row, and returns that decision. The caller owns the surrounding
+    /// decision: `Approve` / `ApproveAllForSession` mean "proceed as if the
+    /// policy had allowed", `Deny` means the caller must refuse.
+    ///
+    /// Exactly-once recording: the cancellation arm of
+    /// [`Self::request_approval_decision`] writes its own `Denied` row and
+    /// returns `Err(Cancelled)`, so this method records only the answered
+    /// path — the `Approved` / `ApprovedAllForSession` / `Denied` decision row
+    /// is written **once per call**, never twice. (The gate's single-consult
+    /// design calls this once per gated action; see
+    /// [`Self::execute_pre_approved`].)
+    ///
+    /// Fail-closed:
+    /// * no sink attached → [`ToolError::PolicyDenied`] with the stable rule
+    ///   `requires_approval_no_sink`;
+    /// * cancellation while parked → [`ToolError::Cancelled`], with the
+    ///   `Denied` audit row already written by
+    ///   [`Self::request_approval_decision`].
+    ///
+    /// The gate calls this **before** acquiring its per-agent write permit so
+    /// a parked approval holds no gate permit, lock, pre-image, or WAL work.
+    pub async fn request_approval(
+        &self,
+        action: &PolicyAction<'_>,
+        cancel: CancellationToken,
+    ) -> Result<ApprovalDecision, ToolError> {
+        let Some(sink) = self.approval_sink.as_ref() else {
+            return Err(ToolError::PolicyDenied { rule: "requires_approval_no_sink".into() });
+        };
+        let decision =
+            self.request_approval_decision(sink.as_ref(), action, cancel.clone()).await?;
+        // The pending `RequireApproval` row was already written by the policy
+        // engine; this records the user's answer as a distinct entry, exactly
+        // once. A FRESH token: the answered decision must not be lost to a
+        // cancellation that races the audit write — the same rationale the
+        // cancellation arm uses for its `Denied` row.
+        self.record_approval_decision(action, decision, CancellationToken::new()).await;
+        Ok(decision)
     }
 
     async fn execute_inner(
@@ -997,7 +1114,7 @@ impl ToolExecutor {
         input: serde_json::Value,
         session: &SessionContext,
         cancel: CancellationToken,
-        orchestrator_authority: bool,
+        evaluation: Evaluation,
     ) -> Result<ToolOutput, ToolError> {
         // Translate an OpenCode wire-builtin name onto the real tool before
         // lookup, so a model that emits opencode's builtin `bash`/`read`/`edit`
@@ -1012,7 +1129,7 @@ impl ToolExecutor {
             message: format!("tool not found: {tool_name}"),
         })?;
 
-        self.execute_resolved(tool_name, tool, input, session, cancel, orchestrator_authority).await
+        self.execute_resolved(tool_name, tool, input, session, cancel, evaluation).await
     }
 
     /// Execute a host-owned operation through the same policy, approval, and audit gates.
@@ -1024,7 +1141,15 @@ impl ToolExecutor {
         session: &SessionContext,
         cancel: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
-        self.execute_resolved(tool.name(), tool, input, session, cancel, false).await
+        self.execute_resolved(
+            tool.name(),
+            tool,
+            input,
+            session,
+            cancel,
+            Evaluation::Policy { orchestrator_authority: false },
+        )
+        .await
     }
 
     /// ADR-82 slice 5 (b): bank pre-mutation bytes for the canonical
@@ -1052,6 +1177,50 @@ impl ToolExecutor {
         sink.capture_before_mutation(targets, session, cancel).await;
     }
 
+    /// Run an action that is already authorized — either the policy returned
+    /// `Allow` or the gate obtained approval and routed through
+    /// [`Self::execute_pre_approved`].
+    ///
+    /// Banks checkpoint pre-mutation bytes (ADR-82 slice 5 (b)) for the
+    /// canonical targets, then executes and writes the single post-execution
+    /// completion row. Shared by all authorized paths so their audit context
+    /// and execution behavior cannot drift.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_authorized(
+        &self,
+        tool: &dyn Tool,
+        tool_name: &str,
+        input: serde_json::Value,
+        session: &SessionContext,
+        cancel: CancellationToken,
+        canonical: &CanonicalEffect,
+        correlation_id: crate::ids::Ulid,
+        input_hash: String,
+        command_facts: Option<CommandPolicyFacts>,
+        path_facts: Option<PathPolicyFacts>,
+        canonical_audit: (Option<String>, Option<String>),
+    ) -> Result<ToolOutput, ToolError> {
+        // ADR-82 slice 5 (b): the write is authorized — bank current bytes for
+        // active checkpoints BEFORE the tool materializes it.
+        self.note_mutation_targets(canonical, session, cancel.clone()).await;
+        self.execute_allowed(
+            tool,
+            tool_name,
+            input,
+            session,
+            cancel,
+            ExecutionAuditContext {
+                correlation_id,
+                input_hash,
+                facts: command_facts,
+                path_facts,
+                canonical_tool: canonical_audit.0,
+                canonical_operation: canonical_audit.1,
+            },
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn execute_resolved(
         &self,
@@ -1060,7 +1229,7 @@ impl ToolExecutor {
         input: serde_json::Value,
         session: &SessionContext,
         cancel: CancellationToken,
-        orchestrator_authority: bool,
+        evaluation: Evaluation,
     ) -> Result<ToolOutput, ToolError> {
         if cancel.is_cancelled() {
             return Err(ToolError::Cancelled);
@@ -1082,6 +1251,10 @@ impl ToolExecutor {
         // attribution, canonical pair for accounting.
         let canonical = canonical_effect_of(tool, &input);
         let canonical_audit = (Some(canonical.policy_name.clone()), canonical.operation.clone());
+        let (orchestrator_authority, pre_approved) = match evaluation {
+            Evaluation::Policy { orchestrator_authority } => (orchestrator_authority, false),
+            Evaluation::PreApproved => (false, true),
+        };
         let action = build_action(
             &canonical.policy_name,
             &canonical.policy_input,
@@ -1094,25 +1267,43 @@ impl ToolExecutor {
         let command_facts = action.command_facts.clone();
         let path_facts = action.path_facts.clone();
 
-        match self.policy.evaluate(&action, cancel.clone()).await {
-            Ok(PolicyVerdict::Allow) => {
-                // ADR-82 slice 5 (b): the write is authorized — bank current
-                // bytes for active checkpoints BEFORE the tool materializes it.
-                self.note_mutation_targets(&canonical, session, cancel.clone()).await;
-                self.execute_allowed(
+        // Gate-only pre-approved path: the caller already evaluated this action
+        // and obtained whatever authorization it required, so evaluating again
+        // would write a duplicate decision row and (for approval-required
+        // actions) consult the sink a second time. Skip straight to the
+        // authorized tail, exactly like the policy-`Allow` arm below.
+        if pre_approved {
+            return self
+                .execute_authorized(
                     tool,
                     tool_name,
                     input,
                     session,
                     cancel,
-                    ExecutionAuditContext {
-                        correlation_id,
-                        input_hash,
-                        facts: command_facts,
-                        path_facts,
-                        canonical_tool: canonical_audit.0,
-                        canonical_operation: canonical_audit.1,
-                    },
+                    &canonical,
+                    correlation_id,
+                    input_hash,
+                    command_facts,
+                    path_facts,
+                    canonical_audit,
+                )
+                .await;
+        }
+
+        match self.policy.evaluate(&action, cancel.clone()).await {
+            Ok(PolicyVerdict::Allow) => {
+                self.execute_authorized(
+                    tool,
+                    tool_name,
+                    input,
+                    session,
+                    cancel,
+                    &canonical,
+                    correlation_id,
+                    input_hash,
+                    command_facts,
+                    path_facts,
+                    canonical_audit,
                 )
                 .await
             }
@@ -1126,52 +1317,32 @@ impl ToolExecutor {
             Ok(
                 PolicyVerdict::RequireApproval { .. }
                 | PolicyVerdict::RequireApprovalWithTimeout { .. },
-            ) => match &self.approval_sink {
-                Some(sink) => {
-                    match self
-                        .request_approval_decision(sink.as_ref(), &action, cancel.clone())
-                        .await
-                    {
-                        Ok(decision) => {
-                            // Persist the user's decision as a distinct audit
-                            // entry, correlated with the `RequireApproval` row
-                            // the policy engine already wrote. The execution
-                            // outcome row (if any) is written separately by
-                            // `execute_allowed`, so there is no duplication.
-                            self.record_approval_decision(&action, decision, cancel.clone()).await;
-                            match decision {
-                                ApprovalDecision::Approve
-                                | ApprovalDecision::ApproveAllForSession => {
-                                    // ADR-82 slice 5 (b): same pre-execution
-                                    // capture as the direct-Allow path above.
-                                    self.note_mutation_targets(&canonical, session, cancel.clone())
-                                        .await;
-                                    self.execute_allowed(
-                                        tool,
-                                        tool_name,
-                                        input,
-                                        session,
-                                        cancel,
-                                        ExecutionAuditContext {
-                                            correlation_id,
-                                            input_hash,
-                                            facts: command_facts,
-                                            path_facts,
-                                            canonical_tool: canonical_audit.0,
-                                            canonical_operation: canonical_audit.1,
-                                        },
-                                    )
-                                    .await
-                                }
-                                ApprovalDecision::Deny => {
-                                    Err(ToolError::PolicyDenied { rule: "user_denied".into() })
-                                }
-                            }
-                        }
-                        Err(error) => Err(error),
-                    }
+            ) => match self.request_approval(&action, cancel.clone()).await {
+                // `request_approval` already recorded the user's decision as a
+                // distinct audit entry, correlated with the `RequireApproval`
+                // row the policy engine wrote. The execution outcome row (if
+                // any) is written separately by `execute_allowed`, so there is
+                // no duplication.
+                Ok(ApprovalDecision::Approve | ApprovalDecision::ApproveAllForSession) => {
+                    self.execute_authorized(
+                        tool,
+                        tool_name,
+                        input,
+                        session,
+                        cancel,
+                        &canonical,
+                        correlation_id,
+                        input_hash,
+                        command_facts,
+                        path_facts,
+                        canonical_audit,
+                    )
+                    .await
                 }
-                None => Err(ToolError::PolicyDenied { rule: "requires_approval_no_sink".into() }),
+                Ok(ApprovalDecision::Deny) => {
+                    Err(ToolError::PolicyDenied { rule: "user_denied".into() })
+                }
+                Err(error) => Err(error),
             },
             Err(PolicyError::AuditLogWriteFailed(msg)) => {
                 Err(ToolError::PolicyDenied { rule: format!("audit_failure: {msg}") })
@@ -3819,6 +3990,50 @@ mod tests {
         assert_eq!(entries[1].duration_ms, None);
         assert_eq!(entries[0].correlation_id, entries[1].correlation_id);
         assert_eq!(entries[0].input_hash, entries[1].input_hash);
+    }
+
+    /// The gate-only **pre-approved** entry neither evaluates policy nor
+    /// consults the approval sink — the gate already made both decisions.
+    /// Re-evaluating would write a second `RequireApproval` verdict row, a
+    /// second `Approved` decision row, and re-prompt the user for one write
+    /// (see `execute_pre_approved` docs). Asserted with a policy that always
+    /// yields `RequireApproval` and a sink that counts consultations: the tool
+    /// still runs, the sink is never consulted, and the ONLY audit row is the
+    /// execution outcome.
+    #[tokio::test]
+    async fn execute_pre_approved_skips_policy_and_approval() {
+        let audit = Arc::new(RecordingAudit::default());
+        let policy = Arc::new(RecordingApprovalPolicy { audit: audit.clone() });
+        let mut registry = ToolRegistry::default();
+        registry.register(Box::new(EchoTool));
+        let sink = Arc::new(ControlledApprovalSink::new());
+        let executor =
+            ToolExecutor::new(Arc::new(registry), policy).with_approval_sink(sink.clone());
+        let session = test_session();
+
+        let output = executor
+            .execute_pre_approved(
+                "echo",
+                serde_json::json!({"exit_code": 0}),
+                &session,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("a pre-approved action executes without re-evaluation");
+        assert_eq!(output.data, serde_json::json!({"exit_code": 0}));
+
+        assert_eq!(
+            sink.requests.load(Ordering::SeqCst),
+            0,
+            "the gate's decision is the only consultation; the executor must not re-prompt"
+        );
+        let entries = audit.entries.lock().unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "pre-approved execution writes only the outcome row — no verdict, no decision"
+        );
+        assert_eq!(entries[0].verdict, "ExecutionSucceeded");
     }
 
     // ------------------------------------------------------------------
