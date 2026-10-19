@@ -5,7 +5,7 @@
 //! the digest through the SAME block shape
 //! ([`crate::environment_manifest::format_manifest_block`]). These tests pin
 //! the integration: one shared cache, one probe set per run even with
-//! `environment.describe` registered, and the digest in the single-agent
+//! `environment_describe` registered, and the digest in the single-agent
 //! system prompt.
 
 use super::super::*;
@@ -54,7 +54,7 @@ async fn single_agent_barrier_collects_once_and_describe_serves_the_cache() {
     let project_path = project_dir.path().to_path_buf();
     let config = AppConfig::default();
 
-    // One shared registry: the stub plus `environment.describe` registered
+    // One shared registry: the stub plus `environment_describe` registered
     // LAST (the production `setup_shared_tooling` order), so the tool-names
     // snapshot covers every tool.
     let mut registry = ToolRegistry::default();

@@ -350,7 +350,7 @@ impl App {
     }
 
     /// Run one harness operation through the shared service seam (H13). The
-    /// desktop reuses its long-lived memory store so a `memory.recall` never
+    /// desktop reuses its long-lived memory store so a `memory_recall` never
     /// re-initialises (and cannot deadlock on the data-dir lock the app holds).
     pub(super) fn run_harness_request(
         &self,
@@ -664,7 +664,7 @@ impl App {
 /// Resolve the desktop's project-scoped memory store for the harness panel,
 /// reusing the cached one when present and initialising (without a re-index)
 /// otherwise. Returns `None` when memory is disabled or init fails — the
-/// harness `memory.recall` then reports *unavailable*, never a fake store.
+/// harness `memory_recall` then reports *unavailable*, never a fake store.
 async fn resolve_desktop_memory_store(
     memory: &Arc<Mutex<Option<ActiveMemoryServices>>>,
     bus: EventBus,

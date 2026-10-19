@@ -12,14 +12,14 @@ One service seam — `concerto_orchestrator::harness_service::HarnessService`
 
 | Operation | Tool implementation | Path |
 | --- | --- | --- |
-| `environment.describe` | `EnvironmentDescribeTool` | `ToolExecutor::execute` |
-| `checkpoint.create` | `CheckpointCreateTool` | `ToolExecutor::execute` |
-| `checkpoint.inspect` | `CheckpointInspectTool` | `ToolExecutor::execute` |
-| `checkpoint.restore` | `restore_file_checkpoint` | `ToolExecutor::restore_checkpoint` |
+| `environment_describe` | `EnvironmentDescribeTool` | `ToolExecutor::execute` |
+| `checkpoint_create` | `CheckpointCreateTool` | `ToolExecutor::execute` |
+| `checkpoint_inspect` | `CheckpointInspectTool` | `ToolExecutor::execute` |
+| `checkpoint_restore` | `restore_file_checkpoint` | `ToolExecutor::restore_checkpoint` |
 | `checkpoint.prune` (CLI-only carve-out, see below) | `run_checkpoint_prune` (CLI dispatch) | direct `SqliteSessionStore::prune_file_checkpoints` — operator-invoked, delete-only of window-expired rows, same precedent as `sessions prune` |
-| `verify.run` | `VerifyRunTool` | `ToolExecutor::execute` |
-| `memory.recall` | `MemoryRecallTool` | `ToolExecutor::execute` |
-| `memory.inspect` | `MemoryInspectTool` | `ToolExecutor::execute` |
+| `verify_run` | `VerifyRunTool` | `ToolExecutor::execute` |
+| `memory_recall` | `MemoryRecallTool` | `ToolExecutor::execute` |
+| `memory_inspect` | `MemoryInspectTool` | `ToolExecutor::execute` |
 
 Every adapter calls `HarnessService`; no adapter touches a filesystem path, a
 SQLite pool, or a `FileCheckpointStore` directly — with one explicit,
@@ -27,7 +27,7 @@ operator-scoped exception: `checkpoint.prune` (CLI-only, see below) connects
 to the session store directly to delete window-expired sidecar rows, mirroring
 the pre-existing `sessions prune` precedent. It is delete-only, never runs
 automatically, and is listed in the operations table as its own row rather
-than hidden inside the service claim. `checkpoint.restore` is a
+than hidden inside the service claim. `checkpoint_restore` is a
 service-level operation because a restore must itself issue gated `filesystem`
 writes; it calls the executor's dedicated `restore_checkpoint` pipeline (one
 policy decision + audit row per resource). Restore is operator/frontend-scoped
@@ -38,8 +38,8 @@ something an agent invokes on itself mid-run.
 
 | Adapter path | Status | Proof |
 | --- | --- | --- |
-| In-process single-agent | covered except `checkpoint.restore` (operator/frontend-scoped, see below) | `harness_service::tests`, `vertical_slice` |
-| In-process coordinator | covered except `checkpoint.restore` (operator/frontend-scoped, see below) | `resume_with_memory_still_grounds` (evidence-bearing recall) |
+| In-process single-agent | covered except `checkpoint_restore` (operator/frontend-scoped, see below) | `harness_service::tests`, `vertical_slice` |
+| In-process coordinator | covered except `checkpoint_restore` (operator/frontend-scoped, see below) | `resume_with_memory_still_grounds` (evidence-bearing recall) |
 | Supervised agents | covered (memory recall evidence) | `ipc::MemoryChunk` status fields + `supervisor` |
 | CLI JSON | covered | `concerto-cli` `harness` subcommand |
 | Desktop | covered | `concerto-desktop` harness panel |
@@ -54,17 +54,17 @@ through any covered adapter yields the same `HarnessInvocation.data` payload
 Adapter proof map:
 
 - In-process / standalone service: `tests/harness_equivalence.rs`
-  (`memory.recall` equals a direct `retrieve_with_evidence`; the standalone
-  `environment.describe` payload is stable across builds; the checkpoint
+  (`memory_recall` equals a direct `retrieve_with_evidence`; the standalone
+  `environment_describe` payload is stable across builds; the checkpoint
   lifecycle round-trips real bytes and records its evidence).
 - Supervised: `gate_proxy::tests::wire_standing_rebuilds_evidence_bearing_chunks`
   (the wire's status/source/why/degraded/interrupted rebuild the same
   `EvidentChunk` evidence) plus the `ipc` wire round-trip/legacy-decode tests.
 - CLI JSON: `concerto-cli::dispatch::harness` tests invoke the real service
-  end-to-end for `environment.describe` and the checkpoint lifecycle and
-  assert the `--json` payload is the service shape. `memory.recall`/`inspect`
+  end-to-end for `environment_describe` and the checkpoint lifecycle and
+  assert the `--json` payload is the service shape. `memory_recall`/`memory_inspect`
   CLI dispatch is covered by unit tests and by the shared service seam; a full
-  CLI `memory.recall` end-to-end run is **not claimed** here because the first
+  CLI `memory_recall` end-to-end run is **not claimed** here because the first
   recall triggers `fastembed` model resolution (a network download) in this
   environment — the same embedder every in-process recall uses.
 - Desktop: `concerto-desktop::views::harness` tests (request building,
@@ -102,9 +102,9 @@ authorization path.
 | Key | Meaning | Controlled by | Why |
 | --- | --- | --- | --- |
 | `harness.checkpoint_retention_days` | Retention window for checkpoint byte rows | client/operator | Local disk-lifecycle choice; `0`/unset keeps today's keep-all behavior. Applied only by the operator-invoked `concerto harness checkpoint prune` |
-| `harness.recall_limit` | Default `memory.recall` `top_k` | client/operator | Local disclosure bound (validated `1..=50`); callers may request less |
-| `harness.verify_selector` | Default verifier selection for `verify.run` | client/operator | Operator preference, not an authorization decision |
-| `harness.declared_capabilities` | Descriptive capability declarations surfaced by `environment.describe` | client/operator | Descriptive labels only; never an admission gate |
+| `harness.recall_limit` | Default `memory_recall` `top_k` | client/operator | Local disclosure bound (validated `1..=50`); callers may request less |
+| `harness.verify_selector` | Default verifier selection for `verify_run` | client/operator | Operator preference, not an authorization decision |
+| `harness.declared_capabilities` | Descriptive capability declarations surfaced by `environment_describe` | client/operator | Descriptive labels only; never an admission gate |
 
 **Security-impacting configuration stays outside this section**: policy rules
 (`[policy]`), the native shell security ceiling (`[shell_security]`), and the

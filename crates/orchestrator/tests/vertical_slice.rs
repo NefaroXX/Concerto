@@ -4,7 +4,7 @@
 //! (a scratch dir under `crates/orchestrator/tests/vertical_slice_work/`,
 //! never `/tmp`, never a git repo):
 //!
-//! - `EnvironmentManifest` + `environment.describe` (descriptive-only)
+//! - `EnvironmentManifest` + `environment_describe` (descriptive-only)
 //! - `CheckpointRecord` + chunked byte-oriented pre-image store +
 //!   `ToolExecutor::restore_checkpoint` (policy-gated, ownership-checked,
 //!   idempotent)
@@ -319,7 +319,7 @@ async fn py_compile(harness: &SliceHarness) -> (i64, String) {
 }
 
 // ---------------------------------------------------------------------------
-// Step 1 — environment.describe: effective write/restore scope, descriptive.
+// Step 1 — environment_describe: effective write/restore scope, descriptive.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

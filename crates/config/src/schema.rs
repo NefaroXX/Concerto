@@ -922,12 +922,12 @@ pub struct AuditConfig {
 // ---- [harness]: H13 shared harness operations settings -----------------------
 
 /// `[harness]` — the ONE settings home for the H13 harness operations
-/// (`environment.describe`, `checkpoint.create/inspect/restore`, `verify.run`,
-/// `memory.recall/inspect`).
+/// (`environment_describe`, `checkpoint_create`/`checkpoint_inspect`/
+/// `checkpoint_restore`, `verify_run`, `memory_recall`/`memory_inspect`).
 ///
 /// Additive serde-default only: a config without a `[harness]` section keeps
 /// today's behavior exactly (no automatic checkpoint retention, recall's
-/// built-in 5-chunk default, `verify.run`'s `all` selector, no declared
+/// built-in 5-chunk default, `verify_run`'s `all` selector, no declared
 /// capabilities), so no schema-version bump is needed.
 ///
 /// **Every key here is client/operator-controlled.** None of them feeds the
@@ -945,19 +945,19 @@ pub struct HarnessConfig {
     #[serde(default)]
     pub checkpoint_retention_days: Option<u64>,
 
-    /// Default `memory.recall` `top_k` when the caller omits one. `None` uses
+    /// Default `memory_recall` `top_k` when the caller omits one. `None` uses
     /// the operation's built-in default (5). Validated to `1..=50`, the
     /// operation's ceiling.
     #[serde(default)]
     pub recall_limit: Option<u32>,
 
-    /// Default `verify.run` verifier selector when the caller omits one.
+    /// Default `verify_run` verifier selector when the caller omits one.
     /// One of `all`, `project-tests`, `build`, `lsp-diagnostics`,
     /// `existence` (plus the documented aliases). `None` uses `all`.
     #[serde(default)]
     pub verify_selector: Option<String>,
 
-    /// Descriptive capability declarations surfaced by `environment.describe`.
+    /// Descriptive capability declarations surfaced by `environment_describe`.
     /// Purely descriptive labels (e.g. `sandboxed-ci`); they never widen a
     /// policy decision and are not read by any authorization path.
     #[serde(default)]
@@ -1007,14 +1007,14 @@ impl HarnessConfig {
         Ok(())
     }
 
-    /// The effective `memory.recall` `top_k`: the configured value or the
+    /// The effective `memory_recall` `top_k`: the configured value or the
     /// operation's built-in default (5), clamped to the operation ceiling.
     #[must_use]
     pub fn effective_recall_limit(&self) -> u32 {
         self.recall_limit.unwrap_or(5).clamp(1, 50)
     }
 
-    /// The effective `verify.run` selector label (trimmed), if configured.
+    /// The effective `verify_run` selector label (trimmed), if configured.
     #[must_use]
     pub fn effective_verify_selector(&self) -> Option<&str> {
         self.verify_selector.as_deref().map(str::trim).filter(|value| !value.is_empty())

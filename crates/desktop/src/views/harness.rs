@@ -1,8 +1,9 @@
 //! Harness modal (H13): desktop controls over the shared harness service.
 //!
 //! The panel issues the same `HarnessService` operations the CLI and
-//! in-process paths use (`environment.describe`, `verify.run`,
-//! `checkpoint.create/inspect/restore`, `memory.recall/inspect`) and renders
+//! in-process paths use (`environment_describe`, `verify_run`,
+//! `checkpoint_create`/`checkpoint_inspect`/`checkpoint_restore`,
+//! `memory_recall`/`memory_inspect`) and renders
 //! the service's [`HarnessInvocation`] verbatim — including refusal, partial,
 //! and degraded states — rather than any desktop-only shape.
 //!
@@ -95,7 +96,7 @@ impl State {
     /// The request a "Describe Environment" press issues.
     pub fn describe_request() -> HarnessRequest {
         HarnessRequest {
-            operation: "environment.describe".to_string(),
+            operation: "environment_describe".to_string(),
             input: serde_json::json!({}),
             memory: false,
         }
@@ -104,7 +105,7 @@ impl State {
     /// The request a "Run Verification" press issues.
     pub fn verify_request() -> HarnessRequest {
         HarnessRequest {
-            operation: "verify.run".to_string(),
+            operation: "verify_run".to_string(),
             input: serde_json::json!({}),
             memory: false,
         }
@@ -117,7 +118,7 @@ impl State {
             return None;
         }
         Some(HarnessRequest {
-            operation: "checkpoint.create".to_string(),
+            operation: "checkpoint_create".to_string(),
             input: serde_json::json!({ "paths": [path] }),
             memory: false,
         })
@@ -130,7 +131,7 @@ impl State {
             return None;
         }
         Some(HarnessRequest {
-            operation: "checkpoint.inspect".to_string(),
+            operation: "checkpoint_inspect".to_string(),
             input: serde_json::json!({ "checkpoint_id": id }),
             memory: false,
         })
@@ -143,7 +144,7 @@ impl State {
             return None;
         }
         Some(HarnessRequest {
-            operation: "checkpoint.restore".to_string(),
+            operation: "checkpoint_restore".to_string(),
             input: serde_json::json!({ "checkpoint_id": id }),
             memory: false,
         })
@@ -156,7 +157,7 @@ impl State {
             return None;
         }
         Some(HarnessRequest {
-            operation: "memory.recall".to_string(),
+            operation: "memory_recall".to_string(),
             input: serde_json::json!({ "query": query }),
             memory: true,
         })
@@ -169,7 +170,7 @@ impl State {
             return None;
         }
         Some(HarnessRequest {
-            operation: "memory.inspect".to_string(),
+            operation: "memory_inspect".to_string(),
             input: serde_json::json!({ "chunk_id": id }),
             memory: true,
         })
@@ -300,12 +301,12 @@ mod tests {
 
         state.update(Message::PathChanged("src/lib.rs".into()));
         let request = state.create_checkpoint_request().expect("path present");
-        assert_eq!(request.operation, "checkpoint.create");
+        assert_eq!(request.operation, "checkpoint_create");
         assert_eq!(request.input["paths"][0], "src/lib.rs");
 
         state.update(Message::QueryChanged("why".into()));
         let request = state.recall_request().expect("query present");
-        assert_eq!(request.operation, "memory.recall");
+        assert_eq!(request.operation, "memory_recall");
         assert!(request.memory, "recall needs the memory subsystem");
     }
 
@@ -313,7 +314,7 @@ mod tests {
     fn update_returns_requests_and_records_completion() {
         let mut state = State::new();
         let request = HarnessRequest {
-            operation: "environment.describe".into(),
+            operation: "environment_describe".into(),
             input: serde_json::json!({}),
             memory: false,
         };
@@ -338,7 +339,7 @@ mod tests {
         let _ = state.update(Message::Completed(Err("refused".into())));
         let _ = state.view(&theme());
         let _ = state.update(Message::Completed(Ok(HarnessInvocation {
-            operation: "memory.recall".into(),
+            operation: "memory_recall".into(),
             summary: "chunks=0 degraded".into(),
             data: serde_json::json!({ "chunks": Vec::<EvidentChunk>::new(), "degraded": true, "interrupted": false }),
         })));

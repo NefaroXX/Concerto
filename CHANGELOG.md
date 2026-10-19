@@ -92,6 +92,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Harness tool names are wire-safe (underscore form).** The seven H13
+  operation names were renamed from dotted to underscore form so strict
+  provider APIs accept the tool declarations: `environment.describe` →
+  `environment_describe`, `checkpoint.create`/`checkpoint.inspect`/
+  `checkpoint.restore` → `checkpoint_create`/`checkpoint_inspect`/
+  `checkpoint_restore`, `verify.run` → `verify_run`, `memory.recall` →
+  `memory_recall`, `memory.inspect` → `memory_inspect`. Dotted function names
+  were rejected upstream with HTTP 400 ("Function name 'memory.inspect' must
+  not contain dots"), breaking every single-agent run against strict APIs
+  including the OpenCode Zen relay (anonymous tier included). Constant names,
+  CLI subcommands, and MCP naming are unchanged; a regression test pins the
+  `^[A-Za-z0-9_-]{1,64}$` charset.
+
 - **Anonymous OpenCode Zen requests now present the client identity the relay
   requires.** The free-tier branch rejects credential-less completions whose
   `tools` lack a function named `read` (name-only check) and whose session

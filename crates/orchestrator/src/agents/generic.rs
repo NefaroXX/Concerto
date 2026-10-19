@@ -226,7 +226,7 @@ impl GenericSpecialistAgent {
         self
     }
 
-    /// Attach the same verification service used by native verify.run.
+    /// Attach the same verification service used by native verify_run.
     pub fn with_verifier_service(self, service: Arc<crate::verify::VerifierService>) -> Self {
         self.verification_service.set(service);
         self

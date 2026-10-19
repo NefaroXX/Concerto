@@ -1,14 +1,14 @@
-//! ADR-82 H05 — `verify.run`: verification as a callable service.
+//! ADR-82 H05 — `verify_run`: verification as a callable service.
 //!
 //! This module owns the reusable verification service: the freshness/stamp
 //! logic (H04 run-scoped freshness clock, formerly private to
 //! [`crate::agent_loop::AgentLoop`]), the per-file sweep and harness record
 //! builders the loop has always used, four labeled adapters, a coalescing
-//! layer over workspace-wide spawns, and the `verify.run` tool surface.
+//! layer over workspace-wide spawns, and the `verify_run` tool surface.
 //!
 //! # One implementation, two consumers
 //!
-//! Both the single-agent loop and the `verify.run` tool call the free
+//! Both the single-agent loop and the `verify_run` tool call the free
 //! functions here ([`verify_file_changes`], [`run_project_tests`], the
 //! freshness predicates). Each consumer stamps records with its OWN run
 //! clock — the loop keeps its fields and delegates evaluation here, the
@@ -21,7 +21,7 @@
 //!
 //! Everything here evaluates facts. Nothing here selects work, ends work, or
 //! authorizes anything: the loop's gate remains the sole authority, and
-//! `verify.run` carries empty capabilities through the normal
+//! `verify_run` carries empty capabilities through the normal
 //! [`concerto_core::executor::ToolExecutor`] policy/audit path like any
 //! other read.
 //!
@@ -73,8 +73,10 @@ use serde::{Deserialize, Serialize};
 // Bounds and identities
 // ---------------------------------------------------------------------------
 
-/// Registry name of the H05 operation. Dotted like `environment.describe`.
-pub const VERIFY_RUN_TOOL_NAME: &str = "verify.run";
+/// Registry name of the H05 operation. Underscore form (never dotted): strict
+/// provider APIs reject function names containing dots, so every H13 wire name
+/// stays within `[A-Za-z0-9_-]{1,64}` (pinned by `harness_service` tests).
+pub const VERIFY_RUN_TOOL_NAME: &str = "verify_run";
 
 /// Default per-run wall-clock budget when the caller names none.
 pub const VERIFY_DEFAULT_TIMEOUT_MS: u64 = 120_000;
@@ -1884,7 +1886,7 @@ pub struct VerifyRequest {
 impl VerifyRequest {
     /// Project-wide run with the default budget. The `overlay_pending: false`
     /// is an explicit clean-disk attestation by the constructing caller
-    /// (service-direct callers, tests) — the `verify.run` tool surface never
+    /// (service-direct callers, tests) — the `verify_run` tool surface never
     /// defaults here; it resolves through
     /// [`VerifierService::effective_overlay_pending`].
     pub fn project() -> Self {
@@ -1947,7 +1949,7 @@ impl SharedVerifier {
 ///
 /// `std::sync::Mutex` with short critical sections — never held across
 /// `.await` (snapshots are cloned out first), mirroring
-/// `environment.describe`.
+/// `environment_describe`.
 pub struct VerifierService {
     project_root: PathBuf,
     eval: Mutex<EvalEngine>,
@@ -2087,7 +2089,7 @@ impl VerifierService {
         .unwrap_or_default();
         if captured.is_empty() {
             tracing::warn!(
-                "verify.run: workspace fingerprint unavailable; verification remains display data"
+                "verify_run: workspace fingerprint unavailable; verification remains display data"
             );
         }
         let base_changed = {
@@ -2200,7 +2202,7 @@ impl VerifierService {
     }
 
     /// The single public entry point: run `request` to bounded records. Both
-    /// the `verify.run` tool and internal evaluation callers use this — the
+    /// the `verify_run` tool and internal evaluation callers use this — the
     /// loop's own sweep/harness path shares the builders, stamped with the
     /// loop's clock instead.
     pub async fn verify(
@@ -2735,7 +2737,7 @@ fn timeout_record(request: &VerifyRequest, generation: &str) -> VerificationSumm
         scope.clone(),
         VERIFY_RUN_TOOL_NAME,
         format!(
-            "verify.run timed out after {}ms (scope={scope}, verifier={})",
+            "verify_run timed out after {}ms (scope={scope}, verifier={})",
             request.timeout.as_millis(),
             request.selector.as_str(),
         ),
@@ -2756,7 +2758,7 @@ fn bound_records(mut records: Vec<VerificationSummary>) -> Vec<VerificationSumma
 }
 
 // ---------------------------------------------------------------------------
-// `verify.run` tool (shared registry; normal policy/audit path)
+// `verify_run` tool (shared registry; normal policy/audit path)
 // ---------------------------------------------------------------------------
 
 /// Static adapter contract table: adapter | spawns | proves | labeled how.
@@ -2791,7 +2793,7 @@ fn adapter_proves_table() -> serde_json::Value {
     ])
 }
 
-/// Input for the `verify.run` operation. Every field is
+/// Input for the `verify_run` operation. Every field is
 /// `#[serde(default)]`-tolerant: `{}` means "project scope, all adapters,
 /// default budget, unknown overlay" — and unknown overlay reports
 /// overlay-pending (fail-safe: only an explicit `overlay_pending: false`
@@ -2819,10 +2821,10 @@ pub struct VerifyRunInput {
     pub overlay_pending: Option<bool>,
 }
 
-/// The `verify.run` operation: callable verification returning bounded
+/// The `verify_run` operation: callable verification returning bounded
 /// evidence records.
 ///
-/// Empty capability requirements (the `environment.describe` precedent):
+/// Empty capability requirements (the `environment_describe` precedent):
 /// every agent may discover it; whether a call *runs* is the policy engine's
 /// job through the normal executor gate. Descriptive of verification, never
 /// an authorization input — no policy path reads verification results.
@@ -2863,7 +2865,7 @@ impl VerifyRunTool {
                 if raw.split(['/', '\\']).any(|segment| segment == "..") {
                     return Err(ToolError::ExecutionFailed {
                         message: format!(
-                            "invalid verify.run scope '{raw}': path escapes the project root"
+                            "invalid verify_run scope '{raw}': path escapes the project root"
                         ),
                     });
                 }
@@ -2876,7 +2878,7 @@ impl VerifyRunTool {
                 if !resolved.starts_with(&session.project_dir) {
                     return Err(ToolError::ExecutionFailed {
                         message: format!(
-                            "invalid verify.run scope '{raw}': path escapes the project root"
+                            "invalid verify_run scope '{raw}': path escapes the project root"
                         ),
                     });
                 }
@@ -2887,7 +2889,7 @@ impl VerifyRunTool {
             None | Some("") => self.default_selector,
             Some(raw) => VerifySelector::parse_override(raw).map_err(|message| {
                 ToolError::ExecutionFailed {
-                    message: format!("invalid verify.run input: {message}"),
+                    message: format!("invalid verify_run input: {message}"),
                 }
             })?,
         };
@@ -2943,7 +2945,7 @@ impl concerto_core::traits::tool::Tool for VerifyRunTool {
         _session: &SessionContext,
     ) -> Option<PathPolicyFacts> {
         // File-scope runs name their target for the audit trail (the
-        // `environment.describe` precedent names nothing; verification names
+        // `environment_describe` precedent names nothing; verification names
         // its scope). Project-scope runs name no path.
         let scope = input.get("scope").and_then(serde_json::Value::as_str)?;
         if scope.trim().is_empty() || scope.trim() == "project" {
@@ -2967,7 +2969,7 @@ impl concerto_core::traits::tool::Tool for VerifyRunTool {
             return Err(ToolError::Cancelled);
         }
         let parsed: VerifyRunInput = serde_json::from_value(input).map_err(|error| {
-            ToolError::ExecutionFailed { message: format!("invalid verify.run input: {error}") }
+            ToolError::ExecutionFailed { message: format!("invalid verify_run input: {error}") }
         })?;
         let request = self.parse_request(&parsed, session)?;
         let (records, total_records) = match self
@@ -2980,7 +2982,7 @@ impl concerto_core::traits::tool::Tool for VerifyRunTool {
             Err(VerifyError::Denied(detail)) => {
                 return Err(ToolError::ExecutionFailed {
                     message: format!(
-                        "policy denied: {detail} (verify.run sub-spawn denied; no ungoverned fallback)"
+                        "policy denied: {detail} (verify_run sub-spawn denied; no ungoverned fallback)"
                     ),
                 });
             }
@@ -3007,7 +3009,7 @@ impl concerto_core::traits::tool::Tool for VerifyRunTool {
             })
             .count();
         let summary = format!(
-            "verify.run scope={} verifier={} records={} passed={passed} failed={failed} checked_state=[{checked_state}]",
+            "verify_run scope={} verifier={} records={} passed={passed} failed={failed} checked_state=[{checked_state}]",
             request.scope.key(),
             request.selector.as_str(),
             records.len(),
@@ -3030,8 +3032,8 @@ impl concerto_core::traits::tool::Tool for VerifyRunTool {
 
 /// Build the per-run service and register the operation into `registry`.
 ///
-/// Call after plugin/MCP registration but BEFORE `environment.describe`
-/// registration so the describe tool-names snapshot covers `verify.run`.
+/// Call after plugin/MCP registration but BEFORE `environment_describe`
+/// registration so the describe tool-names snapshot covers `verify_run`.
 /// Returns the shared handle for the run wiring (the run upgrades the
 /// harness engine to the governed one once the executor exists).
 ///
@@ -3054,7 +3056,7 @@ pub fn register_verify_tool(
 }
 
 /// As [`register_verify_tool`], additionally setting the default selector
-/// applied when a `verify.run` call omits `verifier` (H13
+/// applied when a `verify_run` call omits `verifier` (H13
 /// `[harness].verify_selector`).
 pub fn register_verify_tool_with_selector(
     registry: &mut ToolRegistry,
@@ -3681,7 +3683,7 @@ mod tests {
         assert!(state.starts_with("disk"), "a clean run claims disk bytes: {state}");
     }
 
-    /// `verify.run` travels the normal executor path: policy verdict row +
+    /// `verify_run` travels the normal executor path: policy verdict row +
     /// post-execution completion row, with the bounded envelope.
     #[tokio::test]
     async fn tool_travels_the_executor_path_with_audit_rows() {
@@ -3705,7 +3707,7 @@ mod tests {
                 CancellationToken::new(),
             )
             .await
-            .expect("verify.run executes through the normal path");
+            .expect("verify_run executes through the normal path");
 
         assert_eq!(output.data["scope"], "file:page.html");
         assert_eq!(output.data["verifier"], "existence");
@@ -3715,7 +3717,7 @@ mod tests {
             "the envelope carries the full adapter honesty table"
         );
         assert!(output.data["honesty"].as_str().is_some_and(|note| !note.is_empty()));
-        assert!(output.summary.contains("verify.run"));
+        assert!(output.summary.contains("verify_run"));
 
         let entries = audit.entries.lock().unwrap_or_else(|error| error.into_inner());
         assert_eq!(entries.len(), 2, "policy row + completion row: {entries:?}");
@@ -3905,7 +3907,7 @@ mod tests {
                 CancellationToken::new(),
             )
             .await
-            .expect("verify.run executes");
+            .expect("verify_run executes");
         assert!(
             output.data["checked_state"]
                 .as_str()
@@ -3927,7 +3929,7 @@ mod tests {
                 CancellationToken::new(),
             )
             .await
-            .expect("verify.run executes");
+            .expect("verify_run executes");
         assert!(
             output.data["checked_state"]
                 .as_str()
@@ -3948,7 +3950,7 @@ mod tests {
                 CancellationToken::new(),
             )
             .await
-            .expect("verify.run executes");
+            .expect("verify_run executes");
         assert!(
             output.data["checked_state"].as_str().is_some_and(|state| state.starts_with("disk")),
             "attested clean with no live pending claims disk bytes: {}",

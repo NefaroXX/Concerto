@@ -3340,7 +3340,7 @@ impl AgentLoop {
         // the loop clock sees, so service-side checks observe positional
         // supersession within the run (not just base-generation re-capture).
         // Deliberately independent of the strict gate: the service clock
-        // serves `verify.run` consumers whether or not the completion gate is
+        // serves `verify_run` consumers whether or not the completion gate is
         // armed. Same conservative rule as above — executed writes advance
         // (even failed ones, which may have mutated unpredictably); a
         // `Denied` refusal never executed and advances nothing.

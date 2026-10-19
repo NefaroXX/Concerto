@@ -1160,7 +1160,7 @@ async fn create_session_and_recorder(
 /// identities via the slice-1 canonical-effect service), the session pool, and
 /// the workspace paths — or, on resume, restores the stored manifest from its
 /// `EnvironmentObserved` whiteboard row with zero probes — then hands the
-/// result to the shared `environment.describe` cache
+/// result to the shared `environment_describe` cache
 /// ([`crate::environment_describe::populate_from_barrier`]) so later describe
 /// calls serve it with zero further probes. Returns the manifest for prompt
 /// injection (`None` only when the barrier produced none — fail-soft, the run
@@ -1199,7 +1199,7 @@ async fn run_environment_manifest_barrier(
         container_routing: concerto_core::types::CommandRouting::Direct,
         inventory: inventory_from_executor(executor),
         // H03: the descriptive policy scope is derived by the shared
-        // helper so the barrier and `environment.describe` label the run
+        // helper so the barrier and `environment_describe` label the run
         // identically (their fingerprints must agree on a fresh run).
         policy_scope: crate::environment_describe::policy_scope_from_config(config),
         persistence,
@@ -1266,7 +1266,7 @@ async fn execute_agent_loop(
     environment_manifest_digest: Option<String>,
     // ADR-82 H05: the run's shared verification service. Its harness engine
     // upgrades to the governed executor-backed engine built below, so
-    // `verify.run` project-tests travel the same policy path as the loop's
+    // `verify_run` project-tests travel the same policy path as the loop's
     // own evaluation.
     verify_service: Arc<crate::verify::VerifierService>,
 ) -> Result<AgentOutput, OrchestratorError> {
@@ -1964,7 +1964,7 @@ struct SharedTooling {
     provider: Arc<dyn LlmProvider>,
     model: String,
     provider_config_id: Option<String>,
-    /// H03: the run's shared `environment.describe` cache. Registered into
+    /// H03: the run's shared `environment_describe` cache. Registered into
     /// the registry below; the manifest barrier
     /// (`run_environment_manifest_barrier`) populates it on BOTH the
     /// coordinator and single-agent paths, so describe calls serve the run's
@@ -1973,13 +1973,13 @@ struct SharedTooling {
     /// the single-agent path used before it gained its barrier).
     describe_state: crate::environment_describe::SharedDescribeState,
     /// H05: the run's shared verification service. Registered into the
-    /// registry below as `verify.run` (reachable on both paths through the
+    /// registry below as `verify_run` (reachable on both paths through the
     /// normal policy/audit gate); the harness engine upgrades to the
     /// governed executor-backed engine once each path builds one.
     verify_service: Arc<crate::verify::VerifierService>,
 }
 
-/// Resolves the run's memory store lazily for the `memory.recall` operation.
+/// Resolves the run's memory store lazily for the `memory_recall` operation.
 ///
 /// The registry is frozen into the executor before the project memory store is
 /// initialised, so the tool reads the shared handle at call time.
@@ -2041,7 +2041,7 @@ async fn setup_shared_tooling(
     if let Err(error) = services.mcp.register_tools(&mut registry).await {
         tracing::warn!(%error, "mcp registration failed; continuing without mcp tools");
     }
-    // ADR-82 H05: register `verify.run` BEFORE `environment.describe` so
+    // ADR-82 H05: register `verify_run` BEFORE `environment_describe` so
     // the describe tool-names snapshot covers it. One shared registry feeds
     // both the single-agent loop and the coordinator, so the operation is
     // reachable on both paths through the normal policy/audit gate. The
@@ -2072,7 +2072,7 @@ async fn setup_shared_tooling(
     // H13: checkpoint + memory operations into the shared registry. The
     // checkpoint sidecar rides the same sessions pool the gate appends to; the
     // memory store is initialised AFTER this registry is frozen into the
-    // executor, so `memory.recall` resolves it lazily from the run's shared
+    // executor, so `memory_recall` resolves it lazily from the run's shared
     // handle (an unavailable store yields an honest empty recall).
     let harness_checkpoint_store = gate_pool
         .clone()
@@ -2095,7 +2095,7 @@ async fn setup_shared_tooling(
             project_id: harness_project_id,
         },
     );
-    // ADR-82 H03: register `environment.describe` LAST so its tool-names
+    // ADR-82 H03: register `environment_describe` LAST so its tool-names
     // snapshot covers every other tool (filesystem, shell, git, LSP, plugin,
     // MCP). One shared registry feeds both the single-agent loop and the
     // coordinator, so the operation is reachable on both paths; the manifest
@@ -2872,7 +2872,7 @@ pub async fn run_shared_agent(
     // ADR-82 single-agent manifest injection: collect the run's manifest
     // through the SAME barrier the coordinator path uses (one probe set per
     // run, resume restores with zero probes) and populate the SAME shared
-    // describe cache, so `environment.describe` serves it with zero further
+    // describe cache, so `environment_describe` serves it with zero further
     // probes. The digest rides the single-agent system prompt in the shared
     // `<environment_manifest>` block shape; fail-soft (`None`) prompts
     // exactly as before.
@@ -2895,7 +2895,7 @@ pub async fn run_shared_agent(
         // byte-identical across runs, so inject the timestamp-free projection.
         // `collected_at_ms` changes every run and would otherwise defeat the
         // provider prompt cache on every turn. Freshness remains available via
-        // `environment.describe`.
+        // `environment_describe`.
         .map(|manifest| manifest.summary_stable())
     };
     // ADR-60 D5: give the in-process single-agent loop the same always-on
@@ -3009,11 +3009,11 @@ async fn run_multi_agent(
     // environment card; its refresh cadence also gates the coordinator's
     // maintenance nudge. Refreshed once at run start by `run_shared_agent`.
     project_context: Arc<crate::project_context::ProjectContext>,
-    // ADR-82 H03: the shared `environment.describe` cache. The shared
+    // ADR-82 H03: the shared `environment_describe` cache. The shared
     // manifest barrier (`run_environment_manifest_barrier`) populates it so
     // describe calls serve the run's manifest with zero further probes.
     describe_state: &crate::environment_describe::SharedDescribeState,
-    // ADR-82 H05: the run's shared verification service (`verify.run`). Its
+    // ADR-82 H05: the run's shared verification service (`verify_run`). Its
     // harness engine upgrades to the governed executor-backed engine below,
     // so coordinator-path verification travels the same policy path.
     verify_service: Arc<crate::verify::VerifierService>,
@@ -3459,7 +3459,7 @@ async fn run_multi_agent(
     // path; attached unconditionally — the coordinator
     // only uses it when a validate-stage agent is absent.
     // ADR-82 H05: the shared verification service upgrades to the same
-    // governed engine, so `verify.run` and coordinator self-verification
+    // governed engine, so `verify_run` and coordinator self-verification
     // never drift.
     let coordinator_eval = EvalEngine::new(&req.project_dir).with_process_executor(Arc::new(
         crate::exec_backend::NativeEvalExecutor {
