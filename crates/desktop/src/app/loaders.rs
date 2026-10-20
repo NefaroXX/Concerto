@@ -390,6 +390,7 @@ impl App {
     pub(super) fn delete_memory_entry(&self, id: String) -> iced::Task<Message> {
         let memory = self.memory_services.clone();
         let result_id = id.clone();
+        let project_id = concerto_core::types::ProjectId(project_id_hash(&self.project_dir));
         iced::Task::perform(
             async move {
                 let store = memory
@@ -399,7 +400,10 @@ impl App {
                     .map(|m| m.store.clone())
                     .ok_or_else(|| "Memory is not initialized yet.".to_string())?;
                 let cancel = concerto_core::CancellationToken::new();
-                store.invalidate_chunk(&id, cancel).await.map_err(|error| error.to_string())
+                store
+                    .invalidate_project_chunk(&project_id, &id, cancel)
+                    .await
+                    .map_err(|error| error.to_string())
             },
             move |result| Message::MemoryEntryDeleted { id: result_id.clone(), result },
         )

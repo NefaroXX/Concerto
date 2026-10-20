@@ -171,6 +171,18 @@ pub struct OrchestrationCheckpointRecord {
 
 #[async_trait::async_trait]
 pub trait SessionStore: Send + Sync {
+    /// Resolve one evidence event within the requested session. A missing or
+    /// foreign-session id returns None; unsupported stores report an error.
+    async fn load_evidence_event(
+        &self,
+        session_id: Ulid,
+        event_id: &str,
+        cancel: CancellationToken,
+    ) -> Result<Option<WhiteboardEvent>, SessionError> {
+        let _ = (session_id, event_id, cancel);
+        Err(SessionError::Storage("evidence lookup is unavailable for this store".into()))
+    }
+
     async fn create_session(
         &self,
         project_dir: &camino::Utf8Path,
@@ -772,6 +784,15 @@ fn decode_task_execution_mode(
 
 #[async_trait::async_trait]
 impl SessionStore for SqliteSessionStore {
+    async fn load_evidence_event(
+        &self,
+        session_id: Ulid,
+        event_id: &str,
+        cancel: CancellationToken,
+    ) -> Result<Option<WhiteboardEvent>, SessionError> {
+        whiteboard::load_session_event(&self.pool, &session_id.to_string(), event_id, cancel).await
+    }
+
     async fn create_session(
         &self,
         project_dir: &camino::Utf8Path,
