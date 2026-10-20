@@ -1,7 +1,8 @@
 # Desktop ↔ CLI Parity Plan
 
 **Status: settings and configuration parity expanded 2026-10-03; checkpoint
-runtime inspection added 2026-10-10; interaction parity remains in progress.** The August R2–R4/P1–P7 checklist below is a
+runtime inspection added 2026-10-10; topology/evidence-reference views and TUI
+navigation added 2026-10-16; interaction parity remains in progress.** The August R2–R4/P1–P7 checklist below is a
 historical milestone, not proof of complete parity. [ADR-80](adrs/ADR-80-cli-settings-and-studio-parity.md)
 corrects the former blanket exclusions. See [CLI settings reference](cli-settings.md).
 
@@ -70,11 +71,23 @@ These are real gaps, not GUI-only exclusions.
 |---|---|---|
 | Done on current dev | Staged change review | TUI unified diff and accept/reject through the shared overlay; narrow-terminal checks |
 | P1 | Live Coordinator pause/resume/decisions | Same in-process control handles and checkpoint semantics; cross-process control requires a shared authenticated API |
-| Partial | Runtime Studio inspection | Checkpoint world model, decisions (including evidence references), diagnoses and suitability now have text/JSON and TUI views. Dedicated evidence/topology navigation remains. |
+| Partial | Runtime Studio inspection | Checkpoint topology, world model, decisions, evidence references, diagnoses and suitability have text/JSON and selectable TUI views. Full evidence-event drill-down and live state remain. |
 | P2 | Rich memory explorer | Search/detail/delete through the shared memory service; graph/explain commands cover only part of Desktop |
 | P2 | Structured TUI editors | Roster/provider/policy/MCP inspectors and multiline prompts backed by validated command services |
 | P2 | Editor operations | File/context selection, search, diagnostics, patch/review, attachments and external-editor integration |
 | P2 | Terminal workflow | Launch selected profile with the same toolchain/environment; only terminal-page layout is exempt |
+
+### Runtime inspection navigation (2026-10-16)
+
+The TUI now switches between seven views with Tab/Shift+Tab or 1–7, preserves
+the selected view on refresh, and clamps paging/Home/End to the rendered report.
+The complete saved task graph retains edge direction and saved statuses even
+when `--limit` restricts history. Evidence references preserve fact grounding,
+contradictions and decision citations without claiming to load full events.
+Tests cover graph-only checkpoints, filtering/limits, cached view switching,
+late load results, process commands alongside a held frontend lock, and render
+bounds at 24×8–120×40. This branch's build/test/lint validation is tracked in its
+PR; the local implementation environment has no Rust toolchain.
 
 ### Runtime inspection validation (2026-10-10)
 
