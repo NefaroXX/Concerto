@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **One conversation flow for desktop and TUI.** Both interfaces now use the
+  same controller for session setup, submission, follow-ups, cancellation and
+  checkpoint recovery. The coordinator moves between discussion and work
+  without a single/multi-agent switch. Messages sent during work are read at
+  the next decision boundary; status replies can accompany continued work.
+  Questions retain unfinished tasks, rejected messages retain their drafts,
+  and unconsumed follow-ups return to the composer when work stops. See
+  [ADR-84](docs/adrs/ADR-84-shared-conversation-application.md).
 - **Headless `concerto run`.** One-shot, non-interactive agent execution for
   external orchestrators (`crates/cli/src/dispatch/run.rs`): the prompt comes
   from an argument, `-`, or piped stdin — a terminal with no prompt fails fast
