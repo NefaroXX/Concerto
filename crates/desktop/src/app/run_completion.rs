@@ -18,11 +18,25 @@ impl App {
     /// no-op.
     pub(super) fn update_run_completed(&mut self, message: Message) -> iced::Task<Message> {
         match message {
-            Message::AgentRunCompleted(session_id, res) => {
+            Message::AgentRunCompleted(completion) => {
+                if !self.conversation.settle(&completion) {
+                    return iced::Task::none();
+                }
+                let display_message = completion.display_message();
+                let ConversationCompletion { result, undelivered, reply_only, .. } = *completion;
+                if !undelivered.is_empty() {
+                    let mut recovered = undelivered.join("\n\n");
+                    let draft = self.chat.input();
+                    if !draft.trim().is_empty() {
+                        recovered.push_str("\n\n");
+                        recovered.push_str(&draft);
+                    }
+                    let _ = self.chat.update(views::chat::Message::InputChanged(recovered));
+                    self.chat.add_error("Work stopped before reading your latest messages. They are restored in the composer.".into());
+                }
                 // A discarded checkpoint can settle without specialist events
                 // (e.g. an answer-only task); clear its old presentation here.
                 self.reset_pending_task_views();
-                self.run_status = RunStatus::Idle;
                 self.note_run_settled();
                 // ADR-57 §3a: memory teardown may have been deferred while the
                 // run was active (a config edit that disables memory is not
@@ -35,13 +49,7 @@ impl App {
                 // every open thinking phase (navigation's finalize_streaming
                 // deliberately leaves them open).
                 self.chat.finalize_run();
-                // Keep the newly-created session active even when the run
-                // fails. A retry then continues the same conversation instead
-                // of silently creating another session and losing context.
-                if let Some(session_id) = session_id {
-                    self.active_session_id = Some(session_id);
-                }
-                match *res {
+                match result {
                     Ok(output) => {
                         let completed =
                             output.completion_status == AgentCompletionStatus::Completed;
@@ -50,28 +58,27 @@ impl App {
                         } else {
                             views::chat::ToolCallStatus::Cancelled
                         });
-                        self.agent_graph.settle_incomplete(if completed {
-                            NodeState::Completed
-                        } else {
-                            NodeState::Cancelled
-                        });
-                        self.active_session_id = Some(output.session_id);
-                        let final_message = format_run_summary(&output);
+                        if !reply_only {
+                            self.agent_graph.settle_incomplete(if completed {
+                                NodeState::Completed
+                            } else {
+                                NodeState::Cancelled
+                            });
+                        }
+                        let final_message = display_message;
                         let _ = self.chat.update(views::chat::Message::AddAssistant(final_message));
-                        self.chat.set_run_completion(
-                            self.multi_agent,
-                            completed,
-                            output.files_modified.iter().map(ToString::to_string).collect(),
-                            output.project_root.as_ref().map(ToString::to_string),
-                        );
+                        if !reply_only {
+                            self.chat.set_run_completion(
+                                self.multi_agent,
+                                completed,
+                                output.files_modified.iter().map(ToString::to_string).collect(),
+                                output.project_root.as_ref().map(ToString::to_string),
+                            );
+                        }
                         self.load_diff_from_vfs();
-                        // Store checkpoint for potential resume.
-                        self.resume_checkpoint_json = output.checkpoint_json.clone();
                     }
                     Err(failure) => {
-                        // Clear any stored checkpoint so a failed resume does
-                        // not poison subsequent messages (Finding 2 / #65).
-                        self.resume_checkpoint_json = None;
+                        // The shared controller reloads durable recovery state after errors.
 
                         let terminal_state = if failure.code == "TASK_CANCELLED" {
                             NodeState::Cancelled
@@ -111,7 +118,7 @@ impl App {
                 // Persist the transcript so the on-screen conversation survives a
                 // restart. Best-effort: a write failure must never break the UI.
                 let project_dir = self.project_dir.clone();
-                if let Some(session_id) = self.active_session_id {
+                if let Some(session_id) = self.conversation.session_id {
                     let session_id = session_id.to_string();
                     let _ = self.chat.save_to(&transcript_path(&project_dir, &session_id));
                 }

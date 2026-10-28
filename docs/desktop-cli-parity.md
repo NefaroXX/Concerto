@@ -7,6 +7,12 @@ corrects the former blanket exclusions. See [CLI settings reference](cli-setting
 
 ## Objective
 
+Desktop is a graphical wrapper around the same application behavior as the
+TUI. Shared services alone are insufficient if each frontend separately owns
+the user flow. Conversation lifecycle now lives in the shared
+`ConversationController`: both adapters use the same submit, session, follow-up,
+cancel and completion path. See [ADR-84](adrs/ADR-84-shared-conversation-application.md).
+
 Parity applies to capabilities, settings, data and actions. Only graphical
 presentation is exempt. A Studio layout does not exclude agent configuration;
 a graph has textual data; desktop appearance preferences can be set from CLI.
@@ -33,7 +39,7 @@ a graph has textual data; desktop appearance preferences can be set from CLI.
 | CLI display | `config set display…` | Same flag/env precedence; CLI theme and desktop theme preferences are separate settings |
 | Roots, audit, updates, observability | `config set project_roots/audit…/updates…/observability…` | Existing readers and startup/run semantics |
 | Saved Coordinator runtime state | `sessions runtime ID [--view VIEW] [--json] [--limit N]`; TUI Esc → i | Same checkpoint reader, world model, decisions, diagnoses and suitability projection as Desktop; read-only database access alongside a running frontend |
-| TUI quick settings | 19 fields with scrolling selection | Adds memory, retention, retries, extensions, context, Git init, motion, title, theme, shell and update check |
+| TUI quick settings | Scrolling selection | Memory, retention, retries, extensions, context, Git init, motion, title, theme, shell and update check; conversation execution has no single/multi-agent toggle |
 
 Standard builds now include both frontends. Commands automatically select CLI
 mode without a setup wizard or provider. CLI-only builds remain available via
@@ -69,7 +75,7 @@ These are real gaps, not GUI-only exclusions.
 | Priority | Capability | Planned CLI acceptance |
 |---|---|---|
 | Done on current dev | Staged change review | TUI unified diff and accept/reject through the shared overlay; narrow-terminal checks |
-| P1 | Live Coordinator pause/resume/decisions | Same in-process control handles and checkpoint semantics; cross-process control requires a shared authenticated API |
+| Shared application | Live conversation, steering, stop and resume | One controller and inbox; preserved checkpoint on follow-up; decisions remain coordinator-owned. Cross-process control requires a shared authenticated API. |
 | Partial | Runtime Studio inspection | Checkpoint world model, decisions (including evidence references), diagnoses and suitability now have text/JSON and TUI views. Dedicated evidence/topology navigation remains. |
 | P2 | Rich memory explorer | Search/detail/delete through the shared memory service; graph/explain commands cover only part of Desktop |
 | P2 | Structured TUI editors | Roster/provider/policy/MCP inspectors and multiline prompts backed by validated command services |

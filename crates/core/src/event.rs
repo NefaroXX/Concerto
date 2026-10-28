@@ -164,6 +164,10 @@ pub enum EventKind {
     },
 
     // --- agent lifecycle (Phase 3) ---
+    /// Follow-up delivered to the root conversation, ordered with its tool events.
+    ConversationMessageReceived {
+        content: String,
+    },
     /// Assistant text response from an agent, published by the CLI/desktop
     /// so subscribers (UI, session replay, etc.) receive the actual text
     /// rather than reconstructing it from streaming debug events.

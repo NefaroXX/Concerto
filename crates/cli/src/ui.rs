@@ -88,7 +88,8 @@ fn draw_command_menu(frame: &mut Frame, app: &App) {
     let items: Vec<ListItem> = CHAT_COMMANDS
         .iter()
         .map(|(key, name)| {
-            let note = if *key == 'n' && app.running { " (run active)" } else { "" };
+            let note =
+                if *key == 'n' && app.conversation.is_running() { " (run active)" } else { "" };
             ListItem::new(format!("{key}  {name}{note}"))
         })
         .collect();
@@ -145,8 +146,8 @@ fn draw_chat_screen(frame: &mut Frame, app: &App) {
     );
     draw_chat(frame, chunks[1], app);
     draw_input(frame, chunks[2], app);
-    let hint = if app.running {
-        "Ctrl+C cancel · F1 commands"
+    let hint = if app.conversation.is_running() {
+        "Enter send follow-up · Ctrl+C stop · F1 commands"
     } else if app.project_picker_mode {
         "Enter switch · Esc keep draft"
     } else if !app.input_mode && chunks[3].width < 45 {
@@ -188,8 +189,8 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
         " Project path "
     } else if !app.input_mode {
         " Browse · Esc to type "
-    } else if app.running {
-        " Draft · send after this run "
+    } else if app.conversation.is_running() {
+        " Follow-up · Enter to send "
     } else {
         " Message "
     };
@@ -546,8 +547,11 @@ fn draw_agent_assignments_screen(frame: &mut Frame, app: &App) {
 }
 
 fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
-    let state =
-        if app.running { app.run_stage.map(run_stage_label).unwrap_or("Running") } else { "Ready" };
+    let state = if app.conversation.is_running() {
+        app.run_stage.map(run_stage_label).unwrap_or("Running")
+    } else {
+        "Ready"
+    };
     let status = if area.width < 80 {
         format!(" {state} · {}", app.model_label())
     } else {
@@ -563,9 +567,9 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
 fn status_line(app: &App) -> String {
     let provider = app.provider_label();
     let model = app.model_label();
-    let mode = if app.multi_agent { "multi" } else { "single" };
+    let mode = "coordinator";
     let fast = if app.fast { " fast" } else { "" };
-    let run = if app.running { " | RUNNING (Ctrl+C cancel)" } else { "" };
+    let run = if app.conversation.is_running() { " | RUNNING (Ctrl+C cancel)" } else { "" };
     let memory = if app.memory_chunks > 0 {
         format!(" | {} chunks", app.memory_chunks)
     } else {
@@ -575,7 +579,7 @@ fn status_line(app: &App) -> String {
     // run is active, mirroring the desktop chip's `run_status == Running`
     // guard. The run boundaries clear `run_stage`, but the guard is cheap
     // insurance against a stale value leaking onto the line.
-    let stage = match (app.running, app.run_stage) {
+    let stage = match (app.conversation.is_running(), app.run_stage) {
         (true, Some(stage)) => format!(" | stage: {}", run_stage_label(stage)),
         _ => String::new(),
     };
@@ -1372,17 +1376,10 @@ mod tests {
     }
 
     #[test]
-    fn settings_toggle_multi_agent() {
-        let mut app = App::new();
-        app.screen = Screen::Settings;
-        assert!(!app.multi_agent);
-        // Navigate to MultiAgent (index 3; InteractionMode was removed in
-        // ADR-55 §7).
-        app.settings_index = 3;
-        app.handle_key(key_event(KeyCode::Enter, KeyModifiers::empty()));
+    fn interactive_conversations_have_no_execution_mode_switch() {
+        let app = App::new();
         assert!(app.multi_agent);
-        app.handle_key(key_event(KeyCode::Enter, KeyModifiers::empty()));
-        assert!(!app.multi_agent);
+        assert!(SettingsField::ALL.iter().all(|field| field.label() != "Multi-agent"));
     }
 
     #[test]
@@ -1390,7 +1387,10 @@ mod tests {
         let mut app = App::new();
         app.screen = Screen::Settings;
         assert!(!app.fast);
-        app.settings_index = 5;
+        app.settings_index = SettingsField::ALL
+            .iter()
+            .position(|field| *field == SettingsField::FastMode)
+            .expect("fast setting");
         app.handle_key(key_event(KeyCode::Enter, KeyModifiers::empty()));
         assert!(app.fast);
     }
@@ -1433,14 +1433,14 @@ mod tests {
         );
 
         // Running with a stage → the suffix appears with the ADR label.
-        app.running = true;
+        app.conversation.status = concerto_orchestrator::conversation::RunStatus::Running;
         assert!(status_line(&app).contains(" | stage: Editing"), "{}", status_line(&app));
     }
 
     #[test]
     fn status_line_drops_stage_when_cleared() {
         let mut app = App::new();
-        app.running = true;
+        app.conversation.status = concerto_orchestrator::conversation::RunStatus::Running;
         app.run_stage = Some(RunStage::Plan);
         assert!(status_line(&app).contains("stage: Planning"));
         // Completion boundary clears the stage (App::handle_key path is

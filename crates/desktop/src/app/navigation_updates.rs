@@ -150,10 +150,12 @@ impl App {
     pub(super) fn update_session_selected(&mut self, message: Message) -> iced::Task<Message> {
         match message {
             Message::SessionSelected { session_id, history, events, transcript } => {
+                if self.conversation.is_running() {
+                    return iced::Task::none();
+                }
                 // Flush the previously active session before switching.
                 self.persist_active_agent_graph();
-                self.active_session_id = Ulid::from_string(&session_id).ok();
-                self.resume_checkpoint_json = None;
+                self.conversation.select_session(Ulid::from_string(&session_id).ok());
                 // A resumed session starts with a fresh spend chip + log; its
                 // records (if any) are re-loaded when the Spend Log opens.
                 self.reset_spend_state();
@@ -170,7 +172,7 @@ impl App {
                 } else {
                     transcript_entries
                 });
-                let persisted_graph = self.active_session_id.and_then(|id| {
+                let persisted_graph = self.conversation.session_id.and_then(|id| {
                     views::agent_graph::State::load_from(agent_graph_path(
                         &self.project_dir,
                         &id.to_string(),

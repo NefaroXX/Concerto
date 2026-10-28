@@ -84,7 +84,7 @@ impl App {
             Message::StudioRuntimeLoaded(session_id, snapshot) => {
                 // Discard a stale load: only apply the snapshot whose session
                 // still matches the active one.
-                if session_id == self.active_session_id {
+                if session_id == self.conversation.session_id {
                     self.orchestration_studio.set_runtime_snapshot(*snapshot);
                 }
                 iced::Task::none()
@@ -125,7 +125,7 @@ impl App {
                             &Utf8PathBuf::from_path_buf(self.project_dir.clone()).unwrap_or_else(
                                 |p| Utf8PathBuf::from(p.to_string_lossy().as_ref()),
                             ),
-                            &self.cancel_token,
+                            &self.conversation.cancel_token,
                         )
                         .map(Message::Editor);
                     if refresh_diff {

@@ -4,6 +4,8 @@
 //! verbatim out of `crates/desktop/src/app.rs` so test names, assertions,
 //! and helpers are unchanged; the module path stays `app::tests::…`.
 
+use concerto_orchestrator::conversation::{ConversationCompletion, Submission};
+
 use super::{
     configured_default_route, orchestration_hides_relationships, AgentOutput, App,
     DesktopApprovalSink, EventBus, Message, Page, PolicyAction, RunStatus, ThinkingKind, Ulid,
@@ -29,11 +31,11 @@ fn run_settle_epoch_tracks_run_settlement() {
     assert!(!app.is_run_active(), "idle at construction");
     let before = app.run_settle_epoch().load(Ordering::Acquire);
 
-    app.run_status = RunStatus::Running;
+    app.conversation.status = RunStatus::Running;
     assert!(app.is_run_active(), "a running run is active");
 
     // The completion settle point: status back to Idle + epoch bump.
-    app.run_status = RunStatus::Idle;
+    app.conversation.status = RunStatus::Idle;
     app.note_run_settled();
     assert!(!app.is_run_active());
     let after = app.run_settle_epoch().load(Ordering::Acquire);
@@ -196,7 +198,7 @@ fn studio_runtime_loaded_applies_only_for_the_active_session() {
 
     let (mut app, _) = App::new();
     let active = Ulid::new();
-    app.active_session_id = Some(active);
+    app.conversation.session_id = Some(active);
     assert!(app.orchestration_studio.runtime_snapshot.load_error.is_none());
 
     // A result for a different session is dropped.
@@ -366,7 +368,7 @@ fn memory_teardown_is_deferred_while_run_is_active() {
     // (The slot is empty here, so this verifies the reconcile reaches the
     // memory section during a run without touching the slot; completion
     // of the deferred teardown happens in `Message::AgentRunCompleted`.)
-    app.run_status = RunStatus::Running;
+    app.conversation.status = RunStatus::Running;
     app.apply_reloaded_config(reloaded.clone(), reloaded.clone());
     assert!(
         matches!(app.memory.status, crate::views::memory::MemoryStatus::Disabled),
@@ -379,7 +381,7 @@ fn memory_teardown_is_deferred_while_run_is_active() {
 
     // At idle the same reload must also settle cleanly (the deferred
     // teardown path is a no-op when the slot is empty).
-    app.run_status = RunStatus::Idle;
+    app.conversation.status = RunStatus::Idle;
     app.apply_reloaded_config(reloaded.clone(), reloaded);
     assert!(matches!(app.memory.status, crate::views::memory::MemoryStatus::Disabled));
 }
@@ -1087,18 +1089,42 @@ fn new_task_shortcut_clears_the_visible_conversation() {
 fn startup_opens_a_blank_session() {
     let (app, _) = App::new();
     assert!(app.chat.entries().is_empty());
-    assert!(app.active_session_id.is_none());
+    assert!(app.conversation.session_id.is_none());
     assert!(app.agent_graph.model.nodes.is_empty());
+}
+
+#[test]
+fn conversation_followup_is_accepted_while_working_and_cancel_preserves_draft() {
+    let (mut app, _) = App::new();
+    app.config = Some(concerto_config::AppConfig::default());
+    assert!(matches!(app.conversation.submit("Work".into()), Ok(Submission::Start(_))));
+    let _ =
+        app.update(Message::Chat(crate::views::chat::Message::InputChanged("Keep the API".into())));
+    let _ = app.update(Message::Chat(crate::views::chat::Message::SubmitInput));
+    assert!(app.chat.input().trim().is_empty());
+    assert_eq!(app.conversation.status, RunStatus::Running);
+    app.conversation.cancel();
+    let _ = app
+        .update(Message::Chat(crate::views::chat::Message::InputChanged("Keep this draft".into())));
+    let _ = app.update(Message::Chat(crate::views::chat::Message::SubmitInput));
+    assert_eq!(app.chat.input().trim(), "Keep this draft");
+    assert!(app.text_focused, "rejected input keeps the composer focused");
+    assert_eq!(app.conversation.status, RunStatus::Cancelling);
 }
 
 #[test]
 fn text_focus_tracks_chat_input() {
     let (mut app, _) = App::new();
+    app.config = Some(concerto_config::AppConfig::default());
     assert!(!app.text_focused);
     let _ = app.update(Message::Chat(crate::views::chat::Message::InputChanged("hello".into())));
     assert!(app.text_focused);
     let _ = app.update(Message::Chat(crate::views::chat::Message::SubmitInput));
     assert!(!app.text_focused);
+    let _ = app.update(Message::Chat(crate::views::chat::Message::InputAction(
+        iced::widget::text_editor::Action::Edit(iced::widget::text_editor::Edit::Insert('x')),
+    )));
+    assert!(app.text_focused, "the live multiline editor also owns keyboard focus");
 }
 
 #[test]
@@ -1126,7 +1152,7 @@ fn project_dir_apply_switches_active_folder() {
     // Switching rebinds the session handler so the next run uses the new folder.
     assert!(app.session_manager.lock().unwrap_or_else(|e| e.into_inner()).is_none());
     assert!(app.chat.entries().is_empty());
-    assert!(app.active_session_id.is_none());
+    assert!(app.conversation.session_id.is_none());
 }
 
 // -----------------------------------------------------------------------
@@ -1518,7 +1544,7 @@ fn run_summary_includes_changed_files() {
 #[test]
 fn run_stage_event_updates_chip_while_running() {
     let (mut app, _) = App::new();
-    app.run_status = RunStatus::Running;
+    app.conversation.status = RunStatus::Running;
     let _ = app.update(Message::DesktopEvent(crate::runtime::DesktopEvent::RunStageChanged {
         stage: RunStage::Execute,
     }));
@@ -1530,7 +1556,7 @@ fn run_stage_event_updates_chip_while_running() {
 #[test]
 fn run_stage_event_ignored_when_not_running() {
     let (mut app, _) = App::new();
-    assert_eq!(app.run_status, RunStatus::Idle);
+    assert_eq!(app.conversation.status, RunStatus::Idle);
     // A stale stage left over (e.g. mid-cancel) stays untouched: the chip
     // only re-appears after a fresh run boundary re-arms it.
     app.run_stage = Some(RunStage::Inspect);
@@ -1546,13 +1572,20 @@ fn run_stage_event_ignored_when_not_running() {
 #[test]
 fn agent_run_completed_clears_run_stage() {
     let (mut app, _) = App::new();
-    app.run_status = RunStatus::Running;
+    app.conversation.status = RunStatus::Running;
     app.run_stage = Some(RunStage::Execute);
     // True run boundary: status flips to Idle and the stage is dropped in
     // one line before any result handling.
-    let _ = app.update(Message::AgentRunCompleted(
-        None,
-        Box::new(Ok(AgentOutput {
+    app.conversation.status = RunStatus::Idle;
+    let Ok(Submission::Start(turn)) = app.conversation.submit("Test turn".into()) else {
+        panic!("start");
+    };
+    let _ = app.update(Message::AgentRunCompleted(Box::new(ConversationCompletion {
+        turn_id: turn.id(),
+        session_id: None,
+        reply_only: true,
+        undelivered: Vec::new(),
+        result: Ok(AgentOutput {
             task_id: TaskId::new(),
             session_id: Ulid::new(),
             final_message: "done".to_string(),
@@ -1566,9 +1599,9 @@ fn agent_run_completed_clears_run_stage() {
             provider_metrics: Vec::new(),
             checkpoint_json: None,
             provider_error_class: None,
-        })),
-    ));
-    assert_eq!(app.run_status, RunStatus::Idle);
+        }),
+    })));
+    assert_eq!(app.conversation.status, RunStatus::Idle);
     assert_eq!(app.run_stage, None);
 }
 
@@ -1606,18 +1639,18 @@ fn resume_dispatch_preserves_held_views_when_provider_validation_blocks_start() 
     })
     .to_string();
     assert!(concerto_orchestrator::checkpoint::GraphCheckpoint::from_json(&checkpoint).is_ok());
-    app.resume_checkpoint_json = Some(checkpoint.clone());
+    app.conversation.checkpoint_json = Some(checkpoint.clone());
 
     let _ = app.submit_to_agent("Continue".into());
-    assert_eq!(app.run_status, RunStatus::Idle, "validation must still block dispatch");
-    assert_eq!(app.resume_checkpoint_json.as_deref(), Some(checkpoint.as_str()));
+    assert_eq!(app.conversation.status, RunStatus::Idle, "validation must still block dispatch");
+    assert_eq!(app.conversation.checkpoint_json.as_deref(), Some(checkpoint.as_str()));
     assert_eq!(app.agent_graph.model.nodes.len(), 1);
     assert_eq!(app.agent_graph.model.nodes[0].state, NodeState::NeedsRevision);
 
     // The backend confirms retention before any resumed specialist dispatch.
     let session_id = Ulid::new();
-    app.active_session_id = Some(session_id);
-    app.run_status = RunStatus::Running;
+    app.conversation.session_id = Some(session_id);
+    app.conversation.status = RunStatus::Running;
     let event = concerto_core::event::Event::new(
         Ulid::new(),
         Ulid::new(),
@@ -1647,7 +1680,7 @@ fn resume_dispatch_preserves_held_views_when_provider_validation_blocks_start() 
 }
 
 #[test]
-fn fresh_and_single_agent_dispatches_clear_previous_task_views() {
+fn rejected_submissions_preserve_previous_task_views() {
     use crate::runtime::DesktopEvent;
     use concerto_core::AgentId;
 
@@ -1656,7 +1689,7 @@ fn fresh_and_single_agent_dispatches_clear_previous_task_views() {
         app.config = None;
         app.settings.providers.clear();
         app.multi_agent = multi_agent;
-        app.resume_checkpoint_json = checkpoint;
+        app.conversation.checkpoint_json = checkpoint;
         let _ = app.update(Message::DesktopEvent(DesktopEvent::SubTaskCreated {
             task_id: TaskId::new(),
             role: AgentId::new("coder"),
@@ -1664,9 +1697,9 @@ fn fresh_and_single_agent_dispatches_clear_previous_task_views() {
         }));
         assert!(app.chat.has_running_subagent());
         let _ = app.submit_to_agent("New task".into());
-        assert_eq!(app.run_status, RunStatus::Idle);
-        assert!(app.agent_graph.model.nodes.is_empty());
-        assert!(!app.chat.has_running_subagent());
+        assert_eq!(app.conversation.status, RunStatus::Idle);
+        assert_eq!(app.agent_graph.model.nodes.len(), 1);
+        assert!(app.chat.has_running_subagent());
     }
 }
 
@@ -1681,15 +1714,17 @@ fn stale_resume_signal_cannot_keep_old_views_for_fresh_specialist_work() {
         app.settings.providers.clear();
         app.multi_agent = true;
         let active = Ulid::new();
-        app.active_session_id = Some(active);
+        app.conversation.session_id = Some(active);
         let old_task = TaskId::new();
         let _ = app.update(Message::DesktopEvent(DesktopEvent::SubTaskCreated {
             task_id: old_task,
             role: AgentId::new("coder"),
             description: "Previous objective".into(),
         }));
-        app.resume_checkpoint_json = Some("candidate checkpoint".into());
+        app.conversation.checkpoint_json = Some("candidate checkpoint".into());
         let _ = app.submit_to_agent("A different objective".into());
+        // Simulate a dispatched turn awaiting the backend resume decision.
+        app.pending_task_view_reset = true;
         assert_eq!(app.agent_graph.model.nodes.len(), 1, "await the backend decision");
         if stale_signal {
             let _ = app.update(Message::DesktopEvent(DesktopEvent::ResumeRequested {
@@ -1697,7 +1732,7 @@ fn stale_resume_signal_cannot_keep_old_views_for_fresh_specialist_work() {
             }));
             assert!(app.pending_task_view_reset, "an idle replay cannot confirm resume");
         }
-        app.run_status = RunStatus::Running;
+        app.conversation.status = RunStatus::Running;
         if stale_signal {
             let _ = app.update(Message::DesktopEvent(DesktopEvent::ResumeRequested {
                 session_id: Ulid::new(),
@@ -1733,12 +1768,20 @@ fn fresh_completion_without_specialists_clears_candidate_views() -> std::io::Res
         role: AgentId::new("coder"),
         description: "Old objective".into(),
     }));
-    app.resume_checkpoint_json = Some("candidate checkpoint".into());
+    app.conversation.checkpoint_json = Some("candidate checkpoint".into());
     let _ = app.submit_to_agent("Answer a new question".into());
-    app.run_status = RunStatus::Running;
-    let _ = app.update(Message::AgentRunCompleted(
-        None,
-        Box::new(Ok(AgentOutput {
+    app.pending_task_view_reset = true;
+    app.conversation.status = RunStatus::Running;
+    app.conversation.status = RunStatus::Idle;
+    let Ok(Submission::Start(turn)) = app.conversation.submit("Test turn".into()) else {
+        panic!("start");
+    };
+    let _ = app.update(Message::AgentRunCompleted(Box::new(ConversationCompletion {
+        turn_id: turn.id(),
+        session_id: None,
+        reply_only: true,
+        undelivered: Vec::new(),
+        result: Ok(AgentOutput {
             task_id: TaskId::new(),
             session_id: Ulid::new(),
             final_message: "The answer".into(),
@@ -1752,8 +1795,8 @@ fn fresh_completion_without_specialists_clears_candidate_views() -> std::io::Res
             provider_metrics: vec![],
             checkpoint_json: None,
             provider_error_class: None,
-        })),
-    ));
+        }),
+    })));
     assert!(app.agent_graph.model.nodes.is_empty());
     assert!(!app.chat.has_running_subagent());
     assert!(!app.pending_task_view_reset);

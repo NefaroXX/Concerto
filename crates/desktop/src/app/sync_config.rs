@@ -347,11 +347,10 @@ impl App {
         self.global_config = reloaded_global;
         self.config = Some(reloaded.clone());
         // Re-derive run-mode flags — the file is truth (ADR-57 §6).
-        self.multi_agent =
-            reloaded.multi_agent.as_ref().map(|settings| settings.default_enabled).unwrap_or(false);
-        // Re-derive the Display motion toggles — the file is truth. The chat
-        // setter settles any in-flight wipe instantly when reduced-motion
-        // turns on mid-animation.
+        self.multi_agent = true; // Execution-mode config applies to headless runs.
+                                 // Re-derive the Display motion toggles — the file is truth. The chat
+                                 // setter settles any in-flight wipe instantly when reduced-motion
+                                 // turns on mid-animation.
         self.scanline_overlay_enabled = reloaded.display.scanline_overlay_enabled;
         self.reduced_motion = reloaded.display.reduced_motion;
         self.chat.set_reduced_motion(self.reduced_motion);
@@ -367,7 +366,7 @@ impl App {
         // Memory parameter changes are not hot-applied — restart-scoped.
         let memory_enabled = reloaded.memory.enabled;
         self.memory.set_enabled(memory_enabled);
-        if !memory_enabled && self.run_status == RunStatus::Idle {
+        if !memory_enabled && self.conversation.status == RunStatus::Idle {
             if let Some(prev) =
                 self.memory_services.lock().unwrap_or_else(|error| error.into_inner()).take()
             {

@@ -235,7 +235,8 @@ impl DesktopApp {
                 };
                 let project_dir = Utf8PathBuf::from_path_buf(current.project_dir.clone())
                     .unwrap_or_else(|path| Utf8PathBuf::from(path.to_string_lossy().as_ref()));
-                let app::App { editor, vfs, cancel_token, .. } = current;
+                let app::App { editor, vfs, conversation, .. } = current;
+                let cancel_token = &conversation.cancel_token;
                 let failures = editor.save_all(vfs, &project_dir, cancel_token);
                 if failures.is_empty() {
                     self.exit_guard = None;
@@ -305,13 +306,13 @@ impl DesktopApp {
     /// desktop's hard-kill: the executor drops its runtime 750 ms after exit
     /// and nothing lands.
     fn begin_close(&mut self) -> Task<Message> {
-        let Some(app) = self.app.as_ref() else {
+        let Some(app) = self.app.as_mut() else {
             // No project open: nothing can be running — exit as before.
             return iced::exit();
         };
         let running = app.is_run_active();
         let settle = app.run_settle_epoch();
-        app.cancel_token.cancel();
+        app.conversation.cancel();
         if !running {
             iced::exit()
         } else {
@@ -650,7 +651,7 @@ impl DesktopApp {
 impl Drop for DesktopApp {
     fn drop(&mut self) {
         if let Some(app) = &self.app {
-            app.cancel_token.cancel();
+            app.conversation.cancel_token.cancel();
         }
     }
 }
@@ -839,7 +840,7 @@ mod tests {
         std::fs::write(&second, "fn second() {}\n")?;
 
         let (mut app, _) = app::App::new();
-        let cancel = app.cancel_token.clone();
+        let cancel = app.conversation.cancel_token.clone();
         app.editor.open_file(&first, &app.vfs);
         let _ = app.editor.update(editor_edit('x'), &app.vfs, &root, &cancel);
         app.editor.open_file(&second, &app.vfs);

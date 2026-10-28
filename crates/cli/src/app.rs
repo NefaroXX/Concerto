@@ -16,8 +16,7 @@ use crate::theme::CliTheme;
 use crate::ui::{self, chat_line_with_theme, ChatRole};
 use concerto_api_types::diff::DiffResult;
 use concerto_config::{
-    AgentModelAssignment, AppConfig, ConditionDef, ModelSettings, MultiAgentConfig, PolicyConfig,
-    PolicyRuleDef,
+    AgentModelAssignment, AppConfig, ConditionDef, ModelSettings, PolicyConfig, PolicyRuleDef,
 };
 use concerto_core::event::{EventBus, EventKind, ThinkingKind};
 use concerto_core::ids::Ulid;
@@ -26,12 +25,14 @@ use concerto_core::traits::approval::ApprovalDecision;
 use concerto_core::transcript::{TranscriptEntry, TranscriptToolStatus};
 
 use concerto_core::types::normalize_agent_id;
+#[cfg(test)]
 use concerto_core::types::AgentOutput;
 use concerto_core::CancellationToken;
-use concerto_orchestrator::runtime_runner::{
-    memory_enabled, run_shared_agent, ActiveMemoryServices,
+use concerto_orchestrator::conversation::{
+    ConversationCompletion, ConversationController, ConversationOptions, Submission,
 };
-use concerto_orchestrator::services::{RequestBuilder, ServicesBuilder};
+use concerto_orchestrator::runtime_runner::ActiveMemoryServices;
+use concerto_orchestrator::services::ServicesBuilder;
 use concerto_orchestrator::session_manager::ProjectSessionManager;
 use concerto_providers::factory::ProviderFactory;
 use concerto_providers::provider_defs::{model_options_for, provider_definition};
@@ -44,8 +45,8 @@ use concerto_tools::virtual_fs::{VirtualFs, VirtualFsEntry};
 /// reload; `None` means "follow the (reloaded) config default".
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunFlags {
-    /// Explicit `--multi-agent`/`-m`. Always `Some(true)` when the flag was
-    /// passed (there is no `--no-multi-agent`); `None` when it was not.
+    /// Legacy `--multi-agent`/`-m` flag retained for startup compatibility.
+    /// Interactive conversations always use the coordinator.
     pub multi_agent: Option<bool>,
     /// Explicit `--fast`/`-f`, likewise. There is no config key for fast, so
     /// absent means `false`.
@@ -241,7 +242,6 @@ pub enum SettingsField {
     Model,
     Provider,
     PolicyPreset,
-    MultiAgent,
     AgentAssignments,
     FastMode,
     MemoryEnabled,
@@ -264,7 +264,6 @@ impl SettingsField {
         SettingsField::Model,
         SettingsField::Provider,
         SettingsField::PolicyPreset,
-        SettingsField::MultiAgent,
         SettingsField::AgentAssignments,
         SettingsField::FastMode,
         SettingsField::MemoryEnabled,
@@ -287,7 +286,6 @@ impl SettingsField {
             SettingsField::Model => "Model",
             SettingsField::Provider => "Provider",
             SettingsField::PolicyPreset => "Policy preset",
-            SettingsField::MultiAgent => "Multi-agent",
             SettingsField::AgentAssignments => "Agent assignments",
             SettingsField::FastMode => "Fast mode",
             SettingsField::MemoryEnabled => "Memory",
@@ -311,7 +309,6 @@ impl SettingsField {
             SettingsField::Model => app.model_label().to_string(),
             SettingsField::Provider => app.provider_label().to_string(),
             SettingsField::PolicyPreset => app.policy_label().to_string(),
-            SettingsField::MultiAgent => if app.multi_agent { "on" } else { "off" }.to_string(),
             SettingsField::AgentAssignments => {
                 let count = app.agent_assignments.len();
                 if count > 0 {
@@ -367,9 +364,7 @@ impl SettingsField {
     }
 }
 
-struct RunCompletion {
-    result: Result<AgentOutput, String>,
-}
+type RunCompletion = ConversationCompletion;
 
 /// An inbound line destined for the chat view, tagged by origin. Assistant
 /// final messages arrive whole and are revealed character-by-character
@@ -479,18 +474,16 @@ pub struct App {
     model_choices: Vec<String>,
     memory: Arc<Mutex<Option<ActiveMemoryServices>>>,
     session_manager: Option<Arc<ProjectSessionManager>>,
-    session_id: Option<Ulid>,
     pub sessions_list: Vec<SessionSummary>,
     pub sessions_index: usize,
     pub agent_assignments: Vec<AgentModelAssignment>,
     pub agent_assignment_index: usize,
-    pub running: bool,
+    pub conversation: ConversationController,
     /// Intent-router stage of the active run (ADR-55 §9), rendered in
     /// the status bar. `Some` only while a run is in flight; cleared at every
     /// run boundary: dispatch start, completion, and cancel.
     pub run_stage: Option<RunStage>,
     pub project_picker_mode: bool,
-    cancel_token: CancellationToken,
     approval_state: CliApprovalState,
     approval_sink: Arc<CliApprovalSink>,
     completion_tx: std::sync::mpsc::Sender<RunCompletion>,
@@ -582,21 +575,19 @@ impl App {
             global_config: None,
             run_flags: RunFlags::default(),
             fast: false,
-            multi_agent: false,
+            multi_agent: true,
             project_dir: PathBuf::from("."),
             selected_model: String::new(),
             model_choices: Vec::new(),
             memory: Arc::new(Mutex::new(None)),
             session_manager: None,
-            session_id: None,
             sessions_list: Vec::new(),
             sessions_index: 0,
             agent_assignments: Vec::new(),
             agent_assignment_index: 0,
-            running: false,
+            conversation: ConversationController::default(),
             run_stage: None,
             project_picker_mode: false,
-            cancel_token: CancellationToken::new(),
             approval_state,
             approval_sink,
             completion_tx,
@@ -702,12 +693,12 @@ impl App {
             return;
         }
 
-        // Cancel any running agent.
-        if self.running {
-            self.cancel_token.cancel();
-            self.running = false;
-            self.run_stage = None;
+        // Keep the active conversation attached to its workspace until it settles.
+        if self.conversation.is_running() {
+            self.push_line(Line::from("Stop the current work before switching projects."));
+            return;
         }
+        self.run_stage = None;
 
         // Cancel memory indexer if active and clear it.
         if let Some(prev) = self.memory.lock().unwrap_or_else(|error| error.into_inner()).take() {
@@ -736,7 +727,7 @@ impl App {
         self.config = Some(effective_config);
 
         // Reset session state.
-        self.session_id = None;
+        self.conversation.select_session(None);
         self.messages.clear();
         self.follow_chat = true;
         self.scroll = 0;
@@ -787,7 +778,7 @@ impl App {
             }
         };
         if !transcript.is_empty() {
-            self.session_id = Some(session.session_id);
+            self.conversation.select_session(Some(session.session_id));
             self.messages.push(Line::from(format!("Resumed session {}", session.session_id)));
             let theme = self.cli_theme;
             let styling = styling_enabled();
@@ -803,7 +794,7 @@ impl App {
                 return;
             }
         };
-        self.session_id = Some(session.session_id);
+        self.conversation.select_session(Some(session.session_id));
         if !history.is_empty() {
             self.messages.push(Line::from(format!("Resumed session {}", session.session_id)));
             let styling = styling_enabled();
@@ -992,8 +983,8 @@ impl App {
         // checkpoint BEFORE the process tears down. Missing the window is
         // the documented hard-kill loss (the later `continue` then resumes
         // headless from the evidence chain) — never a hang.
-        if self.running {
-            self.cancel_token.cancel();
+        if self.conversation.is_running() {
+            self.conversation.cancel();
             self.await_run_settlement(GRACEFUL_SHUTDOWN_WAIT);
         }
         if let Some(prev) = self.memory.lock().unwrap_or_else(|error| error.into_inner()).take() {
@@ -1014,7 +1005,7 @@ impl App {
     /// checkpoint, and tell the user cancellation was requested. The run task
     /// keeps unwinding on the runtime; the UI stays responsive.
     fn handle_interrupt(&mut self) {
-        self.cancel_token.cancel();
+        self.conversation.cancel();
         self.push_line(Line::from("Cancellation requested…"));
     }
 
@@ -1028,21 +1019,13 @@ impl App {
     /// evidence chain) — never a hang.
     fn await_run_settlement(&mut self, grace: Duration) {
         let deadline = std::time::Instant::now() + grace;
-        while self.running {
+        while self.conversation.is_running() {
             let now = std::time::Instant::now();
             if now >= deadline {
                 break;
             }
             match self.completion_rx.recv_timeout(deadline - now) {
-                Ok(completion) => {
-                    self.running = false;
-                    // Mirror the event loop's completion handling minimally:
-                    // the run task already published its final message; the
-                    // session id stays authoritative for the next dispatch.
-                    if let Ok(output) = &completion.result {
-                        self.session_id = Some(output.session_id);
-                    }
-                }
+                Ok(completion) => self.settle_conversation(completion),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
@@ -1060,14 +1043,7 @@ impl App {
                 self.ingest_ui_line(ui_line);
             }
             while let Ok(completion) = self.completion_rx.try_recv() {
-                self.running = false;
-                // Run boundary: the stage chip must not survive the run.
-                self.run_stage = None;
-                match completion.result {
-                    Ok(output) => self.session_id = Some(output.session_id),
-                    Err(error) => self.push_line(Line::from(format!("Error: {error}"))),
-                }
-                self.sync_terminal_title();
+                self.settle_conversation(completion);
             }
 
             // Drain raw events (tool + status) (collect first to avoid borrow conflict).
@@ -1112,7 +1088,7 @@ impl App {
                 self.sync_terminal_title();
             }
 
-            self.runtime_inspector.poll(self.session_id);
+            self.runtime_inspector.poll(self.conversation.session_id);
             terminal.draw(|frame| ui::draw(frame, self))?;
             // While a reveal is animating, poll at the typewriter cadence so
             // each tick can redraw a longer prefix; idle stays at the original
@@ -1139,7 +1115,9 @@ impl App {
 
     /// Continue the restored session through the ordinary run and approval UI.
     pub fn continue_active_session(&mut self, rt: &tokio::runtime::Runtime) {
-        let (Some(id), Some(manager)) = (self.session_id, self.session_manager.clone()) else {
+        let (Some(id), Some(manager)) =
+            (self.conversation.session_id, self.session_manager.clone())
+        else {
             return;
         };
         match rt.block_on(manager.store().load_orchestration_checkpoint(id)) {
@@ -1170,86 +1148,54 @@ impl App {
     }
 
     fn dispatch_message(&mut self, input: String, rt: &tokio::runtime::Runtime) {
-        if self.running || input.trim().is_empty() {
+        if input.trim().is_empty() {
             return;
         }
-        // `/thinking` is a local accordion toggle for the current movement
-        // (collapse-all / expand-all) — never dispatched as a run.
         if input.trim() == "/thinking" {
             self.toggle_thinking();
             return;
         }
-        // External config edits take effect on this dispatch (ADR-57 D5).
-        self.reload_config_for_run();
+        if !self.conversation.is_running() {
+            self.reload_config_for_run();
+        }
         let (Some(config), Some(session_manager)) =
             (self.config.clone(), self.session_manager.clone())
         else {
-            self.push_line(Line::from("Configuration or session storage is unavailable."));
+            self.input = input;
+            self.push_line(Line::from(
+                "Configuration or session storage is unavailable. Your draft is preserved.",
+            ));
             return;
         };
-
-        let project = match camino::Utf8PathBuf::from_path_buf(self.project_dir.clone()) {
-            Ok(project) => project,
-            Err(path) => {
-                self.push_line(Line::from(format!(
-                    "Project path is not valid UTF-8: {}",
-                    path.display()
-                )));
-                return;
-            }
+        let options = ConversationOptions {
+            project_dir: self.project_dir.clone(),
+            provider_id: None,
+            model: (!self.selected_model.is_empty()).then(|| self.selected_model.clone()),
+            fast: self.fast,
         };
-        let provider = self.provider_label().to_string();
-        let model = self.selected_model.clone();
-        let session_id = match self.session_id {
-            Some(id) => id,
-            None => match rt.block_on(session_manager.get_or_create_active_session(
-                &project,
-                &provider,
-                &model,
-                CancellationToken::new(),
-            )) {
-                Ok(session) => session.session_id,
-                Err(error) => {
-                    self.push_line(Line::from(format!("Could not open session: {error}")));
-                    return;
-                }
-            },
-        };
-        self.session_id = Some(session_id);
-        let history = match rt
-            .block_on(session_manager.load_recent_messages(session_id, CancellationToken::new()))
+        let submission = match self.conversation.submit_configured(input.clone(), &config, &options)
         {
-            Ok(history) => history,
-            Err(error) => {
-                self.push_line(Line::from(format!("Could not load session history: {error}")));
+            Ok(submission) => submission,
+            Err(message) => {
+                self.input = input;
+                self.push_line(Line::from(message));
                 return;
             }
         };
-
         self.push_line(chat_line_with_theme(
             ChatRole::User,
             &input,
             styling_enabled(),
             &self.cli_theme,
         ));
-        self.running = true;
-        // Fresh run boundary: no stale stage from a previous run may show in
-        // the status bar (the chip re-appears once a stage event lands).
+        let Submission::Start(turn) = submission else {
+            self.push_line(Line::from(concerto_orchestrator::conversation::MESSAGE_QUEUED));
+            return;
+        };
         self.run_stage = None;
         self.current_agent = None;
-        // Fresh movement boundary: the thought log belongs to the previous
-        // movement, and collapse mode resets to show-everything.
         self.thought_log.clear();
         self.thinking_expanded = true;
-        self.cancel_token = CancellationToken::new();
-
-        let request =
-            RequestBuilder::new(input, self.project_dir.clone(), self.cancel_token.clone())
-                .with_provider_model(None, (!model.is_empty()).then_some(model.clone()))
-                .with_session(session_id, history)
-                .with_single_agent(!self.multi_agent)
-                .with_memory_enabled(memory_enabled(self.fast, config.memory.enabled))
-                .build();
 
         let services = ServicesBuilder::new(self.bus.clone(), config, self.approval_sink.clone())
             .with_vfs(self.vfs.clone())
@@ -1257,52 +1203,44 @@ impl App {
             .with_memory(self.memory.clone())
             .build();
         let completion = self.completion_tx.clone();
-        let bus = self.bus.clone();
         rt.spawn(async move {
-            let result = run_shared_agent(request, services).await;
-            if let Ok(output) = &result {
-                let _ = bus.publish_for_session(
-                    output.session_id,
-                    output.task_id.0,
-                    EventKind::AssistantMessage {
-                        task_id: output.task_id,
-                        content: output.summary(),
-                    },
-                );
-            }
-            let _ = completion
-                .send(RunCompletion { result: result.map_err(|error| error.to_string()) });
+            let _ = completion.send(turn.execute(options, services).await);
         });
     }
 
-    fn start_new_session(&mut self, rt: &tokio::runtime::Runtime) {
-        if self.running {
+    fn settle_conversation(&mut self, completion: ConversationCompletion) {
+        if !self.conversation.settle(&completion) {
             return;
         }
-        let Some(manager) = self.session_manager.clone() else { return };
-        let Ok(project) = camino::Utf8PathBuf::from_path_buf(self.project_dir.clone()) else {
-            return;
-        };
-        match rt.block_on(manager.create_new_session(
-            &project,
-            self.provider_label(),
-            self.model_label(),
-            CancellationToken::new(),
-        )) {
-            Ok(session) => {
-                self.session_id = Some(session.session_id);
-                self.approval_sink.set_auto_approve(false);
-                self.messages.clear();
-                self.follow_chat = true;
-                self.scroll = 0;
-                self.push_line(Line::from(format!(
-                    "New session {} — {}",
-                    session.session_id,
-                    self.project_dir.display()
-                )));
+        self.run_stage = None;
+        let display_message = completion.display_message();
+        match completion.result {
+            Ok(_) => self.ingest_ui_line(UiLine::Assistant(display_message)),
+            Err(failure) => self.push_line(Line::from(failure.user_message)),
+        }
+        if !completion.undelivered.is_empty() {
+            let mut draft = completion.undelivered.join("\n\n");
+            if !self.input.trim().is_empty() {
+                draft.push_str("\n\n");
+                draft.push_str(&self.input);
             }
-            Err(error) => self.push_line(Line::from(format!("Could not create session: {error}"))),
+            self.input = draft;
+            self.push_line(Line::from("Work stopped before reading your latest messages. They are restored in the composer."));
         }
+        self.sync_terminal_title();
+    }
+
+    fn start_new_session(&mut self, _rt: &tokio::runtime::Runtime) {
+        if self.conversation.is_running() {
+            self.push_line(Line::from("Stop the current work before starting a new conversation."));
+            return;
+        }
+        self.conversation.select_session(None);
+        self.approval_sink.set_auto_approve(false);
+        self.messages.clear();
+        self.follow_chat = true;
+        self.scroll = 0;
+        self.push_line(Line::from(format!("New conversation — {}", self.project_dir.display())));
     }
 
     /// Route one tagged inbound line into the chat view (Issue #147 Part 2).
@@ -1566,7 +1504,7 @@ impl App {
                 && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
             {
                 self.approval_state.resolve(ApprovalDecision::Deny);
-                return if self.running { Action::Cancel } else { Action::None };
+                return if self.conversation.is_running() { Action::Cancel } else { Action::None };
             }
             let decision = match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => Some(ApprovalDecision::Approve),
@@ -1585,7 +1523,7 @@ impl App {
                 && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
             {
                 self.approval_state.resolve_intent(None);
-                return if self.running { Action::Cancel } else { Action::None };
+                return if self.conversation.is_running() { Action::Cancel } else { Action::None };
             }
             if let Some(selected) = self.intent_key_choice(key.code) {
                 self.approval_state.resolve_intent(selected);
@@ -1599,7 +1537,7 @@ impl App {
             {
                 self.approval_state.resolve_plan(plan.session_id, &plan.plan_id, None);
                 self.plan_scroll = 0;
-                return if self.running { Action::Cancel } else { Action::None };
+                return if self.conversation.is_running() { Action::Cancel } else { Action::None };
             }
             match key.code {
                 KeyCode::Enter | KeyCode::Char('a') => {
@@ -1637,7 +1575,7 @@ impl App {
         if key.code == KeyCode::Char('c')
             && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
         {
-            return if self.running { Action::Cancel } else { Action::Quit };
+            return if self.conversation.is_running() { Action::Cancel } else { Action::Quit };
         }
 
         if self.screen == Screen::Chat && !self.project_picker_mode {
@@ -1659,7 +1597,7 @@ impl App {
                 };
                 if let Some(choice) = choice {
                     let shortcut = ui::CHAT_COMMANDS[choice].0;
-                    if shortcut == 'n' && self.running {
+                    if shortcut == 'n' && self.conversation.is_running() {
                         return Action::None;
                     }
                     self.command_menu = None;
@@ -1813,7 +1751,7 @@ impl App {
 
         match key {
             KeyCode::Esc => self.input_mode = !self.input_mode,
-            KeyCode::Enter if self.input_mode && !self.running => {
+            KeyCode::Enter if self.input_mode => {
                 let input = std::mem::take(&mut self.input);
                 self.input_cursor = None;
                 if !input.trim().is_empty() {
@@ -1969,9 +1907,9 @@ impl App {
                 let max = self.sessions_list.len().saturating_sub(1);
                 self.sessions_index = (self.sessions_index + 1).min(max);
             }
-            KeyCode::Enter if !self.sessions_list.is_empty() => {
+            KeyCode::Enter if !self.sessions_list.is_empty() && !self.conversation.is_running() => {
                 let session = &self.sessions_list[self.sessions_index];
-                self.session_id = Some(session.id);
+                self.conversation.select_session(Some(session.id));
                 self.screen = Screen::Chat;
                 // Reload history into the chat display.
                 self.resume_session_display(session.id);
@@ -1983,7 +1921,7 @@ impl App {
 
     fn refresh_runtime_inspector(&mut self) {
         let store = self.session_manager.as_ref().map(|manager| manager.store());
-        self.runtime_inspector.load(self.session_id, store);
+        self.runtime_inspector.load(self.conversation.session_id, store);
     }
 
     fn handle_runtime_key(&mut self, key: KeyCode) -> Action {
@@ -2345,16 +2283,6 @@ impl App {
                 };
                 true
             }
-            SettingsField::MultiAgent => {
-                self.multi_agent = !self.multi_agent;
-                if let Some(global) = &mut self.global_config {
-                    global
-                        .multi_agent
-                        .get_or_insert_with(MultiAgentConfig::default)
-                        .default_enabled = self.multi_agent;
-                }
-                true
-            }
             SettingsField::FastMode => {
                 self.fast = !self.fast;
                 false
@@ -2518,11 +2446,9 @@ fn available_models(config: &AppConfig) -> Vec<String> {
 /// CLI flags (ADR-57 D5). CLI flags win when present; otherwise the file is
 /// truth. Pure so reload behavior is unit-testable.
 fn resolve_run_prefs(effective: &AppConfig, flags: &RunFlags) -> ResolvedRunPrefs {
-    let multi_agent = flags.multi_agent.unwrap_or_else(|| {
-        effective.multi_agent.as_ref().map(|settings| settings.default_enabled).unwrap_or(false)
-    });
-    // `fast` has no config key: absent flag means off (matches the pre-reload
-    // startup derivation).
+    let multi_agent = true; // Interactive conversations always belong to the coordinator.
+                            // `fast` has no config key: absent flag means off (matches the pre-reload
+                            // startup derivation).
     let fast = flags.fast.unwrap_or(false);
     // Reduced-motion precedence: explicit flag > CONCERTO_REDUCED_MOTION env
     // > config file > default (false). The CLI has no scan-line; this flag
@@ -3313,7 +3239,7 @@ mod tests {
             app.handle_key(key_event(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Action::Quit
         ));
-        app.running = true;
+        app.conversation.status = concerto_orchestrator::conversation::RunStatus::Running;
         assert!(matches!(
             app.handle_key(key_event(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Action::Cancel
@@ -3347,15 +3273,15 @@ mod tests {
     #[test]
     fn handle_interrupt_cancels_the_run_token() {
         let mut app = App::new();
-        app.running = true;
-        let token = app.cancel_token.clone();
+        app.conversation.status = concerto_orchestrator::conversation::RunStatus::Running;
+        let token = app.conversation.cancel_token.clone();
         app.handle_interrupt();
         assert!(token.is_cancelled(), "the interrupt cancels the run token");
         assert!(
             app.messages.iter().any(|line| line.to_string().contains("Cancellation requested")),
             "the user is told cancellation was requested"
         );
-        assert!(app.running, "the run keeps unwinding; the app stays responsive");
+        assert!(app.conversation.is_running(), "the run keeps unwinding; the app stays responsive");
     }
 
     /// A drained SIGINT takes the same cooperative-cancel path as the Ctrl+C
@@ -3366,8 +3292,8 @@ mod tests {
         let mut app = App::new();
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         app.interrupt_rx = Some(rx);
-        app.running = true;
-        let token = app.cancel_token.clone();
+        app.conversation.status = concerto_orchestrator::conversation::RunStatus::Running;
+        let token = app.conversation.cancel_token.clone();
         tx.send(()).expect("signal sent");
         // Same drain the event loop runs, inline for a headless test.
         if let Some(rx) = app.interrupt_rx.as_ref() {
@@ -3389,16 +3315,25 @@ mod tests {
     #[test]
     fn await_run_settlement_returns_when_the_run_settles() {
         let mut app = App::new();
-        app.running = true;
+        let Ok(Submission::Start(turn)) = app.conversation.submit("Work".into()) else {
+            panic!("start");
+        };
+        let turn_id = turn.id();
         let session_id = Ulid::new();
         let tx = app.completion_tx.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(50));
-            let _ = tx.send(RunCompletion { result: Ok(test_agent_output(session_id)) });
+            let _ = tx.send(RunCompletion {
+                turn_id,
+                session_id: Some(session_id),
+                result: Ok(test_agent_output(session_id)),
+                reply_only: true,
+                undelivered: Vec::new(),
+            });
         });
         app.await_run_settlement(Duration::from_secs(5));
-        assert!(!app.running, "the settled completion ends the run");
-        assert_eq!(app.session_id, Some(session_id), "the session id is retained");
+        assert!(!app.conversation.is_running(), "the settled completion ends the run");
+        assert_eq!(app.conversation.session_id, Some(session_id), "the session id is retained");
     }
 
     /// The bounded quit wait NEVER hangs: without a completion it returns at
@@ -3407,10 +3342,10 @@ mod tests {
     #[test]
     fn await_run_settlement_bounds_the_wait() {
         let mut app = App::new();
-        app.running = true;
+        app.conversation.status = concerto_orchestrator::conversation::RunStatus::Running;
         let started = std::time::Instant::now();
         app.await_run_settlement(Duration::from_millis(60));
-        assert!(app.running, "no completion arrived; the run is still in flight");
+        assert!(app.conversation.is_running(), "no completion arrived; the run is still in flight");
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "the wait is bounded by the grace, got: {:?}",
@@ -3421,13 +3356,14 @@ mod tests {
     #[test]
     fn enter_does_not_overlap_running_dispatches() {
         let mut app = App::new();
+        assert!(matches!(app.conversation.submit("first".into()), Ok(Submission::Start(_))));
         app.input = "second".into();
-        app.running = true;
-        assert!(matches!(
-            app.handle_key(key_event(KeyCode::Enter, KeyModifiers::NONE)),
-            Action::None
-        ));
-        assert_eq!(app.input, "second");
+        let Action::Dispatch(input) = app.handle_key(key_event(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("busy composer should deliver a follow-up");
+        };
+        assert!(matches!(app.conversation.submit(input), Ok(Submission::Delivered)));
+        assert!(app.input.is_empty());
     }
 
     #[test]
@@ -3494,8 +3430,8 @@ mod tests {
         let app = App::new();
         assert_eq!(app.screen, Screen::Chat);
         assert!(app.input_mode);
-        assert!(!app.running);
-        assert!(!app.multi_agent);
+        assert!(!app.conversation.is_running());
+        assert!(app.multi_agent);
         assert!(!app.fast);
         assert_eq!(app.run_flags, RunFlags::default());
     }
@@ -3679,6 +3615,16 @@ mod tests {
     }
 
     #[test]
+    fn enter_sends_a_followup_while_the_conversation_is_running() {
+        let mut app = App::new();
+        assert!(matches!(app.conversation.submit("Work".into()), Ok(Submission::Start(_))));
+        app.input = "Keep the API".into();
+        let action = app.handle_key(key_event(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(matches!(action, Action::Dispatch(message) if message == "Keep the API"));
+        assert!(app.conversation.is_running());
+    }
+
+    #[test]
     fn enter_with_empty_input_does_not_dispatch() {
         let mut app = App::new();
         let action = app.handle_key(key_event(KeyCode::Enter, KeyModifiers::empty()));
@@ -3790,7 +3736,7 @@ mod tests {
         assert_eq!(app.input, "hi\nnext\nline    ");
         app.handle_key(key_event(KeyCode::Char('j'), KeyModifiers::CONTROL));
         assert!(app.input.ends_with('\n'));
-        assert!(!app.running);
+        assert!(!app.conversation.is_running());
     }
 
     #[test]

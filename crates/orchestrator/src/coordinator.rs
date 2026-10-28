@@ -1994,6 +1994,12 @@ pub struct CoordinatorAgent {
     replan_attempts: HashMap<TaskId, u32>,
     retry_policy: RetryPolicy,
     session_store: Option<Arc<dyn SessionStore>>,
+    conversation_inbox: Option<crate::conversation::ConversationInbox>,
+    /// A new conversational turn over unfinished work may answer and pause;
+    /// it must never mark the preserved obligations completed by prose.
+    conversation_resume: bool,
+    conversation_reply: Option<String>,
+    conversation_history: Vec<Message>,
     source_revision: Option<String>,
     /// ADR-42 §4 fallback-ladder guards. These are checkpointed (see
     /// `checkpoint::GraphCheckpoint`): a resumed run restores them and does
@@ -3811,6 +3817,19 @@ struct PerHypothesisRecord {
 }
 
 impl CoordinatorAgent {
+    pub fn with_conversation_history(mut self, history: Vec<Message>) -> Self {
+        self.conversation_history = history;
+        self
+    }
+
+    pub fn with_conversation_inbox(
+        mut self,
+        inbox: Option<crate::conversation::ConversationInbox>,
+    ) -> Self {
+        self.conversation_inbox = inbox;
+        self
+    }
+
     /// Opt into current-state canonical verification for action-required completion.
     pub fn with_strict_verification_gate(mut self, enabled: bool) -> Self {
         self.strict_verification_gate = enabled;
@@ -3849,6 +3868,10 @@ impl CoordinatorAgent {
             replan_attempts: HashMap::new(),
             retry_policy: RetryPolicy::default(),
             session_store: None,
+            conversation_inbox: None,
+            conversation_resume: false,
+            conversation_reply: None,
+            conversation_history: Vec::new(),
             source_revision: None,
             escalation_attempted: HashSet::new(),
             identical_failures: crate::failure_diagnosis::IdenticalFailureTracker::default(),
@@ -7009,8 +7032,12 @@ impl CoordinatorAgent {
                  replay successful calls blindly or declare a duplicate task. Prose alone does \
                  not finish this work.\n</specialist_continuations>\n"
             ));
-        } else {
+        } else if !self.conversation_resume {
             intro.push_str(&resume_drive_instruction());
+        }
+        if self.conversation_resume {
+            intro.push_str(&format!("\nPreserved work objective: {}\n", result.objective));
+            intro.push_str("\nThis is a new message in an ongoing conversation. Interpret the latest user message in the context of the preserved objective and task graph. Answer questions directly; continue or revise work when requested or implied. A direct answer may pause unfinished work, but must not claim that work is complete. Preserve existing task identities and completed work.\n");
         }
         let mut state = DispatchSessionState {
             doc,
@@ -7170,7 +7197,10 @@ impl CoordinatorAgent {
                     // dead end that re-persists on every resume. Hand it back
                     // to the decision loop instead, so the Coordinator
                     // dispatches the promised work.
-                    if self.resume_needs_implement_drive(task, &result)
+                    if (self.conversation_resume
+                        && result.requested_user_input.is_none()
+                        && result.pending_approval.is_none())
+                        || self.resume_needs_implement_drive(task, &result)
                         || self.resume_needs_continuation_drive(&result)
                         || (result.requested_user_input.is_none()
                             && result.pending_approval.is_none()
@@ -8772,6 +8802,36 @@ impl CoordinatorAgent {
             );
         }
 
+        // A conversational reply settles the message, not the outstanding
+        // task graph. Keep the same run checkpoint and return the reply
+        // without scheduling work the user may have asked to discuss first.
+        if self.conversation_resume && self.dispatch_guard_arms(&task, &graph, &all_files) {
+            if let Some(reply) = self.conversation_reply.take() {
+                if let Some(inbox) = &self.conversation_inbox {
+                    inbox.mark_reply_only();
+                }
+                return Ok(self
+                    .publish_completion_and_checkpoint(
+                        &task,
+                        reply,
+                        &mut checkpoint_scope,
+                        &context,
+                        &graph,
+                        &completed_results,
+                        total_cost,
+                        total_tool_calls,
+                        provider_metrics,
+                        &all_files,
+                        &subtask_attempts,
+                        &retry_feedback,
+                        &model_assignments,
+                        &action_ledger,
+                        recoverable_notes,
+                    )
+                    .await);
+            }
+        }
+
         // ── ADR-35 amendment (2026-09-16 §2): AwaitingUser short-circuit ──
         // The Coordinator requested human input during its decision loop
         // (`request_user_input`), OR a resume restored such a pending
@@ -8920,6 +8980,34 @@ impl CoordinatorAgent {
                 );
                 self.persist_checkpoint(&mut interrupted, &model_assignments).await;
                 return Err(OrchestratorError::Cancelled);
+            }
+
+            // Hand control back before dispatching another batch. The shared
+            // conversation runner resumes this checkpoint with the queued
+            // message, so steering can affect the next scheduling decision.
+            if let Some(inbox) =
+                self.conversation_inbox.as_ref().filter(|inbox| inbox.has_pending())
+            {
+                inbox.yield_to_input();
+                return Ok(self
+                    .publish_completion_and_checkpoint(
+                        &task,
+                        String::new(),
+                        &mut checkpoint_scope,
+                        &context,
+                        &graph,
+                        &completed_results,
+                        total_cost,
+                        total_tool_calls,
+                        provider_metrics,
+                        &all_files,
+                        &subtask_attempts,
+                        &retry_feedback,
+                        &model_assignments,
+                        &action_ledger,
+                        recoverable_notes,
+                    )
+                    .await);
             }
 
             // ── Issue #58: deterministic critical-path-ready batch order ──
@@ -10057,6 +10145,10 @@ impl CoordinatorAgent {
         cancel: CancellationToken,
         resume_checkpoint_json: Option<String>,
     ) -> Result<AgentOutput, OrchestratorError> {
+        self.conversation_resume = self.conversation_inbox.is_some()
+            && resume_checkpoint_json.is_some()
+            && !task.execution_mode.is_action_required();
+        self.conversation_reply = None;
         // Fresh run: forget settlements from any prior run on this instance.
         self.settled_metrics.clear();
         // Fresh run: no pending human-input request carries across runs.
@@ -12530,6 +12622,9 @@ impl CoordinatorAgent {
     /// Gated on `dispatching`: a planning-only run exposes no tools.
     fn build_dispatch_tool_defs(&self, dispatching: bool) -> Vec<ToolDefinition> {
         let mut tool_defs: Vec<ToolDefinition> = Vec::new();
+        if self.conversation_inbox.is_some() {
+            tool_defs.push(crate::conversation::reply_tool_definition());
+        }
         if dispatching {
             tool_defs.push(call_specialist_tool_definition());
             tool_defs.push(draft_plan_tool_definition());
@@ -12632,9 +12727,12 @@ impl CoordinatorAgent {
         // planning would have no run to name.
         self.run_id = Some(scope.run_id.to_string());
         let dispatching = self.orchestration_depth != OrchestrationDepth::PlanningOnly;
-        let system_message = self
+        let mut system_message = self
             .build_dispatch_prompt(task, base_ctx, cancel, intro, dispatching, state, ledger)
             .await;
+        if self.conversation_inbox.is_some() {
+            system_message.content.push_str(crate::conversation::CONVERSATION_GUIDANCE);
+        }
         let tool_defs = self.build_dispatch_tool_defs(dispatching);
 
         let profile = match self.planning_profile.clone() {
@@ -12655,18 +12753,17 @@ impl CoordinatorAgent {
         // neither conditional nudge below has fired yet. Reusing the exact
         // objective text keeps the model's first turn aligned with the
         // objective it was instructed on — this is not new prompt text.
-        let mut messages = vec![
-            system_message,
-            Message {
-                role: Role::User,
-                content: task.description.clone(),
-                tool_calls: None,
-                tool_results: None,
-                reasoning_content: None,
-                tokens_in: None,
-                tokens_out: None,
-            },
-        ];
+        let mut messages = vec![system_message];
+        messages.extend(self.conversation_history.iter().cloned());
+        messages.push(Message {
+            role: Role::User,
+            content: task.description.clone(),
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: None,
+            tokens_in: None,
+            tokens_out: None,
+        });
         // ── Issue #63: resume one-shot WAIT re-evaluation ────────────────
         // A checkpoint-restored in-flight wait is NEVER re-entered into the
         // park loop; instead it is re-evaluated exactly once against the
@@ -12788,6 +12885,16 @@ impl CoordinatorAgent {
                 }
             }
 
+            if let Some(inbox) = &self.conversation_inbox {
+                let incoming = inbox
+                    .receive(self.session_store.as_ref(), Some(&self.bus), task.session_id, cancel)
+                    .await?;
+                if !incoming.is_empty() {
+                    self.conversation_resume = true;
+                }
+                messages.extend(incoming);
+            }
+
             // W3c: issue the per-turn provider request and record its provider
             // metrics on the ledger in one ordered unit
             // ([`Self::request_dispatch_turn`]).
@@ -12806,6 +12913,14 @@ impl CoordinatorAgent {
             });
 
             if tool_calls.is_empty() {
+                // A message arriving during the provider request gets its
+                // own decision before the previous response closes the turn.
+                if self.conversation_inbox.as_ref().is_some_and(|inbox| inbox.has_pending()) {
+                    continue;
+                }
+                if self.conversation_resume {
+                    self.conversation_reply = Some(text.clone());
+                }
                 // ── Prose-only dispatch guard ────────────────────────────
                 // An ACTION-REQUIRED dispatch session is not allowed to close
                 // in prose while ZERO dispatches exist: an empty graph makes
@@ -12828,8 +12943,9 @@ impl CoordinatorAgent {
                 // with no code artifact yet — whatever its mode. Conversational
                 // turns (empty graph, no plan) stay exempt: no dispatch is
                 // manufactured for them.
-                let prose_only_stop =
-                    self.dispatch_guard_arms(task, graph, &ledger.all_files) && graph.is_empty();
+                let prose_only_stop = !self.conversation_resume
+                    && self.dispatch_guard_arms(task, graph, &ledger.all_files)
+                    && graph.is_empty();
                 if dispatching && prose_only_stop && prose_stop_reprompts < MAX_PROSE_STOP_REPROMPTS
                 {
                     prose_stop_reprompts += 1;
@@ -12884,11 +13000,17 @@ impl CoordinatorAgent {
             let journal_len_before_cycle = self.decision_journal.len();
             let cost_before_cycle = ledger.total_cost;
             let mut observation = crate::progress::CycleObservation::default();
-            // Conversational-close gate (issue #145): every tool call the
-            // session executes marks it tool-mediated, so only a pure-prose
-            // session (zero calls) can close as a direct answer.
+            // A conversational reply is presentation, not work. Other tools
+            // retain the established tool-mediated completion accounting.
+            let work_calls = tool_calls
+                .iter()
+                .filter(|call| {
+                    self.conversation_inbox.is_none()
+                        || call.name != crate::conversation::REPLY_TOOL
+                })
+                .count();
             ledger.coordinator_tool_calls =
-                ledger.coordinator_tool_calls.saturating_add(tool_calls.len() as u32);
+                ledger.coordinator_tool_calls.saturating_add(work_calls as u32);
 
             for tool_call in tool_calls {
                 if cancel.is_cancelled() {
@@ -12896,6 +13018,16 @@ impl CoordinatorAgent {
                 }
                 let mut call_plan: Option<PlanArtifact> = None;
                 let result = match tool_call.name.as_str() {
+                    crate::conversation::REPLY_TOOL if self.conversation_inbox.is_some() => {
+                        crate::conversation::reply_to_user(
+                            &tool_call.arguments,
+                            self.session_store.as_ref(),
+                            &self.bus,
+                            task,
+                            cancel,
+                        )
+                        .await
+                    }
                     CALL_SPECIALIST_TOOL if dispatching => {
                         let result = self
                             .handle_call_specialist(
@@ -18817,6 +18949,7 @@ mod tests {
         /// to model a LATER planning turn failing after earlier dispatches
         /// already produced artifacts.
         terminal_error: Option<ProviderError>,
+        followup: std::sync::Mutex<Option<(crate::conversation::ConversationInbox, String)>>,
     }
 
     impl TurnProvider {
@@ -18825,6 +18958,7 @@ mod tests {
                 turns: std::sync::Mutex::new(turns.into()),
                 requests: std::sync::Mutex::new(Vec::new()),
                 terminal_error: None,
+                followup: std::sync::Mutex::new(None),
             }
         }
 
@@ -18894,6 +19028,9 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<concerto_core::traits::provider::CompletionStream, ProviderError> {
             self.requests.lock().unwrap().push(request);
+            if let Some((inbox, message)) = self.followup.lock().unwrap().take() {
+                inbox.send(message).expect("follow-up accepted");
+            }
             let turn = match self.turns.lock().unwrap().pop_front() {
                 Some(turn) => turn,
                 None => match &self.terminal_error {
@@ -22225,6 +22362,146 @@ mod tests {
         assert!(output.checkpoint_json.is_some(), "the Partial run stays resumable");
     }
 
+    #[tokio::test]
+    async fn conversation_reply_without_work_keeps_the_plain_final_answer() {
+        let bus = EventBus::new(256);
+        let mut coordinator = coordinator_with_turns(
+            bus,
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            vec![
+                CoordinatorTurn::Calls(vec![ToolCall {
+                    id: "reply".into(),
+                    name: crate::conversation::REPLY_TOOL.into(),
+                    arguments: serde_json::json!({"message": "One more detail…"}),
+                    ..Default::default()
+                }]),
+                CoordinatorTurn::Text("That is how the design fits together.".into()),
+            ],
+        )
+        .with_conversation_inbox(Some(crate::conversation::ConversationInbox::default()));
+        let session_id = Ulid::new();
+        let dir = tempfile::tempdir().unwrap();
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_coordinator_decides(session_id, "Explain the design"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.final_message, "That is how the design fits together.");
+        assert!(output.checkpoint_json.is_none());
+        assert_eq!(output.tool_call_count, 0);
+    }
+
+    #[tokio::test]
+    async fn conversation_history_and_status_reply_allow_work_to_continue() {
+        let bus = EventBus::new(256);
+        let (coordinator, provider) = coordinator_with_turns_captured(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+                AgentId::new("researcher"),
+                "inspected the module",
+            )])),
+            vec![
+                CoordinatorTurn::Calls(vec![ToolCall {
+                    id: "status".into(),
+                    name: crate::conversation::REPLY_TOOL.into(),
+                    arguments: serde_json::json!({"message": "I will inspect it now."}),
+                    ..Default::default()
+                }]),
+                CoordinatorTurn::Calls(vec![call_specialist("researcher", "inspect the module")]),
+                CoordinatorTurn::Text("Inspection finished".into()),
+            ],
+        );
+        let history = vec![Message {
+            role: Role::Assistant,
+            content: "I can inspect the module and explain its structure.".into(),
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: None,
+            tokens_in: None,
+            tokens_out: None,
+        }];
+        let coordinator = coordinator
+            .with_conversation_inbox(Some(crate::conversation::ConversationInbox::default()))
+            .with_conversation_history(history);
+        let (output, events) = run_for_test(coordinator, bus).await;
+        assert_eq!(provider.turn_count(), 3, "a status reply must not end the work loop");
+        let reply_position = events.iter().position(|event| matches!(event,
+            EventKind::AssistantMessage { content, .. } if content == "I will inspect it now."
+        )).expect("visible status reply");
+        let work_position = events
+            .iter()
+            .position(|event| {
+                matches!(event,
+                    EventKind::SubTaskStarted { role, .. } if role == &AgentId::new("researcher")
+                )
+            })
+            .expect("work continues after reply");
+        assert!(reply_position < work_position);
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed
+        );
+        let requests = provider.requests.lock().unwrap();
+        assert!(
+            requests[0].messages.iter().any(|message| message.role == Role::Assistant
+                && message.content.starts_with("I can inspect")),
+            "the previous proposal retains its assistant role"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_followup_during_a_provider_request_reaches_the_next_turn() {
+        let inbox = crate::conversation::ConversationInbox::default();
+        let provider = Arc::new(TurnProvider::new(vec![
+            CoordinatorTurn::Text("First answer".into()),
+            CoordinatorTurn::Text("Answer to the follow-up".into()),
+        ]));
+        *provider.followup.lock().unwrap() =
+            Some((inbox.clone(), "And what about the tests?".into()));
+        let mut coordinator = coordinator_with_turn_provider(
+            EventBus::new(256),
+            Arc::new(AgentRegistry::from_mocks(vec![])),
+            provider.clone(),
+        )
+        .with_conversation_inbox(Some(inbox));
+        let session_id = Ulid::new();
+        let dir = tempfile::tempdir().unwrap();
+        let context = AgentContext::new(concerto_core::types::SessionContext::new(
+            session_id,
+            dir.path().to_path_buf(),
+        ));
+        let output = coordinator
+            .run(
+                AgentTask::new_coordinator_decides(session_id, "Discuss this design"),
+                context,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(provider.turn_count(), 2);
+        assert_eq!(output.final_message, "Answer to the follow-up");
+        assert_eq!(output.tool_call_count, 0);
+        let requests = provider.requests.lock().unwrap();
+        assert!(!requests[0]
+            .messages
+            .iter()
+            .any(|message| message.content == "And what about the tests?"));
+        assert!(requests[1]
+            .messages
+            .iter()
+            .any(|message| message.role == Role::User
+                && message.content == "And what about the tests?"));
+    }
+
     /// D. Follow-up direct answer keeps the obligation intact and dispatches
     /// nothing extra: resuming the Partial checkpoint with a purely
     /// conversational turn still reports Partial, runs zero dispatches, and
@@ -22267,7 +22544,7 @@ mod tests {
         let checkpoint_json = output.checkpoint_json.expect("the Partial run stays resumable");
         // The follow-up is a direct answer: no new declaration, no dispatch.
         let bus2 = EventBus::new(256);
-        let mut coordinator2 = coordinator_with_turns(
+        let (coordinator2, provider2) = coordinator_with_turns_captured(
             bus2,
             Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
                 AgentId::new("coder"),
@@ -22275,15 +22552,22 @@ mod tests {
             )])),
             vec![CoordinatorTurn::Text("noted, thanks".into())],
         );
+        let mut coordinator2 = coordinator2
+            .with_conversation_inbox(Some(crate::conversation::ConversationInbox::default()));
         let second = coordinator2
             .run(
-                AgentTask::new_coordinator_decides(session_id, "continue"),
+                AgentTask::new_coordinator_decides(
+                    session_id,
+                    "Before continuing, explain what remains",
+                ),
                 context_for(session_id),
                 CancellationToken::new(),
                 Some(checkpoint_json),
             )
             .await
             .expect("resume should succeed");
+        assert_eq!(second.final_message, "noted, thanks");
+        assert_eq!(provider2.turn_count(), 1, "a conversational reply is not forced into work");
         assert_eq!(
             second.completion_status,
             concerto_core::types::AgentCompletionStatus::Partial,
@@ -26202,6 +26486,33 @@ mod tests {
             events.push(event.kind.clone());
         }
         (output, events)
+    }
+
+    #[tokio::test]
+    async fn conversation_input_yields_the_graph_before_another_batch_dispatches() {
+        let bus = EventBus::new(256);
+        let inbox = crate::conversation::ConversationInbox::default();
+        inbox.send("Pause and explain before continuing".into()).unwrap();
+        let mut coordinator = coordinator_with_turns(
+            bus.clone(),
+            Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
+                AgentId::new("researcher"),
+                "inspected",
+            )])),
+            vec![],
+        )
+        .with_conversation_inbox(Some(inbox.clone()));
+        let session_id = Ulid::new();
+        let (graph, pending_id) = single_pending_graph(session_id, "researcher");
+        let (output, events) =
+            run_graph_for_test(&mut coordinator, bus, graph, session_id, HashMap::new()).await;
+        assert!(inbox.is_handoff());
+        assert!(inbox.has_pending(), "the shared runner still owns delivery");
+        assert!(!events.iter().any(|event| matches!(event, EventKind::SubTaskStarted { .. })));
+        let checkpoint =
+            checkpoint::GraphCheckpoint::from_json(&output.checkpoint_json.unwrap()).unwrap();
+        let restored = checkpoint::restore_graph(&checkpoint).unwrap();
+        assert_eq!(restored.get(&pending_id).unwrap().status, SubTaskStatus::Pending);
     }
 
     // ------------------------------------------------------------------

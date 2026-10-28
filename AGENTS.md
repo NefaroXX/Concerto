@@ -191,6 +191,10 @@ cargo audit
   and live discovery (`GET /zen/v1/models`) covers the rest.
 
 ## Key entrypoints (start reading here)
+- Interactive application: `crates/orchestrator/src/conversation.rs` — shared
+  controller for TUI and desktop (ADR-84). Put conversation submission,
+  session preparation, follow-up delivery, cancellation and settlement fixes
+  here; frontend adapters own presentation, not separate execution lifecycles.
 - Single-agent loop: `crates/orchestrator/src/agent_loop.rs`
 - Supervised agent-process (ADR-60 S5): `crates/orchestrator/src/gate_proxy.rs` (agent-process facade), `crates/orchestrator/src/supervisor.rs` (Completed semantics, ADR-60 S5)
 - Multi-agent coordinator: `crates/orchestrator/src/coordinator.rs`

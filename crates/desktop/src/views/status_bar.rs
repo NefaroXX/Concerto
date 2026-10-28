@@ -42,7 +42,7 @@ fn dialog_waiting(app: &App) -> bool {
 /// stage) — the chip is absent at idle, while cancelling, and before the first
 /// stage event of a run arrives.
 pub(crate) fn run_stage_chip_label(app: &App) -> Option<String> {
-    if app.run_status != RunStatus::Running {
+    if app.conversation.status != RunStatus::Running {
         return None;
     }
     let stage = app.run_stage?;
@@ -58,7 +58,7 @@ pub fn status_bar_view(app: &App) -> Element<'_, Message> {
     let sp = &app.current_theme.spacing;
     let palette = &app.current_theme.palette;
 
-    let run_section: Element<'_, Message> = match app.run_status {
+    let run_section: Element<'_, Message> = match app.conversation.status {
         RunStatus::Idle => text("Idle").size(ts.caption).into(),
         RunStatus::Running => row![
             text("Running").size(ts.caption),
@@ -168,12 +168,12 @@ mod tests {
     fn run_stage_chip_hidden_when_idle_or_stage_unknown() {
         // Idle: no stage yet.
         let (app, _) = App::new();
-        assert_eq!(app.run_status, RunStatus::Idle);
+        assert_eq!(app.conversation.status, RunStatus::Idle);
         assert_eq!(run_stage_chip_label(&app), None);
 
         // Running but no stage event has landed yet.
         let (mut app, _) = App::new();
-        app.run_status = RunStatus::Running;
+        app.conversation.status = RunStatus::Running;
         assert_eq!(run_stage_chip_label(&app), None);
 
         // A stale stage with the run not running must stay hidden.
@@ -185,7 +185,7 @@ mod tests {
     #[test]
     fn run_stage_chip_shows_stage_label_while_running() {
         let (mut app, _) = App::new();
-        app.run_status = RunStatus::Running;
+        app.conversation.status = RunStatus::Running;
         app.run_stage = Some(RunStage::Execute);
         assert_eq!(run_stage_chip_label(&app), Some("Editing".to_string()));
     }
@@ -193,7 +193,7 @@ mod tests {
     #[test]
     fn run_stage_chip_reports_waiting_when_dialog_pending() {
         let (mut app, _) = App::new();
-        app.run_status = RunStatus::Running;
+        app.conversation.status = RunStatus::Running;
         app.run_stage = Some(RunStage::Inspect);
 
         let (tx, _rx) = tokio::sync::oneshot::channel();
@@ -214,7 +214,7 @@ mod tests {
         let _ = status_bar_view(&app);
 
         let (mut app, _) = App::new();
-        app.run_status = RunStatus::Running;
+        app.conversation.status = RunStatus::Running;
         app.run_stage = Some(RunStage::Verify);
         let _ = status_bar_view(&app);
     }

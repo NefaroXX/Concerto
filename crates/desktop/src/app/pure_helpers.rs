@@ -249,7 +249,7 @@ impl App {
     /// window-close handler cancels it and waits for settlement instead of
     /// exiting over it.
     pub fn is_run_active(&self) -> bool {
-        self.run_status != RunStatus::Idle
+        self.conversation.status != RunStatus::Idle
     }
 
     /// ADR-60 D7 (interrupt-safe resume): the run-settlement epoch — bumped

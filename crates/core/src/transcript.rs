@@ -126,6 +126,9 @@ pub fn transcript_entry_from_event_with_labels(
     labels: &GateLabels,
 ) -> Option<TranscriptEntry> {
     match kind {
+        EventKind::ConversationMessageReceived { content } => {
+            Some(TranscriptEntry::User { content: content.clone() })
+        }
         // ---- Tool lifecycle: one entry per event (correlation is the
         //      recorder's job). ----
         EventKind::ToolExecutionStarted { tool_name, detail, .. } => {

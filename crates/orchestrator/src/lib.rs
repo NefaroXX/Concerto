@@ -24,6 +24,7 @@ pub mod consolidation;
 mod consultation;
 mod context_compaction;
 pub mod context_engine;
+pub mod conversation;
 pub mod coordinator;
 pub mod cost;
 pub mod cycle;

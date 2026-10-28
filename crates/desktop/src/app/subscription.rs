@@ -92,7 +92,7 @@ impl App {
         };
         // Only ticks while an agent run is actually in flight, so the
         // ambient background costs nothing the rest of the time.
-        let circuit_sub = if self.run_status == RunStatus::Running {
+        let circuit_sub = if self.conversation.status == RunStatus::Running {
             iced::time::every(std::time::Duration::from_millis(circuit_background::TICK_MS))
                 .map(|_| Message::CircuitTick)
         } else {
@@ -132,12 +132,13 @@ impl App {
         // progress (`run_status == Running`), so the composing indicator keeps
         // animating even when the busy work has no reveal/entrance state of its
         // own (e.g. a coordinator thinking phase before any subagent dispatch).
-        let typing_sub = if self.chat.is_revealing() || self.run_status == RunStatus::Running {
-            iced::time::every(std::time::Duration::from_millis(circuit_background::TICK_MS))
-                .map(|_| Message::Chat(views::chat::Message::TypingTick))
-        } else {
-            Subscription::none()
-        };
+        let typing_sub =
+            if self.chat.is_revealing() || self.conversation.status == RunStatus::Running {
+                iced::time::every(std::time::Duration::from_millis(circuit_background::TICK_MS))
+                    .map(|_| Message::Chat(views::chat::Message::TypingTick))
+            } else {
+                Subscription::none()
+            };
         // Ticks every second while any toast is showing so stale toasts
         // auto-dismiss after `TOAST_LIFETIME_SECS`. Inactive when idle.
         let toast_sub = if self.toasts.has_toasts() {

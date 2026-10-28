@@ -8,7 +8,7 @@
 //! * [`App::update_chat_pre_routing`] — the `Chat` arm's pre-routing: the
 //!   clipboard write, the `Navigate*` / `SetActiveModel` / `SelectSession` /
 //!   `RefreshSpendLog` re-dispatches, the `NewSession` reset, the input-focus
-//!   tracking, and the `SubmitInput` / `ToggleMultiAgent` / `ToggleFastMode` /
+//!   tracking, and the `SubmitInput` / `ToggleFastMode` /
 //!   `ToggleMuteAgent` pre-work. Every branch the pre-routing does not
 //!   intercept still falls through to the S39 pure-delegation tail
 //!   ([`App::update_chat_tail`]) unchanged.
@@ -86,6 +86,12 @@ impl App {
                 // Intercept New Session — flush the outgoing session, reset chat
                 // + agent graph, and create a fresh session.
                 if matches!(&msg, views::chat::Message::NewSession) {
+                    if self.conversation.is_running() {
+                        self.chat.add_error(
+                            "Stop the current work before starting a new conversation.".into(),
+                        );
+                        return iced::Task::none();
+                    }
                     // Persist the current session's agent graph before clearing.
                     self.persist_active_agent_graph();
                     self.chat = views::chat::State::new();
@@ -96,68 +102,35 @@ impl App {
                     self.seed_muted_agents();
                     self.agent_graph = views::agent_graph::State::new();
                     self.tool_log = views::tool_log::State::new();
-                    self.active_session_id = None;
-                    self.resume_checkpoint_json = None;
+                    self.conversation.select_session(None);
                     self.reset_spend_state();
                     return iced::Task::none();
                 }
 
-                match &msg {
-                    views::chat::Message::InputChanged(_) => {
-                        TEXT_FOCUSED.store(true, Ordering::Relaxed);
-                        self.text_focused = true;
-                    }
-                    views::chat::Message::SubmitInput => {
-                        TEXT_FOCUSED.store(false, Ordering::Relaxed);
-                        self.text_focused = false;
-                    }
-                    _ => {}
+                if matches!(
+                    &msg,
+                    views::chat::Message::InputChanged(_) | views::chat::Message::InputAction(_)
+                ) {
+                    TEXT_FOCUSED.store(true, Ordering::Relaxed);
+                    self.text_focused = true;
                 }
 
                 if matches!(&msg, views::chat::Message::SubmitInput) {
-                    if self.run_status != RunStatus::Idle {
-                        return iced::Task::none();
-                    }
                     let user_input = self.chat.input().to_string();
                     // `/thinking` is a local accordion toggle for the current
                     // movement (collapse-all / expand-all) — never dispatched.
                     if user_input.trim() == "/thinking" {
+                        TEXT_FOCUSED.store(false, Ordering::Relaxed);
+                        self.text_focused = false;
                         self.chat.toggle_thinking_all();
                         return self
                             .chat
                             .update(views::chat::Message::InputChanged(String::new()))
                             .map(Message::Chat);
                     }
-                    let chat_task =
-                        self.chat.update(views::chat::Message::SubmitInput).map(Message::Chat);
-                    let agent_task = self.submit_to_agent(user_input);
-                    iced::Task::batch(vec![chat_task, agent_task])
-                } else if matches!(&msg, views::chat::Message::ToggleMultiAgent) {
-                    self.multi_agent = !self.multi_agent;
-                    let mut config = self.global_config.clone();
-                    config.multi_agent.get_or_insert_with(Default::default).default_enabled =
-                        self.multi_agent;
-                    match concerto_config::default_config_path() {
-                        Some(path) => {
-                            if let Err(error) = concerto_config::save_config(&config, &path) {
-                                tracing::error!(%error, "failed to persist multi-agent preference");
-                            } else {
-                                // Reload + re-derive through the shared helper:
-                                // if a project file overrides `default_enabled`,
-                                // the merged result is the truth (ADR-57 §6).
-                                self.reconcile_config_from_reload();
-                            }
-                        }
-                        None => {
-                            self.global_config = config.clone();
-                            self.config = Some(config);
-                        }
-                    }
-                    iced::Task::none()
+                    self.submit_to_agent(user_input)
                 } else if matches!(&msg, views::chat::Message::ToggleFastMode) {
-                    // Runtime-only toggle, mirroring CLI `-f/--fast`: unlike the
-                    // multi-agent toggle it is deliberately NOT persisted to
-                    // config — fast mode is a per-session choice.
+                    // Runtime-only toggle, mirroring CLI `-f/--fast`.
                     self.fast = !self.fast;
                     iced::Task::none()
                 } else if matches!(&msg, views::chat::Message::ToggleMuteAgent(_)) {

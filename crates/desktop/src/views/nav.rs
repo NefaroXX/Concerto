@@ -45,8 +45,8 @@ fn session_row<'a>(
 ) -> Element<'a, Message> {
     let sp = &app.current_theme.spacing;
     let palette = &app.current_theme.palette;
-    let is_active =
-        concerto_core::ids::Ulid::from_string(&session.session_id).ok() == app.active_session_id;
+    let is_active = concerto_core::ids::Ulid::from_string(&session.session_id).ok()
+        == app.conversation.session_id;
 
     let id = text(short_session_id(&session.session_id))
         .size(11)

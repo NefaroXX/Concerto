@@ -704,7 +704,10 @@ pub struct MemorySystemHandles {
 }
 
 /// Bundles services that are reused across calls.
+#[derive(Clone)]
 pub struct SharedServices {
+    /// Incoming conversation messages for the root agent, shared by renderers.
+    pub conversation_inbox: Option<crate::conversation::ConversationInbox>,
     pub bus: EventBus,
     pub config: AppConfig,
     /// Project-scoped memory services (store, indexer, sync, cancel).
@@ -1297,7 +1300,10 @@ async fn execute_agent_loop(
     } else {
         concerto_core::types::SYSTEM_PROMPT_CHAT
     };
-    let prompt_text = base_prompt.to_string();
+    let mut prompt_text = base_prompt.to_string();
+    if services.conversation_inbox.is_some() {
+        prompt_text.push_str(crate::conversation::CONVERSATION_GUIDANCE);
+    }
     let prompt_builder = PromptBuilder::with_skills(prompt_text, Some(services.skills.clone()))
         // Native execution uses explicit argv, independently of compatibility profiles.
         .with_native_shell()
@@ -1343,6 +1349,7 @@ async fn execute_agent_loop(
     .with_usage_model(model)
     .with_advertised_tool_support(advertised_tool_support)
     .with_initial_messages(req.conversation_history)
+    .with_conversation_inbox(services.conversation_inbox.clone())
     .with_session_store(session_store)
     // ADR-82 slice 4: opt-in, default-off completion-honesty gate, wired from
     // `[agent] strict_verification_gate` (config-driven v1, next-run
@@ -2471,7 +2478,8 @@ pub async fn run_shared_agent(
                         && checkpoint
                             .validate_scope(session_id, &resume_scope_project_id(&req.project_dir))
                             .is_ok()
-                        && (is_resume_request(&req.input)
+                        && (services.conversation_inbox.is_some()
+                            || is_resume_request(&req.input)
                             || checkpoint.pending_user_input.is_some())
                     {
                         req.force_single_agent = false;
@@ -2535,7 +2543,10 @@ pub async fn run_shared_agent(
                 // rejected cleanly (C-05).
                 match crate::checkpoint::GraphCheckpoint::from_json(checkpoint_json) {
                     Ok(mut checkpoint)
-                        if resume_requested || checkpoint.pending_user_input.is_some() =>
+                        if !checkpoint.completed
+                            && (services.conversation_inbox.is_some()
+                                || resume_requested
+                                || checkpoint.pending_user_input.is_some()) =>
                     {
                         // Explicit "continue" / "resume" — validate scope
                         // before trusting the checkpoint (Finding 2 / #65).
@@ -2669,12 +2680,14 @@ pub async fn run_shared_agent(
     //   coordinator may answer directly or delegate. This is the default for
     //   ordinary conversation and informational requests; no word router
     //   classifies them (ADR-71: the coordinator is the sole decision-maker).
-    let execution_mode =
-        if apply_plan || req.resume_checkpoint_json.is_some() || req.force_single_agent {
-            TaskExecutionMode::ACTION_REQUIRED
-        } else {
-            TaskExecutionMode::CoordinatorDecides
-        };
+    let execution_mode = if apply_plan
+        || (req.resume_checkpoint_json.is_some() && services.conversation_inbox.is_none())
+        || req.force_single_agent
+    {
+        TaskExecutionMode::ACTION_REQUIRED
+    } else {
+        TaskExecutionMode::CoordinatorDecides
+    };
     // Capability (not requirement): true for ActionRequired and
     // CoordinatorDecides, false only for AnswerOnly. Mutation boundaries remain
     // enforced by deny-class policy rules and the approval sink.
@@ -3258,6 +3271,10 @@ async fn run_multi_agent(
     // (no session-DB pool, missing child binary, empty roster) degrades loudly
     // to the coordinator below rather than failing the run.
     if action_capable
+        // Interactive conversations use the in-process coordinator, whose
+        // inbox can accept follow-ups. The one-shot supervised protocol has
+        // no operator message channel.
+        && services.conversation_inbox.is_none()
         && req.resume_checkpoint_json.is_none()
         && !services.config.strict_verification_gate()
         && services.config.multi_agent.as_ref().is_some_and(|multi| multi.supervisor_enabled)
@@ -3489,6 +3506,10 @@ async fn run_multi_agent(
         session_store.clone(),
         current_source_revision(&req.project_dir).await,
     );
+    coordinator = coordinator.with_conversation_inbox(services.conversation_inbox.clone());
+    if services.conversation_inbox.is_some() && approved_plan.is_none() {
+        coordinator = coordinator.with_conversation_history(req.conversation_history.clone());
+    }
     // ADR-65 §7: the checkpoint row's own updated_at backs the additive v4
     // backfill for pre-§7 (v3) checkpoints (fail-soft when absent).
     coordinator = coordinator.with_resume_cursor_hint_ms(resume_cursor_hint_ms);
@@ -3613,6 +3634,7 @@ async fn run_multi_agent(
     // non-approved runs keep the exact pre-D7 history injection.
     let multi_task = match approved_plan {
         Some(_) => task.clone(),
+        None if services.conversation_inbox.is_some() => task.clone(),
         None => multi_agent_task_with_history(task.clone(), &req.conversation_history),
     };
     let mut context = AgentContext::new(SessionContext::new(session_id, project_dir.clone()));
@@ -3865,6 +3887,17 @@ async fn run_multi_agent(
         }
         tracing::debug!(%session_id, %plan_objective_hash, %plan_id, "stored plan binding for objective");
     }
+    let reply_only = services.conversation_inbox.as_ref().is_some_and(|inbox| {
+        inbox.is_reply_only()
+            || (output.tool_call_count == 0
+                && output.checkpoint_json.is_none()
+                && output.files_modified.is_empty())
+    });
+    if reply_only {
+        if let Some(inbox) = &services.conversation_inbox {
+            inbox.mark_reply_only();
+        }
+    }
     output.project_root =
         Some(camino::Utf8PathBuf::from_path_buf(project_dir.clone()).unwrap_or_default());
     persist_provider_metrics(
@@ -3886,14 +3919,16 @@ async fn run_multi_agent(
         req.cancel_token.clone(),
     )
     .await;
-    if let Some(store) = &session_store {
+    let conversation_handoff =
+        services.conversation_inbox.as_ref().is_some_and(|inbox| inbox.is_handoff());
+    if let Some(store) = session_store.as_ref().filter(|_| !conversation_handoff) {
         // ADR-48 §4: the assistant row records the same settled usage the
         // `provider_metrics` and spend writes above record for this run. The
         // run-start user row predates any provider call and stays `None`.
         let (tokens_in, tokens_out) = message_row_usage(&output.provider_metrics);
         let assistant_message = Message {
             role: concerto_core::types::Role::Assistant,
-            content: output.summary(),
+            content: if reply_only { output.final_message.clone() } else { output.summary() },
             tool_calls: None,
             tool_results: None,
             reasoning_content: None,
@@ -3910,18 +3945,18 @@ async fn run_multi_agent(
             }
         }
     }
-    // Final transcript entries (ADR-36 §4): assistant text + completion marker.
-    transcript_recorder
-        .append_entries(&[
-            TranscriptEntry::Assistant { content: output.final_message.clone() },
-            TranscriptEntry::Completion {
-                multi_agent: true,
-                completed: output.completion_status == AgentCompletionStatus::Completed,
-                files: output.files_modified.iter().map(ToString::to_string).collect(),
-                project_root: output.project_root.as_ref().map(ToString::to_string),
-            },
-        ])
-        .await;
+    let mut transcript = vec![TranscriptEntry::Assistant { content: output.final_message.clone() }];
+    if !reply_only {
+        transcript.push(TranscriptEntry::Completion {
+            multi_agent: true,
+            completed: output.completion_status == AgentCompletionStatus::Completed,
+            files: output.files_modified.iter().map(ToString::to_string).collect(),
+            project_root: output.project_root.as_ref().map(ToString::to_string),
+        });
+    }
+    if conversation_handoff {
+        transcript.clear();
+    }
     maintain_context_after_run(
         session_store.as_ref(),
         session_id,
@@ -3930,7 +3965,7 @@ async fn run_multi_agent(
         Some(&services.bus),
     )
     .await;
-    transcript_recorder.stop().await;
+    transcript_recorder.finish(&transcript).await;
     event_recorder.stop().await;
     Ok(output)
 }

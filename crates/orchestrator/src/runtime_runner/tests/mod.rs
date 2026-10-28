@@ -623,6 +623,35 @@ async fn transcript_recorder_records_user_and_final_entries() {
 }
 
 #[tokio::test]
+async fn transcript_finish_drains_conversation_events_before_the_final_answer() {
+    let (recorder_store, store, session_id, bus) = transcript_store();
+    let recorder = start_transcript_recorder(&bus, store, session_id, GateLabels::default());
+    recorder.record_user_message("implement it".into()).await;
+    let task_id = concerto_core::types::TaskId::new();
+    let _ = bus.publish_for_session(
+        session_id,
+        task_id.0,
+        EventKind::ConversationMessageReceived { content: "How is it going?".into() },
+    );
+    let _ = bus.publish_for_session(
+        session_id,
+        task_id.0,
+        EventKind::AssistantMessage { task_id, content: "Checking tests; continuing work.".into() },
+    );
+    // No sleep/yield: finalization must drain queued events itself.
+    recorder.finish(&[TranscriptEntry::Assistant { content: "Done".into() }]).await;
+    assert_eq!(
+        recorder_store.recorded_transcript(),
+        vec![
+            TranscriptEntry::User { content: "implement it".into() },
+            TranscriptEntry::User { content: "How is it going?".into() },
+            TranscriptEntry::Assistant { content: "Checking tests; continuing work.".into() },
+            TranscriptEntry::Assistant { content: "Done".into() },
+        ]
+    );
+}
+
+#[tokio::test]
 async fn transcript_recorder_flushes_batches_in_order() {
     // More than the batch threshold of transcript-relevant events: the
     // recorder flushes an in-order mid-run batch and the stop flush must

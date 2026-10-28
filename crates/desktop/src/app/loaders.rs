@@ -526,7 +526,11 @@ impl App {
     /// Resume a previously picked session: make it active for the project and
     /// load its history (and durable typed transcript) so the chat shows the
     /// resumed conversation.
-    pub(super) fn select_session(&self, session_id: String) -> iced::Task<Message> {
+    pub(super) fn select_session(&mut self, session_id: String) -> iced::Task<Message> {
+        if self.conversation.is_running() {
+            self.chat.add_error("Stop the current work before switching conversations.".into());
+            return iced::Task::none();
+        }
         let session_manager = self.session_manager.clone();
         let app_config = self.config.clone().unwrap_or_default();
         let project_dir = self.project_dir.clone();
@@ -572,7 +576,7 @@ impl App {
     /// failure (or missing session) yields an empty list rather than breaking
     /// the UI.
     pub(super) fn load_spend_log(&self) -> iced::Task<Message> {
-        let Some(session_id) = self.active_session_id else {
+        let Some(session_id) = self.conversation.session_id else {
             return iced::Task::none();
         };
         let session_manager = self.session_manager.clone();
@@ -619,7 +623,7 @@ impl App {
     /// cancellation token (the reader still honors it at the seam) — the
     /// run's own token must not permanently disable the panel after a cancel.
     pub(super) fn load_studio_runtime(&self) -> iced::Task<Message> {
-        let session_id = self.active_session_id;
+        let session_id = self.conversation.session_id;
         let session_manager = self.session_manager.clone();
         let app_config = self.config.clone().unwrap_or_default();
         iced::Task::perform(
