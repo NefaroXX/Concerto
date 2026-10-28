@@ -664,6 +664,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Updated the plugin runtime to Wasmtime 36.0.19 LTS for the Cranelift fixes
+  in RUSTSEC-2026-0379/0380, and retired all eight Wasmtime audit exceptions.
+  Memory64 remains disabled; tests enforce the 64 MiB allocation/growth limit.
+  Updated Tokio, ctutils, rustls-webpki and WebPKI roots to patched releases,
+  and replaced the yanked clipboard-win release in the lockfile.
 - Shell `allow_all` mode can no longer bypass the denylist, and its construction no
   longer relies on `expect()` (removed a startup panic path)
 - Plugin capability grant lifecycle (ADR-37): 30-day TTL prevents indefinite

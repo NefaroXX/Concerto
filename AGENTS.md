@@ -95,8 +95,7 @@ cargo audit
 ## Gotchas — do NOT "fix" these without review
 - **cargo-deny exceptions are intentional**: many `RUSTSEC-*` advisories are
   ignored for unmaintained *transitive* deps, and `wasmtime` is pinned to
-  the **24.0.x** line (v43+ needs a `func_wrap` API migration). Read
-  `deny.toml`
+  the **36.0.x LTS** line (minimum 36.0.19). Read `deny.toml`
   justification/scope before changing anything. The two supply-chain gates are
   complementary: `cargo-deny` resolves features and cannot see
   optional/unactivated lockfile deps (e.g. `quinn-proto` via an unenabled
@@ -105,7 +104,7 @@ cargo audit
   `deny.toml`).
 - **Dependencies**: historical phase comments are not authorization to retain
   unused crates. Add a dependency only for a current, tested need. Wasmtime is
-  pinned to the patched 24.0.x line for the current RustSec advisory; do not
+  pinned to the patched 36.0.x LTS line for the current RustSec advisories; do not
   move it to an unpatched release without checking the advisory and API
   (`crates/plugins/src/host.rs` pins `config.wasm_memory64(false)` — keep
   `winch` off on any bump, see deny.toml).

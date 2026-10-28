@@ -38,17 +38,6 @@ ignore = [
     "RUSTSEC-2024-0436",
     # bincode — unmaintained, transitive dep
     "RUSTSEC-2025-0141",
-    # wasmtime 24.0.13 — pinned for the plugin sandbox. See the deny.toml
-    # wasmtime block for the full config/version neutralization rationale
-    # (memory64 off via host.rs tripwire, no pooling, below vulnerable floors).
-    "RUSTSEC-2026-0086",
-    "RUSTSEC-2026-0088",
-    "RUSTSEC-2026-0089",
-    "RUSTSEC-2026-0094",
-    "RUSTSEC-2026-0095",
-    "RUSTSEC-2026-0096",
-    "RUSTSEC-2026-0316",
-    "RUSTSEC-2026-0363",
     # quick-xml — constrained by upstream, DoS requires crafted XML and this
     # workspace performs no runtime XML parsing; see deny.toml
     "RUSTSEC-2026-0194",

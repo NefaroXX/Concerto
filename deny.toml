@@ -19,66 +19,7 @@ ignore = [
     "RUSTSEC-2024-0384",  # instant — unmaintained, transitive dep via iced
     "RUSTSEC-2024-0436",  # paste — unmaintained, transitive dep
     "RUSTSEC-2025-0141",  # bincode — unmaintained, transitive dep
-    # === wasmtime 24.0.13 exceptions ===
-    # Reason: wasmtime pinned to the 24.0.x line (resolved: 24.0.13) for the plugin
-    # sandbox. The patched lines (>= 36.0.7 / >= 42.0.2 / >= 43.0.1) require
-    # significant API migration (func_wrap signature changed in v32+). The plugin
-    # sandbox is opt-in (plugins disabled by default), and plugins run with limited
-    # host capabilities.
-    # IMPORTANT (2026-09-05, security review): 0095/0096 are HOST-LEVEL sandbox
-    # escapes, not guest-side DoS. They are neutralized in THIS build by configuration
-    # and version, not by severity: Cranelift-only build (no `winch` feature), on-demand
-    # allocator (no pooling feature), memory64 disabled explicitly
-    # (crates/plugins/src/host.rs config.wasm_memory64(false) — load-bearing upgrade
-    # tripwire), and 24.0.13 sits below the upstream vulnerable floors
-    # (25.0.0 / 28.0.0 / 32.0.0). Any future bump must keep `winch` OFF and memory64
-    # FALSE, and re-review 0096 for the shipped aarch64-apple-darwin target.
-    # SCOPE RULE (2026-10-14): this list carries only advisories that actually match
-    # wasmtime 24.0.13 in the current graph. Twelve entries whose vulnerable ranges
-    # start ABOVE 24.0.13 (and one unmaintained-transitive entry, RUSTSEC-2025-0119
-    # number_prefix, no longer matched by any crate) were removed rather than left
-    # as dead suppressions. That is deliberate: a list that silently no longer fires
-    # would wave through a future bump into a vulnerable range. With them gone, any
-    # wasmtime upgrade that lands inside one of those ranges fails `cargo deny check`
-    # and must be re-justified here.
-    # Scope: concerto-plugins crate only (crates/plugins/)
-    # Review date: 2026-10-01 — reassess wasmtime upgrade feasibility.
-    # Upstream: https://github.com/bytecodealliance/wasmtime/security/advisories
-    "RUSTSEC-2026-0086",  # wasmtime host data leakage Winch — requires Winch backend
-    "RUSTSEC-2026-0088",  # wasmtime pooling allocator leakage — data isolation issue
-    "RUSTSEC-2026-0089",  # wasmtime table.fill panic Winch — requires Winch backend
-    "RUSTSEC-2026-0094",  # wasmtime table.grow mask Winch — requires Winch backend
-    "RUSTSEC-2026-0095",  # wasmtime Winch sandbox escape — requires Winch backend
-    "RUSTSEC-2026-0096",  # wasmtime aarch64 Cranelift miscompile — HOST sandbox escape;
-                          # neutralized: 24.0.13 < 32.0.0 floor + memory64 off (tripwire)
-                          # + Cranelift/spectre defaults; aarch64-apple-darwin is shipped
-    "RUSTSEC-2026-0316",  # wasmtime dynamic record lifting can allocate beyond the hostcall
-                          # fuel limit (GHSA-jqpg-j7w6-42pr). NOT REACHABLE: record lifting
-                          # is a COMPONENT-MODEL API (wasmtime::component); the plugin host
-                          # uses core modules only — Config, Store, Module::new, Instance,
-                          # Linker::new, func_wrap_async over linear memory. No Component,
-                          # component linker, or Val is ever constructed, so no hostcall
-                          # record lifting occurs and the fuel limit cannot be bypassed.
-                          # Scope: concerto-plugins crate only (crates/plugins/).
-                          # Fixed upstream in >= 36.0.16 / >= 48.0.3 / >= 49.0.1, all of
-                          # which require the func_wrap API migration noted above; revisit
-                          # if/when wasmtime leaves the 24.0.x line.
-    "RUSTSEC-2026-0363",  # wasmtime component-model handle tables capped only per
-                          # instance, charged to no limit (GHSA-q554-3cjc-rx7p). NOT
-                          # REACHABLE: handle tables are a COMPONENT-MODEL structure;
-                          # the plugin host uses core modules only — Config, Store,
-                          # Module::new, Instance, Linker::new, func_wrap_async over
-                          # linear memory (crates/plugins/src/host.rs, loader.rs,
-                          # active_plugin.rs, host_fns.rs, installer.rs import only
-                          # Engine/Store/Module/Instance/Linker/Caller/ExternType).
-                          # No Component, component::Linker, bindgen!, or Val is ever
-                          # constructed, so no component instance exists to hold a
-                          # handle table.
-                          # Scope: concerto-plugins crate only (crates/plugins/).
-                          # Fixed upstream in wasmtime PR #14732, which requires the
-                          # func_wrap API migration noted above; revisit if/when
-                          # wasmtime leaves the 24.0.x line.
-                          # Added 2026-10-14; tracked for retirement in issue #340.
+    # Wasmtime exceptions retired: the 36.0.19 LTS upgrade includes the fixes.
     # === quick-xml exceptions ===
     # Reason: quick-xml v0.38.4/v0.39.4 constrained by plist (syntect via iced) and
     # wayland-scanner. These are XML parsing DoS vectors that require crafted XML input.

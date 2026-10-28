@@ -57,8 +57,9 @@ impl PluginHost {
         // must go through the wasmtime async API (func_wrap_async /
         // call_async / instantiate_async).
         config.async_support(true);
-        // Limit the static linear-memory reservation per instance.
-        config.static_memory_maximum_size(Self::DEFAULT_MAX_MEMORY as u64);
+        // Reserve address space up to the per-instance budget. The store limiter
+        // below enforces the actual allocation and growth limit.
+        config.memory_reservation(Self::DEFAULT_MAX_MEMORY as u64);
 
         let engine = Engine::new(&config)?;
         Ok(Self { engine })
@@ -169,6 +170,50 @@ pub struct ScratchBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory64_modules_are_rejected() -> anyhow::Result<()> {
+        let host = PluginHost::new()?;
+        let wasm = wat::parse_str("(module (memory i64 1))")?;
+        assert!(wasmtime::Module::new(host.engine(), &wasm).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn store_limits_reject_growth_beyond_budget() -> anyhow::Result<()> {
+        let host = PluginHost::new()?;
+        // No guest maximum: only the host's limiter can reject this growth.
+        let wasm = wat::parse_str(
+            r#"(module
+                (memory (export "memory") 1)
+                (func (export "grow") (param i32) (result i32)
+                    local.get 0
+                    memory.grow))"#,
+        )?;
+        let module = wasmtime::Module::new(host.engine(), &wasm)?;
+        let mut store = host.create_store();
+        let instance = wasmtime::Instance::new_async(&mut store, &module, &[]).await?;
+        let grow = instance.get_typed_func::<i32, i32>(&mut store, "grow")?;
+        let pages = i32::try_from(PluginHost::DEFAULT_MAX_MEMORY / 65536)?;
+        assert_eq!(grow.call_async(&mut store, pages - 1).await?, 1);
+        assert_eq!(grow.call_async(&mut store, 1).await?, -1);
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .ok_or_else(|| anyhow::anyhow!("test module must export memory"))?;
+        assert_eq!(memory.data_size(&store), PluginHost::DEFAULT_MAX_MEMORY);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn store_limits_reject_oversized_initial_memory() -> anyhow::Result<()> {
+        let host = PluginHost::new()?;
+        let pages = PluginHost::DEFAULT_MAX_MEMORY / 65536 + 1;
+        let wasm = wat::parse_str(format!("(module (memory {pages}))"))?;
+        let module = wasmtime::Module::new(host.engine(), &wasm)?;
+        let mut store = host.create_store();
+        assert!(wasmtime::Instance::new_async(&mut store, &module, &[]).await.is_err());
+        Ok(())
+    }
 
     #[test]
     fn epoch_deadline_gives_wall_clock_budget() {
