@@ -7,12 +7,15 @@ pub mod approval;
 mod dispatch;
 pub mod extensions;
 pub mod health;
+mod management;
+mod memory_explorer;
 pub mod plugin_approval;
 pub mod settings;
 mod shell;
 pub mod theme;
 pub mod ui;
 pub mod update;
+mod workspace_browser;
 
 use concerto_core::CancellationToken;
 use concerto_sessions::{AuditLogFilter, AuditLogRow};
@@ -44,6 +47,7 @@ pub fn has_cli_subcommand(args: &[String]) -> bool {
                         | "health"
                         | "harness"
                         | "memory"
+                        | "workspace"
                         | "audit"
                         | "logs"
                         | "agents"
@@ -75,7 +79,9 @@ pub const CLI_COMMAND_HELP: &str =
     run commands and container project mounts are not covered.
     projects <list|current|use>
     sessions <list|show|events|cache|runtime|resume|prune>
-    memory <graph|explain>   health [--json]   audit   logs <path|show>
+    memory <list|search|show|delete|reindex|graph|explain>
+    workspace <list|read|context|search|write|delete|diagnostics|hover|definition|completion|references|help>
+    health [--json]   audit   logs <path|show>
     harness <environment|verify|checkpoint|memory> [--json]
 
     run [PROMPT] [OPTIONS]   Run one agent task headlessly and exit with a
@@ -191,6 +197,7 @@ fn run_cli_inner(
                 return dispatch::harness::run_harness_subcommand(&remaining[1..], &project_root)
             }
             "memory" => return run_memory_subcommand(&remaining[1..], &project_root),
+            "workspace" => return dispatch::workspace::run(&remaining[1..], &project_root),
             "audit" => return run_audit_subcommand(&remaining[1..]),
             "agents" => return settings::run_agents(&remaining[1..], &project_root),
             "blueprint" => return settings::run_blueprint(&remaining[1..], &project_root),
@@ -216,7 +223,7 @@ fn run_cli_inner(
             other => {
                 eprintln!("error: unknown subcommand '{other}'");
                 eprintln!(
-                    "available subcommands: config, providers, sessions, projects, plugin, extensions, health, memory, audit, logs, agents, blueprint, credentials, shell, preferences, run"
+                    "available subcommands: config, providers, sessions, projects, plugin, extensions, health, harness, memory, workspace, audit, logs, agents, blueprint, credentials, shell, preferences, run"
                 );
                 std::process::exit(1);
             }
@@ -1554,7 +1561,7 @@ pub fn startup_arguments(args: &[String]) -> &[String] {
     while index < args.len() {
         match args[index].as_str() {
             "--project" | "-p" | "--theme" => index += 2,
-            "shell" | "sessions" | "run" => return &args[..index],
+            "shell" | "sessions" | "workspace" | "run" => return &args[..index],
             value if value.starts_with('-') => index += 1,
             _ => break,
         }
@@ -1588,7 +1595,7 @@ fn invocation_args(args: &[String]) -> anyhow::Result<(Vec<String>, Option<PathB
         match args[index].as_str() {
             // Native program operands may contain -p/--project and startup
             // flags. Only parse Concerto flags before the shell subcommand.
-            "shell" if remaining.is_empty() => {
+            "shell" | "workspace" if remaining.is_empty() => {
                 remaining.extend_from_slice(&args[index..]);
                 break;
             }
@@ -1680,6 +1687,23 @@ pub fn parse_cli_args<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_and_headless_commands_keep_their_own_operands() {
+        for command in ["workspace", "run"] {
+            let args = vec!["--project".into(), "run".into(), command.into(), "--help".into()];
+            assert!(has_cli_subcommand(&args));
+            assert_eq!(startup_arguments(&args), &args[..2]);
+        }
+        let args = vec![
+            "workspace".into(),
+            "search".into(),
+            "--".into(),
+            "--fast".into(),
+            "--project".into(),
+        ];
+        assert_eq!(invocation_args(&args).unwrap(), (args, None));
+    }
 
     #[test]
     fn command_routing_skips_startup_values_and_recognizes_new_management_commands() {

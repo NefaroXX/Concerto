@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Integrated terminal inspection and editing.** Runtime topology and full
+  evidence records, project-scoped memory exploration, structured settings,
+  workspace file/context commands and Rust language queries now accompany the
+  shared desktop/TUI conversation flow. File context can be sent during work;
+  cancellation from management screens uses the same conversation controller.
 - **One conversation flow for desktop and TUI.** Both interfaces now use the
   same controller for session setup, submission, follow-ups, cancellation and
   checkpoint recovery. The coordinator moves between discussion and work

@@ -62,5 +62,8 @@ to shared behavior must not grow a second frontend implementation.
 Tests cover follow-ups during provider calls, continued work after a visible
 reply, typed history, questions over unfinished obligations, queue bounds,
 cancellation recovery, late completions, transcript ordering and both composer
-adapters. The remaining settings, inspection and editor parity work described
-in ADR-80 is separate from this conversation ownership boundary.
+adapters. The settings, inspection and editor work from PRs #357, #365 and
+#367 is integrated with this controller in #378. Opening those screens does
+not create a separate run lifecycle: cancellation reads the shared controller,
+and file context joins the current draft before an explicit send (including
+while work is active).
