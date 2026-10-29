@@ -25,14 +25,14 @@ impl App {
                 // the active session, and session switches reset this state.
                 match &evt {
                     crate::runtime::DesktopEvent::ResumeRequested { session_id }
-                        if self.run_status == RunStatus::Running
-                            && self.active_session_id == Some(*session_id) =>
+                        if self.conversation.status == RunStatus::Running
+                            && self.conversation.session_id == Some(*session_id) =>
                     {
                         self.pending_task_view_reset = false;
                     }
                     crate::runtime::DesktopEvent::SubTaskCreated { .. }
                     | crate::runtime::DesktopEvent::SubTaskStarted { .. }
-                        if self.run_status == RunStatus::Running =>
+                        if self.conversation.status == RunStatus::Running =>
                     {
                         self.reset_pending_task_views();
                     }
@@ -60,7 +60,7 @@ impl App {
                             CapUiState::Exceeded { current_usd: *current_usd, cap_usd: *cap_usd };
                     }
                     crate::runtime::DesktopEvent::RunStageChanged { stage }
-                        if self.run_status == RunStatus::Running =>
+                        if self.conversation.status == RunStatus::Running =>
                     {
                         // The run-stage chip tracks the active run only. A
                         // stage event outside a run (e.g. a stale bus replay

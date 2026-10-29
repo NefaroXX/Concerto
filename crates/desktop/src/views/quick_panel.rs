@@ -221,8 +221,9 @@ fn coordinator_card<'a>(
     let role_color_val = role_color(app, role);
     // The coordinator is active while the run is in flight and no specialist
     // currently owns the work; an absent row never runs, so it stays idle.
-    let running =
-        coord.is_some() && app.run_status == RunStatus::Running && !app.chat.has_running_subagent();
+    let running = coord.is_some()
+        && app.conversation.status == RunStatus::Running
+        && !app.chat.has_running_subagent();
     let picker = tooltip(
         agent_model_picker(
             app,
@@ -266,7 +267,7 @@ pub fn quick_panel_view(app: &App) -> Element<'_, Message> {
     let ts = &theme.type_scale;
     let sp = &theme.spacing;
 
-    let (run_label, run_color) = match app.run_status {
+    let (run_label, run_color) = match app.conversation.status {
         RunStatus::Idle => ("Idle", palette.text_muted),
         RunStatus::Running => ("Running", palette.success),
         RunStatus::Cancelling => ("Cancelling", palette.warning),
@@ -289,13 +290,6 @@ pub fn quick_panel_view(app: &App) -> Element<'_, Message> {
             .size(11)
             .shaping(iced::widget::text::Shaping::Advanced)
             .style(move |_| crate::theme::sidebar_header_style(palette)),
-        row![
-            text("Multi-agent").size(ts.body).width(Length::Fill),
-            toggler(app.multi_agent)
-                .on_toggle(|_| Message::Chat(crate::views::chat::Message::ToggleMultiAgent))
-                .size(18),
-        ]
-        .align_y(Alignment::Center),
         row![
             text("Fast mode").size(ts.body).width(Length::Fill),
             toggler(app.fast)

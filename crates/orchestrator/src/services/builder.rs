@@ -103,6 +103,7 @@ impl ServicesBuilder {
             self.bus.clone(),
         ));
         SharedServices {
+            conversation_inbox: None,
             bus: self.bus,
             config: self.config,
             memory: self.memory,

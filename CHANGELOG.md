@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Integrated terminal inspection and editing.** Runtime topology and full
+  evidence records, project-scoped memory exploration, structured settings,
+  workspace file/context commands and Rust language queries now accompany the
+  shared desktop/TUI conversation flow. File context can be sent during work;
+  cancellation from management screens uses the same conversation controller.
+- **One conversation flow for desktop and TUI.** Both interfaces now use the
+  same controller for session setup, submission, follow-ups, cancellation and
+  checkpoint recovery. The coordinator moves between discussion and work
+  without a single/multi-agent switch. Messages sent during work are read at
+  the next decision boundary; status replies can accompany continued work.
+  Questions retain unfinished tasks, rejected messages retain their drafts,
+  and unconsumed follow-ups return to the composer when work stops. See
+  [ADR-84](docs/adrs/ADR-84-shared-conversation-application.md).
 - **Headless `concerto run`.** One-shot, non-interactive agent execution for
   external orchestrators (`crates/cli/src/dispatch/run.rs`): the prompt comes
   from an argument, `-`, or piped stdin — a terminal with no prompt fails fast
@@ -656,6 +669,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Updated the plugin runtime to Wasmtime 36.0.19 LTS for the Cranelift fixes
+  in RUSTSEC-2026-0379/0380, and retired all eight Wasmtime audit exceptions.
+  Memory64 remains disabled; tests enforce the 64 MiB allocation/growth limit.
+  Updated Tokio, ctutils, rustls-webpki and WebPKI roots to patched releases,
+  and replaced the yanked clipboard-win release in the lockfile.
 - Shell `allow_all` mode can no longer bypass the denylist, and its construction no
   longer relies on `expect()` (removed a startup panic path)
 - Plugin capability grant lifecycle (ADR-37): 30-day TTL prevents indefinite

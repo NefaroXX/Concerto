@@ -1,4 +1,4 @@
-//! `concerto memory <graph|explain>` — read-only memory evidence views (ADR-69).
+//! Project memory exploration and read-only graph/evidence views.
 //!
 //! `graph` renders the project's memory chunks + links as Mermaid `flowchart
 //! TD` source; `explain <chunk-id>` prints one chunk's links and score. Both
@@ -44,15 +44,136 @@ fn parse_memory_graph_args(args: &[String]) -> anyhow::Result<(usize, usize, usi
 /// `concerto memory <graph|explain <chunk-id>>`.
 pub(crate) fn run_memory_subcommand(args: &[String], project_root: &Path) -> anyhow::Result<()> {
     if args.is_empty() {
-        anyhow::bail!("usage: concerto memory <graph|explain <chunk-id>>");
+        anyhow::bail!("usage: concerto memory <list|search|show|delete|reindex|graph|explain>; memory delete requires --yes");
     }
     match args[0].as_str() {
+        "list" | "search" | "show" | "delete" | "reindex" => run_explorer(args, project_root),
         "graph" => run_memory_graph(&args[1..], project_root),
         "explain" => run_memory_explain(&args[1..], project_root),
         other => anyhow::bail!(
-            "unknown memory subcommand '{other}'; usage: concerto memory <graph|explain <chunk-id>>"
+            "unknown memory subcommand '{other}'; use list, search, show, delete, reindex, graph or explain"
         ),
     }
+}
+
+const EXPLORER_USAGE: &str = "usage: concerto memory list|search [QUERY] [--type TYPE] [--limit 1..1000] [--json]\n       concerto memory show ID [--json]\n       concerto memory delete ID --yes [--json]\n       concerto memory reindex [--json]";
+
+#[derive(Debug)]
+struct ExplorerOptions {
+    operation: String,
+    value: String,
+    kind: Option<concerto_core::memory::ChunkType>,
+    limit: usize,
+    json: bool,
+}
+
+fn parse_explorer(args: &[String]) -> anyhow::Result<ExplorerOptions> {
+    let operation = args.first().ok_or_else(|| anyhow::anyhow!(EXPLORER_USAGE))?.clone();
+    let mut options =
+        ExplorerOptions { operation, value: String::new(), kind: None, limit: 200, json: false };
+    let search = matches!(options.operation.as_str(), "list" | "search");
+    let mut positional = None;
+    let mut confirmed = false;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" if !options.json => options.json = true,
+            "--yes" if options.operation == "delete" && !confirmed => confirmed = true,
+            "--type" if search && options.kind.is_none() => {
+                index += 1;
+                let raw = args
+                    .get(index)
+                    .ok_or_else(|| anyhow::anyhow!("missing type; {EXPLORER_USAGE}"))?;
+                options.kind = Some(parse_kind(raw)?);
+            }
+            "--limit" if search => {
+                index += 1;
+                options.limit =
+                    args.get(index).ok_or_else(|| anyhow::anyhow!("missing limit"))?.parse()?;
+                anyhow::ensure!(
+                    (1..=1000).contains(&options.limit),
+                    "limit must be between 1 and 1000"
+                );
+            }
+            value
+                if !value.starts_with('-')
+                    && positional.is_none()
+                    && options.operation != "reindex" =>
+            {
+                positional = Some(value.to_string())
+            }
+            other => anyhow::bail!("unexpected argument '{other}'; {EXPLORER_USAGE}"),
+        }
+        index += 1;
+    }
+    options.value = positional.unwrap_or_default();
+    if matches!(options.operation.as_str(), "show" | "delete") {
+        anyhow::ensure!(!options.value.trim().is_empty(), "chunk ID is required; {EXPLORER_USAGE}");
+    }
+    anyhow::ensure!(
+        options.operation != "delete" || confirmed,
+        "Deletion requires --yes after inspecting the chunk; {EXPLORER_USAGE}"
+    );
+    Ok(options)
+}
+
+fn parse_kind(raw: &str) -> anyhow::Result<concerto_core::memory::ChunkType> {
+    use concerto_core::memory::ChunkType;
+    Ok(match raw {
+        "function" => ChunkType::Function,
+        "struct" => ChunkType::Struct,
+        "trait" => ChunkType::Trait,
+        "impl" => ChunkType::Impl,
+        "enum" => ChunkType::Enum,
+        "module" => ChunkType::Module,
+        "test" => ChunkType::Test,
+        "sliding-window" => ChunkType::SlidingWindow,
+        "session-summary" => ChunkType::SessionSummary,
+        "fact" => ChunkType::Fact,
+        _ => anyhow::bail!("unknown memory type '{raw}'; use function, struct, trait, impl, enum, module, test, sliding-window, session-summary or fact"),
+    })
+}
+
+fn run_explorer(args: &[String], project_root: &Path) -> anyhow::Result<()> {
+    let options = parse_explorer(args)?;
+    let project = project_root.canonicalize()?;
+    let config = concerto_config::load_config(None, Some(&project))?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    let value = runtime.block_on(async {
+        let cancel = CancellationToken::new();
+        let signal = cancel.clone();
+        let task = tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() { signal.cancel(); }
+        });
+        let result = async {
+            let explorer = concerto_orchestrator::memory_explorer::MemoryExplorer::open(
+                &project, &config, concerto_core::event::EventBus::new(256), cancel.clone(),
+            ).await?;
+            let value = match options.operation.as_str() {
+                "list" | "search" => serde_json::json!({"schema_version": 1, "entries": explorer.search(&options.value, options.kind, options.limit, cancel.clone()).await?}),
+                "show" => {
+                    let chunk = explorer.inspect(&options.value, cancel.clone()).await?;
+                    serde_json::json!({"schema_version": 1, "found": chunk.is_some(), "entry": chunk})
+                }
+                "delete" => {
+                    explorer.delete(&options.value, cancel.clone()).await?;
+                    serde_json::json!({"schema_version": 1, "deleted": options.value})
+                }
+                "reindex" => serde_json::json!({"schema_version": 1, "indexed_chunks": explorer.reindex(cancel.clone()).await?}),
+                _ => return Err(EXPLORER_USAGE.to_string()),
+            };
+            Ok::<_, String>(value)
+        }.await;
+        task.abort();
+        result
+    }).map_err(anyhow::Error::msg)?;
+    // JSON escaping also prevents stored text from injecting terminal controls.
+    if options.json {
+        println!("{}", serde_json::to_string(&value)?);
+    } else {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    }
+    Ok(())
 }
 
 /// `concerto memory graph` — print the project's memory graph as Mermaid.
@@ -139,6 +260,31 @@ fn run_memory_explain(args: &[String], project_root: &Path) -> anyhow::Result<()
 mod tests {
     use super::*;
     use crate::tests::ENV_LOCK;
+
+    #[test]
+    fn explorer_parser_validates_before_opening_memory() {
+        let parse =
+            |args: &[&str]| parse_explorer(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        for args in [
+            vec!["delete", "chunk"],
+            vec!["delete", "--yes"],
+            vec!["show"],
+            vec!["search", "--limit", "0"],
+            vec!["search", "--limit", "1001"],
+            vec!["search", "--type", "bogus"],
+            vec!["reindex", "unexpected"],
+            vec!["show", "id", "--yes"],
+        ] {
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
+        let options =
+            parse(&["search", "my query", "--type", "fact", "--limit", "20", "--json"]).unwrap();
+        assert_eq!(options.value, "my query");
+        assert_eq!(options.kind, Some(concerto_core::memory::ChunkType::Fact));
+        assert_eq!(options.limit, 20);
+        assert!(options.json);
+        assert!(parse(&["delete", "chunk", "--yes"]).is_ok());
+    }
 
     #[test]
     fn parse_memory_graph_args_defaults_and_overrides() {

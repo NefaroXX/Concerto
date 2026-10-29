@@ -32,10 +32,7 @@ impl App {
     pub(super) fn update_cancel_and_ticks(&mut self, message: Message) -> iced::Task<Message> {
         match message {
             Message::CancelAgentRun => {
-                if self.run_status == RunStatus::Running {
-                    self.cancel_token.cancel();
-                    self.run_status = RunStatus::Cancelling;
-                }
+                self.conversation.cancel();
                 iced::Task::none()
             }
             Message::CircuitTick => {

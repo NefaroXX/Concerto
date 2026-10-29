@@ -271,12 +271,18 @@ entries rather than silently calling a cloud embedding provider.
 
 ## Frontends
 
+Desktop and TUI are presentation adapters over the shared interactive
+application in `concerto-orchestrator::conversation` ([ADR-84](adrs/ADR-84-shared-conversation-application.md)).
+It owns submission, session preparation, follow-ups, cancellation and
+completion/checkpoint state. Both always converse with the coordinator, which
+can answer or do work without an execution-mode switch.
+
 - **Desktop (`concerto-desktop`):** Iced views for Chat, Agents, Memory, Tool
   Log, Diff, Terminal, and Settings; recent sessions and session spend
   (status-bar chip, Spend Log modal) live in Chat. Async work is bridged into
   Iced messages/subscriptions.
-- **CLI (`concerto-cli`):** independent `ratatui` TUI with setup, chat,
-  approvals, diffs, and single/multi-agent execution.
+- **CLI (`concerto-cli`):** `ratatui` presentation with setup, chat,
+  approvals and diffs; headless commands retain explicit execution modes.
 - **API (`concerto-api-server`):** Axum sessions/tasks/SSE surface with shared
   API types, authentication rules, and optional OpenAPI docs.
 - **Top-level (`concerto`):** desktop by default and CLI behind its feature.

@@ -307,9 +307,15 @@ impl TranscriptRecorderGuard {
 
     /// Stop the recorder: cancel the background task, let it drain any events
     /// still in flight, then settle still-`Running` tool calls and flush
-    /// everything remaining in order. Must run after the run-end entries are
-    /// recorded so the final Assistant/Completion entries land in the DB.
-    pub(crate) async fn stop(mut self) {
+    /// everything remaining in order.
+    pub(crate) async fn stop(self) {
+        self.finish(&[]).await;
+    }
+
+    /// Drain bus messages before appending the final response. Follow-ups and
+    /// progress replies must precede the answer even if the recorder has not
+    /// been scheduled since the coordinator published them.
+    pub(crate) async fn finish(mut self, entries: &[TranscriptEntry]) {
         self.cancel.cancel();
         if let Some(task) = self.task.take() {
             if let Err(error) = task.await {
@@ -319,6 +325,7 @@ impl TranscriptRecorderGuard {
         let batch = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             state.settle_running();
+            state.pending.extend_from_slice(entries);
             std::mem::take(&mut state.pending)
         };
         flush_entries(&self.store, self.session_id, batch, &self.flush_cancel).await;

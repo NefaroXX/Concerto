@@ -25,28 +25,29 @@ use concerto_core::event::EventBus;
 // that used it moved to `views::chat::entries_from_transcript`.
 #[cfg(test)]
 use concerto_core::event::ThinkingKind;
-use concerto_core::failures::{ClassifiedFailure, FailureAudience};
+use concerto_core::failures::FailureAudience;
 use concerto_core::helpers::project_id_hash;
 use concerto_core::ids::Ulid;
 use concerto_core::intent::{PlanDecision, RequestedOutcome, RunStage};
 use concerto_core::traits::approval::{ApprovalDecision, ApprovalSink};
 use concerto_core::traits::memory::MemoryStore;
 use concerto_core::transcript::TranscriptEntry;
+use concerto_core::types::AgentCompletionStatus;
+#[cfg(test)]
+use concerto_core::types::AgentOutput;
 use concerto_core::types::PolicyAction;
-use concerto_core::types::{AgentCompletionStatus, AgentOutput};
 use concerto_core::CancellationToken;
-use concerto_core::OrchestratorError;
 use concerto_memory::indexer::{IndexConfig, ProjectIndexer};
 use concerto_memory::sync::ChunkSyncService;
-use concerto_orchestrator::runtime_runner::{
-    init_memory_system, memory_enabled, run_shared_agent, ActiveMemoryServices,
+pub use concerto_orchestrator::conversation::RunStatus;
+use concerto_orchestrator::conversation::{
+    ConversationCompletion, ConversationController, ConversationOptions, Submission,
 };
-use concerto_orchestrator::services::{RequestBuilder, ServicesBuilder};
+use concerto_orchestrator::runtime_runner::{init_memory_system, ActiveMemoryServices};
+use concerto_orchestrator::services::ServicesBuilder;
 use concerto_plugins::manager::SharedPluginManager;
 use concerto_providers::factory::ProviderFactory;
-use concerto_providers::provider_defs::{
-    picker_model_options, provider_definition, provider_readiness,
-};
+use concerto_providers::provider_defs::{picker_model_options, provider_definition};
 use concerto_tools::diff::compute_diffs_from_virtual_fs;
 use concerto_tools::virtual_fs::VirtualFs;
 use std::path::{Path, PathBuf};
@@ -65,7 +66,9 @@ mod subscription;
 /// run-summary formatter) lives in the `approval_sink` submodule so the
 /// root `impl App` blocks in this file stay focused on `update`/`view`.
 mod approval_sink;
-use approval_sink::{desktop_approval_sink, format_run_summary};
+use approval_sink::desktop_approval_sink;
+#[cfg(test)]
+use approval_sink::format_run_summary;
 // Only `mod tests` builds `DesktopApprovalSink` directly (field-level
 // setup); every other reference goes through the ctor's trait object.
 #[cfg(test)]
@@ -301,13 +304,6 @@ pub enum Page {
     OrchestrationStudio,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RunStatus {
-    Idle,
-    Running,
-    Cancelling,
-}
-
 /// One node of the sidebar project→session tree: a project folder and, once
 /// loaded, its recent sessions. `sessions == None` means "not loaded yet"
 /// (the first expand spawns the load); an empty `Vec` means "loaded, empty".
@@ -329,7 +325,7 @@ pub enum Message {
     Shortcut(shortcuts::Shortcut),
     /// Agent run completed — carries the final response string.
     /// Triggers diff loading from the shared VirtualFs.
-    AgentRunCompleted(Option<Ulid>, Box<Result<AgentOutput, ClassifiedFailure>>),
+    AgentRunCompleted(Box<ConversationCompletion>),
     CancelAgentRun,
     /// Advances the ambient circuit-trace background pulse. Only ever
     /// dispatched while `run_status == RunStatus::Running` — see
@@ -565,8 +561,7 @@ pub struct App {
     /// instances a running agent uses. The manager itself is materialised on
     /// the first agent run (its epoch ticker needs a tokio runtime context).
     pub plugin_manager: SharedPluginManager,
-    pub cancel_token: concerto_core::CancellationToken,
-    pub run_status: RunStatus,
+    pub conversation: ConversationController,
     /// Current intent-router stage of the active run (ADR-55 §9),
     /// rendered as the status-bar run-stage chip. `Some` only while
     /// `run_status == RunStatus::Running`; it is set by
@@ -598,10 +593,6 @@ pub struct App {
     /// overlay breathing animation. Advanced by `ScanlineTick` while the
     /// overlay is enabled and the Chat page is active.
     pub scanline_progress: f32,
-    /// Serialised orchestration checkpoint from the last partial run.
-    /// Passed to `AgentRunRequest` on the next submit so the coordinator can
-    /// resume the graph without re-architecting.
-    pub resume_checkpoint_json: Option<String>,
     /// Keep candidate continuation views until the backend confirms resume or
     /// begins fresh specialist work. This is transient presentation state.
     pending_task_view_reset: bool,
@@ -687,9 +678,6 @@ pub struct App {
     pub pending_refresh: std::collections::HashMap<String, u64>,
     /// Monotonic counter for refresh request ids.
     pub refresh_seq: u64,
-    /// Backend session whose rich UI transcript is currently displayed.
-    pub active_session_id: Option<Ulid>,
-
     // ---- Spend (issue #93 Phase 4) ----
     /// Live session cost shown on the status-bar spend chip. Updated by
     /// `DesktopEvent::SpendUpdated` (published after each provider call
@@ -753,7 +741,7 @@ impl App {
     /// session's file. A write failure must never break the UI, so errors are
     /// swallowed. Mirrors how the chat transcript is persisted on every run.
     fn persist_active_agent_graph(&self) {
-        if let Some(id) = self.active_session_id {
+        if let Some(id) = self.conversation.session_id {
             let _ = self.agent_graph.save_to(agent_graph_path(&self.project_dir, &id.to_string()));
         }
     }
@@ -816,11 +804,7 @@ impl App {
                     (global_config.clone(), true)
                 }
             };
-        let initial_multi_agent = initial_config
-            .multi_agent
-            .as_ref()
-            .map(|settings| settings.default_enabled)
-            .unwrap_or(false);
+        let initial_multi_agent = true; // The coordinator owns every interactive conversation.
         let initial_session_cap = initial_config.session_spend_cap_usd;
         // Process-lifetime plugin-manager handle: shared with the Settings
         // state (revoke) and passed to every run's ServicesBuilder (liveness).
@@ -870,8 +854,7 @@ impl App {
             global_config,
             memory_services: Arc::new(Mutex::new(None)),
             plugin_manager,
-            cancel_token: CancellationToken::new(),
-            run_status: RunStatus::Idle,
+            conversation: ConversationController::default(),
             run_stage: None,
             circuit_progress: 0.0,
             scanline_overlay_enabled: initial_scanline_overlay,
@@ -903,7 +886,6 @@ impl App {
             git_summary: None,
             pending_refresh: std::collections::HashMap::new(),
             refresh_seq: 0,
-            active_session_id: None,
             session_cap: initial_session_cap,
             config_broken: initial_config_fell_back || global_config_fell_back,
             live_session_cost: 0.0,
@@ -918,7 +900,6 @@ impl App {
             pending_tree_session: None,
             multi_agent: initial_multi_agent,
             fast: false,
-            resume_checkpoint_json: None,
             pending_task_view_reset: false,
             run_settle_epoch: Arc::new(AtomicU64::new(0)),
             project_orchestration_keys: Vec::new(),
@@ -1312,7 +1293,7 @@ impl App {
                     .view(
                         &self.current_theme,
                         !self.chat_model_options.is_empty(),
-                        self.run_status == RunStatus::Running,
+                        self.conversation.status == RunStatus::Running,
                         &self.agent_graph,
                     )
                     .map(Message::Chat);
@@ -1503,7 +1484,7 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        self.cancel_token.cancel();
+        self.conversation.cancel_token.cancel();
         if let Some(prev) =
             self.memory_services.lock().unwrap_or_else(|error| error.into_inner()).take()
         {

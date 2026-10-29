@@ -80,7 +80,6 @@ pub enum Message {
     /// works too (handled in `app.rs`).
     ToggleThinkingAll,
     CopyCode(String),
-    ToggleMultiAgent,
     ToggleFastMode,
     NavigateToToolLog(String),
     /// Navigate to the Diff viewer to review post-run changes.
@@ -1778,7 +1777,6 @@ impl State {
             Message::CopyCode(_) => {
                 // Handled via clipboard integration in the code_block widget
             }
-            Message::ToggleMultiAgent => {}
             Message::ToggleFastMode => {}
             Message::NavigateToDiff => {}
             Message::NavigateToSettings => {}

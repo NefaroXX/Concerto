@@ -406,7 +406,7 @@ impl App {
         &'a self,
         composed: Element<'a, Message>,
     ) -> Element<'a, Message> {
-        let circuit_bg = (self.run_status == RunStatus::Running).then(|| {
+        let circuit_bg = (self.conversation.status == RunStatus::Running).then(|| {
             circuit_background::view(self.circuit_progress, self.current_theme.palette.accent)
         });
         // Faint scan-line overlay behind the chat column, when the default-off

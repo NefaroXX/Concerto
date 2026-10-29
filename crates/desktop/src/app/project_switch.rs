@@ -55,7 +55,7 @@ impl App {
                 iced::Task::none()
             }
             Message::ProjectDirApply => {
-                if self.run_status != RunStatus::Idle {
+                if self.conversation.status != RunStatus::Idle {
                     self.toasts.push(
                         ToastLevel::Info,
                         "Cancel the running task before switching projects.".to_string(),
@@ -130,7 +130,7 @@ impl App {
                     return self
                         .update(Message::Chat(views::chat::Message::SelectSession(session_id)));
                 }
-                if self.run_status != RunStatus::Idle {
+                if self.conversation.status != RunStatus::Idle {
                     self.toasts.push(
                         ToastLevel::Info,
                         "Cancel the running task before switching projects.".to_string(),
@@ -183,8 +183,7 @@ impl App {
         self.vfs = Arc::new(Mutex::new(VirtualFs::new()));
         // A project switch starts a blank session. The folder's
         // earlier sessions remain available in Recent sessions.
-        self.active_session_id = None;
-        self.resume_checkpoint_json = None;
+        self.conversation.select_session(None);
         self.reset_spend_state();
         self.agent_graph = views::agent_graph::State::new();
         self.chat = views::chat::State::new();

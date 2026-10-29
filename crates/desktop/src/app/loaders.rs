@@ -390,6 +390,7 @@ impl App {
     pub(super) fn delete_memory_entry(&self, id: String) -> iced::Task<Message> {
         let memory = self.memory_services.clone();
         let result_id = id.clone();
+        let project_id = concerto_core::types::ProjectId(project_id_hash(&self.project_dir));
         iced::Task::perform(
             async move {
                 let store = memory
@@ -399,7 +400,10 @@ impl App {
                     .map(|m| m.store.clone())
                     .ok_or_else(|| "Memory is not initialized yet.".to_string())?;
                 let cancel = concerto_core::CancellationToken::new();
-                store.invalidate_chunk(&id, cancel).await.map_err(|error| error.to_string())
+                store
+                    .invalidate_project_chunk(&project_id, &id, cancel)
+                    .await
+                    .map_err(|error| error.to_string())
             },
             move |result| Message::MemoryEntryDeleted { id: result_id.clone(), result },
         )
@@ -526,7 +530,11 @@ impl App {
     /// Resume a previously picked session: make it active for the project and
     /// load its history (and durable typed transcript) so the chat shows the
     /// resumed conversation.
-    pub(super) fn select_session(&self, session_id: String) -> iced::Task<Message> {
+    pub(super) fn select_session(&mut self, session_id: String) -> iced::Task<Message> {
+        if self.conversation.is_running() {
+            self.chat.add_error("Stop the current work before switching conversations.".into());
+            return iced::Task::none();
+        }
         let session_manager = self.session_manager.clone();
         let app_config = self.config.clone().unwrap_or_default();
         let project_dir = self.project_dir.clone();
@@ -572,7 +580,7 @@ impl App {
     /// failure (or missing session) yields an empty list rather than breaking
     /// the UI.
     pub(super) fn load_spend_log(&self) -> iced::Task<Message> {
-        let Some(session_id) = self.active_session_id else {
+        let Some(session_id) = self.conversation.session_id else {
             return iced::Task::none();
         };
         let session_manager = self.session_manager.clone();
@@ -619,7 +627,7 @@ impl App {
     /// cancellation token (the reader still honors it at the seam) — the
     /// run's own token must not permanently disable the panel after a cancel.
     pub(super) fn load_studio_runtime(&self) -> iced::Task<Message> {
-        let session_id = self.active_session_id;
+        let session_id = self.conversation.session_id;
         let session_manager = self.session_manager.clone();
         let app_config = self.config.clone().unwrap_or_default();
         iced::Task::perform(

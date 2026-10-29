@@ -295,6 +295,7 @@ pub(super) fn desktop_approval_sink(
 /// The final answer is composed by `AgentOutput::summary` from structured
 /// execution data (files written, verification results, project root) plus
 /// any optional model-authored notes — never from unverified provider prose.
+#[cfg(test)]
 pub(crate) fn format_run_summary(output: &AgentOutput) -> String {
     output.summary()
 }

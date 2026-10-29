@@ -22,6 +22,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Screen::AgentAssignments => draw_agent_assignments_screen(frame, app),
         Screen::DiffReview => draw_diff_review_screen(frame, app),
         Screen::RuntimeInspector => draw_runtime_inspector(frame, app),
+        Screen::MemoryExplorer => app.memory_screen.draw(frame, &app.cli_theme),
+        Screen::Management => app.management.draw(frame, &app.cli_theme),
+        Screen::WorkspaceFiles => app.workspace_browser.draw(frame, &app.cli_theme),
     }
     if let Some(prompt) = app.approval_prompt() {
         draw_approval_modal(frame, frame.area(), &prompt, &app.cli_theme);
@@ -39,24 +42,66 @@ fn draw_runtime_inspector(frame: &mut Frame, app: &App) {
     let block = panel(" Runtime inspector ", &app.cli_theme);
     let inner = block.inner(frame.area());
     frame.render_widget(block, frame.area());
-    let areas = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(inner);
-    let body = Paragraph::new(app.runtime_inspector.text.as_str())
-        .wrap(Wrap { trim: false })
-        .scroll((app.runtime_inspector.scroll, 0));
-    frame.render_widget(body, areas[0]);
-    let help = Paragraph::new("r refresh | Esc back | j/k scroll | PgUp/PgDn | Home")
+    let evidence_view = app.runtime_inspector.view == crate::dispatch::runtime::View::Evidence;
+    let areas = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(u16::from(evidence_view)),
+        Constraint::Min(1),
+        Constraint::Length(2),
+    ])
+    .split(inner);
+    let inspector = &app.runtime_inspector;
+    let heading = format!("{}/7 {}", inspector.view.index() + 1, inspector.view.label());
+    frame.render_widget(
+        Paragraph::new(heading).style(Style::default().fg(app.cli_theme.warning)),
+        areas[0],
+    );
+    if evidence_view {
+        let selected = match inspector.evidence.selected() {
+            Some(id) => format!(
+                "{}/{} {}",
+                inspector.evidence.index + 1,
+                inspector.evidence.ids.len(),
+                serde_json::json!(id)
+            ),
+            None => "No event references".into(),
+        };
+        frame.render_widget(
+            Paragraph::new(selected).style(Style::default().fg(app.cli_theme.user)),
+            areas[1],
+        );
+    }
+    let body = Paragraph::new(inspector.display_text()).wrap(Wrap { trim: false });
+    let max_scroll = body.line_count(areas[2].width).saturating_sub(areas[2].height as usize);
+    let max_scroll = u16::try_from(max_scroll).unwrap_or(u16::MAX);
+    inspector.max_scroll.set(max_scroll);
+    inspector.page_rows.set(areas[2].height.max(1));
+    frame.render_widget(body.scroll((inspector.scroll.min(max_scroll), 0)), areas[2]);
+    let hints = if evidence_view && inner.width < 76 {
+        "[/] pick | Enter open\nr refresh | Esc back"
+    } else if evidence_view {
+        "[/] reference | Enter open | Tab view | r refresh | Esc back\nj/k scroll | PgUp/PgDn page | Home/End"
+    } else if inner.width < 60 {
+        "Tab view | r refresh\nEsc back | j/k scroll"
+    } else {
+        "Tab/Shift+Tab or 1–7: view | r refresh | Esc back\nj/k scroll | PgUp/PgDn page | Home/End"
+    };
+    let help = Paragraph::new(hints)
         .style(Style::default().fg(app.cli_theme.muted))
         .wrap(Wrap { trim: false });
-    frame.render_widget(help, areas[1]);
+    frame.render_widget(help, areas[3]);
 }
 
 /// Shared menu labels and their existing command-mode shortcuts.
 pub(crate) const CHAT_COMMANDS: &[(char, &str)] = &[
     ('s', "Settings"),
+    ('o', "Manage providers, agents and policy"),
     ('l', "Sessions"),
     ('t', "Tool history"),
     ('d', "Review changes"),
     ('i', "Runtime"),
+    ('e', "Memory explorer"),
+    ('b', "Workspace files and context"),
     ('p', "Switch project"),
     ('n', "New session"),
 ];
@@ -88,7 +133,8 @@ fn draw_command_menu(frame: &mut Frame, app: &App) {
     let items: Vec<ListItem> = CHAT_COMMANDS
         .iter()
         .map(|(key, name)| {
-            let note = if *key == 'n' && app.running { " (run active)" } else { "" };
+            let note =
+                if *key == 'n' && app.conversation.is_running() { " (run active)" } else { "" };
             ListItem::new(format!("{key}  {name}{note}"))
         })
         .collect();
@@ -145,8 +191,8 @@ fn draw_chat_screen(frame: &mut Frame, app: &App) {
     );
     draw_chat(frame, chunks[1], app);
     draw_input(frame, chunks[2], app);
-    let hint = if app.running {
-        "Ctrl+C cancel · F1 commands"
+    let hint = if app.conversation.is_running() {
+        "Enter send follow-up · Ctrl+C stop · F1 commands"
     } else if app.project_picker_mode {
         "Enter switch · Esc keep draft"
     } else if !app.input_mode && chunks[3].width < 45 {
@@ -188,8 +234,8 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
         " Project path "
     } else if !app.input_mode {
         " Browse · Esc to type "
-    } else if app.running {
-        " Draft · send after this run "
+    } else if app.conversation.is_running() {
+        " Follow-up · Enter to send "
     } else {
         " Message "
     };
@@ -546,8 +592,11 @@ fn draw_agent_assignments_screen(frame: &mut Frame, app: &App) {
 }
 
 fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
-    let state =
-        if app.running { app.run_stage.map(run_stage_label).unwrap_or("Running") } else { "Ready" };
+    let state = if app.conversation.is_running() {
+        app.run_stage.map(run_stage_label).unwrap_or("Running")
+    } else {
+        "Ready"
+    };
     let status = if area.width < 80 {
         format!(" {state} · {}", app.model_label())
     } else {
@@ -563,9 +612,9 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &App) {
 fn status_line(app: &App) -> String {
     let provider = app.provider_label();
     let model = app.model_label();
-    let mode = if app.multi_agent { "multi" } else { "single" };
+    let mode = "coordinator";
     let fast = if app.fast { " fast" } else { "" };
-    let run = if app.running { " | RUNNING (Ctrl+C cancel)" } else { "" };
+    let run = if app.conversation.is_running() { " | RUNNING (Ctrl+C cancel)" } else { "" };
     let memory = if app.memory_chunks > 0 {
         format!(" | {} chunks", app.memory_chunks)
     } else {
@@ -575,7 +624,7 @@ fn status_line(app: &App) -> String {
     // run is active, mirroring the desktop chip's `run_status == Running`
     // guard. The run boundaries clear `run_stage`, but the guard is cheap
     // insurance against a stale value leaking onto the line.
-    let stage = match (app.running, app.run_stage) {
+    let stage = match (app.conversation.is_running(), app.run_stage) {
         (true, Some(stage)) => format!(" | stage: {}", run_stage_label(stage)),
         _ => String::new(),
     };
@@ -1372,17 +1421,10 @@ mod tests {
     }
 
     #[test]
-    fn settings_toggle_multi_agent() {
-        let mut app = App::new();
-        app.screen = Screen::Settings;
-        assert!(!app.multi_agent);
-        // Navigate to MultiAgent (index 3; InteractionMode was removed in
-        // ADR-55 §7).
-        app.settings_index = 3;
-        app.handle_key(key_event(KeyCode::Enter, KeyModifiers::empty()));
+    fn interactive_conversations_have_no_execution_mode_switch() {
+        let app = App::new();
         assert!(app.multi_agent);
-        app.handle_key(key_event(KeyCode::Enter, KeyModifiers::empty()));
-        assert!(!app.multi_agent);
+        assert!(SettingsField::ALL.iter().all(|field| field.label() != "Multi-agent"));
     }
 
     #[test]
@@ -1390,7 +1432,10 @@ mod tests {
         let mut app = App::new();
         app.screen = Screen::Settings;
         assert!(!app.fast);
-        app.settings_index = 5;
+        app.settings_index = SettingsField::ALL
+            .iter()
+            .position(|field| *field == SettingsField::FastMode)
+            .expect("fast setting");
         app.handle_key(key_event(KeyCode::Enter, KeyModifiers::empty()));
         assert!(app.fast);
     }
@@ -1433,14 +1478,14 @@ mod tests {
         );
 
         // Running with a stage → the suffix appears with the ADR label.
-        app.running = true;
+        app.conversation.status = concerto_orchestrator::conversation::RunStatus::Running;
         assert!(status_line(&app).contains(" | stage: Editing"), "{}", status_line(&app));
     }
 
     #[test]
     fn status_line_drops_stage_when_cleared() {
         let mut app = App::new();
-        app.running = true;
+        app.conversation.status = concerto_orchestrator::conversation::RunStatus::Running;
         app.run_stage = Some(RunStage::Plan);
         assert!(status_line(&app).contains("stage: Planning"));
         // Completion boundary clears the stage (App::handle_key path is
@@ -1684,20 +1729,53 @@ mod tests {
         for (width, height) in [(24, 8), (40, 12), (80, 24), (120, 40)] {
             let mut app = App::new();
             app.screen = Screen::RuntimeInspector;
-            app.runtime_inspector.text =
-                "Saved checkpoint\nDecision journal\nWorld model\nFailure diagnoses\nSuitability"
-                    .into();
+            app.runtime_inspector.text = format!(
+                "Saved checkpoint\nDecision journal\nWorld model\nFailure diagnoses\nSuitability{}Last saved task",
+                "\n".repeat(50)
+            );
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal.draw(|frame| super::draw(frame, &app)).unwrap();
             let text = buffer_text(&terminal);
             assert!(text.contains("Runtime inspector"), "{width}x{height}: {text}");
             assert!(text.contains("Saved checkpoint"));
             assert!(text.contains("r refresh"));
+            assert!(text.contains("1/7 Overview"));
+            assert!(app.runtime_inspector.max_scroll.get() > 0);
             app.runtime_inspector.scroll = 2;
             terminal.draw(|frame| super::draw(frame, &app)).unwrap();
             let text = buffer_text(&terminal);
             assert!(!text.contains("Saved checkpoint"));
             assert!(text.contains("World model"));
+            app.runtime_inspector.scroll = u16::MAX;
+            terminal.draw(|frame| super::draw(frame, &app)).unwrap();
+            assert!(buffer_text(&terminal).contains("Last saved task"));
+            for view in crate::dispatch::runtime::View::ALL {
+                app.runtime_inspector.select_view(view);
+                terminal.draw(|frame| super::draw(frame, &app)).unwrap();
+                assert!(buffer_text(&terminal).contains(view.label()));
+            }
+        }
+    }
+
+    #[test]
+    fn evidence_picker_and_detail_fit_supported_terminal_sizes() {
+        for (width, height) in [(24, 8), (40, 12), (80, 24), (120, 40)] {
+            let mut app = App::new();
+            app.screen = Screen::RuntimeInspector;
+            app.runtime_inspector.select_view(crate::dispatch::runtime::View::Evidence);
+            app.runtime_inspector.evidence.ids = vec!["event-1".into(), "event-2".into()];
+            app.runtime_inspector.evidence.index = 1;
+            app.runtime_inspector.evidence.text =
+                Some(format!("Stored event\n{}End of payload", "line\n".repeat(50)));
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| super::draw(frame, &app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(text.contains("2/2 \"event-2\""));
+            assert!(text.contains("Stored event"));
+            assert!(text.contains("Enter open"));
+            app.runtime_inspector.scroll = u16::MAX;
+            terminal.draw(|frame| super::draw(frame, &app)).unwrap();
+            assert!(buffer_text(&terminal).contains("End of payload"));
         }
     }
 

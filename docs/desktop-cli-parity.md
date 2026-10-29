@@ -1,11 +1,21 @@
 # Desktop ↔ CLI Parity Plan
 
 **Status: settings and configuration parity expanded 2026-10-03; checkpoint
-runtime inspection added 2026-10-10; interaction parity remains in progress.** The August R2–R4/P1–P7 checklist below is a
+runtime inspection added 2026-10-10; topology/evidence-reference views and TUI
+navigation added 2026-10-16; memory/structured management validated 2026-10-18;
+file/context and language workflows implemented 2026-10-18; shared conversation
+lifecycle integrated 2026-10-28. PR #378 incorporates #357, #365 and #367,
+retaining their inspection and editing capabilities on the shared controller.** The August R2–R4/P1–P7 checklist below is a
 historical milestone, not proof of complete parity. [ADR-80](adrs/ADR-80-cli-settings-and-studio-parity.md)
 corrects the former blanket exclusions. See [CLI settings reference](cli-settings.md).
 
 ## Objective
+
+Desktop is a graphical wrapper around the same application behavior as the
+TUI. Shared services alone are insufficient if each frontend separately owns
+the user flow. Conversation lifecycle now lives in the shared
+`ConversationController`: both adapters use the same submit, session, follow-up,
+cancel and completion path. See [ADR-84](adrs/ADR-84-shared-conversation-application.md).
 
 Parity applies to capabilities, settings, data and actions. Only graphical
 presentation is exempt. A Studio layout does not exclude agent configuration;
@@ -33,7 +43,7 @@ a graph has textual data; desktop appearance preferences can be set from CLI.
 | CLI display | `config set display…` | Same flag/env precedence; CLI theme and desktop theme preferences are separate settings |
 | Roots, audit, updates, observability | `config set project_roots/audit…/updates…/observability…` | Existing readers and startup/run semantics |
 | Saved Coordinator runtime state | `sessions runtime ID [--view VIEW] [--json] [--limit N]`; TUI Esc → i | Same checkpoint reader, world model, decisions, diagnoses and suitability projection as Desktop; read-only database access alongside a running frontend |
-| TUI quick settings | 19 fields with scrolling selection | Adds memory, retention, retries, extensions, context, Git init, motion, title, theme, shell and update check |
+| TUI quick settings | Scrolling selection | Memory, retention, retries, extensions, context, Git init, motion, title, theme, shell and update check; conversation execution has no single/multi-agent toggle |
 
 Standard builds now include both frontends. Commands automatically select CLI
 mode without a setup wizard or provider. CLI-only builds remain available via
@@ -62,19 +72,68 @@ mode without a setup wizard or provider. CLI-only builds remain available via
   concurrency limits remain a separate runtime issue. Agent capabilities are
   access requests, not policy grants. Policy and write gates remain authoritative.
 
-## Remaining portable interaction work
+## Portable interaction checklist
 
-These are real gaps, not GUI-only exclusions.
+These capabilities are evaluated against current Desktop behavior. Presentation
+differences do not exclude their underlying data or actions.
 
 | Priority | Capability | Planned CLI acceptance |
 |---|---|---|
 | Done on current dev | Staged change review | TUI unified diff and accept/reject through the shared overlay; narrow-terminal checks |
-| P1 | Live Coordinator pause/resume/decisions | Same in-process control handles and checkpoint semantics; cross-process control requires a shared authenticated API |
-| Partial | Runtime Studio inspection | Checkpoint world model, decisions (including evidence references), diagnoses and suitability now have text/JSON and TUI views. Dedicated evidence/topology navigation remains. |
-| P2 | Rich memory explorer | Search/detail/delete through the shared memory service; graph/explain commands cover only part of Desktop |
-| P2 | Structured TUI editors | Roster/provider/policy/MCP inspectors and multiline prompts backed by validated command services |
-| P2 | Editor operations | File/context selection, search, diagnostics, patch/review, attachments and external-editor integration |
-| P2 | Terminal workflow | Launch selected profile with the same toolchain/environment; only terminal-page layout is exempt |
+| Shared application | Live conversation, steering, stop and resume | One controller and inbox; preserved checkpoint on follow-up; decisions remain coordinator-owned. Cross-process control requires a shared authenticated API. |
+| Current Desktop behavior covered | Runtime Studio inspection | Desktop loads persisted snapshots on opening Runtime/Studio. CLI exposes the same checkpoint reader with topology, world model, decisions, evidence, diagnoses and suitability in text/JSON and selectable TUI views. `--event ID` and the TUI picker resolve full evidence records. Neither frontend exposes a separate continuously live inspector. |
+| Validated | Rich memory explorer | `memory list/search/show/delete/reindex` plus graph/explain; TUI search, type filters, full details, confirmed deletion, refresh/re-index and bounded navigation through the shared memory service |
+| Validated | Structured TUI editors | Hierarchical config/provider/policy/MCP and canonical-agent inspection; multiline strings and JSON edits, scope selection, validated saves, stale-draft rejection and discard confirmation. Roster membership and hidden environment edits use existing CLI lifecycle commands. |
+| Implemented | Editor operations | `workspace list/read/search/context/write/delete`; revision-checked external-editor import; Rust diagnostics, hover, definition, completion and references; TUI file preview/filter and explicit context insertion. Existing TUI diff review handles agent changes. Text editing, replace, undo/redo and local editor navigation use the external-editor workflow. |
+| Current Desktop behavior covered | Terminal workflow | Both current frontends use `concerto_shell::client::open` for the native audited console. CLI exposes interactive `shell`, `shell exec` and security settings; neither Desktop's current terminal nor CLI starts a PTY/system shell. Profile selection still configures agent execution separately. |
+
+### File and context workflows (2026-10-18)
+
+`workspace` commands use the shared filesystem executor, policy and audit path,
+without provider setup. Complete UTF-8 reads return a revision; writes preserve
+bytes and require either `--create` or the displayed `--expect REVISION`, plus
+`--stdin --yes`. Deletes also require the revision and confirmation. Stale edits
+are rejected before mutation; this is not a cross-process atomic compare-and-swap.
+Files are limited to 1 MiB, selected context to 4 MiB/32 files, and literal search
+to 1,000 matching lines. Truncation and failures are explicit. Writes materialize
+through the existing VFS tool and do not promise automatic undo.
+
+F1/Ctrl+P → Workspace files and context (command-mode `b`) opens the TUI file
+browser. Enter opens directories or previews a file, `/` filters names, left/backspace
+returns to the parent, and `a` inserts the previewed snapshot into the existing
+chat draft. It never submits the draft. Previews/context are capped at 64 KiB;
+combined drafts at 128 KiB. Escape cancels outstanding loads and ignores late results.
+
+Rust language queries use the existing `LspClient` and an operation-owned
+`rust-analyzer` process. Diagnostics wait for a publication and report `pending`
+with a null diagnostic list if none arrives; missing tooling is an error.
+Navigation positions are zero-based UTF-16 offsets. No query executes code actions
+or applies LSP workspace edits. General text editing, find/replace and undo/redo
+remain available through any external editor using the revision-checked export/import
+workflow in [CLI settings reference](cli-settings.md#workspace-files-and-context).
+
+### Evidence record inspection (2026-10-17)
+
+`sessions runtime ID --event EVENT_ID [--json]` and the TUI evidence picker
+resolve full durable log records through a shared, cancellable, session-scoped
+lookup. Missing or foreign-session IDs are explicit empty results. Lookup does
+not alter checkpoints, approvals, or verification state. The TUI cancels and
+discards old results when the user navigates away. Validation includes scoped
+reads, missing/malformed records, cancellation, payload/provenance preservation,
+held-lock command execution, and narrow-terminal rendering. CI status is
+recorded in the PR; the control comparison above describes the current Desktop contract.
+
+### Runtime inspection navigation (2026-10-16)
+
+The TUI now switches between seven views with Tab/Shift+Tab or 1–7, preserves
+the selected view on refresh, and clamps paging/Home/End to the rendered report.
+The complete saved task graph retains edge direction and saved statuses even
+when `--limit` restricts history. Evidence references preserve fact grounding,
+contradictions and decision citations without claiming to load full events.
+Tests cover graph-only checkpoints, filtering/limits, cached view switching,
+late load results, process commands alongside a held frontend lock, and render
+bounds at 24×8–120×40. This branch's build/test/lint validation is tracked in its
+PR; the local implementation environment has no Rust toolchain.
 
 ### Runtime inspection validation (2026-10-10)
 
@@ -183,10 +242,10 @@ project picker invoked from the status screen (`:654`).
 | Feature | Reason |
 |---------|--------|
 | `AgentGraph` canvas | Canvas layout is graphical; topology/status data remains portable |
-| `DiffViewer` side-by-side layout | Unified terminal diffs/review actions remain portable and planned |
-| `Terminal` panel | Embedded layout differs; configured profile/environment operations remain portable |
-| `OrchestrationStudio` layout | Agent and blueprint commands implemented; live inspectors planned |
-| `Editor` layout | File/search/diagnostic/context operations remain portable and planned |
+| `DiffViewer` side-by-side layout | Unified terminal diffs and review actions implemented |
+| `Terminal` panel | Both frontends use the native audited console; profile/environment configuration remains portable |
+| `OrchestrationStudio` layout | Agent/blueprint commands and persisted runtime inspection implemented |
+| `Editor` layout | File/context/search and Rust language queries implemented; external editors supply text editing and undo/redo |
 | Dashboard CSV export (removed) | Dropped with the Dashboard page (ADR-41): CSV export no longer exists in the desktop UI, so file export is CLI shell piping — the original parity note now describes reality |
 | Theme switching / font size | Both configurable in CLI; desktop font size affects Desktop |
 | Screenshot capture | Not applicable to terminal |

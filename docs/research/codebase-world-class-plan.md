@@ -107,8 +107,9 @@ a successful platform run still does not prove interactive consent or GUI flows.
 
 `unsafe_code = "deny"` remains a workspace rule. Dependency hygiene is
 exception-managed: [deny.toml](../../deny.toml) contains documented advisory
-exceptions, including Wasmtime 24.0.13, with several review dates of
-2026-10-01. Re-review reachability/version assumptions before a dependency
+exceptions, with several review dates of 2026-10-01. The Wasmtime exceptions
+were retired with the patched 36.0.19 LTS upgrade. Re-review
+reachability/version assumptions before a dependency
 change; do not describe a passing exception-aware check as "zero
 vulnerabilities", or remove exceptions without understanding them.
 

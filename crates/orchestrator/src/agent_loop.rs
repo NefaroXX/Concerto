@@ -111,6 +111,7 @@ pub struct AgentLoop {
     /// Prior conversation messages (loaded from the persistent session) used
     /// as context for the current run. Default empty.
     initial_messages: Vec<Message>,
+    conversation_inbox: Option<crate::conversation::ConversationInbox>,
 
     /// Centralized policy for retrying transient provider failures. Lives at
     /// the provider-request boundary and does NOT count as an agent iteration.
@@ -401,6 +402,7 @@ impl AgentLoop {
             project_root,
             budget_allocator,
             initial_messages: Vec::new(),
+            conversation_inbox: None,
             retry_policy: RetryPolicy::default(),
             session_store: None,
             tool_facts: None,
@@ -459,6 +461,14 @@ impl AgentLoop {
     /// active session) so the model sees the full context.
     pub fn with_initial_messages(mut self, messages: Vec<Message>) -> Self {
         self.initial_messages = messages;
+        self
+    }
+
+    pub fn with_conversation_inbox(
+        mut self,
+        inbox: Option<crate::conversation::ConversationInbox>,
+    ) -> Self {
+        self.conversation_inbox = inbox;
         self
     }
 
@@ -896,6 +906,19 @@ impl AgentLoop {
                 return Err(OrchestratorError::Cancelled);
             }
 
+            if let Some(inbox) = &self.conversation_inbox {
+                messages.extend(
+                    inbox
+                        .receive(
+                            self.session_store.as_ref(),
+                            Some(&self.bus),
+                            task.session_id,
+                            &cancel,
+                        )
+                        .await?,
+                );
+            }
+
             // Phase 3: Build provider request
             let mut request = self.build_provider_request(
                 &task.description,
@@ -1108,6 +1131,15 @@ impl AgentLoop {
                 &mut completed,
             );
             match action {
+                ProviderResponseAction::Break
+                    if self
+                        .conversation_inbox
+                        .as_ref()
+                        .is_some_and(|inbox| inbox.has_pending()) =>
+                {
+                    completed = false;
+                    continue;
+                }
                 ProviderResponseAction::Break => break,
                 ProviderResponseAction::ContinueIteration => continue,
                 ProviderResponseAction::Proceed => {}
