@@ -4,7 +4,6 @@
 use crate::virtual_fs::{reject_reserved_device_name, VirtualFs};
 use async_trait::async_trait;
 use camino::Utf8Path;
-use concerto_core::text::normalize_typographic;
 use concerto_core::traits::PolicyEngine;
 use concerto_core::types::{CapabilitySet, PathPolicyFacts, SessionContext, ToolOutput};
 use concerto_core::{CancellationToken, ToolError};
@@ -30,9 +29,9 @@ pub struct FilesystemInput {
     pub operation: String,
     /// Path relative to project root. Use "." to list the workspace root.
     pub path: String,
-    /// Content to write (required for the "write" operation only).
+    /// UTF-8 content to write verbatim (required for the "write" operation only).
     #[serde(default)]
-    #[schemars(description = "Content to write (required for write operation).")]
+    #[schemars(description = "UTF-8 content to write verbatim (required for write operation).")]
     pub content: Option<String>,
     /// Standard-base64-encoded bytes to write (alternative to `content` for
     /// the "write" operation only).
@@ -40,9 +39,8 @@ pub struct FilesystemInput {
     /// The byte-replay channel: checkpoint restore replays banked bytes
     /// verbatim through this field because JSON strings are Unicode and
     /// cannot carry arbitrary bytes. Exactly one of `content`/`content_b64`
-    /// must be present on a write; `content_b64` bytes are written to disk
-    /// and staged **without** typographic normalization (byte-exact replay),
-    /// while `content` keeps the model-output hygiene.
+    /// must be present on a write. Both channels preserve their supplied
+    /// content exactly; `content_b64` also supports non-UTF-8 bytes.
     #[serde(default)]
     #[schemars(
         description = "Base64-encoded bytes to write (alternative to content for write operation; written verbatim without normalization)."
@@ -490,11 +488,8 @@ impl concerto_core::traits::tool::Tool for FilesystemTool {
                 // reserved-name check, so `std::fs::write` to `<root>\nul`
                 // would create a literal 0-byte file instead of erroring.
                 reject_reserved_device_name(&path)?;
-                // Byte-replay channel (`content_b64`) vs model-text channel
-                // (`content`): exactly one must be present. Bytes are
-                // decoded and written verbatim (no typographic
-                // normalization — the caller replays banked bytes); text
-                // keeps the normalization hygiene below.
+                // Exactly one of the byte (`content_b64`) or UTF-8 text
+                // (`content`) channels must be present. Both are verbatim.
                 let replay_bytes: Option<Vec<u8>> = match (
                     fs_input.content.as_deref(),
                     fs_input.content_b64.as_deref(),
@@ -525,17 +520,12 @@ impl concerto_core::traits::tool::Tool for FilesystemTool {
                 if let Some(bytes) = replay_bytes {
                     return Self::execute_bytes_write(&path, path_str, root, &mut vfs, bytes);
                 }
-                let raw_content =
-                    fs_input.content.as_deref().ok_or_else(|| ToolError::ExecutionFailed {
+                let content =
+                    fs_input.content.ok_or_else(|| ToolError::ExecutionFailed {
                         message: "missing 'content' field for write operation".into(),
                     })?;
-                // Normalize typographic Unicode at the write boundary so
-                // model-produced content can never land smart quotes,
-                // non-breaking hyphens, en dashes, or arrows in source files
-                // (they break `cargo build` and other ASCII-delimited
-                // tooling). The normalizer returns a borrow when the input is
-                // already clean, so plain content is zero-allocation.
-                let content = normalize_typographic(raw_content);
+                // File contents are opaque data. Even punctuation that looks
+                // like a mistaken delimiter may be intentional inside a string.
                 let content_len = content.len();
 
                 // Capture the original contents before materializing the write.
@@ -563,7 +553,7 @@ impl concerto_core::traits::tool::Tool for FilesystemTool {
                     })?;
                 }
 
-                std::fs::write(path.as_std_path(), content.as_ref()).map_err(|e| {
+                std::fs::write(path.as_std_path(), content.as_bytes()).map_err(|e| {
                     ToolError::Io(std::io::Error::new(
                         e.kind(),
                         format!(
@@ -574,7 +564,7 @@ impl concerto_core::traits::tool::Tool for FilesystemTool {
                     ))
                 })?;
 
-                vfs.write(&path, content.into_owned())?;
+                vfs.write(&path, content)?;
 
                 Ok(ToolOutput {
                     summary: format!("Wrote {content_len} bytes to {path_str}"),
@@ -1727,55 +1717,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_normalizes_typographic_characters_on_disk() {
+    async fn write_preserves_unicode_json_and_source_on_disk_and_in_overlay() {
         let (tool, dir) = tool_and_dir();
-        // Curly double quotes (U+201C/U+201D), non-breaking hyphen (U+2011),
-        // en dash (U+2013), rightwards arrow (U+2192), and curly single quotes
-        // (U+2018/U+2019) — exactly the characters a model can inject into
-        // source files.
-        let content = "// \u{201C}heading\u{201D}\nlet s = \u{201C}\u{2011}fast\u{201D};\nlet r = a\u{2013}b;\nlet f = |x| x \u{2192} x;\nlet q = \u{2018}y\u{2019};\n";
-        tool.execute(
-            serde_json::json!({
-                "operation": "write",
-                "path": "src/example.rs",
-                "content": content,
-            }),
-            &test_policy(),
-            &session_for(dir.path()),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-        let on_disk = std::fs::read_to_string(dir.path().join("src/example.rs")).unwrap();
-        let expected =
-            "// \"heading\"\nlet s = \"-fast\";\nlet r = a-b;\nlet f = |x| x -> x;\nlet q = 'y';\n";
-        assert_eq!(on_disk, expected);
-        // No typographic character may survive on disk in any form.
-        assert!(
-            !on_disk.chars().any(|ch| matches!(
-                ch,
-                '\u{00A0}'
-                    | '\u{202F}'
-                    | '\u{2018}'
-                    | '\u{2019}'
-                    | '\u{201C}'
-                    | '\u{201D}'
-                    | '\u{2010}'
-                    | '\u{2011}'
-                    | '\u{2012}'
-                    | '\u{2013}'
-                    | '\u{2192}'
-            )),
-            "typographic characters leaked to disk: {on_disk:?}"
-        );
+        // Unicode inside ASCII-delimited strings is valid data. Replacing
+        // curly quotes with ASCII quotes would make both fixtures invalid.
+        for (relative, content) in [
+            ("data.json", "{\"message\":\"‘hi’ “world” ‐‑‒– →\u{00a0}\u{202f}東京\"}\n"),
+            (
+                "src/example.rs",
+                "const MESSAGE: &str = \"‘hi’ “world” ‐‑‒– →\u{00a0}\u{202f}東京\";\n",
+            ),
+        ] {
+            let output = tool
+                .execute(
+                    serde_json::json!({
+                        "operation": "write",
+                        "path": relative,
+                        "content": content,
+                    }),
+                    &test_policy(),
+                    &session_for(dir.path()),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            let path = dir.path().join(relative);
+            assert_eq!(std::fs::read(&path).unwrap(), content.as_bytes());
+            assert_eq!(output.data["size"], content.len());
+            let vfs = tool.vfs().lock().unwrap();
+            assert_eq!(
+                vfs.read_bytes(Utf8Path::from_path(&path).unwrap()).unwrap(),
+                content.as_bytes()
+            );
+        }
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("data.json")).unwrap()).unwrap();
+        assert_eq!(json["message"], "‘hi’ “world” ‐‑‒– →\u{00a0}\u{202f}東京");
     }
 
     #[tokio::test]
     async fn write_leaves_plain_content_unchanged() {
         let (tool, dir) = tool_and_dir();
-        // ASCII-only content (a Cargo.toml) must round-trip byte-identical:
-        // the normalizer's borrow fast path must not rewrite anything.
+        // ASCII-only content (a Cargo.toml) must also round-trip byte-identical.
         let content = "[package]\nname = \"example\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nserde = \"1\"\n";
         tool.execute(
             serde_json::json!({
@@ -1795,8 +1778,7 @@ mod tests {
     #[tokio::test]
     async fn write_preserves_em_dash() {
         let (tool, dir) = tool_and_dir();
-        // U+2014 EM DASH is legal punctuation in prose and comments and is
-        // deliberately left untouched by the normalizer contract.
+        // Prose punctuation is preserved just like source and data content.
         let content = "// README \u{2014} describes the design\n";
         tool.execute(
             serde_json::json!({

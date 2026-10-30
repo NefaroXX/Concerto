@@ -111,6 +111,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **File writes preserve Unicode content exactly.** Filesystem writes and VFS
+  staging/appending no longer replace Unicode punctuation with ASCII. This
+  prevents valid JSON and source literals from being corrupted and preserves
+  existing text when appending. Text and byte writes both retain their content.
 - **Streamed provider events survive fragmented network delivery.** The shared
   SSE parser retains event fields across chunks and treats a split CRLF pair
   as one line ending, preventing lost text/tool-call payloads and premature

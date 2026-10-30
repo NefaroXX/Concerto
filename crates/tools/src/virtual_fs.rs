@@ -10,7 +10,6 @@
 //! which paths were applied and which were not.
 
 use camino::{Utf8Path, Utf8PathBuf};
-use concerto_core::text::normalize_typographic;
 use concerto_core::ToolError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -293,26 +292,17 @@ impl VirtualFs {
     /// Writes content to a file at the given path.
     ///
     /// If the file exists, it becomes `Modified`. If it does not exist, it
-    /// becomes `Created`. Model-produced text is normalized (see below);
-    /// byte replay ([`VirtualFs::write_bytes`]) stages verbatim instead.
+    /// becomes `Created`. UTF-8 content is staged verbatim; use
+    /// [`VirtualFs::write_bytes`] for arbitrary bytes.
     pub fn write(&mut self, path: &Utf8Path, content: String) -> Result<(), ToolError> {
-        // Normalize typographic Unicode at the VFS write boundary (defense in
-        // depth on top of the filesystem tool): any caller that stages text
-        // produced by a model — the tool, the desktop diff viewer, plugins —
-        // lands ASCII quotes/dashes instead of smart punctuation that would
-        // break parsing. The normalizer returns a borrow when the input is
-        // already clean, so plain content is zero-allocation. Only file
-        // content is normalized, never the path.
-        let content = normalize_typographic(&content).into_owned();
         self.stage_text(path, content)
     }
 
     /// Writes arbitrary bytes to a file at the given path.
     ///
     /// The byte-replay boundary (checkpoint restore replays banked bytes
-    /// verbatim): unlike [`VirtualFs::write`], the bytes are staged **without**
-    /// typographic normalization, so a restore is byte-exact even for text
-    /// carrying smart quotes. UTF-8 bytes stage as text entries (reads,
+    /// verbatim). Like [`VirtualFs::write`], staging preserves the supplied
+    /// content exactly. UTF-8 bytes stage as text entries (reads,
     /// diffs, and appends keep working); non-UTF-8 bytes stage as byte
     /// entries (reads show the binary placeholder, commits write the exact
     /// bytes). If the file exists, it becomes `Modified`/`ModifiedBytes`;
@@ -397,10 +387,9 @@ impl VirtualFs {
 
     /// Stage text exactly as given, without typographic normalization.
     ///
-    /// Shared transitions for [`VirtualFs::write`] (normalized model text)
-    /// and the [`VirtualFs::write_bytes`] UTF-8 path (verbatim byte replay
-    /// for byte-exact restore). Byte predecessors convert losslessly when
-    /// their staged bytes are UTF-8, else the standard binary placeholder
+    /// Shared transitions for [`VirtualFs::write`] and the
+    /// [`VirtualFs::write_bytes`] UTF-8 path. Byte predecessors convert
+    /// losslessly when their staged bytes are UTF-8, else the binary placeholder
     /// stands in as the original — text hunks can never address raw bytes,
     /// so the placeholder is the honest original there.
     fn stage_text(&mut self, path: &Utf8Path, content: String) -> Result<(), ToolError> {
@@ -500,11 +489,6 @@ impl VirtualFs {
             });
         }
         let existing = self.read(path)?;
-        // Normalize appended content as well. `write` normalizes too
-        // (idempotent, zero-cost for clean input), but normalizing here keeps
-        // `append` safe even if its implementation ever stops routing through
-        // `write`.
-        let content = normalize_typographic(content);
         self.write(path, format!("{existing}{content}"))
     }
 
@@ -1296,18 +1280,26 @@ mod tests {
     }
 
     #[test]
-    fn write_normalizes_typographic_content() {
+    fn write_preserves_unicode_through_staging_and_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("data.json")).unwrap();
         let mut fs = VirtualFs::new();
-        fs.write(
-            Utf8Path::new("test.txt"),
-            "let s = \u{201C}smart\u{201D} \u{2011}nb \u{2013}en \u{2192} arrow \u{2018}q\u{2019};"
-                .to_string(),
-        )
-        .unwrap();
-        assert_eq!(
-            fs.read(Utf8Path::new("test.txt")).unwrap(),
-            "let s = \"smart\" -nb -en -> arrow 'q';"
-        );
+        let original = "{\"message\":\"“hello” →\"}\n";
+        let updated = "{\"message\":\"‘hi’ ‐‑‒–\u{00a0}\u{202f}東京\"}\n";
+        fs.write(&path, original.into()).unwrap();
+        assert_eq!(fs.read_bytes(&path).unwrap(), original.as_bytes());
+        fs.commit_to_disk().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+
+        // An overwrite retains the exact original for diff/rejection and
+        // stages the supplied replacement without altering either version.
+        let mut fs = VirtualFs::new();
+        fs.read_disk(&path).unwrap();
+        fs.write(&path, updated.into()).unwrap();
+        assert_eq!(fs.get(&path).unwrap().original_content(), Some(original));
+        assert_eq!(fs.read_bytes(&path).unwrap(), updated.as_bytes());
+        fs.commit_to_disk().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), updated.as_bytes());
     }
 
     #[test]
@@ -1333,8 +1325,7 @@ mod tests {
 
     #[test]
     fn write_bytes_utf8_stages_verbatim_text() {
-        // Byte replay skips typographic normalization: banked smart quotes
-        // stage exactly (byte-exact restore), unlike model-produced writes.
+        // Byte replay preserves UTF-8 content as text without changing bytes.
         let mut fs = VirtualFs::new();
         let path = Utf8Path::new("quotes.txt");
         let text = "say \u{201C}hi\u{201D}";
@@ -1424,11 +1415,28 @@ mod tests {
     }
 
     #[test]
-    fn append_normalizes_typographic_content() {
-        let mut fs = VirtualFs::new();
-        fs.write(Utf8Path::new("test.txt"), "let a = 1;".to_string()).unwrap();
-        fs.append(Utf8Path::new("test.txt"), " // \u{201C}done\u{201D} \u{2192} \u{2013}").unwrap();
-        assert_eq!(fs.read(Utf8Path::new("test.txt")).unwrap(), "let a = 1; // \"done\" -> -");
+    fn append_preserves_unicode_in_existing_and_appended_text() {
+        for staged in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = Utf8PathBuf::from_path_buf(dir.path().join("example.rs")).unwrap();
+            let original = "const OLD: &str = \"“hello” →\";\n";
+            let appended = "const NEW: &str = \"‘hi’ ‐‑‒–\u{00a0}\u{202f}東京\";\n";
+            std::fs::write(&path, original).unwrap();
+            let mut fs = VirtualFs::new();
+            fs.read_disk(&path).unwrap();
+            let prefix = if staged {
+                fs.write(&path, appended.into()).unwrap();
+                appended
+            } else {
+                original
+            };
+            fs.append(&path, appended).unwrap();
+            assert_eq!(fs.get(&path).unwrap().original_content(), Some(original));
+            let expected = format!("{prefix}{appended}");
+            assert_eq!(fs.read_bytes(&path).unwrap(), expected.as_bytes());
+            fs.commit_to_disk().unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), expected.as_bytes());
+        }
     }
 
     #[test]

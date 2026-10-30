@@ -1,7 +1,8 @@
 # Harness reliability work log
 
-Audit baseline: `8c11c4a` (2026-10-29). Scope: the twelve findings from the
-source audit and local probes. Changes land in verified, reviewable milestones.
+Audit baseline: `8c11c4a` (2026-10-29). Scope: the twelve initial findings from
+the source audit and local probes, plus follow-up findings recorded below.
+Changes land in verified, reviewable milestones.
 This log distinguishes completed fixes from findings still requiring work;
 passing repository tests alone does not close a finding.
 
@@ -10,7 +11,7 @@ passing repository tests alone does not close a finding.
 | ID | Priority | Finding | Status |
 | --- | --- | --- | --- |
 | H01 | P1 | SSE events lost across network chunk boundaries | Fixed and verified; awaiting merge |
-| H02 | P1 | Ordinary file writes rewrite valid Unicode content | Open |
+| H02 | P1 | Ordinary file writes rewrite valid Unicode content | Fixed and verified; awaiting merge |
 | H03 | P1 | VFS reads shadow external disk changes | Open |
 | H04 | P1 | Scoped Rust verification can pass with zero tests | Open |
 | H05 | P1 | Premature provider EOF accepted as successful completion | Open |
@@ -21,6 +22,8 @@ passing repository tests alone does not close a finding.
 | H10 | P2 | Agent-driven benchmark fixture policy denies tools | Open |
 | H11 | P2 | Empty benchmark outcomes force a zero pass score | Open |
 | H12 | P2 | Durable event subscriber queues have no memory bound | Open |
+| H13 | P1 | Structured-response parsing rewrites Unicode before attempting JSON parsing | Open; source traced during H02 |
+| H14 | P2 | Checkpoint startup can degrade into ToolNotFound; CLI test failed intermittently | Open; observed during H02 verification |
 
 ## 2026-10-29 — H01: preserve streaming events across chunks
 
@@ -76,5 +79,53 @@ Branch: `fix/harness-streaming-integrity`.
   all scratch files inside this repository invalidates the eval test that
   requires a directory without a Cargo manifest in its ancestors.
 
-Next milestone: H02, preserve file-write content with regressions for Unicode
-inside valid JSON and source literals.
+## 2026-10-30 — H02: preserve file-write content
+
+- **Failure:** the filesystem tool and VFS globally replace Unicode
+  punctuation in supplied content. Curly quotes inside valid JSON or Rust
+  strings become unescaped ASCII delimiters; other replacements silently
+  change data. Appending can also rewrite the existing prefix.
+- **Change:** remove punctuation rewriting from filesystem text writes and VFS
+  writes/appends. Both text and byte channels now preserve supplied content;
+  the text path moves its owned string into the overlay after writing the same
+  bytes to disk. Document the verbatim contract in the API/schema and clarify
+  that the shared normalizer is a lossy repair utility.
+- **Regression coverage:** three replacement tests assert exact bytes for valid
+  JSON and source literals on disk and in the overlay; original/replacement
+  content through staging and commit; and append to both original and modified
+  entries without changing the prefix. Fixtures include all punctuation the
+  old write path replaced, non-breaking spaces, and Japanese text.
+- **Verification:** all three regressions failed against the previous
+  implementation. `cargo test -p concerto-tools --locked` passed all 340 tests;
+  formatting and diff checks passed. Workspace Clippy (all targets, warnings
+  denied) and `cargo build --workspace --locked` passed. The workspace retry
+  (`cargo test --workspace --locked --no-fail-fast`) passed: 5,995 tests, zero
+  failed, 16 ignored across 84 groups, including integration and doc tests.
+  The first fixed-code run exposed a test setup mistake (materialization
+  retains the staged entry); the overwrite test now explicitly loads the
+  committed original into a fresh VFS before checking modification semantics.
+- **Index:** refreshed the semantic index with `ccc index`. The graph refresh
+  completed, but its fast-mode exclusions include `crates/tools`; graph results
+  alone should not be treated as proof that this crate's index is current.
+- **Follow-up H13:** `parse_json_value` and `parse_json_substring` in
+  `crates/orchestrator/src/prompts.rs` normalize the whole response before
+  parsing, including characters inside valid JSON strings. This requires a
+  separate parser fix and regression coverage; H02 covers filesystem/VFS
+  preservation of the content supplied to those APIs.
+- **Workspace failure / H14:** the first H02 workspace run failed in
+  `cli_checkpoint_create_then_inspect_share_the_service_payloads`: create
+  succeeded, then inspect returned `tool not found: checkpoint_inspect`.
+  Nineteen subsequent CLI tests failed on the poisoned environment lock.
+  The checkpoint test passed immediately when run alone with the same binary.
+  Source trace: `runtime_runner::build_audit_sink` returns a missing pool after
+  initialization errors, and `build_standalone_harness_with_memory` then skips
+  registering checkpoint tools. The original database-init error was not
+  captured in the test output; the intermittent trigger remains unconfirmed.
+  This path does not write file contents through the APIs changed in H02.
+  The full CLI rerun passed all 314 tests, and the workspace retry passed as
+  recorded above, without code changes between runs. H14 remains open.
+
+H01–H02 review: [draft PR #379](https://github.com/NefaroXX/Concerto/pull/379).
+
+Next milestone: H03, distinguish cached disk originals from pending overlay
+edits so external changes do not silently disappear from reads.
