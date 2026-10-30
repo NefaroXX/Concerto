@@ -111,6 +111,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Streamed provider events survive fragmented network delivery.** The shared
+  SSE parser retains event fields across chunks and treats a split CRLF pair
+  as one line ending, preventing lost text/tool-call payloads and premature
+  event dispatch. Regression tests cover every split point and byte-by-byte
+  delivery with Unicode, multiline data and keepalives.
 - **The write gate surfaces approvals instead of hard-denying them.**
   `WriteGate::run_gated` returned `GateError::Denied` for every
   `RequireApproval` verdict (ADR-60's interactive approval surfacing was
