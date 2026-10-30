@@ -12,7 +12,7 @@ passing repository tests alone does not close a finding.
 | --- | --- | --- | --- |
 | H01 | P1 | SSE events lost across network chunk boundaries | Fixed and verified; awaiting merge |
 | H02 | P1 | Ordinary file writes rewrite valid Unicode content | Fixed and verified; awaiting merge |
-| H03 | P1 | VFS reads shadow external disk changes | Open |
+| H03 | P1 | VFS reads shadow external disk changes | Fixed and verified; awaiting merge |
 | H04 | P1 | Scoped Rust verification can pass with zero tests | Open |
 | H05 | P1 | Premature provider EOF accepted as successful completion | Open |
 | H06 | P1 | Default write versions are captured after the agent's read | Open |
@@ -24,6 +24,7 @@ passing repository tests alone does not close a finding.
 | H12 | P2 | Durable event subscriber queues have no memory bound | Open |
 | H13 | P1 | Structured-response parsing rewrites Unicode before attempting JSON parsing | Open; source traced during H02 |
 | H14 | P2 | Checkpoint startup can degrade into ToolNotFound; CLI test failed intermittently | Open; observed during H02 verification |
+| H15 | P1 | Orchestrator read cache trusts matching size/mtime without checking current bytes | Open; source traced during H03 |
 
 ## 2026-10-29 — H01: preserve streaming events across chunks
 
@@ -125,7 +126,73 @@ Branch: `fix/harness-streaming-integrity`.
   The full CLI rerun passed all 314 tests, and the workspace retry passed as
   recorded above, without code changes between runs. H14 remains open.
 
-H01–H02 review: [draft PR #379](https://github.com/NefaroXX/Concerto/pull/379).
+H01–H03 review: [draft PR #379](https://github.com/NefaroXX/Concerto/pull/379).
 
-Next milestone: H03, distinguish cached disk originals from pending overlay
-edits so external changes do not silently disappear from reads.
+## 2026-10-30 — H03: refresh clean reads without losing staged intent
+
+Implementation baseline: `0e2e778`.
+
+- **Failure:** unbounded, byte and bounded reads treat cached `Original`
+  entries as authoritative after external edits or deletion. The filesystem
+  tool also falls back to disk for staged deletions because `exists` is false.
+- **Design:** clean originals must read current disk state; staged text, bytes
+  and deletions keep precedence. A full hunk rejection is a pending write of
+  restored content, so it must not become a refreshable disk cache before it
+  is materialized. Preserve the existing no-diff result for that restoration.
+- **Change:** text, byte and bounded reads bypass clean cached originals;
+  filesystem reads refresh those observations. Existence checks distinguish
+  staged deletion from a cached disk observation. Appends and transfers use
+  current sources, with UTF-8 validation before appending to a disk file.
+  Full rejection retains a `Modified` entry whose current content equals its
+  original, preserving the pending restoration without reporting a diff.
+  ADR-62 §4 documents this distinction using existing serialized variants.
+  Materialization continues to retain staged review state; explicit unstaging
+  returns disk authority, as for other pending edits.
+- **Regression coverage:** ten tests cover external edits/deletion, bounded
+  size enforcement, exact binary reads/copies, current append/move preimages,
+  rejection of a binary replacement during append, all staged entry kinds,
+  snapshot restoration, and full hunk rejection before materialization.
+- **Verification:** seven of the initial eight regression tests failed
+  against the baseline; the existing staged-precedence behavior passed.
+  An intermediate focused run passed all 350 tools tests, including the two
+  additional boundary tests. Final review added assertions that a no-op hunk
+  rejection leaves clean observations refreshable, invalid hunk selections
+  retain their out-of-bounds error, and bounded tool reads refresh an existing
+  observation to the exact returned text. The final-source workspace run
+  (`cargo test --workspace --locked --no-fail-fast -j 2`) passed: 6,005 tests,
+  zero failed, 16 ignored across 84 groups, including integration and doc tests.
+  `cargo build --workspace --locked -j 2`, formatting and diff checks passed.
+  `cargo clippy --workspace --all-targets --locked -j 2 -- -D warnings`
+  passed against the final source. No dependencies or policy rules changed.
+- **Earlier workspace run:** both `supervisor_slice_crash` tests failed at
+  `whiteboard_pool` setup with `PoolTimedOut`, before exercising their test
+  behavior. The remaining targets completed. Both tests passed in an isolated
+  rerun with the same test binary; the intermittent setup trigger remains
+  unconfirmed. The final-source workspace run passed both tests. No timeouts
+  were increased and no tests were disabled to accommodate this failure.
+- **Intermediate revalidation:** another run, overlapping the rebuild after
+  final review, failed in two supervisor tests: replay timed out waiting for
+  whiteboard events (`supervisor_conflict`), and a healthy-silent-agent test
+  observed one restart instead of zero (`supervisor_loop`). Desktop and eval
+  doc tests also failed because their referenced tools rlib was absent during
+  overlapping compilation. These results are not a valid final verification
+  pass. The final-source workspace test run, after the build completed,
+  passed all four targets. The supervisor failures remain observations with
+  unconfirmed triggers; neither is treated as fixed by H03. Future verification
+  must serialize Cargo test/build/Clippy operations against one target directory
+  and freeze source before the final run.
+- **Index:** refreshed the semantic index with `ccc index` after the final
+  source changes. The graph server was unavailable (transport closed).
+- **Follow-up H15:** `read_cache/serve.rs::maybe_serve_read` checks current disk
+  size and millisecond mtime, then hashes only the cached content. A same-size
+  external edit retaining/restoring the timestamp can therefore serve stale
+  bytes without invoking the filesystem tool. This separate orchestrator cache
+  defect is source-traced and still needs a focused regression/fix; H03 fixes
+  reads that reach the VFS/tool, not every end-to-end cache path.
+- **Remaining:** H06 still governs optimistic write-version capture; these
+  fresh reads do not make subsequent writes atomic against external changes.
+  Read-only VFS accessors do not rebind recorded originals to write preimages;
+  write/preimage consistency needs separate coverage with H06.
+
+Next milestone: H04, prevent scoped Rust verification from passing with zero
+tests. H15 also needs attention before claiming end-to-end read freshness.

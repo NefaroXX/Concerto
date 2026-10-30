@@ -111,6 +111,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **VFS reads reflect external edits and deletions.** Clean VFS originals
+  now read current disk contents, including bounded and binary reads. Pending
+  edits, deletions and rejected diff restorations retain precedence; appends
+  and transfers use fresh sources without copying binary placeholder text.
 - **File writes preserve Unicode content exactly.** Filesystem writes and VFS
   staging/appending no longer replace Unicode punctuation with ASCII. This
   prevents valid JSON and source literals from being corrupted and preserves

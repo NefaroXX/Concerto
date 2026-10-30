@@ -1,7 +1,7 @@
 //! Filesystem tool — exposes `VirtualFs` operations through the `Tool` trait,
 //! policy-gated via the executor choke-point.
 
-use crate::virtual_fs::{reject_reserved_device_name, VirtualFs};
+use crate::virtual_fs::{reject_reserved_device_name, VirtualFs, VirtualFsEntry};
 use async_trait::async_trait;
 use camino::Utf8Path;
 use concerto_core::traits::PolicyEngine;
@@ -457,10 +457,19 @@ impl concerto_core::traits::tool::Tool for FilesystemTool {
                         ),
                     });
                 }
-                // First try the in-memory VFS; if not found, load from disk.
+                // Pending changes (including deletion) win over disk. Clean
+                // originals are observations, so refresh them on every read.
                 let content = if let Some(max_bytes) = input.get("max_bytes").and_then(serde_json::Value::as_u64) {
-                    vfs.read_bounded(&path, usize::try_from(max_bytes).unwrap_or(usize::MAX))?
-                } else if vfs.exists(&path) {
+                    let content = vfs.read_bounded(&path, usize::try_from(max_bytes).unwrap_or(usize::MAX))?;
+                    // Keep an existing observation aligned with the returned
+                    // bytes, just as read_disk does for unbounded reads.
+                    if matches!(vfs.get(&path), Some(VirtualFsEntry::Original { .. })) {
+                        vfs.insert(VirtualFsEntry::Original {
+                            path: path.clone(), content: content.clone(),
+                        });
+                    }
+                    content
+                } else if !matches!(vfs.get(&path), None | Some(VirtualFsEntry::Original { .. })) {
                     vfs.read(&path)?
                 } else {
                     vfs.read_disk(&path).map_err(|error| {
@@ -606,7 +615,11 @@ impl concerto_core::traits::tool::Tool for FilesystemTool {
             }
             "exists" => {
                 check_cancel(&cancel)?;
-                let exists = vfs.exists(&path) || vfs.exists_on_disk(&path);
+                let exists = if vfs.get(&path).is_some() {
+                    vfs.exists(&path)
+                } else {
+                    vfs.exists_on_disk(&path)
+                };
                 Ok(ToolOutput {
                     summary: if exists {
                         format!("{path_str} exists")
@@ -886,6 +899,80 @@ mod tests {
 
     fn test_policy() -> AllowAllPolicy {
         AllowAllPolicy
+    }
+
+    #[tokio::test]
+    async fn freshness_tool_reads_follow_external_changes_and_deletion() {
+        let (tool, dir) = tool_and_dir();
+        let path = dir.path().join("live.txt");
+        std::fs::write(&path, "before").unwrap();
+        let resolved = crate::common::resolve_path(&tool.root, Utf8Path::new("live.txt")).unwrap();
+        for (expected, limit) in [("before", None), ("after!", None), ("bounded", Some(7))] {
+            std::fs::write(&path, expected).unwrap();
+            let mut input = serde_json::json!({"operation": "read", "path": "live.txt"});
+            if let Some(limit) = limit {
+                input["max_bytes"] = serde_json::json!(limit);
+            }
+            let output = tool
+                .execute(input, &test_policy(), &session_for(dir.path()), CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(output.data["content"], expected);
+            assert_eq!(
+                tool.vfs().lock().unwrap().get(&resolved).unwrap().original_content(),
+                Some(expected),
+            );
+        }
+        std::fs::remove_file(&path).unwrap();
+        let result = tool
+            .execute(
+                serde_json::json!({"operation": "read", "path": "live.txt"}),
+                &test_policy(),
+                &session_for(dir.path()),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(result.is_err());
+        let exists = tool
+            .execute(
+                serde_json::json!({"operation": "exists", "path": "live.txt"}),
+                &test_policy(),
+                &session_for(dir.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exists.data["exists"], false);
+    }
+
+    #[tokio::test]
+    async fn freshness_tool_does_not_resurrect_a_staged_deletion() {
+        let (tool, dir) = tool_and_dir();
+        let path = dir.path().join("deleted.txt");
+        std::fs::write(&path, "still on disk").unwrap();
+        let resolved =
+            crate::common::resolve_path(&tool.root, Utf8Path::new("deleted.txt")).unwrap();
+        tool.vfs().lock().unwrap().stage_delete(&resolved).unwrap();
+        for input in [
+            serde_json::json!({"operation": "read", "path": "deleted.txt"}),
+            serde_json::json!({"operation": "read", "path": "deleted.txt", "max_bytes": 100}),
+        ] {
+            assert!(tool
+                .execute(input, &test_policy(), &session_for(dir.path()), CancellationToken::new())
+                .await
+                .is_err());
+        }
+        let exists = tool
+            .execute(
+                serde_json::json!({"operation": "exists", "path": "deleted.txt"}),
+                &test_policy(),
+                &session_for(dir.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exists.data["exists"], false);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "still on disk");
     }
 
     #[tokio::test]
