@@ -1,10 +1,9 @@
 //! Filesystem tool — exposes `VirtualFs` operations through the `Tool` trait,
 //! policy-gated via the executor choke-point.
 
-use crate::virtual_fs::{reject_reserved_device_name, VirtualFs};
+use crate::virtual_fs::{reject_reserved_device_name, VirtualFs, VirtualFsEntry};
 use async_trait::async_trait;
 use camino::Utf8Path;
-use concerto_core::text::normalize_typographic;
 use concerto_core::traits::PolicyEngine;
 use concerto_core::types::{CapabilitySet, PathPolicyFacts, SessionContext, ToolOutput};
 use concerto_core::{CancellationToken, ToolError};
@@ -30,9 +29,9 @@ pub struct FilesystemInput {
     pub operation: String,
     /// Path relative to project root. Use "." to list the workspace root.
     pub path: String,
-    /// Content to write (required for the "write" operation only).
+    /// UTF-8 content to write verbatim (required for the "write" operation only).
     #[serde(default)]
-    #[schemars(description = "Content to write (required for write operation).")]
+    #[schemars(description = "UTF-8 content to write verbatim (required for write operation).")]
     pub content: Option<String>,
     /// Standard-base64-encoded bytes to write (alternative to `content` for
     /// the "write" operation only).
@@ -40,9 +39,8 @@ pub struct FilesystemInput {
     /// The byte-replay channel: checkpoint restore replays banked bytes
     /// verbatim through this field because JSON strings are Unicode and
     /// cannot carry arbitrary bytes. Exactly one of `content`/`content_b64`
-    /// must be present on a write; `content_b64` bytes are written to disk
-    /// and staged **without** typographic normalization (byte-exact replay),
-    /// while `content` keeps the model-output hygiene.
+    /// must be present on a write. Both channels preserve their supplied
+    /// content exactly; `content_b64` also supports non-UTF-8 bytes.
     #[serde(default)]
     #[schemars(
         description = "Base64-encoded bytes to write (alternative to content for write operation; written verbatim without normalization)."
@@ -459,10 +457,19 @@ impl concerto_core::traits::tool::Tool for FilesystemTool {
                         ),
                     });
                 }
-                // First try the in-memory VFS; if not found, load from disk.
+                // Pending changes (including deletion) win over disk. Clean
+                // originals are observations, so refresh them on every read.
                 let content = if let Some(max_bytes) = input.get("max_bytes").and_then(serde_json::Value::as_u64) {
-                    vfs.read_bounded(&path, usize::try_from(max_bytes).unwrap_or(usize::MAX))?
-                } else if vfs.exists(&path) {
+                    let content = vfs.read_bounded(&path, usize::try_from(max_bytes).unwrap_or(usize::MAX))?;
+                    // Keep an existing observation aligned with the returned
+                    // bytes, just as read_disk does for unbounded reads.
+                    if matches!(vfs.get(&path), Some(VirtualFsEntry::Original { .. })) {
+                        vfs.insert(VirtualFsEntry::Original {
+                            path: path.clone(), content: content.clone(),
+                        });
+                    }
+                    content
+                } else if !matches!(vfs.get(&path), None | Some(VirtualFsEntry::Original { .. })) {
                     vfs.read(&path)?
                 } else {
                     vfs.read_disk(&path).map_err(|error| {
@@ -490,11 +497,8 @@ impl concerto_core::traits::tool::Tool for FilesystemTool {
                 // reserved-name check, so `std::fs::write` to `<root>\nul`
                 // would create a literal 0-byte file instead of erroring.
                 reject_reserved_device_name(&path)?;
-                // Byte-replay channel (`content_b64`) vs model-text channel
-                // (`content`): exactly one must be present. Bytes are
-                // decoded and written verbatim (no typographic
-                // normalization — the caller replays banked bytes); text
-                // keeps the normalization hygiene below.
+                // Exactly one of the byte (`content_b64`) or UTF-8 text
+                // (`content`) channels must be present. Both are verbatim.
                 let replay_bytes: Option<Vec<u8>> = match (
                     fs_input.content.as_deref(),
                     fs_input.content_b64.as_deref(),
@@ -525,17 +529,12 @@ impl concerto_core::traits::tool::Tool for FilesystemTool {
                 if let Some(bytes) = replay_bytes {
                     return Self::execute_bytes_write(&path, path_str, root, &mut vfs, bytes);
                 }
-                let raw_content =
-                    fs_input.content.as_deref().ok_or_else(|| ToolError::ExecutionFailed {
+                let content =
+                    fs_input.content.ok_or_else(|| ToolError::ExecutionFailed {
                         message: "missing 'content' field for write operation".into(),
                     })?;
-                // Normalize typographic Unicode at the write boundary so
-                // model-produced content can never land smart quotes,
-                // non-breaking hyphens, en dashes, or arrows in source files
-                // (they break `cargo build` and other ASCII-delimited
-                // tooling). The normalizer returns a borrow when the input is
-                // already clean, so plain content is zero-allocation.
-                let content = normalize_typographic(raw_content);
+                // File contents are opaque data. Even punctuation that looks
+                // like a mistaken delimiter may be intentional inside a string.
                 let content_len = content.len();
 
                 // Capture the original contents before materializing the write.
@@ -563,7 +562,7 @@ impl concerto_core::traits::tool::Tool for FilesystemTool {
                     })?;
                 }
 
-                std::fs::write(path.as_std_path(), content.as_ref()).map_err(|e| {
+                std::fs::write(path.as_std_path(), content.as_bytes()).map_err(|e| {
                     ToolError::Io(std::io::Error::new(
                         e.kind(),
                         format!(
@@ -574,7 +573,7 @@ impl concerto_core::traits::tool::Tool for FilesystemTool {
                     ))
                 })?;
 
-                vfs.write(&path, content.into_owned())?;
+                vfs.write(&path, content)?;
 
                 Ok(ToolOutput {
                     summary: format!("Wrote {content_len} bytes to {path_str}"),
@@ -616,7 +615,11 @@ impl concerto_core::traits::tool::Tool for FilesystemTool {
             }
             "exists" => {
                 check_cancel(&cancel)?;
-                let exists = vfs.exists(&path) || vfs.exists_on_disk(&path);
+                let exists = if vfs.get(&path).is_some() {
+                    vfs.exists(&path)
+                } else {
+                    vfs.exists_on_disk(&path)
+                };
                 Ok(ToolOutput {
                     summary: if exists {
                         format!("{path_str} exists")
@@ -896,6 +899,80 @@ mod tests {
 
     fn test_policy() -> AllowAllPolicy {
         AllowAllPolicy
+    }
+
+    #[tokio::test]
+    async fn freshness_tool_reads_follow_external_changes_and_deletion() {
+        let (tool, dir) = tool_and_dir();
+        let path = dir.path().join("live.txt");
+        std::fs::write(&path, "before").unwrap();
+        let resolved = crate::common::resolve_path(&tool.root, Utf8Path::new("live.txt")).unwrap();
+        for (expected, limit) in [("before", None), ("after!", None), ("bounded", Some(7))] {
+            std::fs::write(&path, expected).unwrap();
+            let mut input = serde_json::json!({"operation": "read", "path": "live.txt"});
+            if let Some(limit) = limit {
+                input["max_bytes"] = serde_json::json!(limit);
+            }
+            let output = tool
+                .execute(input, &test_policy(), &session_for(dir.path()), CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(output.data["content"], expected);
+            assert_eq!(
+                tool.vfs().lock().unwrap().get(&resolved).unwrap().original_content(),
+                Some(expected),
+            );
+        }
+        std::fs::remove_file(&path).unwrap();
+        let result = tool
+            .execute(
+                serde_json::json!({"operation": "read", "path": "live.txt"}),
+                &test_policy(),
+                &session_for(dir.path()),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(result.is_err());
+        let exists = tool
+            .execute(
+                serde_json::json!({"operation": "exists", "path": "live.txt"}),
+                &test_policy(),
+                &session_for(dir.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exists.data["exists"], false);
+    }
+
+    #[tokio::test]
+    async fn freshness_tool_does_not_resurrect_a_staged_deletion() {
+        let (tool, dir) = tool_and_dir();
+        let path = dir.path().join("deleted.txt");
+        std::fs::write(&path, "still on disk").unwrap();
+        let resolved =
+            crate::common::resolve_path(&tool.root, Utf8Path::new("deleted.txt")).unwrap();
+        tool.vfs().lock().unwrap().stage_delete(&resolved).unwrap();
+        for input in [
+            serde_json::json!({"operation": "read", "path": "deleted.txt"}),
+            serde_json::json!({"operation": "read", "path": "deleted.txt", "max_bytes": 100}),
+        ] {
+            assert!(tool
+                .execute(input, &test_policy(), &session_for(dir.path()), CancellationToken::new())
+                .await
+                .is_err());
+        }
+        let exists = tool
+            .execute(
+                serde_json::json!({"operation": "exists", "path": "deleted.txt"}),
+                &test_policy(),
+                &session_for(dir.path()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exists.data["exists"], false);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "still on disk");
     }
 
     #[tokio::test]
@@ -1727,55 +1804,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_normalizes_typographic_characters_on_disk() {
+    async fn write_preserves_unicode_json_and_source_on_disk_and_in_overlay() {
         let (tool, dir) = tool_and_dir();
-        // Curly double quotes (U+201C/U+201D), non-breaking hyphen (U+2011),
-        // en dash (U+2013), rightwards arrow (U+2192), and curly single quotes
-        // (U+2018/U+2019) — exactly the characters a model can inject into
-        // source files.
-        let content = "// \u{201C}heading\u{201D}\nlet s = \u{201C}\u{2011}fast\u{201D};\nlet r = a\u{2013}b;\nlet f = |x| x \u{2192} x;\nlet q = \u{2018}y\u{2019};\n";
-        tool.execute(
-            serde_json::json!({
-                "operation": "write",
-                "path": "src/example.rs",
-                "content": content,
-            }),
-            &test_policy(),
-            &session_for(dir.path()),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-
-        let on_disk = std::fs::read_to_string(dir.path().join("src/example.rs")).unwrap();
-        let expected =
-            "// \"heading\"\nlet s = \"-fast\";\nlet r = a-b;\nlet f = |x| x -> x;\nlet q = 'y';\n";
-        assert_eq!(on_disk, expected);
-        // No typographic character may survive on disk in any form.
-        assert!(
-            !on_disk.chars().any(|ch| matches!(
-                ch,
-                '\u{00A0}'
-                    | '\u{202F}'
-                    | '\u{2018}'
-                    | '\u{2019}'
-                    | '\u{201C}'
-                    | '\u{201D}'
-                    | '\u{2010}'
-                    | '\u{2011}'
-                    | '\u{2012}'
-                    | '\u{2013}'
-                    | '\u{2192}'
-            )),
-            "typographic characters leaked to disk: {on_disk:?}"
-        );
+        // Unicode inside ASCII-delimited strings is valid data. Replacing
+        // curly quotes with ASCII quotes would make both fixtures invalid.
+        for (relative, content) in [
+            ("data.json", "{\"message\":\"‘hi’ “world” ‐‑‒– →\u{00a0}\u{202f}東京\"}\n"),
+            (
+                "src/example.rs",
+                "const MESSAGE: &str = \"‘hi’ “world” ‐‑‒– →\u{00a0}\u{202f}東京\";\n",
+            ),
+        ] {
+            let output = tool
+                .execute(
+                    serde_json::json!({
+                        "operation": "write",
+                        "path": relative,
+                        "content": content,
+                    }),
+                    &test_policy(),
+                    &session_for(dir.path()),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            let path = dir.path().join(relative);
+            assert_eq!(std::fs::read(&path).unwrap(), content.as_bytes());
+            assert_eq!(output.data["size"], content.len());
+            let vfs = tool.vfs().lock().unwrap();
+            assert_eq!(
+                vfs.read_bytes(Utf8Path::from_path(&path).unwrap()).unwrap(),
+                content.as_bytes()
+            );
+        }
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("data.json")).unwrap()).unwrap();
+        assert_eq!(json["message"], "‘hi’ “world” ‐‑‒– →\u{00a0}\u{202f}東京");
     }
 
     #[tokio::test]
     async fn write_leaves_plain_content_unchanged() {
         let (tool, dir) = tool_and_dir();
-        // ASCII-only content (a Cargo.toml) must round-trip byte-identical:
-        // the normalizer's borrow fast path must not rewrite anything.
+        // ASCII-only content (a Cargo.toml) must also round-trip byte-identical.
         let content = "[package]\nname = \"example\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nserde = \"1\"\n";
         tool.execute(
             serde_json::json!({
@@ -1795,8 +1865,7 @@ mod tests {
     #[tokio::test]
     async fn write_preserves_em_dash() {
         let (tool, dir) = tool_and_dir();
-        // U+2014 EM DASH is legal punctuation in prose and comments and is
-        // deliberately left untouched by the normalizer contract.
+        // Prose punctuation is preserved just like source and data content.
         let content = "// README \u{2014} describes the design\n";
         tool.execute(
             serde_json::json!({

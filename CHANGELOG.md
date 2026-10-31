@@ -111,6 +111,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Rust verification requires executed tests.** Cargo validation runs the full
+  suite at the resolved manifest root instead of guessing test-name filters
+  from changed paths. Empty, ignored-only or unrecognized results cannot pass
+  on exit code alone; direct and governed runs share the same evidence check.
+- **VFS reads reflect external edits and deletions.** Clean VFS originals
+  now read current disk contents, including bounded and binary reads. Pending
+  edits, deletions and rejected diff restorations retain precedence; appends
+  and transfers use fresh sources without copying binary placeholder text.
+- **File writes preserve Unicode content exactly.** Filesystem writes and VFS
+  staging/appending no longer replace Unicode punctuation with ASCII. This
+  prevents valid JSON and source literals from being corrupted and preserves
+  existing text when appending. Text and byte writes both retain their content.
+- **Streamed provider events survive fragmented network delivery.** The shared
+  SSE parser retains event fields across chunks and treats a split CRLF pair
+  as one line ending, preventing lost text/tool-call payloads and premature
+  event dispatch. Regression tests cover every split point and byte-by-byte
+  delivery with Unicode, multiline data and keepalives.
 - **The write gate surfaces approvals instead of hard-denying them.**
   `WriteGate::run_gated` returned `GateError::Denied` for every
   `RequireApproval` verdict (ADR-60's interactive approval surfacing was
