@@ -35,6 +35,7 @@ pub mod observation;
 pub mod persona_mem;
 pub mod runner;
 pub mod scenarios;
+mod test_output;
 pub use runner::EvalRunner;
 
 // ---------------------------------------------------------------------------
@@ -351,22 +352,13 @@ impl EvalEngine {
                 .ok_or_else(|| {
                     EvalError::TestRunnerFailed("native executor returned no exit code".into())
                 })?;
-            let combined = format!(
-                "{}{}",
-                output.data.get("stdout").and_then(serde_json::Value::as_str).unwrap_or_default(),
-                output.data.get("stderr").and_then(serde_json::Value::as_str).unwrap_or_default(),
-            );
-            let output_tail =
-                combined.chars().rev().take(2000).collect::<String>().chars().rev().collect();
-            return Ok(EvalResult {
+            return Ok(test_output::completed_result(
                 runner,
                 exit_code,
-                passed: exit_code == 0,
-                duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
-                output_tail,
-                coverage: None,
-                provenance: EvalProvenance::Harness,
-            });
+                u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                output.data.get("stdout").and_then(serde_json::Value::as_str).unwrap_or_default(),
+                output.data.get("stderr").and_then(serde_json::Value::as_str).unwrap_or_default(),
+            ));
         }
         let mut command = if let Some(profile) = &self.shell_profile {
             let backend = ShellProfileFactory::backend_for(profile);
@@ -400,26 +392,13 @@ impl EvalEngine {
         };
         let duration_ms = start.elapsed().as_millis() as u64;
         match output {
-            Ok(Ok(out)) => {
-                let exit_code = out.status.code().unwrap_or(-1);
-                let passed = out.status.success();
-                let combined = String::from_utf8_lossy(&out.stdout).to_string()
-                    + &String::from_utf8_lossy(&out.stderr);
-                let output_tail = if combined.len() > 2000 {
-                    combined[combined.len() - 2000..].to_string()
-                } else {
-                    combined
-                };
-                Ok(EvalResult {
-                    runner,
-                    exit_code,
-                    passed,
-                    duration_ms,
-                    output_tail,
-                    coverage: None,
-                    provenance: EvalProvenance::Harness,
-                })
-            }
+            Ok(Ok(out)) => Ok(test_output::completed_result(
+                runner,
+                out.status.code().unwrap_or(-1),
+                duration_ms,
+                &String::from_utf8_lossy(&out.stdout),
+                &String::from_utf8_lossy(&out.stderr),
+            )),
             Ok(Err(e)) => Err(EvalError::Io(e)),
             Err(_elapsed) => Ok(EvalResult {
                 runner,
@@ -486,7 +465,7 @@ impl EvalEngine {
 
     /// No-config fallback: run a plain `cargo test` in `project_dir` and mark
     /// the result [`EvalProvenance::Fallback`] with a note naming the missing
-    /// harness config. Pass/fail is whatever cargo reported.
+    /// harness config. A pass also requires confirmed executed Rust tests.
     async fn run_fallback_cargo_test(
         &self,
         project_dir: &Path,
@@ -512,7 +491,9 @@ impl EvalEngine {
         dir.ancestors().any(|ancestor| ancestor.join("Cargo.toml").exists())
     }
 
-    /// Run tests scoped to changed paths; falls back to full suite if mapping unavailable.
+    /// Run tests scoped to changed paths; fall back to the full suite when no
+    /// reliable mapping exists. Cargo always uses the full suite at the resolved
+    /// root: Rust module/test names cannot be inferred safely from file paths.
     pub async fn run_scoped(
         &self,
         changed_paths: &[camino::Utf8PathBuf],
@@ -547,32 +528,10 @@ impl EvalEngine {
         changed_paths: &[camino::Utf8PathBuf],
     ) -> Option<Vec<String>> {
         match runner {
-            TestRunner::Cargo => {
-                use std::collections::HashSet;
-                let mut modules: HashSet<String> = HashSet::new();
-                for path in changed_paths {
-                    let path_str = path.to_string();
-                    if !path_str.starts_with("src/") || !path_str.ends_with(".rs") {
-                        return None;
-                    }
-                    // Strip "src/" prefix and ".rs" suffix
-                    let mut rel = &path_str["src/".len()..path_str.len() - ".rs".len()];
-                    // Handle mod.rs case
-                    if rel.ends_with("/mod") {
-                        rel = &rel[..rel.len() - "/mod".len()];
-                    }
-                    let module_path = rel.replace('/', "::");
-                    modules.insert(module_path);
-                }
-                if modules.is_empty() {
-                    return Some(vec!["test".to_string()]);
-                }
-                // Build args: cargo test -- <module patterns>
-                let mut args = vec!["test".to_string(), "--".to_string()];
-                let pattern = modules.iter().cloned().collect::<Vec<_>>().join(" ");
-                args.push(pattern);
-                Some(args)
-            }
+            // File paths are not test dependencies: crate roots, #[path]
+            // modules and integration tests defeat name-based guesses. Even a
+            // nonempty filtered run can omit the tests affected by an edit.
+            TestRunner::Cargo => None,
             TestRunner::Pytest => {
                 // Return paths as-is for pytest (could be used as arguments)
                 Some(changed_paths.iter().map(|p| p.to_string()).collect())
@@ -969,9 +928,14 @@ mod tests {
             if self.deny {
                 return Err(EvalError::TestRunnerFailed("policy denied".into()));
             }
+            let stdout = format!(
+                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; \
+                 0 filtered out; finished in 0.00s\n{}",
+                "🙂".repeat(2100),
+            );
             Ok(concerto_core::types::ToolOutput {
                 summary: "validated".into(),
-                data: serde_json::json!({"exit_code":0,"stdout":"🙂".repeat(2100),"stderr":""}),
+                data: serde_json::json!({"exit_code":0,"stdout":stdout,"stderr":""}),
             })
         }
     }
@@ -1466,24 +1430,18 @@ mod tests {
     use camino::Utf8PathBuf;
 
     #[test]
-    fn scoped_args_cargo_returns_filtered_pattern() {
-        let paths = vec![Utf8PathBuf::from("src/lib.rs")];
-        let args = EvalEngine::scoped_args(&TestRunner::Cargo, &paths);
-        assert_eq!(args, Some(vec!["test".to_string(), "--".to_string(), "lib".to_string()]));
-    }
-
-    #[test]
-    fn scoped_args_cargo_non_src_returns_none() {
-        let paths = vec![Utf8PathBuf::from("tests/integration.rs")];
-        let args = EvalEngine::scoped_args(&TestRunner::Cargo, &paths);
-        assert!(args.is_none(), "paths outside src/ should return None");
-    }
-
-    #[test]
-    fn scoped_args_cargo_mod_rs_strips_mod() {
-        let paths = vec![Utf8PathBuf::from("src/cli/mod.rs")];
-        let args = EvalEngine::scoped_args(&TestRunner::Cargo, &paths);
-        assert_eq!(args, Some(vec!["test".to_string(), "--".to_string(), "cli".to_string()]));
+    fn scoped_args_cargo_falls_back_without_guessing_test_names() {
+        for paths in [
+            vec![],
+            vec!["src/lib.rs"],
+            vec!["src/main.rs"],
+            vec!["src/cli/mod.rs"],
+            vec!["src/first.rs", "src/second.rs"],
+            vec!["tests/integration.rs"],
+        ] {
+            let paths: Vec<_> = paths.into_iter().map(Utf8PathBuf::from).collect();
+            assert_eq!(EvalEngine::scoped_args(&TestRunner::Cargo, &paths), None);
+        }
     }
 
     #[test]

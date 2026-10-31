@@ -13,7 +13,7 @@ passing repository tests alone does not close a finding.
 | H01 | P1 | SSE events lost across network chunk boundaries | Fixed and verified; awaiting merge |
 | H02 | P1 | Ordinary file writes rewrite valid Unicode content | Fixed and verified; awaiting merge |
 | H03 | P1 | VFS reads shadow external disk changes | Fixed and verified; awaiting merge |
-| H04 | P1 | Scoped Rust verification can pass with zero tests | Open |
+| H04 | P1 | Scoped Rust verification can pass with zero tests | Fixed and verified; awaiting merge |
 | H05 | P1 | Premature provider EOF accepted as successful completion | Open |
 | H06 | P1 | Default write versions are captured after the agent's read | Open |
 | H07 | P1 | Verification errors can accompany Completed status | Open |
@@ -25,6 +25,7 @@ passing repository tests alone does not close a finding.
 | H13 | P1 | Structured-response parsing rewrites Unicode before attempting JSON parsing | Open; source traced during H02 |
 | H14 | P2 | Checkpoint startup can degrade into ToolNotFound; CLI test failed intermittently | Open; observed during H02 verification |
 | H15 | P1 | Orchestrator read cache trusts matching size/mtime without checking current bytes | Open; source traced during H03 |
+| H16 | P2 | Coverage-only Cargo runners trust exit status and truncate output at byte offsets | Open; source traced during H04 |
 
 ## 2026-10-29 — H01: preserve streaming events across chunks
 
@@ -126,7 +127,7 @@ Branch: `fix/harness-streaming-integrity`.
   The full CLI rerun passed all 314 tests, and the workspace retry passed as
   recorded above, without code changes between runs. H14 remains open.
 
-H01–H03 review: [draft PR #379](https://github.com/NefaroXX/Concerto/pull/379).
+H01–H04 review: [draft PR #379](https://github.com/NefaroXX/Concerto/pull/379).
 
 ## 2026-10-30 — H03: refresh clean reads without losing staged intent
 
@@ -194,5 +195,65 @@ Implementation baseline: `0e2e778`.
   Read-only VFS accessors do not rebind recorded originals to write preimages;
   write/preimage consistency needs separate coverage with H06.
 
-Next milestone: H04, prevent scoped Rust verification from passing with zero
-tests. H15 also needs attention before claiming end-to-end read freshness.
+H04 continues below. H15 also needs attention before claiming end-to-end
+read freshness.
+
+## 2026-10-30 — H04: require meaningful Rust test evidence
+
+Implementation baseline: `1724124`.
+
+- **Failure:** `scoped_args` guesses Rust test-name filters from source paths.
+  Crate roots become `lib`/`main`, renamed modules do not follow file names,
+  and multiple module names become one space-containing filter. Even a filter
+  that matches unit tests can omit unrelated integration tests. `run_with_args`
+  accepts exit code zero without checking whether any tests executed.
+- **Design:** use the full Cargo suite at the resolved manifest root until a
+  reliable dependency-to-test mapping exists. Preserve the actual exit code,
+  but require a successful libtest summary with at least one passed test before
+  setting `EvalResult.passed`. Empty, ignored-only, missing, or malformed
+  evidence cannot establish a pass. Parse available output before reducing it
+  to a bounded, Unicode-safe display tail, for both governed and direct runs.
+- **Reference:** [Cargo test filtering](https://doc.rust-lang.org/cargo/commands/cargo-test.html)
+  filters test names, not source dependencies (checked through Context7).
+- **Regression coverage:** real Cargo fixtures for crate-root/multi-file/renamed
+  module filters, integration failures, empty/ignored/passing/doc-only suites,
+  and ancestor-manifest fallback; governed executor cases for mixed summaries,
+  missing/malformed output, nonzero exits, and Unicode output beyond the tail.
+- **Verification:** all three new integration tests failed against the baseline:
+  a guessed root filter hid failing tests, a real empty suite returned a pass,
+  and governed zero-test output returned a pass. The first fixed-code eval run
+  passed 83 unit tests and all three integration tests. Final review tightened
+  summary parsing so truncated/malformed trailing fields cannot count as proof;
+  the stricter-parser regression run passed all three tests. A formatting
+  check requested one line wrap, which was applied. Final workspace results
+  are recorded in the completion entry below.
+- **Compatibility:** Cargo's actual exit code and existing serialized result
+  shape remain unchanged. `passed = false` can now accompany exit code zero,
+  with an explanation in the output tail. Custom Rust harnesses without libtest
+  summaries need a future explicit adapter; their successful exit alone is
+  insufficient. Non-Cargo runner pass/fail rules are unchanged. The graph
+  server remains unavailable (transport closed); source discovery used local
+  files. The semantic index was refreshed with `ccc index`.
+- **Follow-up H16:** `run_with_coverage` directly runs llvm-cov/tarpaulin and
+  builds results from exit status, with a byte-offset output slice that can
+  split UTF-8. Those optional coverage-only paths need their own execution
+  tests; H04 covers ordinary full/scoped/fallback Cargo test runs (including
+  the test result reused by `run_scoped_with_coverage`).
+
+## 2026-10-31 — H04: verification complete
+
+- `cargo test --workspace --locked --no-fail-fast -j 2`: 6,006 passed, zero
+  failed, 16 ignored across 85 groups, including integration and doc tests.
+- `cargo clippy --workspace --all-targets --locked -j 2 -- -D warnings` and
+  `cargo build --workspace --locked -j 2`: passed. These checks ran sequentially
+  after the workspace test run, with no intervening source changes.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+- All three H04 regressions failed before the fix and passed after it. The net
+  workspace count increases by one: three new integration tests, and three old
+  Cargo-filter unit tests consolidated into one fallback matrix.
+- No dependency, policy, cancellation or serialization contracts changed.
+  H16 remains open for optional coverage-only runners. The existing supply-chain
+  results and registry-timeout caveat from H01 remain applicable; those checks
+  were not repeated for this dependency-free change.
+
+Next milestone: H05, reject provider EOF without valid completion evidence.

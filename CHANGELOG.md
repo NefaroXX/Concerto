@@ -111,6 +111,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Rust verification requires executed tests.** Cargo validation runs the full
+  suite at the resolved manifest root instead of guessing test-name filters
+  from changed paths. Empty, ignored-only or unrecognized results cannot pass
+  on exit code alone; direct and governed runs share the same evidence check.
 - **VFS reads reflect external edits and deletions.** Clean VFS originals
   now read current disk contents, including bounded and binary reads. Pending
   edits, deletions and rejected diff restorations retain precedence; appends
