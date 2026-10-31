@@ -2028,3 +2028,68 @@ async fn heartbeat_provider_emits_keepalive_while_call_pending() {
     assert!(final_chunk.is_final, "the last chunk must be final");
     assert_eq!(final_chunk.delta, "done");
 }
+
+/// The completion host function must not turn partial provider text into a
+/// successful WASM completion response (harness audit H05).
+#[tokio::test]
+async fn premature_eof_in_host_completion_is_rejected() {
+    use concerto_core::error::ProviderError;
+    use concerto_core::traits::provider::{CompletionStream, LlmProvider};
+    use concerto_core::types::{CompletionChunk, CompletionRequest, TokenBudget};
+    use concerto_core::CancellationToken;
+    use concerto_plugins::capability::CapabilityManager;
+    use concerto_plugins::host::PluginHost;
+    use concerto_plugins::manager::PluginManager;
+    use futures::StreamExt;
+
+    struct EofProvider(bool);
+    #[async_trait::async_trait]
+    impl LlmProvider for EofProvider {
+        async fn stream_completion(
+            &self,
+            _request: CompletionRequest,
+            _cancel: CancellationToken,
+        ) -> Result<CompletionStream, ProviderError> {
+            Ok(Box::pin(futures::stream::iter([Ok(CompletionChunk {
+                delta: "partial".into(),
+                reasoning: None,
+                tool_call: None,
+                is_final: self.0,
+                usage: None,
+            })])))
+        }
+        fn context_capacity(&self, _model: &str) -> TokenBudget {
+            TokenBudget::new(8192, 2048)
+        }
+        fn approximate_cost(&self, _tokens_in: u64, _tokens_out: u64) -> f64 {
+            0.0
+        }
+        fn provider_name(&self) -> &'static str {
+            "eof-fixture"
+        }
+    }
+
+    for finished in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let host = Arc::new(PluginHost::new().unwrap());
+        let cap_mgr = CapabilityManager::open(dir.path()).unwrap();
+        let mut mgr =
+            PluginManager::new(host, cap_mgr, None, Some(Arc::new(EofProvider(finished))));
+        let manifest = r#"{"id":"eof-provider","name":"EOF","version":"0.1.0","description":"EOF regression","abi_version":1,"capabilities_required":[],"provides":[{"Provider":{"name":"eof","model":"eof-model"}}]}"#;
+        let wasm = make_heartbeat_provider_wat(manifest);
+        let loaded = mgr.load_plugin(&wasm, Path::new("eof.wasm"), &AutoApprove).await.unwrap();
+        mgr.initialise_plugin(&loaded, GrantedCapabilities::new()).await.unwrap();
+        let provider = mgr.create_provider("eof-provider").await.unwrap();
+        let request = CompletionRequest { model: "eof-model".into(), ..Default::default() };
+        let result = provider.stream_completion(request, CancellationToken::new()).await;
+        if finished {
+            let mut stream = result.unwrap();
+            let chunk = stream.next().await.unwrap().unwrap();
+            assert!(chunk.is_final);
+            assert_eq!(chunk.delta, "partial");
+        } else {
+            let error = result.err().expect("EOF without final must fail");
+            assert!(error.to_string().contains("stream ended before a final chunk"));
+        }
+    }
+}

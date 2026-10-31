@@ -111,6 +111,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Incomplete provider streams cannot complete a run or execute partial tool
+  calls.** Orchestrator collectors and the plugin completion host require a
+  final chunk. Premature orchestrator EOF follows bounded request retries;
+  Gemini accepts STOP followed by clean EOF while preserving trailing usage
+  and cancellation/transport errors.
 - **Rust verification requires executed tests.** Cargo validation runs the full
   suite at the resolved manifest root instead of guessing test-name filters
   from changed paths. Empty, ignored-only or unrecognized results cannot pass

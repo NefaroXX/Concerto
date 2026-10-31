@@ -14,7 +14,7 @@ passing repository tests alone does not close a finding.
 | H02 | P1 | Ordinary file writes rewrite valid Unicode content | Fixed and verified; awaiting merge |
 | H03 | P1 | VFS reads shadow external disk changes | Fixed and verified; awaiting merge |
 | H04 | P1 | Scoped Rust verification can pass with zero tests | Fixed and verified; awaiting merge |
-| H05 | P1 | Premature provider EOF accepted as successful completion | Open |
+| H05 | P1 | Premature provider EOF accepted as successful completion | Fixed and verified; awaiting merge |
 | H06 | P1 | Default write versions are captured after the agent's read | Open |
 | H07 | P1 | Verification errors can accompany Completed status | Open |
 | H08 | P2 | Compaction counts historical usage as current context size | Open |
@@ -127,7 +127,7 @@ Branch: `fix/harness-streaming-integrity`.
   The full CLI rerun passed all 314 tests, and the workspace retry passed as
   recorded above, without code changes between runs. H14 remains open.
 
-H01–H04 review: [draft PR #379](https://github.com/NefaroXX/Concerto/pull/379).
+H01–H05 review: [draft PR #379](https://github.com/NefaroXX/Concerto/pull/379).
 
 ## 2026-10-30 — H03: refresh clean reads without losing staged intent
 
@@ -256,4 +256,80 @@ Implementation baseline: `1724124`.
   results and registry-timeout caveat from H01 remain applicable; those checks
   were not repeated for this dependency-free change.
 
-Next milestone: H05, reject provider EOF without valid completion evidence.
+H05 continues below.
+
+## 2026-10-31 — H05: require provider completion evidence
+
+Implementation baseline: `236c496`.
+
+- **Failure:** both orchestrator stream collectors accept EOF without seeing a
+  canonical final chunk. Buffered text/tool calls can therefore escape a
+  truncated attempt as a successful response. The plugin completion host call
+  also accepts EOF without checking completion.
+- **Design:** require a final chunk before returning assembled output; classify
+  premature EOF as the existing retryable `StreamTransport` error. Keep
+  consuming the stream to preserve existing error, timeout and metering
+  semantics. Retries assemble into fresh buffers; tools execute only after
+  successful assembly. Preserve terminal-only usage and legitimate empty
+  completions with an explicit final chunk.
+- **Compatibility:** Gemini STOP is valid completion evidence even without an
+  OpenAI-style DONE marker. Its adapter must emit a final chunk on clean EOF
+  after STOP, preserve trailing usage, and never turn cancellation/transport
+  failure into successful completion. OpenAI already accepts finish_reason at
+  EOF; an EOF with neither finish_reason nor DONE is rejected by the collector.
+- **Sources:** [OpenAI streaming events](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events),
+  [Gemini finishReason](https://ai.google.dev/api/generate-content#FinishReason).
+  The graph server has no index for this project; discovery used local sources
+  and the refreshed semantic index.
+- **Reproduction:** all three orchestrator regressions failed on the baseline:
+  EOF was accepted as a completion, a truncated write reached the filesystem,
+  and repeated empty streams were classified Completed. The plugin host
+  regression also failed: partial provider text escaped as a successful WASM
+  response.
+- **Change:** both orchestrator collectors now require a final chunk before
+  returning assembled output. The plugin host returns its existing ABI error
+  on premature EOF. Gemini's decoder distinguishes clean EOF after STOP from
+  missing completion evidence, emits terminal usage once, and preserves
+  cancellation/transport failures. Its decoder is factored from HTTP setup so
+  these boundaries are tested without network or credentials. Existing complete
+  test-provider fixtures now emit final chunks; deliberate truncation scripts
+  remain incomplete.
+- **Regression coverage:** focused regressions cover collector EOF,
+  cancellation, late errors, valid empty completions, bounded retry/exhaustion,
+  no tool side effects on incomplete attempts, the WASM host boundary, and
+  Gemini STOP/EOF, trailing usage, duplicate DONE, missing/partial markers and
+  midstream cancellation/transport failure.
+- **Intermediate checks:** all ten focused regressions passed. The first
+  affected-library run found one more intended-complete scripted provider in
+  the runtime stage tests that omitted a terminal marker; its fixture now
+  includes one. The new WASM regression initially asserted the error at stream
+  consumption, but this plugin reports it during stream creation; the assertion
+  now checks that boundary and the specific incomplete-stream error. A test-only
+  tuple equality assertion was also replaced with field checks because
+  `ToolCall` does not implement `PartialEq`. None of these corrections relaxes
+  the production completion requirement.
+- **Affected suites:** orchestrator, providers and plugins library tests passed
+  (2,562 passed, two ignored); all 55 plugin integration tests passed. These
+  runs use local scripted streams and WAT fixtures, without live provider
+  requests or credentials.
+
+## 2026-10-31 — H05: verification complete
+
+- `cargo test --workspace --locked --no-fail-fast -j 2`: 6,016 passed, zero
+  failed, 16 ignored across 85 groups, including integration and doc tests.
+- `cargo clippy --workspace --all-targets --locked -j 2 -- -D warnings` and
+  `cargo build --workspace --locked -j 2`: passed. Cargo checks ran sequentially
+  with no intervening source changes.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+- Ten new regressions cover the shared collectors, actual agent-loop retries
+  and filesystem side effects, Gemini wire decoding, and the WASM completion
+  host. Existing complete-response fixtures now provide explicit final chunks.
+- The semantic index was refreshed with `ccc index`. The graph server remains
+  reachable but has no Concerto project index.
+- No dependencies, serialized result shapes, policy gates or retry limits
+  changed. The plugin host returns its existing ABI error rather than adding
+  guest retries. No live provider requests were made. The H01 supply-chain
+  results and registry-timeout caveat remain applicable; those checks were not
+  repeated for this dependency-free change.
+
+Next milestone: H06, bind default write versions to the content the agent read.

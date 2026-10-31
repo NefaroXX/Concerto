@@ -3638,26 +3638,23 @@ mod tests {
         ) -> Result<CompletionStream, ProviderError> {
             let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
             let tool_calls = self.responses.get(idx).cloned().unwrap_or_default();
-            let chunks: Vec<_> = if tool_calls.is_empty() {
-                vec![CompletionChunk {
-                    delta: String::new(),
+            let mut chunks: Vec<_> = tool_calls
+                .into_iter()
+                .map(|tc| CompletionChunk {
                     reasoning: None,
-                    tool_call: None,
-                    is_final: true,
+                    delta: String::new(),
+                    tool_call: Some(tc),
+                    is_final: false,
                     usage: None,
-                }]
-            } else {
-                tool_calls
-                    .into_iter()
-                    .map(|tc| CompletionChunk {
-                        reasoning: None,
-                        delta: String::new(),
-                        tool_call: Some(tc),
-                        is_final: false,
-                        usage: None,
-                    })
-                    .collect()
-            };
+                })
+                .collect();
+            chunks.push(CompletionChunk {
+                reasoning: None,
+                delta: String::new(),
+                tool_call: None,
+                is_final: true,
+                usage: None,
+            });
             Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
         }
     }
@@ -3811,7 +3808,7 @@ mod tests {
                 reasoning: None,
                 delta: String::new(),
                 tool_call: Some(tc),
-                is_final: false,
+                is_final: true,
                 usage: None,
             })])))
         }
@@ -6848,6 +6845,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn premature_eof_exhaustion_is_partial_not_completed() {
+        let provider = Arc::new(CountingScriptedProvider::new(vec![Ok(vec![]), Ok(vec![])]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop(provider.clone(), approval, 10).with_retry_policy(
+            RetryPolicy::new(concerto_config::RetryConfig {
+                max_attempts: 2,
+                initial_delay_ms: 1,
+                max_delay_ms: 1,
+                jitter: false,
+                ..Default::default()
+            }),
+        );
+        let result = loop_
+            .run(AgentTask::new(Ulid::new(), "answer-only task"), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(result.completion_status, concerto_core::types::AgentCompletionStatus::Partial);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            result.provider_error_class.as_deref(),
+            Some(concerto_core::failures::PROVIDER_RETRIES_EXHAUSTED_CODE)
+        );
+    }
+
+    #[tokio::test]
+    async fn premature_eof_retries_without_executing_partial_tool_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let partial = CompletionChunk {
+            delta: "unfinished".into(),
+            reasoning: None,
+            tool_call: Some(ToolCall {
+                id: "partial-write".into(),
+                name: "filesystem".into(),
+                arguments: serde_json::json!({
+                    "operation": "write", "path": "must-not-exist.txt", "content": "partial",
+                }),
+                ..Default::default()
+            }),
+            is_final: false,
+            usage: None,
+        };
+        let provider =
+            Arc::new(CountingScriptedProvider::new(vec![Ok(vec![partial]), Ok(answer_chunk())]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let (loop_, fs_calls) =
+            make_loop_with_counting_fs_tool(dir.path(), provider.clone(), approval, 10);
+        let mut loop_ = loop_.with_retry_policy(RetryPolicy::new(concerto_config::RetryConfig {
+            max_attempts: 2,
+            initial_delay_ms: 1,
+            max_delay_ms: 1,
+            jitter: false,
+            ..Default::default()
+        }));
+        let result = loop_
+            .run(AgentTask::new(Ulid::new(), "answer-only task"), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(fs_calls.load(Ordering::SeqCst), 0, "partial attempt must not execute tools");
+        assert!(!dir.path().join("must-not-exist.txt").exists());
+        assert!(!result.final_message.contains("unfinished"));
+    }
+
+    #[tokio::test]
     async fn provider_retry_429_then_success_calls_provider_thrice() {
         // 429, 429, success: exactly three provider calls, one completion,
         // same session/task on retry events, and the agent iteration count
@@ -6928,7 +6989,7 @@ mod tests {
                 reasoning: None,
                 delta: String::new(),
                 tool_call: Some(write_tc),
-                is_final: false,
+                is_final: true,
                 usage: None,
             }]),
             Err(ProviderError::Network("transient failure after successful write".into())),

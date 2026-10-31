@@ -736,7 +736,8 @@ fn balanced_end(text: &str, start: usize, opening: char) -> Option<usize> {
 /// no streamed reasoning was observed (ADR-46); otherwise the concatenated
 /// reasoning deltas. `usage` is `Some` only when the terminal chunk carried a
 /// provider usage report (providers report usage exclusively on the final
-/// chunk).
+/// chunk). EOF without a final chunk is a retryable transport failure;
+/// buffered output from that attempt must not escape to tool execution.
 pub async fn collect_stream(
     mut stream: CompletionStream,
 ) -> Result<(String, Option<String>, Vec<ToolCall>, Option<CompletionUsage>), OrchestratorError> {
@@ -745,6 +746,7 @@ pub async fn collect_stream(
     let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
     let mut usage = None;
+    let mut final_seen = false;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(OrchestratorError::Provider)?;
         text.push_str(&chunk.delta);
@@ -755,8 +757,12 @@ pub async fn collect_stream(
             tool_calls.push(tool_call);
         }
         if chunk.is_final {
+            final_seen = true;
             usage = chunk.usage;
         }
+    }
+    if !final_seen {
+        return Err(OrchestratorError::Provider(incomplete_stream_error()));
     }
     let reasoning = if reasoning.is_empty() { None } else { Some(reasoning) };
     Ok((text, reasoning, tool_calls, usage))
@@ -863,11 +869,13 @@ async fn collect_stream_measured(
     let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
     let mut usage = None;
+    let mut final_seen = false;
     let mut first_chunk = true;
     loop {
         let timeout = if first_chunk { first_byte_timeout } else { idle_timeout };
         let phase = if first_chunk { "time-to-first-byte" } else { "stream-idle" };
         let next = tokio::select! {
+            biased;
             _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
             result = tokio::time::timeout(timeout, stream.next()) => {
                 result.map_err(|_| ProviderError::Timeout {
@@ -892,11 +900,19 @@ async fn collect_stream_measured(
             tool_calls.push(tool_call);
         }
         if chunk.is_final {
+            final_seen = true;
             usage = chunk.usage;
         }
     }
+    if !final_seen {
+        return Err(incomplete_stream_error());
+    }
     let reasoning = if reasoning.is_empty() { None } else { Some(reasoning) };
     Ok((text, reasoning, tool_calls, usage))
+}
+
+fn incomplete_stream_error() -> ProviderError {
+    ProviderError::StreamTransport("completion stream ended before a final chunk".into())
 }
 
 #[cfg(test)]
@@ -1227,6 +1243,82 @@ mod tests {
             parse_json_substring::<Vec<String>>("```json\n[\"one\"]\n```"),
             Some(vec!["one".to_string()])
         );
+    }
+
+    #[tokio::test]
+    async fn premature_eof_is_not_a_completed_response() {
+        use concerto_core::types::CompletionChunk;
+        for chunks in [
+            vec![],
+            vec![CompletionChunk::keepalive()],
+            vec![CompletionChunk {
+                delta: "partial answer".into(),
+                reasoning: Some("partial reasoning".into()),
+                tool_call: Some(ToolCall { name: "filesystem".into(), ..Default::default() }),
+                is_final: false,
+                usage: None,
+            }],
+        ] {
+            let plain =
+                collect_stream(Box::pin(stream::iter(chunks.clone().into_iter().map(Ok)))).await;
+            assert!(
+                matches!(
+                    plain,
+                    Err(OrchestratorError::Provider(ProviderError::StreamTransport(_)))
+                ),
+                "premature EOF must fail: {plain:?}"
+            );
+            let timed = collect_stream_with_timeouts(
+                Box::pin(stream::iter(chunks.into_iter().map(Ok))),
+                &CancellationToken::new(),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            )
+            .await;
+            assert!(matches!(timed, Err(ProviderError::StreamTransport(_))), "{timed:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn premature_eof_does_not_override_cancellation() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = collect_stream_with_timeouts(
+            Box::pin(stream::empty()),
+            &cancel,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(result, Err(ProviderError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn premature_eof_guard_preserves_empty_completions_and_late_errors() {
+        use concerto_core::types::CompletionChunk;
+        for late_error in [false, true] {
+            let terminal = CompletionChunk { is_final: true, ..CompletionChunk::keepalive() };
+            let mut chunks = vec![Ok(terminal)];
+            if late_error {
+                chunks.push(Err(ProviderError::AuthFailure));
+            }
+            let result = collect_stream_with_timeouts(
+                Box::pin(stream::iter(chunks)),
+                &CancellationToken::new(),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            )
+            .await;
+            if late_error {
+                assert!(matches!(result, Err(ProviderError::AuthFailure)));
+            } else {
+                let (text, reasoning, calls, usage) = result.unwrap();
+                assert!(text.is_empty());
+                assert!(reasoning.is_none());
+                assert!(calls.is_empty());
+                assert!(usage.is_none());
+            }
+        }
     }
 
     #[tokio::test]

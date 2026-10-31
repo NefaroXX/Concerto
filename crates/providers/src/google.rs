@@ -196,13 +196,15 @@ fn parse_function_call_part(
 /// of the OpenAI/Anthropic connectors).
 struct GoogleStreamState {
     parser: BufferedSseParser,
+    finish_seen: bool,
+    terminal_emitted: bool,
     /// Provider-reported usage captured from the final chunk's
     /// `usageMetadata` (ADR-48 §4); attached to the terminal chunk only.
     usage: Option<CompletionUsage>,
     /// Tool calls parsed from the current assistant turn, held out of the
     /// stream until the turn completes so a multi-call turn is always emitted
-    /// as one group before the terminal chunk (and a cancelled or truncated
-    /// stream never drops an already-parsed call).
+    /// as one group before the terminal chunk. Incomplete attempts must not
+    /// expose buffered calls as a successful response.
     ///
     /// Gemini attaches the opaque `thought_signature` to exactly the parts the
     /// model signed (usually only the first of a parallel-call turn) and
@@ -214,7 +216,43 @@ struct GoogleStreamState {
 
 impl GoogleStreamState {
     fn new() -> Self {
-        Self { parser: BufferedSseParser::new(), usage: None, pending_tool_calls: Vec::new() }
+        Self {
+            parser: BufferedSseParser::new(),
+            finish_seen: false,
+            terminal_emitted: false,
+            usage: None,
+            pending_tool_calls: Vec::new(),
+        }
+    }
+
+    fn finish_stream(&mut self) -> Vec<Result<CompletionChunk, ProviderError>> {
+        if self.terminal_emitted {
+            return Vec::new();
+        }
+        self.terminal_emitted = true;
+        let mut items = self.flush_pending_tool_calls();
+        items.push(Ok(CompletionChunk {
+            reasoning: None,
+            delta: String::new(),
+            tool_call: None,
+            is_final: true,
+            usage: self.usage.take(),
+        }));
+        items
+    }
+
+    /// Native Gemini can end after finishReason without a DONE sentinel.
+    /// Defer STOP's terminal until EOF/DONE to retain trailing usage metadata.
+    fn finish_at_eof(&mut self) -> Vec<Result<CompletionChunk, ProviderError>> {
+        if self.terminal_emitted {
+            Vec::new()
+        } else if self.finish_seen {
+            self.finish_stream()
+        } else {
+            vec![Err(ProviderError::StreamTransport(
+                "Gemini completion stream ended before finishReason or DONE".into(),
+            ))]
+        }
     }
 
     /// Drain the turn's parsed tool calls unchanged.
@@ -267,6 +305,9 @@ impl GoogleStreamState {
         tool_adapted: bool,
     ) -> Vec<Result<CompletionChunk, ProviderError>> {
         let mut items = Vec::new();
+        if self.terminal_emitted {
+            return items;
+        }
         if event.keepalive {
             // Liveness signal (SSE comment line): emit an empty chunk so the
             // stream stays active and the orchestrator idle timeout does not
@@ -282,19 +323,7 @@ impl GoogleStreamState {
         }
         let Some(data) = event.data else { return items };
         if data == "[DONE]" {
-            // End of the turn: drain any parsed tool calls (see
-            // [`Self::pending_tool_calls`]) before the terminal chunk so a
-            // stream that ended without an explicit finishReason still emits
-            // them.
-            items.extend(self.flush_pending_tool_calls());
-            items.push(Ok(CompletionChunk {
-                reasoning: None,
-                delta: String::new(),
-                tool_call: None,
-                is_final: true,
-                usage: self.usage.take(),
-            }));
-            return items;
+            return self.finish_stream();
         }
         let parsed: serde_json::Value = match serde_json::from_str(&data) {
             Ok(v) => v,
@@ -344,30 +373,59 @@ impl GoogleStreamState {
                     }
                 }
                 if let Some(finish) = candidate["finishReason"].as_str() {
-                    if !finish.is_empty() && finish != "STOP" {
-                        // A non-STOP terminal (MAX_TOKENS, SAFETY, ...) closes
-                        // the turn and the stream: flush sibling calls, then
-                        // the terminal chunk with usage.
-                        items.extend(self.flush_pending_tool_calls());
-                        items.push(Ok(CompletionChunk {
-                            reasoning: None,
-                            delta: String::new(),
-                            tool_call: None,
-                            is_final: true,
-                            usage: self.usage.take(),
-                        }));
-                    } else if !finish.is_empty() {
-                        // Plain STOP closes the assistant turn; the [DONE]
-                        // sentinel still delivers the terminal usage chunk.
-                        // Flush the parsed calls now so a clean STOP (or a
-                        // truncated stream before [DONE]) never drops them.
-                        items.extend(self.flush_pending_tool_calls());
+                    if !finish.is_empty() && finish != "FINISH_REASON_UNSPECIFIED" {
+                        self.finish_seen = true;
+                        if finish == "STOP" {
+                            items.extend(self.flush_pending_tool_calls());
+                        } else {
+                            items.extend(self.finish_stream());
+                        }
                     }
                 }
             }
         }
         items
     }
+}
+
+/// Decode the wire stream independently of HTTP setup, retaining cancellation
+/// and transport errors instead of completing a partially assembled response.
+fn decode_google_stream<S, B>(
+    bytes: S,
+    tool_adapted: bool,
+    cancel: CancellationToken,
+) -> CompletionStream
+where
+    S: futures::Stream<Item = Result<B, ProviderError>> + Send + 'static,
+    B: AsRef<[u8]> + Send + 'static,
+{
+    stream! {
+        let mut state = GoogleStreamState::new();
+        let mut fc_counter = 0;
+        let mut byte_stream = Box::pin(bytes);
+        loop {
+            let chunk = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => { yield Err(ProviderError::Cancelled); return; }
+                chunk = byte_stream.next() => chunk,
+            };
+            let Some(chunk) = chunk else { break; };
+            match chunk {
+                Ok(bytes) => {
+                    for event in state.parser.push_bytes(bytes.as_ref()) {
+                        for item in state.handle_event(event, &mut fc_counter, tool_adapted) {
+                            yield item;
+                        }
+                    }
+                }
+                Err(error) => { yield Err(error); return; }
+            }
+        }
+        for item in state.finish_at_eof() {
+            yield item;
+        }
+    }
+    .boxed()
 }
 
 /// Substitution written in place of every representation of the API key.
@@ -573,58 +631,15 @@ impl LlmProvider for GoogleProvider {
             }
         };
 
-        // Gemini does not provide unique call IDs for function calls, so we
-        // generate sequential IDs within a stream.
-        let fc_counter: u64 = 0;
-
-        let s = stream! {
-            let mut state = GoogleStreamState::new();
-            let mut fc_counter = fc_counter;
-            let mut byte_stream = response.bytes_stream();
-            while let Some(chunk) = byte_stream.next().await {
-                // Check for cancellation before processing the chunk
-                if cancel.is_cancelled() {
-                    // A mid-turn cancel must not drop already-parsed calls:
-                    // flush the pending turn (per-part signatures preserved,
-                    // possibly all `None` — fail-open).
-                    for item in state.flush_pending_tool_calls() {
-                        yield item;
-                    }
-                    break;
-                }
-                let items = match chunk {
-                    Ok(bytes) => {
-                        let events = state.parser.push_bytes(&bytes);
-                        let mut items = Vec::new();
-                        for event in events {
-                            items.extend(state.handle_event(event, &mut fc_counter, tool_adapted));
-                        }
-                        items
-                    }
-                    // Stream-retry: a transport fault
-                    // mid-stream is retriable (tools execute only
-                    // post-assembly — re-issue is side-effect-free within
-                    // the bounded attempt budget); framing/parse failures
-                    // inside a healthy stream stay fatal.
-                    Err(e) => vec![Err(ProviderError::StreamTransport(format!(
-                        "connection dropped mid-stream: {}",
-                        scrub_message(&describe_error_chain(&e), &scrub_key)
-                    )))]
-                };
-                for item in items {
-                    yield item;
-                }
-            }
-            // The byte stream ended without an explicit terminal/[DONE]:
-            // flush any pending tool calls so a truncated stream never drops
-            // a parsed turn (already flushed by a finishReason — a no-op).
-            for item in state.flush_pending_tool_calls() {
-                yield item;
-            }
-        }
-        .boxed();
-
-        Ok(s)
+        let byte_stream = response.bytes_stream().map(move |result| {
+            result.map_err(|error| {
+                ProviderError::StreamTransport(format!(
+                    "connection dropped mid-stream: {}",
+                    scrub_message(&describe_error_chain(&error), &scrub_key)
+                ))
+            })
+        });
+        Ok(decode_google_stream(byte_stream, tool_adapted, cancel))
     }
 
     fn context_capacity(&self, model: &str) -> TokenBudget {
@@ -1301,6 +1316,133 @@ mod tests {
         assert!(!heuristic.adapt_tools_for(&mut plain_request, "gemini-2.0-flash"));
     }
 
+    fn eof_wire(value: serde_json::Value) -> Vec<u8> {
+        format!("data: {value}\n\n").into_bytes()
+    }
+
+    #[tokio::test]
+    async fn premature_eof_google_rejects_missing_completion_evidence() {
+        let partial = eof_wire(serde_json::json!({"candidates":[{"content":{"parts":[
+            {"text":"partial"}, {"functionCall":{"name":"shell","args":{}}}
+        ]}}]}));
+        for frames in [
+            vec![],
+            vec![partial.clone()],
+            vec![
+                partial.clone(),
+                eof_wire(
+                    serde_json::json!({"candidates":[{"finishReason":"FINISH_REASON_UNSPECIFIED"}]}),
+                ),
+            ],
+            vec![partial, b"data: {\"candidates\":[{\"finishReason\":\"STOP\"}]}\n".to_vec()],
+        ] {
+            let chunks = decode_google_stream(
+                futures::stream::iter(frames.into_iter().map(Ok)),
+                false,
+                CancellationToken::new(),
+            )
+            .collect::<Vec<_>>()
+            .await;
+            assert!(
+                matches!(chunks.last(), Some(Err(ProviderError::StreamTransport(_)))),
+                "{chunks:?}"
+            );
+            assert!(chunks
+                .iter()
+                .filter_map(|c| c.as_ref().ok())
+                .all(|c| !c.is_final && c.tool_call.is_none()));
+        }
+    }
+
+    #[tokio::test]
+    async fn premature_eof_google_accepts_stop_and_preserves_trailing_usage_once() {
+        for done_count in 0..=2 {
+            let mut frames = vec![
+                eof_wire(serde_json::json!({"candidates":[{"content":{"parts":[
+                    {"functionCall":{"name":"shell","args":{}},"thoughtSignature":"signed"}
+                ]},"finishReason":"STOP"}]})),
+                eof_wire(
+                    serde_json::json!({"usageMetadata":{"promptTokenCount":17,"candidatesTokenCount":4}}),
+                ),
+            ];
+            frames.extend((0..done_count).map(|_| b"data: [DONE]\n\n".to_vec()));
+            let chunks = decode_google_stream(
+                futures::stream::iter(frames.into_iter().map(Ok)),
+                false,
+                CancellationToken::new(),
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+            crate::testing::assert_terminal_usage_contract(&chunks);
+            assert_eq!(chunks.iter().filter(|c| c.is_final).count(), 1);
+            assert_eq!(chunks.iter().filter(|c| c.tool_call.is_some()).count(), 1);
+            assert_eq!(
+                chunks[0].tool_call.as_ref().unwrap().thought_signature.as_deref(),
+                Some("signed")
+            );
+            assert_eq!(chunks.last().unwrap().usage.as_ref().unwrap().prompt_tokens, Some(17));
+            assert_eq!(chunks.last().unwrap().usage.as_ref().unwrap().completion_tokens, Some(4));
+        }
+    }
+
+    #[tokio::test]
+    async fn premature_eof_google_non_stop_terminal_is_not_duplicated() {
+        let frames = vec![
+            eof_wire(serde_json::json!({"candidates":[{"finishReason":"MAX_TOKENS"}],
+                "usageMetadata":{"candidatesTokenCount":4}})),
+            b"data: [DONE]\n\n".to_vec(),
+        ];
+        let chunks = decode_google_stream(
+            futures::stream::iter(frames.into_iter().map(Ok)),
+            false,
+            CancellationToken::new(),
+        )
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].is_final);
+        assert_eq!(chunks[0].usage.as_ref().unwrap().completion_tokens, Some(4));
+    }
+
+    #[tokio::test]
+    async fn premature_eof_google_preserves_transport_errors_and_cancellation() {
+        let stop = eof_wire(
+            serde_json::json!({"candidates":[{"content":{"parts":[{"text":"partial"}]},"finishReason":"STOP"}]}),
+        );
+        let chunks = decode_google_stream(
+            futures::stream::iter(vec![
+                Ok(stop.clone()),
+                Err(ProviderError::StreamTransport("reset".into())),
+            ]),
+            false,
+            CancellationToken::new(),
+        )
+        .collect::<Vec<_>>()
+        .await;
+        assert!(
+            matches!(chunks.last(), Some(Err(ProviderError::StreamTransport(message))) if message == "reset")
+        );
+        assert!(chunks.iter().filter_map(|c| c.as_ref().ok()).all(|c| !c.is_final));
+
+        let cancel = CancellationToken::new();
+        let mut stream = decode_google_stream(
+            futures::stream::iter([Ok(stop)]).chain(futures::stream::pending()),
+            false,
+            cancel.clone(),
+        );
+        assert_eq!(stream.next().await.unwrap().unwrap().delta, "partial");
+        cancel.cancel();
+        let chunks = stream.collect::<Vec<_>>().await;
+        assert_eq!(chunks.len(), 1);
+        assert!(matches!(chunks[0], Err(ProviderError::Cancelled)));
+    }
+
     /// ADR-48 §4: Gemini's `usageMetadata` (`promptTokenCount` /
     /// `candidatesTokenCount`, reported on the final streamed chunk) is
     /// captured and attached to the terminal chunk only; intermediate chunks
@@ -1329,7 +1471,7 @@ mod tests {
                 .map(|r| r.expect("chunk emitted")),
         );
         // The final data chunk carries usageMetadata; Gemini ends the stream
-        // with finishReason "STOP" and then the [DONE] sentinel.
+        // with finishReason "STOP"; compatible gateways may also send [DONE].
         chunks.extend(
             state
                 .handle_event(
