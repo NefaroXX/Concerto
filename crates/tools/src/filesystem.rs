@@ -459,7 +459,7 @@ impl concerto_core::traits::tool::Tool for FilesystemTool {
                 }
                 // Pending changes (including deletion) win over disk. Clean
                 // originals are observations, so refresh them on every read.
-                let content = if let Some(max_bytes) = input.get("max_bytes").and_then(serde_json::Value::as_u64) {
+                let (content, raw_hash) = if let Some(max_bytes) = input.get("max_bytes").and_then(serde_json::Value::as_u64) {
                     let content = vfs.read_bounded(&path, usize::try_from(max_bytes).unwrap_or(usize::MAX))?;
                     // Keep an existing observation aligned with the returned
                     // bytes, just as read_disk does for unbounded reads.
@@ -468,11 +468,11 @@ impl concerto_core::traits::tool::Tool for FilesystemTool {
                             path: path.clone(), content: content.clone(),
                         });
                     }
-                    content
+                    (content, None)
                 } else if !matches!(vfs.get(&path), None | Some(VirtualFsEntry::Original { .. })) {
-                    vfs.read(&path)?
+                    (vfs.read(&path)?, None)
                 } else {
-                    vfs.read_disk(&path).map_err(|error| {
+                    let (content, hash) = vfs.read_disk_versioned(&path).map_err(|error| {
                         if matches!(&error, ToolError::Io(io) if io.kind() == std::io::ErrorKind::NotFound)
                         {
                             ToolError::ExecutionFailed {
@@ -483,11 +483,23 @@ impl concerto_core::traits::tool::Tool for FilesystemTool {
                         } else {
                             error
                         }
-                    })?
+                    })?;
+                    (content, Some(hash))
                 };
+                // Staged byte entries display placeholders; hash their raw
+                // bytes under this same VFS lock. Other bounded/staged reads
+                // return full UTF-8 content, so its hash is exact.
+                let content_hash = raw_hash.unwrap_or_else(|| {
+                    let bytes = match vfs.get(&path) {
+                        Some(VirtualFsEntry::CreatedBytes { current, .. }
+                            | VirtualFsEntry::ModifiedBytes { current, .. }) => current.as_slice(),
+                        _ => content.as_bytes(),
+                    };
+                    blake3::hash(bytes).to_hex().to_string()
+                });
                 Ok(ToolOutput {
                     summary: format!("Read {} bytes from {path_str}", content.len()),
-                    data: serde_json::json!({ "content": content, "path": path_str }),
+                    data: serde_json::json!({ "content": content, "path": path_str, "content_hash": content_hash }),
                 })
             }
             "write" => {
@@ -973,6 +985,41 @@ mod tests {
             .unwrap();
         assert_eq!(exists.data["exists"], false);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "still on disk");
+    }
+
+    #[tokio::test]
+    async fn read_bound_hashes_match_raw_bytes_not_binary_placeholders() {
+        let (tool, dir) = tool_and_dir();
+        for bytes in ["日本語 text".as_bytes(), &[0xff, 0x00, 0xfe]] {
+            std::fs::write(dir.path().join("f"), bytes).unwrap();
+            let output = tool
+                .execute(
+                    serde_json::json!({"operation":"read", "path":"f"}),
+                    &test_policy(),
+                    &session_for(dir.path()),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(output.data["content_hash"], blake3::hash(bytes).to_hex().to_string());
+        }
+        let path = camino::Utf8PathBuf::from_path_buf(dir.path().join("f")).unwrap();
+        tool.vfs.lock().unwrap().write_bytes(&path, vec![0xff, 0x42]).unwrap();
+        for bounded in [false, true] {
+            let mut input = serde_json::json!({"operation":"read", "path":"f"});
+            if bounded {
+                input["max_bytes"] = serde_json::json!(10);
+            }
+            let output = tool
+                .execute(input, &test_policy(), &session_for(dir.path()), CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(
+                output.data["content_hash"],
+                blake3::hash(&[0xff, 0x42]).to_hex().to_string()
+            );
+            assert!(output.data["content"].as_str().unwrap().contains("binary file"));
+        }
     }
 
     #[tokio::test]

@@ -673,11 +673,23 @@ impl VirtualFs {
     /// Non-UTF-8 (binary) files do not fail the read: they are returned (and
     /// registered) as an informative `[binary file: N bytes …]` placeholder.
     pub fn read_disk(&mut self, path: &Utf8Path) -> Result<String, ToolError> {
+        self.read_disk_versioned(path).map(|(content, _)| content)
+    }
+
+    /// Return display content and the hash of the same raw disk read. Binary
+    /// display placeholders must never become optimistic write versions.
+    pub(crate) fn read_disk_versioned(
+        &mut self,
+        path: &Utf8Path,
+    ) -> Result<(String, String), ToolError> {
         // Reading a reserved device name would address the Windows device
         // (or, behind `\\?\`, a literal `nul` file) rather than a real file;
         // reject it with the same message as the write/delete paths.
         reject_reserved_device_name(path)?;
-        let content = read_disk_text(path.as_std_path())?;
+        let bytes = std::fs::read(path.as_std_path()).map_err(ToolError::Io)?;
+        let hash = blake3::hash(&bytes).to_hex().to_string();
+        let content = String::from_utf8(bytes)
+            .unwrap_or_else(|error| binary_placeholder(error.as_bytes().len()));
         match self.entries.get(path) {
             Some(VirtualFsEntry::Original { .. }) | None => {
                 self.entries.insert(
@@ -694,7 +706,7 @@ impl VirtualFs {
                 // Staged change present: keep it; do not overwrite it.
             }
         }
-        Ok(content)
+        Ok((content, hash))
     }
 
     /// Moves a file from one path to another.

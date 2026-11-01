@@ -153,6 +153,8 @@
 //! every agent write through [`WriteGate::submit`] — and fairness is
 //! resolved above.)
 
+mod read_versions;
+
 use crate::hunk::{stage_three_way, HunkStaging};
 use crate::ownership::{OwnershipRecord, OwnershipState, OwnershipTable, OwnershipVerdict};
 use concerto_core::checkpoint::versioned_fs_targets;
@@ -262,9 +264,10 @@ pub struct GateRequest {
     /// [`GateError::Conflict`] — and appends nothing to the whiteboard — if
     /// the target's current pre-image hash differs, so a sibling agent's
     /// intervening write to that target is never silently overwritten. An
-    /// absent target carries no claim (a fresh create has no prior version to
-    /// conflict with → documented last-writer-wins), and a target without a
-    /// declared claim is not conflict-checked. Declared claims on read-only
+    /// absent target can carry the reserved `<absent>` claim after an absence
+    /// observation. Unobserved fresh creates retain the no-claim behavior;
+    /// a target without any claim is not conflict-checked. Missing claims are
+    /// filled from read observations before the arrival-time fallback. Claims on read-only
     /// targets (the `copy` source, see [`versioned_targets`]) are ignored.
     /// Empty on the wire for clients that predate the field (deserializes to
     /// an empty map via `#[serde(default)]`).
@@ -556,6 +559,8 @@ pub struct WriteGate {
     /// Observed pre-image bytes keyed by blake3 hex — lets hunk staging
     /// recover a claimed base text without a wire format change.
     text_cache: Mutex<PreImageTextCache>,
+    /// Versions actually returned to each session/agent, bounded per run.
+    read_versions: Mutex<read_versions::ReadVersions>,
     /// ADR-82 slice 5 (a): checkpoint sidecar backfill target. When set, every
     /// gated write banks its pre-image bytes (already in hand for hashing)
     /// for active checkpoints covering the path — beside the `WriteApplied`
@@ -728,6 +733,7 @@ impl WriteGate {
             locks: Arc::new(Mutex::new(HashMap::new())),
             ownership: Arc::new(Mutex::new(OwnershipTable::new())),
             text_cache: Mutex::new(PreImageTextCache::default()),
+            read_versions: Mutex::new(read_versions::ReadVersions::default()),
             checkpoint_store: None,
             run_started_at_ms: now_millis(),
         }
@@ -1282,9 +1288,12 @@ impl WriteGate {
         let session_ctx = self.session(session_id);
         let output = self
             .executor
-            .execute_read_only(exec_tool, req.input, &session_ctx, cancel)
+            .execute_read_only(exec_tool, req.input.clone(), &session_ctx, cancel)
             .await
             .map_err(GateError::from)?;
+        if let Ok(mut observations) = self.read_versions.lock() {
+            observations.record_read(&self.project_root, &req, &output.data);
+        }
         let result = serde_json::to_value(&output)
             .map_err(|error| GateError::Execution(format!("output serialization: {error}")))?;
 
@@ -1472,8 +1481,8 @@ impl WriteGate {
         // content (disjoint concurrent edits both survive); otherwise the
         // collision surfaces loudly with NO whiteboard row (nothing was
         // applied, so nothing is logged) for the manual-resolution path.
-        // Targets without a declared claim are not checked (fresh creates
-        // carry no claim → documented last-writer-wins), and declared claims
+        // Targets without a claim are not checked (unobserved fresh creates
+        // retain the legacy no-claim behavior), and declared claims
         // on read-only targets (the `copy` source, absent from
         // [`versioned_targets`]) are ignored.
         let mut staging_notes = Vec::new();
@@ -1481,8 +1490,16 @@ impl WriteGate {
             let Some(expected) = req.base_versions.get(target).cloned() else {
                 continue;
             };
+            if expected == read_versions::REREAD {
+                return Err(GateError::Conflict {
+                    event_id: req.call_id.clone(),
+                    reason: format!("read version unavailable for {target}; reread the file before editing. If the run's observation limit was reached, start a new run"),
+                });
+            }
             let actual = pre_images.get(target);
-            if actual.map(String::as_str) == Some(expected.as_str()) {
+            if actual.map(String::as_str) == Some(expected.as_str())
+                || (expected == read_versions::ABSENT && actual.is_none())
+            {
                 continue;
             }
             match self.try_stage_hunks(&req, target, &expected, actual.cloned()) {
@@ -1555,7 +1572,8 @@ impl WriteGate {
                 acquired_now.clone().into_iter().map(serde_json::Value::String).collect(),
             );
         }
-        if !staging_notes.is_empty() {
+        let content_was_staged = !staging_notes.is_empty();
+        if content_was_staged {
             // Observability for the manual-resolution trail: records exactly
             // what was staged onto whose state (ADR-60 D5 attribution).
             payload["hunk_staging"] = serde_json::Value::Array(staging_notes);
@@ -1619,6 +1637,10 @@ impl WriteGate {
                 return Err(GateError::from(error));
             }
         };
+
+        if let Ok(mut observations) = self.read_versions.lock() {
+            observations.record_write(&self.project_root, &req, content_was_staged);
+        }
 
         // The full `ToolOutput` (summary + data) rides the wire so the agent
         // side can rebuild the shape the loop consumes (ADR-60 S5).
@@ -1888,35 +1910,17 @@ impl WriteGate {
     }
 }
 
-/// ADR-60 D5 always-on injection: stamp an incoming gated write with the
-/// current pre-image hash of every one of its versioned (mutated) targets,
-/// UNLESS the agent already declared a claim for that target (a caller-
-/// declared claim must win — never clobber it, per target).
+/// Fill missing claims from this session/agent's observed read versions first.
+/// Explicit claims retain precedence. Only targets with no observation use the
+/// legacy arrival-time pre-image stamp; that fallback does not protect edits
+/// based on context acquired outside the gate. Both backends canonicalize the
+/// request before calling this helper.
 ///
-/// The supervisor is the single owner of the write gate, so it is also the
-/// single authority able to attest "the target looks like this right now":
-/// every versioned filesystem write/delete/move/copy that reaches the gate
-/// carries per-target base versions computed from *this* function — the gate's
-/// own reader + blake3 hex convention — so the stamp and the gate's conflict
-/// check share one source of truth and can never drift. A same-target sibling
-/// write landing between this stamp and the gate's own pre-image capture (a
-/// sub-millisecond window, but exactly the race D5 exists for) then surfaces
-/// as a loud [`GateError::Conflict`] instead of silent last-writer-wins.
-///
-/// Deliberate edges:
-/// - A fresh create (target has no pre-image yet) carries no claim for that
-///   target — there is no version to conflict with (documented LWW).
-/// - A pre-image read failure for a target leaves NO claim for it and is
-///   logged at `debug` (the silent degradation to LWW must be observable).
-/// - Read-only targets (the `copy` source) are not versioned targets and are
-///   never stamped here — the gate still records their pre-image for
-///   attribution on the WAL row.
-///
-/// Both gated-write paths call this, in the same order relative to
-/// [`WriteGate::canonicalize_request`]: the supervisor's `handle_execute_tool`
-/// and the in-process agent loop's `InProcessGateBackend::execute_gated` each
-/// canonicalize the request first, then stamp, so the stamped targets always
-/// reflect the canonical operation.
+/// Successful filesystem reads retain the hash of the returned content, never
+/// a later disk reread. Missing paths observed through `exists` use an explicit
+/// absence claim. The fixed-capacity ledger fails closed on overflow/poisoning.
+/// Fresh creates without an absence observation retain the legacy no-claim
+/// behavior. A failed fallback pre-image read is debug-logged and unstamped.
 pub(crate) async fn stamp_base_versions(gate: &WriteGate, request: &mut GateRequest) {
     let targets: Vec<String> = versioned_targets(request);
     if targets.is_empty() {
@@ -1926,6 +1930,14 @@ pub(crate) async fn stamp_base_versions(gate: &WriteGate, request: &mut GateRequ
         if request.base_versions.contains_key(&target) {
             // A caller-declared claim wins per target — never clobber it,
             // even when it is stale (the gate surfaces the conflict then).
+            continue;
+        }
+        let observed = match gate.read_versions.lock() {
+            Ok(observations) => observations.observed(&gate.project_root, request, &target),
+            Err(_) => Some(read_versions::REREAD.to_owned()),
+        };
+        if let Some(version) = observed {
+            request.base_versions.insert(target, version);
             continue;
         }
         let bytes = match gate.pre_image.read(Path::new(&target)).await {
@@ -3347,6 +3359,240 @@ mod tests {
             root,
             1,
         ))
+    }
+
+    #[tokio::test]
+    async fn read_bound_version_rejects_edits_after_the_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, pool) = test_pool(8).await;
+        let gate = real_fs_gate(pool.clone(), dir.path().to_path_buf());
+        std::fs::write(dir.path().join("f.txt"), "read base").unwrap();
+        let read = filesystem_request("read-base", "read", "f.txt");
+        let output = gate.submit(read, CancellationToken::new()).await.unwrap();
+        assert_eq!(output.result["data"]["content"], "read base");
+        std::fs::write(dir.path().join("f.txt"), "external edit").unwrap();
+        let mut write = real_fs_write("stale-write", "f.txt", "agent edit");
+        stamp_base_versions(&gate, &mut write).await;
+        assert_eq!(write.base_versions["f.txt"], blake3::hash(b"read base").to_hex().to_string());
+        assert!(matches!(
+            gate.submit(write, CancellationToken::new()).await,
+            Err(GateError::Conflict { .. })
+        ));
+        assert_eq!(std::fs::read_to_string(dir.path().join("f.txt")).unwrap(), "external edit");
+        assert_eq!(whiteboard_row_count(&pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn read_bound_versions_are_isolated_and_rereading_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, pool) = test_pool(8).await;
+        let gate = real_fs_gate(pool, dir.path().to_path_buf());
+        std::fs::write(dir.path().join("f.txt"), "base").unwrap();
+        gate.submit(filesystem_request("read-a", "read", "./f.txt"), CancellationToken::new())
+            .await
+            .unwrap();
+        std::fs::write(dir.path().join("f.txt"), "external").unwrap();
+        let mut other = filesystem_request("read-b", "read", "f.txt");
+        other.agent_id = "agent-b".into();
+        gate.submit(other, CancellationToken::new()).await.unwrap();
+        let mut stale = real_fs_write("stale-a", "f.txt", "overwrite");
+        stamp_base_versions(&gate, &mut stale).await;
+        assert!(matches!(
+            gate.submit(stale, CancellationToken::new()).await,
+            Err(GateError::Conflict { .. })
+        ));
+        gate.submit(filesystem_request("reread-a", "read", "f.txt"), CancellationToken::new())
+            .await
+            .unwrap();
+        let mut fresh = real_fs_write("fresh-a", "f.txt", "new");
+        stamp_base_versions(&gate, &mut fresh).await;
+        gate.submit(fresh, CancellationToken::new()).await.unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("f.txt")).unwrap(), "new");
+    }
+
+    #[tokio::test]
+    async fn read_bound_versions_cover_each_mutated_target() {
+        for (operation, changed) in
+            [("delete", "src"), ("move", "src"), ("move", "dst"), ("copy", "dst")]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let (_db, pool) = test_pool(8).await;
+            let gate = real_fs_gate(pool.clone(), dir.path().to_path_buf());
+            for path in ["src", "dst"] {
+                std::fs::write(dir.path().join(path), format!("base {path}")).unwrap();
+                gate.submit(
+                    filesystem_request(&format!("read-{path}"), "read", path),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            }
+            std::fs::write(dir.path().join(changed), "external").unwrap();
+            let mut request = filesystem_request("mutation", operation, "src");
+            request.input["destination"] = json!("dst");
+            stamp_base_versions(&gate, &mut request).await;
+            assert!(
+                matches!(
+                    gate.submit(request, CancellationToken::new()).await,
+                    Err(GateError::Conflict { .. })
+                ),
+                "{operation} must protect {changed}"
+            );
+            assert_eq!(std::fs::read_to_string(dir.path().join(changed)).unwrap(), "external");
+            assert!(dir.path().join("src").exists());
+            assert_eq!(whiteboard_row_count(&pool).await, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn read_bound_versions_advance_only_to_the_writers_own_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, pool) = test_pool(8).await;
+        let gate = real_fs_gate(pool, dir.path().to_path_buf());
+        std::fs::write(dir.path().join("f"), "base").unwrap();
+        gate.submit(filesystem_request("read", "read", "f"), CancellationToken::new())
+            .await
+            .unwrap();
+        for (id, content) in [("write-1", "first"), ("write-2", "second")] {
+            let mut request = real_fs_write(id, "f", content);
+            stamp_base_versions(&gate, &mut request).await;
+            gate.submit(request, CancellationToken::new()).await.unwrap();
+        }
+        std::fs::write(dir.path().join("f"), "external").unwrap();
+        let mut request = real_fs_write("write-3", "f", "third");
+        stamp_base_versions(&gate, &mut request).await;
+        assert_eq!(request.base_versions["f"], blake3::hash(b"second").to_hex().to_string());
+        assert!(matches!(
+            gate.submit(request, CancellationToken::new()).await,
+            Err(GateError::Conflict { .. })
+        ));
+        assert_eq!(std::fs::read_to_string(dir.path().join("f")).unwrap(), "external");
+    }
+
+    #[tokio::test]
+    async fn read_bound_absence_protects_creates_and_delete_recreate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, pool) = test_pool(8).await;
+        let gate = real_fs_gate(pool.clone(), dir.path().to_path_buf());
+        gate.submit(filesystem_request("missing", "exists", "f"), CancellationToken::new())
+            .await
+            .unwrap();
+        std::fs::write(dir.path().join("f"), "external create").unwrap();
+        let mut stale = real_fs_write("stale-create", "f", "clobber");
+        stamp_base_versions(&gate, &mut stale).await;
+        assert!(matches!(
+            gate.submit(stale, CancellationToken::new()).await,
+            Err(GateError::Conflict { .. })
+        ));
+        assert_eq!(whiteboard_row_count(&pool).await, 0);
+        gate.submit(filesystem_request("read-created", "read", "f"), CancellationToken::new())
+            .await
+            .unwrap();
+        let mut delete = filesystem_request("delete", "delete", "f");
+        stamp_base_versions(&gate, &mut delete).await;
+        gate.submit(delete, CancellationToken::new()).await.unwrap();
+        let mut recreate = real_fs_write("recreate", "f", "ours");
+        stamp_base_versions(&gate, &mut recreate).await;
+        gate.submit(recreate, CancellationToken::new()).await.unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("f")).unwrap(), "ours");
+    }
+
+    #[tokio::test]
+    async fn read_bound_failed_reads_sessions_and_explicit_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, pool) = test_pool(8).await;
+        let gate = real_fs_gate(pool, dir.path().to_path_buf());
+        let session_a = new_id().to_string();
+        let session_b = new_id().to_string();
+        std::fs::write(dir.path().join("f"), "base").unwrap();
+        let mut read = filesystem_request("read-a", "read", "f");
+        read.session_id = Some(session_a.clone());
+        gate.submit(read, CancellationToken::new()).await.unwrap();
+        std::fs::remove_file(dir.path().join("f")).unwrap();
+        let mut failed = filesystem_request("failed-read", "read", "f");
+        failed.session_id = Some(session_a.clone());
+        assert!(gate.submit(failed, CancellationToken::new()).await.is_err());
+        std::fs::write(dir.path().join("f"), "changed").unwrap();
+        let mut other = filesystem_request("read-b", "read", "f");
+        other.session_id = Some(session_b);
+        gate.submit(other, CancellationToken::new()).await.unwrap();
+        let mut request = real_fs_write("write-a", "f", "edit");
+        request.session_id = Some(session_a);
+        stamp_base_versions(&gate, &mut request).await;
+        assert_eq!(request.base_versions["f"], blake3::hash(b"base").to_hex().to_string());
+        request.base_versions.insert("f".into(), "explicit-stale".into());
+        stamp_base_versions(&gate, &mut request).await;
+        assert_eq!(request.base_versions["f"], "explicit-stale");
+        assert!(matches!(
+            gate.submit(request, CancellationToken::new()).await,
+            Err(GateError::Conflict { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_bound_binary_versions_allow_unchanged_delete_and_reject_changed_bytes() {
+        for changed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (_db, pool) = test_pool(8).await;
+            let gate = real_fs_gate(pool, dir.path().to_path_buf());
+            std::fs::write(dir.path().join("binary"), [0xff, 0x00]).unwrap();
+            gate.submit(filesystem_request("read", "read", "binary"), CancellationToken::new())
+                .await
+                .unwrap();
+            if changed {
+                std::fs::write(dir.path().join("binary"), [0xfe, 0x00]).unwrap();
+            }
+            let mut delete = filesystem_request("delete", "delete", "binary");
+            stamp_base_versions(&gate, &mut delete).await;
+            let result = gate.submit(delete, CancellationToken::new()).await;
+            if changed {
+                assert!(matches!(result, Err(GateError::Conflict { .. })));
+                assert_eq!(std::fs::read(dir.path().join("binary")).unwrap(), [0xfe, 0x00]);
+            } else {
+                result.unwrap();
+                assert!(!dir.path().join("binary").exists());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn read_bound_staging_requires_observing_the_merged_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, pool) = test_pool(8).await;
+        let gate = real_fs_gate(pool.clone(), dir.path().to_path_buf());
+        let base = numbered_file();
+        std::fs::write(dir.path().join("f"), &base).unwrap();
+        gate.submit(filesystem_request("read", "read", "f"), CancellationToken::new())
+            .await
+            .unwrap();
+        // An ordinary write banks the base needed by existing hunk staging.
+        let mut prime = real_fs_write("prime", "f", &base);
+        stamp_base_versions(&gate, &mut prime).await;
+        gate.submit(prime, CancellationToken::new()).await.unwrap();
+        let external = replace_line(&base, 1, "EXTERNAL");
+        std::fs::write(dir.path().join("f"), &external).unwrap();
+        let mut staged = real_fs_write("staged", "f", &replace_line(&base, 13, "AGENT"));
+        stamp_base_versions(&gate, &mut staged).await;
+        gate.submit(staged, CancellationToken::new()).await.unwrap();
+        let merged = replace_line(&external, 13, "AGENT");
+        assert_eq!(std::fs::read_to_string(dir.path().join("f")).unwrap(), merged);
+        // The model submitted its edit, but was never shown the merged bytes.
+        let mut stale = real_fs_write("stale-after-merge", "f", &replace_line(&base, 13, "NEXT"));
+        stamp_base_versions(&gate, &mut stale).await;
+        assert!(matches!(
+            gate.submit(stale, CancellationToken::new()).await,
+            Err(GateError::Conflict { .. })
+        ));
+        assert_eq!(std::fs::read_to_string(dir.path().join("f")).unwrap(), merged);
+        gate.submit(filesystem_request("read-merge", "read", "f"), CancellationToken::new())
+            .await
+            .unwrap();
+        let next = replace_line(&merged, 13, "NEXT");
+        let mut fresh = real_fs_write("fresh-after-merge", "f", &next);
+        stamp_base_versions(&gate, &mut fresh).await;
+        gate.submit(fresh, CancellationToken::new()).await.unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("f")).unwrap(), next);
+        assert_eq!(whiteboard_row_count(&pool).await, 3);
     }
 
     #[tokio::test]

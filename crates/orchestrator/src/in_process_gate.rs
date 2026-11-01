@@ -248,11 +248,8 @@ impl InProcessGateBackend {
         // capture and conflict check then key on the canonical operation; the
         // registered name is preserved for execution.
         self.gate.canonicalize_request(&mut request);
-        // ADR-60 D5 always-on: stamp each mutated target's current pre-image
-        // hash before submission — the same injection the supervisor applies
-        // in `handle_execute_tool` — so the in-process loop's base_version
-        // claims are attested from the same reader the gate conflict-checks
-        // against. The gate refuses a sibling-altared target loudly.
+        // Prefer this agent's observed read version. Only unobserved targets
+        // fall back to arrival-time stamping (shared with the supervisor).
         stamp_base_versions(&self.gate, &mut request).await;
         let outcome = match self.gate.submit(request, cancel.clone()).await {
             Ok(outcome) => outcome,
@@ -609,6 +606,40 @@ mod tests {
     /// The backend dispatches through the gate: the WAL row lands BEFORE the
     /// tool runs, the pre-image is attributed, and the outcome round-trips as
     /// a full `ToolOutput`.
+    #[tokio::test]
+    async fn read_bound_versions_protect_in_process_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let utf8_root = camino::Utf8PathBuf::from_path_buf(root.path().to_path_buf()).unwrap();
+        let (_db, pool) = test_pool().await;
+        let (gate, executor) = fs_gate(utf8_root, pool);
+        let backend = InProcessGateBackend::new(gate, executor, "single-agent");
+        let session = SessionContext::new(Ulid::new(), root.path().to_path_buf());
+        std::fs::write(root.path().join("f"), "base").unwrap();
+        backend
+            .execute(
+                "filesystem",
+                json!({"operation":"read", "path":"f"}),
+                "read",
+                &session,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        std::fs::write(root.path().join("f"), "external").unwrap();
+        let error = backend
+            .execute_with_authority(
+                "filesystem",
+                json!({"operation":"write", "path":"f", "content":"stale"}),
+                "write",
+                &session,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::VirtualFsConflict { .. }), "{error:?}");
+        assert_eq!(std::fs::read_to_string(root.path().join("f")).unwrap(), "external");
+    }
+
     #[tokio::test]
     async fn execute_goes_through_the_gate_and_round_trips_the_output() {
         let root = tempfile::tempdir().expect("tempdir");

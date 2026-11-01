@@ -15,7 +15,7 @@ passing repository tests alone does not close a finding.
 | H03 | P1 | VFS reads shadow external disk changes | Fixed and verified; awaiting merge |
 | H04 | P1 | Scoped Rust verification can pass with zero tests | Fixed and verified; awaiting merge |
 | H05 | P1 | Premature provider EOF accepted as successful completion | Fixed and verified; awaiting merge |
-| H06 | P1 | Default write versions are captured after the agent's read | Open |
+| H06 | P1 | Default write versions are captured after the agent's read | Fixed and verified; awaiting merge |
 | H07 | P1 | Verification errors can accompany Completed status | Open |
 | H08 | P2 | Compaction counts historical usage as current context size | Open |
 | H09 | P2 | Compaction truncates constraints and unresolved work | Open |
@@ -26,6 +26,8 @@ passing repository tests alone does not close a finding.
 | H14 | P2 | Checkpoint startup can degrade into ToolNotFound; CLI test failed intermittently | Open; observed during H02 verification |
 | H15 | P1 | Orchestrator read cache trusts matching size/mtime without checking current bytes | Open; source traced during H03 |
 | H16 | P2 | Coverage-only Cargo runners trust exit status and truncate output at byte offsets | Open; source traced during H04 |
+| H17 | P1 | Resumed history lacks restored read-version claims when a new gate is constructed | Open; source traced during H06 |
+| H18 | P1 | Locked Wasmtime 36.0.19 fails fresh security gates on RUSTSEC-2026-0424 | Open; discovered during H06 verification |
 
 ## 2026-10-29 — H01: preserve streaming events across chunks
 
@@ -127,7 +129,7 @@ Branch: `fix/harness-streaming-integrity`.
   The full CLI rerun passed all 314 tests, and the workspace retry passed as
   recorded above, without code changes between runs. H14 remains open.
 
-H01–H05 review: [draft PR #379](https://github.com/NefaroXX/Concerto/pull/379).
+H01–H06 review: [draft PR #379](https://github.com/NefaroXX/Concerto/pull/379).
 
 ## 2026-10-30 — H03: refresh clean reads without losing staged intent
 
@@ -332,4 +334,112 @@ Implementation baseline: `236c496`.
   results and registry-timeout caveat remain applicable; those checks were not
   repeated for this dependency-free change.
 
-Next milestone: H06, bind default write versions to the content the agent read.
+H06 continues below.
+
+## 2026-11-01 — H06: bind default versions to observed reads
+
+Implementation baseline: `e8df4a6`.
+
+- **Failure:** both gated backends stamp missing claims at write arrival.
+  An external edit between read and write therefore becomes the accepted base.
+- **Design:** retain versions derived from successful filesystem
+  read output, scoped by session and agent, and prefer those observations to
+  arrival-time stamping. Explicit claims retain their existing precedence.
+  Keep observations bounded without silently evicting stale-write protection.
+- **Scope:** the in-process gate and supervisor share this seam. Neither gated
+  backend enables the advisory cache-serve hook; plain-executor fallback and
+  H15 read-cache freshness remain separate limitations. This change does not
+  make compare-and-write atomic against external processes.
+- **Discovery:** the graph server is reachable but still has no Concerto index;
+  semantic search and local source inspection traced the shared path.
+
+- **Reproduction:** both initial regressions failed against `e8df4a6`: the
+  stamped hash matched the external edit rather than the returned read, and a
+  stale writer was accepted after another agent reread the changed file.
+- **Implementation:** the shared gate retains bounded, session/agent-scoped
+  hashes of returned filesystem content. Claims prefer those observations;
+  successful text writes advance only the writer's own known base. Absent-path
+  observations protect subsequent creates. Unknown post-write bytes require a
+  reread rather than a potentially racy post-write disk hash.
+
+- **Binary compatibility:** filesystem reads now return an additive
+  `content_hash` field from the same raw read as their display content. Staged
+  byte entries hash their raw bytes under the VFS lock; binary placeholders
+  are never used as the base version. Bounded reads retain their existing
+  allocation limit and UTF-8 behavior.
+- **Initial verification:** the first 11 regressions passed. The expanded
+  binary-read test initially lacked a qualified `camino::Utf8PathBuf` name;
+  that test-only compile error was corrected before rerunning the suites.
+
+- **Follow-up H17:** `runtime_runner.rs` constructs a new `WriteGate` for a
+  resumed single-agent run while restoring conversation/checkpoint context.
+  The read ledger is deliberately run-local and is not reconstructed from that
+  history. Resumed writers need fresh tool reads or explicit claims until
+  durable observation restoration is implemented and tested.
+
+- **Affected-suite verification:** all 13 regressions passed (12 orchestrator,
+  one tools). Full affected library suites passed: 1,854 orchestrator tests
+  with one ignored, and 351 tools tests. Coverage includes both real backend
+  paths, failed reads, independent sessions/agents, explicit claims, each
+  mutated target, read recovery, own-write advancement, absence/create/delete,
+  binary and staged reads, capacity exhaustion, and symlink retargeting.
+
+- **Review correction:** the first workspace test run passed 6,029 tests with
+  zero failures and 16 ignored, and Clippy passed. Review then found that
+  hunk staging can change the submitted content without showing the merged
+  bytes to the agent. Advancing the ledger to that unseen merged version would
+  allow a subsequent stale write to erase the external edit. A dedicated
+  regression will pin this sequence; staged merges must require a fresh read.
+  These initial broad results do not verify that final correction.
+
+- **Merge reproduction and correction:** the new real-gate sequence failed
+  against the initial implementation: a disjoint merge preserved the external
+  edit, but a second default-claimed write based on the agent's original view
+  was accepted. The ledger now marks hunk-staged content as requiring a reread,
+  rather than advancing to bytes the agent has not observed. The regression
+  also verifies that reading the merged content restores successful editing.
+
+- **Corrected affected suites:** all 14 regressions passed, followed by 1,855
+  orchestrator library tests (one ignored) and 351 tools library tests.
+  Workspace tests, Clippy and build are being repeated because the staged-merge
+  correction changed production behavior after the first broad pass.
+
+- **Path-identity correction:** review found that raw `PathBuf` comparison does
+  not fold Windows case/verbatim aliases, especially for an observed absence
+  without an existing file to canonicalize. Ledger keys now use the filesystem
+  module's existing host-specific comparison rules. A native-host wrapper test
+  and a Windows-only absence-alias test accompany the existing pure Windows
+  normalization tests. The in-flight workspace repeat was interrupted before
+  source edits; final verification restarts on this corrected source.
+
+- **Environment interruption:** the goal transition removed the active tool
+  session, and process inspection confirmed no Cargo process remained. The
+  final-v2 log stopped during integration tests without a completed suite.
+  Verification was restarted from the existing disk-backed artifacts; that
+  interrupted run is not counted as a pass.
+
+
+## 2026-11-01 — H06: source verification complete
+
+- `cargo test --workspace --locked --no-fail-fast -j 2`: 6,031 passed, zero
+  failed, 16 ignored across 85 groups, including integration and doc tests.
+- `cargo clippy --workspace --all-targets --locked -j 2 -- -D warnings` and
+  `cargo build --workspace --locked -j 2`: passed sequentially on final source.
+- `cargo fmt --all -- --check`, `git diff --check`, the UI palette check, and
+  all six Python script tests passed. The semantic index was refreshed.
+- All 15 Linux regressions passed. Native Windows execution of the added
+  absence-alias case remains unverified; existing pure Windows normalization
+  tests passed as part of the tools suite.
+- Both original stale-read regressions failed before implementation. The
+  staged-merge regression also failed before its correction, then passed along
+  with reread recovery. Interrupted broad runs were not counted as passes.
+- **New blocker H18:** fresh `cargo deny check` and `cargo audit` both failed on
+  [RUSTSEC-2026-0424](https://rustsec.org/advisories/RUSTSEC-2026-0424), published
+  after the earlier supply-chain pass. Wasmtime 36.0.19 is affected; the same
+  LTS line is patched in 36.0.20. No suppression was added. H06 is committed
+  separately; publishing waits for the dependency repair and verification.
+- H17 remains open: gate-lifetime observations are not restored with resumed
+  history. Plain-executor fallback and non-atomic external file races also
+  remain outside H06's guarantees, as recorded in ADR-60.
+
+Next: patch H18, then continue H07's truthful verification/completion handling.

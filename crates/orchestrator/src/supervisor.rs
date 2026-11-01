@@ -1843,10 +1843,9 @@ async fn handle_execute_tool(
     // all key on the canonical operation while the registered name still
     // executes.
     services.gate.canonicalize_request(&mut request);
-    // ADR-60 D5 always-on: the supervisor attests each mutated target's
-    // current state at request arrival so every versioned write carries
-    // per-target `base_versions` claims (see [`crate::gate::stamp_base_versions`]);
-    // a caller-declared claim is never clobbered, per target.
+    // Prefer this registered agent's observed read versions, with arrival-time
+    // stamping only for unobserved targets. Explicit per-target claims remain
+    // intact (see `stamp_base_versions`).
     stamp_base_versions(&services.gate, &mut request).await;
     match services.gate.submit(request, cancel.clone()).await {
         Ok(outcome) => {
@@ -2777,6 +2776,26 @@ mod write_path_tests {
     /// All whiteboard rows in `gate_seq` order.
     async fn all_events(pool: &sqlx::SqlitePool) -> Vec<WhiteboardEvent> {
         load_whiteboard_events(pool, &WhiteboardLoadOpts::default()).await.expect("load events")
+    }
+
+    #[tokio::test]
+    async fn read_bound_versions_protect_supervised_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let (_db, pool) = test_pool().await;
+        let services = services(pool.clone(), root.path().to_path_buf());
+        let cancel = CancellationToken::new();
+        std::fs::write(root.path().join("f"), "base").unwrap();
+        let mut read = fs_write("read", "f", "");
+        read.input = json!({"operation":"read", "path":"f"});
+        let response = handle_execute_tool(&services, "agent-a", read, 1, &cancel).await;
+        assert!(response.error.is_none());
+        std::fs::write(root.path().join("f"), "external").unwrap();
+        let response =
+            handle_execute_tool(&services, "agent-a", fs_write("write", "f", "stale"), 2, &cancel)
+                .await;
+        assert_eq!(response.error.unwrap().code, IpcErrorCode::Conflict);
+        assert!(all_events(&pool).await.is_empty());
+        assert_eq!(std::fs::read_to_string(root.path().join("f")).unwrap(), "external");
     }
 
     #[tokio::test]

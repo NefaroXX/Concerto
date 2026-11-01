@@ -111,6 +111,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Gated writes retain the version the agent read.** Default claims use
+  session/agent-scoped read observations, including raw binary hashes, so an
+  intervening external edit is refused instead of adopted as the new base.
+  Rereads refresh only that agent's observations; successful text writes
+  advance its own base. The bounded ledger fails closed when full.
 - **Incomplete provider streams cannot complete a run or execute partial tool
   calls.** Orchestrator collectors and the plugin completion host require a
   final chunk. Premature orchestrator EOF follows bounded request retries;
