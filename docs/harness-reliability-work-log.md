@@ -27,7 +27,7 @@ passing repository tests alone does not close a finding.
 | H15 | P1 | Orchestrator read cache trusts matching size/mtime without checking current bytes | Open; source traced during H03 |
 | H16 | P2 | Coverage-only Cargo runners trust exit status and truncate output at byte offsets | Open; source traced during H04 |
 | H17 | P1 | Resumed history lacks restored read-version claims when a new gate is constructed | Open; source traced during H06 |
-| H18 | P1 | Locked Wasmtime 36.0.19 fails fresh security gates on RUSTSEC-2026-0424 | Open; discovered during H06 verification |
+| H18 | P1 | Locked Wasmtime 36.0.19 fails fresh security gates on RUSTSEC-2026-0424 | Patched; tests/security gates pass; remaining CI checks running |
 
 ## 2026-10-29 — H01: preserve streaming events across chunks
 
@@ -443,3 +443,63 @@ Implementation baseline: `e8df4a6`.
   remain outside H06's guarantees, as recorded in ADR-60.
 
 Next: patch H18, then continue H07's truthful verification/completion handling.
+
+## 2026-11-01 — H18: patch the Wasmtime LTS security dependency
+
+- **Reproduction:** fresh `cargo deny check` and `cargo audit` both rejected
+  Wasmtime 36.0.19 for
+  [RUSTSEC-2026-0424](https://rustsec.org/advisories/RUSTSEC-2026-0424).
+  The upstream advisory describes unchecked memory growth when transferring
+  borrowed component resources. Concerto does not enable the component model;
+  this is a dependency-gate repair, not a demonstrated Concerto exploit.
+- **Change:** raised the manifest minimum to `~36.0.20` and regenerated the
+  lockfile with `cargo update -p wasmtime --precise 36.0.20`. Only 29 matching
+  Wasmtime/Cranelift/Pulley packages changed; their dependency edges did not.
+  Kept the existing feature selection, memory64 restriction, and intentional
+  unrelated advisory exceptions. No new suppression was added.
+- **Initial verification:** both fresh supply-chain gates now pass. Feature
+  inspection confirms async/Cranelift with no component-model, Winch or pooling
+  allocator. Plugin and workspace verification is running serially against
+  the patched dependency before publication.
+
+- **Plugin suite:** 195 tests passed (128 unit, 55 WASM integration, 12
+  policy integration); one doc test is intentionally ignored. Existing
+  resource-limit, capability and host-call tests cover the retained sandbox.
+- **H07 investigation:** the shared test adapter turns all harness failures
+  into `eval_result: None`, and finalization consults only `EvalResult.passed`.
+  Typed sweep/eval failures are therefore ignored by completion. Missing
+  harness configuration currently uses the same setup-error variant as real
+  configuration faults; the repair must distinguish absence from failure and
+  cover both live completion events and persisted task status. No H07 source
+  changes are included in the dependency milestone.
+- **H07 continuation edge:** `merge_run_progress` retains earlier verification
+  records but copies the latest round's completion status after finalization
+  has already published its event. A latest-round-only fix could therefore
+  miss unresolved earlier failures. Regression coverage must include a failed
+  check carried across an iteration-cap continuation and a successful recheck
+  that supersedes it, without contradictory live/persisted completion events.
+- **H07 contract constraints:** `VerificationSummary::effective_outcome` is
+  explicitly display-only; completion must use typed outcomes and the existing
+  evidence rules rather than promoting legacy `passed` flags. Preserve the
+  ordinary answer-only completion case, distinguish an unsupported harness
+  from a real setup/I/O failure, and ensure cancellation during evaluation
+  cannot publish successful completion. The optional strict freshness gate
+  and basic truthful status need separate regression coverage.
+
+
+## 2026-11-03 — H18: final workspace checks and CI parity
+
+- The previous goal turn made concrete progress: patched dependencies,
+  passing security gates and plugin tests, then a complete workspace suite.
+  Current-state inspection confirms the full run finished: 6,031 passed,
+  zero failed, 16 ignored across 85 groups; Clippy with warnings denied and
+  the workspace build also finished successfully. No Cargo process remained.
+- Fresh `cargo deny check` and `cargo audit` passed again on November 3.
+- Remaining CI checks include single-frontend builds, launcher/cache replay
+  smoke tests, WASM guest builds and benchmark smoke runs. The launcher/cache
+  smoke passed. The first desktop-only build was deliberately interrupted
+  with SIGINT after confirming its process group, to reclaim 25 GB of
+  incremental caches before exhausting disk space. Only repository
+  `target/debug/incremental` was removed after all compiler processes stopped;
+  sources, logs and compiled outputs were retained. The interrupted build is
+  not counted as a pass, and the extra checks resume from compiled artifacts.

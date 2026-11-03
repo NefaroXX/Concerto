@@ -204,7 +204,7 @@ once_cell = "1"
 # ---- WASM Plugin Runtime (Phase 7, ADR-14, ADR-21) ----
 # Patched 36 LTS line; retain the minimal Cranelift/async sandbox (no Winch,
 # pooling allocator or component model). Keep memory64 disabled in PluginHost.
-wasmtime = { version = "~36.0.19", default-features = false, features = ["cranelift", "async"] }
+wasmtime = { version = "~36.0.20", default-features = false, features = ["cranelift", "async"] }
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

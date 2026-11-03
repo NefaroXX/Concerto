@@ -95,7 +95,7 @@ cargo audit
 ## Gotchas — do NOT "fix" these without review
 - **cargo-deny exceptions are intentional**: many `RUSTSEC-*` advisories are
   ignored for unmaintained *transitive* deps, and `wasmtime` is pinned to
-  the **36.0.x LTS** line (minimum 36.0.19). Read `deny.toml`
+  the **36.0.x LTS** line (minimum 36.0.20). Read `deny.toml`
   justification/scope before changing anything. The two supply-chain gates are
   complementary: `cargo-deny` resolves features and cannot see
   optional/unactivated lockfile deps (e.g. `quinn-proto` via an unenabled

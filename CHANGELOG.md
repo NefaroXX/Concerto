@@ -696,6 +696,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Raised the Wasmtime 36 LTS minimum to 36.0.20 for RUSTSEC-2026-0424
+  (unbounded memory usage when transferring borrowed component resources).
+  The plugin host retains its minimal async/Cranelift features, with the
+  component model, Winch and pooling allocator disabled; memory64 stays off.
+  No advisory exception was added.
 - Updated the plugin runtime to Wasmtime 36.0.19 LTS for the Cranelift fixes
   in RUSTSEC-2026-0379/0380, and retired all eight Wasmtime audit exceptions.
   Memory64 remains disabled; tests enforce the 64 MiB allocation/growth limit.
