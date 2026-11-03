@@ -16,7 +16,7 @@ passing repository tests alone does not close a finding.
 | H04 | P1 | Scoped Rust verification can pass with zero tests | Fixed and verified; awaiting merge |
 | H05 | P1 | Premature provider EOF accepted as successful completion | Fixed and verified; awaiting merge |
 | H06 | P1 | Default write versions are captured after the agent's read | Fixed and verified; awaiting merge |
-| H07 | P1 | Verification errors can accompany Completed status | Open |
+| H07 | P1 | Verification errors can accompany Completed status | In progress; isolated draft awaiting reproduction/tests |
 | H08 | P2 | Compaction counts historical usage as current context size | Open |
 | H09 | P2 | Compaction truncates constraints and unresolved work | Open |
 | H10 | P2 | Agent-driven benchmark fixture policy denies tools | Open |
@@ -27,7 +27,8 @@ passing repository tests alone does not close a finding.
 | H15 | P1 | Orchestrator read cache trusts matching size/mtime without checking current bytes | Open; source traced during H03 |
 | H16 | P2 | Coverage-only Cargo runners trust exit status and truncate output at byte offsets | Open; source traced during H04 |
 | H17 | P1 | Resumed history lacks restored read-version claims when a new gate is constructed | Open; source traced during H06 |
-| H18 | P1 | Locked Wasmtime 36.0.19 fails fresh security gates on RUSTSEC-2026-0424 | Patched; tests/security gates pass; remaining CI checks running |
+| H18 | P1 | Locked Wasmtime 36.0.19 fails fresh security gates on RUSTSEC-2026-0424 | Fixed and verified; awaiting merge |
+| H19 | P2 | Action-required minimum tool-call check ignores earlier continuation rounds | Open; source traced during H07 |
 
 ## 2026-10-29 — H01: preserve streaming events across chunks
 
@@ -503,3 +504,55 @@ Next: patch H18, then continue H07's truthful verification/completion handling.
   `target/debug/incremental` was removed after all compiler processes stopped;
   sources, logs and compiled outputs were retained. The interrupted build is
   not counted as a pass, and the extra checks resume from compiled artifacts.
+
+- **Additional CI coverage:** desktop-only and CLI-only builds passed, as did
+  default-launcher commands, cache-replay smoke, CLI startup/routing smoke and
+  all four `wasm32-wasip2` guest builds. The nine benchmark smoke targets are
+  compiling in the release profile; no timing/performance claim is made.
+- **Checkpoint:** H18 is committed locally as `9793148`; H06 is `80047b8`.
+  Publication waits for the remaining benchmark gate.
+
+## 2026-11-03 — H07: isolated regression and implementation draft
+
+- The prior goal turn made concrete progress: committed H18 and prepared H07
+  regressions in disk-backed worktree `Concerto-worktrees/h07`, branch
+  `fix/harness-verification-status`. No concurrent Cargo operation shares the
+  active target directory. H18's source tree remains unchanged for its checks.
+- The initial regression patch is saved for baseline reproduction before
+  applying production changes. It checks harness denial/missing runner/timeout,
+  verification cancellation, live and persisted completion events, unresolved
+  failures across continuation rounds, recovery after rechecking, missing
+  harness classification and required versus optional verification.
+- The isolated implementation draft distinguishes unavailable harnesses from
+  execution failures, reconciles same-run checks before terminal events, and
+  refuses completion for failures or unmet required verification. Rechecks
+  must match the verifier/scope; a skipped/unavailable attempt cannot erase an
+  unresolved failure. Diagnostic messages and persisted summaries explain a
+  downgrade. The optional strict freshness gate remains separate.
+- These H07 changes are formatted but **not yet compiled or tested**. After
+  H18's benchmark gate finishes, reproduce the initial failures on the baseline
+  and then verify the implementation. No H07 fix is claimed yet.
+
+- **Follow-up H19:** `run` carries audited file mutations across rounds, but
+  `decide_exit` compares `min_tool_calls` only with the latest round's tool
+  count. An action-required continuation that already wrote files can therefore
+  fail `ExecutionRequiredButNoTools` when its final round only answers. This
+  source-traced case still needs reproduction and its own fix; H07's
+  continuation regression uses coordinator-decides mode to isolate the
+  independent verification-state defect.
+
+## 2026-11-03 — H18: verification complete
+
+- All nine discovered benchmark targets compiled in the release profile and
+  passed their `--test` smoke runs. The sequential extra-CI script exited 0;
+  process inspection confirmed no Cargo operation remained. These are
+  correctness/compilation smoke tests, not measured performance comparisons.
+- Final checks also passed: formatting, diff hygiene, UI palette restrictions
+  and all six Python script tests. Together with 6,031 workspace tests,
+  warnings-denied Clippy, default/single-frontend builds, runtime smoke tests,
+  WASM guest builds and fresh deny/audit scans, local CI coverage is complete.
+- H06 and H18 are ready to publish to draft PR #379. The native Windows-only
+  H06 case remains unexecuted locally; no Windows runtime validation is claimed.
+- The preceding goal turn made progress: completed the live benchmark wait and
+  drafted the H07 implementation/regressions in isolation. Next, reproduce H07
+  on the unfixed baseline, then verify the corrected implementation.
