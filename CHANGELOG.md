@@ -111,6 +111,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Provider context guard counts replayable reasoning.** Large reasoning
+  payloads can no longer bypass the input budget behind short visible answers;
+  fitting requests retain their reasoning unchanged.
 - **Compaction budgets current content independently of historical usage.**
   Prior prompt/completion counts no longer inflate or erase current context
   size. The estimate includes replayable reasoning and structured tool payloads

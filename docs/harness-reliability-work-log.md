@@ -33,7 +33,7 @@ passing repository tests alone does not close a finding.
 | H21 | P2 | Multi-agent runtime stage reports Complete for partial outputs | Open; source traced during H07 |
 | H22 | P1 | Cache path normalization can select a different file from the filesystem tool | Fixed and verified with H15; awaiting merge |
 | H23 | P2 | CLI MCP probe integration test timed out during the H19 workspace run | Open; cause under investigation |
-| H24 | P2 | Final provider context guard omits replayable reasoning from its size estimate | Reproduced; implementation applied, verification running |
+| H24 | P2 | Final provider context guard omits replayable reasoning from its size estimate | Fixed and verified; awaiting merge |
 
 ## 2026-10-29 — H01: preserve streaming events across chunks
 
@@ -938,3 +938,15 @@ Next: patch H18, then continue H07's truthful verification/completion handling.
   The migration/bounded-upsert SQL passed an in-memory SQLite probe; the Rust
   draft has only been formatted, not compiled or tested. No H17 guarantee is
   claimed from H08/H24 validation.
+
+## 2026-11-04 — H24: final verification complete
+
+- Published H08 as `ba06570`. H24 adds reasoning bytes to the provider guard's
+  existing estimate; oversized replay reasoning is rejected before dispatch
+  when reduction cannot fit it, while fitting reasoning remains unchanged.
+- The new rejection regression failed before the fix; all eight focused guard
+  tests pass in the complete 594-test provider suite. The unchanged combined
+  H08/H24 tree passed every local check recorded above (6,059 workspace tests).
+- This remains a heuristic estimate, not an exact model tokenizer. Neither
+  this fix nor H08 claims to preserve every constraint through compaction;
+  H09 remains open. Remote checks follow publication of this new head.
