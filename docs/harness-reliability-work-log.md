@@ -19,8 +19,8 @@ passing repository tests alone does not close a finding.
 | H07 | P1 | Verification errors can accompany Completed status | Fixed and verified; awaiting merge |
 | H08 | P2 | Compaction counts historical usage as current context size | Fixed and verified; awaiting merge |
 | H09 | P2 | Compaction truncates constraints and unresolved work | Open |
-| H10 | P2 | Agent-driven benchmark fixture policy denies tools | Open |
-| H11 | P2 | Empty benchmark outcomes force a zero pass score | Open |
+| H10 | P2 | Agent-driven benchmark fixture policy denies tools | Fixed and verified locally; awaiting merge |
+| H11 | P2 | Empty benchmark outcomes force a zero pass score | Fixed and verified locally; awaiting merge |
 | H12 | P2 | Durable event subscriber queues have no memory bound | Open |
 | H13 | P1 | Structured-response parsing rewrites Unicode before attempting JSON parsing | Fixed and verified; awaiting merge |
 | H14 | P2 | Checkpoint startup can degrade into ToolNotFound; CLI test failed intermittently | Open; observed during H02 verification |
@@ -34,8 +34,10 @@ passing repository tests alone does not close a finding.
 | H22 | P1 | Cache path normalization can select a different file from the filesystem tool | Fixed and verified with H15; awaiting merge |
 | H23 | P2 | CLI MCP probe integration test timed out during the H19 workspace run | Open; cause under investigation |
 | H24 | P2 | Final provider context guard omits replayable reasoning from its size estimate | Fixed and verified; awaiting merge |
-| H25 | P2 | Benchmark required-pattern checks count unreadable files as matching | Open; source traced during H17 verification |
-| H26 | P2 | Nine non-standard benchmark task manifests contain invalid-length IDs | Open; fixture inspection confirmed 27-character IDs |
+| H25 | P2 | Benchmark required-pattern checks count unreadable files as matching | Fixed and verified locally; awaiting merge |
+| H26 | P2 | Nine non-standard benchmark task manifests contain invalid-length IDs | Fixed and verified locally; awaiting merge |
+| H27 | P1 | Native orchestrator builds fail on macOS (Linux syscall) and Windows (test helper cfgs) | Reproduced by expanded native CI; isolated corrections drafted |
+
 
 ## 2026-10-29 — H01: preserve streaming events across chunks
 
@@ -1049,3 +1051,77 @@ Next: patch H18, then continue H07's truthful verification/completion handling.
   exact line/column error. Quoted the command; all workflow YAML now parses.
   This workflow-only correction does not change the verified Rust source or
   imply that Windows/macOS gate tests have passed.
+- The policy baseline also failed behaviorally (`Deny` instead of `Allow`
+  for a filesystem write). Both baseline commands exited 101 with the five
+  intended assertion failures, not compilation errors. Logs are retained.
+- Applied the separate implementation patch after the baseline: explicit
+  audited permissive fixture policy, neutral empty file constraints, failed
+  unreadable pattern checks, and nine deterministic valid unique task IDs.
+  Five focused regressions are now running on the primary tree.
+- Published the native-workflow quoting correction as `9f1eaf9`; its expanded
+  Windows/macOS/Linux gate test results remain pending.
+- All five focused regressions now pass: four scoring/corpus tests and one
+  policy/audit test. The corpus test loads all 22 tasks across six categories;
+  the suite regression proves exactly one pass among a valid completed task,
+  an incomplete task and a task with failing tests. The policy test confirms
+  both filesystem and shell Allow decisions remain in the audit log.
+- Starting full workspace tests, all-target Clippy, workspace/frontend builds
+  and the supplemental CI smoke checks on this unchanged primary source.
+- Benchmark-fix index refresh, palette enforcement, six Python script tests
+  and fresh `cargo deny check`/`cargo audit` passed. The full Rust pipeline is
+  still running; there is no workspace result for the benchmark fixes yet.
+- H17's corrected native workflow is running on Windows/Linux, with macOS
+  queued. Remote fmt, Clippy, WASM, palette and deny checks have passed on
+  `9f1eaf9`; these checks do not cover the uncommitted benchmark fixes.
+- H21 follow-up remains isolated in the `h21` worktree. Both multi-agent
+  tails unconditionally publish Complete even for Partial (and the coordinator
+  may return AwaitingUser). A shared status-to-stage boundary and three
+  observable event/state regression drafts cover unfinished and completed
+  results. No H21 Rust compile/test result is claimed yet.
+- The benchmark-fix workspace suite passed: 6,073 passed, zero failed,
+  16 ignored across 85 groups. Clippy/build/supplemental checks are still live.
+- All nine main remote CI checks on H17's corrected head `9f1eaf9` passed.
+  The expanded native Linux job also passed both the gate/resume suite and
+  session-provenance cleanup. Windows/macOS gate steps remain in progress.
+- All-target workspace Clippy passed with warnings denied for the benchmark
+  fixes. Workspace/frontend builds and supplemental checks continue.
+- H16 follow-up evidence: Context7's llvm-cov documentation confirms explicit
+  JSON report-file output; the current code mixes report JSON and test logs.
+  Tarpaulin's [released 0.37.5 report implementation](https://github.com/xd009642/tarpaulin/blob/0.37.5/src/report/json.rs)
+  writes `tarpaulin-report.json` with `coverage`, `covered` and `coverable`.
+  Concerto instead reads stdout and expects `coverage_percent`, defaulting a
+  missing field to zero. The existing parser tests use that invented shape.
+  This adds concrete report-format evidence to H16; no coverage code has been
+  changed or claimed fixed in the benchmark milestone.
+- Expanded macOS CI exposed H27: `supervisor.rs:867` calls Linux-only
+  `libc::prctl(PR_SET_PDEATHSIG, ...)` under `cfg(unix)`, causing E0425 before
+  gate tests could run. The same code exists in published pre-H17 `3dc5f0a`;
+  older native jobs never compiled this crate. The failed job log is retained.
+- Drafted a targeted platform guard in the isolated H21 worktree (exported
+  separately as the H27 patch): keep Unix process-group setup, restrict the
+  Linux parent-death syscall to Linux, and document the actual platform
+  guarantee. This is not applied to the primary source during its live
+  benchmark verification. Native macOS execution remains unverified.
+
+## 2026-11-04 — H10/H11/H25/H26: final local verification complete
+
+- All 6,073 workspace tests passed, with zero failures and 16 ignored across
+  85 groups. All-target Clippy with warnings denied, workspace/default and
+  both frontend builds, launcher/cache/CLI smoke checks, all four WASM guests,
+  formatting/diff checks, palette enforcement, six Python tests, semantic
+  indexing and both fresh supply-chain scans passed.
+- The original pipeline handle was unavailable after its complete final bench
+  log. Process inspection confirmed no Cargo/rustc/linker remained. Earlier
+  stages had finished successfully (the sequential pipeline reached its last
+  command). Re-ran only that cached final benchmark command to capture an
+  authoritative terminal result: exit 0 for all nine targets, also persisted
+  to a status artifact. No incomplete run is reported as successful.
+- Expanded Windows CI found the other H27 branch: Unix-only rollback tests
+  leave seven helper items unused when the orchestrator test crate builds
+  with warnings denied. The failed log is retained. The isolated correction
+  makes two already-portable rollback tests run on all platforms and limits
+  the Unix sleep fixture helper to Unix. Native CI will run the rollback
+  suite explicitly; no lint is weakened.
+- Publishing the four benchmark fixes as one evaluation-validity milestone.
+  H27 portability corrections and the H21 completion-stage draft are still
+  separate, unapplied work; broader harness findings remain open.

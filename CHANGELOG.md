@@ -111,6 +111,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Benchmark validity.** Agent-driven fixtures now explicitly allow and audit
+  their tool calls. Tasks without optional file constraints can pass when
+  completed with passing tests; unreadable required content fails its checks.
+  Nine category task IDs are valid ULIDs, and every committed category is
+  covered by a corpus-loading regression.
+
 - **Read-version protection survives resumed runs.** Identified sessions retain
   observed file hashes and absence claims across gate recreation. Unknown
   legacy provenance and unavailable storage require rereading; stored claims
