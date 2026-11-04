@@ -2671,12 +2671,17 @@ impl AgentLoop {
             None => HashMap::new(),
         };
 
-        // ADR-65 §4: safe read dedupe. A plain single-path filesystem read
-        // whose clean observation still matches the disk (re-statted now,
-        // content hash verified) is a serve candidate. Any doubt (_None_)
-        // degrades to normal execution below.
+        // Cache validation reads current bytes, so the advisory Allow check
+        // must precede it. A non-Allow verdict or cache miss falls through to
+        // normal policy-checked execution; the advisory check consumes no quota.
         let serve = match &self.tool_facts {
-            Some(facts) => {
+            Some(facts)
+                if crate::read_cache::plain_single_path_read(&tc.name, &arguments).is_some()
+                    && self
+                        .tool_executor
+                        .policy_verdict_is_allow(&tc.name, &arguments, session, cancel.clone())
+                        .await =>
+            {
                 crate::read_cache::maybe_serve_read(
                     facts,
                     &self.project_root,
@@ -2685,24 +2690,6 @@ impl AgentLoop {
                     &cancel,
                 )
                 .await
-            }
-            None => None,
-        };
-        // ADR-65 F1a: a cached read is served ONLY when the policy engine
-        // explicitly allows the read through the advisory path — re-evaluated
-        // here, per serve, so a served read is never a policy bypass. The
-        // advisory evaluation records no decision row and consumes no quota
-        // (see `ToolExecutor::policy_verdict_is_allow`); a non-`Allow` verdict
-        // falls through to the normal executor path below, where the full
-        // policy gate (Deny / RequireApproval) surfaces as usual.
-        let serve = match serve {
-            Some(serve)
-                if self
-                    .tool_executor
-                    .policy_verdict_is_allow(&tc.name, &arguments, session, cancel.clone())
-                    .await =>
-            {
-                Some(serve)
             }
             _ => None,
         };

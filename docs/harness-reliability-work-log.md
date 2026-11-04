@@ -24,14 +24,14 @@ passing repository tests alone does not close a finding.
 | H12 | P2 | Durable event subscriber queues have no memory bound | Open |
 | H13 | P1 | Structured-response parsing rewrites Unicode before attempting JSON parsing | Fixed and verified; awaiting merge |
 | H14 | P2 | Checkpoint startup can degrade into ToolNotFound; CLI test failed intermittently | Open; observed during H02 verification |
-| H15 | P1 | Orchestrator read cache trusts matching size/mtime without checking current bytes | Reproduced; implementation applied, verification running |
+| H15 | P1 | Orchestrator read cache trusts matching size/mtime without checking current bytes | Fixed and verified; awaiting merge |
 | H16 | P2 | Coverage-only Cargo runners trust exit status and truncate output at byte offsets | Open; source traced during H04 |
 | H17 | P1 | Resumed history lacks restored read-version claims when a new gate is constructed | Open; source traced during H06 |
 | H18 | P1 | Locked Wasmtime 36.0.19 fails fresh security gates on RUSTSEC-2026-0424 | Fixed and verified; awaiting merge |
 | H19 | P2 | Action-required minimum tool-call check ignores earlier continuation rounds | Fixed and verified; awaiting merge |
 | H20 | P1 | Yanked async-executor 1.14.0 remains locked after an upstream memory-safety regression | Fixed and verified; awaiting merge |
 | H21 | P2 | Multi-agent runtime stage reports Complete for partial outputs | Open; source traced during H07 |
-| H22 | P1 | Cache path normalization can select a different file from the filesystem tool | Reproduced; implementation applied with H15, verification running |
+| H22 | P1 | Cache path normalization can select a different file from the filesystem tool | Fixed and verified with H15; awaiting merge |
 | H23 | P2 | CLI MCP probe integration test timed out during the H19 workspace run | Open; cause under investigation |
 
 ## 2026-10-29 — H01: preserve streaming events across chunks
@@ -838,3 +838,21 @@ Next: patch H18, then continue H07's truthful verification/completion handling.
   repair preserves string data. The cache fix was tested alongside it and is
   recorded in the following milestone. H23's earlier timeout remains open;
   the successful current suite does not establish its cause.
+
+## 2026-11-04 — H15/H22: verification complete
+
+- Published H13 as `e33045d`. H15/H22 now land together because fresh bytes
+  only establish correctness when they belong to the file actually requested.
+- Regressions prove rejection of same-length edits with restored mtime,
+  Unix literal-backslash aliases, symlink-parent lexical collapse and a path
+  replaced with an escaping symlink. Empty, Unicode and exact-64-KiB reads
+  remain cacheable; pre-cancelled reads miss. All tests passed in the unchanged
+  combined tree and workspace validation recorded above.
+- All three production cache callers obtain advisory Allow before validation
+  reads disk. Native resolver identity/containment, same-handle metadata and
+  bounded current-byte comparison supplement the existing clean-row/hash rules.
+  Any uncertainty falls through to ordinary policy-gated execution.
+- ADR-65 and the cache API documentation explicitly supersede metadata-only
+  freshness. No filesystem lock, atomic-write guarantee or disk-I/O saving is
+  claimed. Native Unix regressions ran on Linux; Windows-specific orchestrator
+  coverage remains an explicit verification limitation.

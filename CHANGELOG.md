@@ -115,6 +115,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   original JSON before repair. Fallback repair changes only smart delimiters
   and nonbreaking whitespace outside strings, preserving punctuation in keys
   and values across strict, fenced and prose-wrapped responses.
+- **Cached reads validate current bytes and native paths.** Metadata equality
+  no longer hides same-size external edits. Cache keys must resolve to the same
+  contained file as the requested tool path, including native backslash and
+  symlink behavior. Bounded byte validation runs after advisory policy Allow
+  and honors cancellation; uncertainty falls through to normal execution.
 - **Continuation rounds retain execution progress.** Action-required tasks can
   finish after work done in earlier rounds without repeating writes. Tool-call
   minimums accumulate across rounds and are enforced at completion; a capped
