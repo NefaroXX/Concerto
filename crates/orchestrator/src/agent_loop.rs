@@ -561,12 +561,6 @@ impl AgentLoop {
         let mut last_partial: Option<AgentOutput> = None;
         let mut cumulative_progress: Option<AgentOutput> = None;
 
-        let mut carried_file_changes: u32 = 0;
-        // Cross-round file-changing carry (completion-fix reconciliation):
-        // the ActionRequired completion check runs INSIDE `run_once` with a
-        // round-scoped counter; the audited write path accumulates across
-        // continuation rounds. The carry tracks the audited file-changing
-        // total so a later round's check sees the earlier rounds' writes.
         for round in 0..MAX_CONTINUATION_ROUNDS {
             // Seed this round's conversation. The first round includes the
             // original task prompt; continuation rounds reuse the full prior
@@ -584,17 +578,8 @@ impl AgentLoop {
                 });
             }
 
-            let prior_verification = cumulative_progress
-                .as_ref()
-                .map_or(&[][..], |output| output.verification.as_slice());
             let exit = self
-                .run_once(
-                    task.clone(),
-                    seed,
-                    cancel.clone(),
-                    carried_file_changes,
-                    prior_verification,
-                )
+                .run_once(task.clone(), seed, cancel.clone(), cumulative_progress.as_ref())
                 .await?;
 
             match exit {
@@ -710,9 +695,6 @@ impl AgentLoop {
                         cumulative_progress = Some(partial.clone());
                     }
                     let cumulative = cumulative_progress.as_ref().unwrap_or(&partial);
-                    // Reconcile the cross-round file-changing carry with the
-                    // audited write path (completion-fix).
-                    carried_file_changes = audited_file_changes(cumulative);
                     let fp = ProgressFingerprint::from_output(cumulative);
                     if Some(&fp) == last_fp.as_ref() {
                         stale_rounds += 1;
@@ -874,14 +856,10 @@ impl AgentLoop {
         task: AgentTask,
         seed_messages: Vec<Message>,
         cancel: CancellationToken,
-        // Cross-round audited file-changing carry (completion-fix): the
-        // ActionRequired completion check inside `decide_exit` sees the
-        // earlier continuation rounds' audited writes, not just this round's
-        // round-scoped counter.
-        prior_file_changes: u32,
-        // Same-run checks must be reconciled before deciding or publishing
-        // completion, not after the latest round has already claimed success.
-        prior_verification: &[VerificationSummary],
+        // The same run's accumulated output supplies counters and verification
+        // to every completion boundary. Keep returned counts round-local so
+        // merging this round does not count earlier calls twice.
+        prior_progress: Option<&AgentOutput>,
     ) -> Result<AgentRunExit, OrchestratorError> {
         self.state = AgentState::Planning;
         let correlation_id = Ulid::new();
@@ -907,7 +885,10 @@ impl AgentLoop {
         let mut file_changing_tool_count = 0u32;
         let mut files_modified = Vec::new();
         let mut tool_events: Vec<ToolExecutionSummary> = Vec::new();
-        let mut verification = prior_verification.to_vec();
+        let prior_tool_calls = prior_progress.map_or(0, |output| output.tool_call_count);
+        let prior_file_changes = prior_progress.map_or(0, audited_file_changes);
+        let mut verification =
+            prior_progress.map_or_else(Vec::new, |output| output.verification.clone());
         let mut final_message = String::new();
         let mut completed = false;
         let mut messages: Vec<Message> = seed_messages;
@@ -1136,7 +1117,7 @@ impl AgentLoop {
                 &tool_calls,
                 usage,
                 &task.execution_mode,
-                file_changing_tool_count,
+                prior_file_changes.saturating_add(file_changing_tool_count),
                 iteration,
                 correlation_id,
                 task.session_id,
@@ -1275,7 +1256,7 @@ impl AgentLoop {
         if let Some(exit) = self.decide_exit(
             &task,
             &output,
-            tool_call_count,
+            prior_tool_calls.saturating_add(tool_call_count),
             file_changing_tool_count,
             prior_file_changes,
             &eval_result,
@@ -1928,7 +1909,10 @@ impl AgentLoop {
         if let TaskExecutionMode::ActionRequired { min_tool_calls, require_verification } =
             task.execution_mode
         {
-            if tool_call_count < min_tool_calls {
+            // The minimum applies to the completed task, across all rounds.
+            // A capped round with real progress can continue toward it. Keep
+            // the existing no-tools failure for a run that never acted at all.
+            if tool_call_count < min_tool_calls && (completed || tool_call_count == 0) {
                 return Err(OrchestratorError::ExecutionRequiredButNoTools);
             }
 
@@ -4978,13 +4962,13 @@ mod tests {
         let first_provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
         let (mut loop1, audit1) =
             make_loop_with_dir_capturing(first_provider, approval.clone(), 10, dir_path);
-        loop1.run_once(task.clone(), Vec::new(), cancel.clone(), 0, &[]).await.expect("instance 1");
+        loop1.run_once(task.clone(), Vec::new(), cancel.clone(), None).await.expect("instance 1");
 
         // Instance 2 (a later user message): same session + project, no re-prompt.
         let second_provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
         let (mut loop2, audit2) =
             make_loop_with_dir_capturing(second_provider, approval.clone(), 10, dir_path);
-        loop2.run_once(task.clone(), Vec::new(), cancel.clone(), 0, &[]).await.expect("instance 2");
+        loop2.run_once(task.clone(), Vec::new(), cancel.clone(), None).await.expect("instance 2");
 
         assert_eq!(
             prompts.load(Ordering::SeqCst),
@@ -5013,9 +4997,9 @@ mod tests {
         let task = AgentTask::new(Ulid::new(), "test task");
         let cancel = CancellationToken::new();
 
-        loop_.run_once(task.clone(), Vec::new(), cancel.clone(), 0, &[]).await.expect("round 1");
+        loop_.run_once(task.clone(), Vec::new(), cancel.clone(), None).await.expect("round 1");
         loop_.project_root = std::path::PathBuf::from(second.path());
-        loop_.run_once(task.clone(), Vec::new(), cancel.clone(), 0, &[]).await.expect("round 2");
+        loop_.run_once(task.clone(), Vec::new(), cancel.clone(), None).await.expect("round 2");
 
         assert_eq!(prompts.load(Ordering::SeqCst), 2, "a different project must be asked again");
         assert_eq!(audit.ack_rows(), 2, "both prompts are audited");
@@ -5040,7 +5024,7 @@ mod tests {
         let first_provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
         let (mut loop1, _audit1) =
             make_loop_with_dir_capturing(first_provider, approval.clone(), 10, dir_path);
-        let aborted = loop1.run_once(task.clone(), Vec::new(), cancel.clone(), 0, &[]).await;
+        let aborted = loop1.run_once(task.clone(), Vec::new(), cancel.clone(), None).await;
         assert!(matches!(aborted.unwrap_err(), OrchestratorError::Cancelled));
 
         // Instance 2: same triple; request_ack now returns true. Because the
@@ -5048,7 +5032,7 @@ mod tests {
         let second_provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
         let (mut loop2, _audit2) =
             make_loop_with_dir_capturing(second_provider, approval.clone(), 10, dir_path);
-        loop2.run_once(task.clone(), Vec::new(), cancel.clone(), 0, &[]).await.expect("second run");
+        loop2.run_once(task.clone(), Vec::new(), cancel.clone(), None).await.expect("second run");
 
         assert_eq!(
             prompts.load(Ordering::SeqCst),
@@ -10077,6 +10061,150 @@ mod tests {
 
     /// Deterministic process boundary: exercises real evaluation mapping and
     /// finalization without depending on installed test runners or the network.
+    #[tokio::test]
+    async fn action_required_continuation_completes_without_repeating_prior_writes() {
+        for writes in [1usize, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut script: Vec<_> = (0..writes)
+                .map(|i| vec![completion_test_write(&format!("note-{i}.txt"), "finished")])
+                .collect();
+            script.push(vec![]);
+            let provider = Arc::new(ScriptedProvider::new(script));
+            let mut loop_ = make_loop_with_fs_tool(
+                dir.path(),
+                provider.clone(),
+                Arc::new(ApprovalTestHarness::always_approve()),
+                1,
+            );
+            let mut events = loop_.bus.subscribe().into_inner();
+            let task = AgentTask::new_with_execution_mode(
+                Ulid::new(),
+                "write the notes",
+                TaskExecutionMode::ActionRequired {
+                    min_tool_calls: 1,
+                    require_verification: false,
+                },
+            );
+            let output = loop_.run(task, CancellationToken::new()).await.unwrap();
+            assert_eq!(
+                output.completion_status,
+                concerto_core::types::AgentCompletionStatus::Completed
+            );
+            assert_eq!(output.tool_call_count as usize, writes);
+            assert_eq!(output.tool_events.len(), writes);
+            assert_eq!(output.files_modified.len(), writes);
+            assert_eq!(provider.call_count.load(Ordering::SeqCst), writes + 1);
+            for i in 0..writes {
+                assert_eq!(
+                    std::fs::read_to_string(dir.path().join(format!("note-{i}.txt"))).unwrap(),
+                    "finished"
+                );
+            }
+            while let Ok(event) = events.try_recv() {
+                if let EventKind::AgentThought { content, .. } = &event.kind {
+                    assert!(
+                        !content.contains("no file action returned"),
+                        "prior writes satisfy the action contract"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn action_required_minimum_calls_can_accumulate_across_rounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![completion_test_write("first.txt", "one")],
+            vec![completion_test_write("second.txt", "two")],
+            vec![],
+        ]));
+        let mut loop_ = make_loop_with_fs_tool(
+            dir.path(),
+            provider.clone(),
+            Arc::new(ApprovalTestHarness::always_approve()),
+            1,
+        );
+        let task = AgentTask::new_with_execution_mode(
+            Ulid::new(),
+            "write both notes",
+            TaskExecutionMode::ActionRequired { min_tool_calls: 2, require_verification: false },
+        );
+        let output = loop_.run(task, CancellationToken::new()).await.unwrap();
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed
+        );
+        assert_eq!(output.tool_call_count, 2);
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn action_required_continuation_still_enforces_the_final_minimum() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![completion_test_write("first.txt", "one")],
+            vec![],
+        ]));
+        let mut loop_ = make_loop_with_fs_tool(
+            dir.path(),
+            provider.clone(),
+            Arc::new(ApprovalTestHarness::always_approve()),
+            1,
+        );
+        let task = AgentTask::new_with_execution_mode(
+            Ulid::new(),
+            "perform two actions",
+            TaskExecutionMode::ActionRequired { min_tool_calls: 2, require_verification: false },
+        );
+        let mut live = loop_.bus.subscribe().into_inner();
+        let result = loop_.run(task, CancellationToken::new()).await;
+        assert!(matches!(result, Err(OrchestratorError::ExecutionRequiredButNoTools)));
+        assert_eq!(
+            provider.call_count.load(Ordering::SeqCst),
+            2,
+            "allow the next round to act before enforcing the final minimum"
+        );
+        assert_eq!(std::fs::read_to_string(dir.path().join("first.txt")).unwrap(), "one");
+        while let Ok(event) = live.try_recv() {
+            assert!(!matches!(event.kind, EventKind::TaskCompleted { success: true, .. }));
+        }
+    }
+
+    #[tokio::test]
+    async fn action_required_new_run_does_not_inherit_prior_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![completion_test_write("first.txt", "one")],
+            vec![],
+            vec![],
+        ]));
+        let mut loop_ = make_loop_with_fs_tool(
+            dir.path(),
+            provider.clone(),
+            Arc::new(ApprovalTestHarness::always_approve()),
+            1,
+        );
+        let task = AgentTask::new_with_execution_mode(
+            Ulid::new(),
+            "perform an action",
+            TaskExecutionMode::ActionRequired { min_tool_calls: 1, require_verification: false },
+        );
+        let output = loop_.run(task.clone(), CancellationToken::new()).await.unwrap();
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed
+        );
+        let next_task = AgentTask::new_with_execution_mode(
+            task.session_id,
+            "perform another action",
+            task.execution_mode,
+        );
+        let result = loop_.run(next_task, CancellationToken::new()).await;
+        assert!(matches!(result, Err(OrchestratorError::ExecutionRequiredButNoTools)));
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 3);
+    }
+
     struct CompletionEvalExecutor(&'static str);
 
     #[async_trait]
@@ -10235,7 +10363,9 @@ mod tests {
 
     #[tokio::test]
     async fn completion_continuation_retains_failures_until_a_successful_recheck() {
-        for repair in [false, true] {
+        for (repair, action_required) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n").unwrap();
             let mut script =
@@ -10255,7 +10385,11 @@ mod tests {
             let mut live = loop_.bus.subscribe().into_inner();
             let output = loop_
                 .run(
-                    AgentTask::new_coordinator_decides(Ulid::new(), "prepare the page"),
+                    if action_required {
+                        AgentTask::new_action_required(Ulid::new(), "prepare the page")
+                    } else {
+                        AgentTask::new_coordinator_decides(Ulid::new(), "prepare the page")
+                    },
                     CancellationToken::new(),
                 )
                 .await

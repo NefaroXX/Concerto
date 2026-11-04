@@ -111,6 +111,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Continuation rounds retain execution progress.** Action-required tasks can
+  finish after work done in earlier rounds without repeating writes. Tool-call
+  minimums accumulate across rounds and are enforced at completion; a capped
+  round with progress can continue. Counts remain scoped to one run, and
+  required verification still governs the completion result.
 - **Verification failures cannot report successful completion.** The single-agent
   loop includes failures from earlier continuation rounds before publishing
   completion. Denied, errored and cancelled checks remain Partial; required
