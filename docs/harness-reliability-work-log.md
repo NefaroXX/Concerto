@@ -17,7 +17,7 @@ passing repository tests alone does not close a finding.
 | H05 | P1 | Premature provider EOF accepted as successful completion | Fixed and verified; awaiting merge |
 | H06 | P1 | Default write versions are captured after the agent's read | Fixed and verified; awaiting merge |
 | H07 | P1 | Verification errors can accompany Completed status | Fixed and verified; awaiting merge |
-| H08 | P2 | Compaction counts historical usage as current context size | Open |
+| H08 | P2 | Compaction counts historical usage as current context size | Fixed and verified; awaiting merge |
 | H09 | P2 | Compaction truncates constraints and unresolved work | Open |
 | H10 | P2 | Agent-driven benchmark fixture policy denies tools | Open |
 | H11 | P2 | Empty benchmark outcomes force a zero pass score | Open |
@@ -33,6 +33,7 @@ passing repository tests alone does not close a finding.
 | H21 | P2 | Multi-agent runtime stage reports Complete for partial outputs | Open; source traced during H07 |
 | H22 | P1 | Cache path normalization can select a different file from the filesystem tool | Fixed and verified with H15; awaiting merge |
 | H23 | P2 | CLI MCP probe integration test timed out during the H19 workspace run | Open; cause under investigation |
+| H24 | P2 | Final provider context guard omits replayable reasoning from its size estimate | Reproduced; implementation applied, verification running |
 
 ## 2026-10-29 — H01: preserve streaming events across chunks
 
@@ -856,3 +857,84 @@ Next: patch H18, then continue H07's truthful verification/completion handling.
   freshness. No filesystem lock, atomic-write guarantee or disk-I/O saving is
   claimed. Native Unix regressions ran on Linux; Windows-specific orchestrator
   coverage remains an explicit verification limitation.
+
+## 2026-11-04 — H08: size the current context independently of usage
+
+- Published H13 and H15/H22 as `e33045d` and `2793320` and updated draft PR
+  #379. Their full local verification is complete; the new remote jobs are
+  running. The primary worktree was clean before starting H08.
+- Three new regressions failed against the previous estimator (nine existing
+  context-engine tests passed): large historical usage inflated tiny windows,
+  zero usage hid large tool payloads, and a persisted tiny conversation was
+  unnecessarily checkpointed. The baseline log is retained.
+- The estimator now measures current content/tool payloads and replayable
+  reasoning, independent of usage counters. Structured tool results replace
+  legacy display text for sizing. Saturating arithmetic bounds accumulation;
+  the public payload/usage shape and accounting writes are unchanged.
+- The persistence regression compares stored rows before and after compaction:
+  the existing SQLite adapter restores stored zero usage as unknown, so the
+  test does not assume zero-vs-unknown round-trip preservation. Added payload
+  coverage checks reasoning and legacy-display duplication. Focused context
+  tests are running; no completed verification is claimed yet.
+- **H24:** `providers/context_guard.rs::estimate_message_tokens` also omits
+  `reasoning_content`, despite OpenAI-compatible adapters replaying it. H08
+  corrects the durable compaction estimate, not that final request guard. A
+  provider-boundary regression and fix remain required.
+- H08's focused context run passed all 29 tests. The provider guard follow-up
+  now has two execution-boundary regressions: reject oversized replay reasoning
+  before calling the provider, and preserve fitting reasoning even with very
+  large historical usage counters. Its baseline is running separately.
+- H17 follow-up tracing confirms reads intentionally return `gate_seq = 0`
+  without a gate WAL row (`gate.rs::run_read_only`), and `WriteGate::new`
+  constructs an empty `ReadVersions` map. A resumed single-agent runtime
+  constructs a fresh gate, so replaying that WAL cannot recover read claims.
+  Any restoration fix must preserve the actual returned-byte observation,
+  not replace it with a post-resume disk hash.
+
+## 2026-11-04 — H24: account for replay reasoning at the provider boundary
+
+- The provider baseline passed seven tests and failed the new oversized-
+  reasoning rejection test: the inner provider received a request whose
+  reasoning alone exceeded the input budget. The fitting-reasoning case
+  already passed and remains a preservation check.
+- The final guard now includes reasoning bytes in its existing estimate.
+  It retains the current reduction order and returns ContextOverflow before
+  dispatch when the request still cannot fit. No reasoning truncation or
+  historical-usage-based sizing was introduced.
+- Both changes are being verified together through the provider and
+  orchestrator suites, then the workspace and supplemental CI checks.
+- The affected suites passed: 1,880 orchestrator tests and 594 provider tests,
+  with one ignored in each. Formatting/diff checks, palette enforcement, all
+  six Python tests, semantic indexing and fresh cargo-deny/cargo-audit scans
+  passed. Full workspace validation is running on the unchanged source.
+- Prepared two H17 regressions in the separate disk-backed `h17` worktree:
+  re-create a gate against the same database/session after an observed read or
+  absence, then reject an intervening external edit/create. These are formatted
+  drafts only, not compiled or run. They are not part of H08/H24 validation.
+- All twelve remote CI checks on published `2793320` now pass, including
+  workspace tests/build/benchmarks, native Windows/macOS/Linux jobs and both
+  supply-chain gates. H08/H24 remain uncommitted pending the live full local
+  pipeline; no remote result is attributed to those newer changes.
+
+## 2026-11-04 — H08: final verification complete
+
+- The sequential H08/H24 pipeline exited 0. Full workspace tests passed:
+  6,059 passed, zero failed, 16 ignored across 85 groups. Affected suites passed
+  1,880 orchestrator and 594 provider tests (one ignored in each).
+- Workspace Clippy (all targets, warnings denied), default workspace build,
+  both frontend builds, launcher/cache/CLI smoke checks, all four WASM guests
+  and all nine release benchmark smoke targets passed. No performance claim
+  is inferred from smoke benchmarks.
+- Formatting/diff checks, palette enforcement, six Python script tests, semantic
+  index refresh and both fresh supply-chain scans passed. No primary source
+  changes occurred during the final pipeline. No Cargo process remains.
+- H08 is published separately with the sizing regressions and ADR-48 amendment;
+  H24 was tested alongside it and follows as a separate provider fix.
+- H17 remains an isolated draft: durable claims keyed by project/session/agent,
+  bounded per-session storage, cleanup, explicit legacy reread requirements,
+  cancellation-aware lookup and persistence failures that do not fall back to
+  disk hashes. Six regression drafts now cover restart, absence, own-write
+  advancement/isolation, legacy recovery, unavailable storage and capacity.
+  The migration/bounded-upsert SQL passed an in-memory SQLite probe; the Rust
+  draft has only been formatted, not compiled or tested. No H17 guarantee is
+  claimed from H08/H24 validation.

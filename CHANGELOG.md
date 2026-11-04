@@ -111,6 +111,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Compaction budgets current content independently of historical usage.**
+  Prior prompt/completion counts no longer inflate or erase current context
+  size. The estimate includes replayable reasoning and structured tool payloads
+  without counting legacy tool display text twice; accounting stays unchanged.
 - **Structured JSON preserves Unicode data.** Both model-response parsers try
   original JSON before repair. Fallback repair changes only smart delimiters
   and nonbreaking whitespace outside strings, preserving punctuation in keys

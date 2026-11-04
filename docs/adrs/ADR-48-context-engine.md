@@ -114,6 +114,10 @@ DeepSeek/GLM models; measurements and the GLM relay-replica caveat are in
 
 ### 4. Token accounting becomes real
 
+The accounting policy below concerns historical usage. The [2026-11-04
+amendment](#amendment-2026-11-04--separate-context-size-from-historical-usage)
+clarifies that it does not define current-window sizing.
+
 Provider-reported usage (`usage.*`/`tokens_*` from the completion response) is
 recorded per message **when available** and preferred over the estimate; the
 estimate remains the fallback. Nothing in this ADR implements the write path —
@@ -187,3 +191,25 @@ the seven decisions above.
 - The multi-agent coordinator is deliberately out of scope; its isolation
   guarantees (fresh windows, summaries returned) already meet the redesign's
   principle 6.
+
+## Amendment (2026-11-04) — separate context size from historical usage
+
+Provider-reported usage is authoritative for the completed request's accounting,
+not for the length of an individual message retained in a future request. A
+prompt-token count includes the earlier request's whole context; summing those
+counts over a conversation repeatedly counts earlier context. Completion usage
+can also cover reasoning or content no longer present. Zero is a legitimate
+accounting value and must not hide a large current payload.
+
+The compaction planner and durable checkpoint path now estimate the current
+message content, replayable reasoning, tool calls and structured tool results
+with the existing byte/4 heuristic and per-message overhead. Structured tool
+results replace legacy display text, so that text is not counted twice. Usage
+metadata does not change the estimate or compaction decision. Persisted usage
+and spend records remain untouched.
+
+This is a deterministic sizing estimate, not an exact tokenizer or proof that a
+complete provider request fits its capacity. Provider-specific serialization,
+tool definitions and the final request guard remain separate concerns. This
+amendment does not claim that truncated checkpoint summaries preserve every
+constraint or unresolved task (H09).
