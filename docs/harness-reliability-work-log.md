@@ -1031,3 +1031,21 @@ Next: patch H18, then continue H07's truthful verification/completion handling.
 - The previous goal turn made concrete progress: H17 verification completed,
   and five benchmark regressions plus an isolated implementation were drafted.
   The broader audit remains active; the remaining open findings are unchanged.
+
+## 2026-11-04 — H10/H11/H25/H26: benchmark validity regressions
+
+- Published H17 as `69c2ac3` and updated draft PR #379 to describe all sixteen
+  fixed findings and their limits. Expanded native gate coverage is pending.
+- Applied only the benchmark regression/extraction patch to the primary tree.
+  Policy construction and score calculation still preserve the defective
+  behavior so the new assertions can reproduce each finding. The final fix
+  remains isolated until baseline test results have been inspected.
+- The four eval regressions failed behaviorally on the baseline: invalid ID
+  length, empty-constraint score 0, unreadable-required-content score 1, and
+  aggregate score 0 instead of one passing task out of three. The policy
+  regression is still compiling; its result is not yet claimed.
+- Remote H17 native CI failed before running tests because the unquoted
+  `gate::` filter is invalid YAML at the final colon. PyYAML reproduced the
+  exact line/column error. Quoted the command; all workflow YAML now parses.
+  This workflow-only correction does not change the verified Rust source or
+  imply that Windows/macOS gate tests have passed.
