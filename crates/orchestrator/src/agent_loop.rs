@@ -43,7 +43,8 @@ use crate::verify::{VerifierService, VerifySpawner};
 
 mod output_progress;
 use output_progress::{
-    audited_file_changes, continuation_instruction, merge_run_progress, ProgressFingerprint,
+    audited_file_changes, continuation_instruction, merge_run_progress, merge_verification,
+    verification_completion_blocker, ProgressFingerprint,
 };
 
 /// The single-agent loop driving plan → act → observe → plan cycles.
@@ -583,8 +584,18 @@ impl AgentLoop {
                 });
             }
 
-            let exit =
-                self.run_once(task.clone(), seed, cancel.clone(), carried_file_changes).await?;
+            let prior_verification = cumulative_progress
+                .as_ref()
+                .map_or(&[][..], |output| output.verification.as_slice());
+            let exit = self
+                .run_once(
+                    task.clone(),
+                    seed,
+                    cancel.clone(),
+                    carried_file_changes,
+                    prior_verification,
+                )
+                .await?;
 
             match exit {
                 AgentRunExit::Done(mut output) => {
@@ -595,7 +606,7 @@ impl AgentLoop {
                     // Truthful completion (ADR-55 §1, completion fix):
                     // `AgentOutput.completion_status` is the single source
                     // of truth. `finalize_completion` set it from the agent's
-                    // own landing state (an eval failure stays `Partial`);
+                    // own landing state (verification failures stay `Partial`);
                     // no transport-level success ever overrides it here.
                     self.persist_run_success(session_id, &output, cancel.clone()).await;
                     self.note_degraded(&mut output);
@@ -868,6 +879,9 @@ impl AgentLoop {
         // earlier continuation rounds' audited writes, not just this round's
         // round-scoped counter.
         prior_file_changes: u32,
+        // Same-run checks must be reconciled before deciding or publishing
+        // completion, not after the latest round has already claimed success.
+        prior_verification: &[VerificationSummary],
     ) -> Result<AgentRunExit, OrchestratorError> {
         self.state = AgentState::Planning;
         let correlation_id = Ulid::new();
@@ -893,7 +907,7 @@ impl AgentLoop {
         let mut file_changing_tool_count = 0u32;
         let mut files_modified = Vec::new();
         let mut tool_events: Vec<ToolExecutionSummary> = Vec::new();
-        let mut verification: Vec<VerificationSummary> = Vec::new();
+        let mut verification = prior_verification.to_vec();
         let mut final_message = String::new();
         let mut completed = false;
         let mut messages: Vec<Message> = seed_messages;
@@ -1215,6 +1229,10 @@ impl AgentLoop {
         self.state = AgentState::Evaluating;
         let (eval_result, eval_verification) =
             self.run_evaluation(&files_modified, cancel.clone()).await;
+        if cancel.is_cancelled() {
+            self.state = AgentState::Cancelled;
+            return Err(OrchestratorError::Cancelled);
+        }
 
         // Lightweight verification for file changes (H05: the shared sweep
         // implementation in `crate::verify`, stamped with this run's clock).
@@ -1225,7 +1243,7 @@ impl AgentLoop {
         let sweep_spawner = crate::verify::SystemSpawner::new();
         sweep_spawner.set_governed_eval(self.eval.clone());
         let mut sweep_coalesce = HashMap::new();
-        verification = crate::verify::verify_file_changes_with(
+        let sweep_verification = crate::verify::verify_file_changes_with(
             &files_modified,
             &self.project_root,
             &self.verification_stamp(),
@@ -1235,7 +1253,12 @@ impl AgentLoop {
             &cancel,
         )
         .await;
-        verification.extend(eval_verification);
+        merge_verification(&mut verification, &sweep_verification);
+        merge_verification(&mut verification, &eval_verification);
+        if cancel.is_cancelled() {
+            self.state = AgentState::Cancelled;
+            return Err(OrchestratorError::Cancelled);
+        }
 
         // Phase 9: Build agent output
         let output = self.build_agent_output(
@@ -1267,10 +1290,8 @@ impl AgentLoop {
             &task,
             &session,
             output,
-            &eval_result,
             tool_call_count,
             &files_modified,
-            &final_message,
             correlation_id,
             cancel,
         )
@@ -1812,7 +1833,7 @@ impl AgentLoop {
     /// ([`crate::verify::run_project_tests`], H05 single-implementation
     /// rule), stamped with this run's clock. `AgentOutput.eval_result`
     /// semantics are UNCHANGED: `Some` only for an actually-finished harness
-    /// run — no run-outcome change.
+    /// run; unavailable/error/cancelled checks remain typed in the ledger.
     async fn run_evaluation(
         &self,
         files_modified: &[Utf8PathBuf],
@@ -1880,8 +1901,8 @@ impl AgentLoop {
     /// `strict_verification_gate`, `task_finished=`, `verification_passed=`,
     /// `require_verification=`, `records=`, per-record `outcomes=[..]`,
     /// `freshness=`, and (for stale passes) `stale_detail=[..]` ledger tokens.
-    /// Flag off (the default) preserves the warn-and-continue below
-    /// byte-identically.
+    /// Flag off (the default) preserves the exit decision here. Finalization
+    /// still refuses successful completion for failed or unmet verification.
     #[allow(clippy::too_many_arguments)]
     fn decide_exit(
         &mut self,
@@ -1969,49 +1990,49 @@ impl AgentLoop {
         Ok(None)
     }
 
-    /// Phase 11: Finalize completion when the task is truly done.
-    /// Sets `Completed` state, publishes the completion event, stores the
-    /// task summary, and returns `AgentRunExit::Done`.
+    /// Phase 11: settle a naturally finished loop. Task success also requires
+    /// honest verification; output, live events and durable state use the same
+    /// completion status. A finished loop may therefore return Partial.
     #[allow(clippy::too_many_arguments)]
     async fn finalize_completion(
         &mut self,
         task: &AgentTask,
         session: &SessionContext,
         mut output: AgentOutput,
-        eval_result: &Option<concerto_core::types::EvalResult>,
         tool_call_count: u32,
         files_modified: &[Utf8PathBuf],
-        final_message: &str,
         correlation_id: Ulid,
         cancel: CancellationToken,
     ) -> Result<AgentRunExit, OrchestratorError> {
+        if cancel.is_cancelled() {
+            self.state = AgentState::Cancelled;
+            return Err(OrchestratorError::Cancelled);
+        }
         self.state = AgentState::Completed;
-
-        // Truthful completion: `AgentOutput.completion_status` is the single
-        // source of truth, decided HERE from the agent's own landing state —
-        // an eval failure stays `Partial`, everything else lands `Completed`
-        // (a run with no evaluation result is a normal done run, exactly once
-        // the task genuinely reached finalize). Nothing transport-derived
-        // (a successful provider call, a successful tool transfer) can
-        // override this afterwards; `persist_run_success` and the run-level
-        // Completion card mirror this status.
-        output.completion_status = if eval_result.as_ref().is_some_and(|result| !result.passed) {
+        let blocker = verification_completion_blocker(task, &output);
+        output.completion_status = if blocker.is_some() {
             concerto_core::types::AgentCompletionStatus::Partial
         } else {
             concerto_core::types::AgentCompletionStatus::Completed
         };
-        // Supremacy invariant: an eval-driven downgrade to `Partial` is a
-        // Coordinator Decision row (visibility), not a silent status flip.
-        if output.completion_status == concerto_core::types::AgentCompletionStatus::Partial {
-            let reason = eval_result
-                .as_ref()
-                .map(|result| format!("evaluation did not pass: {result:?}"))
-                .unwrap_or_else(|| "completion downgraded to Partial".to_owned());
+        if let Some(reason) = blocker {
+            let reason: String = reason.chars().take(END_REASON_CHARS).collect();
+            if !output.final_message.is_empty() {
+                output.final_message.push_str("\n\n");
+            }
+            output.final_message.push_str("Verification incomplete: ");
+            output.final_message.push_str(&reason);
+            let decision_kind = if output.eval_result.as_ref().is_some_and(|result| !result.passed)
+            {
+                "agent-loop-eval-downgrade"
+            } else {
+                "agent-loop-verification-downgrade"
+            };
             self.tool_executor
                 .record_coordinator_decision(
                     task.session_id,
                     concerto_core::ids::new_id(),
-                    "agent-loop-eval-downgrade",
+                    decision_kind,
                     &reason,
                     CancellationToken::new(),
                 )
@@ -2030,7 +2051,7 @@ impl AgentLoop {
             session,
             tool_call_count,
             files_modified,
-            final_message,
+            &output.final_message,
             cancel.clone(),
         )
         .await;
@@ -2143,7 +2164,7 @@ impl AgentLoop {
         // Truthful completion (completion-status fix): the TaskCompleted
         // event and the task row mirror `AgentOutput.completion_status` —
         // never an unconditional transport-level `success: true`. A partial
-        // landing (eval failure) persists `success: false` with a `partial`
+        // landing (verification failure) persists `success: false` with a `partial`
         // task row, exactly like `persist_run_partial`.
         let success =
             output.completion_status == concerto_core::types::AgentCompletionStatus::Completed;
@@ -4957,13 +4978,13 @@ mod tests {
         let first_provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
         let (mut loop1, audit1) =
             make_loop_with_dir_capturing(first_provider, approval.clone(), 10, dir_path);
-        loop1.run_once(task.clone(), Vec::new(), cancel.clone(), 0).await.expect("instance 1");
+        loop1.run_once(task.clone(), Vec::new(), cancel.clone(), 0, &[]).await.expect("instance 1");
 
         // Instance 2 (a later user message): same session + project, no re-prompt.
         let second_provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
         let (mut loop2, audit2) =
             make_loop_with_dir_capturing(second_provider, approval.clone(), 10, dir_path);
-        loop2.run_once(task.clone(), Vec::new(), cancel.clone(), 0).await.expect("instance 2");
+        loop2.run_once(task.clone(), Vec::new(), cancel.clone(), 0, &[]).await.expect("instance 2");
 
         assert_eq!(
             prompts.load(Ordering::SeqCst),
@@ -4992,9 +5013,9 @@ mod tests {
         let task = AgentTask::new(Ulid::new(), "test task");
         let cancel = CancellationToken::new();
 
-        loop_.run_once(task.clone(), Vec::new(), cancel.clone(), 0).await.expect("round 1");
+        loop_.run_once(task.clone(), Vec::new(), cancel.clone(), 0, &[]).await.expect("round 1");
         loop_.project_root = std::path::PathBuf::from(second.path());
-        loop_.run_once(task.clone(), Vec::new(), cancel.clone(), 0).await.expect("round 2");
+        loop_.run_once(task.clone(), Vec::new(), cancel.clone(), 0, &[]).await.expect("round 2");
 
         assert_eq!(prompts.load(Ordering::SeqCst), 2, "a different project must be asked again");
         assert_eq!(audit.ack_rows(), 2, "both prompts are audited");
@@ -5019,7 +5040,7 @@ mod tests {
         let first_provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
         let (mut loop1, _audit1) =
             make_loop_with_dir_capturing(first_provider, approval.clone(), 10, dir_path);
-        let aborted = loop1.run_once(task.clone(), Vec::new(), cancel.clone(), 0).await;
+        let aborted = loop1.run_once(task.clone(), Vec::new(), cancel.clone(), 0, &[]).await;
         assert!(matches!(aborted.unwrap_err(), OrchestratorError::Cancelled));
 
         // Instance 2: same triple; request_ack now returns true. Because the
@@ -5027,7 +5048,7 @@ mod tests {
         let second_provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
         let (mut loop2, _audit2) =
             make_loop_with_dir_capturing(second_provider, approval.clone(), 10, dir_path);
-        loop2.run_once(task.clone(), Vec::new(), cancel.clone(), 0).await.expect("second run");
+        loop2.run_once(task.clone(), Vec::new(), cancel.clone(), 0, &[]).await.expect("second run");
 
         assert_eq!(
             prompts.load(Ordering::SeqCst),
@@ -5735,8 +5756,13 @@ mod tests {
         let mut loop_ = make_loop_with_fs_tool(dir.path(), provider.clone(), approval, 10)
             .with_usage_model("muse-v2".to_string())
             .with_advertised_tool_support(Some(false));
-        let task =
-            AgentTask::new_action_required(Ulid::new(), "write a file through the text driver");
+        // This fixture tests tool transport; file bytes are asserted below.
+        // It deliberately has no project verification harness.
+        let task = AgentTask::new_with_execution_mode(
+            Ulid::new(),
+            "write a file through the text driver",
+            TaskExecutionMode::ActionRequired { min_tool_calls: 1, require_verification: false },
+        );
         let result = loop_.run(task, CancellationToken::new()).await;
         assert!(result.is_ok(), "fallback-driven run should succeed: {:?}", result.err());
         let output = result.unwrap();
@@ -5781,7 +5807,13 @@ mod tests {
         let mut loop_ = make_loop_with_fs_tool(dir.path(), provider.clone(), approval, 10)
             .with_usage_model("muse-spark-1.3-contributor-free".to_string())
             .with_advertised_tool_support(Some(false));
-        let task = AgentTask::new_action_required(Ulid::new(), "write a file on muse-spark");
+        // This fixture tests tool transport; file bytes are asserted below.
+        // It deliberately has no project verification harness.
+        let task = AgentTask::new_with_execution_mode(
+            Ulid::new(),
+            "write a file on muse-spark",
+            TaskExecutionMode::ActionRequired { min_tool_calls: 1, require_verification: false },
+        );
         let result = loop_.run(task, CancellationToken::new()).await;
         assert!(
             result.is_ok(),
@@ -6382,7 +6414,8 @@ mod tests {
         let output = result.unwrap();
 
         let summary = output.summary();
-        assert!(summary.contains("Completed"), "summary should start with Completed");
+        assert_eq!(output.completion_status, concerto_core::types::AgentCompletionStatus::Partial);
+        assert!(summary.contains("Partial"), "unverified execution must remain Partial");
         assert!(summary.contains("Files changed:"), "summary should contain Files changed");
         assert!(summary.contains("src/main.rs"), "summary should contain the written path");
         // The raw model prose (empty delta from ScriptedProvider) should NOT
@@ -6569,9 +6602,9 @@ mod tests {
         assert!(!record.passed);
     }
 
-    /// The typed eval-error mapping is total: `Cancelled` maps to `Cancelled`
-    /// and every other harness error maps to `Error` carrying the error text —
-    /// never to an absent value.
+    /// Configured harness errors remain explicit: cancellation is Cancelled,
+    /// execution/setup failures are Error. Absence of a supported harness is
+    /// tested separately as Unavailable; no error is collapsed into silence.
     #[test]
     fn eval_error_mapping_is_total_and_typed() {
         use concerto_eval::EvalError;
@@ -6636,13 +6669,11 @@ mod tests {
         assert!(!failed_record.passed);
     }
 
-    /// End-to-end through `run_evaluation`: a harness setup failure (no
-    /// manifest, no Cargo project reachable) yields `None` for `eval_result`
-    /// — identical to the old `.ok()` collapse, so `decide_exit` and the
-    /// completion downgrade behave exactly as before — while the verification
-    /// vec carries the typed `Error` record instead of silence.
+    /// A directory with no supported harness reports unavailability, distinct
+    /// from a configured check that failed to execute. Ordinary conversation
+    /// must not be treated as a failed test run merely because no harness exists.
     #[tokio::test]
-    async fn run_evaluation_maps_harness_failure_to_error_record_with_none_result() {
+    async fn completion_no_harness_is_unavailable_not_execution_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = Arc::new(ScriptedProvider::new(vec![]));
         let approval = Arc::new(ApprovalTestHarness::always_approve());
@@ -6653,8 +6684,8 @@ mod tests {
             eval_result.is_none(),
             "no harness run means no eval payload — exactly the old `.ok()` value"
         );
-        assert_eq!(records.len(), 1, "the failure maps to one record, never silence");
-        assert_eq!(records[0].outcome, Some(VerificationOutcome::Error));
+        assert_eq!(records.len(), 1, "unavailability maps to one record, never silence");
+        assert_eq!(records[0].outcome, Some(VerificationOutcome::Unavailable));
         assert!(!records[0].passed);
         assert!(records[0].checked_at.is_some());
     }
@@ -10042,6 +10073,301 @@ mod tests {
             }
         }
         assert!(end_reason, "the loop-end reason must surface in the session event log");
+    }
+
+    /// Deterministic process boundary: exercises real evaluation mapping and
+    /// finalization without depending on installed test runners or the network.
+    struct CompletionEvalExecutor(&'static str);
+
+    #[async_trait]
+    impl concerto_eval::EvalProcessExecutor for CompletionEvalExecutor {
+        async fn execute(
+            &self,
+            _program: &str,
+            _args: &[&str],
+            _cwd: &std::path::Path,
+            cancel: CancellationToken,
+        ) -> Result<concerto_core::types::ToolOutput, concerto_eval::EvalError> {
+            use concerto_eval::EvalError;
+            match self.0 {
+                "passed" => Ok(concerto_core::types::ToolOutput {
+                    summary: "tests passed".into(),
+                    data: serde_json::json!({
+                        "exit_code": 0,
+                        "stdout": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n",
+                        "stderr": "",
+                    }),
+                }),
+                "denied" => Err(EvalError::Denied("verification refused".into())),
+                "io" => Err(EvalError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "test runner missing",
+                ))),
+                "timeout" => Err(EvalError::Timeout(Duration::from_millis(1))),
+                "cancelled" => {
+                    cancel.cancel();
+                    Err(EvalError::Cancelled)
+                }
+                other => panic!("unknown completion test outcome: {other}"),
+            }
+        }
+    }
+
+    fn completion_test_write(path: &str, content: &str) -> ToolCall {
+        ToolCall {
+            id: "completion-write".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::json!({
+                "operation": "write", "path": path, "content": content,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_harness_errors_are_partial_in_output_live_and_durable_events() {
+        for (failure, require_verification) in [
+            ("denied", true),
+            ("denied", false),
+            ("io", true),
+            ("io", false),
+            ("timeout", true),
+            ("timeout", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+            let root = camino::Utf8Path::from_path(dir.path()).unwrap();
+            let store =
+                Arc::new(concerto_sessions::SqliteSessionStore::connect_in_memory().await.unwrap());
+            let session_id = store
+                .create_session(root, "test", "test", CancellationToken::new())
+                .await
+                .unwrap()
+                .id;
+            let provider = Arc::new(ScriptedProvider::new(vec![
+                vec![completion_test_write("output.txt", "done")],
+                vec![],
+            ]));
+            let mut loop_ = make_loop_with_fs_tool(
+                dir.path(),
+                provider,
+                Arc::new(ApprovalTestHarness::always_approve()),
+                4,
+            )
+            .with_session_store(Some(store.clone()));
+            loop_.eval = EvalEngine::new(dir.path())
+                .with_process_executor(Arc::new(CompletionEvalExecutor(failure)));
+            let mut live = loop_.bus.subscribe().into_inner();
+            let task = AgentTask::new_with_execution_mode(
+                session_id,
+                "write the output file",
+                TaskExecutionMode::ActionRequired { min_tool_calls: 1, require_verification },
+            );
+            let output = loop_.run(task, CancellationToken::new()).await.unwrap();
+            assert!(output.eval_result.is_none(), "{failure} never finished a test run");
+            assert!(output
+                .verification
+                .iter()
+                .any(|record| { record.outcome == Some(VerificationOutcome::Error) }));
+            assert_eq!(
+                output.completion_status,
+                concerto_core::types::AgentCompletionStatus::Partial,
+                "{failure} cannot complete the task"
+            );
+            let mut live_completions = Vec::new();
+            while let Ok(event) = live.try_recv() {
+                if let EventKind::TaskCompleted { success, .. } = event.kind {
+                    live_completions.push(success);
+                }
+            }
+            assert_eq!(live_completions, vec![false], "{failure}: live completion");
+            let persisted = store.load_events(session_id, CancellationToken::new()).await.unwrap();
+            let durable_completions: Vec<_> = persisted
+                .iter()
+                .filter_map(|stored| match stored.to_event().unwrap().kind {
+                    EventKind::TaskCompleted { success, .. } => Some(success),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(durable_completions, vec![false], "{failure}: durable completion");
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_cancelled_verification_never_publishes_success() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![completion_test_write("output.txt", "done")],
+            vec![],
+        ]));
+        let mut loop_ = make_loop_with_fs_tool(
+            dir.path(),
+            provider,
+            Arc::new(ApprovalTestHarness::always_approve()),
+            4,
+        );
+        loop_.eval = EvalEngine::new(dir.path())
+            .with_process_executor(Arc::new(CompletionEvalExecutor("cancelled")));
+        let mut live = loop_.bus.subscribe().into_inner();
+        let result = loop_
+            .run(
+                AgentTask::new_action_required(Ulid::new(), "write the output file"),
+                CancellationToken::new(),
+            )
+            .await;
+        match result {
+            Err(OrchestratorError::Cancelled) => {}
+            Ok(output) => assert_eq!(
+                output.completion_status,
+                concerto_core::types::AgentCompletionStatus::Partial,
+                "a cancelled verifier cannot complete the task"
+            ),
+            other => panic!("unexpected cancellation result: {other:?}"),
+        }
+        while let Ok(event) = live.try_recv() {
+            assert!(
+                !matches!(event.kind, EventKind::TaskCompleted { success: true, .. }),
+                "cancelled verification cannot publish success"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_continuation_retains_failures_until_a_successful_recheck() {
+        for repair in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+            let mut script =
+                vec![vec![completion_test_write("index.html", "<img src=\"missing.png\">")]];
+            if repair {
+                script.push(vec![completion_test_write("index.html", "<p>fixed</p>")]);
+            }
+            script.push(vec![]);
+            let mut loop_ = make_loop_with_fs_tool(
+                dir.path(),
+                Arc::new(ScriptedProvider::new(script)),
+                Arc::new(ApprovalTestHarness::always_approve()),
+                1, // Every write reaches the iteration cap before the final answer.
+            );
+            loop_.eval = EvalEngine::new(dir.path())
+                .with_process_executor(Arc::new(CompletionEvalExecutor("passed")));
+            let mut live = loop_.bus.subscribe().into_inner();
+            let output = loop_
+                .run(
+                    AgentTask::new_coordinator_decides(Ulid::new(), "prepare the page"),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert!(output.eval_result.as_ref().is_some_and(|result| result.passed));
+            let html = output
+                .verification
+                .iter()
+                .find(|record| record.path.as_str().ends_with("index.html"))
+                .expect("the earlier HTML verification is retained");
+            assert_eq!(
+                html.outcome,
+                Some(if repair {
+                    VerificationOutcome::Passed
+                } else {
+                    VerificationOutcome::Failed
+                })
+            );
+            assert_eq!(
+                output.completion_status,
+                if repair {
+                    concerto_core::types::AgentCompletionStatus::Completed
+                } else {
+                    concerto_core::types::AgentCompletionStatus::Partial
+                },
+                "completion must include earlier rounds' unresolved failures; repair={repair}"
+            );
+            let mut completions = Vec::new();
+            while let Ok(event) = live.try_recv() {
+                if let EventKind::TaskCompleted { success, .. } = event.kind {
+                    completions.push(success);
+                }
+            }
+            assert_eq!(completions, vec![repair], "one truthful terminal event");
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_missing_required_verification_is_partial_but_optional_is_not() {
+        for require_verification in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let provider = Arc::new(ScriptedProvider::new(vec![
+                vec![completion_test_write("notes.txt", "reviewed")],
+                vec![],
+            ]));
+            let mut loop_ = make_loop_with_fs_tool(
+                dir.path(),
+                provider,
+                Arc::new(ApprovalTestHarness::always_approve()),
+                4,
+            );
+            let task = AgentTask::new_with_execution_mode(
+                Ulid::new(),
+                "write the notes",
+                TaskExecutionMode::ActionRequired { min_tool_calls: 1, require_verification },
+            );
+            let output = loop_.run(task, CancellationToken::new()).await.unwrap();
+            assert!(output.eval_result.is_none());
+            assert_eq!(output.verification.len(), 1);
+            assert_eq!(output.verification[0].outcome, Some(VerificationOutcome::Unavailable));
+            assert_eq!(
+                output.completion_status,
+                if require_verification {
+                    concerto_core::types::AgentCompletionStatus::Partial
+                } else {
+                    concerto_core::types::AgentCompletionStatus::Completed
+                },
+                "the task's required verification contract must be honored"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_run_cancelled_during_evaluation_is_not_done() {
+        struct CancelRun(CancellationToken);
+        #[async_trait]
+        impl concerto_eval::EvalProcessExecutor for CancelRun {
+            async fn execute(
+                &self,
+                _program: &str,
+                _args: &[&str],
+                _cwd: &std::path::Path,
+                _cancel: CancellationToken,
+            ) -> Result<concerto_core::types::ToolOutput, concerto_eval::EvalError> {
+                self.0.cancel();
+                Err(concerto_eval::EvalError::Cancelled)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![completion_test_write("output.txt", "done")],
+            vec![],
+        ]));
+        let mut loop_ = make_loop_with_fs_tool(
+            dir.path(),
+            provider,
+            Arc::new(ApprovalTestHarness::always_approve()),
+            4,
+        );
+        let cancel = CancellationToken::new();
+        loop_.eval =
+            EvalEngine::new(dir.path()).with_process_executor(Arc::new(CancelRun(cancel.clone())));
+        let mut live = loop_.bus.subscribe().into_inner();
+        let result = loop_
+            .run(AgentTask::new_action_required(Ulid::new(), "write the output file"), cancel)
+            .await;
+        assert!(matches!(result, Err(OrchestratorError::Cancelled)));
+        assert_eq!(loop_.state, AgentState::Cancelled);
+        while let Ok(event) = live.try_recv() {
+            assert!(!matches!(event.kind, EventKind::TaskCompleted { success: true, .. }));
+        }
     }
 
     /// The Done path with no evaluation result is a normal `Completed` run:

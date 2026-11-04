@@ -111,6 +111,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Verification failures cannot report successful completion.** The single-agent
+  loop includes failures from earlier continuation rounds before publishing
+  completion. Denied, errored and cancelled checks remain Partial; required
+  verification must have a passing check. Matching rechecks can resolve failures,
+  while skipped/unavailable checks cannot erase them. An absent test harness is
+  reported as unavailable, distinct from a broken runner; normal answer-only
+  completion remains supported. Live events and persisted summaries agree with
+  the output status. The optional strict freshness gate remains separate.
 - **Gated writes retain the version the agent read.** Default claims use
   session/agent-scoped read observations, including raw binary hashes, so an
   intervening external edit is refused instead of adopted as the new base.

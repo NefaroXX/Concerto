@@ -16,7 +16,7 @@ passing repository tests alone does not close a finding.
 | H04 | P1 | Scoped Rust verification can pass with zero tests | Fixed and verified; awaiting merge |
 | H05 | P1 | Premature provider EOF accepted as successful completion | Fixed and verified; awaiting merge |
 | H06 | P1 | Default write versions are captured after the agent's read | Fixed and verified; awaiting merge |
-| H07 | P1 | Verification errors can accompany Completed status | In progress; isolated draft awaiting reproduction/tests |
+| H07 | P1 | Verification errors can accompany Completed status | Fixed and verified locally; native CI rerun pending |
 | H08 | P2 | Compaction counts historical usage as current context size | Open |
 | H09 | P2 | Compaction truncates constraints and unresolved work | Open |
 | H10 | P2 | Agent-driven benchmark fixture policy denies tools | Open |
@@ -29,6 +29,8 @@ passing repository tests alone does not close a finding.
 | H17 | P1 | Resumed history lacks restored read-version claims when a new gate is constructed | Open; source traced during H06 |
 | H18 | P1 | Locked Wasmtime 36.0.19 fails fresh security gates on RUSTSEC-2026-0424 | Fixed and verified; awaiting merge |
 | H19 | P2 | Action-required minimum tool-call check ignores earlier continuation rounds | Open; source traced during H07 |
+| H20 | P1 | Yanked async-executor 1.14.0 remains locked after an upstream memory-safety regression | Fixed and verified locally; remote security rerun pending |
+| H21 | P2 | Multi-agent runtime stage reports Complete for partial outputs | Open; source traced during H07 |
 
 ## 2026-10-29 — H01: preserve streaming events across chunks
 
@@ -556,3 +558,109 @@ Next: patch H18, then continue H07's truthful verification/completion handling.
 - The preceding goal turn made progress: completed the live benchmark wait and
   drafted the H07 implementation/regressions in isolation. Next, reproduce H07
   on the unfixed baseline, then verify the corrected implementation.
+
+## 2026-11-03 — H07: reproduced and implementation applied
+
+- Published H06/H18 and completed verification notes to PR #379 at
+  `e216aeb`. The preceding goal turn made concrete progress: completed all
+  remaining CI checks, published the verified milestones, and prepared H07.
+- All five initial H07 regressions failed against the unfixed implementation
+  (zero passed, five failed). Failures demonstrated false Completed outcomes
+  for verification denial/cancellation and an earlier continuation failure,
+  plus incorrect Error-versus-Unavailable classification.
+- Applied the isolated implementation to the main topic branch after that
+  reproduction. Focused verification is now running; the additional tests
+  cover cancelled whole runs, invalid project roots, cache/record mapping,
+  legacy/inconsistent records, verifier/scope identity and skipped rechecks.
+- Basic completion checks consume typed results produced during the current
+  run. They do not assert freshness or full coverage; the existing opt-in
+  strict gate still checks fingerprints, generation and provenance.
+
+## 2026-11-03 — H07 checks and remote CI follow-ups
+
+- All 19 focused completion tests passed, including the five baseline
+  regressions. The broader affected-library run passed the eval suite and
+  1,860 orchestrator tests, with four fixture failures and one ignored test.
+  Those fixtures asserted Completed despite lacking required verification.
+- Driver-only fixtures now explicitly make verification optional while still
+  checking written bytes. The execution-summary fixture asserts honest Partial
+  status; stage tracking covers both optional and required verification and
+  must omit Complete when the required check never passed. Production
+  verification requirements were not disabled to accommodate these fixtures.
+- Remote checks on `e216aeb` caught a platform-specific H06 test-fixture bug:
+  staged bytes used a raw temporary-directory key instead of the resolved key
+  used by `FilesystemTool::execute`. Windows verbatim paths and macOS temp-path
+  symlinks made these different entries. The fixture now resolves the path
+  through the production helper; its Linux regression passes. Native reruns
+  are still required; this correction changes no production behavior.
+- **H20:** remote cargo-deny rejected async-executor 1.14.0 as yanked. The
+  [registry](https://crates.io/api/v1/crates/async-executor) confirms the yank
+  on November 2; upstream's [changelog](https://github.com/smol-rs/async-executor/blob/master/CHANGELOG.md)
+  identifies a use-after-free during executor drop, fixed in 1.14.1. Earlier
+  local registry scans missed this yank; their pass is not proof of current
+  registry state. Update only this transitive patch, then rerun both gates.
+
+## 2026-11-03 — H07: completion-stage boundary and final checks
+
+- The second affected-suite run passed 1,863 orchestrator tests but exposed
+  an actual runtime bug: a Partial output still emitted the Complete stage.
+  The single-agent runtime now advances to Complete only for Completed output;
+  the regression checks both optional and required verification contracts.
+  The workspace suite, Clippy and build are running on this correction.
+- Fresh `cargo deny check` and `cargo audit` both exited 0 after updating only
+  async-executor's locked version/checksum to 1.14.1. No advisory exceptions
+  or dependency edges changed. This patch addresses H20's upstream regression.
+- **H21:** the coordinator and supervised runtime tails also unconditionally
+  emit Complete for partial outcomes (`runtime_runner.rs`). They need their
+  own multi-agent regression coverage; the single-agent H07 fix does not close
+  this independently observed presentation defect.
+- Published-head CI is now fully settled: tests, build, Clippy, formatting,
+  benchmarks, WASM, palette and cargo-audit passed; native Windows/macOS and
+  cargo-deny failed for the H06 fixture and H20 issues recorded above. The next
+  push must rerun those failing gates before claiming remote verification.
+- **H19 tracing detail:** the ActionRequired prose-response branch in
+  `process_provider_response` also tests only the current round's mutation
+  count. Its retry instruction can demand a redundant write before the
+  later minimum-tool-count check fails. Regression coverage must exercise
+  both boundaries, not just change `decide_exit`.
+
+## 2026-11-03 — H07/H20: workspace verification passed
+
+- The preceding goal turn made concrete progress: fixed the single-agent
+  completion-stage boundary, passed the focused and affected suites, and
+  recorded H21 plus H19's second affected boundary. The existing verification
+  process has now exited 0; no restart was needed.
+- Final workspace tests: 6,041 passed, zero failed, 16 ignored across 85 groups,
+  including integration and doc tests. Workspace Clippy (all targets, warnings
+  denied) and the default workspace build also passed.
+- Formatting, diff hygiene, palette enforcement, six Python script tests and
+  the semantic index refresh passed. The supplemental CI script is now checking
+  launcher/cache behavior, both frontend builds, four WASM guests and all nine
+  benchmark smoke targets. These pending checks are not counted as passes.
+- Prepared (not yet executed) H19 regression drafts outside the source tree:
+  a one-iteration round cap followed by a prose finish after one/two real
+  writes, and a minimum of two calls accumulated over separate rounds. The
+  latter also checks whether an intermediate round cap incorrectly enforces
+  a minimum intended for the finished task. Apply after H07 publication and
+  reproduce against the baseline before implementing the continuation fix.
+
+## 2026-11-04 — H07/H20: local CI coverage complete
+
+- The preceding goal turn made progress: confirmed 6,041 passing workspace
+  tests, warnings-denied Clippy and the workspace build; completed the launcher
+  smoke and desktop-only build, and prepared H19 regression drafts.
+- Current-state inspection confirms the supplemental script has finished:
+  desktop-only and CLI-only builds, launcher/cache-replay and CLI startup
+  smoke tests, all four WASM guests, and all nine release benchmark smoke
+  targets passed. The benchmark log contains all nine executed targets and
+  their successful cases, with no reported failure; no Cargo process remains.
+  No performance measurement or comparison is claimed.
+- Final formatting and diff checks passed. H07 now prevents failed/unmet
+  verification from producing a successful single-agent result or Complete
+  stage. H20 removes the yanked, vulnerable async-executor version. The H06
+  test uses the production canonical path key on each platform.
+- These are separate reviewable changes. Publication and native Windows/macOS
+  plus cargo-deny reruns follow; local Linux passes do not prove native results.
+- Remaining findings retain their scope, including H19's continuation counts
+  and H21's multi-agent stage reporting. Overall harness superiority is not
+  established by these fixes or by passing repository tests.

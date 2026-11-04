@@ -1372,8 +1372,8 @@ async fn execute_agent_loop(
     let task_id = task.id.0;
     // Run-stage signals (ADR-55 §9): the loop is about to start, so the
     // run is Inspecting the workspace; a mutation-capable run then moves to
-    // Execute. Complete is reported only after `run` returns Ok below — an Err
-    // or cancellation never advances the stage. Under full local agency the
+    // Execute. Complete is reported only for a completed output below — a
+    // partial result, error or cancellation never advances the stage. Under full local agency the
     // single-agent (forced) loop is action-capable, so `execute_granted` is
     // true; the explicit flag keeps the stage independent of task shaping.
     {
@@ -1388,7 +1388,12 @@ async fn execute_agent_loop(
             // Full-local-agency runs are action-capable: an empty final message
             // is left as the model produced it (no honesty synthesis, which is
             // reserved for read-only runs that no longer exist as a mode).
-            stage_tracker.lock().unwrap_or_else(|error| error.into_inner()).set(RunStage::Complete);
+            if output.completion_status == AgentCompletionStatus::Completed {
+                stage_tracker
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .set(RunStage::Complete);
+            }
             output
         }
         Err(error) => {

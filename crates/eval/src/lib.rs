@@ -45,6 +45,10 @@ pub use runner::EvalRunner;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum EvalError {
+    /// No supported test harness applies to this existing project directory.
+    /// Distinct from a configured harness that could not be started.
+    #[error("eval harness unavailable: {0}")]
+    HarnessUnavailable(String),
     #[error("eval harness setup failed: {0}")]
     HarnessSetupFailed(String),
     #[error("test runner failed: {0}")]
@@ -435,20 +439,23 @@ impl EvalEngine {
         project_dir: &Path,
         cancel: CancellationToken,
     ) -> Result<EvalResult, EvalError> {
-        // No harness config: fall back to a plain `cargo test` IF a Cargo
-        // project is actually reachable (a `Cargo.toml` in this directory or an
-        // ancestor), instead of hard-failing. A hard failure here surfaced as
-        // `None` to the coordinator, which then treated the build as
-        // unvalidated; running cargo test captures an honest pass/fail and is
-        // marked `Fallback` so the report distinguishes it from a real harness
-        // run. With no Cargo project anywhere there is nothing to validate, so
-        // the honest Unknown failure is preserved (callers treat it as "no eval
-        // result") rather than marking every non-Rust project as a failed run.
+        if cancel.is_cancelled() {
+            return Err(EvalError::Cancelled);
+        }
+        // Keep the ancestor-Cargo fallback. Absence of a supported harness
+        // in an existing directory is unavailability, not an execution error;
+        // an invalid/missing project directory must still report its failure.
         if let TestRunner::Unknown(reason) = &runner {
             if Self::cargo_project_in_ancestors(project_dir) {
                 return self.run_fallback_cargo_test(project_dir, reason, cancel).await;
             }
-            return Err(EvalError::HarnessSetupFailed(format!("cannot run tests: {reason}")));
+            if !std::fs::metadata(project_dir)?.is_dir() {
+                return Err(EvalError::HarnessSetupFailed(format!(
+                    "project root is not a directory: {}",
+                    project_dir.display()
+                )));
+            }
+            return Err(EvalError::HarnessUnavailable(reason.clone()));
         }
         // Default args per runner
         let default_args: &[&str] = match &runner {
@@ -1217,11 +1224,10 @@ mod tests {
         assert!(result.output_tail.contains("eval fallback"));
     }
 
-    /// With no Cargo project reachable there is nothing to validate, so the
-    /// honest Unknown failure is preserved (not a false fallback failure that
-    /// would mark every non-Rust run Partial).
+    /// Absence of a supported harness is distinct from an execution failure;
+    /// callers can report unavailability without inventing a passing run.
     #[tokio::test]
-    async fn no_config_and_no_cargo_project_keeps_honest_failure() {
+    async fn no_config_and_no_cargo_project_reports_unavailable() {
         let dir = tempfile::tempdir().unwrap();
         let engine = EvalEngine::new(dir.path());
         let error = engine
@@ -1229,6 +1235,26 @@ mod tests {
             .await
             .expect_err("no Cargo project and no harness must stay a clean error");
         assert!(error.to_string().contains("no config file found"), "{error}");
+        assert!(matches!(error, EvalError::HarnessUnavailable(_)));
+    }
+
+    #[tokio::test]
+    async fn unavailable_harness_does_not_hide_invalid_roots_or_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = EvalEngine::new(dir.path().join("missing"))
+            .run(CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, EvalError::Io(ref error)
+            if error.kind() == std::io::ErrorKind::NotFound));
+        let file = dir.path().join("file.txt");
+        std::fs::write(&file, "not a project directory").unwrap();
+        let error = EvalEngine::new(file).run(CancellationToken::new()).await.unwrap_err();
+        assert!(matches!(error, EvalError::HarnessSetupFailed(_)));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let error = EvalEngine::new(dir.path()).run(cancel).await.unwrap_err();
+        assert!(matches!(error, EvalError::Cancelled));
     }
 
     /// A detected harness keeps `Harness` provenance (no false fallback mark).

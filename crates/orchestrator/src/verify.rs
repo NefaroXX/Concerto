@@ -833,10 +833,15 @@ pub fn eval_result_record(eval_path: &Utf8PathBuf, result: &EvalResult) -> Verif
 
 /// Map a harness error into its typed verification record: `Cancelled` maps
 /// to `Cancelled`, a policy denial maps to `Error` naming the denial (the
-/// check never ran — never a pass, never silent), every other variant to
-/// `Error` carrying the error text.
+/// check never ran — never a pass, never silent), absence of an applicable
+/// harness to `Unavailable`, and other failures to `Error`.
 pub fn eval_error_record(eval_path: &Utf8PathBuf, error: &EvalError) -> VerificationSummary {
     match error {
+        EvalError::HarnessUnavailable(reason) => VerificationSummary::unavailable(
+            eval_path.clone(),
+            "eval",
+            format!("eval unavailable: {reason}"),
+        ),
         EvalError::Cancelled => {
             VerificationSummary::cancelled(eval_path.clone(), "eval", "eval cancelled")
         }
@@ -862,6 +867,7 @@ pub fn eval_error_record(eval_path: &Utf8PathBuf, error: &EvalError) -> Verifica
 #[derive(Debug, Clone)]
 pub enum CachedEvalOutcome {
     Ran(EvalResult),
+    Unavailable(String),
     Cancelled,
     Failed(String),
 }
@@ -870,6 +876,9 @@ impl CachedEvalOutcome {
     fn into_record(self, eval_path: &Utf8PathBuf) -> VerificationSummary {
         match self {
             Self::Ran(result) => eval_result_record(eval_path, &result),
+            Self::Unavailable(reason) => {
+                eval_error_record(eval_path, &EvalError::HarnessUnavailable(reason))
+            }
             Self::Cancelled => eval_error_record(eval_path, &EvalError::Cancelled),
             Self::Failed(message) => VerificationSummary::error(eval_path.clone(), "eval", message)
                 .with_verifier(EVAL_HARNESS_VERIFIER)
@@ -2427,6 +2436,9 @@ impl VerifierService {
                 let eval = self.eval.lock().unwrap_or_else(|error| error.into_inner()).clone();
                 match self.spawner.run_eval(&eval, &eval_dir, files, cancel).await {
                     Ok(result) => CachedEvalOutcome::Ran(result),
+                    Err(EvalError::HarnessUnavailable(reason)) => {
+                        CachedEvalOutcome::Unavailable(reason)
+                    }
                     Err(EvalError::Cancelled) => return Err(VerifyError::Cancelled),
                     Err(error) => CachedEvalOutcome::Failed(format!("eval error: {error}")),
                 }
@@ -4053,5 +4065,21 @@ mod tests {
         service.verify(&project, &cancel).await.expect("third runs");
         assert_eq!(counting.spawn_count(), 2, "a moved base drops the build cache");
         assert_eq!(counting.eval_count(), 2, "a moved base drops the eval cache");
+    }
+
+    #[test]
+    fn unavailable_harness_stays_distinct_through_record_and_cache_mapping() {
+        let path = Utf8PathBuf::from("project");
+        let reason = "no supported test manifest".to_owned();
+        let direct = eval_error_record(&path, &EvalError::HarnessUnavailable(reason.clone()));
+        let cached = CachedEvalOutcome::Unavailable(reason).into_record(&path);
+        for record in [direct, cached] {
+            assert_eq!(record.outcome, Some(VerificationOutcome::Unavailable));
+            assert!(!record.passed);
+            assert_eq!(record.verifier, EVAL_HARNESS_VERIFIER);
+            assert_eq!(record.scope, "project");
+        }
+        let failed = eval_error_record(&path, &EvalError::HarnessSetupFailed("bad config".into()));
+        assert_eq!(failed.outcome, Some(VerificationOutcome::Error));
     }
 }
