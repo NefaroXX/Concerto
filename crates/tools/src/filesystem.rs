@@ -1003,7 +1003,10 @@ mod tests {
                 .unwrap();
             assert_eq!(output.data["content_hash"], blake3::hash(bytes).to_hex().to_string());
         }
-        let path = camino::Utf8PathBuf::from_path_buf(dir.path().join("f")).unwrap();
+        // Stage under the same resolved key that execute uses. macOS temp
+        // paths can contain symlinks and Windows canonical paths use a
+        // verbatim prefix; a raw tempdir join would stage a different entry.
+        let path = crate::common::resolve_path(&tool.root, Utf8Path::new("f")).unwrap();
         tool.vfs.lock().unwrap().write_bytes(&path, vec![0xff, 0x42]).unwrap();
         for bounded in [false, true] {
             let mut input = serde_json::json!({"operation":"read", "path":"f"});
