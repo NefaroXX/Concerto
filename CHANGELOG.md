@@ -696,6 +696,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Updated transitive async-executor to 1.14.1, fixing the executor-drop
+  use-after-free regression and removing the yanked 1.14.0 lockfile entry.
 - Raised the Wasmtime 36 LTS minimum to 36.0.20 for RUSTSEC-2026-0424
   (unbounded memory usage when transferring borrowed component resources).
   The plugin host retains its minimal async/Cranelift features, with the
