@@ -1,4 +1,4 @@
-name: Native shell platforms
+name: Native shell and write protection
 
 on:
   pull_request:
@@ -28,3 +28,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Native commands and security regression tests
         run: cargo test --locked -p concerto-core -p concerto-config -p concerto-tools -p concerto-shell
+      - name: Native write-version and resume regressions
+        run: cargo test --locked -p concerto-orchestrator --lib gate:: -j2
+      - name: Native read-provenance session cleanup
+        run: cargo test --locked -p concerto-sessions --lib delete_session_removes_read_provenance -j2

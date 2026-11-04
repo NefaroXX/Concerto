@@ -1,4 +1,4 @@
-//! Read-derived claims for the lifetime of one gate. No disk reread may replace
+//! Read-derived claims, durable for identified sessions. No disk reread may replace
 //! the bytes returned to an agent with a newer, unobserved base.
 
 use std::collections::HashMap;
@@ -9,6 +9,8 @@ use super::{versioned_targets, GateRequest};
 pub(super) const ABSENT: &str = "<absent>";
 pub(super) const REREAD: &str = "<read-required>";
 const MAX_OBSERVATIONS: usize = 4096;
+
+mod durable;
 
 type Key = (Option<String>, String, PathBuf);
 
@@ -31,25 +33,7 @@ impl ReadVersions {
     }
 
     pub(super) fn record_read(&mut self, root: &Path, req: &GateRequest, data: &serde_json::Value) {
-        if req.tool != "filesystem" {
-            return;
-        }
-        let Some(path) = req.input["path"].as_str() else { return };
-        let version = match req.input["operation"].as_str() {
-            Some("read") => match data.get("content_hash") {
-                Some(hash) => hash
-                    .as_str()
-                    .filter(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| REREAD.to_owned()),
-                None => data["content"]
-                    .as_str()
-                    .map(|content| blake3::hash(content.as_bytes()).to_hex().to_string())
-                    .unwrap_or_else(|| REREAD.to_owned()),
-            },
-            Some("exists") if data["exists"] == false => ABSENT.to_owned(),
-            _ => return,
-        };
+        let Some((path, version)) = read_observation(req, data) else { return };
         self.insert(root, req, path, &version);
     }
 
@@ -64,20 +48,7 @@ impl ReadVersions {
             if self.observed(root, req, &path).is_none() {
                 continue;
             }
-            let version = match req.input["operation"].as_str() {
-                Some("write") if !content_was_staged => req.input["content"]
-                    .as_str()
-                    .map(|content| blake3::hash(content.as_bytes()).to_hex().to_string())
-                    .unwrap_or_else(|| REREAD.to_owned()),
-                Some("delete") => ABSENT.to_owned(),
-                Some("move") if req.input["path"].as_str() == Some(path.as_str()) => {
-                    ABSENT.to_owned()
-                }
-                // A staged merge contains external edits the agent has not
-                // seen. Like copy/move destinations and opaque binary writes,
-                // it requires a fresh read. Never attest a later disk reread.
-                _ => REREAD.to_owned(),
-            };
+            let version = written_version(req, &path, content_was_staged);
             self.insert(root, req, &path, &version);
         }
     }
@@ -91,6 +62,47 @@ impl ReadVersions {
                 self.saturated = true;
             }
         }
+    }
+}
+
+fn read_observation<'a>(
+    req: &'a GateRequest,
+    data: &serde_json::Value,
+) -> Option<(&'a str, String)> {
+    if req.tool != "filesystem" {
+        return None;
+    }
+    let path = req.input["path"].as_str()?;
+    let version = match req.input["operation"].as_str() {
+        Some("read") => match data.get("content_hash") {
+            Some(hash) => hash
+                .as_str()
+                .filter(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+                .map(str::to_owned)
+                .unwrap_or_else(|| REREAD.to_owned()),
+            None => data["content"]
+                .as_str()
+                .map(|content| blake3::hash(content.as_bytes()).to_hex().to_string())
+                .unwrap_or_else(|| REREAD.to_owned()),
+        },
+        Some("exists") if data["exists"] == false => ABSENT.to_owned(),
+        _ => return None,
+    };
+    Some((path, version))
+}
+
+fn written_version(req: &GateRequest, path: &str, content_was_staged: bool) -> String {
+    match req.input["operation"].as_str() {
+        Some("write") if !content_was_staged => req.input["content"]
+            .as_str()
+            .map(|content| blake3::hash(content.as_bytes()).to_hex().to_string())
+            .unwrap_or_else(|| REREAD.to_owned()),
+        Some("delete") => ABSENT.to_owned(),
+        Some("move") if req.input["path"].as_str() == Some(path) => ABSENT.to_owned(),
+        // A staged merge contains external edits the agent has not
+        // seen. Like copy/move destinations and opaque binary writes,
+        // it requires a fresh read. Never attest a later disk reread.
+        _ => REREAD.to_owned(),
     }
 }
 

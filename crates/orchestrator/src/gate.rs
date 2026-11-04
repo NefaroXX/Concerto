@@ -559,7 +559,8 @@ pub struct WriteGate {
     /// Observed pre-image bytes keyed by blake3 hex — lets hunk staging
     /// recover a claimed base text without a wire format change.
     text_cache: Mutex<PreImageTextCache>,
-    /// Versions actually returned to each session/agent, bounded per run.
+    /// Ephemeral claims for requests with no session identity. Identified
+    /// sessions use the bounded durable read ledger instead.
     read_versions: Mutex<read_versions::ReadVersions>,
     /// ADR-82 slice 5 (a): checkpoint sidecar backfill target. When set, every
     /// gated write banks its pre-image bytes (already in hand for hashing)
@@ -1219,10 +1220,11 @@ impl WriteGate {
     /// is advisory only — a `Deny`/`RequireApproval` here does not change the
     /// outcome and is never persisted. Cancellation still propagates.
     ///
-    /// Fail-open: any gate infrastructure failure (session-id shaping, advisory
-    /// evaluation) degrades to a direct execute with a warning rather than
-    /// hard-failing the run — a read must never be blocked by the write gate's
-    /// own machinery.
+    /// Session-id shaping and advisory-policy errors retain their read-only
+    /// fallback. Identified-session file observations are different: the hash
+    /// of returned bytes (or observed absence) must commit before a successful
+    /// response. Persistence failure cannot silently discard resume protection.
+    /// This writes provenance rows, never a whiteboard write decision.
     async fn run_read_only(
         &self,
         req: GateRequest,
@@ -1288,12 +1290,12 @@ impl WriteGate {
         let session_ctx = self.session(session_id);
         let output = self
             .executor
-            .execute_read_only(exec_tool, req.input.clone(), &session_ctx, cancel)
+            .execute_read_only(exec_tool, req.input.clone(), &session_ctx, cancel.clone())
             .await
             .map_err(GateError::from)?;
-        if let Ok(mut observations) = self.read_versions.lock() {
-            observations.record_read(&self.project_root, &req, &output.data);
-        }
+        // Publish returned bytes only after their version is durable. A failed
+        // persistence operation cannot silently discard resume protection.
+        self.record_read_version(&req, &output.data, &cancel).await?;
         let result = serde_json::to_value(&output)
             .map_err(|error| GateError::Execution(format!("output serialization: {error}")))?;
 
@@ -1493,7 +1495,7 @@ impl WriteGate {
             if expected == read_versions::REREAD {
                 return Err(GateError::Conflict {
                     event_id: req.call_id.clone(),
-                    reason: format!("read version unavailable for {target}; reread the file before editing. If the run's observation limit was reached, start a new run"),
+                    reason: format!("read version unavailable for {target}; reread the file before editing. If the run's observation limit was reached, start a new session"),
                 });
             }
             let actual = pre_images.get(target);
@@ -1627,8 +1629,10 @@ impl WriteGate {
                                        // invoked, never the canonical name that only accounts for the call.
                                        // For a non-alias request the two are the same name.
         let exec_tool = req.registered_as.as_deref().unwrap_or(&req.tool);
-        let output =
-            self.executor.execute_pre_approved(exec_tool, input, &session_ctx, cancel).await;
+        let output = self
+            .executor
+            .execute_pre_approved(exec_tool, input, &session_ctx, cancel.clone())
+            .await;
         let output = match output {
             Ok(output) => output,
             Err(ToolError::Cancelled) => return Err(GateError::Cancelled),
@@ -1638,8 +1642,15 @@ impl WriteGate {
             }
         };
 
-        if let Ok(mut observations) = self.read_versions.lock() {
-            observations.record_write(&self.project_root, &req, content_was_staged);
+        if let Err(error) = self.record_write_versions(&req, content_was_staged, &cancel).await {
+            tracing::warn!(call_id = %req.call_id, %error,
+                "write executed but its updated read version could not be persisted");
+            return Err(match error {
+                GateError::Cancelled => GateError::Cancelled,
+                error => GateError::Execution(format!(
+                    "write executed, but its read version was not persisted: {error}; reread before editing again"
+                )),
+            });
         }
 
         // The full `ToolOutput` (summary + data) rides the wire so the agent
@@ -1916,12 +1927,18 @@ impl WriteGate {
 /// based on context acquired outside the gate. Both backends canonicalize the
 /// request before calling this helper.
 ///
+/// Identified sessions recover claims from durable, project-scoped provenance.
 /// Successful filesystem reads retain the hash of the returned content, never
 /// a later disk reread. Missing paths observed through `exists` use an explicit
-/// absence claim. The fixed-capacity ledger fails closed on overflow/poisoning.
+/// absence claim. Unknown legacy provenance, storage errors and capacity
+/// exhaustion require a fresh read instead of arrival-time stamping.
 /// Fresh creates without an absence observation retain the legacy no-claim
 /// behavior. A failed fallback pre-image read is debug-logged and unstamped.
-pub(crate) async fn stamp_base_versions(gate: &WriteGate, request: &mut GateRequest) {
+pub(crate) async fn stamp_base_versions(
+    gate: &WriteGate,
+    request: &mut GateRequest,
+    cancel: &CancellationToken,
+) {
     let targets: Vec<String> = versioned_targets(request);
     if targets.is_empty() {
         return;
@@ -1932,15 +1949,20 @@ pub(crate) async fn stamp_base_versions(gate: &WriteGate, request: &mut GateRequ
             // even when it is stale (the gate surfaces the conflict then).
             continue;
         }
-        let observed = match gate.read_versions.lock() {
-            Ok(observations) => observations.observed(&gate.project_root, request, &target),
-            Err(_) => Some(read_versions::REREAD.to_owned()),
-        };
+        let observed = gate.observed_version(request, &target, cancel).await;
         if let Some(version) = observed {
             request.base_versions.insert(target, version);
             continue;
         }
-        let bytes = match gate.pre_image.read(Path::new(&target)).await {
+        let current = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                request.base_versions.insert(target, read_versions::REREAD.into());
+                continue;
+            }
+            result = gate.pre_image.read(Path::new(&target)) => result,
+        };
+        let bytes = match current {
             Ok(Some(bytes)) => bytes,
             Ok(None) => continue, // fresh create: no prior version to claim
             Err(error) => {
@@ -2863,7 +2885,7 @@ mod tests {
         assert_eq!(req.tool, "filesystem", "accounting identity is canonical");
         assert_eq!(req.registered_as.as_deref(), Some("write"), "requested identity preserved");
         assert_eq!(req.input["operation"], json!("write"), "operation forced by the view");
-        stamp_base_versions(&gate, &mut req).await;
+        stamp_base_versions(&gate, &mut req, &CancellationToken::new()).await;
         assert!(
             !req.base_versions.is_empty(),
             "canonical operation yields versioned targets (the escape left none)"
@@ -3372,7 +3394,7 @@ mod tests {
         assert_eq!(output.result["data"]["content"], "read base");
         std::fs::write(dir.path().join("f.txt"), "external edit").unwrap();
         let mut write = real_fs_write("stale-write", "f.txt", "agent edit");
-        stamp_base_versions(&gate, &mut write).await;
+        stamp_base_versions(&gate, &mut write, &CancellationToken::new()).await;
         assert_eq!(write.base_versions["f.txt"], blake3::hash(b"read base").to_hex().to_string());
         assert!(matches!(
             gate.submit(write, CancellationToken::new()).await,
@@ -3380,6 +3402,260 @@ mod tests {
         ));
         assert_eq!(std::fs::read_to_string(dir.path().join("f.txt")).unwrap(), "external edit");
         assert_eq!(whiteboard_row_count(&pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn resumed_gate_keeps_read_claims_after_external_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, pool) = test_pool(8).await;
+        let session_id = Ulid::new().to_string();
+        let first = real_fs_gate(pool.clone(), dir.path().to_path_buf());
+        std::fs::write(dir.path().join("f.txt"), "observed before restart").unwrap();
+        let mut read = filesystem_request("before-restart-read", "read", "f.txt");
+        read.session_id = Some(session_id.clone());
+        let output = first.submit(read, CancellationToken::new()).await.unwrap();
+        assert_eq!(output.result["data"]["content"], "observed before restart");
+        drop(first);
+
+        std::fs::write(dir.path().join("f.txt"), "external after restart").unwrap();
+        let resumed = real_fs_gate(pool.clone(), dir.path().to_path_buf());
+        let mut write = real_fs_write("after-restart-write", "f.txt", "stale agent edit");
+        write.session_id = Some(session_id);
+        stamp_base_versions(&resumed, &mut write, &CancellationToken::new()).await;
+        assert_eq!(
+            write.base_versions["f.txt"],
+            blake3::hash(b"observed before restart").to_hex().to_string(),
+            "restoration must use the returned bytes, never the new disk version"
+        );
+        assert!(matches!(
+            resumed.submit(write, CancellationToken::new()).await,
+            Err(GateError::Conflict { .. })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "external after restart"
+        );
+        assert_eq!(whiteboard_row_count(&pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn resumed_gate_keeps_observed_absence_after_external_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, pool) = test_pool(8).await;
+        let session_id = Ulid::new().to_string();
+        let first = real_fs_gate(pool.clone(), dir.path().to_path_buf());
+        let mut read = filesystem_request("before-restart-exists", "exists", "new.txt");
+        read.session_id = Some(session_id.clone());
+        let output = first.submit(read, CancellationToken::new()).await.unwrap();
+        assert_eq!(output.result["data"]["exists"], false);
+        drop(first);
+
+        std::fs::write(dir.path().join("new.txt"), "external create").unwrap();
+        let resumed = real_fs_gate(pool.clone(), dir.path().to_path_buf());
+        let mut write = real_fs_write("after-restart-create", "new.txt", "agent create");
+        write.session_id = Some(session_id);
+        stamp_base_versions(&resumed, &mut write, &CancellationToken::new()).await;
+        assert_eq!(write.base_versions["new.txt"], read_versions::ABSENT);
+        assert!(matches!(
+            resumed.submit(write, CancellationToken::new()).await,
+            Err(GateError::Conflict { .. })
+        ));
+        assert_eq!(std::fs::read_to_string(dir.path().join("new.txt")).unwrap(), "external create");
+        assert_eq!(whiteboard_row_count(&pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn resumed_gate_preserves_own_write_versions_and_scope_isolation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, pool) = test_pool(8).await;
+        let session_id = Ulid::new().to_string();
+        let first = real_fs_gate(pool.clone(), dir.path().to_path_buf());
+        std::fs::write(dir.path().join("f.txt"), "base").unwrap();
+        let mut read = filesystem_request("owned-read", "read", "f.txt");
+        read.session_id = Some(session_id.clone());
+        first.submit(read.clone(), CancellationToken::new()).await.unwrap();
+        let mut write = real_fs_write("owned-write", "f.txt", "own edit");
+        write.session_id = Some(session_id.clone());
+        stamp_base_versions(&first, &mut write, &CancellationToken::new()).await;
+        first.submit(write, CancellationToken::new()).await.unwrap();
+        drop(first);
+        let resumed = real_fs_gate(pool.clone(), dir.path().to_path_buf());
+        let cancel = CancellationToken::new();
+        assert_eq!(
+            resumed.observed_version(&read, "f.txt", &cancel).await,
+            Some(blake3::hash(b"own edit").to_hex().to_string())
+        );
+        let mut other_agent = read.clone();
+        other_agent.agent_id = "other-agent".into();
+        assert_eq!(resumed.observed_version(&other_agent, "f.txt", &cancel).await, None);
+        let mut other_session = read.clone();
+        other_session.session_id = Some(Ulid::new().to_string());
+        assert_eq!(resumed.observed_version(&other_session, "f.txt", &cancel).await, None);
+        let other_dir = tempfile::tempdir().unwrap();
+        let other_root = real_fs_gate(pool, other_dir.path().to_path_buf());
+        assert_eq!(other_root.observed_version(&read, "f.txt", &cancel).await, None);
+    }
+
+    #[tokio::test]
+    async fn legacy_resume_requires_fresh_read_without_guessing_current_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, pool) = test_pool(8).await;
+        let session_id = Ulid::new().to_string();
+        sqlx::query("INSERT INTO gate_read_legacy_sessions (session_id) VALUES (?)")
+            .bind(&session_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        std::fs::write(dir.path().join("f.txt"), "current, not necessarily observed").unwrap();
+        let resumed = real_fs_gate(pool, dir.path().to_path_buf());
+        let mut write = real_fs_write("legacy-write", "f.txt", "agent edit");
+        write.session_id = Some(session_id.clone());
+        stamp_base_versions(&resumed, &mut write, &CancellationToken::new()).await;
+        assert_eq!(write.base_versions["f.txt"], read_versions::REREAD);
+        assert!(matches!(
+            resumed.submit(write, CancellationToken::new()).await,
+            Err(GateError::Conflict { .. })
+        ));
+        let mut read = filesystem_request("legacy-reread", "read", "f.txt");
+        read.session_id = Some(session_id.clone());
+        resumed.submit(read, CancellationToken::new()).await.unwrap();
+        let mut fresh = real_fs_write("legacy-fresh-write", "f.txt", "agent edit");
+        fresh.session_id = Some(session_id);
+        stamp_base_versions(&resumed, &mut fresh, &CancellationToken::new()).await;
+        resumed.submit(fresh, CancellationToken::new()).await.unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("f.txt")).unwrap(), "agent edit");
+    }
+
+    #[tokio::test]
+    async fn unavailable_read_provenance_never_falls_back_to_disk_stamping() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, pool) = test_pool(8).await;
+        let gate = real_fs_gate(pool.clone(), dir.path().to_path_buf());
+        std::fs::write(dir.path().join("f.txt"), "protected").unwrap();
+        let session_id = Ulid::new().to_string();
+        sqlx::query("DROP TABLE gate_read_versions").execute(&pool).await.unwrap();
+        let mut write = real_fs_write("no-store-write", "f.txt", "overwrite");
+        write.session_id = Some(session_id.clone());
+        stamp_base_versions(&gate, &mut write, &CancellationToken::new()).await;
+        assert_eq!(write.base_versions["f.txt"], read_versions::REREAD);
+        assert!(matches!(
+            gate.submit(write, CancellationToken::new()).await,
+            Err(GateError::Conflict { .. })
+        ));
+        let mut read = filesystem_request("no-store-read", "read", "f.txt");
+        read.session_id = Some(session_id);
+        assert!(matches!(
+            gate.submit(read, CancellationToken::new()).await,
+            Err(GateError::Execution(_))
+        ));
+        assert_eq!(std::fs::read_to_string(dir.path().join("f.txt")).unwrap(), "protected");
+        assert_eq!(whiteboard_row_count(&pool).await, 0);
+    }
+
+    #[tokio::test]
+    async fn durable_read_capacity_survives_restart_without_evicting_protection() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, pool) = test_pool(8).await;
+        let first = real_fs_gate(pool.clone(), dir.path().to_path_buf());
+        let session_id = Ulid::new().to_string();
+        std::fs::write(dir.path().join("known"), "base").unwrap();
+        let mut read = filesystem_request("capacity-known", "read", "known");
+        read.session_id = Some(session_id.clone());
+        first.submit(read.clone(), CancellationToken::new()).await.unwrap();
+        let root: String =
+            sqlx::query_scalar("SELECT project_root FROM gate_read_scopes WHERE session_id = ?")
+                .bind(&session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM gate_read_versions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        sqlx::query("WITH RECURSIVE filler(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM filler WHERE i < ?)             INSERT INTO gate_read_versions (project_root, session_id, agent_id, path, version)             SELECT ?, ?, ?, 'capacity-' || i, 'unused' FROM filler")
+            .bind(4096 - count).bind(&root).bind(&session_id).bind(&read.agent_id)
+            .execute(&pool).await.unwrap();
+        std::fs::write(dir.path().join("overflow"), "extra").unwrap();
+        let mut overflow = filesystem_request("capacity-extra", "read", "overflow");
+        overflow.session_id = Some(session_id.clone());
+        first.submit(overflow, CancellationToken::new()).await.unwrap();
+        drop(first);
+        let resumed = real_fs_gate(pool.clone(), dir.path().to_path_buf());
+        let cancel = CancellationToken::new();
+        assert_eq!(
+            resumed.observed_version(&read, "unknown", &cancel).await,
+            Some(read_versions::REREAD.into())
+        );
+        assert_eq!(
+            resumed.observed_version(&read, "known", &cancel).await,
+            Some(blake3::hash(b"base").to_hex().to_string())
+        );
+        std::fs::write(dir.path().join("known"), "fresh").unwrap();
+        read.call_id = "capacity-refresh".into();
+        resumed.submit(read.clone(), CancellationToken::new()).await.unwrap();
+        assert_eq!(
+            resumed.observed_version(&read, "known", &cancel).await,
+            Some(blake3::hash(b"fresh").to_hex().to_string())
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM gate_read_versions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 4096);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resumed_gate_recovers_claims_through_a_project_root_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let aliases = tempfile::tempdir().unwrap();
+        let alias = aliases.path().join("project");
+        std::os::unix::fs::symlink(dir.path(), &alias).unwrap();
+        let (_db, pool) = test_pool(8).await;
+        let session_id = Ulid::new().to_string();
+        let first = real_fs_gate(pool.clone(), dir.path().to_path_buf());
+        std::fs::write(dir.path().join("f.txt"), "observed").unwrap();
+        let mut read = filesystem_request("alias-read", "read", "f.txt");
+        read.session_id = Some(session_id.clone());
+        first.submit(read, CancellationToken::new()).await.unwrap();
+        drop(first);
+        std::fs::write(dir.path().join("f.txt"), "external").unwrap();
+        let resumed = real_fs_gate(pool, alias);
+        let mut write = real_fs_write("alias-write", "f.txt", "stale edit");
+        write.session_id = Some(session_id);
+        stamp_base_versions(&resumed, &mut write, &CancellationToken::new()).await;
+        assert_eq!(write.base_versions["f.txt"], blake3::hash(b"observed").to_hex().to_string());
+        assert!(matches!(
+            resumed.submit(write, CancellationToken::new()).await,
+            Err(GateError::Conflict { .. })
+        ));
+        assert_eq!(std::fs::read_to_string(dir.path().join("f.txt")).unwrap(), "external");
+    }
+
+    #[tokio::test]
+    async fn durable_claim_lookup_cancels_while_waiting_for_database_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_db, pool) = test_pool(1).await;
+        let gate = real_fs_gate(pool.clone(), dir.path().to_path_buf());
+        let held_connection = pool.acquire().await.unwrap();
+        let mut write = real_fs_write("cancel-lookup", "f.txt", "edit");
+        write.session_id = Some(Ulid::new().to_string());
+        let cancel = CancellationToken::new();
+        {
+            let stamping = stamp_base_versions(&gate, &mut write, &cancel);
+            tokio::pin!(stamping);
+            tokio::select! {
+                biased;
+                _ = &mut stamping => panic!("the only database connection is held"),
+                _ = tokio::task::yield_now() => {},
+            }
+            cancel.cancel();
+            tokio::time::timeout(std::time::Duration::from_secs(5), &mut stamping)
+                .await
+                .expect("cancellation must not wait for the connection");
+        }
+        assert_eq!(write.base_versions["f.txt"], read_versions::REREAD);
+        drop(held_connection);
     }
 
     #[tokio::test]
@@ -3396,7 +3672,7 @@ mod tests {
         other.agent_id = "agent-b".into();
         gate.submit(other, CancellationToken::new()).await.unwrap();
         let mut stale = real_fs_write("stale-a", "f.txt", "overwrite");
-        stamp_base_versions(&gate, &mut stale).await;
+        stamp_base_versions(&gate, &mut stale, &CancellationToken::new()).await;
         assert!(matches!(
             gate.submit(stale, CancellationToken::new()).await,
             Err(GateError::Conflict { .. })
@@ -3405,7 +3681,7 @@ mod tests {
             .await
             .unwrap();
         let mut fresh = real_fs_write("fresh-a", "f.txt", "new");
-        stamp_base_versions(&gate, &mut fresh).await;
+        stamp_base_versions(&gate, &mut fresh, &CancellationToken::new()).await;
         gate.submit(fresh, CancellationToken::new()).await.unwrap();
         assert_eq!(std::fs::read_to_string(dir.path().join("f.txt")).unwrap(), "new");
     }
@@ -3430,7 +3706,7 @@ mod tests {
             std::fs::write(dir.path().join(changed), "external").unwrap();
             let mut request = filesystem_request("mutation", operation, "src");
             request.input["destination"] = json!("dst");
-            stamp_base_versions(&gate, &mut request).await;
+            stamp_base_versions(&gate, &mut request, &CancellationToken::new()).await;
             assert!(
                 matches!(
                     gate.submit(request, CancellationToken::new()).await,
@@ -3455,12 +3731,12 @@ mod tests {
             .unwrap();
         for (id, content) in [("write-1", "first"), ("write-2", "second")] {
             let mut request = real_fs_write(id, "f", content);
-            stamp_base_versions(&gate, &mut request).await;
+            stamp_base_versions(&gate, &mut request, &CancellationToken::new()).await;
             gate.submit(request, CancellationToken::new()).await.unwrap();
         }
         std::fs::write(dir.path().join("f"), "external").unwrap();
         let mut request = real_fs_write("write-3", "f", "third");
-        stamp_base_versions(&gate, &mut request).await;
+        stamp_base_versions(&gate, &mut request, &CancellationToken::new()).await;
         assert_eq!(request.base_versions["f"], blake3::hash(b"second").to_hex().to_string());
         assert!(matches!(
             gate.submit(request, CancellationToken::new()).await,
@@ -3479,7 +3755,7 @@ mod tests {
             .unwrap();
         std::fs::write(dir.path().join("f"), "external create").unwrap();
         let mut stale = real_fs_write("stale-create", "f", "clobber");
-        stamp_base_versions(&gate, &mut stale).await;
+        stamp_base_versions(&gate, &mut stale, &CancellationToken::new()).await;
         assert!(matches!(
             gate.submit(stale, CancellationToken::new()).await,
             Err(GateError::Conflict { .. })
@@ -3489,10 +3765,10 @@ mod tests {
             .await
             .unwrap();
         let mut delete = filesystem_request("delete", "delete", "f");
-        stamp_base_versions(&gate, &mut delete).await;
+        stamp_base_versions(&gate, &mut delete, &CancellationToken::new()).await;
         gate.submit(delete, CancellationToken::new()).await.unwrap();
         let mut recreate = real_fs_write("recreate", "f", "ours");
-        stamp_base_versions(&gate, &mut recreate).await;
+        stamp_base_versions(&gate, &mut recreate, &CancellationToken::new()).await;
         gate.submit(recreate, CancellationToken::new()).await.unwrap();
         assert_eq!(std::fs::read_to_string(dir.path().join("f")).unwrap(), "ours");
     }
@@ -3518,10 +3794,10 @@ mod tests {
         gate.submit(other, CancellationToken::new()).await.unwrap();
         let mut request = real_fs_write("write-a", "f", "edit");
         request.session_id = Some(session_a);
-        stamp_base_versions(&gate, &mut request).await;
+        stamp_base_versions(&gate, &mut request, &CancellationToken::new()).await;
         assert_eq!(request.base_versions["f"], blake3::hash(b"base").to_hex().to_string());
         request.base_versions.insert("f".into(), "explicit-stale".into());
-        stamp_base_versions(&gate, &mut request).await;
+        stamp_base_versions(&gate, &mut request, &CancellationToken::new()).await;
         assert_eq!(request.base_versions["f"], "explicit-stale");
         assert!(matches!(
             gate.submit(request, CancellationToken::new()).await,
@@ -3543,7 +3819,7 @@ mod tests {
                 std::fs::write(dir.path().join("binary"), [0xfe, 0x00]).unwrap();
             }
             let mut delete = filesystem_request("delete", "delete", "binary");
-            stamp_base_versions(&gate, &mut delete).await;
+            stamp_base_versions(&gate, &mut delete, &CancellationToken::new()).await;
             let result = gate.submit(delete, CancellationToken::new()).await;
             if changed {
                 assert!(matches!(result, Err(GateError::Conflict { .. })));
@@ -3567,18 +3843,18 @@ mod tests {
             .unwrap();
         // An ordinary write banks the base needed by existing hunk staging.
         let mut prime = real_fs_write("prime", "f", &base);
-        stamp_base_versions(&gate, &mut prime).await;
+        stamp_base_versions(&gate, &mut prime, &CancellationToken::new()).await;
         gate.submit(prime, CancellationToken::new()).await.unwrap();
         let external = replace_line(&base, 1, "EXTERNAL");
         std::fs::write(dir.path().join("f"), &external).unwrap();
         let mut staged = real_fs_write("staged", "f", &replace_line(&base, 13, "AGENT"));
-        stamp_base_versions(&gate, &mut staged).await;
+        stamp_base_versions(&gate, &mut staged, &CancellationToken::new()).await;
         gate.submit(staged, CancellationToken::new()).await.unwrap();
         let merged = replace_line(&external, 13, "AGENT");
         assert_eq!(std::fs::read_to_string(dir.path().join("f")).unwrap(), merged);
         // The model submitted its edit, but was never shown the merged bytes.
         let mut stale = real_fs_write("stale-after-merge", "f", &replace_line(&base, 13, "NEXT"));
-        stamp_base_versions(&gate, &mut stale).await;
+        stamp_base_versions(&gate, &mut stale, &CancellationToken::new()).await;
         assert!(matches!(
             gate.submit(stale, CancellationToken::new()).await,
             Err(GateError::Conflict { .. })
@@ -3589,7 +3865,7 @@ mod tests {
             .unwrap();
         let next = replace_line(&merged, 13, "NEXT");
         let mut fresh = real_fs_write("fresh-after-merge", "f", &next);
-        stamp_base_versions(&gate, &mut fresh).await;
+        stamp_base_versions(&gate, &mut fresh, &CancellationToken::new()).await;
         gate.submit(fresh, CancellationToken::new()).await.unwrap();
         assert_eq!(std::fs::read_to_string(dir.path().join("f")).unwrap(), next);
         assert_eq!(whiteboard_row_count(&pool).await, 3);
@@ -3607,7 +3883,7 @@ mod tests {
         // a versioned write stamps the target's current pre-image hash — the
         // same blake3 hex the gate's conflict check compares against.
         let mut write_req = filesystem_request("stamp-1", "write", "f.txt");
-        stamp_base_versions(&gate, &mut write_req).await;
+        stamp_base_versions(&gate, &mut write_req, &CancellationToken::new()).await;
         assert_eq!(
             write_req.base_versions.get("f.txt").map(String::as_str),
             Some(blake3::hash(b"base").to_hex().to_string().as_str()),
@@ -3617,7 +3893,7 @@ mod tests {
         // A target with no current file carries no claim (fresh creates have
         // no prior version to conflict with -> documented LWW).
         let mut create_req = filesystem_request("stamp-2", "write", "ghost.txt");
-        stamp_base_versions(&gate, &mut create_req).await;
+        stamp_base_versions(&gate, &mut create_req, &CancellationToken::new()).await;
         assert!(
             write_req.base_versions.contains_key("f.txt")
                 && !create_req.base_versions.contains_key("ghost.txt"),
@@ -3629,7 +3905,7 @@ mod tests {
         std::fs::write(root.join("src.txt"), "move me").expect("seed source");
         let mut move_req = filesystem_request("stamp-3", "move", "src.txt");
         move_req.input["destination"] = json!("dest.txt");
-        stamp_base_versions(&gate, &mut move_req).await;
+        stamp_base_versions(&gate, &mut move_req, &CancellationToken::new()).await;
         assert_eq!(
             move_req.base_versions.get("src.txt").map(String::as_str),
             Some(blake3::hash(b"move me").to_hex().to_string().as_str()),
@@ -3644,7 +3920,7 @@ mod tests {
         // pre-image is still attributed on the WAL row).
         let mut copy_req = filesystem_request("stamp-4", "copy", "src.txt");
         copy_req.input["destination"] = json!("copy.txt");
-        stamp_base_versions(&gate, &mut copy_req).await;
+        stamp_base_versions(&gate, &mut copy_req, &CancellationToken::new()).await;
         assert!(
             !copy_req.base_versions.contains_key("src.txt"),
             "the read-only copy source is never stamped as a claim"
@@ -3656,10 +3932,10 @@ mod tests {
 
         // Non-versioned operations and non-filesystem tools carry no claims.
         let mut listed = filesystem_request("stamp-5", "list", ".");
-        stamp_base_versions(&gate, &mut listed).await;
+        stamp_base_versions(&gate, &mut listed, &CancellationToken::new()).await;
         assert!(listed.base_versions.is_empty(), "non-versioned operation -> no claims");
         let mut other = request("stamp-6");
-        stamp_base_versions(&gate, &mut other).await;
+        stamp_base_versions(&gate, &mut other, &CancellationToken::new()).await;
         assert!(other.base_versions.is_empty(), "non-filesystem tool -> no claims");
     }
 
@@ -3677,7 +3953,7 @@ mod tests {
         let mut request = filesystem_request("stamp-dw-1", "move", "src.txt");
         request.input["destination"] = json!("dest.txt");
         request.base_versions.insert("src.txt".to_owned(), "declared-stale".to_owned());
-        stamp_base_versions(&gate, &mut request).await;
+        stamp_base_versions(&gate, &mut request, &CancellationToken::new()).await;
         assert_eq!(
             request.base_versions.get("src.txt").map(String::as_str),
             Some("declared-stale"),
@@ -3703,7 +3979,7 @@ mod tests {
         // the target's current pre-image hash (same reader + blake3 hex the
         // gate's conflict check compares against).
         let mut request = real_fs_write("auto-1", "f.txt", "new");
-        stamp_base_versions(&gate, &mut request).await;
+        stamp_base_versions(&gate, &mut request, &CancellationToken::new()).await;
         assert_eq!(
             request.base_versions.get("f.txt").map(String::as_str),
             Some(blake3::hash(b"base").to_hex().to_string().as_str()),
@@ -3734,7 +4010,7 @@ mod tests {
 
         // Stamp at request arrival...
         let mut request = real_fs_write("auto-2", "f.txt", "mine");
-        stamp_base_versions(&gate, &mut request).await;
+        stamp_base_versions(&gate, &mut request, &CancellationToken::new()).await;
         assert_eq!(
             request.base_versions.get("f.txt").map(String::as_str),
             Some(blake3::hash(b"base").to_hex().to_string().as_str()),

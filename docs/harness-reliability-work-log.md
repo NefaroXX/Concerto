@@ -26,7 +26,7 @@ passing repository tests alone does not close a finding.
 | H14 | P2 | Checkpoint startup can degrade into ToolNotFound; CLI test failed intermittently | Open; observed during H02 verification |
 | H15 | P1 | Orchestrator read cache trusts matching size/mtime without checking current bytes | Fixed and verified; awaiting merge |
 | H16 | P2 | Coverage-only Cargo runners trust exit status and truncate output at byte offsets | Open; source traced during H04 |
-| H17 | P1 | Resumed history lacks restored read-version claims when a new gate is constructed | Open; source traced during H06 |
+| H17 | P1 | Resumed history lacks restored read-version claims when a new gate is constructed | Fixed and verified locally; awaiting native CI and merge |
 | H18 | P1 | Locked Wasmtime 36.0.19 fails fresh security gates on RUSTSEC-2026-0424 | Fixed and verified; awaiting merge |
 | H19 | P2 | Action-required minimum tool-call check ignores earlier continuation rounds | Fixed and verified; awaiting merge |
 | H20 | P1 | Yanked async-executor 1.14.0 remains locked after an upstream memory-safety regression | Fixed and verified; awaiting merge |
@@ -34,6 +34,8 @@ passing repository tests alone does not close a finding.
 | H22 | P1 | Cache path normalization can select a different file from the filesystem tool | Fixed and verified with H15; awaiting merge |
 | H23 | P2 | CLI MCP probe integration test timed out during the H19 workspace run | Open; cause under investigation |
 | H24 | P2 | Final provider context guard omits replayable reasoning from its size estimate | Fixed and verified; awaiting merge |
+| H25 | P2 | Benchmark required-pattern checks count unreadable files as matching | Open; source traced during H17 verification |
+| H26 | P2 | Nine non-standard benchmark task manifests contain invalid-length IDs | Open; fixture inspection confirmed 27-character IDs |
 
 ## 2026-10-29 — H01: preserve streaming events across chunks
 
@@ -950,3 +952,82 @@ Next: patch H18, then continue H07's truthful verification/completion handling.
 - This remains a heuristic estimate, not an exact model tokenizer. Neither
   this fix nor H08 claims to preserve every constraint through compaction;
   H09 remains open. Remote checks follow publication of this new head.
+
+## 2026-11-04 — H17: reproduce lost resume claims and apply durable provenance
+
+- Published H08/H24 as `ba06570` and `3dc5f0a` and updated draft PR #379.
+  Their full local verification is complete; remote checks follow publication.
+- Both H17 baseline regressions failed: a fresh gate over the same database
+  stamped the new disk hash instead of the returned-byte hash or observed
+  absence from the earlier gate. The test-only baseline log is retained.
+- Applied the isolated H17 diff after reproducing the failures, preserving
+  H08/H24. The primary tree is now authoritative. Migration 041 stores native
+  project/session/agent/path claims with a persistent 4,096-entry limit and
+  legacy-session markers; session cleanup removes them. Old sessions with
+  unknown provenance require fresh reads instead of guessing current bytes.
+- Reads publish success only after provenance commits. Storage failure and
+  cancelled lookup cannot revert to arrival-time stamping. Tracked writes
+  advance durable claims from known submitted bytes; update failures leave
+  conservative prior claims and explicitly report that the write executed.
+  Policy/approval and write-ahead decision ordering are unchanged.
+- Eight orchestrator regressions now cover restart after read/absence,
+  own-write advancement and isolation, legacy recovery, unavailable storage,
+  persistent capacity, native project-root aliases and cancellation while
+  waiting for a connection. A session-cleanup regression covers the new rows.
+  The gate suite is compiling; no Rust verification result is claimed yet.
+- ADR-60 documents the new durability boundary, legacy recovery and remaining
+  limitations. The in-memory SQLite migration/upsert probe passed, including
+  rejection of a new entry at capacity and refresh of an existing entry.
+- All 71 gate/in-process-gate tests passed, including the eight new H17
+  regressions. The session-cleanup test and broader suites follow.
+- Extended the existing native-platform workflow to run the orchestrator gate
+  and read-version tests plus session-provenance cleanup on Windows, macOS and
+  Linux. This will cover H06's previously unexecuted Windows-only absence-alias
+  regression; it is not reported as executed until the new workflow runs.
+- The complete affected suites passed: 1,888 orchestrator tests (one ignored)
+  and 206 session tests, including cleanup. Clippy found one `question_mark`
+  lint in the extracted pure read parser; replaced its `let...else` with `?`
+  without changing behavior. The final workspace/Clippy/build/supplemental
+  pipeline now runs on that correction. The isolated draft must not overwrite
+  primary changes made after application.
+- H17's index refresh, formatting/diff checks, palette enforcement, six Python
+  tests and both fresh supply-chain scans passed. All twelve remote checks on
+  H08/H24's published head `3dc5f0a` also passed; these do not cover H17 yet.
+- **H25:** the benchmark scorer leaves `all_match = true` when reading a file
+  with required patterns fails (`eval/runner.rs`). A binary or unreadable file
+  can therefore satisfy checks whose patterns were never inspected.
+- **H26:** nine task manifests across bug-fix/library/CLI/web-API benchmark
+  categories have 27-character IDs, incompatible with the 26-character ULID
+  field. Inspection confirmed each length; a corpus-loading regression is
+  still needed. Standard-suite tests do not exercise these category manifests.
+  These benchmark follow-ups are outside the current H17 verification tree.
+
+- H17's full workspace test run passed: 6,068 passed, zero failed, 16 ignored
+  across 85 groups. Workspace Clippy with all targets and warnings denied also
+  passed. The sequential build/frontend/WASM/benchmark checks are still live;
+  no terminal result is claimed for that pipeline yet.
+- The H17 default workspace build and launcher/cache-replay smoke checks also
+  passed. Frontend-only builds and supplemental CI checks remain in progress.
+- Benchmark follow-ups are drafted only in the disk-backed `h10-h11` worktree.
+  Five regressions cover the fixture policy/audit, optional empty constraints,
+  actual suite completion/test aggregation, unreadable required content and
+  loading all six committed categories. The baseline preserves the old
+  behavior; a separate draft adds the explicit fixture allow rule, correct
+  scoring and nine valid unique IDs. Neither draft is yet compiled or tested.
+
+## 2026-11-04 — H17: final local verification complete
+
+- The sequential final pipeline exited 0. Full workspace tests passed: 6,068
+  passed, zero failed, 16 ignored across 85 groups. All-target workspace Clippy
+  with warnings denied, the workspace build, both frontend builds, launcher/
+  cache/CLI smoke checks, all four WASM guests and all nine release benchmark
+  smoke targets passed. No performance improvement is inferred from smoke runs.
+- Formatting/diff checks, palette enforcement, six Python tests, semantic-index
+  refresh and fresh `cargo deny check`/`cargo audit` passed. The tested primary
+  Rust source remained unchanged throughout the final pipeline.
+- Publishing the durable ledger, migration 041, nine regressions, ADR amendment
+  and expanded native workflow together. Windows/macOS execution of the new
+  gate coverage remains unverified until remote CI runs this revision.
+- The previous goal turn made concrete progress: H17 verification completed,
+  and five benchmark regressions plus an isolated implementation were drafted.
+  The broader audit remains active; the remaining open findings are unchanged.

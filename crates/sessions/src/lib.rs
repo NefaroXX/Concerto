@@ -1204,6 +1204,9 @@ impl SessionStore for SqliteSessionStore {
         // ON DELETE CASCADE (project_active_sessions, orchestration_checkpoints)
         // are left to the cascade and must NOT be deleted here.
         for table in [
+            "gate_read_versions",
+            "gate_read_scopes",
+            "gate_read_legacy_sessions",
             "messages",
             "provider_metrics",
             "session_events",
@@ -3593,6 +3596,45 @@ mod tests {
             .unwrap();
         let listed = store.list_spend_records(session.id, CancellationToken::new()).await.unwrap();
         assert!(listed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_session_removes_read_provenance_only_for_that_session() {
+        let store = SqliteSessionStore::connect_in_memory().await.unwrap();
+        let session = store
+            .create_session(
+                camino::Utf8Path::new("/var/tmp/read-provenance"),
+                "provider",
+                "model",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let id = session.id.to_string();
+        sqlx::query("INSERT INTO gate_read_scopes (project_root, session_id) VALUES ('root', ?)")
+            .bind(&id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO gate_read_versions (project_root, session_id, agent_id, path, version)             VALUES ('root', ?, 'agent', 'file', '<absent>')")
+            .bind(&id).execute(&store.pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO gate_read_legacy_sessions (session_id) VALUES (?), ('other-session')",
+        )
+        .bind(&id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        assert!(store.delete_session(session.id, CancellationToken::new()).await.unwrap());
+        let count: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM gate_read_versions)             + (SELECT COUNT(*) FROM gate_read_scopes)")
+            .fetch_one(&store.pool).await.unwrap();
+        assert_eq!(count, 0);
+        let remaining: Vec<String> =
+            sqlx::query_scalar("SELECT session_id FROM gate_read_legacy_sessions")
+                .fetch_all(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining, ["other-session"]);
     }
 
     #[tokio::test]

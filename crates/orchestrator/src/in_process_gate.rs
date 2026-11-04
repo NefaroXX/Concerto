@@ -250,7 +250,7 @@ impl InProcessGateBackend {
         self.gate.canonicalize_request(&mut request);
         // Prefer this agent's observed read version. Only unobserved targets
         // fall back to arrival-time stamping (shared with the supervisor).
-        stamp_base_versions(&self.gate, &mut request).await;
+        stamp_base_versions(&self.gate, &mut request, &cancel).await;
         let outcome = match self.gate.submit(request, cancel.clone()).await {
             Ok(outcome) => outcome,
             Err(error) => {

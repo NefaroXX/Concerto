@@ -111,6 +111,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Read-version protection survives resumed runs.** Identified sessions retain
+  observed file hashes and absence claims across gate recreation. Unknown
+  legacy provenance and unavailable storage require rereading; stored claims
+  remain bounded and are removed with their session.
 - **Provider context guard counts replayable reasoning.** Large reasoning
   payloads can no longer bypass the input budget behind short visible answers;
   fitting requests retain their reasoning unchanged.
