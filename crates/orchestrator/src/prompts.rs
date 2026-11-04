@@ -12,7 +12,6 @@ use concerto_config::{ShellBackendType, ShellProfileConfig};
 use concerto_core::error::ProviderError;
 use concerto_core::event::EventBus;
 use concerto_core::ids::Ulid;
-use concerto_core::text::normalize_typographic;
 use concerto_core::traits::provider::{CompletionStream, LlmProvider};
 use concerto_core::types::{
     CompletionRequest, CompletionUsage, Message, Role, ToolCall, ToolDefinition,
@@ -605,12 +604,18 @@ fn platform_notes(os: &str) -> Vec<String> {
 /// pairing the first opening brace with the final closing brace, which was the
 /// source of repeated architect failures when a model added commentary.
 ///
-/// Typographic (Unicode) punctuation in model output is normalized to ASCII
-/// first — models emit curly quotes, en dashes, and non-breaking hyphens that
-/// `serde_json` rejects outright.
+/// Original candidates are tried before repairing smart-quote delimiters or
+/// nonbreaking whitespace outside strings. Unicode keys and values are data
+/// and must not be rewritten to make a response parse.
 pub fn parse_json_value(text: &str) -> Option<serde_json::Value> {
-    let normalized = normalize_typographic(text);
-    let trimmed = normalized.trim();
+    parse_json_value_raw(text).or_else(|| {
+        let repaired = repair_json_typography(text)?;
+        parse_json_value_raw(&repaired)
+    })
+}
+
+fn parse_json_value_raw(text: &str) -> Option<serde_json::Value> {
+    let trimmed = text.trim();
     if let Ok(value) = serde_json::from_str(trimmed) {
         return Some(value);
     }
@@ -628,14 +633,20 @@ pub fn parse_json_value(text: &str) -> Option<serde_json::Value> {
 /// Deserialize the first JSON fragment in a model response that deserializes
 /// to `T`.
 ///
-/// After normalizing typographic punctuation, tries in order: strict
-/// whole-text deserialization, deserialization after stripping an outer code
-/// fence, then every balanced `{...}`/`[...]` candidate in occurrence order.
+/// Tries strict whole-text deserialization, an outer code fence, then every
+/// balanced `{...}`/`[...]` candidate in occurrence order. Only after all
+/// original candidates fail does it try structural typography repair.
 /// A prose prefix may contain an earlier balanced fragment that is valid JSON
 /// of the wrong type — each candidate is tried until one deserializes to `T`.
 pub fn parse_json_substring<T: serde::de::DeserializeOwned>(text: &str) -> Option<T> {
-    let normalized = normalize_typographic(text);
-    let trimmed = normalized.trim();
+    parse_json_substring_raw(text).or_else(|| {
+        let repaired = repair_json_typography(text)?;
+        parse_json_substring_raw(&repaired)
+    })
+}
+
+fn parse_json_substring_raw<T: serde::de::DeserializeOwned>(text: &str) -> Option<T> {
+    let trimmed = text.trim();
 
     if let Ok(value) = serde_json::from_str::<T>(trimmed) {
         return Some(value);
@@ -654,6 +665,53 @@ pub fn parse_json_substring<T: serde::de::DeserializeOwned>(text: &str) -> Optio
         }
     }
     None
+}
+
+/// Repair only JSON typography with a structural meaning. Ordinary strings
+/// retain every codepoint, including curly quotes, dashes and nonbreaking
+/// spaces. Smart-quoted strings retain their contents while their delimiters
+/// become ASCII quotes. Ambiguous/malformed repairs must still pass serde.
+fn repair_json_typography(text: &str) -> Option<String> {
+    if !text.chars().any(|ch| matches!(ch, '“' | '”' | '\u{00a0}' | '\u{202f}')) {
+        return None;
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut closing_quote = None;
+    let mut escaped = false;
+    for ch in text.chars() {
+        if let Some(closer) = closing_quote {
+            if escaped {
+                out.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                out.push(ch);
+                escaped = true;
+            } else if ch == closer {
+                out.push('"');
+                closing_quote = None;
+            } else {
+                // An ASCII quote inside a smart-quoted string is content.
+                if ch == '"' && closer != '"' {
+                    out.push('\\');
+                }
+                out.push(ch);
+            }
+        } else {
+            match ch {
+                '"' => {
+                    closing_quote = Some('"');
+                    out.push(ch);
+                }
+                '“' | '”' => {
+                    closing_quote = Some('”');
+                    out.push('"');
+                }
+                '\u{00a0}' | '\u{202f}' => out.push(' '),
+                _ => out.push(ch),
+            }
+        }
+    }
+    (out != text).then_some(out)
 }
 
 fn strip_outer_fence(text: &str) -> &str {
@@ -1150,6 +1208,54 @@ mod tests {
     }
 
     #[test]
+    fn valid_json_keeps_unicode_in_keys_and_values() {
+        for content in
+            ["café – a‑b …", "‘quoted’ and “double quoted”", "line\n{braces} \\\"escaped\\\" 🦀"]
+        {
+            let expected = serde_json::json!({ "unicode–key": content });
+            let raw = expected.to_string();
+            for text in [raw.clone(), format!("```json\n{raw}\n```"), format!("Result: {raw} done")]
+            {
+                assert_eq!(parse_json_value(&text), Some(expected.clone()), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn typed_json_keeps_unicode_across_wrappers_and_candidate_selection() {
+        let content = "Keep “quotes”, a‑b, en–dash, café and 🦀";
+        let raw = serde_json::json!({"task": content}).to_string();
+        for text in [
+            raw.clone(),
+            format!("```json\n{raw}\n```"),
+            format!("Preface {{\"other\":0}} then {raw}"),
+        ] {
+            let parsed: Option<TestPlanItem> = parse_json_substring(&text);
+            assert_eq!(parsed, Some(TestPlanItem { task: content.to_owned() }), "{text}");
+        }
+    }
+
+    #[test]
+    fn structural_quote_repair_preserves_string_contents() {
+        for input in [
+            "{“task”: \"Keep “quotes” and a‑b\"}",
+            "{“task”: “Keep ‘quotes’ and a‑b”}",
+            "{\u{a0}\"task\":\u{a0}\"Keep\u{a0}space\"}",
+        ] {
+            let expected = if input.contains("‘quotes’") {
+                "Keep ‘quotes’ and a‑b"
+            } else if input.contains("\u{a0}space") {
+                "Keep\u{a0}space"
+            } else {
+                "Keep “quotes” and a‑b"
+            };
+            let parsed: Option<TestPlanItem> = parse_json_substring(input);
+            assert_eq!(parsed, Some(TestPlanItem { task: expected.to_owned() }));
+            assert_eq!(parse_json_value(input), Some(serde_json::json!({"task": expected})));
+        }
+    }
+
+    #[test]
     fn parses_fenced_json() {
         let value = parse_json_value("```json\n{\"ok\":true}\n```").unwrap();
         assert_eq!(value["ok"], true);
@@ -1209,17 +1315,15 @@ mod tests {
     }
 
     #[test]
-    fn substring_normalizes_smart_quotes_and_non_breaking_hyphens() {
-        // U+201C/U+201D delimit the JSON strings and U+2011 (non-breaking
-        // hyphen) appears inside a value; both break strict serde_json, which
-        // previously also confused the string tracking in the balanced-bracket
-        // scan. Normalization maps them to ASCII before parsing.
+    fn substring_repairs_smart_delimiters_without_rewriting_hyphens() {
+        // Smart delimiters are malformed JSON, but the nonbreaking hyphens
+        // inside the string are valid data and survive delimiter repair.
         let input = concat!(
             "Result: {\u{201C}task\u{201D}: ",
             "\u{201C}write\u{2011}commit\u{2011}code\u{201D}} done",
         );
         let parsed: Option<TestPlanItem> = parse_json_substring(input);
-        assert_eq!(parsed, Some(TestPlanItem { task: "write-commit-code".into() }));
+        assert_eq!(parsed, Some(TestPlanItem { task: "write‑commit‑code".into() }));
     }
 
     #[test]

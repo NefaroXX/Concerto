@@ -111,6 +111,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Structured JSON preserves Unicode data.** Both model-response parsers try
+  original JSON before repair. Fallback repair changes only smart delimiters
+  and nonbreaking whitespace outside strings, preserving punctuation in keys
+  and values across strict, fenced and prose-wrapped responses.
 - **Continuation rounds retain execution progress.** Action-required tasks can
   finish after work done in earlier rounds without repeating writes. Tool-call
   minimums accumulate across rounds and are enforced at completion; a capped

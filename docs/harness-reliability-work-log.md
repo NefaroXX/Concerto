@@ -22,16 +22,16 @@ passing repository tests alone does not close a finding.
 | H10 | P2 | Agent-driven benchmark fixture policy denies tools | Open |
 | H11 | P2 | Empty benchmark outcomes force a zero pass score | Open |
 | H12 | P2 | Durable event subscriber queues have no memory bound | Open |
-| H13 | P1 | Structured-response parsing rewrites Unicode before attempting JSON parsing | Draft prepared in isolated worktree; baseline reproduction pending |
+| H13 | P1 | Structured-response parsing rewrites Unicode before attempting JSON parsing | Fixed and verified; awaiting merge |
 | H14 | P2 | Checkpoint startup can degrade into ToolNotFound; CLI test failed intermittently | Open; observed during H02 verification |
-| H15 | P1 | Orchestrator read cache trusts matching size/mtime without checking current bytes | Draft prepared in isolated worktree; baseline reproduction pending |
+| H15 | P1 | Orchestrator read cache trusts matching size/mtime without checking current bytes | Reproduced; implementation applied, verification running |
 | H16 | P2 | Coverage-only Cargo runners trust exit status and truncate output at byte offsets | Open; source traced during H04 |
 | H17 | P1 | Resumed history lacks restored read-version claims when a new gate is constructed | Open; source traced during H06 |
 | H18 | P1 | Locked Wasmtime 36.0.19 fails fresh security gates on RUSTSEC-2026-0424 | Fixed and verified; awaiting merge |
-| H19 | P2 | Action-required minimum tool-call check ignores earlier continuation rounds | Fixed and verified locally; remote CI pending |
+| H19 | P2 | Action-required minimum tool-call check ignores earlier continuation rounds | Fixed and verified; awaiting merge |
 | H20 | P1 | Yanked async-executor 1.14.0 remains locked after an upstream memory-safety regression | Fixed and verified; awaiting merge |
 | H21 | P2 | Multi-agent runtime stage reports Complete for partial outputs | Open; source traced during H07 |
-| H22 | P1 | Cache path normalization can select a different file from the filesystem tool | Open; source traced during H15 preparation |
+| H22 | P1 | Cache path normalization can select a different file from the filesystem tool | Reproduced; implementation applied with H15, verification running |
 | H23 | P2 | CLI MCP probe integration test timed out during the H19 workspace run | Open; cause under investigation |
 
 ## 2026-10-29 — H01: preserve streaming events across chunks
@@ -789,3 +789,52 @@ Next: patch H18, then continue H07's truthful verification/completion handling.
 - H19 is ready to publish as one logical fix with its regressions and changelog.
   The earlier MCP timeout is preserved under H23; its cause remains unproven.
   H13/H15/H22 isolated drafts are not included in this verified milestone.
+
+## 2026-11-04 — H13/H15/H22: baseline failures reproduced, fixes applied
+
+- Published H19 as `e07991c` and updated draft PR #379. The primary tree was
+  clean before applying the saved test-only patches. H19's remote native,
+  Clippy, formatting, WASM and supply-chain checks are green; full remote
+  tests/build/benchmarks are still running.
+- H13 baseline: 44 parser tests passed and all three new regressions failed.
+  Valid JSON silently changed Unicode keys/values, and typed/repair cases lost
+  punctuation. H15/H22 baseline: 12 cache tests passed, four regressions failed
+  (same-size/restored-mtime edit, literal backslash, symlink parent and symlink
+  escape). These are behavioral failures, not compile failures.
+- Applied the isolated production diffs after reproduction, retaining H19's
+  accumulated counters. The primary tree is now authoritative; the older
+  worktrees must not overwrite subsequent primary fixes. The orchestrator
+  suite is running on the combined changes.
+- ADR-65 now explicitly supersedes its originally accepted metadata-only risk.
+  Cache hits pay for bounded disk-byte validation and retain original fact
+  attribution; no disk-I/O saving or atomic write guarantee is claimed.
+- All 1,876 orchestrator tests pass after applying H13/H15/H22 (one ignored),
+  including every reproduced regression and existing policy/cancellation/cache
+  coverage. The full workspace, Clippy, build and supplemental CI pipeline
+  follows. No native runtime result is inferred from this Linux suite.
+- All twelve remote checks on H19's published head `e07991c` have now passed,
+  including Tests and Benchmarks. This does not imply execution of the separate
+  Windows-only orchestrator absence-alias regression.
+- **H16 tracing:** coverage discovery uses `status().is_ok()` rather than the
+  process success bit, so an unavailable Cargo subcommand is classified as
+  installed. On this host `cargo llvm-cov --version` exits 101 with “no such
+  command”; current discovery would nevertheless select it. Standalone
+  `run_coverage` also ignores its cancellation token and blocks on child exit.
+  No coverage implementation changes are included in H13/H15/H22.
+
+## 2026-11-04 — H13: verification complete
+
+- The sequential H13/H15/H22 validation pipeline exited 0. Full workspace
+  tests passed: 6,053 passed, zero failed, 16 ignored across 85 groups. All
+  1,876 orchestrator tests passed (one ignored), including all seven original
+  behavioral failures and the cache boundary/cancellation regression.
+- Workspace Clippy (all targets, warnings denied), default build, both frontend
+  builds, launcher/cache/CLI smoke tests, all four WASM guests and all nine
+  benchmark smoke targets passed. Benchmarks establish correctness only.
+- Formatting, diff hygiene, palette checks, six Python tests and semantic index
+  refresh passed. Fresh cargo-deny and cargo-audit scans passed under the
+  existing exception policy. No source edits occurred during the final pipeline.
+- H13 is published separately: original valid JSON is tried first, and fallback
+  repair preserves string data. The cache fix was tested alongside it and is
+  recorded in the following milestone. H23's earlier timeout remains open;
+  the successful current suite does not establish its cause.
