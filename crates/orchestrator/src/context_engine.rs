@@ -140,8 +140,8 @@ impl ContextEngine {
         }
     }
 
-    /// Token estimate for a window, using the shared production estimator
-    /// (`bytes / 4` + per-message overhead).
+    /// Estimate the current content, replayable reasoning and structured tool
+    /// payloads (`bytes / 4` + per-message overhead), never historical usage.
     pub fn estimate_tokens(&self, messages: &[Message]) -> u64 {
         estimate_messages_tokens(messages)
     }
@@ -461,5 +461,111 @@ mod tests {
             serde_json::to_vec(&messages).unwrap(),
             "default budget passes the window through unchanged"
         );
+    }
+
+    #[test]
+    fn context_size_and_plan_do_not_depend_on_historical_usage() {
+        let engine = ContextEngine::new();
+        let original = transcript(8, 40);
+        let expected_tokens = engine.estimate_tokens(&original);
+        let expected_plan = engine.plan(&original);
+        assert!(matches!(expected_plan, ContextPlan::PassThrough { .. }));
+        for usage in [
+            (Some(20_000), Some(500)),
+            (Some(0), Some(0)),
+            (Some(u64::MAX), Some(u64::MAX)),
+            (Some(20_000), None),
+            (None, Some(500)),
+        ] {
+            let mut accounted = original.clone();
+            for message in &mut accounted {
+                (message.tokens_in, message.tokens_out) = usage;
+            }
+            assert_eq!(engine.estimate_tokens(&accounted), expected_tokens, "usage={usage:?}");
+            assert_eq!(engine.plan(&accounted), expected_plan, "usage={usage:?}");
+        }
+    }
+
+    #[test]
+    fn zero_usage_cannot_hide_large_current_tool_payloads() {
+        use concerto_core::types::{ToolCall, ToolResult};
+        let engine = ContextEngine::new();
+        let mut messages = transcript(8, 10);
+        let small = engine.estimate_tokens(&messages);
+        let assistant = &mut messages[1];
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: "read-1".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::json!({"operation":"read","path":"observed.txt"}),
+            ..Default::default()
+        }]);
+        messages.push(Message {
+            tool_results: Some(vec![ToolResult {
+                id: "read-1".into(),
+                name: "filesystem".into(),
+                content: serde_json::json!({"content":"🦀".repeat(20_000)}),
+            }]),
+            ..message(Role::Tool, "")
+        });
+        let expected = engine.estimate_tokens(&messages);
+        assert!(expected > small + 20_000);
+        for message in &mut messages {
+            message.tokens_in = Some(0);
+            message.tokens_out = Some(0);
+        }
+        assert_eq!(engine.estimate_tokens(&messages), expected);
+        assert!(matches!(engine.plan(&messages), ContextPlan::Compact { .. }));
+    }
+
+    #[tokio::test]
+    async fn durable_compaction_uses_current_content_and_preserves_usage_records() {
+        let engine = ContextEngine::from_config(Some(&ContextConfig {
+            trigger_tokens: Some(1_000),
+            retain_user_turns: Some(2),
+            minimum_user_turns: Some(4),
+            cache_stable_prefix: None,
+        }));
+        // Expensive earlier requests cannot shrink a tiny current window;
+        // zero reported usage cannot exempt a large window from compaction.
+        for (fill, usage, should_compact) in [(20, 20_000, false), (2_000, 0, true)] {
+            let store = Arc::new(SqliteSessionStore::connect_in_memory().await.unwrap());
+            let session = store
+                .create_session(
+                    Utf8Path::new("/var/tmp/context-usage"),
+                    "provider",
+                    "model",
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            let mut messages = transcript(8, fill);
+            for message in &mut messages {
+                message.tokens_in = Some(usage);
+                message.tokens_out = Some(usage);
+            }
+            store.append_messages(session.id, &messages, CancellationToken::new()).await.unwrap();
+            let before = store.load_messages(session.id, CancellationToken::new()).await.unwrap();
+            let active = engine
+                .assemble(store.clone(), session.id, &messages, CancellationToken::new(), None)
+                .await
+                .unwrap();
+            let checkpoints =
+                store.list_checkpoints(session.id, CancellationToken::new()).await.unwrap();
+            assert_eq!(!checkpoints.is_empty(), should_compact, "fill={fill}, usage={usage}");
+            if should_compact {
+                assert!(engine.estimate_tokens(&active) < engine.estimate_tokens(&messages));
+            } else {
+                assert_eq!(
+                    serde_json::to_value(&active).unwrap(),
+                    serde_json::to_value(&messages).unwrap()
+                );
+            }
+            let persisted =
+                store.load_messages(session.id, CancellationToken::new()).await.unwrap();
+            assert_eq!(
+                serde_json::to_value(persisted).unwrap(),
+                serde_json::to_value(before).unwrap()
+            );
+        }
     }
 }

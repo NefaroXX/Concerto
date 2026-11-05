@@ -35,6 +35,7 @@ pub mod observation;
 pub mod persona_mem;
 pub mod runner;
 pub mod scenarios;
+mod test_output;
 pub use runner::EvalRunner;
 
 // ---------------------------------------------------------------------------
@@ -44,6 +45,10 @@ pub use runner::EvalRunner;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum EvalError {
+    /// No supported test harness applies to this existing project directory.
+    /// Distinct from a configured harness that could not be started.
+    #[error("eval harness unavailable: {0}")]
+    HarnessUnavailable(String),
     #[error("eval harness setup failed: {0}")]
     HarnessSetupFailed(String),
     #[error("test runner failed: {0}")]
@@ -351,22 +356,13 @@ impl EvalEngine {
                 .ok_or_else(|| {
                     EvalError::TestRunnerFailed("native executor returned no exit code".into())
                 })?;
-            let combined = format!(
-                "{}{}",
-                output.data.get("stdout").and_then(serde_json::Value::as_str).unwrap_or_default(),
-                output.data.get("stderr").and_then(serde_json::Value::as_str).unwrap_or_default(),
-            );
-            let output_tail =
-                combined.chars().rev().take(2000).collect::<String>().chars().rev().collect();
-            return Ok(EvalResult {
+            return Ok(test_output::completed_result(
                 runner,
                 exit_code,
-                passed: exit_code == 0,
-                duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
-                output_tail,
-                coverage: None,
-                provenance: EvalProvenance::Harness,
-            });
+                u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                output.data.get("stdout").and_then(serde_json::Value::as_str).unwrap_or_default(),
+                output.data.get("stderr").and_then(serde_json::Value::as_str).unwrap_or_default(),
+            ));
         }
         let mut command = if let Some(profile) = &self.shell_profile {
             let backend = ShellProfileFactory::backend_for(profile);
@@ -400,26 +396,13 @@ impl EvalEngine {
         };
         let duration_ms = start.elapsed().as_millis() as u64;
         match output {
-            Ok(Ok(out)) => {
-                let exit_code = out.status.code().unwrap_or(-1);
-                let passed = out.status.success();
-                let combined = String::from_utf8_lossy(&out.stdout).to_string()
-                    + &String::from_utf8_lossy(&out.stderr);
-                let output_tail = if combined.len() > 2000 {
-                    combined[combined.len() - 2000..].to_string()
-                } else {
-                    combined
-                };
-                Ok(EvalResult {
-                    runner,
-                    exit_code,
-                    passed,
-                    duration_ms,
-                    output_tail,
-                    coverage: None,
-                    provenance: EvalProvenance::Harness,
-                })
-            }
+            Ok(Ok(out)) => Ok(test_output::completed_result(
+                runner,
+                out.status.code().unwrap_or(-1),
+                duration_ms,
+                &String::from_utf8_lossy(&out.stdout),
+                &String::from_utf8_lossy(&out.stderr),
+            )),
             Ok(Err(e)) => Err(EvalError::Io(e)),
             Err(_elapsed) => Ok(EvalResult {
                 runner,
@@ -456,20 +439,23 @@ impl EvalEngine {
         project_dir: &Path,
         cancel: CancellationToken,
     ) -> Result<EvalResult, EvalError> {
-        // No harness config: fall back to a plain `cargo test` IF a Cargo
-        // project is actually reachable (a `Cargo.toml` in this directory or an
-        // ancestor), instead of hard-failing. A hard failure here surfaced as
-        // `None` to the coordinator, which then treated the build as
-        // unvalidated; running cargo test captures an honest pass/fail and is
-        // marked `Fallback` so the report distinguishes it from a real harness
-        // run. With no Cargo project anywhere there is nothing to validate, so
-        // the honest Unknown failure is preserved (callers treat it as "no eval
-        // result") rather than marking every non-Rust project as a failed run.
+        if cancel.is_cancelled() {
+            return Err(EvalError::Cancelled);
+        }
+        // Keep the ancestor-Cargo fallback. Absence of a supported harness
+        // in an existing directory is unavailability, not an execution error;
+        // an invalid/missing project directory must still report its failure.
         if let TestRunner::Unknown(reason) = &runner {
             if Self::cargo_project_in_ancestors(project_dir) {
                 return self.run_fallback_cargo_test(project_dir, reason, cancel).await;
             }
-            return Err(EvalError::HarnessSetupFailed(format!("cannot run tests: {reason}")));
+            if !std::fs::metadata(project_dir)?.is_dir() {
+                return Err(EvalError::HarnessSetupFailed(format!(
+                    "project root is not a directory: {}",
+                    project_dir.display()
+                )));
+            }
+            return Err(EvalError::HarnessUnavailable(reason.clone()));
         }
         // Default args per runner
         let default_args: &[&str] = match &runner {
@@ -486,7 +472,7 @@ impl EvalEngine {
 
     /// No-config fallback: run a plain `cargo test` in `project_dir` and mark
     /// the result [`EvalProvenance::Fallback`] with a note naming the missing
-    /// harness config. Pass/fail is whatever cargo reported.
+    /// harness config. A pass also requires confirmed executed Rust tests.
     async fn run_fallback_cargo_test(
         &self,
         project_dir: &Path,
@@ -512,7 +498,9 @@ impl EvalEngine {
         dir.ancestors().any(|ancestor| ancestor.join("Cargo.toml").exists())
     }
 
-    /// Run tests scoped to changed paths; falls back to full suite if mapping unavailable.
+    /// Run tests scoped to changed paths; fall back to the full suite when no
+    /// reliable mapping exists. Cargo always uses the full suite at the resolved
+    /// root: Rust module/test names cannot be inferred safely from file paths.
     pub async fn run_scoped(
         &self,
         changed_paths: &[camino::Utf8PathBuf],
@@ -547,32 +535,10 @@ impl EvalEngine {
         changed_paths: &[camino::Utf8PathBuf],
     ) -> Option<Vec<String>> {
         match runner {
-            TestRunner::Cargo => {
-                use std::collections::HashSet;
-                let mut modules: HashSet<String> = HashSet::new();
-                for path in changed_paths {
-                    let path_str = path.to_string();
-                    if !path_str.starts_with("src/") || !path_str.ends_with(".rs") {
-                        return None;
-                    }
-                    // Strip "src/" prefix and ".rs" suffix
-                    let mut rel = &path_str["src/".len()..path_str.len() - ".rs".len()];
-                    // Handle mod.rs case
-                    if rel.ends_with("/mod") {
-                        rel = &rel[..rel.len() - "/mod".len()];
-                    }
-                    let module_path = rel.replace('/', "::");
-                    modules.insert(module_path);
-                }
-                if modules.is_empty() {
-                    return Some(vec!["test".to_string()]);
-                }
-                // Build args: cargo test -- <module patterns>
-                let mut args = vec!["test".to_string(), "--".to_string()];
-                let pattern = modules.iter().cloned().collect::<Vec<_>>().join(" ");
-                args.push(pattern);
-                Some(args)
-            }
+            // File paths are not test dependencies: crate roots, #[path]
+            // modules and integration tests defeat name-based guesses. Even a
+            // nonempty filtered run can omit the tests affected by an edit.
+            TestRunner::Cargo => None,
             TestRunner::Pytest => {
                 // Return paths as-is for pytest (could be used as arguments)
                 Some(changed_paths.iter().map(|p| p.to_string()).collect())
@@ -969,9 +935,14 @@ mod tests {
             if self.deny {
                 return Err(EvalError::TestRunnerFailed("policy denied".into()));
             }
+            let stdout = format!(
+                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; \
+                 0 filtered out; finished in 0.00s\n{}",
+                "🙂".repeat(2100),
+            );
             Ok(concerto_core::types::ToolOutput {
                 summary: "validated".into(),
-                data: serde_json::json!({"exit_code":0,"stdout":"🙂".repeat(2100),"stderr":""}),
+                data: serde_json::json!({"exit_code":0,"stdout":stdout,"stderr":""}),
             })
         }
     }
@@ -1253,11 +1224,10 @@ mod tests {
         assert!(result.output_tail.contains("eval fallback"));
     }
 
-    /// With no Cargo project reachable there is nothing to validate, so the
-    /// honest Unknown failure is preserved (not a false fallback failure that
-    /// would mark every non-Rust run Partial).
+    /// Absence of a supported harness is distinct from an execution failure;
+    /// callers can report unavailability without inventing a passing run.
     #[tokio::test]
-    async fn no_config_and_no_cargo_project_keeps_honest_failure() {
+    async fn no_config_and_no_cargo_project_reports_unavailable() {
         let dir = tempfile::tempdir().unwrap();
         let engine = EvalEngine::new(dir.path());
         let error = engine
@@ -1265,6 +1235,26 @@ mod tests {
             .await
             .expect_err("no Cargo project and no harness must stay a clean error");
         assert!(error.to_string().contains("no config file found"), "{error}");
+        assert!(matches!(error, EvalError::HarnessUnavailable(_)));
+    }
+
+    #[tokio::test]
+    async fn unavailable_harness_does_not_hide_invalid_roots_or_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = EvalEngine::new(dir.path().join("missing"))
+            .run(CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, EvalError::Io(ref error)
+            if error.kind() == std::io::ErrorKind::NotFound));
+        let file = dir.path().join("file.txt");
+        std::fs::write(&file, "not a project directory").unwrap();
+        let error = EvalEngine::new(file).run(CancellationToken::new()).await.unwrap_err();
+        assert!(matches!(error, EvalError::HarnessSetupFailed(_)));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let error = EvalEngine::new(dir.path()).run(cancel).await.unwrap_err();
+        assert!(matches!(error, EvalError::Cancelled));
     }
 
     /// A detected harness keeps `Harness` provenance (no false fallback mark).
@@ -1466,24 +1456,18 @@ mod tests {
     use camino::Utf8PathBuf;
 
     #[test]
-    fn scoped_args_cargo_returns_filtered_pattern() {
-        let paths = vec![Utf8PathBuf::from("src/lib.rs")];
-        let args = EvalEngine::scoped_args(&TestRunner::Cargo, &paths);
-        assert_eq!(args, Some(vec!["test".to_string(), "--".to_string(), "lib".to_string()]));
-    }
-
-    #[test]
-    fn scoped_args_cargo_non_src_returns_none() {
-        let paths = vec![Utf8PathBuf::from("tests/integration.rs")];
-        let args = EvalEngine::scoped_args(&TestRunner::Cargo, &paths);
-        assert!(args.is_none(), "paths outside src/ should return None");
-    }
-
-    #[test]
-    fn scoped_args_cargo_mod_rs_strips_mod() {
-        let paths = vec![Utf8PathBuf::from("src/cli/mod.rs")];
-        let args = EvalEngine::scoped_args(&TestRunner::Cargo, &paths);
-        assert_eq!(args, Some(vec!["test".to_string(), "--".to_string(), "cli".to_string()]));
+    fn scoped_args_cargo_falls_back_without_guessing_test_names() {
+        for paths in [
+            vec![],
+            vec!["src/lib.rs"],
+            vec!["src/main.rs"],
+            vec!["src/cli/mod.rs"],
+            vec!["src/first.rs", "src/second.rs"],
+            vec!["tests/integration.rs"],
+        ] {
+            let paths: Vec<_> = paths.into_iter().map(Utf8PathBuf::from).collect();
+            assert_eq!(EvalEngine::scoped_args(&TestRunner::Cargo, &paths), None);
+        }
     }
 
     #[test]

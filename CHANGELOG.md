@@ -111,6 +111,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Native CI builds.** Restrict the supervisor's Linux parent-death syscall
+  to Linux, enable portable rollback tests on Windows, and align Unix fixture
+  helpers with their tests. Required CI workflows use the Node 24 checkout
+  action, retaining warnings-as-errors.
+
+- **Benchmark validity.** Agent-driven fixtures now explicitly allow and audit
+  their tool calls. Tasks without optional file constraints can pass when
+  completed with passing tests; unreadable required content fails its checks.
+  Nine category task IDs are valid ULIDs, and every committed category is
+  covered by a corpus-loading regression.
+
+- **Read-version protection survives resumed runs.** Identified sessions retain
+  observed file hashes and absence claims across gate recreation. Unknown
+  legacy provenance and unavailable storage require rereading; stored claims
+  remain bounded and are removed with their session.
+- **Provider context guard counts replayable reasoning.** Large reasoning
+  payloads can no longer bypass the input budget behind short visible answers;
+  fitting requests retain their reasoning unchanged.
+- **Compaction budgets current content independently of historical usage.**
+  Prior prompt/completion counts no longer inflate or erase current context
+  size. The estimate includes replayable reasoning and structured tool payloads
+  without counting legacy tool display text twice; accounting stays unchanged.
+- **Structured JSON preserves Unicode data.** Both model-response parsers try
+  original JSON before repair. Fallback repair changes only smart delimiters
+  and nonbreaking whitespace outside strings, preserving punctuation in keys
+  and values across strict, fenced and prose-wrapped responses.
+- **Cached reads validate current bytes and native paths.** Metadata equality
+  no longer hides same-size external edits. Cache keys must resolve to the same
+  contained file as the requested tool path, including native backslash and
+  symlink behavior. Bounded byte validation runs after advisory policy Allow
+  and honors cancellation; uncertainty falls through to normal execution.
+- **Continuation rounds retain execution progress.** Action-required tasks can
+  finish after work done in earlier rounds without repeating writes. Tool-call
+  minimums accumulate across rounds and are enforced at completion; a capped
+  round with progress can continue. Counts remain scoped to one run, and
+  required verification still governs the completion result.
+- **Verification failures cannot report successful completion.** The single-agent
+  loop includes failures from earlier continuation rounds before publishing
+  completion. Denied, errored and cancelled checks remain Partial; required
+  verification must have a passing check. Matching rechecks can resolve failures,
+  while skipped/unavailable checks cannot erase them. An absent test harness is
+  reported as unavailable, distinct from a broken runner; normal answer-only
+  completion remains supported. Live events and persisted summaries agree with
+  the output status. The optional strict freshness gate remains separate.
+- **Gated writes retain the version the agent read.** Default claims use
+  session/agent-scoped read observations, including raw binary hashes, so an
+  intervening external edit is refused instead of adopted as the new base.
+  Rereads refresh only that agent's observations; successful text writes
+  advance its own base. The bounded ledger fails closed when full.
+- **Incomplete provider streams cannot complete a run or execute partial tool
+  calls.** Orchestrator collectors and the plugin completion host require a
+  final chunk. Premature orchestrator EOF follows bounded request retries;
+  Gemini accepts STOP followed by clean EOF while preserving trailing usage
+  and cancellation/transport errors.
+- **Rust verification requires executed tests.** Cargo validation runs the full
+  suite at the resolved manifest root instead of guessing test-name filters
+  from changed paths. Empty, ignored-only or unrecognized results cannot pass
+  on exit code alone; direct and governed runs share the same evidence check.
+- **VFS reads reflect external edits and deletions.** Clean VFS originals
+  now read current disk contents, including bounded and binary reads. Pending
+  edits, deletions and rejected diff restorations retain precedence; appends
+  and transfers use fresh sources without copying binary placeholder text.
+- **File writes preserve Unicode content exactly.** Filesystem writes and VFS
+  staging/appending no longer replace Unicode punctuation with ASCII. This
+  prevents valid JSON and source literals from being corrupted and preserves
+  existing text when appending. Text and byte writes both retain their content.
+- **Streamed provider events survive fragmented network delivery.** The shared
+  SSE parser retains event fields across chunks and treats a split CRLF pair
+  as one line ending, preventing lost text/tool-call payloads and premature
+  event dispatch. Regression tests cover every split point and byte-by-byte
+  delivery with Unicode, multiline data and keepalives.
 - **The write gate surfaces approvals instead of hard-denying them.**
   `WriteGate::run_gated` returned `GateError::Denied` for every
   `RequireApproval` verdict (ADR-60's interactive approval surfacing was
@@ -669,6 +740,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Updated transitive async-executor to 1.14.1, fixing the executor-drop
+  use-after-free regression and removing the yanked 1.14.0 lockfile entry.
+- Raised the Wasmtime 36 LTS minimum to 36.0.20 for RUSTSEC-2026-0424
+  (unbounded memory usage when transferring borrowed component resources).
+  The plugin host retains its minimal async/Cranelift features, with the
+  component model, Winch and pooling allocator disabled; memory64 stays off.
+  No advisory exception was added.
 - Updated the plugin runtime to Wasmtime 36.0.19 LTS for the Cranelift fixes
   in RUSTSEC-2026-0379/0380, and retired all eight Wasmtime audit exceptions.
   Memory64 remains disabled; tests enforce the 64 MiB allocation/growth limit.

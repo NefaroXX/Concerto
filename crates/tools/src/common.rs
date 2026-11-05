@@ -72,6 +72,13 @@ pub(crate) fn path_form_key(host: Host, path: &Utf8Path) -> String {
     un_verbatim.replace('\\', "/").to_ascii_lowercase()
 }
 
+/// Comparison-only spelling of a path under this host's filesystem rules.
+/// Windows case, separator and verbatim-prefix aliases share a key; Unix
+/// spellings remain case-sensitive. This does not resolve or authorize a path.
+pub fn path_comparison_key(path: &Utf8Path) -> String {
+    path_form_key(current_host(), path)
+}
+
 /// Whether `candidate` is `root` or lies beneath it under `host`'s path-form
 /// rules, so a verbatim candidate and a plain root naming the same directory
 /// compare equal. The explicit separator guard prevents a sibling such as
@@ -488,6 +495,13 @@ mod tests {
     // Pure path-form handling (Windows verbatim vs plain). Exercised on the
     // Linux CI via the explicit `Host` seam, mirroring `shell.rs`.
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn read_bound_comparison_key_uses_host_rules() {
+        let raw = r"\\?\C:\Root\FILE.txt";
+        let expected = if cfg!(windows) { "c:/root/file.txt" } else { raw };
+        assert_eq!(path_comparison_key(Utf8Path::new(raw)), expected);
+    }
 
     #[test]
     fn unix_path_form_key_is_identity() {

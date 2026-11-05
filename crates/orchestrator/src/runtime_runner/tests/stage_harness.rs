@@ -149,26 +149,23 @@ impl LlmProvider for ScriptedProvider {
     ) -> Result<CompletionStream, ProviderError> {
         let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
         let tool_calls = self.responses.get(idx).cloned().unwrap_or_default();
-        let chunks: Vec<_> = if tool_calls.is_empty() {
-            vec![CompletionChunk {
+        let mut chunks: Vec<_> = tool_calls
+            .into_iter()
+            .map(|tc| CompletionChunk {
                 reasoning: None,
                 delta: String::new(),
-                tool_call: None,
-                is_final: true,
+                tool_call: Some(tc),
+                is_final: false,
                 usage: None,
-            }]
-        } else {
-            tool_calls
-                .into_iter()
-                .map(|tc| CompletionChunk {
-                    reasoning: None,
-                    delta: String::new(),
-                    tool_call: Some(tc),
-                    is_final: false,
-                    usage: None,
-                })
-                .collect()
-        };
+            })
+            .collect();
+        chunks.push(CompletionChunk {
+            reasoning: None,
+            delta: String::new(),
+            tool_call: None,
+            is_final: true,
+            usage: None,
+        });
         Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
     }
 }

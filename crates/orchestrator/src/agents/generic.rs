@@ -1718,10 +1718,24 @@ impl GenericSpecialistAgent {
                             }
                             None => HashMap::new(),
                         };
-                        // ADR-65 §4: safe read dedupe (same rule as the
-                        // freeform loop above; any doubt → execute normally).
-                        let serve = match &self.tool_facts {
-                            Some(facts) => {
+                        // Authorize before cache validation reads current disk bytes.
+                        // No executor or non-Allow verdict means no cached read.
+                        let serve = match (&self.tool_facts, &self.tool_executor) {
+                            (Some(facts), Some(executor))
+                                if crate::read_cache::plain_single_path_read(
+                                    &tool_call.name,
+                                    &arguments,
+                                )
+                                .is_some()
+                                    && executor
+                                        .policy_verdict_is_allow(
+                                            &tool_call.name,
+                                            &arguments,
+                                            &context.session,
+                                            cancel.clone(),
+                                        )
+                                        .await =>
+                            {
                                 crate::read_cache::maybe_serve_read(
                                     facts,
                                     &context.session.project_dir,
@@ -1731,28 +1745,7 @@ impl GenericSpecialistAgent {
                                 )
                                 .await
                             }
-                            None => None,
-                        };
-                        // ADR-65 F1a: serve only on an explicit policy Allow via
-                        // the advisory path; anything else runs the normal,
-                        // fully policy-checked executor path below.
-                        let serve = match &self.tool_executor {
-                            Some(executor) => match serve {
-                                Some(serve)
-                                    if executor
-                                        .policy_verdict_is_allow(
-                                            &tool_call.name,
-                                            &arguments,
-                                            &context.session,
-                                            cancel.clone(),
-                                        )
-                                        .await =>
-                                {
-                                    Some(serve)
-                                }
-                                _ => None,
-                            },
-                            None => None,
+                            _ => None,
                         };
                         if let Some(serve) = serve {
                             // ADR-65 F1b: persist the ServedFromCache audit row

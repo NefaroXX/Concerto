@@ -445,3 +445,72 @@ they add detail rather than restating it.
 - **Weighted round-robin** was evaluated against this delivered mechanism and
   rejected on the reasoning recorded in D4 above; the `gate.rs` module docs
   carry the same rejection so the deferral is not silently reopened.
+
+
+### 2026-11-01 amendment — read-bound default versions (harness audit H06)
+
+Arrival-time stamping alone protects only the interval between request arrival
+and the gate's pre-image check. It cannot detect an edit made after the agent
+read a file but before it submitted a write. Missing per-target claims now
+prefer successful filesystem observations from the same gate, session and
+agent. Explicit claims retain precedence; unobserved targets retain the prior
+arrival-time fallback.
+
+Filesystem read results include `content_hash`, computed from the same raw
+bytes as the displayed result. Binary placeholders are presentation only.
+Successful text writes advance that writer's observed hash from the exact
+submitted content; no post-write disk reread can attest an intervening edit.
+Hunk-staged merges, copy/move destinations and opaque binary writes require a
+reread before a later observed write: a merge may include external edits the
+agent has not seen. An observed absence uses the reserved `<absent>` claim and
+conflicts with a newly created target. Unobserved fresh creates keep their
+legacy no-claim behavior.
+
+The ledger retains at most 4,096 path keys (session/agent scoped, with lexical
+and resolved aliases, using the filesystem module's host comparison rules).
+It does not evict protected observations: when full,
+untracked writes fail closed with recovery guidance. A reread can refresh an
+existing entry. Poisoned state also fails closed. Policy, WAL, ownership and
+explicit claim checks remain at their existing boundaries.
+
+This is a gate-lifetime contract, shared by `InProcessGateBackend` and the
+supervisor. It does not cover plain-executor fallback, reads acquired outside
+the gate, restored history without fresh reads (H17), or external changes after
+the pre-image check. Compare-and-write is still not an atomic filesystem
+transaction. The gated backends currently do not enable cache serving; H15
+remains open for the separate orchestrator read cache.
+
+### 2026-11-04 amendment — durable read observations across resume (H17)
+
+The H06 gate-lifetime restriction is superseded for identified sessions. A
+filesystem read's returned-byte hash, or an `exists: false` observation, is
+persisted before the successful tool response is published. The durable key is
+native project-root identity, session, agent and path (including the existing
+lexical/resolved aliases). Re-created in-process and supervised gates consult
+that same provenance rather than stamping a new disk hash over missing state.
+No file content is stored in this ledger.
+
+The SQLite projection is bounded to 4,096 path keys per project/session. It
+never evicts protected claims; a persisted saturation marker makes untracked
+writes require a fresh session. Existing tracked paths can still be refreshed.
+Session deletion removes the claims and markers. Session-less gate callers
+retain the original bounded in-memory behavior and have no restart guarantee.
+
+Migration 041 marks pre-existing sessions as having unknown provenance: their
+old transcripts cannot establish which bytes a gate returned. These sessions
+must reread untracked targets (or explicitly supply their own version claims).
+New successful reads recover protection for individual paths. Missing tables,
+query failures or cancellation never authorize arrival-time fallback.
+
+Read policy remains advisory at this gate, with no write decision, ownership
+claim or whiteboard sequence for a read. Durability is now a separate
+requirement for successful file observations: an inability to persist them is
+an execution error, not a successful but unprotected read. Successful tracked
+writes advance claims from submitted bytes using H06's existing rules; an
+update failure leaves the older conservative claim and reports that the write
+executed but its new version could not be persisted. No rollback is implied.
+
+This does not make filesystem compare-and-write atomic, recover the bytes of
+legacy observations, protect plain-executor fallbacks or create provenance for
+context acquired outside the gate. Explicit claims retain precedence. Write
+policy/approval and write-ahead decision ordering are unchanged.

@@ -254,6 +254,9 @@ rebuildable from the log (ADR-64 derived-view rule).
 
 ### Serve predicate (never-stale)
 
+The metadata-only validation below records the original implementation. It is
+superseded by the [2026-11-04 amendment](#amendment-2026-11-04--cache-byte-freshness-and-path-identity).
+
 `maybe_serve_read` serves **only** when every rule holds:
 
 1. **Plain read only.** Tool is `filesystem`, operation is `read`, and the
@@ -965,3 +968,32 @@ detail of this one.
 
 ### Scoping/design (merged)
 - Question-key scoping and explicit dismissal design as above (Q-NO-AUTO-RESOLVE; dismissal never re-opens).
+
+## Amendment (2026-11-04) — cache byte freshness and path identity
+
+The original metadata-only rule is insufficient for correctness: an external
+editor can preserve or restore both length and mtime while changing content.
+Lexical resource keys also do not identify the same native file in every case:
+Unix backslashes are literal characters, and collapsing `..` through a symlink
+can select a different target. H15/H22 regressions demonstrate both failures.
+
+Cache serving now requires all of the following:
+
+1. The caller obtains an explicit advisory policy Allow before cache validation
+   reads current disk bytes. Other verdicts use normal policy-gated execution.
+2. The existing plain-read, project-scope, clean-row and cached-hash checks pass.
+3. The raw requested path and the stored resource key resolve to the same
+   contained path through the filesystem tool's resolver. Lexical keys remain
+   storage identifiers; they do not establish filesystem identity or containment.
+4. One file handle supplies metadata and current bytes. Size and mtime remain
+   rejection checks; byte equality is mandatory. Reads are bounded to the cached
+   length plus one byte, with the existing 64 KiB cache limit, so growth cannot
+   cause an unbounded allocation or a false match.
+5. Cancellation or any validation error produces a cache miss. Successful serves
+   retain the original observation's attribution and do not reset dirty state.
+
+This deliberately pays for disk-byte validation. The optimization still avoids
+normal tool execution on a verified hit, but no disk-I/O saving is claimed.
+Validation observes bytes at read time; it does not lock files, prevent later
+external edits, or provide atomic compare-and-write semantics. Existing write
+version claims and their documented scope remain separate.

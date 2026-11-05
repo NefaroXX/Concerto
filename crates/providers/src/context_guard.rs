@@ -254,7 +254,15 @@ fn estimate_message_tokens(message: &Message) -> u64 {
         .as_ref()
         .and_then(|results| serde_json::to_vec(results).ok())
         .map_or(0, |bytes| bytes.len().div_ceil(4) as u64);
-    content.saturating_add(calls).saturating_add(results).saturating_add(4)
+    // OpenAI-compatible adapters replay this field. Omitting it lets a
+    // short visible answer hide a request-sized reasoning payload.
+    let reasoning =
+        message.reasoning_content.as_ref().map_or(0, |text| text.len().div_ceil(4) as u64);
+    content
+        .saturating_add(reasoning)
+        .saturating_add(calls)
+        .saturating_add(results)
+        .saturating_add(4)
 }
 
 fn compact_old_tool_outputs(messages: &mut [Message]) {
@@ -698,5 +706,55 @@ mod tests {
 
         let result = guard.stream_completion(request, CancellationToken::new()).await;
         assert!(matches!(result, Err(ProviderError::ContextOverflow { .. })));
+    }
+
+    #[tokio::test]
+    async fn replay_reasoning_that_exceeds_budget_is_rejected_before_provider_call() {
+        let captured = Arc::new(Mutex::new(None));
+        let inner =
+            Arc::new(CaptureProvider { captured: captured.clone(), capacity: 2_048, reserve: 512 });
+        let guard = ContextGuardProvider::new(inner, "model");
+        let mut assistant = message(Role::Assistant, "brief answer");
+        assistant.reasoning_content = Some("🦀".repeat(1_500));
+        let request = CompletionRequest {
+            messages: vec![
+                message(Role::User, "first"),
+                assistant,
+                message(Role::User, "continue"),
+            ],
+            max_tokens: Some(512),
+            ..CompletionRequest::default()
+        };
+        let result = guard.stream_completion(request, CancellationToken::new()).await;
+        assert!(matches!(result, Err(ProviderError::ContextOverflow { .. })));
+        assert!(
+            captured.lock().unwrap().is_none(),
+            "an oversized request must not reach the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_reasoning_within_budget_is_preserved_despite_large_usage() {
+        let captured = Arc::new(Mutex::new(None));
+        let inner =
+            Arc::new(CaptureProvider { captured: captured.clone(), capacity: 2_048, reserve: 512 });
+        let guard = ContextGuardProvider::new(inner, "model");
+        let mut assistant = message(Role::Assistant, "brief answer");
+        assistant.reasoning_content = Some("🦀".repeat(100));
+        assistant.tokens_in = Some(u64::MAX);
+        assistant.tokens_out = Some(u64::MAX);
+        let messages =
+            vec![message(Role::User, "first"), assistant, message(Role::User, "continue")];
+        let request = CompletionRequest {
+            messages: messages.clone(),
+            max_tokens: Some(512),
+            ..CompletionRequest::default()
+        };
+        let _stream = guard.stream_completion(request, CancellationToken::new()).await.unwrap();
+        let actual = captured.lock().unwrap().take().unwrap();
+        assert_eq!(
+            serde_json::to_value(actual.messages).unwrap(),
+            serde_json::to_value(messages).unwrap()
+        );
     }
 }

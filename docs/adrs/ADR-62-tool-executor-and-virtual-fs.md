@@ -6,6 +6,7 @@ for the `filesystem` tool; see the dated **Amendment (2026-10-09)** before
 References. The executor-chokepoint, deny-by-default, audit-trail, and
 path-confinement decisions are unchanged.)
 **Date:** 2026-08-19 (original), 2026-10-09 (amendment)
+**Clarification:** 2026-10-30, clean-original reads and pending diff restorations (§4)
 **Deciders:** Concerto architecture
 **Related crates:** `concerto-core`, `concerto-tools`, `concerto-config`, `concerto-sessions`
 **Supersedes:** nothing — codifies the tool/policy/filesystem layer that every
@@ -95,7 +96,10 @@ them the overlay is a **post-disk audit/diff record**, not a pre-disk gate
 (see **Amendment (2026-10-09)**). The staged-overlay capabilities below
 describe the overlay itself:
 
-- writes create pending entries; reads resolve through the overlay onto disk;
+- writes create pending entries; reads resolve through the overlay onto disk.
+  A clean `Original` is a cached observation, not a pending edit: live reads
+  consult current disk contents, including byte and bounded reads. Pending
+  modifications, creations and deletions retain precedence over disk;
 - snapshots capture pre-review state; diffs are computed once by
   `imara-diff` into a shared `DiffResult` consumed by both frontends
   (ADR-05);
@@ -103,6 +107,13 @@ describe the overlay itself:
   `VirtualFs` atomically on commit; diff review restores a stable pre-review
   snapshot, applies all rejected hunks in one pass, then materializes the
   reviewed result to disk (ADR-33);
+- rejecting all modifications keeps the restored original text as staged
+  review state, rather than turning it into a refreshable disk observation.
+  Its before/after diff is empty; its read content remains the user's restored
+  version. As with other staged edits, materialization retains the overlay;
+  explicit unstaging returns authority to disk. This clarification follows
+  harness audit H03 (2026-10-30) and does not introduce new serialized entry
+  variants;
 - session undo/snapshot support uses git infrastructure where a repository is
   configured;
 - all paths are confined to the session/project root via canonicalizing

@@ -18,7 +18,13 @@ pub struct SseEvent {
 /// Buffered parser that can handle arbitrary chunk boundaries.
 #[derive(Debug, Default)]
 pub struct BufferedSseParser {
+    /// Bytes of the current incomplete line, retained until a terminator.
     buffer: Vec<u8>,
+    /// Complete fields awaiting the blank line that dispatches their event.
+    event: SseEvent,
+    /// A CR terminates a line immediately; swallow its optional LF even when
+    /// the pair crosses a network chunk boundary.
+    skip_lf: bool,
 }
 
 impl BufferedSseParser {
@@ -34,87 +40,54 @@ impl BufferedSseParser {
     /// and the terminating `\r` of a `\r\n` pair is excluded from the line
     /// content. An event is dispatched on the first blank line.
     pub fn push_bytes(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
-        self.buffer.extend_from_slice(chunk);
         let mut events = Vec::new();
-        let mut event = SseEvent::default();
-        loop {
-            // Scan for the next line terminator at byte level. A `\r` is treated
-            // as a terminator immediately (even at the end of the buffer): a
-            // `\r\n` pair split across chunks merely yields an extra blank line,
-            // which is harmless to consumers.
-            let mut content_end = 0;
-            let mut term_end = None;
-            let mut i = 0;
-            while i < self.buffer.len() {
-                match self.buffer[i] {
-                    b'\n' => {
-                        // The `\r` of a `\r\n` pair is part of the terminator.
-                        content_end = if i > 0 && self.buffer[i - 1] == b'\r' { i - 1 } else { i };
-                        term_end = Some(i + 1);
-                        break;
-                    }
-                    b'\r' => {
-                        if matches!(self.buffer.get(i + 1), Some(b'\n')) {
-                            // CRLF: move past the `\r`; the `\n` finishes the
-                            // line and excludes the `\r` from the content.
-                            i += 1;
-                            continue;
-                        }
-                        content_end = i;
-                        term_end = Some(i + 1);
-                        break;
-                    }
-                    _ => i += 1,
+        for &byte in chunk {
+            if self.skip_lf {
+                self.skip_lf = false;
+                if byte == b'\n' {
+                    continue;
                 }
             }
-            let Some(term_end) = term_end else {
-                break;
-            };
-
-            // Extract the complete line (content only, terminator excluded).
-            // `from_utf8` failure can only mean the line itself is malformed:
-            // newline bytes are ASCII, so a multi-byte UTF-8 sequence can never
-            // span lines. A multi-byte character split across chunks stays raw
-            // in the byte buffer until its line completes, so it survives
-            // intact. The lossy fallback is therefore scoped to THIS line only
-            // and can never corrupt adjacent lines.
-            let line_bytes = self.buffer.drain(..term_end).collect::<Vec<u8>>();
-            let line: std::borrow::Cow<'_, str> =
-                match std::str::from_utf8(&line_bytes[..content_end]) {
-                    Ok(s) => std::borrow::Cow::Borrowed(s),
-                    Err(_) => std::borrow::Cow::Owned(
-                        String::from_utf8_lossy(&line_bytes[..content_end]).into_owned(),
-                    ),
-                };
-
-            if line.is_empty() {
-                // Blank line: dispatch the accumulated event.
-                if let Some(d) = &mut event.data {
-                    while d.ends_with('\n') {
-                        d.pop();
-                    }
+            match byte {
+                b'\r' | b'\n' => {
+                    self.finish_line(&mut events);
+                    self.buffer.clear();
+                    self.skip_lf = byte == b'\r';
                 }
-                events.push(event);
-                event = SseEvent::default();
-            } else if line.starts_with(':') {
-                // Comment line: emit a liveness signal immediately so long
-                // keep-alive-only periods still count as stream activity. The
-                // comment is not part of the event being accumulated.
-                events.push(SseEvent { event: None, data: None, id: None, keepalive: true });
-            } else if let Some(v) = line.strip_prefix("event: ") {
-                event.event = Some(v.to_string());
-            } else if let Some(v) = line.strip_prefix("data: ") {
-                let data = event.data.get_or_insert_with(String::new);
-                if !data.is_empty() {
-                    data.push('\n');
-                }
-                data.push_str(v);
-            } else if let Some(v) = line.strip_prefix("id: ") {
-                event.id = Some(v.to_string());
+                _ => self.buffer.push(byte),
             }
-            // Other field lines (no `:`, unknown fields) are ignored, as before.
         }
         events
+    }
+
+    /// Consume a complete line without discarding fields from earlier chunks.
+    fn finish_line(&mut self, events: &mut Vec<SseEvent>) {
+        // Decode only complete lines: split UTF-8 sequences stay buffered,
+        // and malformed bytes affect only the line that contains them.
+        let line = String::from_utf8_lossy(&self.buffer);
+        if line.is_empty() {
+            if let Some(data) = &mut self.event.data {
+                while data.ends_with('\n') {
+                    data.pop();
+                }
+            }
+            events.push(std::mem::take(&mut self.event));
+        } else if line.starts_with(':') {
+            // Keepalives are immediate activity signals, independent of the
+            // data event currently being assembled.
+            events.push(SseEvent { keepalive: true, ..SseEvent::default() });
+        } else if let Some(value) = line.strip_prefix("event: ") {
+            self.event.event = Some(value.to_string());
+        } else if let Some(value) = line.strip_prefix("data: ") {
+            let data = self.event.data.get_or_insert_with(String::new);
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(value);
+        } else if let Some(value) = line.strip_prefix("id: ") {
+            self.event.id = Some(value.to_string());
+        }
+        // Other field lines (no `:`, unknown fields) are ignored, as before.
     }
 }
 
@@ -148,6 +121,97 @@ mod tests {
         assert_eq!(events2[0].data.as_deref(), Some("hello"));
         assert_eq!(events2[1].event.as_deref(), Some("done"));
         assert_eq!(events2[1].data.as_deref(), Some("[DONE]"));
+    }
+
+    #[test]
+    fn complete_fields_survive_until_the_blank_line_arrives() {
+        let mut parser = BufferedSseParser::new();
+        assert!(parser.push_bytes(b"id: request-1\nevent: delta\n").is_empty());
+        assert!(parser.push_bytes(b"data: hello\n").is_empty());
+        assert!(parser.push_bytes(b"").is_empty());
+        assert_eq!(
+            parser.push_bytes(b"\n"),
+            vec![SseEvent {
+                id: Some("request-1".into()),
+                event: Some("delta".into()),
+                data: Some("hello".into()),
+                keepalive: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn split_crlf_does_not_dispatch_an_event_early() {
+        let mut parser = BufferedSseParser::new();
+        assert!(parser.push_bytes(b"data: first\r").is_empty());
+        assert!(parser.push_bytes(b"").is_empty());
+        assert!(parser.push_bytes(b"\ndata: second\r").is_empty());
+        assert!(parser.push_bytes(b"\n").is_empty());
+        assert_eq!(
+            parser.push_bytes(b"\r"),
+            vec![SseEvent { data: Some("first\nsecond".into()), ..SseEvent::default() }]
+        );
+        assert!(parser.push_bytes(b"\n").is_empty());
+    }
+
+    /// Exact expected events, rather than a one-chunk parse as the oracle:
+    /// fragmentation must preserve fields, order, UTF-8 and keepalives.
+    fn fragmented_fixture(newline: &str) -> (Vec<u8>, Vec<SseEvent>) {
+        let wire = [
+            "id: first",
+            "event: delta",
+            "data: hello €",
+            ": ping",
+            "data: world",
+            "",
+            "event: done",
+            "data: [DONE]",
+            "",
+            "",
+        ]
+        .join(newline)
+        .into_bytes();
+        let expected = vec![
+            SseEvent { keepalive: true, ..SseEvent::default() },
+            SseEvent {
+                id: Some("first".into()),
+                event: Some("delta".into()),
+                data: Some("hello €\nworld".into()),
+                keepalive: false,
+            },
+            SseEvent {
+                event: Some("done".into()),
+                data: Some("[DONE]".into()),
+                ..SseEvent::default()
+            },
+        ];
+        (wire, expected)
+    }
+
+    #[test]
+    fn every_two_chunk_split_preserves_the_event_sequence() {
+        for newline in ["\n", "\r", "\r\n"] {
+            let (wire, expected) = fragmented_fixture(newline);
+            for split in 0..=wire.len() {
+                let mut parser = BufferedSseParser::new();
+                let mut actual = parser.push_bytes(&wire[..split]);
+                actual.extend(parser.push_bytes(&wire[split..]));
+                assert_eq!(actual, expected, "newline={newline:?}, split={split}");
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_fragmentation_preserves_the_event_sequence() {
+        for newline in ["\n", "\r", "\r\n"] {
+            let (wire, expected) = fragmented_fixture(newline);
+            for chunk_size in 1..=wire.len() {
+                let mut parser = BufferedSseParser::new();
+                let actual: Vec<_> =
+                    wire.chunks(chunk_size).flat_map(|chunk| parser.push_bytes(chunk)).collect();
+                assert_eq!(actual, expected, "newline={newline:?}, chunk_size={chunk_size}");
+            }
+        }
     }
 
     #[test]
