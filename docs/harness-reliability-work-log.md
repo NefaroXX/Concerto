@@ -36,7 +36,7 @@ passing repository tests alone does not close a finding.
 | H24 | P2 | Final provider context guard omits replayable reasoning from its size estimate | Fixed and verified; awaiting merge |
 | H25 | P2 | Benchmark required-pattern checks count unreadable files as matching | Fixed and verified locally; awaiting merge |
 | H26 | P2 | Nine non-standard benchmark task manifests contain invalid-length IDs | Fixed and verified locally; awaiting merge |
-| H27 | P1 | Native orchestrator builds fail on macOS (Linux syscall) and Windows (test helper cfgs) | Reproduced by expanded native CI; isolated corrections drafted |
+| H27 | P1 | Native orchestrator builds fail on macOS (Linux syscall) and Windows (test helper cfgs) | Corrections pass affected tests and Clippy locally; exact-head native CI required |
 
 
 ## 2026-10-29 — H01: preserve streaming events across chunks
@@ -1125,3 +1125,36 @@ Next: patch H18, then continue H07's truthful verification/completion handling.
 - Publishing the four benchmark fixes as one evaluation-validity milestone.
   H27 portability corrections and the H21 completion-stage draft are still
   separate, unapplied work; broader harness findings remain open.
+
+## 2026-11-04 — CI repair takes priority
+
+- The benchmark commit `9adafff` was pushed while native CI failures were
+  unresolved. That was a workflow error: passing Linux checks was not enough
+  to treat the branch as ready. Unrelated audit work is stopped until every
+  required check on the final revision passes. The broader audit goal remains
+  paused at the user's request.
+- Applied the native build corrections: Linux-only parent-death syscall guard,
+  Unix-only sleep fixture helper, and two portable rollback regressions enabled
+  on Windows. Added explicit native rollback test execution. No warning or
+  test failure is suppressed, and warnings-as-errors remains enabled.
+- Verification must include the exact pushed commit on Linux, macOS and
+  Windows. Local success alone will not close this repair.
+
+- Correction to the failure attribution: the user's handoff baseline was
+  green. Calling failures exposed after changing CI coverage “pre-existing
+  failures” was incorrect. The changed branch and verification configuration
+  are this work's responsibility; source age does not excuse a red check.
+  Completion requires restoring every required check to green.
+
+## 2026-11-05 — CI warning cleanup
+
+- Updated checkout to v6 in the two required PR workflows to remove the
+  Node 20 deprecation warning shown in their job logs. Checked the official
+  [checkout migration notes](https://github.com/actions/checkout/blob/v6/README.md)
+  against the observed hosted runner version 2.338.2; it exceeds both stated
+  runner minimums. Workflow YAML parses successfully.
+- The applied repair passed all 1,888 orchestrator library tests (one ignored)
+  and workspace all-target Clippy with warnings denied. Both exit codes are
+  recorded as 0 in the validation artifact. YAML parsing and formatting/diff
+  checks passed. Publishing this repair to run the complete required matrix;
+  it is not considered complete until every check on that commit passes.

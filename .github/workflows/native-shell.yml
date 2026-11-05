@@ -20,7 +20,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
       RUSTFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.96.0
       - name: Linux system libraries
         if: runner.os == 'Linux'
@@ -32,3 +32,5 @@ jobs:
         run: "cargo test --locked -p concerto-orchestrator --lib gate:: -j2"
       - name: Native read-provenance session cleanup
         run: cargo test --locked -p concerto-sessions --lib delete_session_removes_read_provenance -j2
+      - name: Native managed rollback regressions
+        run: "cargo test --locked -p concerto-orchestrator --lib managed_rollback::tests -j2"

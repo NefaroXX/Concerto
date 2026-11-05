@@ -25,10 +25,10 @@
 //! the async message loop that feeds on [`LineEvent`]s is the remaining
 //! chunk.
 //!
-//! The orphan model per ADR-60: each agent child sets `PR_SET_PDEATHSIG` on
-//! itself so it dies with its supervisor (deferred to the agent-process entry,
-//! S5), and the supervisor's own cleanup path is stdin-close → child
-//! exits → reap.
+//! Linux children request `PR_SET_PDEATHSIG` before exec so the kernel signals
+//! them when their supervisor dies. All Unix children use their own process
+//! group for teardown. Other platforms do not have Linux's parent-death signal;
+//! the supervisor's portable cleanup path is stdin-close → child exits → reap.
 
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write as IoWrite};
@@ -860,10 +860,12 @@ impl Supervisor {
                 command.env("CONCERTO_WHITEBOARD_SCOPES", json);
             }
         }
-        // ADR-60 D1: orphan cleanup — child dies with supervisor, own process group.
+        // ADR-60 D1: Unix process-group teardown; Linux also supports a
+        // parent-death signal. prctl is not a portable Unix API.
         #[cfg(unix)]
         unsafe {
             command.pre_exec(|| {
+                #[cfg(target_os = "linux")]
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }

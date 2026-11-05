@@ -111,6 +111,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Native CI builds.** Restrict the supervisor's Linux parent-death syscall
+  to Linux, enable portable rollback tests on Windows, and align Unix fixture
+  helpers with their tests. Required CI workflows use the Node 24 checkout
+  action, retaining warnings-as-errors.
+
 - **Benchmark validity.** Agent-driven fixtures now explicitly allow and audit
   their tool calls. Tasks without optional file constraints can pass when
   completed with passing tests; unreadable required content fails its checks.
