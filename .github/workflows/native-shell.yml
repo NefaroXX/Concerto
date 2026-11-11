@@ -32,5 +32,12 @@ jobs:
         run: "cargo test --locked -p concerto-orchestrator --lib gate:: -j2"
       - name: Native read-provenance session cleanup
         run: cargo test --locked -p concerto-sessions --lib delete_session_removes_read_provenance -j2
+      - name: Native SQLite security regression
+        run: cargo test --locked -p concerto-sessions --lib sqlite_runtime_includes_wal_page_size_security_fix -j2
+      - name: Native SQLCipher storage regressions
+        if: runner.os != 'Windows'
+        run: cargo test --locked -p concerto-sessions --lib at_rest -j2
       - name: Native managed rollback regressions
         run: "cargo test --locked -p concerto-orchestrator --lib managed_rollback::tests -j2"
+      - name: Native run completion regressions
+        run: cargo test --locked -p concerto-orchestrator --lib stage_tracker_ -j2
