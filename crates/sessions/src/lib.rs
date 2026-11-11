@@ -2105,6 +2105,24 @@ mod tests {
     use concerto_core::traits::AuditLog;
     use concerto_core::types::{Role, TokenBudget};
 
+    /// Check the linked engine, including SQLCipher on Unix. A clean lockfile
+    /// alone cannot prove that the bundled SQLCipher amalgamation is patched.
+    #[tokio::test]
+    async fn sqlite_runtime_includes_wal_page_size_security_fix(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let pool = SqlitePool::connect("sqlite::memory:").await?;
+        let version: String =
+            sqlx::query_scalar("SELECT sqlite_version()").fetch_one(&pool).await?;
+        pool.close().await;
+        let parts = version.split('.').map(str::parse::<u32>).collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(parts.len(), 3, "unexpected SQLite version: {version}");
+        assert!(
+            parts.as_slice() >= [3, 54, 0].as_slice(),
+            "SQLite {version} lacks the RUSTSEC-2026-0459 WAL page-size fix"
+        );
+        Ok(())
+    }
+
     #[test]
     fn conversation_history_add_and_retrieve() {
         let budget = TokenBudget::new(1000, 100);

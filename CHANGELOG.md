@@ -111,6 +111,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SQLite/SQLCipher security.** Upgrade the linked database engine for
+  RUSTSEC-2026-0459, including the encrypted database path, and verify the
+  runtime SQLite version in the native CI matrix. A vendored SQLx driver
+  manifest permits the patched binding without changing driver implementation.
+
+- **Dependency maintenance.** Update the locked WASM timer dependency to 0.4.5,
+  removing unmaintained `pin-utils` (RUSTSEC-2026-0441) and including the
+  upstream timer Arc leak fix.
+
 - **Native CI builds.** Restrict the supervisor's Linux parent-death syscall
   to Linux, enable portable rollback tests on Windows, and align Unix fixture
   helpers with their tests. Required CI workflows use the Node 24 checkout

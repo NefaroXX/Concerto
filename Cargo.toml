@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
-# `vendor/utoipa-swagger-ui` is third-party source consumed only through the
+# `vendor/` contains third-party source consumed only through the
 # `[patch.crates-io]` entry at the bottom of this file. It is excluded so it is
 # not a workspace member: its dev-dependencies, lints, and formatting are not
 # ours to maintain.
-exclude = ["vendor/utoipa-swagger-ui"]
+exclude = ["vendor/utoipa-swagger-ui", "vendor/sqlx-sqlite"]
 members = [
     "crates/core",
     "crates/config",
@@ -93,7 +93,7 @@ tiktoken-rs = "0.6"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate", "time", "uuid"] }
 # SQLCipher build of the same libsqlite3-sys sqlx links (feature unification).
 # Enables `PRAGMA key` at-rest encryption for the sessions/audit database.
-libsqlite3-sys = { version = "0.37", features = ["bundled-sqlcipher"] }
+libsqlite3-sys = { version = "0.40", features = ["bundled-sqlcipher"] }
 
 # ---- Filesystem & paths (Phase 1, sessions) ----
 dirs = "6"
@@ -225,6 +225,9 @@ unsafe_code = "deny"
 # ---------------------------------------------------------------------------
 [patch.crates-io]
 utoipa-swagger-ui = { path = "vendor/utoipa-swagger-ui" }
+# SQLx 0.9.0 caps libsqlite3-sys below the SQLite/SQLCipher security fixes.
+# Only its driver dependency requirement is patched; see README.vendored.md.
+sqlx-sqlite = { path = "vendor/sqlx-sqlite" }
 
 # NOTE: no [workspace.lints.rustdoc] table here. On toolchains >= ~1.80 the
 # legacy `rustdoc::missing_docs` lint path is gone (renamed to the top-level

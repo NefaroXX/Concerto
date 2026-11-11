@@ -114,6 +114,12 @@ cargo audit
   unyanked `zip` (`9.0.3+`, `deflate-flate2-zlib-rs`). Do not "fix" a
   `cargo deny` yanked failure by deleting the Swagger UI again — update the
   vendored patch instead. See `vendor/utoipa-swagger-ui/README.vendored.md`.
+- **SQLx SQLite driver dependency patch**: `vendor/sqlx-sqlite` retains the
+  published 0.9.0 Rust source but permits `libsqlite3-sys` 0.40 for
+  RUSTSEC-2026-0459. The 0.39.x binding patches plain SQLite but still bundles
+  affected SQLCipher; keep the runtime SQLite version regression and encrypted
+  storage tests. Remove the patch when a published SQLx accepts the repaired
+  binding. See `vendor/sqlx-sqlite/README.vendored.md`.
 - **Policy gates**: every file write / shell / git op is policy-gated, but do
   not read "reversible via git stash/branch rollback" as a universal property:
   there is no automatic rollback pipeline (`ToolExecutor` never calls
