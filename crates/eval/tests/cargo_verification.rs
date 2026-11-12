@@ -20,9 +20,16 @@ fn fixture() -> tempfile::TempDir {
     std::fs::create_dir_all(&root).unwrap();
     let dir = tempfile::tempdir_in(root).unwrap();
     std::fs::create_dir(dir.path().join("src")).unwrap();
+    // An inherited CARGO_TARGET_DIR makes independent fixture projects share
+    // Cargo's output paths. Give each package its own artifact identity so
+    // parallel tests cannot execute another fixture's test binary.
+    let package_name =
+        format!("h04_fixture_{}", concerto_core::ids::Ulid::new().to_string().to_ascii_lowercase());
     std::fs::write(
         dir.path().join("Cargo.toml"),
-        "[package]\nname = \"h04_fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[workspace]\n",
+        format!(
+            "[package]\nname = \"{package_name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[workspace]\n"
+        ),
     )
     .unwrap();
     dir
