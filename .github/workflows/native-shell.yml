@@ -41,3 +41,7 @@ jobs:
         run: "cargo test --locked -p concerto-orchestrator --lib managed_rollback::tests -j2"
       - name: Native run completion regressions
         run: cargo test --locked -p concerto-orchestrator --lib stage_tracker_ -j2
+      - name: Native Cargo verification with shared artifacts
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: cargo test --locked -p concerto-eval --test cargo_verification -j2
