@@ -19,24 +19,29 @@ passing repository tests alone does not close a finding.
 | H07 | P1 | Verification errors can accompany Completed status | Fixed and verified; awaiting merge |
 | H08 | P2 | Compaction counts historical usage as current context size | Fixed and verified; awaiting merge |
 | H09 | P2 | Compaction truncates constraints and unresolved work | Open |
-| H10 | P2 | Agent-driven benchmark fixture policy denies tools | Fixed and verified locally; awaiting merge |
-| H11 | P2 | Empty benchmark outcomes force a zero pass score | Fixed and verified locally; awaiting merge |
+| H10 | P2 | Agent-driven benchmark fixture policy denies tools | Fixed and verified; awaiting merge |
+| H11 | P2 | Empty benchmark outcomes force a zero pass score | Fixed and verified; awaiting merge |
 | H12 | P2 | Durable event subscriber queues have no memory bound | Open |
 | H13 | P1 | Structured-response parsing rewrites Unicode before attempting JSON parsing | Fixed and verified; awaiting merge |
 | H14 | P2 | Checkpoint startup can degrade into ToolNotFound; CLI test failed intermittently | Open; observed during H02 verification |
 | H15 | P1 | Orchestrator read cache trusts matching size/mtime without checking current bytes | Fixed and verified; awaiting merge |
 | H16 | P2 | Coverage-only Cargo runners trust exit status and truncate output at byte offsets | Open; source traced during H04 |
-| H17 | P1 | Resumed history lacks restored read-version claims when a new gate is constructed | Fixed and verified locally; awaiting native CI and merge |
+| H17 | P1 | Resumed history lacks restored read-version claims when a new gate is constructed | Fixed and verified; awaiting merge |
 | H18 | P1 | Locked Wasmtime 36.0.19 fails fresh security gates on RUSTSEC-2026-0424 | Fixed and verified; awaiting merge |
 | H19 | P2 | Action-required minimum tool-call check ignores earlier continuation rounds | Fixed and verified; awaiting merge |
 | H20 | P1 | Yanked async-executor 1.14.0 remains locked after an upstream memory-safety regression | Fixed and verified; awaiting merge |
-| H21 | P2 | Multi-agent runtime stage reports Complete for partial outputs | Open; source traced during H07 |
+| H21 | P2 | Multi-agent runtime stage reports Complete for partial outputs | Locally verified; remote CI pending |
 | H22 | P1 | Cache path normalization can select a different file from the filesystem tool | Fixed and verified with H15; awaiting merge |
 | H23 | P2 | CLI MCP probe integration test timed out during the H19 workspace run | Open; cause under investigation |
 | H24 | P2 | Final provider context guard omits replayable reasoning from its size estimate | Fixed and verified; awaiting merge |
-| H25 | P2 | Benchmark required-pattern checks count unreadable files as matching | Fixed and verified locally; awaiting merge |
-| H26 | P2 | Nine non-standard benchmark task manifests contain invalid-length IDs | Fixed and verified locally; awaiting merge |
-| H27 | P1 | Native orchestrator builds fail on macOS (Linux syscall) and Windows (test helper cfgs) | Corrections pass affected tests and Clippy locally; exact-head native CI required |
+| H25 | P2 | Benchmark required-pattern checks count unreadable files as matching | Fixed and verified; awaiting merge |
+| H26 | P2 | Nine non-standard benchmark task manifests contain invalid-length IDs | Fixed and verified; awaiting merge |
+| H27 | P1 | Native orchestrator builds fail on macOS (Linux syscall) and Windows (test helper cfgs) | Fixed and verified; awaiting merge |
+| H28 | P2 | Unused API dependency pulls in a duplicate Axum stack | Open; warning dependency paths traced |
+| H29 | P2 | Declared Rust 1.88 minimum contradicts required locked dependencies | Open; dependency manifests verified |
+| H30 | P1 | Locked wasmtimer retains unmaintained pin-utils and fails the supply-chain gate | Locally verified; remote CI pending |
+| H31 | P1 | Bundled SQLite/SQLCipher fails the WAL memory-disclosure security gate | Locally verified; remote CI pending |
+| H32 | P1 | Locked rustix fails the extended-attribute buffer soundness security gate | Locally verified; remote CI pending |
 
 
 ## 2026-10-29 — H01: preserve streaming events across chunks
@@ -1158,3 +1163,310 @@ Next: patch H18, then continue H07's truthful verification/completion handling.
   recorded as 0 in the validation artifact. YAML parsing and formatting/diff
   checks passed. Publishing this repair to run the complete required matrix;
   it is not considered complete until every check on that commit passes.
+
+## 2026-11-05 — CI repair verified on the published revision
+
+- All twelve required GitHub checks passed on `8682c373f7a76d2aa0fcdc80eba3fe8789307a9e`:
+  [main CI](https://github.com/NefaroXX/Concerto/actions/runs/41938380129) and
+  [native CI](https://github.com/NefaroXX/Concerto/actions/runs/41938380066).
+  These results attest that exact source revision, not an earlier green run.
+- Inspected native job logs: Linux/macOS each ran 74 gate tests, one session
+  cleanup test and eight rollback tests; Windows ran 73, one and six. Both
+  resume regressions and both portable rollback tests actually executed and
+  passed. Windows/macOS logs contain no warning annotations.
+- The full local battery also completed on the same revision: 6,073 workspace
+  tests passed, zero failed, 16 ignored across 85 groups; Clippy, formatting,
+  workspace/frontend/WASM builds, launcher/cache/CLI smoke checks, nine release
+  benchmark smoke targets, palette and six Python tests all exited 0. Both
+  security scans exited 0. The final status artifacts record the revision and
+  each command's exit code, so an expired process handle does not lose proof.
+- Warning review: cargo-deny emitted 74 duplicate-version warnings under the
+  repository's explicit `multiple-versions = "warn"` policy. These remain
+  visible; no suppression or policy relaxation was added. GitHub's remaining
+  inspected annotations were informational Ubuntu runner-image rollout
+  notices. This milestone is not described as warning-free.
+- The user resumed the broader audit after this repair. New fixes must retain
+  this discipline: reproduce, verify locally, publish, then resolve every
+  required check before proceeding to another milestone.
+
+## 2026-11-05 — H21: multi-agent completion stage regressions
+
+- Reconfirmed all twelve required checks pass on published revision `8682c37`
+  before resuming changes. Both multi-agent runtime tails still emit Complete
+  unconditionally, contradicting their Partial/AwaitingUser output status.
+- Extracted their existing terminal-stage behavior into `StageTracker::finish`
+  without changing its unconditional transition, so regressions can demonstrate
+  the defect before correcting it. Added status/event tests for Partial,
+  AwaitingUser and Completed, plus a real supervised runtime test whose child
+  executable is absent. That test checks the failed-child summary, Partial
+  status, and absence of a Complete stage event.
+- The baseline regression command is compiling with `RUSTFLAGS="-D warnings"`
+  and `CARGO_INCREMENTAL=0`. No passing result or fix is claimed yet. Build
+  artifacts remain in this repository's disk-backed `target/` directory.
+
+- Baseline execution finished: four stage tests passed and all three negative
+  regressions failed at the expected assertions (exit 101). The failed-child
+  runtime emitted `[Execute, Complete]` despite returning Partial; both status
+  tests incorrectly advanced to Complete as well. The exact baseline patch,
+  output and terminal status are preserved under `target/harness-reliability/`.
+- Applied the fix: only Completed advances to Complete. Coordinator and
+  supervised runs use their actual returned status; the single-agent runtime
+  now uses the same helper while preserving its existing completion rule.
+  Successful completion still publishes only one transition. Full validation
+  is pending; this milestone has not been published.
+- Native CI now explicitly executes the stage-tracker regression filter on
+  Linux, macOS and Windows, including the failed-child runtime scenario.
+  Workflow YAML parses successfully; all warning policies remain unchanged.
+- Fixed-source focused run passed all seven stage tests, including all three
+  regressions that failed on the baseline and the successful-completion control.
+  Formatting, diff checks and native workflow YAML validation passed. The full
+  workspace/CI-equivalent battery is running sequentially with warnings denied;
+  `h21-status.json` records each completed command. Commit/push and remote CI
+  verification remain pending until that battery succeeds.
+
+## 2026-11-05 — Dependency warning triage during H21 validation
+
+- Traced three duplicate-version warnings (`axum`, `axum-core`, `matchit`) to
+  `utoipa-axum = "0.1"`, declared in the workspace and API-server manifests.
+  A repository-wide reference search found only these manifest declarations;
+  the server builds its routes with `axum::Router`, `utoipa::OpenApi` and
+  `utoipa_swagger_ui::SwaggerUi` directly (`crates/api-server/src/routes.rs`).
+- Recorded H28 for removal and verification after H21's required checks pass.
+  Existing API tests exercise the OpenAPI endpoint, docs-disabled routing,
+  and embedded Swagger assets, providing behavior checks for that cleanup.
+  No dependency or warning-policy changes are mixed into the running H21
+  validation; all 74 warnings remain visible until individually resolved.
+
+## 2026-11-06 — H21: workspace passed; remaining validation resumed
+
+- The full workspace run exited 0: 6,077 passed, zero failed, 16 ignored across
+  85 unit/integration/doc-test groups. Confirmed the code, workflow and changelog
+  diff still matches the saved validation snapshot; only the work log changed.
+- The validation process and its session handle are no longer present. Its
+  status file records workspace success but no Clippy result, and the Clippy
+  log ends during dependency checking. Preserved that incomplete log and
+  resumed the remaining battery from Clippy. An interrupted check is not a pass;
+  the already completed workspace result does not need to be inferred or rerun.
+- Reclaimed approximately 23 GiB before continuing builds by removing 133
+  obsolete generated test executables whose Cargo fingerprints have no warning
+  flags. Current `-D warnings` executables, source and validation logs remain.
+  The removed-path inventory is saved in `h21-obsolete-test-artifacts.json`;
+  available repository disk space increased from 17 to 40 GiB.
+- Resumed workspace all-target Clippy completed successfully with warnings
+  denied (exit 0). The full workspace build and remaining smoke/security gates
+  are now running; publication remains pending their results.
+- Full workspace build exited 0. Default launcher/config and cache-report
+  smoke checks passed before the frontend feature builds started. Source review
+  confirmed blueprint feed labels exclude Complete, so the coordinator's feed
+  cannot independently bypass H21's returned-status rule.
+- Desktop-only frontend build passed (7m23s). The serial extra-check script
+  progressed to the CLI-only build, proving launcher/cache smoke and desktop
+  commands returned successfully under `set -euo pipefail`. Saved these substep
+  results separately; CLI/WASM builds, benchmark smoke and security scans remain
+  pending. No new commit has been pushed.
+- CLI-only frontend build, CLI startup/dispatch smoke checks and all four
+  wasm32-wasip2 guest builds passed. The serial script has reached the nine
+  release benchmark smoke targets. Those and the subsequent palette/Python
+  checks and security scans remain pending.
+
+## 2026-11-06 — H29: declared Rust minimum contradicts dependencies
+
+- The workspace declares `rust-version = "1.88"`, but its required SQLx 0.9.0
+  and SQLite backend declare Rust 1.94.0. Those packages are used in the passed
+  workspace build. Also found higher minimums in opentelemetry-langfuse 0.7.0
+  (1.93.1) and tree-sitter 0.27.1 (1.90).
+- Verified these values using locked offline Cargo metadata and the downloaded
+  dependency manifests. Current CI uses Rust 1.96.0; its green result does not
+  establish 1.88 support. H29 requires testing the actual supported minimum and
+  aligning the manifest/documentation/CI contract, without claiming an untested
+  version. No toolchain or dependency change is mixed into H21 validation.
+
+## 2026-11-07 — H30: remove the dependency failing the security gate
+
+- H21's remaining nine release benchmark smoke targets, palette check and six
+  Python tests passed. The full battery then stopped at cargo-deny:
+  RUSTSEC-2026-0441 reports `pin-utils` as unmaintained. A separate cargo-audit
+  returned zero but emitted the same maintenance warning; that is not a clean
+  security result. The dependency path was `iced_futures` → `wasmtimer` 0.4.3
+  → `pin-utils` 0.1.0. This advisory is a maintenance finding, not a claimed
+  exploit.
+- Updated only the locked `wasmtimer` version to 0.4.5, within iced_futures'
+  existing compatible requirement. This removes `pin-utils` and uses the
+  already-locked `pin-project-lite`; no advisory exceptions or warning-policy
+  changes were added. Upstream's [pinned changelog](https://github.com/whizsid/wasmtimer-rs/blob/101a11e164f3e4fad93758147e580bb72ecb79e1/CHANGELOG.md)
+  records the replacement in 0.4.4 and an Arc leak fix in 0.4.5.
+- Restarted the full local CI-equivalent battery on the combined H21/H30 tree,
+  with security scans first and Rust warnings denied. The previous H21 logs
+  remain intact; new commands and results use the `h30-` artifact prefix.
+  Commit/push and exact-head remote CI verification remain pending.
+- Both fresh security scans passed after the lockfile update. Cargo-audit
+  reports no warnings; cargo-deny still reports the 74 duplicate-version
+  families tracked separately. All seven focused stage tests, formatting and
+  diff checks also passed. The complete workspace suite is running.
+- The combined H21/H30 tree passed the full local battery: 6,077 workspace
+  tests, zero failed, 16 ignored across 85 unit/integration/doc-test groups;
+  all-target Clippy and all builds with warnings denied; default launcher,
+  cache-report and CLI smoke checks; desktop-only/CLI-only builds; four WASM
+  guest builds; nine release benchmark smoke targets; palette checks; six
+  Python tests; formatting; and both security scans. Source, workflow and
+  lockfile diffs match the validation snapshot. No compiler warning was emitted.
+- Added a direct `wasmtimer` wasm32-wasip2 compile check because the four guest
+  plugins do not depend on Iced's timer. This checks the updated package itself
+  on a WASM target; it does not claim browser runtime testing.
+
+## 2026-11-11 — H31: repair SQLite and SQLCipher together
+
+- On resumption, the entire untracked `target/` directory was absent and the
+  extra WASM check's process handle was unknown. Its completion cannot be
+  established. The November 7 full-battery results were observed directly and
+  remain recorded above, but their raw logs are no longer available. The
+  tracked source changes still matched the inspected November 7 diff.
+- Refreshed security scans before publication. Cargo-deny failed on
+  [RUSTSEC-2026-0459](https://rustsec.org/advisories/RUSTSEC-2026-0459.html),
+  issued November 9: `libsqlite3-sys` 0.37.0 bundles an affected SQLite engine.
+  Database files paired with crafted WAL files can disclose process memory.
+  Nothing has been committed or pushed with this failure unresolved.
+- Verified the published dependency contracts: SQLx 0.9.0 caps
+  `libsqlite3-sys` below 0.38; 0.39.x patches plain SQLite but retains an
+  affected SQLCipher amalgamation. Version 0.40.0 uses SQLCipher 4.20.0 with
+  SQLite 3.54.1. Updated the workspace requirement and vendored only SQLx's
+  0.9.0 SQLite driver to change that dependency requirement. Its Rust source
+  is unchanged; provenance, licenses and retirement instructions are included.
+- Added a runtime version regression using `SELECT sqlite_version()` so a
+  passing generic advisory scan cannot mask an affected SQLCipher build.
+  Native CI runs it on Linux/macOS/Windows. Existing encryption feature gates
+  remain intact. Dependency resolution changed only the SQLite binding,
+  driver source and SQLCipher source package beyond H30's timer update.
+- This dependency change invalidates using November 7's full battery as
+  verification of the final tree. Fresh security, storage and full-workspace
+  verification are required before publication.
+- Cargo-deny's advisory check now passes. Its license check initially rejected
+  the new source package's SQLite `blessing` and LibTomCrypt `WTFPL` license
+  identifiers. Reviewed the shipped component notices and added an exact-version,
+  package-scoped license allowance for `sqlcipher-src =420.0.0`; no advisory
+  ignore or global license allowance was added. The next cargo-deny run passed
+  all four gates. The existing duplicate-version warnings remain visible.
+- Native CI also runs the at-rest storage regressions on Linux/macOS, where
+  SQLCipher is enabled. Windows retains its existing encryption availability
+  behavior and runs the linked-engine version regression. The full session
+  suite is rebuilding locally with warnings denied.
+- The full session library suite passed: 207 tests, zero failed/ignored,
+  including the runtime engine-version regression, encrypted creation,
+  wrong-key rejection, plaintext migration, read-only inspection, recovery and
+  encrypted audit archive tests. Rust warnings were denied. Cargo-audit also
+  passed without warnings; cargo-deny passed with the 74 tracked duplicate
+  warnings. The native workflow YAML parses, and every vendored driver source
+  file matches the published 0.9.0 bytes.
+- Started the full final-tree battery (`h31-validate.py`): direct WASM timer
+  compilation, H21 regressions, workspace unit/integration/doc tests, all-target
+  Clippy, all builds/frontend variants, launcher/CLI/cache smoke, WASM guests,
+  nine release benchmark targets, palette/Python checks and fresh security
+  scans. Its statuses are written per completed command. Publication and
+  exact-head GitHub verification remain pending.
+- The direct WASM timer check passed. After a tool-session handoff, the
+  validation coordinator was gone but its orphaned Cargo child was still
+  actively compiling the orchestrator target (confirmed through its process,
+  compiler children and log descriptor). Kept that build running. A detached
+  resume coordinator waits for that exact child to finish, preserves its log,
+  and then re-runs the focused command to capture an authoritative exit status
+  before continuing the remaining battery. The source checksum manifest still
+  matched every file at handoff; no completed check is inferred from a live or
+  orphaned process.
+- The orphaned build finished, and the detached coordinator captured a fresh
+  successful focused run: all seven stage-tracker regressions passed on the
+  repaired dependency tree. Formatting and diff checks also passed. The
+  coordinator has advanced to the full workspace suite; Clippy, complete build
+  and smoke/security gates remain pending. Code search indexing was refreshed
+  successfully.
+- CI parity review found the Python dataset-export fixture used the default
+  temporary directory. That command runs outside Cargo, so Cargo's TMPDIR
+  setting does not govern it. Updated this one fixture to use the repository's
+  disk-backed `target/` directory, like the cache smoke script. All six Python
+  tests passed. Rust/manifests/lockfile remain unchanged during their run; the
+  full pipeline will also run the updated Python suite before finishing.
+
+## 2026-11-11 — H31 battery passed; H32 blocks publication
+
+- The detached runner finished all compilation and runtime gates successfully:
+  6,078 workspace tests passed, zero failed, 16 ignored across 85 groups;
+  all-target Clippy with warnings denied; full workspace build; both frontend
+  builds; launcher/cache/CLI smoke; four WASM guest builds; all nine release
+  benchmark targets; palette; six Python tests; formatting and diff checks.
+  Source checksums still matched apart from this work log.
+- The final cargo-deny scan failed on newly issued
+  [RUSTSEC-2026-0486](https://rustsec.org/advisories/RUSTSEC-2026-0486.html):
+  `rustix` 1.1.4 can mark unwritten extended-attribute buffer memory as
+  initialized. The unaffected 0.38 series is separate; the affected 1.x copy
+  arrives through multiple transitive paths. No Concerto-specific exploit is
+  claimed. The runner stopped at this failure, so its final audit command did
+  not run. Earlier audit success does not certify this later advisory state.
+- Updated the affected lockfile package to patched `rustix` 1.1.6. Cargo's
+  update also reassigned several unrelated Windows dependency edges to older
+  already-locked versions. Preserved the previously tested Windows selections:
+  the new rustix accepts `windows-sys >=0.52, <0.62`, and locked offline Cargo
+  metadata validates the resulting graph. Only rustix's version/checksum and
+  references change beyond H30/H31. No advisory suppression was added.
+- The full final-tree battery must run on this latest lockfile before
+  publication. Earlier successful gates are retained as evidence of H21/H31,
+  not substituted for validation of the new dependency tree.
+- Fresh cargo-deny and cargo-audit both passed on the rustix 1.1.6 lockfile;
+  the direct WASM timer check passed as well. The detached H32 coordinator is
+  running the complete battery with Rust warnings denied and TMPDIR explicitly
+  set to `/var/tmp`. H31 logs/statuses remain intact. The final PR description
+  is prepared locally with validation deliberately marked pending.
+- On the rustix-updated tree, all seven stage regressions passed, followed by
+  formatting and diff checks. The full workspace suite is running.
+- Staged the vendored driver and reviewed all 56 text files (about 387 KiB).
+  The staged diff check found trailing spaces in three upstream doc-comment
+  lines and extra EOF blank lines in the copied licenses. Removed those and
+  updated the provenance note; staged diff checks now pass. A source comparison
+  confirms executable Rust is unchanged and only those trailing doc-comment
+  spaces differ from the published driver. The validation checksum manifest
+  records this documentation-only normalization explicitly.
+- Saved H21's three Rust files as local commit `b7f9e65` after the completed
+  full-workspace/Clippy checks and the rustix-updated focused regression pass.
+  This is not a claim that the bare intermediate commit has current green
+  security CI: the dependency repairs, native workflow additions and this log
+  remain pending in the integration worktree. No push was made. The final
+  combined tree must finish its battery before the series is published.
+- Saved the verified Python fixture change as local commit `e2948b7` and the
+  SQLite/timer repair as `99c571d`. The latter uses the checksum-verified H31
+  lockfile in its commit; the rustix 1.1.6 update remains in the working tree
+  for its own commit after validation. Vendored text files use normal 0644
+  permissions; no executable source-file flags or build artifacts are included.
+  The current integration worktree retains every pending change, and no commits
+  have been pushed. Native CI additions and the final verification log remain
+  part of the unpublished series.
+- Saved native CI coverage as local commit `e0b03e7` after checking the YAML,
+  three-platform matrix and SQLCipher platform condition. Its Linux tests were
+  exercised by the passing focused/session/workspace suites; Windows/macOS
+  execution is still required on the final pushed head. The H32 workspace
+  command remains live and is linking integration binaries; process and cgroup
+  checks show no OOM event. No restart, warning suppression or push was made.
+
+
+## 2026-11-12 — H21/H30/H31/H32 complete local verification
+
+- The detached H32 coordinator completed every command with exit zero. The
+  final dependency tree passed 6,078 workspace unit/integration/doc tests,
+  zero failed and 16 ignored across 85 groups; all-target Clippy with warnings
+  denied; full workspace and both single-frontend builds; launcher/cache/CLI
+  smoke; all four WASM guest builds; nine release benchmark smoke targets;
+  formatting, diff hygiene, palette, six Python tests and both security scans.
+  All seven stage-tracker regressions and the direct WASM timer check passed.
+- Compared all 994 recorded source hashes against the current tree: only this
+  work log differs. Compiler logs contain no warning lines. Cargo-deny still
+  reports the tracked duplicate-version families; this is not a claim that
+  H28 is resolved or that the entire repository is warning-free.
+- Prepared H28 in the disk-backed `Concerto-worktrees/h28` worktree. Removing
+  the unused `utoipa-axum` manifest entries removes four packages (the bridge,
+  Axum 0.7, axum-core 0.4 and matchit 0.7). Offline metadata resolution preserves
+  every retained package's enabled features. No builds were started there
+  while the main battery ran. This worktree starts before H32's rustix update;
+  its lockfile must not replace the final integration lockfile. API tests and
+  final integration verification remain pending. The main worktree under
+  validation was not changed by this preparation.
+- Publication and Linux/macOS/Windows checks on the final pushed head remain
+  required before taking the next change into the integration branch.
+- Refreshed both security scans immediately before publication on November
+  12: cargo-deny and cargo-audit passed, with no new advisory suppression.

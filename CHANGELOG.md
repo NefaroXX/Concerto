@@ -111,6 +111,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Filesystem dependency soundness.** Update locked `rustix` to 1.1.6 for
+  RUSTSEC-2026-0486, which affects zero-length extended-attribute buffers.
+
 - **SQLite/SQLCipher security.** Upgrade the linked database engine for
   RUSTSEC-2026-0459, including the encrypted database path, and verify the
   runtime SQLite version in the native CI matrix. A vendored SQLx driver
@@ -119,6 +122,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Dependency maintenance.** Update the locked WASM timer dependency to 0.4.5,
   removing unmaintained `pin-utils` (RUSTSEC-2026-0441) and including the
   upstream timer Arc leak fix.
+
+- **Multi-agent completion stages.** Partial runs and requests for user input
+  preserve the last stage reached instead of reporting Complete. Single-agent,
+  coordinator and supervised runs settle their stage from the returned status.
 
 - **Native CI builds.** Restrict the supervisor's Linux parent-death syscall
   to Linux, enable portable rollback tests on Windows, and align Unix fixture
