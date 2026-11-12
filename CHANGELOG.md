@@ -111,6 +111,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Cargo regression fixture isolation.** Give temporary test projects unique
+  package identities so parallel verification cannot run another fixture's
+  binary when `CARGO_TARGET_DIR` points to a shared build directory.
+
+- **Dependency footprint.** Remove unused API-server dependencies on the
+  orchestrator, old Axum integration and HTTP middleware, plus unused direct
+  serialization/ID declarations. Consolidate desktop directory lookups on the
+  workspace dependency and remove the orchestrator's unused older copy.
+
 - **Filesystem dependency soundness.** Update locked `rustix` to 1.1.6 for
   RUSTSEC-2026-0486, which affects zero-length extended-attribute buffers.
 

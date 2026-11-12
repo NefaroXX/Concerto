@@ -30,18 +30,20 @@ passing repository tests alone does not close a finding.
 | H18 | P1 | Locked Wasmtime 36.0.19 fails fresh security gates on RUSTSEC-2026-0424 | Fixed and verified; awaiting merge |
 | H19 | P2 | Action-required minimum tool-call check ignores earlier continuation rounds | Fixed and verified; awaiting merge |
 | H20 | P1 | Yanked async-executor 1.14.0 remains locked after an upstream memory-safety regression | Fixed and verified; awaiting merge |
-| H21 | P2 | Multi-agent runtime stage reports Complete for partial outputs | Locally verified; remote CI pending |
+| H21 | P2 | Multi-agent runtime stage reports Complete for partial outputs | Fixed and verified; awaiting merge |
 | H22 | P1 | Cache path normalization can select a different file from the filesystem tool | Fixed and verified with H15; awaiting merge |
 | H23 | P2 | CLI MCP probe integration test timed out during the H19 workspace run | Open; cause under investigation |
 | H24 | P2 | Final provider context guard omits replayable reasoning from its size estimate | Fixed and verified; awaiting merge |
 | H25 | P2 | Benchmark required-pattern checks count unreadable files as matching | Fixed and verified; awaiting merge |
 | H26 | P2 | Nine non-standard benchmark task manifests contain invalid-length IDs | Fixed and verified; awaiting merge |
 | H27 | P1 | Native orchestrator builds fail on macOS (Linux syscall) and Windows (test helper cfgs) | Fixed and verified; awaiting merge |
-| H28 | P2 | Unused API dependency pulls in a duplicate Axum stack | Open; warning dependency paths traced |
+| H28 | P2 | Unused dependencies and inconsistent versions inflate the dependency graph | Cleanup prepared; full verification pending; remaining warnings tracked |
 | H29 | P2 | Declared Rust 1.88 minimum contradicts required locked dependencies | Open; dependency manifests verified |
-| H30 | P1 | Locked wasmtimer retains unmaintained pin-utils and fails the supply-chain gate | Locally verified; remote CI pending |
-| H31 | P1 | Bundled SQLite/SQLCipher fails the WAL memory-disclosure security gate | Locally verified; remote CI pending |
-| H32 | P1 | Locked rustix fails the extended-attribute buffer soundness security gate | Locally verified; remote CI pending |
+| H30 | P1 | Locked wasmtimer retains unmaintained pin-utils and fails the supply-chain gate | Fixed and verified; awaiting merge |
+| H31 | P1 | Bundled SQLite/SQLCipher fails the WAL memory-disclosure security gate | Fixed and verified; awaiting merge |
+| H32 | P1 | Locked rustix fails the extended-attribute buffer soundness security gate | Fixed and verified; awaiting merge |
+| H33 | P2 | Nested Cargo fixtures can execute each other’s binaries with a shared target directory | Locally verified; remote CI pending |
+| H34 | P2 | Bounded subprocess capture can conceal inconsistent test evidence without marking output incomplete | Open; source path traced, execution reproduction pending |
 
 
 ## 2026-10-29 — H01: preserve streaming events across chunks
@@ -1470,3 +1472,174 @@ Next: patch H18, then continue H07's truthful verification/completion handling.
   required before taking the next change into the integration branch.
 - Refreshed both security scans immediately before publication on November
   12: cargo-deny and cargo-audit passed, with no new advisory suppression.
+
+
+## 2026-11-12 — H28 isolated unused Axum dependency cleanup
+
+- Published the locally verified H21/H30/H31/H32 series as `f8d91bb` in PR
+  #379. Main CI run 43127596886 and native CI run 43127596759 both identify
+  that exact head. At this checkpoint, formatting, palette, WASM guests and
+  cargo-deny passed; the other eight checks remain in progress. No later
+  integration milestone has been pushed.
+- Advanced the isolated H28 worktree to `f8d91bb` before reapplying the two
+  manifest removals and Cargo's minimal lockfile cleanup. The rustix 1.1.6
+  security repair is preserved. Locked offline metadata succeeds and confirms
+  exactly four removed packages, no added packages and no changed feature sets
+  for retained packages. No source import or call uses `utoipa-axum`.
+- Started the complete API-server test suite with Rust warnings denied,
+  followed by cargo-deny and cargo-audit. Existing tests cover docs-disabled
+  routing, OpenAPI, embedded Swagger assets and authentication boundaries.
+  Compilation is still running; this entry does not claim passing API tests
+  or resolution of the remaining duplicate-version warnings.
+- The Axum-only cleanup passed all 63 API-server tests, its binary/doc-test
+  targets, cargo-deny and cargo-audit. Cargo-deny duplicate warnings fell from
+  74 to 71. Saved that intermediate validation separately before extending
+  the same dependency cleanup.
+- Reviewed API source, startup and route tests: it does not use its direct
+  orchestrator, tower-http, serde or ulid declarations. Removed those four
+  declarations, plus the now-unused workspace tower-http declaration. The
+  revised lockfile removes five packages in total, adds none, and preserves
+  the enabled features of every retained package in workspace metadata.
+  Existing authentication and rate-limit middleware remain implemented in
+  API source; no route implementation is changed.
+- The all-platform normal/build dependency closure reachable from API-server
+  shrinks from 707 packages to 444 in resolved metadata. This is a dependency
+  count, not a measured compile-time or runtime performance claim. Started
+  fresh API tests and a binary build, security scans, and an exact parsed-JSON
+  comparison of generated OpenAPI output with the published build. Results
+  for this expanded cleanup are still pending.
+- The expanded API cleanup passed all 63 tests, its binary build, both
+  security scans and parsed-JSON equality of generated OpenAPI output with
+  the published binary. Cargo-deny duplicate warnings fell to 70. Saved this
+  intermediate validation before the directory dependency consolidation.
+- The desktop separately selected dirs 5 while the workspace selected dirs 6.
+  Context7 did not index this library; inspected the downloaded published
+  sources and pinned upstream sources instead. Linux/macOS lookup code is
+  unchanged; the Windows helper changes the null-handle expression for newer
+  Windows bindings. Upstream source:
+  https://github.com/dirs-dev/dirs-sys-rs/blob/8bcd4aa2c35990d57a2cff2953793525fc42709c/src/lib.rs.
+  Switched desktop to the workspace dependency. The remaining dirs 5 edge was
+  an unused orchestrator dependency (text occurrences are local variable names
+  and comments); removed that declaration as well.
+- Froze these manifest/lockfile changes for the complete local battery in the
+  isolated worktree. The published integration head remains f8d91bb while its
+  required GitHub checks run. No warning policy or advisory exception changes
+  are included. Full validation of this combined cleanup is still pending.
+- The combined cleanup's initial cargo-deny scan passed with 67 duplicate
+  warning families (74 before cleanup), with no other warning categories.
+  Initial cargo-audit, direct WASM timer compilation, all seven stage-tracker
+  regressions, formatting and diff checks passed. Full workspace validation
+  is now running; no source changes have been made since its snapshot.
+
+## 2026-11-12 — H16 execution-path review during verification
+
+- Traced the coverage entry points in `crates/eval/src/lib.rs`. Repository
+  searches found no production callers of these public EvalEngine coverage
+  methods outside the module; the similarly named desktop method computes
+  UI run coverage and is unrelated. Existing coverage tests exercise parsers
+  with invented Tarpaulin fields, not the real subprocess/report contract.
+- In addition to the recorded process-status, report-file, UTF-8 and
+  cancellation defects, discovery probes ambient `cargo` while
+  `run_with_coverage` can execute through a configured shell profile.
+  Standalone `run_coverage` ignores that profile entirely. Discovery and
+  execution need one consistent environment. `run_command` provides bounded
+  async execution but does not apply shell profiles, so simply routing all
+  coverage through it unchanged would lose that contract.
+- Planned execution regressions: nonzero version probes must not select a
+  tool; profile-scoped discovery must match execution; report JSON must come
+  from a unique run-specific file and remain separate from stdout/stderr;
+  zero/ignored-only tests, malformed summaries and a failed test run must not
+  pass; Unicode diagnostic truncation must not panic; cancellation before
+  discovery and during execution must propagate through all three entry
+  points; deadline and report failures must stay explicit. Preserve the
+  existing governed-executor fail-closed boundary (no direct coverage spawn).
+  No H16 implementation or test result is claimed yet.
+
+
+## 2026-11-12 — Published head green; H33 fixture isolation repair
+
+- All twelve required GitHub checks passed on exact head
+  `f8d91bb4fd45d94e7c3a10aebb1ab1b5e2c57c99`:
+  [main CI](https://github.com/NefaroXX/Concerto/actions/runs/43127596886)
+  and [native CI](https://github.com/NefaroXX/Concerto/actions/runs/43127596759).
+  Updated PR #379 with that evidence. Linux/macOS ran 74 gate, one cleanup,
+  one SQLite runtime-version, 25 encrypted-storage, eight rollback and seven
+  stage-tracker tests; Windows ran 73, one, one, six and seven respectively
+  (encrypted storage remains intentionally unavailable on Windows).
+- The H28 local workspace run stopped at `cargo_verification` with one failure.
+  Its passing/empty-test fixture executed the separate fixture's deliberately
+  failing root/module tests. Both temporary projects used package name
+  `h04_fixture`; the isolated-worktree runner's inherited `CARGO_TARGET_DIR`
+  made them share the same test artifact path. This is a fixture defect in
+  the regression tests added during this work, not an excused baseline issue.
+  The original failed log/status remain preserved under `h28-final-*`.
+- Assigned each temporary fixture a unique Cargo package identity, preserving
+  the real direct/fallback execution paths and parallel testing. Started the
+  complete three-test target with the same inherited target directory and
+  warnings denied. Its result is pending; the full workspace and remaining
+  CI-equivalent gates must complete after this repair before publication.
+- H16 preparation is isolated in `Concerto-worktrees/h16`: four parser
+  regressions cover the released Tarpaulin report fields, measured zero versus
+  absent data, impossible measurements and out-of-range LLVM percentages.
+  They have not run; no coverage implementation change is claimed.
+- H33 focused verification passed all three Cargo integration tests with
+  the same inherited shared target directory and Rust warnings denied. The
+  combined tree is proceeding through the full workspace and remaining gates.
+- The repaired tree passed the full workspace suite: 6,078 tests,
+  0 failed and 16 ignored across 85 unit/integration/doc groups.
+  Source hashes match the validation snapshot. Clippy and the remaining
+  build/smoke/benchmark/security gates are running; publication remains pending.
+
+- All-target Clippy with warnings denied and the full workspace build passed
+  on the repaired H28/H33 tree. Frontend/launcher/WASM/benchmark smoke checks
+  and final scans are still running.
+
+## 2026-11-12 — H34: incomplete subprocess output lacks a verdict
+
+- While evaluating process-runner reuse for H16, traced
+  `ProcessHandle::read_bounded` in `crates/tools/src/process.rs`: it captures
+  the first 10 MiB per stream, drains and discards the rest, and returns only
+  a String. Pipe read errors also break the loop without preserving the error.
+  `ProcessOutput` carries no completeness flag. The direct coverage code
+  currently uses a different, unbounded capture path, so blindly substituting
+  this helper would weaken coverage verification.
+- `test_output::completed_result` in `crates/eval/src/test_output.rs` accepts
+  Cargo exit zero when captured output contains a passing summary and no
+  failing/malformed summary. A captured passing prefix with a discarded later
+  failure therefore needs explicit incomplete-output handling at the process
+  boundary. A nonzero child exit still fails regardless of captured text;
+  this concern is successful exits with inconsistent or incomplete evidence.
+  This is a source-traced failure path; a process-level regression
+  must reproduce it before the repair is claimed. Do not infer output
+  completeness from a successful child exit or hide the issue with a larger
+  capture limit. Record it separately from H16's Unicode display truncation.
+- Both frontend variants, launcher/cache/CLI smoke and all four WASM
+  guests passed. The remaining release benchmark targets are compiling.
+- Added the three-test Cargo verification integration target to every native
+  CI platform with an explicitly shared CARGO_TARGET_DIR. The YAML, platform
+  matrix and warning policy validate; the exact command already passed
+  locally under that environment. This workflow-only change does not alter
+  the Rust/manifests/lockfile under validation and still requires execution
+  on the final published head.
+
+
+## 2026-11-12 — H28/H33 complete local verification
+
+- The repaired combined tree passed the full local battery: 6,078 workspace
+  tests, zero failed, 16 ignored across 85 groups; warnings-denied all-target
+  Clippy; full workspace and both frontend builds; launcher/cache/CLI smoke;
+  four WASM guests; all nine release benchmark smoke targets; formatting,
+  palette, six Python tests and fresh cargo-deny/cargo-audit scans.
+- Cargo-deny now reports 67 duplicate-version families, down from 74, with
+  no other warning category. Cargo-audit reports no warnings. No advisory or
+  warning suppression was added. H28 remains open for the remaining dependency
+  review; this batch removes 17 packages and adds none.
+- Every Rust source, manifest and lockfile hash matches the repaired validation
+  snapshot. Subsequent differences are only the changelog, this log and the
+  reviewed native-workflow step whose exact command already passed locally.
+  The earlier failed workspace run remains recorded; the successful full run
+  verifies the fixture repair under the same inherited shared target setting.
+- The fixture repair is local commit ad5aea4. The native regression workflow
+  and dependency cleanup are being saved separately before publication; the
+  final head still needs all required GitHub checks, including the new native
+  shared-target integration step. No H16 implementation has been mixed in.
