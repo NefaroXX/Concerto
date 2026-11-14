@@ -631,6 +631,13 @@ impl StageTracker {
         Self { bus, session_id, task_id, current: None }
     }
 
+    /// Settle the stage from the same status returned to the caller.
+    fn finish(&mut self, status: AgentCompletionStatus) {
+        if status == AgentCompletionStatus::Completed {
+            self.set(RunStage::Complete);
+        }
+    }
+
     /// Advance to `stage`, publishing `RunStageChanged` only on transition.
     fn set(&mut self, stage: RunStage) {
         if self.current == Some(stage) {
@@ -1372,8 +1379,8 @@ async fn execute_agent_loop(
     let task_id = task.id.0;
     // Run-stage signals (ADR-55 §9): the loop is about to start, so the
     // run is Inspecting the workspace; a mutation-capable run then moves to
-    // Execute. Complete is reported only after `run` returns Ok below — an Err
-    // or cancellation never advances the stage. Under full local agency the
+    // Execute. Complete is reported only for a completed output below — a
+    // partial result, error or cancellation never advances the stage. Under full local agency the
     // single-agent (forced) loop is action-capable, so `execute_granted` is
     // true; the explicit flag keeps the stage independent of task shaping.
     {
@@ -1388,7 +1395,10 @@ async fn execute_agent_loop(
             // Full-local-agency runs are action-capable: an empty final message
             // is left as the model produced it (no honesty synthesis, which is
             // reserved for read-only runs that no longer exist as a mode).
-            stage_tracker.lock().unwrap_or_else(|error| error.into_inner()).set(RunStage::Complete);
+            stage_tracker
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .finish(output.completion_status);
             output
         }
         Err(error) => {
@@ -3831,7 +3841,10 @@ async fn run_multi_agent(
         }
     };
     stage_feed.abort();
-    stage_tracker.lock().unwrap_or_else(|error| error.into_inner()).set(RunStage::Complete);
+    stage_tracker
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .finish(output.completion_status);
     // ADR-55 §4 (M3): on a completed planning-only run, bind the
     // rendered plan (the coordinator's final message) to this objective,
     // keyed by the same plan_id the coordinator persisted as the durable
@@ -4431,6 +4444,11 @@ async fn drive_supervised_run(
         .filter(|meta| meta.state == AgentState::Completed && expected.contains(&meta.agent_id))
         .count();
     let all_completed = total > 0 && completed == total && failed_to_start.is_empty();
+    let completion_status = if all_completed {
+        AgentCompletionStatus::Completed
+    } else {
+        AgentCompletionStatus::Partial
+    };
     for agent_id in &summary.failed {
         tracing::warn!(%agent_id, "supervised multi-agent run finished with a failed agent");
         // Supremacy invariant: a runtime child crash / restart-budget
@@ -4489,7 +4507,7 @@ async fn drive_supervised_run(
     let project_root =
         camino::Utf8PathBuf::from_path_buf(run.project_root.clone()).unwrap_or_default();
 
-    stage_tracker.lock().unwrap_or_else(|error| error.into_inner()).set(RunStage::Complete);
+    stage_tracker.lock().unwrap_or_else(|error| error.into_inner()).finish(completion_status);
     // Per-child provider metrics/spend are not surfaced through the parent in
     // this slice (the mock-provider children consume none), so there is
     // nothing to persist here yet — the coordinator tail's metric writes are
@@ -4547,11 +4565,7 @@ async fn drive_supervised_run(
         tool_events: Vec::new(),
         verification: Vec::new(),
         project_root: Some(project_root),
-        completion_status: if all_completed {
-            AgentCompletionStatus::Completed
-        } else {
-            AgentCompletionStatus::Partial
-        },
+        completion_status,
         provider_metrics: Vec::new(),
         checkpoint_json: None,
         provider_error_class: None,

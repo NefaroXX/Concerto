@@ -157,7 +157,8 @@ pub enum RunStage {
     Execute,
     /// Running tests/checks against the change.
     Verify,
-    /// The run is finished.
+    /// The task completed successfully. Partial results and requests for
+    /// user input do not advance to this stage.
     Complete,
 }
 

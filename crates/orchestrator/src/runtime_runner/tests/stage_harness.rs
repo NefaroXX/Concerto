@@ -32,6 +32,7 @@ use concerto_core::traits::approval::ApprovalDecision;
 use concerto_core::traits::policy::AuditEntry;
 use concerto_core::traits::provider::CompletionStream;
 use concerto_core::traits::tool::Tool;
+use concerto_core::transcript::GateLabels;
 use concerto_core::types::{
     CapabilitySet, CompletionChunk, CompletionRequest, TokenBudget, ToolCall, ToolOutput,
 };
@@ -149,26 +150,23 @@ impl LlmProvider for ScriptedProvider {
     ) -> Result<CompletionStream, ProviderError> {
         let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
         let tool_calls = self.responses.get(idx).cloned().unwrap_or_default();
-        let chunks: Vec<_> = if tool_calls.is_empty() {
-            vec![CompletionChunk {
+        let mut chunks: Vec<_> = tool_calls
+            .into_iter()
+            .map(|tc| CompletionChunk {
                 reasoning: None,
                 delta: String::new(),
-                tool_call: None,
-                is_final: true,
+                tool_call: Some(tc),
+                is_final: false,
                 usage: None,
-            }]
-        } else {
-            tool_calls
-                .into_iter()
-                .map(|tc| CompletionChunk {
-                    reasoning: None,
-                    delta: String::new(),
-                    tool_call: Some(tc),
-                    is_final: false,
-                    usage: None,
-                })
-                .collect()
-        };
+            })
+            .collect();
+        chunks.push(CompletionChunk {
+            reasoning: None,
+            delta: String::new(),
+            tool_call: None,
+            is_final: true,
+            usage: None,
+        });
         Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
     }
 }
@@ -439,4 +437,113 @@ async fn a5_same_objective_durable_binding_auto_applies() {
         "the binding keeps the ORIGINAL plan objective"
     );
     assert_eq!(binding.plan_text(), "step 1: build verdict");
+}
+
+#[test]
+fn stage_tracker_partial_result_preserves_last_real_stage() {
+    assert_unfinished_stage_is_preserved(AgentCompletionStatus::Partial);
+}
+
+#[test]
+fn stage_tracker_awaiting_user_preserves_last_real_stage() {
+    assert_unfinished_stage_is_preserved(AgentCompletionStatus::AwaitingUser);
+}
+
+fn assert_unfinished_stage_is_preserved(status: AgentCompletionStatus) {
+    for previous in [
+        RunStage::Understand,
+        RunStage::Inspect,
+        RunStage::Plan,
+        RunStage::Execute,
+        RunStage::Verify,
+    ] {
+        let bus = EventBus::new(16);
+        let mut receiver = bus.subscribe();
+        let session_id = Ulid::new();
+        let mut tracker = StageTracker::new(bus, session_id, TaskId::new());
+        tracker.set(previous);
+        tracker.finish(status);
+        assert_eq!(tracker.current, Some(previous), "{status:?} cannot finish {previous:?}");
+        assert_eq!(drain_stage_events(&mut receiver, session_id), [previous]);
+    }
+}
+
+#[test]
+fn stage_tracker_completed_result_publishes_complete_once() {
+    let bus = EventBus::new(16);
+    let mut receiver = bus.subscribe();
+    let session_id = Ulid::new();
+    let mut tracker = StageTracker::new(bus, session_id, TaskId::new());
+    tracker.set(RunStage::Verify);
+    tracker.finish(AgentCompletionStatus::Completed);
+    tracker.finish(AgentCompletionStatus::Completed);
+    assert_eq!(tracker.current, Some(RunStage::Complete));
+    assert_eq!(
+        drain_stage_events(&mut receiver, session_id),
+        [RunStage::Verify, RunStage::Complete]
+    );
+}
+
+#[tokio::test]
+async fn stage_tracker_supervised_spawn_failure_does_not_publish_complete() {
+    let (directory, pool) = super::approved_plan_d7::d7_pool().await;
+    let bus = EventBus::new(256);
+    let mut receiver = bus.subscribe();
+    let session_id = Ulid::new();
+    let task_id = TaskId::new();
+    let services = make_services(bus.clone());
+    let store: Arc<dyn SessionStore> = Arc::new(super::EventRecorderStore::new());
+    let event_recorder = start_event_recorder(&bus, store.clone(), session_id);
+    let transcript_recorder =
+        start_transcript_recorder(&bus, store, session_id, GateLabels::default());
+    let stage_tracker = Arc::new(Mutex::new(StageTracker::new(bus.clone(), session_id, task_id)));
+    stage_tracker.lock().unwrap_or_else(|error| error.into_inner()).set(RunStage::Execute);
+    let policy = Arc::new(SimplePolicyEngine::new(Vec::new(), Arc::new(TestAudit)));
+    let gate = Arc::new(WriteGate::new(
+        policy,
+        make_executor(),
+        pool.clone(),
+        Arc::new(FilePreImageReader::new(directory.path())),
+        directory.path().to_path_buf(),
+        1,
+    ));
+    let run = SupervisedRun {
+        services: SupervisorServices {
+            gate,
+            whiteboard_pool: pool.clone(),
+            memory: Arc::new(NullMemoryStore),
+            project_id: ProjectId(concerto_core::helpers::project_id_hash(directory.path())),
+            subscriptions: SubscriptionManager::new(pool.clone()),
+            consolidation: None,
+            approval_sink: None,
+            bus: Some(bus),
+        },
+        config: SupervisorConfig::default(),
+        binary: directory.path().join("missing-agent-process"),
+        project_root: directory.path().to_path_buf(),
+        session_id,
+        tasks: vec![("worker".into(), "complete the task".into())],
+        plan_id: None,
+        spawn_env: Vec::new(),
+    };
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        drive_supervised_run(
+            run,
+            &services,
+            &stage_tracker,
+            None,
+            task_id,
+            transcript_recorder,
+            event_recorder,
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("a failed spawn settles without waiting for the run budget")
+    .expect("a failed spawn returns a partial output");
+    assert_eq!(output.completion_status, AgentCompletionStatus::Partial);
+    assert!(output.final_message.contains("failed agents: worker"));
+    assert_eq!(drain_stage_events(&mut receiver, session_id), [RunStage::Execute]);
+    pool.close().await;
 }

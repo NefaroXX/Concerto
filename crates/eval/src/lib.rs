@@ -31,10 +31,14 @@ pub trait EvalProcessExecutor: Send + Sync {
 }
 
 pub mod categories;
+mod coverage;
+#[cfg(test)]
+mod coverage_regressions;
 pub mod observation;
 pub mod persona_mem;
 pub mod runner;
 pub mod scenarios;
+mod test_output;
 pub use runner::EvalRunner;
 
 // ---------------------------------------------------------------------------
@@ -44,6 +48,10 @@ pub use runner::EvalRunner;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum EvalError {
+    /// No supported test harness applies to this existing project directory.
+    /// Distinct from a configured harness that could not be started.
+    #[error("eval harness unavailable: {0}")]
+    HarnessUnavailable(String),
     #[error("eval harness setup failed: {0}")]
     HarnessSetupFailed(String),
     #[error("test runner failed: {0}")]
@@ -351,22 +359,13 @@ impl EvalEngine {
                 .ok_or_else(|| {
                     EvalError::TestRunnerFailed("native executor returned no exit code".into())
                 })?;
-            let combined = format!(
-                "{}{}",
-                output.data.get("stdout").and_then(serde_json::Value::as_str).unwrap_or_default(),
-                output.data.get("stderr").and_then(serde_json::Value::as_str).unwrap_or_default(),
-            );
-            let output_tail =
-                combined.chars().rev().take(2000).collect::<String>().chars().rev().collect();
-            return Ok(EvalResult {
+            return Ok(test_output::completed_result(
                 runner,
                 exit_code,
-                passed: exit_code == 0,
-                duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
-                output_tail,
-                coverage: None,
-                provenance: EvalProvenance::Harness,
-            });
+                u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                output.data.get("stdout").and_then(serde_json::Value::as_str).unwrap_or_default(),
+                output.data.get("stderr").and_then(serde_json::Value::as_str).unwrap_or_default(),
+            ));
         }
         let mut command = if let Some(profile) = &self.shell_profile {
             let backend = ShellProfileFactory::backend_for(profile);
@@ -400,26 +399,13 @@ impl EvalEngine {
         };
         let duration_ms = start.elapsed().as_millis() as u64;
         match output {
-            Ok(Ok(out)) => {
-                let exit_code = out.status.code().unwrap_or(-1);
-                let passed = out.status.success();
-                let combined = String::from_utf8_lossy(&out.stdout).to_string()
-                    + &String::from_utf8_lossy(&out.stderr);
-                let output_tail = if combined.len() > 2000 {
-                    combined[combined.len() - 2000..].to_string()
-                } else {
-                    combined
-                };
-                Ok(EvalResult {
-                    runner,
-                    exit_code,
-                    passed,
-                    duration_ms,
-                    output_tail,
-                    coverage: None,
-                    provenance: EvalProvenance::Harness,
-                })
-            }
+            Ok(Ok(out)) => Ok(test_output::completed_result(
+                runner,
+                out.status.code().unwrap_or(-1),
+                duration_ms,
+                &String::from_utf8_lossy(&out.stdout),
+                &String::from_utf8_lossy(&out.stderr),
+            )),
             Ok(Err(e)) => Err(EvalError::Io(e)),
             Err(_elapsed) => Ok(EvalResult {
                 runner,
@@ -456,20 +442,23 @@ impl EvalEngine {
         project_dir: &Path,
         cancel: CancellationToken,
     ) -> Result<EvalResult, EvalError> {
-        // No harness config: fall back to a plain `cargo test` IF a Cargo
-        // project is actually reachable (a `Cargo.toml` in this directory or an
-        // ancestor), instead of hard-failing. A hard failure here surfaced as
-        // `None` to the coordinator, which then treated the build as
-        // unvalidated; running cargo test captures an honest pass/fail and is
-        // marked `Fallback` so the report distinguishes it from a real harness
-        // run. With no Cargo project anywhere there is nothing to validate, so
-        // the honest Unknown failure is preserved (callers treat it as "no eval
-        // result") rather than marking every non-Rust project as a failed run.
+        if cancel.is_cancelled() {
+            return Err(EvalError::Cancelled);
+        }
+        // Keep the ancestor-Cargo fallback. Absence of a supported harness
+        // in an existing directory is unavailability, not an execution error;
+        // an invalid/missing project directory must still report its failure.
         if let TestRunner::Unknown(reason) = &runner {
             if Self::cargo_project_in_ancestors(project_dir) {
                 return self.run_fallback_cargo_test(project_dir, reason, cancel).await;
             }
-            return Err(EvalError::HarnessSetupFailed(format!("cannot run tests: {reason}")));
+            if !std::fs::metadata(project_dir)?.is_dir() {
+                return Err(EvalError::HarnessSetupFailed(format!(
+                    "project root is not a directory: {}",
+                    project_dir.display()
+                )));
+            }
+            return Err(EvalError::HarnessUnavailable(reason.clone()));
         }
         // Default args per runner
         let default_args: &[&str] = match &runner {
@@ -486,7 +475,7 @@ impl EvalEngine {
 
     /// No-config fallback: run a plain `cargo test` in `project_dir` and mark
     /// the result [`EvalProvenance::Fallback`] with a note naming the missing
-    /// harness config. Pass/fail is whatever cargo reported.
+    /// harness config. A pass also requires confirmed executed Rust tests.
     async fn run_fallback_cargo_test(
         &self,
         project_dir: &Path,
@@ -512,7 +501,9 @@ impl EvalEngine {
         dir.ancestors().any(|ancestor| ancestor.join("Cargo.toml").exists())
     }
 
-    /// Run tests scoped to changed paths; falls back to full suite if mapping unavailable.
+    /// Run tests scoped to changed paths; fall back to the full suite when no
+    /// reliable mapping exists. Cargo always uses the full suite at the resolved
+    /// root: Rust module/test names cannot be inferred safely from file paths.
     pub async fn run_scoped(
         &self,
         changed_paths: &[camino::Utf8PathBuf],
@@ -547,32 +538,10 @@ impl EvalEngine {
         changed_paths: &[camino::Utf8PathBuf],
     ) -> Option<Vec<String>> {
         match runner {
-            TestRunner::Cargo => {
-                use std::collections::HashSet;
-                let mut modules: HashSet<String> = HashSet::new();
-                for path in changed_paths {
-                    let path_str = path.to_string();
-                    if !path_str.starts_with("src/") || !path_str.ends_with(".rs") {
-                        return None;
-                    }
-                    // Strip "src/" prefix and ".rs" suffix
-                    let mut rel = &path_str["src/".len()..path_str.len() - ".rs".len()];
-                    // Handle mod.rs case
-                    if rel.ends_with("/mod") {
-                        rel = &rel[..rel.len() - "/mod".len()];
-                    }
-                    let module_path = rel.replace('/', "::");
-                    modules.insert(module_path);
-                }
-                if modules.is_empty() {
-                    return Some(vec!["test".to_string()]);
-                }
-                // Build args: cargo test -- <module patterns>
-                let mut args = vec!["test".to_string(), "--".to_string()];
-                let pattern = modules.iter().cloned().collect::<Vec<_>>().join(" ");
-                args.push(pattern);
-                Some(args)
-            }
+            // File paths are not test dependencies: crate roots, #[path]
+            // modules and integration tests defeat name-based guesses. Even a
+            // nonempty filtered run can omit the tests affected by an edit.
+            TestRunner::Cargo => None,
             TestRunner::Pytest => {
                 // Return paths as-is for pytest (could be used as arguments)
                 Some(changed_paths.iter().map(|p| p.to_string()).collect())
@@ -581,357 +550,6 @@ impl EvalEngine {
             TestRunner::Unknown(_) => None,
             _ => None,
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // Coverage tracking
-    // -----------------------------------------------------------------------
-
-    /// Detect whether a coverage tool is available on the system.
-    pub fn detect_coverage_tool() -> Option<concerto_core::types::CoverageTool> {
-        // Check cargo-llvm-cov first (most common in Rust projects).
-        if std::process::Command::new("cargo")
-            .arg("llvm-cov")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
-        {
-            return Some(concerto_core::types::CoverageTool::LlvmCov);
-        }
-        // Fall back to cargo-tarpaulin.
-        if std::process::Command::new("cargo")
-            .arg("tarpaulin")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
-        {
-            return Some(concerto_core::types::CoverageTool::Tarpaulin);
-        }
-        None
-    }
-
-    /// Parse `cargo llvm-cov --json` output.
-    fn parse_llvm_cov_json(raw: &str) -> Option<concerto_core::types::CoverageInfo> {
-        // Expected JSON structure (simplified):
-        // {
-        //   "data": [{
-        //     "totals": {
-        //       "lines": {"count": N, "covered": M, "percent": P},
-        //       "functions": {"count": N, "covered": M, "percent": P},
-        //       "branches": {"count": N, "covered": M, "percent": P}
-        //     }
-        //   }]
-        // }
-        #[derive(serde::Deserialize)]
-        struct LlvmCovReport {
-            data: Vec<LlvmCovData>,
-        }
-        #[derive(serde::Deserialize)]
-        struct LlvmCovData {
-            totals: LlvmCovTotals,
-        }
-        #[derive(serde::Deserialize)]
-        struct LlvmCovTotals {
-            lines: LlvmCovMetric,
-            #[serde(default)]
-            functions: Option<LlvmCovMetric>,
-            #[serde(default)]
-            branches: Option<LlvmCovMetric>,
-        }
-        #[derive(serde::Deserialize)]
-        struct LlvmCovMetric {
-            percent: f64,
-        }
-
-        let report: LlvmCovReport = serde_json::from_str(raw).ok()?;
-        let totals = report.data.into_iter().next()?.totals;
-        Some(concerto_core::types::CoverageInfo {
-            tool: concerto_core::types::CoverageTool::LlvmCov,
-            line_percent: totals.lines.percent,
-            function_percent: totals.functions.map(|m| m.percent),
-            branch_percent: totals.branches.map(|m| m.percent),
-            raw_tail: raw.chars().rev().take(1000).collect::<String>().chars().rev().collect(),
-        })
-    }
-
-    /// Parse `cargo tarpaulin --out Json` output.
-    fn parse_tarpaulin_json(raw: &str) -> Option<concerto_core::types::CoverageInfo> {
-        // Expected JSON structure:
-        // {
-        //   "coverage_percent": 75.0,
-        //   "line_coverage": [{"covered": 1, "uncovered": 0, ...}, ...]
-        // }
-        #[derive(serde::Deserialize)]
-        struct TarpaulinReport {
-            #[serde(default)]
-            coverage_percent: Option<f64>,
-        }
-        let report: TarpaulinReport = serde_json::from_str(raw).ok()?;
-        let line_percent = report.coverage_percent.unwrap_or(0.0);
-        Some(concerto_core::types::CoverageInfo {
-            tool: concerto_core::types::CoverageTool::Tarpaulin,
-            line_percent,
-            function_percent: None,
-            branch_percent: None,
-            raw_tail: raw.chars().rev().take(1000).collect::<String>().chars().rev().collect(),
-        })
-    }
-
-    /// Run coverage collection only (standalone), returning CoverageInfo.
-    pub async fn run_coverage(
-        &self,
-        _cancel: CancellationToken,
-    ) -> Result<concerto_core::types::CoverageInfo, EvalError> {
-        if self.process_executor.is_some() {
-            return Err(EvalError::HarnessSetupFailed("native coverage execution is not implemented; run coverage through the governed shell tool".into()));
-        }
-        let tool = Self::detect_coverage_tool().ok_or_else(|| {
-            EvalError::HarnessSetupFailed(
-                "no coverage tool found — install cargo-llvm-cov or cargo-tarpaulin".into(),
-            )
-        })?;
-
-        let output = match tool {
-            concerto_core::types::CoverageTool::LlvmCov => {
-                let mut cmd = std::process::Command::new("cargo");
-                cmd.args(["llvm-cov", "--json", "--output-path", "/dev/stdout"]);
-                cmd.current_dir(&self.project_dir);
-                cmd.stdout(std::process::Stdio::piped());
-                cmd.stderr(std::process::Stdio::piped());
-                let child = cmd.spawn().map_err(|e| {
-                    EvalError::HarnessSetupFailed(format!("failed to spawn cargo llvm-cov: {e}"))
-                })?;
-                let output = child.wait_with_output().map_err(EvalError::Io)?;
-                if output.status.success() {
-                    let raw = String::from_utf8_lossy(&output.stdout).to_string();
-                    Self::parse_llvm_cov_json(&raw).ok_or_else(|| {
-                        EvalError::HarnessSetupFailed("failed to parse llvm-cov JSON output".into())
-                    })?
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    return Err(EvalError::HarnessSetupFailed(format!(
-                        "llvm-cov failed: {stderr}"
-                    )));
-                }
-            }
-            concerto_core::types::CoverageTool::Tarpaulin => {
-                let mut cmd = std::process::Command::new("cargo");
-                cmd.args(["tarpaulin", "--out", "Json", "--output-dir", "/tmp"]);
-                cmd.current_dir(&self.project_dir);
-                cmd.stdout(std::process::Stdio::piped());
-                cmd.stderr(std::process::Stdio::piped());
-                let child = cmd.spawn().map_err(|e| {
-                    EvalError::HarnessSetupFailed(format!("failed to spawn cargo tarpaulin: {e}"))
-                })?;
-                let output = child.wait_with_output().map_err(EvalError::Io)?;
-                if output.status.success() {
-                    // tarpaulin writes to a file; also captures stdout
-                    let stdout_raw = String::from_utf8_lossy(&output.stdout).to_string();
-                    Self::parse_tarpaulin_json(&stdout_raw).ok_or_else(|| {
-                        EvalError::HarnessSetupFailed(
-                            "failed to parse tarpaulin JSON output".into(),
-                        )
-                    })?
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    return Err(EvalError::HarnessSetupFailed(format!(
-                        "tarpaulin failed: {stderr}"
-                    )));
-                }
-            }
-            concerto_core::types::CoverageTool::Other(_) => {
-                return Err(EvalError::HarnessSetupFailed("unsupported coverage tool".into()));
-            }
-            _ => {
-                return Err(EvalError::HarnessSetupFailed("unsupported coverage tool".into()));
-            }
-        };
-
-        Ok(output)
-    }
-
-    /// Run the test suite and collect coverage in a single pass.
-    /// This runs `cargo llvm-cov` (or the detected tool) which runs tests AND instruments coverage.
-    pub async fn run_with_coverage(
-        &self,
-        cancel: CancellationToken,
-    ) -> Result<concerto_core::types::EvalResult, EvalError> {
-        if self.process_executor.is_some() {
-            return Err(EvalError::HarnessSetupFailed("native coverage execution is not implemented; run coverage through the governed shell tool".into()));
-        }
-        let start = std::time::Instant::now();
-        let tool = Self::detect_coverage_tool()
-            .ok_or_else(|| EvalError::HarnessSetupFailed("no coverage tool found".into()))?;
-
-        let runner = Self::detect_runner(&self.project_dir);
-        let (passed, exit_code, duration_ms, output_tail, coverage) = match &runner {
-            TestRunner::Cargo => {
-                match &tool {
-                    concerto_core::types::CoverageTool::LlvmCov => {
-                        // `cargo llvm-cov` runs tests and collects coverage in one command.
-                        let mut command = if let Some(profile) = &self.shell_profile {
-                            let backend = ShellProfileFactory::backend_for(profile);
-                            backend.check_available(profile).map_err(|e| {
-                                EvalError::HarnessSetupFailed(format!(
-                                    "build shell profile '{}' is unavailable: {e}",
-                                    profile.name
-                                ))
-                            })?;
-                            let full =
-                                "cargo llvm-cov --json --output-path /dev/stdout".to_string();
-                            let mut cmd = Command::new(backend.resolved_program(profile));
-                            cmd.args(backend.command_args(profile, &full));
-                            let base = std::env::vars().collect();
-                            cmd.envs(backend.effective_env(profile, &base));
-                            cmd
-                        } else {
-                            let mut cmd = Command::new("cargo");
-                            cmd.args(["llvm-cov", "--json", "--output-path", "/dev/stdout"]);
-                            cmd
-                        };
-                        let child = command
-                            .current_dir(&self.project_dir)
-                            .stdout(std::process::Stdio::piped())
-                            .stderr(std::process::Stdio::piped())
-                            .kill_on_drop(true)
-                            .spawn()?;
-                        let output = tokio::select! {
-                            res = tokio::time::timeout(self.timeout, child.wait_with_output()) => res,
-                            _ = cancel.cancelled() => return Err(EvalError::Cancelled),
-                        };
-
-                        let actual_duration = start.elapsed().as_millis() as u64;
-                        match output {
-                            Ok(Ok(out)) => {
-                                let passed = out.status.success();
-                                let exit_code = out.status.code().unwrap_or(-1);
-                                let combined = String::from_utf8_lossy(&out.stdout).to_string()
-                                    + &String::from_utf8_lossy(&out.stderr);
-                                let tail = if combined.len() > 2000 {
-                                    combined[combined.len() - 2000..].to_string()
-                                } else {
-                                    combined.clone()
-                                };
-                                let cov = Self::parse_llvm_cov_json(&combined);
-                                (passed, exit_code, actual_duration, tail, cov)
-                            }
-                            Ok(Err(e)) => return Err(EvalError::Io(e)),
-                            Err(_) => (false, -1, actual_duration, "timed out".into(), None),
-                        }
-                    }
-                    concerto_core::types::CoverageTool::Tarpaulin => {
-                        // `cargo tarpaulin` also runs tests with coverage.
-                        let mut command = if let Some(profile) = &self.shell_profile {
-                            let backend = ShellProfileFactory::backend_for(profile);
-                            backend.check_available(profile).map_err(|e| {
-                                EvalError::HarnessSetupFailed(format!(
-                                    "build shell profile '{}' is unavailable: {e}",
-                                    profile.name
-                                ))
-                            })?;
-                            let full = "cargo tarpaulin --out Json --output-dir /tmp".to_string();
-                            let mut cmd = Command::new(backend.resolved_program(profile));
-                            cmd.args(backend.command_args(profile, &full));
-                            let base = std::env::vars().collect();
-                            cmd.envs(backend.effective_env(profile, &base));
-                            cmd
-                        } else {
-                            let mut cmd = Command::new("cargo");
-                            cmd.args(["tarpaulin", "--out", "Json", "--output-dir", "/tmp"]);
-                            cmd
-                        };
-                        let child = command
-                            .current_dir(&self.project_dir)
-                            .stdout(std::process::Stdio::piped())
-                            .stderr(std::process::Stdio::piped())
-                            .kill_on_drop(true)
-                            .spawn()?;
-                        let output = tokio::select! {
-                            res = tokio::time::timeout(self.timeout, child.wait_with_output()) => res,
-                            _ = cancel.cancelled() => return Err(EvalError::Cancelled),
-                        };
-
-                        let actual_duration = start.elapsed().as_millis() as u64;
-                        match output {
-                            Ok(Ok(out)) => {
-                                let passed = out.status.success();
-                                let exit_code = out.status.code().unwrap_or(-1);
-                                let stdout_raw = String::from_utf8_lossy(&out.stdout).to_string();
-                                let stderr_raw = String::from_utf8_lossy(&out.stderr);
-                                let combined = stdout_raw.clone() + &stderr_raw;
-                                let tail = if combined.len() > 2000 {
-                                    combined[combined.len() - 2000..].to_string()
-                                } else {
-                                    combined.clone()
-                                };
-                                let cov = Self::parse_tarpaulin_json(&stdout_raw);
-                                (passed, exit_code, actual_duration, tail, cov)
-                            }
-                            Ok(Err(e)) => return Err(EvalError::Io(e)),
-                            Err(_) => (false, -1, actual_duration, "timed out".into(), None),
-                        }
-                    }
-                    concerto_core::types::CoverageTool::Other(_) => {
-                        return Err(EvalError::HarnessSetupFailed(
-                            "unsupported coverage tool".into(),
-                        ));
-                    }
-                    _ => {
-                        return Err(EvalError::HarnessSetupFailed(
-                            "unsupported coverage tool".into(),
-                        ));
-                    }
-                }
-            }
-            // For non-Cargo runners, run tests normally, then collect coverage separately.
-            _ => {
-                let eval =
-                    self.run_for_runner(runner.clone(), &self.project_dir, cancel.clone()).await?;
-                let cov = self.run_coverage(cancel).await.ok();
-                (eval.passed, eval.exit_code, eval.duration_ms, eval.output_tail, cov)
-            }
-        };
-
-        Ok(concerto_core::types::EvalResult {
-            runner,
-            exit_code,
-            passed,
-            duration_ms,
-            output_tail,
-            coverage,
-            provenance: EvalProvenance::Harness,
-        })
-    }
-
-    /// Run scoped tests with coverage.
-    pub async fn run_scoped_with_coverage(
-        &self,
-        changed_paths: &[camino::Utf8PathBuf],
-        cancel: CancellationToken,
-    ) -> Result<concerto_core::types::EvalResult, EvalError> {
-        let runner = Self::detect_runner(&self.project_dir);
-        if runner != TestRunner::Cargo {
-            // Scoped coverage only works with Cargo for now.
-            return self.run_with_coverage(cancel).await;
-        }
-        // Fall back to scoped tests without coverage instrumentation for Cargo,
-        // since llvm-cov doesn't easily support --package filtering like `cargo test -p`.
-        // We run tests scoped, then collect full-project coverage.
-        let eval = self.run_scoped(changed_paths, cancel.clone()).await?;
-        let cov = self.run_coverage(cancel).await.ok();
-        Ok(concerto_core::types::EvalResult {
-            runner,
-            exit_code: eval.exit_code,
-            passed: eval.passed,
-            duration_ms: eval.duration_ms,
-            output_tail: eval.output_tail,
-            coverage: cov,
-            provenance: eval.provenance,
-        })
     }
 }
 
@@ -969,9 +587,14 @@ mod tests {
             if self.deny {
                 return Err(EvalError::TestRunnerFailed("policy denied".into()));
             }
+            let stdout = format!(
+                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; \
+                 0 filtered out; finished in 0.00s\n{}",
+                "🙂".repeat(2100),
+            );
             Ok(concerto_core::types::ToolOutput {
                 summary: "validated".into(),
-                data: serde_json::json!({"exit_code":0,"stdout":"🙂".repeat(2100),"stderr":""}),
+                data: serde_json::json!({"exit_code":0,"stdout":stdout,"stderr":""}),
             })
         }
     }
@@ -1004,7 +627,10 @@ mod tests {
                 assert_eq!(result.output_tail.chars().count(), 2000);
             }
             assert!(engine.run_with_coverage(CancellationToken::new()).await.is_err());
+            assert!(engine.run_coverage(CancellationToken::new()).await.is_err());
+            assert!(engine.run_scoped_with_coverage(&[], CancellationToken::new()).await.is_err());
             assert_eq!(calls.load(Ordering::SeqCst), 1, "coverage must not bypass the gate");
+            assert!(!directory.path().join("target").exists());
         }
     }
 
@@ -1253,11 +879,10 @@ mod tests {
         assert!(result.output_tail.contains("eval fallback"));
     }
 
-    /// With no Cargo project reachable there is nothing to validate, so the
-    /// honest Unknown failure is preserved (not a false fallback failure that
-    /// would mark every non-Rust run Partial).
+    /// Absence of a supported harness is distinct from an execution failure;
+    /// callers can report unavailability without inventing a passing run.
     #[tokio::test]
-    async fn no_config_and_no_cargo_project_keeps_honest_failure() {
+    async fn no_config_and_no_cargo_project_reports_unavailable() {
         let dir = tempfile::tempdir().unwrap();
         let engine = EvalEngine::new(dir.path());
         let error = engine
@@ -1265,6 +890,26 @@ mod tests {
             .await
             .expect_err("no Cargo project and no harness must stay a clean error");
         assert!(error.to_string().contains("no config file found"), "{error}");
+        assert!(matches!(error, EvalError::HarnessUnavailable(_)));
+    }
+
+    #[tokio::test]
+    async fn unavailable_harness_does_not_hide_invalid_roots_or_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = EvalEngine::new(dir.path().join("missing"))
+            .run(CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, EvalError::Io(ref error)
+            if error.kind() == std::io::ErrorKind::NotFound));
+        let file = dir.path().join("file.txt");
+        std::fs::write(&file, "not a project directory").unwrap();
+        let error = EvalEngine::new(file).run(CancellationToken::new()).await.unwrap_err();
+        assert!(matches!(error, EvalError::HarnessSetupFailed(_)));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let error = EvalEngine::new(dir.path()).run(cancel).await.unwrap_err();
+        assert!(matches!(error, EvalError::Cancelled));
     }
 
     /// A detected harness keeps `Harness` provenance (no false fallback mark).
@@ -1338,7 +983,7 @@ mod tests {
 
     #[test]
     fn parse_tarpaulin_json_valid() {
-        let json = r#"{"coverage_percent": 82.5}"#;
+        let json = r#"{"coverage": 82.5, "covered": 33, "coverable": 40}"#;
         let info = EvalEngine::parse_tarpaulin_json(json).expect("should parse");
         assert_eq!(info.tool, concerto_core::types::CoverageTool::Tarpaulin);
         assert!((info.line_percent - 82.5).abs() < 0.01);
@@ -1349,14 +994,16 @@ mod tests {
     #[test]
     fn parse_tarpaulin_json_malformed_returns_none() {
         assert!(EvalEngine::parse_tarpaulin_json("not json").is_none());
-        assert!(EvalEngine::parse_tarpaulin_json(r#"{"coverage_percent": "abc"}"#).is_none());
+        assert!(EvalEngine::parse_tarpaulin_json(
+            r#"{"coverage": "abc", "covered": 0, "coverable": 40}"#
+        )
+        .is_none());
     }
 
     #[test]
     fn parse_tarpaulin_json_missing_percent_field() {
         let json = r#"{"other_field": 42}"#;
-        let info = EvalEngine::parse_tarpaulin_json(json).expect("should parse with default");
-        assert!((info.line_percent - 0.0).abs() < 0.01);
+        assert!(EvalEngine::parse_tarpaulin_json(json).is_none());
     }
 
     #[test]
@@ -1466,24 +1113,18 @@ mod tests {
     use camino::Utf8PathBuf;
 
     #[test]
-    fn scoped_args_cargo_returns_filtered_pattern() {
-        let paths = vec![Utf8PathBuf::from("src/lib.rs")];
-        let args = EvalEngine::scoped_args(&TestRunner::Cargo, &paths);
-        assert_eq!(args, Some(vec!["test".to_string(), "--".to_string(), "lib".to_string()]));
-    }
-
-    #[test]
-    fn scoped_args_cargo_non_src_returns_none() {
-        let paths = vec![Utf8PathBuf::from("tests/integration.rs")];
-        let args = EvalEngine::scoped_args(&TestRunner::Cargo, &paths);
-        assert!(args.is_none(), "paths outside src/ should return None");
-    }
-
-    #[test]
-    fn scoped_args_cargo_mod_rs_strips_mod() {
-        let paths = vec![Utf8PathBuf::from("src/cli/mod.rs")];
-        let args = EvalEngine::scoped_args(&TestRunner::Cargo, &paths);
-        assert_eq!(args, Some(vec!["test".to_string(), "--".to_string(), "cli".to_string()]));
+    fn scoped_args_cargo_falls_back_without_guessing_test_names() {
+        for paths in [
+            vec![],
+            vec!["src/lib.rs"],
+            vec!["src/main.rs"],
+            vec!["src/cli/mod.rs"],
+            vec!["src/first.rs", "src/second.rs"],
+            vec!["tests/integration.rs"],
+        ] {
+            let paths: Vec<_> = paths.into_iter().map(Utf8PathBuf::from).collect();
+            assert_eq!(EvalEngine::scoped_args(&TestRunner::Cargo, &paths), None);
+        }
     }
 
     #[test]

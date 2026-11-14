@@ -370,13 +370,24 @@ impl GenericSpecialistAgent {
                     }
                     None => HashMap::new(),
                 };
-                // ADR-65 §4: safe read dedupe — a plain single-path filesystem
-                // read whose clean observation still matches the disk (re-statted
-                // now, content hash verified) is a serve candidate. Any doubt
-                // degrades to normal execution; the model receives a
-                // byte-identical read result either way.
+                // Authorize before cache validation reads current disk bytes.
+                // Denial/approval-required/cache misses use normal execution.
                 let serve = match &self.tool_facts {
-                    Some(facts) => {
+                    Some(facts)
+                        if crate::read_cache::plain_single_path_read(
+                            &tool_call.name,
+                            &arguments,
+                        )
+                        .is_some()
+                            && executor
+                                .policy_verdict_is_allow(
+                                    &tool_call.name,
+                                    &arguments,
+                                    &context.session,
+                                    cancel.clone(),
+                                )
+                                .await =>
+                    {
                         crate::read_cache::maybe_serve_read(
                             facts,
                             &context.session.project_dir,
@@ -385,25 +396,6 @@ impl GenericSpecialistAgent {
                             &cancel,
                         )
                         .await
-                    }
-                    None => None,
-                };
-                // ADR-65 F1a: serve only when the policy engine explicitly
-                // allows the read through the advisory path (no decision row, no
-                // quota consumption); any non-Allow verdict runs the normal,
-                // fully policy-checked executor path below.
-                let serve = match serve {
-                    Some(serve)
-                        if executor
-                            .policy_verdict_is_allow(
-                                &tool_call.name,
-                                &arguments,
-                                &context.session,
-                                cancel.clone(),
-                            )
-                            .await =>
-                    {
-                        Some(serve)
                     }
                     _ => None,
                 };

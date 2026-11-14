@@ -1,4 +1,4 @@
-name: Native shell platforms
+name: Native shell and write protection
 
 on:
   pull_request:
@@ -20,7 +20,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
       RUSTFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.96.0
       - name: Linux system libraries
         if: runner.os == 'Linux'
@@ -28,3 +28,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Native commands and security regression tests
         run: cargo test --locked -p concerto-core -p concerto-config -p concerto-tools -p concerto-shell
+      - name: Native write-version and resume regressions
+        run: "cargo test --locked -p concerto-orchestrator --lib gate:: -j2"
+      - name: Native read-provenance session cleanup
+        run: cargo test --locked -p concerto-sessions --lib delete_session_removes_read_provenance -j2
+      - name: Native SQLite security regression
+        run: cargo test --locked -p concerto-sessions --lib sqlite_runtime_includes_wal_page_size_security_fix -j2
+      - name: Native SQLCipher storage regressions
+        if: runner.os != 'Windows'
+        run: cargo test --locked -p concerto-sessions --lib at_rest -j2
+      - name: Native managed rollback regressions
+        run: "cargo test --locked -p concerto-orchestrator --lib managed_rollback::tests -j2"
+      - name: Native run completion regressions
+        run: cargo test --locked -p concerto-orchestrator --lib stage_tracker_ -j2
+      - name: Native Cargo verification with shared artifacts
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: cargo test --locked -p concerto-eval --test cargo_verification -j2
+      - name: Native coverage regression tests
+        run: cargo test --locked -p concerto-eval --lib coverage -j2
