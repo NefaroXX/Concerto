@@ -285,6 +285,12 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      # cargo-audit can return zero after registry lookup failures. The
+      # action installs it and publishes advisories; this gate additionally
+      # requires a complete, warning-free scan with the same ignore policy.
+      - name: Require complete cargo-audit results
+        run: python3 scripts/check-cargo-audit.py
+
   # ------------------------------------------------------- desktop UI palette
   ui-colors:
     name: Desktop UI palette check
