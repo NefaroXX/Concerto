@@ -25,7 +25,7 @@ passing repository tests alone does not close a finding.
 | H13 | P1 | Structured-response parsing rewrites Unicode before attempting JSON parsing | Fixed and verified; awaiting merge |
 | H14 | P2 | Checkpoint startup can degrade into ToolNotFound; CLI test failed intermittently | Open; observed during H02 verification |
 | H15 | P1 | Orchestrator read cache trusts matching size/mtime without checking current bytes | Fixed and verified; awaiting merge |
-| H16 | P2 | Coverage-only Cargo runners trust exit status and truncate output at byte offsets | Open; source traced during H04 |
+| H16 | P2 | Coverage runners misread reports, lose cancellation and trust incomplete test evidence | Full local battery verified; remote CI pending |
 | H17 | P1 | Resumed history lacks restored read-version claims when a new gate is constructed | Fixed and verified; awaiting merge |
 | H18 | P1 | Locked Wasmtime 36.0.19 fails fresh security gates on RUSTSEC-2026-0424 | Fixed and verified; awaiting merge |
 | H19 | P2 | Action-required minimum tool-call check ignores earlier continuation rounds | Fixed and verified; awaiting merge |
@@ -37,13 +37,15 @@ passing repository tests alone does not close a finding.
 | H25 | P2 | Benchmark required-pattern checks count unreadable files as matching | Fixed and verified; awaiting merge |
 | H26 | P2 | Nine non-standard benchmark task manifests contain invalid-length IDs | Fixed and verified; awaiting merge |
 | H27 | P1 | Native orchestrator builds fail on macOS (Linux syscall) and Windows (test helper cfgs) | Fixed and verified; awaiting merge |
-| H28 | P2 | Unused dependencies and inconsistent versions inflate the dependency graph | Cleanup prepared; full verification pending; remaining warnings tracked |
+| H28 | P2 | Unused dependencies and inconsistent versions inflate the dependency graph | Initial cleanup verified on 43a3e79; 67 duplicate families remain under review |
 | H29 | P2 | Declared Rust 1.88 minimum contradicts required locked dependencies | Open; dependency manifests verified |
 | H30 | P1 | Locked wasmtimer retains unmaintained pin-utils and fails the supply-chain gate | Fixed and verified; awaiting merge |
 | H31 | P1 | Bundled SQLite/SQLCipher fails the WAL memory-disclosure security gate | Fixed and verified; awaiting merge |
 | H32 | P1 | Locked rustix fails the extended-attribute buffer soundness security gate | Fixed and verified; awaiting merge |
-| H33 | P2 | Nested Cargo fixtures can execute each other’s binaries with a shared target directory | Locally verified; remote CI pending |
+| H33 | P2 | Nested Cargo fixtures can execute each other’s binaries with a shared target directory | Fixed and verified on 43a3e79; awaiting merge |
 | H34 | P2 | Bounded subprocess capture can conceal inconsistent test evidence without marking output incomplete | Open; source path traced, execution reproduction pending |
+| H35 | P1 | Locked quinn-udp fails fresh raw-lockfile security scan | Patched and locally verified; remote CI pending |
+| H36 | P2 | cargo-audit can report incomplete registry checks with exit zero | Strict gate locally verified, including complete real scan; remote CI pending |
 
 
 ## 2026-10-29 — H01: preserve streaming events across chunks
@@ -1643,3 +1645,205 @@ Next: patch H18, then continue H07's truthful verification/completion handling.
   and dependency cleanup are being saved separately before publication; the
   final head still needs all required GitHub checks, including the new native
   shared-target integration step. No H16 implementation has been mixed in.
+
+
+## 2026-11-12 — H16 parser regression draft
+
+- Added four isolated parser regressions for real Tarpaulin percentages,
+  measured zero versus missing fields, invalid aggregate measurements, and
+  invalid LLVM line/function/branch percentages. Report shape verified against
+  https://github.com/xd009642/tarpaulin/blob/0.37.5/src/report/json.rs.
+- Formatting has been applied. No baseline execution or implementation fix
+  yet: Cargo compilation remains serialized behind the H28/H33 verification.
+  This worktree starts at f8d91bb and must incorporate the verified dependency
+  cleanup before integration.
+- Added three Unix process-level regression tests using a per-fixture
+  shell profile and fake Cargo executable. They cover profile-local tool
+  discovery/report files, empty and ignored-only suites, and Unicode output.
+  Fixtures use disk-backed directories with spaces, avoid global environment
+  mutation, and refuse report paths outside their own target directory even
+  when exercising the unfixed implementation. Formatting and diff checks
+  pass; execution remains queued behind the active H28/H33 battery.
+
+- Advanced this isolated worktree to published 43a3e79, retaining the drafted
+  tests and the verified H28/H33 cleanup. Starting baseline execution of the
+  seven coverage regressions; no coverage implementation change yet.
+
+
+## 2026-11-12 — Published cleanup green; H16 failures reproduced
+
+- Both GitHub workflows completed successfully on exact head
+  `43a3e7960de997a371cb4aa04ee79b422d734ff0`: main run 43230517229
+  and native run 43230517228. All twelve required checks are green, including
+  shared-target Cargo fixture verification on Linux, macOS and Windows.
+  Updated PR #379 to identify this verified head explicitly.
+- The seven H16 regressions compiled without warnings and all seven failed
+  against that head before implementation changes. Real Tarpaulin fields
+  incorrectly produced zero; missing reports and impossible percentages were
+  accepted. Unicode output panicked at a non-character byte boundary.
+  Report-file guards rejected the legacy /dev/stdout path with exit 65.
+  The empty-suite case stopped at that guard too, so its false-success
+  assertion still needs independent execution after report handling is fixed.
+- Evidence: target/harness-reliability/h16-baseline.log and status JSON,
+  with the baseline source copies and hashes retained alongside them.
+
+## 2026-11-12 — H16 initial implementation and targeted evidence
+
+- Moved coverage execution/parsing into its own module. Runs now discover the
+  coverage executable through the same shell profile used for execution, require
+  a successful version probe, and share one asynchronous, cancellable deadline.
+  Scoped and standalone entrypoints use that path instead of launching a second
+  test suite or swallowing coverage/cancellation errors.
+- Reports live in unique temporary directories under the project's target/,
+  with generated relative paths safe for shell profiles even when the project
+  path contains spaces. Reports are read separately from diagnostics; missing,
+  malformed, non-regular or oversized reports fail explicitly. Cleanup runs on
+  success and early return. Tarpaulin uses its released coverage/count fields;
+  LLVM metrics require valid counts/percentages and a single dataset.
+- Test success uses the existing complete libtest-summary interpreter and
+  character-safe display tail. Empty and ignored-only suites now execute their
+  negative assertions successfully. Nonzero commands retain their failure and
+  do not attach partial coverage.
+- Added a checked entrypoint to the shared process runner so coverage cannot
+  accept silently truncated/read-failed output. It retains the existing process
+  group cancellation/timeout mechanism and bounded pipe draining. Other legacy
+  callers still use their existing capture contract: H34 is not resolved by
+  this coverage-specific use of the checked path.
+- First repair run: all seven original regressions pass. Expanded eval package
+  run: 103 unit tests and three integration tests pass, including discovery/run
+  cancellation and timeout, stale/malformed reports, one instrumented run for
+  standalone/scoped entrypoints and failure propagation. Process-runner tests
+  and warnings-denied targeted Clippy are still running; full CI verification
+  and native coverage execution remain pending. Nothing from H16 is published.
+
+- The checked-process suite completed: 23 passed, including both stdout and
+  stderr overflow with successful child exits, exact capture boundaries and
+  injected pipe-read failure. Targeted Clippy was interrupted without an exit
+  record: its coordinator and every compiler child were confirmed absent
+  after the execution environment changed. It remains unverified and will
+  resume; no compile failure is inferred from the missing process. The same
+  interruption stopped llvm-tools installation; both released coverage tool
+  archives downloaded successfully with verified GitHub SHA-256 digests.
+- Prepared an explicit ignored live-tool contract test for both released
+  coverage tools. This requires external binaries and LLVM tools; it is not
+  silently skipped as a default passing test. The default regression suite
+  remains self-contained. Added its portable parser and Unix process
+  regressions to the native matrix; Windows still runs the portable cases.
+
+- The Clippy metadata failure was traced through concerto-config -> figment
+  -> pear. Rebuilding only concerto-config and then figment exposed the next
+  dependency in that chain; rebuilding pear, pear_codegen and
+  proc-macro2-diagnostics restored resolution. No source/dependency-version
+  change was made to those packages. The final targeted all-target Clippy
+  completed with warnings denied (h16-clippy-pear.log, exit zero). Retained
+  all failed logs and the initially rejected config metadata/hash for diagnosis;
+  the initial cause of the cache inconsistency is not established.
+- Added report-size/type and concurrent-report-path regressions, and extended
+  the policy test to standalone/scoped coverage. LLVM requests summary-only
+  JSON because only aggregate measurements are consumed. Coverage follows the
+  selected tool's supported test types; llvm-cov's stable-Rust run does not
+  instrument doctests. Broader package testing is running on these additions.
+
+## 2026-11-12 — H16 released-tool check and full validation start
+
+- The broader package run passed 465 tests: 106 eval units, three Cargo
+  verification integration tests and 356 tools units, with zero failures.
+  The external-tool contract test is explicitly ignored by default and was
+  then run separately; it is not counted as passing in that default run.
+- Real cargo-llvm-cov 0.9.1 and cargo-tarpaulin 0.37.5 both executed a real
+  fixture test and produced parsed reports (87.5% and 75% line coverage,
+  respectively; different instrumentation/measurement semantics, not a
+  comparison benchmark). Both runs used project paths containing spaces and
+  disk-backed isolated fixture build directories. Tarpaulin used its LLVM
+  engine. The LLVM-tools component installation completed successfully.
+- The first live test exposed a defect in the new fixture launcher: using
+  env!("CARGO") called the bare toolchain Cargo, which cannot interpret
+  Tarpaulin's internal +toolchain directive. The fixture now preserves the
+  PATH Cargo launcher. The failed live log is retained; after that fixture
+  repair, the real-tool test passed for both tools. No production workaround
+  was needed. Evidence: h16-live.log and h16-live-launcher.log.
+- Starting the full workspace/CI battery from a source hash snapshot. This
+  includes warnings-denied Clippy/builds, tests and doctests, frontend/WASM/
+  benchmark smoke checks, palette/Python checks and both supply-chain gates.
+  Native CI must still run on the final published head. H16 is not yet marked
+  fully verified or published; the existing published head remains 43a3e79
+  with all twelve required checks green.
+
+
+## 2026-11-14 — H16 full runtime battery; refreshed security findings
+
+- The H16 coordinator finished. Workspace tests passed: 6,100 passed, zero
+  failed, 17 ignored across 86 groups. All-target Clippy with warnings denied,
+  full/default and both frontend builds, launcher/cache/CLI smoke, four WASM
+  guests, nine release benchmark smokes, formatting, palette and Python checks
+  passed. All 998 files match the recorded source snapshot exactly.
+- The original audit process returned zero but logged registry timeout errors.
+  That is not a complete yanked-package check; its exit code is not treated as
+  sufficient verification. The subsequent fresh audit additionally found
+  RUSTSEC-2026-0538 in quinn-udp 0.5.15 (raw lockfile gate). Cargo-deny still
+  passed. Nothing is published until both gates are fully verified.
+- H35: updated quinn-udp to patched 0.5.16. The fetched RustSec advisory
+  describes a receive-loop denial of service in the recvmsg paths on affected
+  non-Linux/non-Windows targets. Kept all prior dependency selections: Cargo's
+  update initially reselected several broad windows-sys requirements, so those
+  unrelated changes were removed after checking each published requirement.
+  cargo metadata --locked --offline validates the resulting lockfile. Only
+  the quinn-udp version/checksum and quinn's resolved edge differ; no new
+  package or advisory suppression was added. Metadata node membership alone
+  is not proof of an enabled build path.
+- H36: cargo-audit 0.22.2 source confirms registry lookup errors are printed
+  without entering the returned warnings or failure status. Added
+  scripts/check-cargo-audit.py after the existing RustSec CI action: it retains
+  the same advisory exceptions, denies warnings, and independently rejects
+  error/warning diagnostics even when the process exits zero. Seven real
+  child-process regression tests pass; all 13 Python tests pass. The strict
+  gate is now being exercised against the real registry.
+- Evidence: h16-full-* logs, h16-source-sha256.json, h16-audit-refresh.log,
+  h35-resolved.lock (including discarded unrelated resolver changes),
+  h35-metadata.json and h36-strict-audit.log. The previous passing runtime
+  snapshot does not certify these subsequent lockfile/CI changes; final
+  combined validation will run after the security checks complete.
+
+- The patched cargo-deny scan passed. `cargo tree --locked --target all -i
+  quinn-udp` reports no enabled reverse dependency, confirming the raw-lockfile
+  gate is needed for this optional dependency. The first real strict audit
+  rejected a lock-contention warning caused by running it alongside cargo-deny
+  against the shared advisory database; it found no remaining vulnerability
+  or registry timeout. Both processes completed. Rerunning the strict audit
+  alone now, and future local security gates will be serialized. The warning
+  was not suppressed or reclassified as success.
+
+- The serialized strict audit completed with exit zero and no error/warning
+  diagnostics: freshly fetched database, 1,509 advisories, 1,079 lockfile
+  dependencies. Both the advisory scan and registry checks completed. The
+  patched cargo-deny scan also passed. Starting final combined validation with
+  the minimal quinn patch, strict audit wrapper, 13 Python tests and current
+  coverage sources; artifacts use the h16-final-* prefix to preserve the
+  earlier runtime-only results and incomplete audit evidence.
+
+
+## 2026-11-14 — H16/H35/H36 final combined local verification
+
+- Final combined validation completed successfully: 6,100 workspace tests,
+  zero failures, 17 explicitly ignored tests across 86 groups; the released
+  llvm-cov/Tarpaulin contract test also passed separately. All-target Clippy
+  with warnings denied, workspace/frontend builds, launcher/cache/CLI smoke,
+  four WASM guest builds, nine release benchmark smoke targets, formatting,
+  palette checks and all 13 Python tests passed. Both workflow YAML files parse.
+- Both fresh security gates passed. Cargo-deny retains 67 duplicate-version
+  warning families and no other warning category; H28 remains open. The strict
+  raw-lockfile audit fetched 1,509 advisories and checked 1,079 dependencies
+  without errors or warnings, including successful registry checks. No ignore
+  or suppression was added.
+- All 1,000 source-snapshot files matched after validation. Only this final
+  evidence entry is added afterward. The isolated H09 worktree contains two
+  drafted durable-compaction regressions, not an implementation, and has not
+  run Cargo while this battery was active.
+- Saving the quinn dependency repair, coverage repair and stricter audit gate
+  in separate commits, followed by their documentation/work-log update. The
+  final published head still requires every remote check; local results are
+  not presented as native macOS/Windows execution of that new head.
+
+- Saved dependency patch 7d2ab8f, coverage repair 62d1692 and strict audit gate
+  e4af9d6 as separate commits. This documentation commit records their shared
+  verification evidence; publication and exact-head remote checks follow.

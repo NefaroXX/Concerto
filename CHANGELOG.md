@@ -111,6 +111,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Complete security audit gate:** reject registry-check errors even when
+  cargo-audit returns zero, and update locked quinn-udp to 0.5.16 for
+  RUSTSEC-2026-0538 without changing the advisory exception policy.
+
+- **Coverage verification:** discover coverage tools through the configured
+  build shell, collect reports separately from diagnostics, and require
+  executed passing tests. Tarpaulin reports use the released field names;
+  malformed metrics, missing/stale reports and incomplete captured output
+  fail explicitly. Standalone and scoped coverage preserve cancellation and
+  deadlines, and Unicode diagnostics no longer panic.
+
 - **Cargo regression fixture isolation.** Give temporary test projects unique
   package identities so parallel verification cannot run another fixture's
   binary when `CARGO_TARGET_DIR` points to a shared build directory.

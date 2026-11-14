@@ -25,6 +25,11 @@ rules/preset.
 
 ## Automated workspace checks
 
+Use `python3 scripts/check-cargo-audit.py` for the complete raw-lockfile audit
+CI gate. It runs cargo-audit with warnings denied and also rejects diagnostics
+that cargo-audit can print without a nonzero exit status, including incomplete
+registry/yank checks. The advisory exception policy stays in `.cargo/audit.toml`.
+
 These are the same checks CI runs; paste the output into the copied template's
 automated-checks table.
 
@@ -58,6 +63,27 @@ $env:CONCERTO_TEST_MODE = "1"
 | Documentation tests | | |
 | Cargo deny | | |
 | Cargo audit | | |
+
+### Released coverage tool contract check
+
+The default eval tests use isolated executable fixtures and do not require
+coverage tools. An additional Unix integration test exercises real Cargo tests
+with released cargo-llvm-cov and cargo-tarpaulin binaries. Install
+`llvm-tools-preview` for the selected Rust toolchain, place each coverage binary
+under `<tool-root>/cargo-llvm-cov/cargo-llvm-cov` and
+`<tool-root>/cargo-tarpaulin/cargo-tarpaulin`, then run:
+
+```bash
+CONCERTO_COVERAGE_TOOLS_DIR="/absolute/disk-backed/tool-root" \
+  cargo test --locked -p concerto-eval --test coverage_live -- --ignored --nocapture
+```
+
+The fixture uses a separate project and target directory per tool, including
+spaces in its path, and selects Tarpaulin's LLVM engine to avoid container
+ptrace restrictions. It verifies executed tests and parsed measurements, not a
+coverage percentage threshold. The coverage tool determines supported test
+types; cargo-llvm-cov does not instrument doctests on stable Rust. Normal
+workspace doc tests remain a separate required check.
 
 ### Acceptance-bar automation (Phase 6, 2026-08-01)
 
