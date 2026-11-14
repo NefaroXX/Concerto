@@ -45,3 +45,5 @@ jobs:
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: cargo test --locked -p concerto-eval --test cargo_verification -j2
+      - name: Native coverage regression tests
+        run: cargo test --locked -p concerto-eval --lib coverage -j2

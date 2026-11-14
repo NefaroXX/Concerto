@@ -31,6 +31,9 @@ pub trait EvalProcessExecutor: Send + Sync {
 }
 
 pub mod categories;
+mod coverage;
+#[cfg(test)]
+mod coverage_regressions;
 pub mod observation;
 pub mod persona_mem;
 pub mod runner;
@@ -548,357 +551,6 @@ impl EvalEngine {
             _ => None,
         }
     }
-
-    // -----------------------------------------------------------------------
-    // Coverage tracking
-    // -----------------------------------------------------------------------
-
-    /// Detect whether a coverage tool is available on the system.
-    pub fn detect_coverage_tool() -> Option<concerto_core::types::CoverageTool> {
-        // Check cargo-llvm-cov first (most common in Rust projects).
-        if std::process::Command::new("cargo")
-            .arg("llvm-cov")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
-        {
-            return Some(concerto_core::types::CoverageTool::LlvmCov);
-        }
-        // Fall back to cargo-tarpaulin.
-        if std::process::Command::new("cargo")
-            .arg("tarpaulin")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
-        {
-            return Some(concerto_core::types::CoverageTool::Tarpaulin);
-        }
-        None
-    }
-
-    /// Parse `cargo llvm-cov --json` output.
-    fn parse_llvm_cov_json(raw: &str) -> Option<concerto_core::types::CoverageInfo> {
-        // Expected JSON structure (simplified):
-        // {
-        //   "data": [{
-        //     "totals": {
-        //       "lines": {"count": N, "covered": M, "percent": P},
-        //       "functions": {"count": N, "covered": M, "percent": P},
-        //       "branches": {"count": N, "covered": M, "percent": P}
-        //     }
-        //   }]
-        // }
-        #[derive(serde::Deserialize)]
-        struct LlvmCovReport {
-            data: Vec<LlvmCovData>,
-        }
-        #[derive(serde::Deserialize)]
-        struct LlvmCovData {
-            totals: LlvmCovTotals,
-        }
-        #[derive(serde::Deserialize)]
-        struct LlvmCovTotals {
-            lines: LlvmCovMetric,
-            #[serde(default)]
-            functions: Option<LlvmCovMetric>,
-            #[serde(default)]
-            branches: Option<LlvmCovMetric>,
-        }
-        #[derive(serde::Deserialize)]
-        struct LlvmCovMetric {
-            percent: f64,
-        }
-
-        let report: LlvmCovReport = serde_json::from_str(raw).ok()?;
-        let totals = report.data.into_iter().next()?.totals;
-        Some(concerto_core::types::CoverageInfo {
-            tool: concerto_core::types::CoverageTool::LlvmCov,
-            line_percent: totals.lines.percent,
-            function_percent: totals.functions.map(|m| m.percent),
-            branch_percent: totals.branches.map(|m| m.percent),
-            raw_tail: raw.chars().rev().take(1000).collect::<String>().chars().rev().collect(),
-        })
-    }
-
-    /// Parse `cargo tarpaulin --out Json` output.
-    fn parse_tarpaulin_json(raw: &str) -> Option<concerto_core::types::CoverageInfo> {
-        // Expected JSON structure:
-        // {
-        //   "coverage_percent": 75.0,
-        //   "line_coverage": [{"covered": 1, "uncovered": 0, ...}, ...]
-        // }
-        #[derive(serde::Deserialize)]
-        struct TarpaulinReport {
-            #[serde(default)]
-            coverage_percent: Option<f64>,
-        }
-        let report: TarpaulinReport = serde_json::from_str(raw).ok()?;
-        let line_percent = report.coverage_percent.unwrap_or(0.0);
-        Some(concerto_core::types::CoverageInfo {
-            tool: concerto_core::types::CoverageTool::Tarpaulin,
-            line_percent,
-            function_percent: None,
-            branch_percent: None,
-            raw_tail: raw.chars().rev().take(1000).collect::<String>().chars().rev().collect(),
-        })
-    }
-
-    /// Run coverage collection only (standalone), returning CoverageInfo.
-    pub async fn run_coverage(
-        &self,
-        _cancel: CancellationToken,
-    ) -> Result<concerto_core::types::CoverageInfo, EvalError> {
-        if self.process_executor.is_some() {
-            return Err(EvalError::HarnessSetupFailed("native coverage execution is not implemented; run coverage through the governed shell tool".into()));
-        }
-        let tool = Self::detect_coverage_tool().ok_or_else(|| {
-            EvalError::HarnessSetupFailed(
-                "no coverage tool found — install cargo-llvm-cov or cargo-tarpaulin".into(),
-            )
-        })?;
-
-        let output = match tool {
-            concerto_core::types::CoverageTool::LlvmCov => {
-                let mut cmd = std::process::Command::new("cargo");
-                cmd.args(["llvm-cov", "--json", "--output-path", "/dev/stdout"]);
-                cmd.current_dir(&self.project_dir);
-                cmd.stdout(std::process::Stdio::piped());
-                cmd.stderr(std::process::Stdio::piped());
-                let child = cmd.spawn().map_err(|e| {
-                    EvalError::HarnessSetupFailed(format!("failed to spawn cargo llvm-cov: {e}"))
-                })?;
-                let output = child.wait_with_output().map_err(EvalError::Io)?;
-                if output.status.success() {
-                    let raw = String::from_utf8_lossy(&output.stdout).to_string();
-                    Self::parse_llvm_cov_json(&raw).ok_or_else(|| {
-                        EvalError::HarnessSetupFailed("failed to parse llvm-cov JSON output".into())
-                    })?
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    return Err(EvalError::HarnessSetupFailed(format!(
-                        "llvm-cov failed: {stderr}"
-                    )));
-                }
-            }
-            concerto_core::types::CoverageTool::Tarpaulin => {
-                let mut cmd = std::process::Command::new("cargo");
-                cmd.args(["tarpaulin", "--out", "Json", "--output-dir", "/tmp"]);
-                cmd.current_dir(&self.project_dir);
-                cmd.stdout(std::process::Stdio::piped());
-                cmd.stderr(std::process::Stdio::piped());
-                let child = cmd.spawn().map_err(|e| {
-                    EvalError::HarnessSetupFailed(format!("failed to spawn cargo tarpaulin: {e}"))
-                })?;
-                let output = child.wait_with_output().map_err(EvalError::Io)?;
-                if output.status.success() {
-                    // tarpaulin writes to a file; also captures stdout
-                    let stdout_raw = String::from_utf8_lossy(&output.stdout).to_string();
-                    Self::parse_tarpaulin_json(&stdout_raw).ok_or_else(|| {
-                        EvalError::HarnessSetupFailed(
-                            "failed to parse tarpaulin JSON output".into(),
-                        )
-                    })?
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    return Err(EvalError::HarnessSetupFailed(format!(
-                        "tarpaulin failed: {stderr}"
-                    )));
-                }
-            }
-            concerto_core::types::CoverageTool::Other(_) => {
-                return Err(EvalError::HarnessSetupFailed("unsupported coverage tool".into()));
-            }
-            _ => {
-                return Err(EvalError::HarnessSetupFailed("unsupported coverage tool".into()));
-            }
-        };
-
-        Ok(output)
-    }
-
-    /// Run the test suite and collect coverage in a single pass.
-    /// This runs `cargo llvm-cov` (or the detected tool) which runs tests AND instruments coverage.
-    pub async fn run_with_coverage(
-        &self,
-        cancel: CancellationToken,
-    ) -> Result<concerto_core::types::EvalResult, EvalError> {
-        if self.process_executor.is_some() {
-            return Err(EvalError::HarnessSetupFailed("native coverage execution is not implemented; run coverage through the governed shell tool".into()));
-        }
-        let start = std::time::Instant::now();
-        let tool = Self::detect_coverage_tool()
-            .ok_or_else(|| EvalError::HarnessSetupFailed("no coverage tool found".into()))?;
-
-        let runner = Self::detect_runner(&self.project_dir);
-        let (passed, exit_code, duration_ms, output_tail, coverage) = match &runner {
-            TestRunner::Cargo => {
-                match &tool {
-                    concerto_core::types::CoverageTool::LlvmCov => {
-                        // `cargo llvm-cov` runs tests and collects coverage in one command.
-                        let mut command = if let Some(profile) = &self.shell_profile {
-                            let backend = ShellProfileFactory::backend_for(profile);
-                            backend.check_available(profile).map_err(|e| {
-                                EvalError::HarnessSetupFailed(format!(
-                                    "build shell profile '{}' is unavailable: {e}",
-                                    profile.name
-                                ))
-                            })?;
-                            let full =
-                                "cargo llvm-cov --json --output-path /dev/stdout".to_string();
-                            let mut cmd = Command::new(backend.resolved_program(profile));
-                            cmd.args(backend.command_args(profile, &full));
-                            let base = std::env::vars().collect();
-                            cmd.envs(backend.effective_env(profile, &base));
-                            cmd
-                        } else {
-                            let mut cmd = Command::new("cargo");
-                            cmd.args(["llvm-cov", "--json", "--output-path", "/dev/stdout"]);
-                            cmd
-                        };
-                        let child = command
-                            .current_dir(&self.project_dir)
-                            .stdout(std::process::Stdio::piped())
-                            .stderr(std::process::Stdio::piped())
-                            .kill_on_drop(true)
-                            .spawn()?;
-                        let output = tokio::select! {
-                            res = tokio::time::timeout(self.timeout, child.wait_with_output()) => res,
-                            _ = cancel.cancelled() => return Err(EvalError::Cancelled),
-                        };
-
-                        let actual_duration = start.elapsed().as_millis() as u64;
-                        match output {
-                            Ok(Ok(out)) => {
-                                let passed = out.status.success();
-                                let exit_code = out.status.code().unwrap_or(-1);
-                                let combined = String::from_utf8_lossy(&out.stdout).to_string()
-                                    + &String::from_utf8_lossy(&out.stderr);
-                                let tail = if combined.len() > 2000 {
-                                    combined[combined.len() - 2000..].to_string()
-                                } else {
-                                    combined.clone()
-                                };
-                                let cov = Self::parse_llvm_cov_json(&combined);
-                                (passed, exit_code, actual_duration, tail, cov)
-                            }
-                            Ok(Err(e)) => return Err(EvalError::Io(e)),
-                            Err(_) => (false, -1, actual_duration, "timed out".into(), None),
-                        }
-                    }
-                    concerto_core::types::CoverageTool::Tarpaulin => {
-                        // `cargo tarpaulin` also runs tests with coverage.
-                        let mut command = if let Some(profile) = &self.shell_profile {
-                            let backend = ShellProfileFactory::backend_for(profile);
-                            backend.check_available(profile).map_err(|e| {
-                                EvalError::HarnessSetupFailed(format!(
-                                    "build shell profile '{}' is unavailable: {e}",
-                                    profile.name
-                                ))
-                            })?;
-                            let full = "cargo tarpaulin --out Json --output-dir /tmp".to_string();
-                            let mut cmd = Command::new(backend.resolved_program(profile));
-                            cmd.args(backend.command_args(profile, &full));
-                            let base = std::env::vars().collect();
-                            cmd.envs(backend.effective_env(profile, &base));
-                            cmd
-                        } else {
-                            let mut cmd = Command::new("cargo");
-                            cmd.args(["tarpaulin", "--out", "Json", "--output-dir", "/tmp"]);
-                            cmd
-                        };
-                        let child = command
-                            .current_dir(&self.project_dir)
-                            .stdout(std::process::Stdio::piped())
-                            .stderr(std::process::Stdio::piped())
-                            .kill_on_drop(true)
-                            .spawn()?;
-                        let output = tokio::select! {
-                            res = tokio::time::timeout(self.timeout, child.wait_with_output()) => res,
-                            _ = cancel.cancelled() => return Err(EvalError::Cancelled),
-                        };
-
-                        let actual_duration = start.elapsed().as_millis() as u64;
-                        match output {
-                            Ok(Ok(out)) => {
-                                let passed = out.status.success();
-                                let exit_code = out.status.code().unwrap_or(-1);
-                                let stdout_raw = String::from_utf8_lossy(&out.stdout).to_string();
-                                let stderr_raw = String::from_utf8_lossy(&out.stderr);
-                                let combined = stdout_raw.clone() + &stderr_raw;
-                                let tail = if combined.len() > 2000 {
-                                    combined[combined.len() - 2000..].to_string()
-                                } else {
-                                    combined.clone()
-                                };
-                                let cov = Self::parse_tarpaulin_json(&stdout_raw);
-                                (passed, exit_code, actual_duration, tail, cov)
-                            }
-                            Ok(Err(e)) => return Err(EvalError::Io(e)),
-                            Err(_) => (false, -1, actual_duration, "timed out".into(), None),
-                        }
-                    }
-                    concerto_core::types::CoverageTool::Other(_) => {
-                        return Err(EvalError::HarnessSetupFailed(
-                            "unsupported coverage tool".into(),
-                        ));
-                    }
-                    _ => {
-                        return Err(EvalError::HarnessSetupFailed(
-                            "unsupported coverage tool".into(),
-                        ));
-                    }
-                }
-            }
-            // For non-Cargo runners, run tests normally, then collect coverage separately.
-            _ => {
-                let eval =
-                    self.run_for_runner(runner.clone(), &self.project_dir, cancel.clone()).await?;
-                let cov = self.run_coverage(cancel).await.ok();
-                (eval.passed, eval.exit_code, eval.duration_ms, eval.output_tail, cov)
-            }
-        };
-
-        Ok(concerto_core::types::EvalResult {
-            runner,
-            exit_code,
-            passed,
-            duration_ms,
-            output_tail,
-            coverage,
-            provenance: EvalProvenance::Harness,
-        })
-    }
-
-    /// Run scoped tests with coverage.
-    pub async fn run_scoped_with_coverage(
-        &self,
-        changed_paths: &[camino::Utf8PathBuf],
-        cancel: CancellationToken,
-    ) -> Result<concerto_core::types::EvalResult, EvalError> {
-        let runner = Self::detect_runner(&self.project_dir);
-        if runner != TestRunner::Cargo {
-            // Scoped coverage only works with Cargo for now.
-            return self.run_with_coverage(cancel).await;
-        }
-        // Fall back to scoped tests without coverage instrumentation for Cargo,
-        // since llvm-cov doesn't easily support --package filtering like `cargo test -p`.
-        // We run tests scoped, then collect full-project coverage.
-        let eval = self.run_scoped(changed_paths, cancel.clone()).await?;
-        let cov = self.run_coverage(cancel).await.ok();
-        Ok(concerto_core::types::EvalResult {
-            runner,
-            exit_code: eval.exit_code,
-            passed: eval.passed,
-            duration_ms: eval.duration_ms,
-            output_tail: eval.output_tail,
-            coverage: cov,
-            provenance: eval.provenance,
-        })
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -975,7 +627,10 @@ mod tests {
                 assert_eq!(result.output_tail.chars().count(), 2000);
             }
             assert!(engine.run_with_coverage(CancellationToken::new()).await.is_err());
+            assert!(engine.run_coverage(CancellationToken::new()).await.is_err());
+            assert!(engine.run_scoped_with_coverage(&[], CancellationToken::new()).await.is_err());
             assert_eq!(calls.load(Ordering::SeqCst), 1, "coverage must not bypass the gate");
+            assert!(!directory.path().join("target").exists());
         }
     }
 
@@ -1328,7 +983,7 @@ mod tests {
 
     #[test]
     fn parse_tarpaulin_json_valid() {
-        let json = r#"{"coverage_percent": 82.5}"#;
+        let json = r#"{"coverage": 82.5, "covered": 33, "coverable": 40}"#;
         let info = EvalEngine::parse_tarpaulin_json(json).expect("should parse");
         assert_eq!(info.tool, concerto_core::types::CoverageTool::Tarpaulin);
         assert!((info.line_percent - 82.5).abs() < 0.01);
@@ -1339,14 +994,16 @@ mod tests {
     #[test]
     fn parse_tarpaulin_json_malformed_returns_none() {
         assert!(EvalEngine::parse_tarpaulin_json("not json").is_none());
-        assert!(EvalEngine::parse_tarpaulin_json(r#"{"coverage_percent": "abc"}"#).is_none());
+        assert!(EvalEngine::parse_tarpaulin_json(
+            r#"{"coverage": "abc", "covered": 0, "coverable": 40}"#
+        )
+        .is_none());
     }
 
     #[test]
     fn parse_tarpaulin_json_missing_percent_field() {
         let json = r#"{"other_field": 42}"#;
-        let info = EvalEngine::parse_tarpaulin_json(json).expect("should parse with default");
-        assert!((info.line_percent - 0.0).abs() < 0.01);
+        assert!(EvalEngine::parse_tarpaulin_json(json).is_none());
     }
 
     #[test]
