@@ -8,8 +8,9 @@
 //!   and it decides whether the window warrants structural compaction before a
 //!   request is assembled.
 //! * [`ContextEngine::assemble`] runs the durable compaction pass
-//!   (checkpoint summaries + a bounded recent tail) with the configured policy
-//!   and returns the bounded history for the next model request.
+//!   with the configured policy: preserved conversational text, bounded tool
+//!   checkpoint evidence and a recent tail with full protocol records (ADR-85).
+//!   The provider guard rejects mandatory text that cannot fit its budget.
 //! * [`ContextEngine::maintain`] checkpoints any newly eligible ranges after a
 //!   completed run.
 //!
@@ -45,8 +46,8 @@ pub struct ContextBudgetPolicy {
     /// Estimated tokens before deterministic compaction triggers (default
     /// 16000).
     pub trigger_tokens: u64,
-    /// Most-recent user turns always retained verbatim after compaction
-    /// (default 4).
+    /// Most-recent user turns retaining full tool exchanges and reasoning
+    /// (default 4). Conversational text survives for all turns (ADR-85).
     pub retain_user_turns: usize,
     /// Minimum user turns before compaction may fire (default 6).
     pub minimum_user_turns: usize,
@@ -238,6 +239,30 @@ mod tests {
         messages
     }
 
+    fn transcript_with_tools(turns: usize, fill: usize) -> Vec<Message> {
+        let mut messages = transcript(turns, fill);
+        // Compaction reclaims tool/reasoning payload, never mandatory prose.
+        // Exercise both the small and large cases with complete tool pairs.
+        for turn in (0..turns).rev() {
+            let id = format!("read-{turn}");
+            let mut call = message(Role::Assistant, "");
+            call.tool_calls = Some(vec![concerto_core::types::ToolCall {
+                id: id.clone(),
+                name: "filesystem".into(),
+                arguments: serde_json::json!({"path": "source.rs"}),
+                ..Default::default()
+            }]);
+            let mut result = message(Role::Tool, "");
+            result.tool_results = Some(vec![concerto_core::types::ToolResult {
+                id,
+                name: "filesystem".into(),
+                content: serde_json::json!({"content": "x".repeat(fill)}),
+            }]);
+            messages.splice(turn * 2 + 1..turn * 2 + 1, [call, result]);
+        }
+        messages
+    }
+
     #[test]
     fn default_budget_is_16000_4_6() {
         let engine = ContextEngine::new();
@@ -362,11 +387,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn assemble_bounds_input_tokens_and_preserves_recent_turns() {
-        // Simulated long-run: a transcript far past the tuned trigger must
-        // assemble to a bounded window that still recalls the most recent
-        // turns. The messages are large enough that the deterministic summary
-        // (capped internally) provably shrinks the model-input tokens.
+    async fn assemble_reduces_tool_payloads_and_preserves_conversation() {
+        // Tool-heavy histories can shrink without discarding conversational
+        // obligations. Text-only histories cannot promise the same reduction.
         let store = Arc::new(SqliteSessionStore::connect_in_memory().await.unwrap());
         let session = store
             .create_session(
@@ -377,7 +400,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let messages = transcript(15, 2000);
+        let messages = transcript_with_tools(15, 2000);
         store.append_messages(session.id, &messages, CancellationToken::new()).await.unwrap();
 
         let engine = ContextEngine::from_config(Some(&ContextConfig {
@@ -538,7 +561,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let mut messages = transcript(8, fill);
+            let mut messages = transcript_with_tools(8, fill);
             for message in &mut messages {
                 message.tokens_in = Some(usage);
                 message.tokens_out = Some(usage);

@@ -8,6 +8,10 @@
 **Composes with:** ADR-46 (reasoning-as-data), ADR-45/42 (fallback ladder) —
     these remain valid and unchanged.
 
+The continuity repair in [ADR-85](ADR-85-compaction-instruction-continuity.md)
+revises the lossy conversational-window behavior described below. Its
+implementation and full verification are tracked in the harness work log.
+
 ## Context
 
 The single-agent loop builds its provider request from in-memory messages that

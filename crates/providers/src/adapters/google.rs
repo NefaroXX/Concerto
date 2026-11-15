@@ -10,14 +10,13 @@
 //! - `contents`: a flat array of entries with `role` (`"user"`/`"model"`) and
 //!   `parts`.
 //! - System prompt: top-level `system_instruction` with
-//!   `{"parts":[{"text": ...}]}`; the last `Role::System` message wins.
+//!   `{"parts":[{"text": ...}]}`; all system text is joined in source order.
 //! - User parts: `{"text": ...}`. Tool results are appended as `user` parts
 //!   `{"functionResponse":{"name":..., "response":...}}` — one entry per tool
 //!   result, matched by *function name*, not call id.
 //! - Assistant parts: `{"text": ...}`; when the assistant message carries
-//!   `tool_calls` the `parts` array is *replaced* by
-//!   `{"functionCall":{"name":...,"args":...}}` entries (the text part is
-//!   dropped, matching the historical builder).
+//!   `tool_calls`, nonempty text is retained alongside
+//!   `{"functionCall":{"name":...,"args":...}}` entries.
 //! - Tools: `tools:[{"functionDeclarations":[{name, description,
 //!   parameters}]}]`. Parameter schemas are sanitized down to Google's
 //!   restricted JSON Schema subset before going on the wire: `$defs`/
@@ -44,7 +43,7 @@
 
 use concerto_core::types::{CompletionRequest, Role, ToolChoice, ToolDefinition};
 
-use super::{Dialect, ReasoningEcho};
+use super::{append_system_text, Dialect, ReasoningEcho};
 
 /// The Google Gemini chat dialect (`generateContent`).
 ///
@@ -72,7 +71,7 @@ impl Dialect for GeminiChatDialect {
         for msg in &request.messages {
             match msg.role {
                 Role::System => {
-                    system_instruction = Some(msg.content.clone());
+                    append_system_text(&mut system_instruction, &msg.content);
                 }
                 Role::User => {
                     contents.push(serde_json::json!({
@@ -87,7 +86,7 @@ impl Dialect for GeminiChatDialect {
                         "parts": [part]
                     });
                     if let Some(ref tcs) = msg.tool_calls {
-                        let tool_calls: Vec<serde_json::Value> = tcs
+                        let mut tool_calls: Vec<serde_json::Value> = tcs
                             .iter()
                             .map(|tc| {
                                 let mut part = serde_json::json!({
@@ -116,6 +115,9 @@ impl Dialect for GeminiChatDialect {
                                 part
                             })
                             .collect();
+                        if !msg.content.is_empty() {
+                            tool_calls.insert(0, serde_json::json!({"text": msg.content}));
+                        }
                         entry["parts"] = serde_json::json!(tool_calls);
                     }
                     contents.push(entry);
@@ -695,18 +697,16 @@ mod tests {
         assert_eq!(contents[0]["parts"], serde_json::json!([{"text": "Hello!"}]));
     }
 
-    /// When an assistant message has tool calls, Gemini replaces the parts
-    /// array with `functionCall` entries — the text flash is dropped, matching
-    /// the previous `google.rs` builder.
+    /// Assistant commitments remain alongside the calls they introduce.
     #[test]
-    fn assistant_tool_calls_replace_parts_with_function_call() {
+    fn assistant_tool_calls_retain_text_beside_function_call() {
         let request = fixture_request();
         let body = render(&request);
         let contents = body["contents"].as_array().unwrap();
         assert_eq!(contents[1]["role"], "model");
         assert_eq!(
             contents[1]["parts"],
-            serde_json::json!([{
+            serde_json::json!([{"text": "Here is the file list."}, {
                 "functionCall": {
                     "name": "shell",
                     "args": {"command": "ls"}
@@ -1112,7 +1112,7 @@ mod tests {
                 {"role": "user", "parts": [{"text": "Hello!"}]},
                 {
                     "role": "model",
-                    "parts": [{
+                    "parts": [{"text": "Here is the file list."}, {
                         "functionCall": {"name": "shell", "args": {"command": "ls"}}
                     }]
                 },
@@ -1600,11 +1600,10 @@ mod tests {
         assert_eq!(body["generationConfig"]["maxOutputTokens"], 0);
     }
 
-    /// Oracle guard F-6: when several `Role::System` messages are present the
-    /// *last* one wins `system_instruction`, matching the previous builder's
-    /// overwrite loop.
+    /// All system messages retain their authority, including when a later
+    /// checkpoint follows the main prompt (H37).
     #[test]
-    fn last_system_message_wins() {
+    fn all_system_messages_survive_in_source_order() {
         let request = CompletionRequest {
             session_id: None,
             stable_system_prefix_bytes: None,
@@ -1634,8 +1633,8 @@ mod tests {
 
         assert_eq!(
             body["system_instruction"],
-            serde_json::json!({"parts": [{"text": "second system"}]}),
-            "last system message wins"
+            serde_json::json!({"parts": [{"text": "first system\n\nsecond system"}]}),
+            "all system messages survive in source order"
         );
     }
 }

@@ -1,8 +1,9 @@
 //! Durable, same-session context compaction checkpoints.
 //!
 //! The full transcript remains in `messages` for UI restore and audit.  Only the
-//! active model history is materialised from bounded checkpoint summaries plus a
-//! recent uncompacted tail.  Checkpoints use the existing session checkpoint
+//! active model history retains conversational text and roles, with bounded
+//! checkpoint evidence for older tool exchanges plus a recent uncompacted tail.
+//! Checkpoints use the existing session checkpoint
 //! table under a reserved internal label namespace so they survive process
 //! restarts without creating a second visible session.
 
@@ -75,7 +76,7 @@ struct StoredCheckpoint {
 
 /// [`ContextEngine`](crate::context_engine::ContextEngine) calls this with the
 /// policy it resolved from the `[context]` config surface (ADR-048 §6). It
-/// refreshes durable checkpoints when needed and returns the bounded history
+/// refreshes durable checkpoints when needed and returns the compacted history
 /// used for the next model request. Persisted source messages are never
 /// modified.
 pub(crate) async fn refresh_and_materialize_with_policy(
@@ -351,18 +352,23 @@ fn materialize_history(messages: &[Message], checkpoints: &[StoredCheckpoint]) -
     }
 
     let mut active = Vec::new();
-    // System messages are mandatory and remain verbatim even when their sequence
-    // happens to fall inside a compacted range.
-    active.extend(
-        messages
-            .iter()
-            .take(covered_end as usize)
-            .filter(|message| message.role == Role::System)
-            .cloned(),
-    );
+    // Checkpoint excerpts cannot decide which instructions or commitments are
+    // still active. Recover conversational text from the source transcript,
+    // preserving role and order even for legacy/hierarchical checkpoints.
+    active.extend(messages.iter().take(covered_end as usize).filter_map(retain_conversation));
 
     for stored in frontier(checkpoints) {
         if stored.checkpoint.end_sequence > covered_end {
+            continue;
+        }
+        let range_has_tools = messages
+            .iter()
+            .take(stored.checkpoint.end_sequence as usize)
+            .skip(stored.checkpoint.start_sequence.saturating_sub(1) as usize)
+            .any(|message| message.role == Role::Tool || message.tool_calls.is_some());
+        if !range_has_tools {
+            // Plain conversation is already present verbatim. Adding its lossy
+            // duplicate would consume context without preserving more evidence.
             continue;
         }
         active.push(Message {
@@ -378,6 +384,26 @@ fn materialize_history(messages: &[Message], checkpoints: &[StoredCheckpoint]) -
 
     active.extend(messages.iter().skip(covered_end as usize).cloned());
     active
+}
+
+fn retain_conversation(message: &Message) -> Option<Message> {
+    match message.role {
+        Role::Tool => None,
+        Role::Assistant => {
+            // Historical calls/results move together into checkpoint evidence.
+            // Replaying only the assistant call would orphan the protocol pair.
+            // Reasoning is durable in the source, not in compacted requests.
+            if message.content.is_empty() {
+                return None;
+            }
+            let mut retained = message.clone();
+            retained.tool_calls = None;
+            retained.tool_results = None;
+            retained.reasoning_content = None;
+            Some(retained)
+        }
+        _ => Some(message.clone()),
+    }
 }
 
 fn frontier(checkpoints: &[StoredCheckpoint]) -> Vec<&StoredCheckpoint> {
@@ -610,6 +636,24 @@ mod tests {
         }
     }
 
+    pub(super) fn tool_exchange(turn: usize) -> [Message; 2] {
+        let id = format!("read-{turn}");
+        let mut call = message(Role::Assistant, "");
+        call.tool_calls = Some(vec![concerto_core::types::ToolCall {
+            id: id.clone(),
+            name: "filesystem".into(),
+            arguments: serde_json::json!({"path": format!("source-{turn}.rs")}),
+            ..Default::default()
+        }]);
+        let mut result = message(Role::Tool, "");
+        result.tool_results = Some(vec![concerto_core::types::ToolResult {
+            id,
+            name: "filesystem".into(),
+            content: serde_json::json!({"content": "source line\n".repeat(1_000)}),
+        }]);
+        [call, result]
+    }
+
     #[test]
     fn estimate_uses_current_payload_with_any_usage_metadata() {
         let heuristic = (400_u64).div_ceil(4) + 4;
@@ -752,6 +796,7 @@ mod tests {
         let mut messages = Vec::new();
         for turn in 0..8 {
             messages.push(message(Role::User, format!("request {turn} {}", "x".repeat(160))));
+            messages.extend(tool_exchange(turn));
             messages.push(message(Role::Assistant, format!("response {turn} {}", "y".repeat(160))));
         }
         store.append_messages(session.id, &messages, CancellationToken::new()).await.unwrap();
@@ -849,7 +894,7 @@ mod tests {
             )
             .await
             .unwrap();
-        // 15 user turns -> 30 messages of realistic prose, far past the tiny
+        // 15 user turns with tool payloads, far past the tiny
         // test trigger (10 tokens) so compaction must fire.
         let mut messages = Vec::new();
         for turn in 0..15 {
@@ -861,6 +906,7 @@ mod tests {
                     "x".repeat(160),
                 ),
             ));
+            messages.extend(tool_exchange(turn));
             messages.push(message(
                 Role::Assistant,
                 format!(
@@ -960,17 +1006,17 @@ mod tests {
             active.iter().any(|entry| entry.role == Role::User && entry.content == request_five),
             "retained user turn (request 5) missing from active history"
         );
-        // Exactly the retained user turns survive as user messages; older
-        // turns are summarized, never kept verbatim.
+        // ADR-85: earlier user instructions are equally mandatory. A summary
+        // cannot safely decide that their obligations have expired.
         assert_eq!(
             active.iter().filter(|entry| entry.role == Role::User).count(),
-            2,
-            "exactly the retained user turns remain in the active history"
+            6,
+            "all user turns retain their instruction authority"
         );
         let request_zero = format!("request 0 {}", "x".repeat(120));
         assert!(
-            !active.iter().any(|entry| entry.role == Role::User && entry.content == request_zero),
-            "a compacted turn must not survive as a verbatim user message"
+            active.iter().any(|entry| entry.role == Role::User && entry.content == request_zero),
+            "the first user instruction must survive compaction verbatim"
         );
     }
 
@@ -982,3 +1028,7 @@ mod tests {
         assert!(!summary.is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "context_compaction_regressions.rs"]
+mod regression_tests;

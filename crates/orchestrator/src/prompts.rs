@@ -261,8 +261,7 @@ impl PromptBuilder {
     /// With [`PromptBuilder::with_cache_stable_prefix`] enabled,
     /// [`PromptBuilder::build`] emits exactly these bytes first and appends
     /// the volatile working memory (active state plus retrieved chunks) after
-    /// them, inside the same single system message so last-system-wins
-    /// adapters (Anthropic, Gemini) still see it while the bytes before it
+    /// them, inside the same single system message while the bytes before it
     /// never move. [`PromptBuilder::build_agent_request`] instead keeps the
     /// system message limited to this head plus the task-stable context and
     /// moves the per-iteration state to a trailing user message.
@@ -1692,7 +1691,7 @@ mod tests {
     /// The shipped build template carries `{working_memory}`, so the
     /// active-state + retrieved-chunks block is delivered on the DEFAULT
     /// path (`cache_stable_prefix` off) — inside the single system message,
-    /// which is the one last-system-wins adapters (Anthropic, Gemini) read.
+    /// alongside the instruction text on every provider family.
     #[test]
     fn working_memory_block_reaches_the_model_on_the_default_path() {
         let builder = PromptBuilder::new(concerto_core::types::SYSTEM_PROMPT_BUILD.to_string());

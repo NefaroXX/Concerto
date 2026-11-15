@@ -18,14 +18,14 @@ passing repository tests alone does not close a finding.
 | H06 | P1 | Default write versions are captured after the agent's read | Fixed and verified; awaiting merge |
 | H07 | P1 | Verification errors can accompany Completed status | Fixed and verified; awaiting merge |
 | H08 | P2 | Compaction counts historical usage as current context size | Fixed and verified; awaiting merge |
-| H09 | P2 | Compaction truncates constraints and unresolved work | Open |
+| H09 | P2 | Compaction truncates constraints and unresolved work | Full local battery verified; remote validation pending |
 | H10 | P2 | Agent-driven benchmark fixture policy denies tools | Fixed and verified; awaiting merge |
 | H11 | P2 | Empty benchmark outcomes force a zero pass score | Fixed and verified; awaiting merge |
 | H12 | P2 | Durable event subscriber queues have no memory bound | Open |
 | H13 | P1 | Structured-response parsing rewrites Unicode before attempting JSON parsing | Fixed and verified; awaiting merge |
 | H14 | P2 | Checkpoint startup can degrade into ToolNotFound; CLI test failed intermittently | Open; observed during H02 verification |
 | H15 | P1 | Orchestrator read cache trusts matching size/mtime without checking current bytes | Fixed and verified; awaiting merge |
-| H16 | P2 | Coverage runners misread reports, lose cancellation and trust incomplete test evidence | Full local battery verified; remote CI pending |
+| H16 | P2 | Coverage runners misread reports, lose cancellation and trust incomplete test evidence | Fixed and verified on 66309f8; awaiting merge |
 | H17 | P1 | Resumed history lacks restored read-version claims when a new gate is constructed | Fixed and verified; awaiting merge |
 | H18 | P1 | Locked Wasmtime 36.0.19 fails fresh security gates on RUSTSEC-2026-0424 | Fixed and verified; awaiting merge |
 | H19 | P2 | Action-required minimum tool-call check ignores earlier continuation rounds | Fixed and verified; awaiting merge |
@@ -44,8 +44,10 @@ passing repository tests alone does not close a finding.
 | H32 | P1 | Locked rustix fails the extended-attribute buffer soundness security gate | Fixed and verified; awaiting merge |
 | H33 | P2 | Nested Cargo fixtures can execute each other’s binaries with a shared target directory | Fixed and verified on 43a3e79; awaiting merge |
 | H34 | P2 | Bounded subprocess capture can conceal inconsistent test evidence without marking output incomplete | Open; source path traced, execution reproduction pending |
-| H35 | P1 | Locked quinn-udp fails fresh raw-lockfile security scan | Patched and locally verified; remote CI pending |
-| H36 | P2 | cargo-audit can report incomplete registry checks with exit zero | Strict gate locally verified, including complete real scan; remote CI pending |
+| H35 | P1 | Locked quinn-udp fails fresh raw-lockfile security scan | Fixed and verified on 66309f8; awaiting merge |
+| H36 | P2 | cargo-audit can report incomplete registry checks with exit zero | Fixed and verified on 66309f8; awaiting merge |
+| H37 | P1 | Native provider wire adapters discard mandatory system/assistant text | Full local battery verified; remote validation pending |
+| H38 | P2 | Gemini canonical history cannot retain arbitrary native part order or signatures on text parts | Source/API-contract gap traced; execution reproduction pending |
 
 
 ## 2026-10-29 — H01: preserve streaming events across chunks
@@ -1847,3 +1849,165 @@ Next: patch H18, then continue H07's truthful verification/completion handling.
 - Saved dependency patch 7d2ab8f, coverage repair 62d1692 and strict audit gate
   e4af9d6 as separate commits. This documentation commit records their shared
   verification evidence; publication and exact-head remote checks follow.
+
+
+## 2026-11-12 — H09 regression preparation (isolated branch)
+
+- Created fix/harness-compaction-continuity at published 43a3e79 in the
+  disk-backed h09 worktree. H16's full battery continues on its unchanged
+  isolated source snapshot; no Cargo compilation starts here concurrently.
+- Source review confirms two separate clipping boundaries: per-message
+  excerpts in summarize_messages and per-child excerpts in summarize_children.
+  materialize_history retains original system messages but replaces compacted
+  user/assistant messages with those excerpts, so retaining the original audit
+  transcript does not preserve instructions in the active model request.
+- Drafted durable-store regressions for a constraint after a long user
+  preamble and one that survives a leaf checkpoint but disappears after its
+  hierarchical merge. They assert model-visible continuity without prescribing
+  an implementation. No implementation change or test execution yet.
+- The provider context guard also drops older user groups, so fixing only
+  durable compaction would not establish end-to-end continuity. ADR-48
+  intentionally excludes in-loop LLM summarization; any repair must respect
+  that constraint and account for budgets without silently losing instructions.
+
+- Advanced the isolated H09 worktree to published 66309f8 on November 14,
+  retaining both drafted regressions. H16/H35/H36 passed the complete final
+  local battery and are now awaiting GitHub checks. Starting H09 baseline
+  execution with no compaction implementation change.
+
+## 2026-11-14 — published milestone green; H09 reproduced
+
+- All twelve required checks passed on exact published head
+  `66309f8e01a345e63a88a017035498d504556a5d`: main run
+  [43620320067](https://github.com/NefaroXX/Concerto/actions/runs/43620320067)
+  and native run
+  [43620319861](https://github.com/NefaroXX/Concerto/actions/runs/43620319861).
+  Both workflow conclusions and their head SHA were checked. PR #379 now
+  records those results. H16/H35/H36 have passed local and remote validation;
+  seven other findings remain open.
+- Both original H09 regressions failed against that head with implementation
+  unchanged (exit 101, zero passed, two failed). The long-preamble constraint
+  disappears at leaf construction; the second constraint survives a leaf but
+  disappears after a hierarchical merge. Artifacts: `h09-baseline.log`,
+  `h09-baseline-status.json`, source hashes, patch and regression-source copy
+  under `target/harness-reliability/` in the main worktree.
+- Expanding coverage to original role/order, unfinished assistant commitments
+  and the final provider request. A substring in an untrusted system summary
+  is not equivalent to a user instruction. The provider guard also clips
+  literal XML-like markers inside user messages without provenance.
+- Repair direction: preserve user/assistant conversational text and authority;
+  reduce historical tool data deterministically; return explicit context
+  overflow when mandatory text cannot fit. No keyword-based importance
+  classifier or in-loop LLM summarization. This changes ADR-48's lossy-window
+  contract and will be documented with its cost and limits before publication.
+
+## 2026-11-14 — H09 first repair; remaining wire and task-state boundaries
+
+- Four durable-compaction regressions and four provider-guard regressions
+  failed before their respective implementation changes. Baseline artifacts:
+  `h09-expanded-baseline.log`, `h09-provider-baseline.log`, saved regression
+  sources and provider source hashes. Cargo stopped at the failing orchestrator
+  target in the combined baseline, so the provider target was run separately;
+  both executions returned 101 with four assertion failures each.
+- The first repair retains user and assistant conversational text in original
+  roles/order from the persisted source, including when loading legacy or
+  hierarchical checkpoints. Historical tool calls/results are reduced together;
+  recent exchanges remain verbatim. Plain conversation does not gain a redundant
+  lossy summary. The provider guard no longer drops conversation groups or
+  clips conversational prose, and user-authored markers cannot authorize loss.
+- Nine focused regressions passed. A broader run exposed one old text-only
+  fixture requiring arbitrary prose truncation. Its reduction assertion now
+  exercises complete tool exchanges and retains the shrink requirement;
+  separate regressions demand exact conversational preservation. The expanded
+  context run passes 66 tests (34 orchestrator, 32 provider), including retry
+  preservation and durable reload through the real guard. Logs:
+  `h09-focused.log`, `h09-context-first.log`, `h09-context-second.log`.
+- H37: tracing the final wire conversion found that both Anthropic and Gemini
+  overwrite the system prompt for every System message. PromptBuilder prepends
+  the main system prompt and appends materialized history, which can contain
+  checkpoint System messages. Consequently the final checkpoint can replace
+  the main policy prompt on these provider families. Existing adapter tests
+  explicitly encode last-system-wins; new independent regressions assert that
+  both policy and checkpoint evidence survive. This is not certified by the
+  guard-level capture test.
+- The guard still trims working memory/run-state/previous-result blocks inside
+  system messages. Those can contain active tasks, not merely optional retrieved
+  evidence. Added a regression for this remaining H09 path. Wire and task-state
+  regressions are running in `h09-wire-baseline.log`; no passing result or full
+  H09 validation is claimed yet. ADR-85 remains proposed until these boundaries
+  and the full battery are verified. Published head remains green 66309f8.
+
+- The additional baseline completed: both system-policy wire regressions and
+  the active system-task-state regression failed (`h09-wire-baseline.log`;
+  eleven earlier regressions passed). The guard now retains working memory,
+  run state, prior conversation and prior-result blocks even in system
+  messages; only retrieved/file evidence retains a clipping budget.
+- H37 also covers Gemini dropping assistant text whenever the same message
+  carries tool calls. Its independent regression failed before that edit
+  (`h37-assistant-baseline.log`, nine other provider regressions passed).
+  Both adapters now join system text in source order; Gemini retains nonempty
+  assistant text beside function calls, leaving each opaque thought signature
+  on its original call. Anthropic cache-boundary validation stays within the
+  first system message; new tests cover Unicode and an appended checkpoint.
+- Checked current primary API references through Context7: Anthropic's
+  [Messages system parameter](https://github.com/anthropics/anthropic-sdk-python/blob/main/src/anthropic/resources/messages/messages.py)
+  and [text block cache control](https://github.com/anthropics/anthropic-sdk-python/blob/main/src/anthropic/types/text_block_param.py),
+  and Google's [system instruction request format](https://ai.google.dev/gemini-api/docs/generate-content/text-generation).
+  Existing single-system request representation remains unchanged.
+- Running all provider/orchestrator library tests on the combined repair with
+  Rust warnings denied (`h09-h37-packages.log`). This is package validation;
+  the full CI battery and remote checks remain required before publication.
+
+- All provider/orchestrator library tests passed: 2,502 passed, zero failed,
+  two intentionally ignored (1,897 orchestrator and 605 provider). Extended the
+  durable-reload regression afterward to assert that the actual native wire
+  bodies contain every conversational text and the original system policy;
+  this addition will be covered by the full battery. Formatting/diff checks
+  pass. The existing API wire snapshots now retain Gemini assistant text.
+- H38 follow-up: current Gemini decoding emits text into a flat delta and
+  buffers function calls separately; `Message` stores one content string and
+  a tool-call vector. That cannot encode arbitrary original text/call part
+  order or a signature attached to a text part. Google's
+  [thought-signature contract](https://ai.google.dev/gemini-api/docs/generate-content/thinking)
+  requires complete signed parts on replay. The H37 patch preserves canonical
+  assistant text and existing call signatures, but does not establish lossless
+  native-part replay. A native-response reproduction and an explicit persisted
+  representation are still needed; this remains an open finding.
+- Corrected TESTING.md's stale claim that obsolete rustdoc warnings were
+  acceptable: the obsolete lint is absent from Cargo.toml, and the local
+  battery denies Rust warnings. Prepared the combined H09/H37 full validation
+  with serialized Cargo/security gates. No local package result is being
+  substituted for the complete battery or remote validation.
+
+## 2026-11-15 — H09/H37 complete local battery
+
+- The coordinator finished with every check returning zero. Workspace
+  unit/integration/doc tests: 6,116 passed, zero failed, 17 deliberately
+  ignored across 86 groups. The released llvm-cov/Tarpaulin fixture also
+  passed separately. All-target Clippy, full workspace and both frontend
+  builds ran with Rust warnings denied and no compiler diagnostics.
+- Launcher/cache/CLI smoke, four WASM guest builds, direct wasmtimer WASM
+  check, all nine release benchmark smokes, formatting, palette and all 13
+  Python tests passed. Fresh serialized supply-chain gates passed: 1,509
+  advisories / 1,079 lockfile dependencies in a complete strict audit with
+  no diagnostic errors or warnings. Cargo-deny reports only the 67 tracked
+  duplicate-version families; H28 remains open.
+- All 1,003 source-snapshot files matched exactly after the battery. Final
+  review then corrected a stale Gemini module comment claiming text was
+  dropped, and added these documentation/evidence notes; executable code is
+  unchanged. Evidence is under the main worktree's
+  `target/harness-reliability/h09-final-*` prefix, including source hashes,
+  per-check logs and `h09-final-status.json`.
+- Committing this combined continuity repair and publishing to the existing
+  draft PR. H09/H37 remain pending until all checks pass on the new exact
+  head; preceding green 66309f8 is not evidence for that head.
+- The isolated h38 worktree was created at 66309f8 for the next native-part
+  replay investigation. It has not compiled concurrently with this battery.
+  H12/H14/H23/H28/H29/H34/H38 remain open after this milestone.
+
+- Refreshed both security gates again on November 15 immediately before
+  publication because the full battery's scan finished the previous evening.
+  Both passed; strict audit completed without errors/warnings (1,509
+  advisories, 1,079 dependencies), and deny retained only duplicate warnings.
+  Logs: `h09-prepublish-{deny,audit}.log` and
+  `h09-prepublish-security.json`. No source or lockfile adjustment was needed.

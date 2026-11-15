@@ -111,6 +111,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Instruction continuity through compaction.** Earlier user instructions and
+  assistant commitments retain their text, roles and order across durable
+  checkpoints. Provider context reduction preserves active task state and
+  rejects oversized mandatory conversation before sending it. Literal markers
+  in user text cannot authorize truncation. Historical tool payloads remain
+  reducible; text-only histories may reach explicit context overflow sooner.
+- **Native provider prompt preservation.** Anthropic and Gemini retain all
+  system messages, so checkpoint evidence cannot replace the policy prompt.
+  Gemini retains assistant text beside tool calls; Anthropic preserves the
+  first system message's cache prefix when checkpoints follow it.
+
 - **Complete security audit gate:** reject registry-check errors even when
   cargo-audit returns zero, and update locked quinn-udp to 0.5.16 for
   RUSTSEC-2026-0538 without changing the advisory exception policy.

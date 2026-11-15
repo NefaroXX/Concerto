@@ -7,8 +7,8 @@
 //!
 //! # Wire contract
 //!
-//! - System prompt: a top-level `system` string (the last `Role::System`
-//!   message wins); system messages are not part of `messages`.
+//! - System prompt: a top-level `system` string with all `Role::System`
+//!   messages joined in source order; they are not part of `messages`.
 //! - Messages: `user`/`assistant` roles with a `content` *array* of typed
 //!   blocks — `text`, `tool_use` (from assistant `tool_calls`) and
 //!   `tool_result` (from `Role::Tool` messages, which are sent as `user`).
@@ -26,7 +26,7 @@ use concerto_core::types::{CompletionRequest, Role, ToolChoice, ToolDefinition};
 use serde_json::json;
 
 use super::schema_sanitize::sanitize_tool_schema;
-use super::{Dialect, ReasoningEcho};
+use super::{append_system_text, Dialect, ReasoningEcho};
 
 /// The Anthropic Messages API chat dialect.
 ///
@@ -50,7 +50,7 @@ impl Dialect for AnthropicChatDialect {
         let mut msgs = Vec::new();
         for msg in &request.messages {
             if let Role::System = msg.role {
-                system_prompt = Some(msg.content.clone());
+                append_system_text(&mut system_prompt, &msg.content);
                 continue;
             }
 
@@ -109,9 +109,9 @@ impl Dialect for AnthropicChatDialect {
                 .filter(|boundary| {
                     *boundary > 0 && *boundary < system.len() && system.is_char_boundary(*boundary)
                 })
-                .filter(|_| {
+                .filter(|boundary| {
                     request.messages.first().is_some_and(|message| {
-                        message.role == Role::System && message.content == system
+                        message.role == Role::System && *boundary <= message.content.len()
                     })
                 });
             body["system"] = if let Some(boundary) = boundary {
@@ -680,11 +680,10 @@ mod tests {
         assert_eq!(body["temperature"], 0.0);
     }
 
-    /// Oracle guard F-6: when several `Role::System` messages are present the
-    /// *last* one wins the top-level `system` field, matching the previous
-    /// builder's accumulate-and-overwrite loop.
+    /// All system messages retain their authority, including when a later
+    /// checkpoint follows the main prompt (H37).
     #[test]
-    fn last_system_message_wins() {
+    fn all_system_messages_survive_in_source_order() {
         let request = CompletionRequest {
             session_id: None,
             stable_system_prefix_bytes: None,
@@ -712,7 +711,7 @@ mod tests {
         };
         let body = render(&request, "claude-3-5-sonnet");
 
-        assert_eq!(body["system"], "second system", "last system message wins");
+        assert_eq!(body["system"], "first system\n\nsecond system");
         let msgs = body["messages"].as_array().expect("should have messages");
         assert_eq!(msgs.len(), 0, "system messages never appear in the messages array");
     }
@@ -748,6 +747,30 @@ mod tests {
         request.stable_system_prefix_bytes = Some(usize::MAX);
         let invalid = render(&request, "claude-3-5-sonnet");
         assert_eq!(invalid["system"], request.messages[0].content);
+    }
+
+    #[test]
+    fn checkpoint_does_not_displace_stable_system_prefix() {
+        let mut request = CompletionRequest {
+            messages: vec![
+                msg(Role::System, "Policy 🦀"),
+                msg(Role::User, "continue"),
+                msg(Role::System, "checkpoint one"),
+            ],
+            stable_system_prefix_bytes: Some("Policy 🦀".len()),
+            ..Default::default()
+        };
+        let first = render_with_breakpoints(&request, "model");
+        request.messages[2].content = "checkpoint two".into();
+        let second = render_with_breakpoints(&request, "model");
+        assert_eq!(first["system"][0], second["system"][0]);
+        assert_eq!(second["system"][0]["text"], "Policy 🦀");
+        assert_eq!(second["system"][1]["text"], "\n\ncheckpoint two");
+        assert_eq!(second["system"][0]["cache_control"], json!({"type":"ephemeral"}));
+        for invalid in ["Policy ".len() + 1, "Policy 🦀".len() + 1] {
+            request.stable_system_prefix_bytes = Some(invalid);
+            assert_eq!(render(&request, "model")["system"], "Policy 🦀\n\ncheckpoint two");
+        }
     }
 
     /// ADR-48 prefix discipline: applying the breakpoints twice yields the
