@@ -48,9 +48,13 @@ passing repository tests alone does not close a finding.
 | H36 | P2 | cargo-audit can report incomplete registry checks with exit zero | Fixed and verified on 66309f8; awaiting merge |
 | H37 | P1 | Native provider wire adapters discard mandatory system/assistant text | Fixed; full local battery and all 12 exact-head CI checks passed |
 | H38 | P2 | Gemini canonical history loses native part order/text signatures and misclassifies thought text | Fixed; full local battery and all 12 exact-head CI checks passed on 14390eb |
-| H39 | P1 | Run settlement persists summaries instead of complete provider history | Root repair checkpointed locally: tests/builds/benchmarks passed; strict audit incomplete after registry timeout; specialist/process history and cancelled-run spend settlement remain open |
-| H40 | P2 | Headless multi-agent history clips messages and older obligations before dispatch | Both cutoff regressions reproduced; provider-request repair coverage required |
-| H41 | P1 | Settings CLI fixtures use XDG isolation on macOS, where application paths resolve to the real profile | Source-confirmed; Linux-only test gate prepared in H40 worktree, unverified/unpublished |
+| H39 | P1 | Run settlement persists summaries instead of complete provider history | Root repair fixed, published and exact-head verified (`2dbf25a`; ADR-87 `72c414a`); specialist/process history and cancelled-run spend settlement remain open |
+| H40 | P2 | Headless multi-agent history clips messages and older obligations before dispatch | Fixed, published and exact-head verified (`91bf006`); loopback CLI request fixture plus the approved-plan routing control |
+| H41 | P1 | Settings CLI fixtures use XDG isolation on macOS, where application paths resolve to the real profile | Fixed and verified on Linux, published with H40 (`91bf006`); macOS hazard source-confirmed, portable coverage not claimed |
+
+Table reconciled 2026-11-16 after the H39/H40/H41 publication; the H40 and
+H41 rows were previously left at their preparation state. Open work is the
+register below (H12, H14, H23, H28 residual, H29, H34, H39 remainder).
 
 
 ## 2026-10-29 — H01: preserve streaming events across chunks
