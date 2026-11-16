@@ -3004,6 +3004,22 @@ pub async fn run_shared_agent(
 /// opt-in only) the review-cycle resumability store. They mirror exactly what
 /// the single-agent in-process gate is built from, so both gated paths enforce
 /// the same policy over the same durable log.
+/// The single routing decision for coordinator conversation history (H40).
+///
+/// Approved-plan runs take the ADR-60 D7 contract: the verified structured
+/// artifact and its decision ledger govern, and the old rendered transcript is
+/// excluded. Every other run — including headless one-shots with no interactive
+/// inbox — receives the persisted messages as typed history. Keeping the
+/// predicate here, and calling it only from the coordinator wiring, means the
+/// D7 boundary cannot silently weaken without failing the matching control in
+/// `tests::approved_plan_d7`.
+fn conversation_history_for_run(
+    approved_plan: Option<&ApprovedPlanContext>,
+    history: &[Message],
+) -> Option<Vec<Message>> {
+    approved_plan.is_none().then(|| history.to_vec())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_multi_agent(
     req: &AgentRunRequest,
@@ -3520,8 +3536,15 @@ async fn run_multi_agent(
         current_source_revision(&req.project_dir).await,
     );
     coordinator = coordinator.with_conversation_inbox(services.conversation_inbox.clone());
-    if services.conversation_inbox.is_some() && approved_plan.is_none() {
-        coordinator = coordinator.with_conversation_history(req.conversation_history.clone());
+    // ADR-60 D7: an approved-plan run injects no conversation transcript — the
+    // whiteboard-verified structured artifact governs instead. Every other run
+    // attaches the persisted messages as typed history, with or without an
+    // interactive inbox: headless one-shot runs have no inbox, and routing them
+    // through clipped task prose lost long and older obligations (H40). A
+    // degraded/legacy plan load yields `approved_plan == None`, which keeps the
+    // documented pre-D7 prose-mode behavior of supplying history.
+    if let Some(history) = conversation_history_for_run(approved_plan, &req.conversation_history) {
+        coordinator = coordinator.with_conversation_history(history);
     }
     // ADR-65 §7: the checkpoint row's own updated_at backs the additive v4
     // backfill for pre-§7 (v3) checkpoints (fail-soft when absent).
@@ -3643,13 +3666,11 @@ async fn run_multi_agent(
     // ADR-60 D7: an approved-plan run does NOT inject the conversation
     // history as prose — that transcript carries the rendered plan markdown,
     // and the whiteboard-verified structured artifact governs instead.
-    // Prior decisions that matter ride the ledger in the task description;
-    // non-approved runs keep the exact pre-D7 history injection.
-    let multi_task = match approved_plan {
-        Some(_) => task.clone(),
-        None if services.conversation_inbox.is_some() => task.clone(),
-        None => multi_agent_task_with_history(task.clone(), &req.conversation_history),
-    };
+    // Prior decisions that matter ride the ledger in the task description.
+    // Non-approved runs receive the history as typed messages through
+    // `with_conversation_history` above; the task description stays the
+    // caller's objective without a synthetic transcript or rendered roles.
+    let multi_task = task.clone();
     let mut context = AgentContext::new(SessionContext::new(session_id, project_dir.clone()));
     if let Some(checkpoint) = req
         .resume_checkpoint_json
@@ -4544,57 +4565,6 @@ async fn drive_supervised_run(
         checkpoint_json: None,
         provider_error_class: None,
     })
-}
-
-/// Carry persisted conversational decisions into the multi-agent path.
-///
-/// The coordinator and every specialist derive their prompts from the parent
-/// task, so enriching that task keeps planning and execution on the same
-/// context without introducing a second, specialist-specific history channel.
-fn multi_agent_task_with_history(mut task: AgentTask, history: &[Message]) -> AgentTask {
-    if history.is_empty() {
-        return task;
-    }
-
-    let mut context = String::from(
-        "\n\n<conversation_history>\n\
-         The following messages are prior context from this same session. \
-         Preserve the user's earlier decisions and constraints:\n",
-    );
-    const MAX_HISTORY_CHARS: usize = 16_000;
-    const MAX_MESSAGE_CHARS: usize = 4_000;
-    let mut selected = Vec::new();
-    let mut selected_chars = 0usize;
-    for message in history.iter().rev() {
-        if selected_chars >= MAX_HISTORY_CHARS {
-            break;
-        }
-        let content = message.content.chars().take(MAX_MESSAGE_CHARS).collect::<String>();
-        selected_chars = selected_chars.saturating_add(content.chars().count());
-        selected.push((message.role.clone(), content));
-    }
-    selected.reverse();
-    if selected.len() < history.len() {
-        context.push_str(
-            "\n[older session history omitted; retrieve durable events/messages if needed]\n",
-        );
-    }
-    for (message_role, message_content) in selected {
-        let role = match message_role {
-            concerto_core::types::Role::System => "system",
-            concerto_core::types::Role::User => "user",
-            concerto_core::types::Role::Assistant => "assistant",
-            concerto_core::types::Role::Tool => "tool",
-            _ => "unknown",
-        };
-        context.push_str("\n[");
-        context.push_str(role);
-        context.push_str("]\n");
-        context.push_str(&message_content);
-    }
-    context.push_str("\n</conversation_history>");
-    task.description.push_str(&context);
-    task
 }
 
 fn is_resume_request(input: &str) -> bool {

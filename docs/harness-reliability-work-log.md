@@ -2430,3 +2430,102 @@ has terminated; there is no remaining validation process to wait on.
   palette) and `43910428481` (Linux/macOS/Windows native shell). ADR-87 is
   Accepted for the root boundary. H39's specialist/process and cancelled-run
   spend work stays open, so this is not overall H39 completion.
+
+## 2026-11-16 — H40 runtime repair and H41 verification
+
+- Rebased the H40 checkpoint onto the published H39 head `72c414a` (published
+  squash `2dbf25a` plus the ADR-87 acceptance doc commit) on
+  `fix/harness-headless-history`. Wired the moved
+  `coordinator/tests/coordinator_history_regressions.rs` into the coordinator
+  test module; it passes as the typed-history parity control with and without
+  an interactive inbox.
+- Executed the prepared CLI fixture for the first time and repaired only its
+  own harness: `run` must own its flags (`--multi-agent` after a `--project`
+  startup pair was stripped before `run` saw it), and the loopback server must
+  answer `stream: false` requests with a JSON completion body (the coordinator's
+  weak-model transport is non-streamed). The failing runs are preserved:
+  `h40-baseline-cli.log` (empty-stderr startup timeout),
+  `h40-baseline-cli-2.log` (non-streamed body rejected),
+  `h40-baseline-cli-3.log` (request captured, constraint lost).
+- Request-level baseline is preserved in
+  `h40-baseline-headless-history.log`: the provider request contained exactly a
+  system message and one user message whose task text carried
+  ` <conversation_history>`; the long-preamble constraint and the older
+  obligation were both gone, and the earlier assistant turn was flattened into
+  user prose.
+- Repaired production routing in `run_multi_agent`: ordinary runs attach
+  `req.conversation_history` as typed messages whenever no approved plan is
+  bound, independent of `conversation_inbox`; headless runs no longer need a
+  manufactured inbox. The submitted task description stays the caller's
+  objective. Approved-plan runs still receive no conversation transcript
+  (ADR-60 D7 verified-artifact/ledger contract) and the D7 tests pass unchanged.
+- Deleted the clipped-prose `multi_agent_task_with_history` helper and the two
+  helper-only tests it fed (including the `include!` probe file). Replacement
+  coverage is request-level: the headless CLI fixture asserts both durable user
+  constraints, exactly one assistant-role prior reply, and the absence of
+  `<conversation_history>` inside the submitted task; the coordinator parity
+  control asserts the same contract with and without an inbox.
+- Targeted checks pass: `cargo test -p concerto-cli --test headless_history`
+  (`h40-fix-headless-history.log`), the coordinator history control
+  (`h40-orch-history-control.log`), `approved_plan_d7` 4/4
+  (`h40-orch-d7.log`), `agency_topology` 9/9
+  (`h40-orch-agency-topology.log`), `cargo fmt --all -- --check` clean
+  (`h40-fmt.log`).
+- H41 is verified on its supported platform: `cargo test -p concerto-cli
+  --test settings_commands` passes 11/11 on Linux
+  (`h40-h41-settings-commands.log`). The Linux-only gate is source-confirmed;
+  no mutating command was run against a real macOS profile, and portable
+  fixture coverage is not claimed.
+- Starting the serialized full local CI battery on this candidate with new
+  `h40-final-*` evidence names. No publication until every gate and the
+  exact-head remote checks pass.
+
+## 2026-11-16 — H40 review round, first battery, approved-plan routing control
+
+- First complete local battery on `81fe15a`: **11 of 12 gates passed** in
+  55 m 32 s (wasmtimer, fmt, diff, clippy, ignored coverage-live, workspace
+  tests — 6,149 passed / 0 failed / 17 ignored, build, extra group including
+  launcher smoke, desktop/cli feature builds, WASM plugins and benches,
+  palette, Python script tests, deny). Only `audit` failed, solely because the
+  crates.io yanked-package request timed out after the advisory DB load
+  (1,509 advisories) and the scan start (1,079 dependencies). The failing log
+  is preserved as `h40-final-full-audit.first-attempt.log`; the strict gate
+  was not bypassed. A single resumption passed cleanly:
+  `h40-audit-resume-1.log`.
+- Review found one blocking coverage gap: the approved-plan exclusion had no
+  routing-level control, so a future predicate edit could silently re-admit
+  the transcript. Extracted the single decision into
+  `conversation_history_for_run(approved_plan, history)` and added
+  `conversation_history_is_injected_only_without_an_approved_plan` to the D7
+  suite: history attaches with no plan and is withheld with a verified
+  context. D7 is now 5/5 (`h40-orch-d7-control-2.log`); fmt clean
+  (`h40-fmt-2.log`).
+- Lower review items: the degraded/legacy plan arm (`approved_plan == None`)
+  intentionally keeps pre-D7 history and is now documented at the predicate;
+  the `<conversation_history>` marker constants are `#[cfg(test)]`-only, so no
+  production emitter remains; the fixture's child is kill-on-drop, its server
+  task is aborted after the child exits, each response closes the connection,
+  and the 30 s run / 45 s test bounds held under the full workspace suite.
+- Restarting the complete battery on the new candidate. The first battery's
+  result is not inherited by the new SHA.
+
+## 2026-11-16 — H40/H41 complete local verification
+
+- Final full local battery on `8f2853e`: **all 12 gates passed** in 34 m 02 s
+  — wasmtimer, fmt, diff, clippy, ignored coverage-live, workspace tests,
+  build, extra group (launcher smoke, desktop/cli feature builds, WASM
+  plugins, benches), palette, Python script tests, deny and the strict audit
+  (1,509 advisories, 1,079 dependencies, registry yanked check completed).
+  Evidence: `h40-final-full-*.log`, `h40-final-status.json` (base
+  `8f2853ebe69cfb7d8a3786e327de5a765d4a293d`). The attempt-1 logs remain under
+  `h40-attempt1/`; the audit failure there was the transient registry timeout
+  described above, not a vulnerability.
+- Source integrity recheck against `h40-final-source-sha256.json`:
+  **1,019 of 1,019 hashes match**. The candidate tree was clean at the battery
+  base; subsequent edits are this documentation record only.
+- H40 and H41 are therefore complete for local verification. Publication goes
+  through the existing topic PR #379 to `dev`; exact-head remote results must
+  be recorded here before the milestone is called complete.
+- H39 remains open beyond the root milestone: specialist/process-scoped history
+  and cancelled-run spend settlement are unresolved. Passing tests do not
+  establish overall harness completion.

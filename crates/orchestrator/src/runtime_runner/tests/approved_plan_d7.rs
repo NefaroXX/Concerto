@@ -72,6 +72,35 @@ fn d7_binding_named(plan_id: &str) -> PlanBinding {
     )
 }
 
+/// H40 routing control: typed history is injected on the non-approved-plan
+/// path and withheld under a verified approved plan (ADR-60 D7). A future edit
+/// that ignores the plan boundary, or re-narrows injection to inbox-present
+/// runs, fails here.
+#[test]
+fn conversation_history_is_injected_only_without_an_approved_plan() {
+    let history = vec![serde_json::from_value(serde_json::json!({
+        "role": "User",
+        "content": "keep the public API stable",
+        "tool_calls": null,
+        "tool_results": null
+    }))
+    .expect("history message")];
+
+    let injected = conversation_history_for_run(None, &history).expect("ordinary runs get history");
+    assert_eq!(injected.len(), 1);
+    assert_eq!(injected[0].content, "keep the public API stable");
+
+    let context = ApprovedPlanContext {
+        binding: d7_binding(),
+        design_doc: Some(d7_design_doc()),
+        ledger: crate::plan_approval::PlanLedger::default(),
+    };
+    assert!(
+        conversation_history_for_run(Some(&context), &history).is_none(),
+        "an approved plan must not receive the rendered conversation transcript"
+    );
+}
+
 /// Two-turn simulation, happy path:
 /// (a) a completed Plan run approves and its structured artifact lands in
 ///     the whiteboard keyed by `plan_id` (the sole source of truth);

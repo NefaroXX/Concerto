@@ -1,5 +1,5 @@
-//! Agency envelope, resume-scope, multi-agent history, and topology/roster
-//! coverage for `runtime_runner_impl`.
+//! Agency envelope, resume-scope, and topology/roster coverage for
+//! `runtime_runner_impl`.
 //!
 //! Mechanical extraction (NORM S24E): the ADR-55 envelope + acceptance banner,
 //! the "Full local agency" banner, and the eleven tests from
@@ -8,8 +8,8 @@
 //! `runtime_runner::runtime_runner_tests`, so test names and assertions are
 //! unchanged. The span carries no fixtures — every helper it calls
 //! (`dispatches_to_coordinator`, `tool_support_override`,
-//! `resume_scope_project_id`, `multi_agent_task_with_history`,
-//! `topology_roles`, `build_agent_config_map`) is production code in
+//! `resume_scope_project_id`, `topology_roles`, `build_agent_config_map`)
+//! is production code in
 //! `runtime_runner_impl` — so nothing is shared with, or duplicated into, the
 //! donor module. `use super::super::*;` keeps the parent
 //! (`runtime_runner_impl`) items in scope.
@@ -173,47 +173,6 @@ fn resume_scope_uses_the_checkpoint_project_id_definition() {
         resume_scope_project_id(other.path()),
         "distinct project dirs must remain distinct scopes"
     );
-}
-
-#[test]
-fn multi_agent_task_includes_persisted_conversation_history() {
-    let session_id = Ulid::new();
-    let task = AgentTask::new_action_required(session_id, "apply the fix");
-    let history = vec![
-        Message {
-            gemini_replay: None,
-            role: Role::User,
-            content: "do not change the public API".into(),
-            tool_calls: None,
-            tool_results: None,
-            reasoning_content: None,
-            tokens_in: None,
-            tokens_out: None,
-        },
-        Message {
-            gemini_replay: None,
-            role: Role::Assistant,
-            content: "understood".into(),
-            tool_calls: None,
-            tool_results: None,
-            reasoning_content: None,
-            tokens_in: None,
-            tokens_out: None,
-        },
-    ];
-
-    let enriched = multi_agent_task_with_history(task, &history);
-
-    assert!(enriched.description.starts_with("apply the fix"));
-    assert!(enriched.description.contains("[user]\ndo not change the public API"));
-    assert!(enriched.description.contains("[assistant]\nunderstood"));
-}
-
-#[test]
-fn multi_agent_task_is_unchanged_without_history() {
-    let task = AgentTask::new_action_required(Ulid::new(), "apply the fix");
-    let enriched = multi_agent_task_with_history(task.clone(), &[]);
-    assert_eq!(enriched.description, task.description);
 }
 
 // ------------------------------------------------------------------

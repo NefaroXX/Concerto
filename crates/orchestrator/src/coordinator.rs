@@ -18525,6 +18525,8 @@ mod tests {
     // R02: resume/continue coverage lives in `coordinator/tests/resume_tests.rs`.
     mod resume_tests;
     mod specialist_execution;
+    // H40: typed-history request parity with and without an interactive inbox.
+    mod coordinator_history_regressions;
 
     use super::*;
     use crate::progress::{MAX_STALL_RECOVERIES, MAX_STALL_ROUNDS};
