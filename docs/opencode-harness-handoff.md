@@ -15,13 +15,14 @@ runs now receive typed history (no clipped actual-task prose) with the ADR-60
 D7 approved-plan boundary pinned by a routing control. H41: the settings CLI
 fixture is Linux-gated to match its XDG-only isolation. The squashed H40/H41
 commit `91bf006` passed the 12/12 local battery and all twelve exact-head
-checks; the documentation-record commit `d4faeb4` is the verified PR head and
-also passed all twelve. Evidence: `target/harness-reliability/h40-final-*`,
+checks; the documentation-record commit `d4faeb4` and the findings-table
+reconciliation `c901efc` also passed all twelve; `c901efc` is the verified PR
+head. Evidence: `target/harness-reliability/h40-final-*`,
 `h40-attempt1/`, and the work log.
 
 [PR #379](https://github.com/NefaroXX/Concerto/pull/379) targets `dev`, is open
-and draft, and its head is `d4faeb4` (H40/H41 publication plus the docs-record
-commit). Do not merge without authorization. Remaining work is the
+and draft, and its head is `c901efc` (H40/H41 publication, docs record, and
+findings-table reconciliation). Do not merge without authorization. Remaining work is the
 rest of H39: specialist/process-scoped durable history and cancelled-run spend
 settlement.
 
@@ -193,9 +194,11 @@ exact new SHA. Do not inherit the green result from `2dbf25a`/`72c414a`.
   preserved as `h40-final-full-audit.first-attempt.log`, resumed strict gate
   passed); final battery `8f2853e` 12/12 in 34 m 02 s with 1,019/1,019 source
   hashes. Published as `91bf006`; all twelve exact-head checks passed (CI
-  `43942883154`, native `43942883053`). The docs-record commit `d4faeb4` is the
-  current head and also passed all twelve checks (CI `43944565310`, native
-  `43944565347`).
+  `43942883154`, native `43942883053`). The docs-record commit `d4faeb4` and
+  the findings-table reconciliation `c901efc` also passed all twelve checks
+  (CI `43944565310`/`43946513357`, native `43944565347`/`43946513248`; the
+  macOS job on the last run first received no runner, was cancelled before any
+  step, then passed unchanged on rerun).
 
 ## Remaining findings
 
