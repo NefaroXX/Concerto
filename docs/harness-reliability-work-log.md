@@ -2529,3 +2529,26 @@ has terminated; there is no remaining validation process to wait on.
 - H39 remains open beyond the root milestone: specialist/process-scoped history
   and cancelled-run spend settlement are unresolved. Passing tests do not
   establish overall harness completion.
+
+## 2026-11-16 — H40/H41 published; exact-head CI certified
+
+- Published the H40/H41 candidate as `91bf006` on
+  `fix/harness-streaming-integrity` (PR #379, base `dev`), squashed from the
+  rebased WIP checkpoint. The pre-squash checkpoint is preserved locally as
+  `checkpoint/opencode-h40-rebased` (`4ea2018`).
+- **All 12 exact-head checks passed**: [CI run
+  43942883154](https://github.com/NefaroXX/Concerto/actions/runs/43942883154)
+  (Formatting, Lints, Tests, Build, Benchmarks, WASM plugins, cargo-deny,
+  cargo-audit, palette) and [native run
+  43942883053](https://github.com/NefaroXX/Concerto/actions/runs/43942883053)
+  (Ubuntu, Windows, macOS).
+- H40 is complete: headless multi-agent runs receive typed history, the
+  clipped-prose path is gone, and the ADR-60 D7 and routing boundaries are
+  pinned by tests. H41 is complete on its supported platform (Linux), with
+  the macOS hazard documented and portable coverage not claimed.
+- This evidence commit records the certified SHA. Its own exact-head checks
+  must also pass before the milestone is called closed.
+- H39 remains open beyond the root milestone: specialist/process-scoped history
+  and cancelled-run spend settlement are unresolved. Seven findings remain in
+  total (H12, H14, H23, H28, H29, H34, H39). Passing checks do not establish
+  overall harness superiority.

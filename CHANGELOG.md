@@ -119,6 +119,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   calls are never executed automatically. Status replies and errors retain
   their separate rendered transcript. Specialist/process history recovery
   remains tracked under H39.
+- **Headless multi-agent history.** One-shot multi-agent runs now give the
+  coordinator the persisted conversation as typed messages instead of a
+  clipped, role-flattened prose block. Long-preamble constraints and older
+  unresolved obligations survive, and earlier assistant turns keep their
+  role. Approved-plan executions still use the verified structured artifact
+  and decision ledger rather than an old rendered transcript.
+- **Settings CLI test isolation.** The settings command fixture is restricted
+  to Linux, whose XDG isolation it actually uses; on macOS the same code paths
+  can reach the real user profile. Linux behavioral coverage is retained.
 - **Gemini native response replay.** Retain original part order, signed text,
   empty signed trailing parts and native function-call IDs through completion
   collection and stored messages. Thought parts go to reasoning rather than

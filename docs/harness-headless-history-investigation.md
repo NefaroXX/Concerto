@@ -84,8 +84,13 @@ passed (`h40-audit-resume-1.log`), and that attempt's logs are retained under
 `h40-attempt1/`.
 
 The final full battery on `8f2853e` passed **all 12 gates** in 34 m 02 s, and
-all 1,019 source-snapshot hashes match. H40 and H41 are locally verified;
-publication awaits the exact-head remote checks.
+all 1,019 source-snapshot hashes match. The candidate was published as
+`91bf006` on `fix/harness-streaming-integrity` (PR #379 to `dev`), and all 12
+exact-head checks passed ([CI
+43942883154](https://github.com/NefaroXX/Concerto/actions/runs/43942883154),
+[native
+43942883053](https://github.com/NefaroXX/Concerto/actions/runs/43942883053)).
+H40 and H41 are complete for their stated scope.
 
 ## H41: settings CLI fixture could access real macOS application data
 
