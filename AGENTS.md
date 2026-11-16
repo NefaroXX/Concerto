@@ -53,7 +53,7 @@ cargo audit
   `[workspace.lints]` already denies `clippy::all` and `unsafe_code`, so never
   add `unsafe` and keep warnings clean.
 - CI pins fmt/clippy to toolchain **1.96.0**; the workspace MSRV declared in
-  `Cargo.toml` is **1.88**. Use a current stable locally — just keep fmt/clippy
+  `Cargo.toml` is **1.94**. Use a current stable locally — just keep fmt/clippy
   output matching 1.96.0.
 
 ## Non-obvious environment requirements

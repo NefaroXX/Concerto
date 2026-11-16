@@ -38,7 +38,7 @@ passing repository tests alone does not close a finding.
 | H26 | P2 | Nine non-standard benchmark task manifests contain invalid-length IDs | Fixed and verified; awaiting merge |
 | H27 | P1 | Native orchestrator builds fail on macOS (Linux syscall) and Windows (test helper cfgs) | Fixed and verified; awaiting merge |
 | H28 | P2 | Unused dependencies and inconsistent versions inflate the dependency graph | Initial cleanup verified on 43a3e79; 67 duplicate families remain under review |
-| H29 | P2 | Declared Rust 1.88 minimum contradicts required locked dependencies | Open; dependency manifests verified |
+| H29 | P2 | Declared Rust 1.88 minimum contradicts required locked dependencies | Fixed and verified: MSRV 1.94 declared; full workspace `check --all-targets` on Rust 1.94.0 passed with warnings denied |
 | H30 | P1 | Locked wasmtimer retains unmaintained pin-utils and fails the supply-chain gate | Fixed and verified; awaiting merge |
 | H31 | P1 | Bundled SQLite/SQLCipher fails the WAL memory-disclosure security gate | Fixed and verified; awaiting merge |
 | H32 | P1 | Locked rustix fails the extended-attribute buffer soundness security gate | Fixed and verified; awaiting merge |
@@ -2556,3 +2556,21 @@ has terminated; there is no remaining validation process to wait on.
   and cancelled-run spend settlement are unresolved. Seven findings remain in
   total (H12, H14, H23, H28, H29, H34, H39). Passing checks do not establish
   overall harness superiority.
+
+## 2026-11-16 — H29: declared MSRV aligned to 1.94
+
+- Changed the workspace `rust-version` in `Cargo.toml` from 1.88 to 1.94 and
+  updated the live README, CONTRIBUTING, AGENTS, security-threat-model and
+  TODO MSRV claims. Historical ADRs, dated plans and existing CHANGELOG release
+  entries were left unchanged.
+- Evidence basis: `cargo metadata --offline --locked --format-version 1` over
+  the resolved closure reports a maximum declared `rust_version` of **1.94.0**
+  (sqlx/sqlx-core/sqlx-macros/sqlx-macros-core/sqlx-sqlite 0.9.0), followed by
+  opentelemetry-langfuse 0.7.0 (1.93.1) and tree-sitter 0.27.1 (1.90). CI and
+  `rust-toolchain.toml` remain pinned to 1.96.0.
+- Verified on a real 1.94.0 toolchain: `cargo +1.94.0 check --workspace
+  --all-targets -j1` passed with `RUSTFLAGS="-D warnings"`, no warnings or
+  errors (17 m 21 s cold, log `h29-msrv-1.94-check.log`), and `cargo +1.94.0
+  fmt --all -- --check` passed. The declared MSRV is therefore build-verified
+  on the host target. CI remains on 1.96.0; the wasm32-wasip2 guest target is
+  still built by CI on 1.96.0 and is not part of this claim.

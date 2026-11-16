@@ -99,7 +99,7 @@ unstarted.
   and never breadth; `Options::default()` does I/O and reads `NO_COLOR` from
   stdout, a defect for the Iced GUI; and it is immature — two releases a day
   apart, ~44 lifetime downloads, 0 reverse dependencies, no declared MSRV
-  against this workspace's 1.88, and 0.x semver. The builtin's traversal is
+  against this workspace's 1.94, and 0.x semver. The builtin's traversal is
   ~20 lines; the rest is repo plumbing (effect classification, cancellation,
   root confinement) — the ADR-62 policy-gate boundary. Conclusion: keep the
   builtin; the external crate is deliberately not a Concerto dependency, and

@@ -328,6 +328,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   had been broken by a signature change, so `concerto --cli` was unavailable and
   `--reduced-motion` was rejected as an unknown subcommand. Both fixed and now
   built and smoke-run in CI (`c7f68a6`).
+- **Declared MSRV now matches the locked dependency graph.** The workspace
+  `rust-version` is 1.94 instead of 1.88, because the locked sqlx 0.9.0 family
+  requires 1.94.0, opentelemetry-langfuse 0.7.0 requires 1.93.1, and
+  tree-sitter 0.27.1 requires 1.90. CI remains pinned to Rust 1.96.0; 1.88
+  support is no longer claimed.
 
 ### Added
 

@@ -6,7 +6,7 @@ expanding claims or adding speculative dependencies.
 
 ## Development setup
 
-- Rust 1.88 or newer (the workspace MSRV). The repository pins Rust 1.96.0 via
+- Rust 1.94 or newer (the workspace MSRV). The repository pins Rust 1.96.0 via
   `rust-toolchain.toml`, so a rustup-managed installation resolves the exact CI
   toolchain automatically.
 - The `wasm32-wasip2` target — required by the `test-*-plugin-wasm` crates.
@@ -65,7 +65,7 @@ security-sensitive findings.
 The GitHub Actions workflow at `.github/workflows/ci.yml` is authoritative.
 It runs fmt, clippy, test, cargo-deny, and cargo-audit as separate,
 independent jobs and pins the toolchain to Rust 1.96.0 through
-`rust-toolchain.toml`. The workspace MSRV is Rust 1.88.
+`rust-toolchain.toml`. The workspace MSRV is Rust 1.94.
 
 ```bash
 rustup target add wasm32-wasip2
