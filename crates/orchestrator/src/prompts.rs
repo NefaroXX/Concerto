@@ -406,6 +406,7 @@ impl PromptBuilder {
     /// the orchestrator uses for its system and working-memory turns.
     fn message(role: Role, content: String) -> Message {
         Message {
+            gemini_replay: None,
             role,
             content,
             tool_calls: None,
@@ -786,10 +787,20 @@ fn balanced_end(text: &str, start: usize, opening: char) -> Option<usize> {
     None
 }
 
+/// One completed provider turn, including replay state that survives persistence.
+#[derive(Debug, Clone)]
+pub struct CompletedTurn {
+    pub text: String,
+    pub reasoning: Option<String>,
+    pub tool_calls: Vec<ToolCall>,
+    pub usage: Option<CompletionUsage>,
+    pub gemini_replay: Option<concerto_core::provider_replay::GeminiReplay>,
+}
+
 /// Collect a `CompletionStream` into its full text, any reasoning text, any
 /// tool calls, and the provider-reported usage (ADR-48 §4).
 ///
-/// Returns `(text, reasoning, tool_calls, usage)`. `reasoning` is `None` when
+/// Returns the complete canonical turn and native replay state. `reasoning` is `None` when
 /// no streamed reasoning was observed (ADR-46); otherwise the concatenated
 /// reasoning deltas. `usage` is `Some` only when the terminal chunk carried a
 /// provider usage report (providers report usage exclusively on the final
@@ -797,13 +808,14 @@ fn balanced_end(text: &str, start: usize, opening: char) -> Option<usize> {
 /// buffered output from that attempt must not escape to tool execution.
 pub async fn collect_stream(
     mut stream: CompletionStream,
-) -> Result<(String, Option<String>, Vec<ToolCall>, Option<CompletionUsage>), OrchestratorError> {
+) -> Result<CompletedTurn, OrchestratorError> {
     use futures::StreamExt;
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
     let mut usage = None;
     let mut final_seen = false;
+    let mut gemini_replay = None;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(OrchestratorError::Provider)?;
         text.push_str(&chunk.delta);
@@ -816,13 +828,14 @@ pub async fn collect_stream(
         if chunk.is_final {
             final_seen = true;
             usage = chunk.usage;
+            gemini_replay = chunk.gemini_replay;
         }
     }
     if !final_seen {
         return Err(OrchestratorError::Provider(incomplete_stream_error()));
     }
     let reasoning = if reasoning.is_empty() { None } else { Some(reasoning) };
-    Ok((text, reasoning, tool_calls, usage))
+    Ok(CompletedTurn { text, reasoning, tool_calls, usage, gemini_replay })
 }
 
 /// Execute and collect one logical provider request through the single retry
@@ -833,7 +846,7 @@ pub async fn collect_stream(
 /// data. A retry recreates only this request; it never replays an agent or any
 /// tool side effects.
 ///
-/// Returns `(text, reasoning, tool_calls, usage)`; see [`collect_stream`].
+/// Returns the complete canonical turn and native replay state; see [`collect_stream`].
 #[allow(clippy::too_many_arguments)]
 pub async fn complete_provider_request(
     provider: &std::sync::Arc<dyn LlmProvider>,
@@ -843,7 +856,7 @@ pub async fn complete_provider_request(
     session_id: Ulid,
     task_id: TaskId,
     cancel: &CancellationToken,
-) -> Result<(String, Option<String>, Vec<ToolCall>, Option<CompletionUsage>), OrchestratorError> {
+) -> Result<CompletedTurn, OrchestratorError> {
     let first_byte_timeout = Duration::from_secs(retry_policy.config().time_to_first_byte_seconds);
     let idle_timeout = Duration::from_secs(retry_policy.config().stream_idle_timeout_seconds);
     let provider_name = provider.provider_name();
@@ -909,7 +922,7 @@ pub(crate) async fn collect_stream_with_timeouts(
     cancel: &CancellationToken,
     first_byte_timeout: Duration,
     idle_timeout: Duration,
-) -> Result<(String, Option<String>, Vec<ToolCall>, Option<CompletionUsage>), ProviderError> {
+) -> Result<CompletedTurn, ProviderError> {
     collect_stream_measured(stream, cancel, first_byte_timeout, idle_timeout, None).await
 }
 
@@ -919,7 +932,7 @@ async fn collect_stream_measured(
     first_byte_timeout: Duration,
     idle_timeout: Duration,
     mut recorder: Option<&mut crate::provider_telemetry::AttemptRecorder>,
-) -> Result<(String, Option<String>, Vec<ToolCall>, Option<CompletionUsage>), ProviderError> {
+) -> Result<CompletedTurn, ProviderError> {
     use futures::StreamExt;
 
     let mut text = String::new();
@@ -927,6 +940,7 @@ async fn collect_stream_measured(
     let mut tool_calls = Vec::new();
     let mut usage = None;
     let mut final_seen = false;
+    let mut gemini_replay = None;
     let mut first_chunk = true;
     loop {
         let timeout = if first_chunk { first_byte_timeout } else { idle_timeout };
@@ -959,13 +973,14 @@ async fn collect_stream_measured(
         if chunk.is_final {
             final_seen = true;
             usage = chunk.usage;
+            gemini_replay = chunk.gemini_replay;
         }
     }
     if !final_seen {
         return Err(incomplete_stream_error());
     }
     let reasoning = if reasoning.is_empty() { None } else { Some(reasoning) };
-    Ok((text, reasoning, tool_calls, usage))
+    Ok(CompletedTurn { text, reasoning, tool_calls, usage, gemini_replay })
 }
 
 fn incomplete_stream_error() -> ProviderError {
@@ -997,6 +1012,7 @@ mod tests {
         let builder = PromptBuilder::new("System prompt".to_string());
 
         let user_msg = Message {
+            gemini_replay: None,
             role: Role::User,
             content: "Hello".to_string(),
             tool_calls: None,
@@ -1355,6 +1371,7 @@ mod tests {
             vec![],
             vec![CompletionChunk::keepalive()],
             vec![CompletionChunk {
+                gemini_replay: None,
                 delta: "partial answer".into(),
                 reasoning: Some("partial reasoning".into()),
                 tool_call: Some(ToolCall { name: "filesystem".into(), ..Default::default() }),
@@ -1415,7 +1432,8 @@ mod tests {
             if late_error {
                 assert!(matches!(result, Err(ProviderError::AuthFailure)));
             } else {
-                let (text, reasoning, calls, usage) = result.unwrap();
+                let CompletedTurn { text, reasoning, tool_calls: calls, usage, .. } =
+                    result.unwrap();
                 assert!(text.is_empty());
                 assert!(reasoning.is_none());
                 assert!(calls.is_empty());
@@ -1442,6 +1460,7 @@ mod tests {
         use concerto_core::types::CompletionChunk;
         let stream: CompletionStream = Box::pin(stream::iter(vec![
             Ok(CompletionChunk {
+                gemini_replay: None,
                 delta: "part one".into(),
                 reasoning: Some("reason one".into()),
                 tool_call: None,
@@ -1449,6 +1468,7 @@ mod tests {
                 usage: None,
             }),
             Ok(CompletionChunk {
+                gemini_replay: None,
                 delta: "".into(),
                 reasoning: Some("reason two".into()),
                 tool_call: None,
@@ -1456,6 +1476,7 @@ mod tests {
                 usage: None,
             }),
             Ok(CompletionChunk {
+                gemini_replay: None,
                 delta: " part two".into(),
                 reasoning: None,
                 tool_call: None,
@@ -1463,7 +1484,8 @@ mod tests {
                 usage: None,
             }),
         ]));
-        let (text, reasoning, tool_calls, usage) = collect_stream(stream).await.unwrap();
+        let CompletedTurn { text, reasoning, tool_calls, usage, .. } =
+            collect_stream(stream).await.unwrap();
         assert_eq!(text, "part one part two");
         assert_eq!(reasoning.as_deref(), Some("reason onereason two"));
         assert!(tool_calls.is_empty());
@@ -1475,13 +1497,15 @@ mod tests {
     async fn collect_stream_reasoning_none_when_absent() {
         use concerto_core::types::CompletionChunk;
         let stream: CompletionStream = Box::pin(stream::iter(vec![Ok(CompletionChunk {
+            gemini_replay: None,
             delta: "no reasoning here".into(),
             reasoning: None,
             tool_call: None,
             is_final: true,
             usage: None,
         })]));
-        let (text, reasoning, tool_calls, usage) = collect_stream(stream).await.unwrap();
+        let CompletedTurn { text, reasoning, tool_calls, usage, .. } =
+            collect_stream(stream).await.unwrap();
         assert_eq!(text, "no reasoning here");
         assert_eq!(reasoning, None);
         assert!(tool_calls.is_empty());
@@ -1493,6 +1517,7 @@ mod tests {
         use concerto_core::types::{CompletionChunk, CompletionUsage};
         let stream: CompletionStream = Box::pin(stream::iter(vec![
             Ok(CompletionChunk {
+                gemini_replay: None,
                 delta: "hi".into(),
                 reasoning: None,
                 tool_call: None,
@@ -1500,6 +1525,7 @@ mod tests {
                 usage: None,
             }),
             Ok(CompletionChunk {
+                gemini_replay: None,
                 delta: "".into(),
                 reasoning: None,
                 tool_call: None,
@@ -1511,7 +1537,7 @@ mod tests {
                 }),
             }),
         ]));
-        let (_, _, _, usage) = collect_stream(stream).await.unwrap();
+        let CompletedTurn { usage, .. } = collect_stream(stream).await.unwrap();
         assert_eq!(
             usage,
             Some(CompletionUsage {
@@ -1526,6 +1552,7 @@ mod tests {
 
     fn user_message(content: &str) -> Message {
         Message {
+            gemini_replay: None,
             role: Role::User,
             content: content.to_string(),
             tool_calls: None,
@@ -2017,3 +2044,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "prompts_replay_tests.rs"]
+mod replay_tests;

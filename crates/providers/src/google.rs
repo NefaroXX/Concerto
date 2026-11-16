@@ -1,6 +1,9 @@
 use async_stream::stream;
 use async_trait::async_trait;
 use concerto_core::error::{describe_error_chain, ProviderError};
+use concerto_core::provider_replay::{
+    GeminiReplay, MAX_GEMINI_REPLAY_BYTES, MAX_GEMINI_REPLAY_PARTS,
+};
 use concerto_core::traits::{CompletionStream, LlmProvider};
 use concerto_core::types::{
     CompletionChunk, CompletionRequest, CompletionUsage, ModelInfo, TokenBudget, ToolCall,
@@ -11,6 +14,10 @@ use futures::stream::StreamExt;
 
 use crate::adapters::{Dialect, GeminiChatDialect, ReasoningEcho};
 use crate::sse::BufferedSseParser;
+
+#[cfg(test)]
+#[path = "google_replay_regressions.rs"]
+mod replay_regressions;
 
 pub struct GoogleProvider {
     api_key: SecretString,
@@ -155,8 +162,8 @@ fn function_call_thought_signature(
 
 /// Parse one Gemini `functionCall` part into a canonical [`ToolCall`].
 ///
-/// Gemini provides no unique call IDs, so `counter` mints sequential `gc_<n>`
-/// ids for the stream. When the loose tool-schema tier was active for the
+/// Preserve a native call ID when present; otherwise `counter` mints
+/// sequential `gc_<n>` ids for the stream. When the loose tool-schema tier was active for the
 /// stream, `unflatten` re-nests dot-notation arguments back into the tools'
 /// original nested shape (see [`crate::adapters::schema_loose`]).
 ///
@@ -184,7 +191,12 @@ fn parse_function_call_part(
         crate::adapters::schema_loose::unflatten_tool_arguments(&mut args);
     }
     *counter += 1;
-    let id = format!("gc_{counter}");
+    let id = fc
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("gc_{counter}"));
     let thought_signature = function_call_thought_signature(fc, part);
     ToolCall { id, name, arguments: args, thought_signature }
 }
@@ -212,6 +224,11 @@ struct GoogleStreamState {
     /// parts that arrived bare must stay bare, because forcing a signature
     /// onto them is itself rejectable. Nothing is backfilled here.
     pending_tool_calls: Vec<CompletionChunk>,
+    replay_parts: Vec<serde_json::Value>,
+    replay_bytes: usize,
+    replay_text: String,
+    replay_reasoning: String,
+    replay_calls: Vec<ToolCall>,
 }
 
 impl GoogleStreamState {
@@ -222,6 +239,11 @@ impl GoogleStreamState {
             terminal_emitted: false,
             usage: None,
             pending_tool_calls: Vec::new(),
+            replay_parts: Vec::new(),
+            replay_bytes: 2,
+            replay_text: String::new(),
+            replay_reasoning: String::new(),
+            replay_calls: Vec::new(),
         }
     }
 
@@ -230,8 +252,19 @@ impl GoogleStreamState {
             return Vec::new();
         }
         self.terminal_emitted = true;
+        let replay = GeminiReplay::capture(
+            std::mem::take(&mut self.replay_parts),
+            &self.replay_text,
+            Some(&self.replay_reasoning),
+            &self.replay_calls,
+        );
+        let replay = match replay {
+            Ok(replay) => replay,
+            Err(error) => return vec![Err(error)],
+        };
         let mut items = self.flush_pending_tool_calls();
         items.push(Ok(CompletionChunk {
+            gemini_replay: Some(replay),
             reasoning: None,
             delta: String::new(),
             tool_call: None,
@@ -297,6 +330,52 @@ impl GoogleStreamState {
         }
     }
 
+    /// Capture native parts separately from executable calls: buffering calls
+    /// until completion must not alter the original text/call replay order.
+    fn capture_part(
+        &mut self,
+        part: &serde_json::Value,
+        fc_counter: &mut u64,
+        tool_adapted: bool,
+    ) -> Result<Option<CompletionChunk>, ProviderError> {
+        let bytes = serde_json::to_vec(part)
+            .map_err(|error| ProviderError::Serialization(error.to_string()))?
+            .len();
+        // Array brackets were counted at initialization; commas separate parts.
+        self.replay_bytes = self
+            .replay_bytes
+            .saturating_add(bytes)
+            .saturating_add(usize::from(!self.replay_parts.is_empty()));
+        if self.replay_bytes > MAX_GEMINI_REPLAY_BYTES
+            || self.replay_parts.len() >= MAX_GEMINI_REPLAY_PARTS
+        {
+            return Err(ProviderError::InvalidResponse(
+                "Gemini response exceeds native replay limits".into(),
+            ));
+        }
+        self.replay_parts.push(part.clone());
+        let text_chunk = part["text"].as_str().map(|text| {
+            let thought = part["thought"].as_bool() == Some(true);
+            if thought {
+                self.replay_reasoning.push_str(text);
+            } else {
+                self.replay_text.push_str(text);
+            }
+            CompletionChunk {
+                reasoning: thought.then(|| text.to_owned()),
+                delta: if thought { String::new() } else { text.to_owned() },
+                ..CompletionChunk::keepalive()
+            }
+        });
+        if let Some(fc) = part.get("functionCall") {
+            let call = parse_function_call_part(fc, part, fc_counter, tool_adapted);
+            self.replay_calls.push(call.clone());
+            self.pending_tool_calls
+                .push(CompletionChunk { tool_call: Some(call), ..CompletionChunk::keepalive() });
+        }
+        Ok(text_chunk)
+    }
+
     /// Reduce one SSE event into canonical chunks to yield.
     fn handle_event(
         &mut self,
@@ -313,6 +392,7 @@ impl GoogleStreamState {
             // stream stays active and the orchestrator idle timeout does not
             // fire during long keep-alive-only periods.
             items.push(Ok(CompletionChunk {
+                gemini_replay: None,
                 reasoning: None,
                 delta: String::new(),
                 tool_call: None,
@@ -340,34 +420,15 @@ impl GoogleStreamState {
                     if let Some(parts) = content.get("parts").and_then(serde_json::Value::as_array)
                     {
                         for part in parts {
-                            if let Some(text) = part["text"].as_str() {
-                                items.push(Ok(CompletionChunk {
-                                    reasoning: None,
-                                    delta: text.to_string(),
-                                    tool_call: None,
-                                    is_final: false,
-                                    usage: None,
-                                }));
-                            }
-                            if let Some(fc) = part.get("functionCall") {
-                                // Gemini emits function calls inline in
-                                // parts. Parse the name, args, and the opaque
-                                // `thought_signature` (replayed verbatim by
-                                // the dialect) into a ToolCall chunk.
-                                // Per-part signature presence is preserved
-                                // exactly — no within-turn backfill onto
-                                // siblings. The chunk is held until the turn
-                                // completes so a multi-call turn is emitted
-                                // as one group before the terminal chunk.
-                                let tc =
-                                    parse_function_call_part(fc, part, fc_counter, tool_adapted);
-                                self.pending_tool_calls.push(CompletionChunk {
-                                    reasoning: None,
-                                    delta: String::new(),
-                                    tool_call: Some(tc),
-                                    is_final: false,
-                                    usage: None,
-                                });
+                            match self.capture_part(part, fc_counter, tool_adapted) {
+                                Ok(Some(chunk)) => items.push(Ok(chunk)),
+                                Ok(None) => {}
+                                Err(error) => {
+                                    self.terminal_emitted = true;
+                                    self.pending_tool_calls.clear();
+                                    items.push(Err(error));
+                                    return items;
+                                }
                             }
                         }
                     }

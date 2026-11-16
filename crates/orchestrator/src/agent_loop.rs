@@ -3,6 +3,7 @@
 //! Phase 3: basic sequential loop with memory, undo, and eval hooks.
 //! Multi-agent coordination is Phase 5.
 
+use crate::prompts::CompletedTurn;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -568,6 +569,7 @@ impl AgentLoop {
             let mut seed = history.clone();
             if round == 0 {
                 seed.push(Message {
+                    gemini_replay: None,
                     role: Role::User,
                     content: task.description.clone(),
                     tool_calls: None,
@@ -737,6 +739,7 @@ impl AgentLoop {
                     // history (same session_id, same project root).
                     history = self.initial_messages.clone();
                     history.push(Message {
+                        gemini_replay: None,
                         role: Role::User,
                         content: continuation_instruction(&reason),
                         tool_calls: None,
@@ -988,7 +991,7 @@ impl AgentLoop {
                 .sum::<u64>()
                 .div_ceil(4);
 
-            let (text, reasoning, tool_calls, usage) = match self
+            let CompletedTurn { text, reasoning, tool_calls, usage, gemini_replay } = match self
                 .call_provider_with_retry(&request, task.session_id, task.id, &cancel)
                 .await
             {
@@ -1057,27 +1060,29 @@ impl AgentLoop {
             // structured tool-call blocks parsed from the text, bounded
             // repair on malformed blocks, loud failure on bound exhaustion.
             // Native turns (driver inactive) pass through untouched.
-            let (text, reasoning, tool_calls, usage) = match tool_driver.as_mut() {
-                Some(driver) => {
-                    self.driver_resolve_turn(
-                        driver,
-                        &task,
-                        iteration,
-                        &files_modified,
-                        &tool_events,
-                        &verification,
-                        &retrieved_memory_block,
-                        text,
-                        reasoning,
-                        usage,
-                        &mut messages,
-                        correlation_id,
-                        &cancel,
-                    )
-                    .await?
-                }
-                None => (text, reasoning, tool_calls, usage),
-            };
+            let CompletedTurn { text, reasoning, tool_calls, usage, gemini_replay } =
+                match tool_driver.as_mut() {
+                    Some(driver) => {
+                        self.driver_resolve_turn(
+                            driver,
+                            &task,
+                            iteration,
+                            &files_modified,
+                            &tool_events,
+                            &verification,
+                            &retrieved_memory_block,
+                            text,
+                            reasoning,
+                            usage,
+                            gemini_replay,
+                            &mut messages,
+                            correlation_id,
+                            &cancel,
+                        )
+                        .await?
+                    }
+                    None => CompletedTurn { text, reasoning, tool_calls, usage, gemini_replay },
+                };
 
             // Publish lifecycle event after provider call succeeds
             let _ = self.bus.publish_for_session(
@@ -1112,10 +1117,13 @@ impl AgentLoop {
 
             // Phase 5: Process provider response
             let action = self.process_provider_response(
-                &text,
-                reasoning,
-                &tool_calls,
-                usage,
+                CompletedTurn {
+                    text: text.clone(),
+                    reasoning,
+                    tool_calls: tool_calls.clone(),
+                    usage,
+                    gemini_replay,
+                },
                 &task.execution_mode,
                 prior_file_changes.saturating_add(file_changing_tool_count),
                 iteration,
@@ -1467,11 +1475,11 @@ impl AgentLoop {
         mut text: String,
         mut reasoning: Option<String>,
         mut usage: Option<CompletionUsage>,
+        mut gemini_replay: Option<concerto_core::provider_replay::GeminiReplay>,
         messages: &mut Vec<Message>,
         correlation_id: Ulid,
         cancel: &CancellationToken,
-    ) -> Result<(String, Option<String>, Vec<ToolCall>, Option<CompletionUsage>), OrchestratorError>
-    {
+    ) -> Result<CompletedTurn, OrchestratorError> {
         let provider = self.provider.provider_name();
         let model = self.usage_model.clone();
         let mut attempts = 0u32;
@@ -1504,10 +1512,22 @@ impl AgentLoop {
                             cancel.clone(),
                         )
                         .await;
-                    return Ok((text, reasoning, calls, usage));
+                    return Ok(CompletedTurn {
+                        text,
+                        reasoning,
+                        tool_calls: calls,
+                        usage,
+                        gemini_replay: None,
+                    });
                 }
                 BlockDecision::FinalAnswer(final_text) => {
-                    return Ok((final_text, reasoning, Vec::new(), usage));
+                    return Ok(CompletedTurn {
+                        gemini_replay: if final_text == text { gemini_replay } else { None },
+                        text: final_text,
+                        reasoning,
+                        tool_calls: Vec::new(),
+                        usage,
+                    });
                 }
                 BlockDecision::Exhausted { reason } => {
                     self.tool_executor
@@ -1558,6 +1578,7 @@ impl AgentLoop {
                     // the model can see its own defect, followed by the
                     // repair instruction.
                     messages.push(Message {
+                        gemini_replay: gemini_replay.take(),
                         role: Role::Assistant,
                         content: text.clone(),
                         tool_calls: None,
@@ -1578,12 +1599,19 @@ impl AgentLoop {
                     );
                     request.session_id = Some(task.session_id);
                     driver.augment_request(&mut request);
-                    let (repaired_text, repaired_reasoning, _, repaired_usage) = self
+                    let CompletedTurn {
+                        text: repaired_text,
+                        reasoning: repaired_reasoning,
+                        usage: repaired_usage,
+                        gemini_replay: repaired_replay,
+                        ..
+                    } = self
                         .call_provider_with_retry(&request, task.session_id, task.id, cancel)
                         .await?;
                     usage = tool_driver::merge_usage(usage, repaired_usage);
                     text = repaired_text;
-                    reasoning = repaired_reasoning.or(reasoning);
+                    reasoning = repaired_reasoning;
+                    gemini_replay = repaired_replay;
                 }
             }
         }
@@ -1602,8 +1630,7 @@ impl AgentLoop {
         session_id: Ulid,
         task_id: TaskId,
         cancel: &CancellationToken,
-    ) -> Result<(String, Option<String>, Vec<ToolCall>, Option<CompletionUsage>), OrchestratorError>
-    {
+    ) -> Result<CompletedTurn, OrchestratorError> {
         match crate::prompts::complete_provider_request(
             &self.provider,
             request,
@@ -1656,10 +1683,7 @@ impl AgentLoop {
     #[allow(clippy::too_many_arguments)]
     fn process_provider_response(
         &self,
-        text: &str,
-        reasoning: Option<String>,
-        tool_calls: &[ToolCall],
-        usage: Option<CompletionUsage>,
+        turn: CompletedTurn,
         task_execution_mode: &TaskExecutionMode,
         file_changing_tool_count: u32,
         iteration: u32,
@@ -1669,6 +1693,7 @@ impl AgentLoop {
         final_message: &mut String,
         completed: &mut bool,
     ) -> ProviderResponseAction {
+        let CompletedTurn { text, reasoning, tool_calls, usage, gemini_replay } = turn;
         let action_required =
             matches!(task_execution_mode, TaskExecutionMode::ActionRequired { .. });
 
@@ -1683,6 +1708,7 @@ impl AgentLoop {
         };
 
         messages.push(Message {
+            gemini_replay,
             role: Role::Assistant,
             content: text.to_string(),
             tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls.to_vec()) },
@@ -1743,6 +1769,8 @@ impl AgentLoop {
                     );
 
                     messages.push(Message {
+
+                        gemini_replay: None,
                         role: Role::User,
                         content: "This task requires concrete repository changes. Do not describe the result. Call the filesystem tool with operation \"write\" or \"delete\" and a concrete relative path. A text-only response is not valid completion.".to_string(),
                         tool_calls: None,
@@ -2115,6 +2143,7 @@ impl AgentLoop {
         // Run-start row: no provider call has happened yet, so there is no
         // usage to record — tokens stay `None` by design.
         let user_msg = Message {
+            gemini_replay: None,
             role: Role::User,
             content: task.description.clone(),
             tool_calls: None,
@@ -2183,6 +2212,7 @@ impl AgentLoop {
         // provider call and keeps `None`.
         let (tokens_in, tokens_out) = message_row_usage(&output.provider_metrics);
         let assistant_msg = Message {
+            gemini_replay: None,
             role: Role::Assistant,
             content: output.summary(),
             tool_calls: None,
@@ -2235,6 +2265,7 @@ impl AgentLoop {
         // spent real tokens, so the assistant row records them (ADR-48 §4).
         let (tokens_in, tokens_out) = message_row_usage(&output.provider_metrics);
         let assistant_msg = Message {
+            gemini_replay: None,
             role: Role::Assistant,
             content: output.summary(),
             tool_calls: None,
@@ -2464,6 +2495,7 @@ impl AgentLoop {
                     },
                 );
                 messages.push(Message {
+                    gemini_replay: None,
                     role: Role::Tool,
                     content,
                     tool_calls: None,
@@ -2550,6 +2582,7 @@ impl AgentLoop {
                 },
             );
             messages.push(Message {
+                gemini_replay: None,
                 role: Role::Tool,
                 content,
                 tool_calls: None,
@@ -2742,6 +2775,7 @@ impl AgentLoop {
                 serde_json::to_string(&served_data).unwrap_or_else(|_| "{}".to_string())
             );
             messages.push(Message {
+                gemini_replay: None,
                 role: Role::Tool,
                 content: tool_result_content.clone(),
                 tool_calls: None,
@@ -2870,6 +2904,7 @@ impl AgentLoop {
                 );
 
                 messages.push(Message {
+                    gemini_replay: None,
                     role: Role::Tool,
                     content: tool_result_content.clone(),
                     tool_calls: None,
@@ -3040,6 +3075,7 @@ impl AgentLoop {
                     tc.name, rule
                 );
                 messages.push(Message {
+                    gemini_replay: None,
                     role: Role::Tool,
                     content: denial_msg,
                     tool_calls: None,
@@ -3141,6 +3177,7 @@ impl AgentLoop {
                     tc.name, tc.id, e
                 );
                 messages.push(Message {
+                    gemini_replay: None,
                     role: Role::Tool,
                     content: error_msg,
                     tool_calls: None,
@@ -3261,6 +3298,7 @@ impl AgentLoop {
             &failure,
         );
         Some(Message {
+            gemini_replay: None,
             role: Role::User,
             content,
             tool_calls: None,
@@ -3633,6 +3671,7 @@ mod tests {
             let mut chunks: Vec<_> = tool_calls
                 .into_iter()
                 .map(|tc| CompletionChunk {
+                    gemini_replay: None,
                     reasoning: None,
                     delta: String::new(),
                     tool_call: Some(tc),
@@ -3641,6 +3680,7 @@ mod tests {
                 })
                 .collect();
             chunks.push(CompletionChunk {
+                gemini_replay: None,
                 reasoning: None,
                 delta: String::new(),
                 tool_call: None,
@@ -3710,6 +3750,7 @@ mod tests {
                 self.saw_wire_tools.store(true, Ordering::SeqCst);
             }
             Ok(Box::pin(stream::iter(vec![Ok(CompletionChunk {
+                gemini_replay: None,
                 delta: self.reply_at(idx),
                 reasoning: None,
                 tool_call: None,
@@ -3756,6 +3797,7 @@ mod tests {
                 return Err(ProviderError::Network(format!("transient failure #{}", idx + 1)));
             }
             Ok(Box::pin(stream::iter(vec![Ok(CompletionChunk {
+                gemini_replay: None,
                 reasoning: None,
                 delta: String::new(),
                 tool_call: None,
@@ -3797,6 +3839,7 @@ mod tests {
                 ..Default::default()
             };
             Ok(Box::pin(stream::iter(vec![Ok(CompletionChunk {
+                gemini_replay: None,
                 reasoning: None,
                 delta: String::new(),
                 tool_call: Some(tc),
@@ -5159,6 +5202,7 @@ mod tests {
             ) -> Result<CompletionStream, ProviderError> {
                 *self.captured.lock().expect("lock") = Some(request);
                 Ok(Box::pin(stream::iter(vec![Ok(CompletionChunk {
+                    gemini_replay: None,
                     reasoning: None,
                     delta: String::new(),
                     tool_call: None,
@@ -5344,6 +5388,7 @@ mod tests {
         ) -> Result<CompletionStream, ProviderError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let chunk = CompletionChunk {
+                gemini_replay: None,
                 delta: self.text.clone(),
                 reasoning: None,
                 tool_call: None,
@@ -6825,6 +6870,7 @@ mod tests {
                 Some(Ok(chunks)) => Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok)))),
                 Some(Err(e)) => Err(e),
                 None => Ok(Box::pin(stream::iter(vec![Ok(CompletionChunk {
+                    gemini_replay: None,
                     reasoning: None,
                     delta: String::new(),
                     tool_call: None,
@@ -6838,6 +6884,7 @@ mod tests {
     /// Helper: a single answer-only completion chunk.
     fn answer_chunk() -> Vec<CompletionChunk> {
         vec![CompletionChunk {
+            gemini_replay: None,
             delta: String::new(),
             reasoning: None,
             tool_call: None,
@@ -6875,6 +6922,7 @@ mod tests {
     async fn premature_eof_retries_without_executing_partial_tool_calls() {
         let dir = tempfile::tempdir().unwrap();
         let partial = CompletionChunk {
+            gemini_replay: None,
             delta: "unfinished".into(),
             reasoning: None,
             tool_call: Some(ToolCall {
@@ -6988,6 +7036,7 @@ mod tests {
         };
         let provider = Arc::new(CountingScriptedProvider::new(vec![
             Ok(vec![CompletionChunk {
+                gemini_replay: None,
                 reasoning: None,
                 delta: String::new(),
                 tool_call: Some(write_tc),
@@ -7768,6 +7817,7 @@ mod tests {
         // The assistant message that carried the (broken) tool call — its
         // text states the intended call explicitly.
         messages.push(Message {
+            gemini_replay: None,
             role: Role::Assistant,
             content: "Listing the sources now: Filesystem operation=\"list\" path=\"src\"".into(),
             tool_calls: None,
@@ -8813,10 +8863,13 @@ mod tests {
         let mut completed = false;
 
         let action = loop_.process_provider_response(
-            "", // _text placeholder (not used by this branch)
-            None,
-            &[], // no tool calls → enters the else-if chain
-            None,
+            CompletedTurn {
+                text: "".into(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                usage: None,
+                gemini_replay: None,
+            },
             &TaskExecutionMode::AnswerOnly,
             0,
             1,
@@ -8833,17 +8886,20 @@ mod tests {
     }
 
     #[test]
-    fn process_provider_response_coordinator_decides_completes_in_prose() {
+    fn replay_regression_process_response_preserves_native_prose() {
         let loop_ = make_minimal_loop();
         let mut messages = vec![];
         let mut final_message = String::new();
         let mut completed = false;
 
         let action = loop_.process_provider_response(
-            "direct coordinator answer",
-            None,
-            &[], // no tool calls → prose completion
-            None,
+            CompletedTurn {
+                text: "direct coordinator answer".into(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                usage: None,
+                gemini_replay: Some(concerto_core::provider_replay::GeminiReplay::capture(vec![serde_json::json!({"text":"direct coordinator answer", "thoughtSignature":"opaque"})], "direct coordinator answer", None, &[]).unwrap()),
+            },
             &TaskExecutionMode::CoordinatorDecides,
             0,
             1,
@@ -8860,6 +8916,8 @@ mod tests {
         assert!(matches!(action, ProviderResponseAction::Break));
         assert!(completed, "CoordinatorDecides prose must mark the run completed");
         assert_eq!(final_message, "direct coordinator answer");
+        let assistant = messages.last().unwrap();
+        assert!(assistant.gemini_replay.as_ref().unwrap().parts_for(assistant).is_some());
     }
 
     #[test]
@@ -8870,10 +8928,13 @@ mod tests {
         let mut completed = false;
 
         let action = loop_.process_provider_response(
-            "some analysis text",
-            None,
-            &[], // no tool calls
-            None,
+            CompletedTurn {
+                text: "some analysis text".into(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                usage: None,
+                gemini_replay: None,
+            },
             &TaskExecutionMode::ActionRequired { min_tool_calls: 1, require_verification: false },
             0, // file_changing_tool_count = 0
             1,
@@ -8892,6 +8953,7 @@ mod tests {
     fn process_provider_response_proceeds_with_tool_calls() {
         let loop_ = make_minimal_loop();
         let mut messages = vec![Message {
+            gemini_replay: None,
             role: Role::User,
             content: "user prompt".into(),
             tool_calls: None,
@@ -8904,20 +8966,24 @@ mod tests {
         let mut completed = false;
 
         let action = loop_.process_provider_response(
-            "need to execute",
-            None,
-            &[ToolCall {
-                id: "call_1".into(),
-                name: "echo".into(),
-                arguments: serde_json::json!({"text": "hi"}),
+            CompletedTurn {
+                text: "need to execute".into(),
+                reasoning: None,
+                tool_calls: [ToolCall {
+                    id: "call_1".into(),
+                    name: "echo".into(),
+                    arguments: serde_json::json!({"text": "hi"}),
 
-                ..Default::default()
-            }],
-            Some(CompletionUsage {
-                prompt_tokens: Some(100),
-                completion_tokens: Some(20),
-                ..Default::default()
-            }),
+                    ..Default::default()
+                }]
+                .to_vec(),
+                usage: Some(CompletionUsage {
+                    prompt_tokens: Some(100),
+                    completion_tokens: Some(20),
+                    ..Default::default()
+                }),
+                gemini_replay: None,
+            },
             &TaskExecutionMode::ActionRequired { min_tool_calls: 1, require_verification: false },
             0,
             1,
@@ -8947,16 +9013,20 @@ mod tests {
         let mut completed = false;
 
         let action = loop_.process_provider_response(
-            "non-empty text",
-            None,
-            &[ToolCall {
-                id: "call_1".into(),
-                name: "echo".into(),
-                arguments: serde_json::json!({}),
+            CompletedTurn {
+                text: "non-empty text".into(),
+                reasoning: None,
+                tool_calls: [ToolCall {
+                    id: "call_1".into(),
+                    name: "echo".into(),
+                    arguments: serde_json::json!({}),
 
-                ..Default::default()
-            }],
-            None,
+                    ..Default::default()
+                }]
+                .to_vec(),
+                usage: None,
+                gemini_replay: None,
+            },
             &TaskExecutionMode::ActionRequired { min_tool_calls: 1, require_verification: false },
             0,
             1,

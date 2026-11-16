@@ -332,6 +332,7 @@ impl concerto_core::traits::provider::LlmProvider for ScriptedCoordModel {
                 return Err(ProviderError::Network("live provider pipe dropped".into()));
             }
             Turn::Text(text) => vec![concerto_core::types::CompletionChunk {
+                gemini_replay: None,
                 reasoning: None,
                 delta: text,
                 tool_call: None,
@@ -344,6 +345,7 @@ impl concerto_core::traits::provider::LlmProvider for ScriptedCoordModel {
                     .into_iter()
                     .enumerate()
                     .map(|(index, call)| concerto_core::types::CompletionChunk {
+                        gemini_replay: None,
                         reasoning: None,
                         delta: String::new(),
                         tool_call: Some(call),

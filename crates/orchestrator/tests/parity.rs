@@ -57,6 +57,7 @@ async fn create_session_with_messages(
     for i in 0..count {
         let role = if i % 2 == 0 { Role::User } else { Role::Assistant };
         messages.push(Message {
+            gemini_replay: None,
             role,
             content: format!(
                 "Message number {i} with some padding to make it realistic: {}",

@@ -225,6 +225,12 @@ fn estimate_message_tokens(message: &Message) -> u64 {
         .saturating_add(reasoning)
         .saturating_add(calls)
         .saturating_add(results)
+        .max(
+            message
+                .gemini_replay
+                .as_ref()
+                .map_or(0, |replay| replay.encoded_len().div_ceil(4) as u64),
+        )
         .saturating_add(4)
 }
 
@@ -314,6 +320,7 @@ mod tests {
         ) -> Result<CompletionStream, ProviderError> {
             *self.captured.lock().unwrap_or_else(|error| error.into_inner()) = Some(request);
             Ok(Box::pin(stream::iter(vec![Ok(CompletionChunk {
+                gemini_replay: None,
                 reasoning: None,
                 delta: String::new(),
                 tool_call: None,
@@ -337,6 +344,7 @@ mod tests {
 
     fn message(role: Role, content: impl Into<String>) -> Message {
         Message {
+            gemini_replay: None,
             role,
             content: content.into(),
             tool_calls: None,
@@ -431,6 +439,7 @@ mod tests {
         let mut messages = vec![message(Role::System, "system"), message(Role::User, "first")];
         for index in 0..4 {
             messages.push(Message {
+                gemini_replay: None,
                 role: Role::Tool,
                 content: "tool-output".repeat(1_000),
                 tool_calls: None,

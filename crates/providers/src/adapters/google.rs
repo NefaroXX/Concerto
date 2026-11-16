@@ -1,9 +1,7 @@
 //! Google Gemini chat dialect (`generateContent` / `streamGenerateContent`).
 //!
 //! This adapter lowers a canonical [`CompletionRequest`] to the wire body of
-//! Google's Gemini `generateContent` endpoint. The logic here is a verbatim
-//! port of the body builder that previously lived in `crate::google`; only the
-//! seam changed, not the bytes.
+//! Google's Gemini `generateContent` endpoint, including native response replay.
 //!
 //! # Wire contract
 //!
@@ -13,10 +11,11 @@
 //!   `{"parts":[{"text": ...}]}`; all system text is joined in source order.
 //! - User parts: `{"text": ...}`. Tool results are appended as `user` parts
 //!   `{"functionResponse":{"name":..., "response":...}}` — one entry per tool
-//!   result, matched by *function name*, not call id.
+//!   result; native call IDs are echoed when the original call supplied one.
 //! - Assistant parts: `{"text": ...}`; when the assistant message carries
 //!   `tool_calls`, nonempty text is retained alongside
-//!   `{"functionCall":{"name":...,"args":...}}` entries.
+//!   `{"functionCall":{"name":...,"args":...}}` entries. Valid native replay
+//!   state instead preserves the exact original parts and their signatures.
 //! - Tools: `tools:[{"functionDeclarations":[{name, description,
 //!   parameters}]}]`. Parameter schemas are sanitized down to Google's
 //!   restricted JSON Schema subset before going on the wire: `$defs`/
@@ -37,9 +36,8 @@
 //! - There is no top-level `stream` field: the connector selects the streaming
 //!   variant through the URL (`:streamGenerateContent?alt=sse`).
 //!
-//! This family never echoes `reasoning_content` back on assistant messages
-//! (Gemini has no such field), so the `ReasoningEcho` argument is accepted for
-//! the uniform [`Dialect`] signature but has no effect on the wire body.
+//! Gemini has no `reasoning_content` field. Native replay retains thought parts
+//! in their original form; `ReasoningEcho` does not affect this dialect.
 
 use concerto_core::types::{CompletionRequest, Role, ToolChoice, ToolDefinition};
 
@@ -67,6 +65,7 @@ impl Dialect for GeminiChatDialect {
         // model name in the request body — it is part of the endpoint URL.
         let mut contents: Vec<serde_json::Value> = Vec::new();
         let mut system_instruction: Option<String> = None;
+        let mut native_call_ids = std::collections::HashSet::new();
 
         for msg in &request.messages {
             match msg.role {
@@ -80,6 +79,17 @@ impl Dialect for GeminiChatDialect {
                     }));
                 }
                 Role::Assistant => {
+                    if let Some(parts) =
+                        msg.gemini_replay.as_ref().and_then(|replay| replay.parts_for(msg))
+                    {
+                        for part in parts {
+                            if let Some(id) = part["functionCall"]["id"].as_str() {
+                                native_call_ids.insert(id);
+                            }
+                        }
+                        contents.push(serde_json::json!({"role": "model", "parts": parts}));
+                        continue;
+                    }
                     let part = serde_json::json!({"text": msg.content});
                     let mut entry = serde_json::json!({
                         "role": "model",
@@ -124,21 +134,16 @@ impl Dialect for GeminiChatDialect {
                 }
                 Role::Tool => {
                     // Gemini uses functionResponse to relay tool results back.
-                    // The `name` must be the function/tool name (from
-                    // ToolResult.name), not the tool call ID — Gemini matches
-                    // this against the function declaration sent in the
-                    // `tools` array.
+                    // Match the function name to its declaration and echo a
+                    // native call ID when one was supplied. Locally generated
+                    // IDs are internal correlation keys, not native wire IDs.
                     if let Some(results) = &msg.tool_results {
                         for result in results {
-                            contents.push(serde_json::json!({
-                                "role": "user",
-                                "parts": [{
-                                    "functionResponse": {
-                                        "name": result.name,
-                                        "response": result.content
-                                    }
-                                }]
-                            }));
+                            let mut response = serde_json::json!({"name": result.name, "response": result.content});
+                            if native_call_ids.contains(result.id.as_str()) {
+                                response["id"] = serde_json::json!(result.id);
+                            }
+                            contents.push(serde_json::json!({"role": "user", "parts": [{"functionResponse": response}]}));
                         }
                     }
                 }
@@ -570,6 +575,7 @@ mod tests {
             model: String::new(),
             messages: vec![
                 Message {
+                    gemini_replay: None,
                     role: Role::System,
                     content: "You are a helpful assistant.".into(),
                     tool_calls: None,
@@ -579,6 +585,7 @@ mod tests {
                     tokens_out: None,
                 },
                 Message {
+                    gemini_replay: None,
                     role: Role::User,
                     content: "Hello!".into(),
                     tool_calls: None,
@@ -588,6 +595,7 @@ mod tests {
                     tokens_out: None,
                 },
                 Message {
+                    gemini_replay: None,
                     role: Role::Assistant,
                     content: "Here is the file list.".into(),
                     tool_calls: Some(vec![ToolCall {
@@ -603,6 +611,7 @@ mod tests {
                     tokens_out: None,
                 },
                 Message {
+                    gemini_replay: None,
                     role: Role::Assistant,
                     content: "Here".into(),
                     tool_calls: None,
@@ -612,6 +621,7 @@ mod tests {
                     tokens_out: None,
                 },
                 Message {
+                    gemini_replay: None,
                     role: Role::Tool,
                     content: String::new(),
                     tool_calls: None,
@@ -625,6 +635,7 @@ mod tests {
                     tokens_out: None,
                 },
                 Message {
+                    gemini_replay: None,
                     role: Role::User,
                     content: "Run that again.".into(),
                     tool_calls: None,
@@ -727,6 +738,7 @@ mod tests {
             session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![Message {
+                gemini_replay: None,
                 role: Role::Assistant,
                 content: String::new(),
                 tool_calls: Some(vec![ToolCall {
@@ -784,6 +796,7 @@ mod tests {
             session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![Message {
+                gemini_replay: None,
                 role: Role::Assistant,
                 content: String::new(),
                 tool_calls: Some(vec![ToolCall {
@@ -832,6 +845,7 @@ mod tests {
             session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![Message {
+                gemini_replay: None,
                 role: Role::Assistant,
                 content: String::new(),
                 tool_calls: Some(vec![
@@ -1073,6 +1087,7 @@ mod tests {
             stable_system_prefix_bytes: None,
             messages: vec![
                 Message {
+                    gemini_replay: None,
                     role: Role::System,
                     content: "You are a test assistant.".into(),
                     tool_calls: None,
@@ -1082,6 +1097,7 @@ mod tests {
                     tokens_out: None,
                 },
                 Message {
+                    gemini_replay: None,
                     role: Role::User,
                     content: "Hello".into(),
                     tool_calls: None,
@@ -1512,6 +1528,7 @@ mod tests {
             session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![Message {
+                gemini_replay: None,
                 role: Role::Tool,
                 content: String::new(),
                 tool_calls: None,
@@ -1571,6 +1588,7 @@ mod tests {
             session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![Message {
+                gemini_replay: None,
                 role: Role::Tool,
                 content: "discarded".into(),
                 tool_calls: None,
@@ -1609,6 +1627,7 @@ mod tests {
             stable_system_prefix_bytes: None,
             messages: vec![
                 Message {
+                    gemini_replay: None,
                     role: Role::System,
                     content: "first system".into(),
                     tool_calls: None,
@@ -1618,6 +1637,7 @@ mod tests {
                     tokens_out: None,
                 },
                 Message {
+                    gemini_replay: None,
                     role: Role::System,
                     content: "second system".into(),
                     tool_calls: None,

@@ -94,6 +94,7 @@ impl LlmProvider for ScriptedProvider {
         let iter = cloned.into_iter().map(|response| {
             Ok(match response {
                 ScriptedResponse::Text(delta) => CompletionChunk {
+                    gemini_replay: None,
                     delta,
                     reasoning: None,
                     tool_call: None,
@@ -101,6 +102,7 @@ impl LlmProvider for ScriptedProvider {
                     usage: None,
                 },
                 ScriptedResponse::ToolCall(tc) => CompletionChunk {
+                    gemini_replay: None,
                     delta: String::new(),
                     reasoning: None,
                     tool_call: Some(tc),
@@ -108,6 +110,7 @@ impl LlmProvider for ScriptedProvider {
                     usage: None,
                 },
                 ScriptedResponse::Done => CompletionChunk {
+                    gemini_replay: None,
                     delta: String::new(),
                     reasoning: None,
                     tool_call: None,
@@ -294,6 +297,7 @@ pub mod mock_server {
 
     fn user_message(content: &str) -> Message {
         Message {
+            gemini_replay: None,
             role: Role::User,
             content: content.to_string(),
             tool_calls: None,

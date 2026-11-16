@@ -1,6 +1,6 @@
 # ADR-85: Preserve conversational obligations through compaction
 
-**Status:** Proposed — implemented and locally verified; remote validation pending
+**Status:** Accepted — full local battery and all 12 exact-head CI checks passed
 **Date:** 2026-11-14
 **Amends:** ADR-48's lossy active-window contract
 

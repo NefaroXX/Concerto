@@ -3047,6 +3047,7 @@ async fn run_multi_agent(
         // Run-start row: no provider call has happened yet, so there is no
         // usage to record — tokens stay `None` by design.
         let user_message = Message {
+            gemini_replay: None,
             role: concerto_core::types::Role::User,
             content: req.input.clone(),
             tool_calls: None,
@@ -3796,6 +3797,7 @@ async fn run_multi_agent(
                 };
                 let (tokens_in, tokens_out) = message_row_usage(settled);
                 let failure_message = Message {
+                    gemini_replay: None,
                     role: concerto_core::types::Role::Assistant,
                     content,
                     tool_calls: None,
@@ -3940,6 +3942,7 @@ async fn run_multi_agent(
         // run-start user row predates any provider call and stays `None`.
         let (tokens_in, tokens_out) = message_row_usage(&output.provider_metrics);
         let assistant_message = Message {
+            gemini_replay: None,
             role: concerto_core::types::Role::Assistant,
             content: if reply_only { output.final_message.clone() } else { output.summary() },
             tool_calls: None,
@@ -4515,6 +4518,7 @@ async fn drive_supervised_run(
     // assistant row's token fields stay `None` for the same reason.
     if let Some(store) = session_store {
         let assistant_message = Message {
+            gemini_replay: None,
             role: Role::Assistant,
             content: final_message.clone(),
             tool_calls: None,

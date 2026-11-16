@@ -218,6 +218,7 @@ mod tests {
 
     fn message(role: Role, content: impl Into<String>) -> Message {
         Message {
+            gemini_replay: None,
             role,
             content: content.into(),
             tool_calls: None,

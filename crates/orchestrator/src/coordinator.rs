@@ -4,6 +4,7 @@
 //! each ready node to the appropriate `ExpertAgent` via `AgentRunner`, and
 //! drives review/validation loops (§3.8) until completion or cycle-limit.
 
+use crate::prompts::CompletedTurn;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -12756,6 +12757,7 @@ impl CoordinatorAgent {
         let mut messages = vec![system_message];
         messages.extend(self.conversation_history.iter().cloned());
         messages.push(Message {
+            gemini_replay: None,
             role: Role::User,
             content: task.description.clone(),
             tool_calls: None,
@@ -12795,6 +12797,7 @@ impl CoordinatorAgent {
             // taken above); a crash before that persist re-runs this one-shot
             // review, which is idempotent via the forward-only journal guard.
             messages.push(Message {
+                gemini_replay: None,
                 role: Role::User,
                 content: format!(
                     "The wait '{reason}' that parked the previous dispatch session was \
@@ -12874,6 +12877,7 @@ impl CoordinatorAgent {
                         },
                     );
                     messages.push(Message {
+                        gemini_replay: None,
                         role: Role::User,
                         content: nudge.to_string(),
                         tool_calls: None,
@@ -12898,11 +12902,12 @@ impl CoordinatorAgent {
             // W3c: issue the per-turn provider request and record its provider
             // metrics on the ledger in one ordered unit
             // ([`Self::request_dispatch_turn`]).
-            let (text, reasoning, tool_calls) = self
+            let CompletedTurn { text, reasoning, tool_calls, gemini_replay, .. } = self
                 .request_dispatch_turn(model.as_str(), &messages, &tool_defs, task, cancel, ledger)
                 .await?; // provider-class errors classify at the decompose level
 
             messages.push(Message {
+                gemini_replay,
                 role: Role::Assistant,
                 content: text.clone(),
                 tool_calls: (!tool_calls.is_empty()).then_some(tool_calls.clone()),
@@ -12960,6 +12965,7 @@ impl CoordinatorAgent {
                         },
                     );
                     messages.push(Message {
+                        gemini_replay: None,
                         role: Role::User,
                         content: instruction,
                         tool_calls: None,
@@ -13294,6 +13300,7 @@ impl CoordinatorAgent {
                     },
                 );
                 messages.push(Message {
+                    gemini_replay: None,
                     role: Role::Tool,
                     content: String::new(),
                     tool_calls: None,
@@ -13382,6 +13389,7 @@ impl CoordinatorAgent {
                         },
                     );
                     messages.push(Message {
+                        gemini_replay: None,
                         role: Role::User,
                         content: nudge,
                         tool_calls: None,
@@ -13410,6 +13418,7 @@ impl CoordinatorAgent {
                         },
                     );
                     messages.push(Message {
+                        gemini_replay: None,
                         role: Role::User,
                         content: nudge,
                         tool_calls: None,
@@ -13470,8 +13479,7 @@ impl CoordinatorAgent {
         task: &AgentTask,
         cancel: &CancellationToken,
         ledger: &mut DispatchLedger,
-    ) -> Result<(String, Option<String>, Vec<concerto_core::types::ToolCall>), OrchestratorError>
-    {
+    ) -> Result<CompletedTurn, OrchestratorError> {
         let request = CompletionRequest {
             session_id: Some(task.session_id),
             stable_system_prefix_bytes: None,
@@ -13494,20 +13502,21 @@ impl CoordinatorAgent {
             .sum::<u64>()
             .div_ceil(4);
         let request_started = std::time::Instant::now();
-        let (text, reasoning, tool_calls, usage) = crate::prompts::complete_provider_request(
-            &self.planning_provider,
-            &request,
-            &self.retry_policy,
-            &self.bus,
-            task.session_id,
-            task.id,
-            cancel,
-        )
-        .await?; // provider-class errors classify at the decompose level
-                 // The decision loop's own model turns are real spend: record each
-                 // turn on the ledger (and the settled mirror) so a zero-dispatch
-                 // conversational close still carries provider metrics instead of
-                 // reporting tokens 0/0 with an empty metric list.
+        let CompletedTurn { text, reasoning, tool_calls, usage, gemini_replay } =
+            crate::prompts::complete_provider_request(
+                &self.planning_provider,
+                &request,
+                &self.retry_policy,
+                &self.bus,
+                task.session_id,
+                task.id,
+                cancel,
+            )
+            .await?; // provider-class errors classify at the decompose level
+                     // The decision loop's own model turns are real spend: record each
+                     // turn on the ledger (and the settled mirror) so a zero-dispatch
+                     // conversational close still carries provider metrics instead of
+                     // reporting tokens 0/0 with an empty metric list.
         {
             let measured_in = usage.as_ref().and_then(|u| u.prompt_tokens);
             let measured_out = usage.as_ref().and_then(|u| u.completion_tokens);
@@ -13530,7 +13539,7 @@ impl CoordinatorAgent {
             self.settled_metrics.push(settled);
             ledger.total_cost += cost;
         }
-        Ok((text, reasoning, tool_calls))
+        Ok(CompletedTurn { text, reasoning, tool_calls, usage, gemini_replay })
     }
 
     /// Same-role dispatch cap — the bound on the repeat-dispatch path beside
@@ -18208,6 +18217,7 @@ impl CoordinatorAgent {
         // degrade to an empty system message rather than panicking if that
         // ever changes.
         request.messages.into_iter().next().unwrap_or_else(|| Message {
+            gemini_replay: None,
             role: Role::System,
             content: String::new(),
             tool_calls: None,
@@ -18788,6 +18798,7 @@ mod tests {
         ) -> Result<concerto_core::traits::provider::CompletionStream, ProviderError> {
             let text = self.responses.lock().unwrap().pop_front().unwrap_or_default();
             Ok(Box::pin(futures::stream::iter(vec![Ok(concerto_core::types::CompletionChunk {
+                gemini_replay: None,
                 reasoning: None,
                 delta: text,
                 tool_call: None,
@@ -18809,6 +18820,7 @@ mod tests {
     /// One Coordinator decision-loop turn served by the mock planning
     /// provider: either tool calls (dispatches) or the final text.
     enum CoordinatorTurn {
+        Native(Vec<concerto_core::types::CompletionChunk>),
         Calls(Vec<ToolCall>),
         Text(String),
     }
@@ -19039,8 +19051,10 @@ mod tests {
                 },
             };
             let chunks: Vec<concerto_core::types::CompletionChunk> = match turn {
+                CoordinatorTurn::Native(chunks) => chunks,
                 CoordinatorTurn::Text(text) => {
                     vec![concerto_core::types::CompletionChunk {
+                        gemini_replay: None,
                         reasoning: None,
                         delta: text,
                         tool_call: None,
@@ -19054,6 +19068,7 @@ mod tests {
                         .into_iter()
                         .enumerate()
                         .map(|(index, call)| concerto_core::types::CompletionChunk {
+                            gemini_replay: None,
                             reasoning: None,
                             delta: String::new(),
                             tool_call: Some(call),
@@ -19142,6 +19157,7 @@ mod tests {
             let chunk = if self.requests.lock().unwrap().len() == 1 {
                 // First coordinator turn: consult.
                 concerto_core::types::CompletionChunk {
+                    gemini_replay: None,
                     reasoning: None,
                     delta: String::new(),
                     tool_call: Some(consult_specialist(
@@ -19158,6 +19174,7 @@ mod tests {
                 // the REAL finding event id (once).
                 self.dispatch_served.store(true, Ordering::SeqCst);
                 concerto_core::types::CompletionChunk {
+                    gemini_replay: None,
                     reasoning: None,
                     delta: String::new(),
                     tool_call: Some(call_specialist_with(
@@ -19171,6 +19188,7 @@ mod tests {
                 }
             } else {
                 concerto_core::types::CompletionChunk {
+                    gemini_replay: None,
                     reasoning: None,
                     delta: "advisory findings: the module graph is sound".to_string(),
                     tool_call: None,
@@ -22125,6 +22143,7 @@ mod tests {
             let chunk = if !self.declare_served.load(Ordering::SeqCst) {
                 self.declare_served.store(true, Ordering::SeqCst);
                 concerto_core::types::CompletionChunk {
+                    gemini_replay: None,
                     reasoning: None,
                     delta: String::new(),
                     tool_call: Some(declare_obligations_call(
@@ -22136,6 +22155,7 @@ mod tests {
                 }
             } else if let Some((agent, work, id)) = self.adopt_queue.lock().unwrap().pop_front() {
                 concerto_core::types::CompletionChunk {
+                    gemini_replay: None,
                     reasoning: None,
                     delta: String::new(),
                     tool_call: Some(call_specialist_for(&agent, &work, &id)),
@@ -22144,6 +22164,7 @@ mod tests {
                 }
             } else {
                 concerto_core::types::CompletionChunk {
+                    gemini_replay: None,
                     reasoning: None,
                     delta: self.closing_text.clone(),
                     tool_call: None,
@@ -22400,8 +22421,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn conversation_history_and_status_reply_allow_work_to_continue() {
+    async fn replay_regression_coordinator_retains_native_status_reply_before_dispatch() {
         let bus = EventBus::new(256);
+        let call = ToolCall {
+            id: "status".into(),
+            name: crate::conversation::REPLY_TOOL.into(),
+            arguments: serde_json::json!({"message":"I will inspect it now."}),
+            ..Default::default()
+        };
+        let parts = vec![
+            serde_json::json!({"functionCall":{"name":call.name,"args":call.arguments}, "thoughtSignature":"status-signature"}),
+        ];
+        let replay = concerto_core::provider_replay::GeminiReplay::capture(
+            parts.clone(),
+            "",
+            None,
+            std::slice::from_ref(&call),
+        )
+        .unwrap();
         let (coordinator, provider) = coordinator_with_turns_captured(
             bus.clone(),
             Arc::new(AgentRegistry::from_mocks(vec![MockExpertAgent::always_succeed(
@@ -22409,17 +22446,18 @@ mod tests {
                 "inspected the module",
             )])),
             vec![
-                CoordinatorTurn::Calls(vec![ToolCall {
-                    id: "status".into(),
-                    name: crate::conversation::REPLY_TOOL.into(),
-                    arguments: serde_json::json!({"message": "I will inspect it now."}),
-                    ..Default::default()
+                CoordinatorTurn::Native(vec![concerto_core::types::CompletionChunk {
+                    tool_call: Some(call),
+                    is_final: true,
+                    gemini_replay: Some(replay),
+                    ..concerto_core::types::CompletionChunk::keepalive()
                 }]),
                 CoordinatorTurn::Calls(vec![call_specialist("researcher", "inspect the module")]),
                 CoordinatorTurn::Text("Inspection finished".into()),
             ],
         );
         let history = vec![Message {
+            gemini_replay: None,
             role: Role::Assistant,
             content: "I can inspect the module and explain its structure.".into(),
             tool_calls: None,
@@ -22450,6 +22488,9 @@ mod tests {
             concerto_core::types::AgentCompletionStatus::Completed
         );
         let requests = provider.requests.lock().unwrap();
+        let assistant =
+            requests[1].messages.iter().find(|message| message.gemini_replay.is_some()).unwrap();
+        assert_eq!(assistant.gemini_replay.as_ref().unwrap().parts_for(assistant).unwrap(), parts);
         assert!(
             requests[0].messages.iter().any(|message| message.role == Role::Assistant
                 && message.content.starts_with("I can inspect")),
@@ -25498,6 +25539,7 @@ mod tests {
                 return Err(self.error.clone());
             }
             Ok(Box::pin(futures::stream::iter(vec![Ok(concerto_core::types::CompletionChunk {
+                gemini_replay: None,
                 reasoning: None,
                 delta: self.plan.clone(),
                 tool_call: None,

@@ -372,6 +372,7 @@ fn materialize_history(messages: &[Message], checkpoints: &[StoredCheckpoint]) -
             continue;
         }
         active.push(Message {
+            gemini_replay: None,
             role: Role::System,
             content: format_checkpoint_for_prompt(&stored.checkpoint),
             tool_calls: None,
@@ -400,6 +401,7 @@ fn retain_conversation(message: &Message) -> Option<Message> {
             retained.tool_calls = None;
             retained.tool_results = None;
             retained.reasoning_content = None;
+            retained.gemini_replay = None;
             Some(retained)
         }
         _ => Some(message.clone()),
@@ -545,6 +547,7 @@ fn estimate_message_tokens(message: &Message) -> u64 {
     if let Some(tool_results) = &message.tool_results {
         bytes = bytes.saturating_add(serde_json::to_vec(tool_results).map_or(0, |json| json.len()));
     }
+    bytes = bytes.max(message.gemini_replay.as_ref().map_or(0, |replay| replay.encoded_len()));
     (bytes as u64).div_ceil(4).saturating_add(4)
 }
 
@@ -615,6 +618,7 @@ mod tests {
 
     fn message(role: Role, content: impl Into<String>) -> Message {
         Message {
+            gemini_replay: None,
             role,
             content: content.into(),
             tool_calls: None,

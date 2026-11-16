@@ -914,6 +914,7 @@ impl SessionStore for SqliteSessionStore {
         };
 
         let reasoning_content = msg.reasoning_content.clone();
+        let gemini_replay = msg.gemini_replay.as_ref().map(serde_json::to_string).transpose()?;
         // ADR-48 §4: real usage when the message carries it; the schema
         // columns are NOT NULL DEFAULT 0, so `None` (unknown) is stored as 0
         // and round-trips back as `None` on load.
@@ -922,8 +923,8 @@ impl SessionStore for SqliteSessionStore {
 
         // Atomic insert with sequence number computed via COALESCE to avoid TOCTOU race
         sqlx::query(
-            "INSERT INTO messages (id, session_id, sequence_num, role, content, tool_calls, tool_results, reasoning_content, tokens_in, tokens_out) \
-            SELECT ?, ?, COALESCE(MAX(sequence_num), 0) + 1, ?, ?, ?, ?, ?, ?, ? FROM messages WHERE session_id = ?"
+            "INSERT INTO messages (id, session_id, sequence_num, role, content, tool_calls, tool_results, reasoning_content, tokens_in, tokens_out, gemini_replay) \
+            SELECT ?, ?, COALESCE(MAX(sequence_num), 0) + 1, ?, ?, ?, ?, ?, ?, ?, ? FROM messages WHERE session_id = ?"
         )
         .bind(id.to_string())
         .bind(session_id.to_string())
@@ -934,6 +935,7 @@ impl SessionStore for SqliteSessionStore {
         .bind(reasoning_content)
         .bind(tokens_in)
         .bind(tokens_out)
+        .bind(gemini_replay)
         .bind(session_id.to_string())
         .execute(&self.pool)
         .await?;
@@ -975,14 +977,16 @@ impl SessionStore for SqliteSessionStore {
             };
 
             let reasoning_content = msg.reasoning_content.clone();
+            let gemini_replay =
+                msg.gemini_replay.as_ref().map(serde_json::to_string).transpose()?;
             // ADR-48 §4: real usage when the message carries it; `None`
             // (unknown) is stored as 0 (columns are NOT NULL DEFAULT 0).
             let tokens_in = msg.tokens_in.unwrap_or(0) as i64;
             let tokens_out = msg.tokens_out.unwrap_or(0) as i64;
 
             sqlx::query(
-                "INSERT INTO messages (id, session_id, sequence_num, role, content, tool_calls, tool_results, reasoning_content, tokens_in, tokens_out) \
-                SELECT ?, ?, COALESCE(MAX(sequence_num), 0) + 1, ?, ?, ?, ?, ?, ?, ? FROM messages WHERE session_id = ?"
+                "INSERT INTO messages (id, session_id, sequence_num, role, content, tool_calls, tool_results, reasoning_content, tokens_in, tokens_out, gemini_replay) \
+                SELECT ?, ?, COALESCE(MAX(sequence_num), 0) + 1, ?, ?, ?, ?, ?, ?, ?, ? FROM messages WHERE session_id = ?"
             )
             .bind(id.to_string())
             .bind(session_id.to_string())
@@ -993,6 +997,7 @@ impl SessionStore for SqliteSessionStore {
             .bind(reasoning_content)
             .bind(tokens_in)
             .bind(tokens_out)
+            .bind(gemini_replay)
             .bind(session_id.to_string())
             .execute(&mut *tx)
             .await?;
@@ -1010,7 +1015,7 @@ impl SessionStore for SqliteSessionStore {
         check_cancel(&cancel)?;
 
         let rows = sqlx::query(
-            "SELECT role, content, tool_calls, tool_results, reasoning_content, tokens_in, tokens_out FROM messages WHERE session_id = ? ORDER BY sequence_num ASC"
+            "SELECT role, content, tool_calls, tool_results, reasoning_content, tokens_in, tokens_out, gemini_replay FROM messages WHERE session_id = ? ORDER BY sequence_num ASC"
         )
         .bind(session_id.to_string())
         .fetch_all(&self.pool)
@@ -1026,6 +1031,8 @@ impl SessionStore for SqliteSessionStore {
             let tool_calls_json: Option<String> = row.try_get("tool_calls")?;
             let tool_results_json: Option<String> = row.try_get("tool_results")?;
             let reasoning_content: Option<String> = row.try_get("reasoning_content")?;
+            let replay_json: Option<String> = row.try_get("gemini_replay")?;
+            let gemini_replay = replay_json.as_deref().map(serde_json::from_str).transpose()?;
             let tokens_in: i64 = row.try_get("tokens_in")?;
             let tokens_out: i64 = row.try_get("tokens_out")?;
 
@@ -1058,6 +1065,7 @@ impl SessionStore for SqliteSessionStore {
             };
 
             messages.push(Message {
+                gemini_replay,
                 role,
                 content,
                 tool_calls,
@@ -2128,6 +2136,7 @@ mod tests {
         let budget = TokenBudget::new(1000, 100);
         let mut history = ConversationHistory::new(budget);
         let msg = Message {
+            gemini_replay: None,
             role: Role::User,
             content: "Hello".to_string(),
             tool_calls: None,
@@ -2170,6 +2179,7 @@ mod tests {
             .unwrap();
 
         let msg = Message {
+            gemini_replay: None,
             role: Role::User,
             content: "Hello, world!".to_string(),
             tool_calls: None,
@@ -2182,6 +2192,7 @@ mod tests {
 
         // ADR-46: reasoning_content round-trips through the DB.
         let reasoning_msg = Message {
+            gemini_replay: None,
             role: Role::Assistant,
             content: "With reasoning".to_string(),
             tool_calls: None,
@@ -2222,6 +2233,7 @@ mod tests {
 
         // ADR-48 §4: measured usage is persisted verbatim.
         let measured = Message {
+            gemini_replay: None,
             role: Role::User,
             content: "measured".to_string(),
             tool_calls: None,
@@ -2235,6 +2247,7 @@ mod tests {
         // Unknown usage (`None`) is stored as 0 and restores as `None` so the
         // estimator heuristic applies — never a fake zero.
         let unknown = Message {
+            gemini_replay: None,
             role: Role::Assistant,
             content: "unknown".to_string(),
             tool_calls: None,
@@ -2264,6 +2277,7 @@ mod tests {
 
         // Simulate a pre-ADR-48 row: tokens written as 0 by an older version.
         let msg = Message {
+            gemini_replay: None,
             role: Role::User,
             content: "legacy".to_string(),
             tool_calls: None,
@@ -2440,6 +2454,7 @@ mod tests {
         let session =
             store.create_session(&project_dir, "p", "m", CancellationToken::new()).await.unwrap();
         let msgs = [Message {
+            gemini_replay: None,
             role: Role::User,
             content: "should not persist".into(),
             tool_calls: None,
@@ -2471,6 +2486,7 @@ mod tests {
             .await
             .unwrap();
         let first_message = Message {
+            gemini_replay: None,
             role: Role::User,
             content: "from first".into(),
             tool_calls: None,
@@ -2480,6 +2496,7 @@ mod tests {
             tokens_out: None,
         };
         let second_message = Message {
+            gemini_replay: None,
             role: Role::Assistant,
             content: "from second".into(),
             tool_calls: None,
@@ -2615,6 +2632,7 @@ mod tests {
             store.create_session(&project_dir, "p", "m", CancellationToken::new()).await.unwrap();
         let msgs = vec![
             Message {
+                gemini_replay: None,
                 role: Role::User,
                 content: "first".into(),
                 tool_calls: None,
@@ -2624,6 +2642,7 @@ mod tests {
                 tokens_out: None,
             },
             Message {
+                gemini_replay: None,
                 role: Role::Assistant,
                 content: "second".into(),
                 tool_calls: None,
@@ -2650,6 +2669,7 @@ mod tests {
             store.create_session(&project_dir, "p", "m", CancellationToken::new()).await.unwrap();
         let msgs = vec![
             Message {
+                gemini_replay: None,
                 role: Role::User,
                 content: "A".into(),
                 tool_calls: None,
@@ -2659,6 +2679,7 @@ mod tests {
                 tokens_out: None,
             },
             Message {
+                gemini_replay: None,
                 role: Role::Assistant,
                 content: "B".into(),
                 tool_calls: None,
@@ -2668,6 +2689,7 @@ mod tests {
                 tokens_out: None,
             },
             Message {
+                gemini_replay: None,
                 role: Role::User,
                 content: "C".into(),
                 tool_calls: None,
@@ -3344,6 +3366,7 @@ mod tests {
             .save_message(
                 session.id,
                 &Message {
+                    gemini_replay: None,
                     role: Role::User,
                     content: "hello".into(),
                     tool_calls: None,
@@ -4250,3 +4273,6 @@ mod tests {
         assert_eq!(audit_row_count(&store).await, 1, "the old row must survive");
     }
 }
+
+#[cfg(test)]
+mod gemini_replay_tests;

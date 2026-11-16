@@ -185,6 +185,7 @@ mod tests {
 
     fn user_message(content: &str) -> Message {
         Message {
+            gemini_replay: None,
             role: Role::User,
             content: content.to_string(),
             tool_calls: None,
@@ -329,6 +330,7 @@ mod tests {
                 // The previous assistant turn issued a tool call and carried
                 // captured reasoning: both must survive on the wire.
                 Message {
+                    gemini_replay: None,
                     role: Role::Assistant,
                     content: String::new(),
                     tool_calls: Some(vec![ToolCall {
@@ -344,6 +346,7 @@ mod tests {
                 },
                 // The matching tool result.
                 Message {
+                    gemini_replay: None,
                     role: Role::Tool,
                     content: "ok".to_string(),
                     tool_calls: None,
@@ -358,6 +361,7 @@ mod tests {
                 },
                 // A plain assistant turn with no captured reasoning.
                 Message {
+                    gemini_replay: None,
                     role: Role::Assistant,
                     content: "next".to_string(),
                     tool_calls: None,

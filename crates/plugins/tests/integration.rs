@@ -1943,6 +1943,7 @@ async fn heartbeat_provider_emits_keepalive_while_call_pending() {
                 _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
             }
             let chunk = CompletionChunk {
+                gemini_replay: None,
                 delta: "done".into(),
                 reasoning: None,
                 tool_call: None,
@@ -2051,6 +2052,7 @@ async fn premature_eof_in_host_completion_is_rejected() {
             _cancel: CancellationToken,
         ) -> Result<CompletionStream, ProviderError> {
             Ok(Box::pin(futures::stream::iter([Ok(CompletionChunk {
+                gemini_replay: None,
                 delta: "partial".into(),
                 reasoning: None,
                 tool_call: None,

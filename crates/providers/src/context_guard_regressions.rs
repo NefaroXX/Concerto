@@ -300,4 +300,19 @@ mod continuity_regressions {
             .await;
         }
     }
+    #[tokio::test]
+    async fn replay_regression_opaque_signatures_count_toward_context_capacity() {
+        let mut assistant = message(Role::Assistant, "brief");
+        assistant.gemini_replay = Some(
+            concerto_core::provider_replay::GeminiReplay::capture(
+                vec![serde_json::json!({"text":"brief", "thoughtSignature":"s".repeat(20_000)})],
+                "brief",
+                None,
+                &[],
+            )
+            .unwrap(),
+        );
+        assert_rejected_without_sending(vec![assistant, message(Role::User, "continue")], 2_048)
+            .await;
+    }
 }

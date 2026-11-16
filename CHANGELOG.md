@@ -111,6 +111,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Gemini native response replay.** Retain original part order, signed text,
+  empty signed trailing parts and native function-call IDs through completion
+  collection and stored messages. Thought parts go to reasoning rather than
+  visible answer text. Replay capture is bounded and committed only for a
+  completed stream; edited canonical content cannot be overridden by stale
+  native parts. This does not yet change summary-only run settlement (H39).
 - **Instruction continuity through compaction.** Earlier user instructions and
   assistant commitments retain their text, roles and order across durable
   checkpoints. Provider context reduction preserves active task state and

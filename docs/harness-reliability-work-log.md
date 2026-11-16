@@ -18,7 +18,7 @@ passing repository tests alone does not close a finding.
 | H06 | P1 | Default write versions are captured after the agent's read | Fixed and verified; awaiting merge |
 | H07 | P1 | Verification errors can accompany Completed status | Fixed and verified; awaiting merge |
 | H08 | P2 | Compaction counts historical usage as current context size | Fixed and verified; awaiting merge |
-| H09 | P2 | Compaction truncates constraints and unresolved work | Full local battery verified; remote validation pending |
+| H09 | P2 | Compaction truncates constraints and unresolved work | Fixed; full local battery and all 12 exact-head CI checks passed |
 | H10 | P2 | Agent-driven benchmark fixture policy denies tools | Fixed and verified; awaiting merge |
 | H11 | P2 | Empty benchmark outcomes force a zero pass score | Fixed and verified; awaiting merge |
 | H12 | P2 | Durable event subscriber queues have no memory bound | Open |
@@ -46,8 +46,10 @@ passing repository tests alone does not close a finding.
 | H34 | P2 | Bounded subprocess capture can conceal inconsistent test evidence without marking output incomplete | Open; source path traced, execution reproduction pending |
 | H35 | P1 | Locked quinn-udp fails fresh raw-lockfile security scan | Fixed and verified on 66309f8; awaiting merge |
 | H36 | P2 | cargo-audit can report incomplete registry checks with exit zero | Fixed and verified on 66309f8; awaiting merge |
-| H37 | P1 | Native provider wire adapters discard mandatory system/assistant text | Full local battery verified; remote validation pending |
-| H38 | P2 | Gemini canonical history cannot retain arbitrary native part order or signatures on text parts | Source/API-contract gap traced; execution reproduction pending |
+| H37 | P1 | Native provider wire adapters discard mandatory system/assistant text | Fixed; full local battery and all 12 exact-head CI checks passed |
+| H38 | P2 | Gemini canonical history loses native part order/text signatures and misclassifies thought text | Full local battery passed; exact-head GitHub verification pending |
+| H39 | P1 | Run settlement persists summaries instead of complete provider history | Open; source path confirmed, restart reproduction required |
+| H40 | P2 | Headless multi-agent history clips messages and older obligations before dispatch | Open; source path confirmed, baseline regressions prepared |
 
 
 ## 2026-10-29 — H01: preserve streaming events across chunks
@@ -2011,3 +2013,151 @@ Next: patch H18, then continue H07's truthful verification/completion handling.
   advisories, 1,079 dependencies), and deny retained only duplicate warnings.
   Logs: `h09-prepublish-{deny,audit}.log` and
   `h09-prepublish-security.json`. No source or lockfile adjustment was needed.
+
+## 2026-11-15 — H09/H37 publication; H38 isolated reproduction
+
+- Saved the verified continuity repair as
+  `a2a9cfd70a6fb8002e5a35c8b7cc6720fc5af373` and fast-forwarded the existing
+  PR branch. The first push reported success, but a subsequent fresh Git
+  lookup and GitHub both showed the preceding 66309f8 tip. The commit itself
+  existed remotely. An explicit ordinary fast-forward push of the same SHA
+  restored agreement; no force push was used and the discrepancy's cause is
+  not established. Earlier runs for 66309f8 do not certify this change.
+- GitHub and `git ls-remote` now both confirm a2a9cfd. Exact-head workflows:
+  main [43661528656](https://github.com/NefaroXX/Concerto/actions/runs/43661528656)
+  and native
+  [43661528358](https://github.com/NefaroXX/Concerto/actions/runs/43661528358).
+  They are still running. PR #379 records the 6,116 passing local tests and
+  pending remote result; the main code index was refreshed after publication.
+- Advanced the disk-backed h38 worktree to a2a9cfd before adding regressions.
+  H38 spans decoding, canonical collection, persisted messages and Gemini
+  rendering: decoding emits flat text deltas and buffers calls separately;
+  both collectors return `(text, reasoning, tool_calls, usage)`, and Message
+  has no ordered native-parts field. Signatures attached to text are dropped
+  at decoding. Reproduction must establish these losses before choosing the
+  persisted representation, and incomplete attempts must remain non-replayable.
+
+- All three decoder regressions failed against a2a9cfd with implementation
+  unchanged (zero passed, three assertion failures, exit 101). Signed and
+  unsigned text decode to identical canonical streams; distinct text/call
+  orders also decode identically. A `thought: true` text part is emitted as
+  visible answer text instead of reasoning. These are direct decoder outputs,
+  before any test reconstruction of collector/storage behavior.
+- Artifacts: `h38-baseline.log`, `h38-baseline-source-sha256.json`,
+  `h38-baseline-regressions.rs` and `h38-baseline.patch` in the main worktree's
+  `target/harness-reliability/`. Repair needs an explicit replay channel through
+  completion collection and durable messages, with legacy defaults, bounded
+  storage, complete-attempt semantics, and provider-specific replay. Existing
+  text/call fields cannot reconstruct the missing distinctions.
+
+## 2026-11-15 — H09/H37 exact-head CI certified; H38 implementation
+
+- Both authoritative workflows above completed successfully on
+  `a2a9cfd70a6fb8002e5a35c8b7cc6720fc5af373`: all nine main jobs and all
+  three native-platform jobs passed. H09/H37 are closed; ADR-85 is accepted.
+- H38 implementation is isolated and unpublished. Adding an optional native
+  replay field to completion chunks and persisted messages requires explicit
+  `None` initialization across other providers and message constructors. Old
+  serialized messages and plugin responses retain defaults and omit the field
+  when absent. No dependency change is needed. Native replay is bound to its
+  canonical response by a BLAKE3 digest so it cannot override edited text/calls.
+- Decoder capture is bounded to 8 MiB and 8,192 parts per turn; only a completed
+  stream publishes replay metadata. Thought text is routed to reasoning.
+  Migration 042 adds a nullable message column. Collector/orchestration wiring
+  and end-to-end tests are in progress; this is not yet a verified fix.
+
+- Initial repaired regression run passed all 16 tests (3 core, 3 orchestrator,
+  9 providers, 1 sessions), including the original three decoder failures,
+  empty signed trailing chunks, native ID echo, loose-schema argument replay,
+  incomplete streams, capture bounds, edited canonical content, legacy JSON,
+  both collectors, compaction invalidation and SQLite close/reopen through
+  both single and batch writes. Log: `h38-focused-third.log`. Earlier targeted
+  builds exposed missing fixture initializers and a test's incorrect method
+  name; both were fixed rather than skipped. No full-suite claim yet.
+- Added actual agent-loop response, specialist Freeform/DesignDoc next-request,
+  coordinator status-reply and context-capacity coverage. Google documents
+  native function-call IDs as required when present; the decoder now retains
+  them and rendering echoes the original ID in the matching tool response.
+  Legacy id-less calls keep local `gc_` IDs without emitting them as native IDs.
+- **H39:** tracing production persistence found `AgentLoop::persist_run_success`
+  and `persist_run_partial` append `output.summary()` with no calls/reasoning;
+  the full model conversation lives in `initial_messages` only. The coordinator
+  also builds a local dispatch `messages` vector. Adding a persisted field
+  proves that stored messages retain replay state, not that runtime settlement
+  actually stores every message. A fresh-run/restart regression and a coherent
+  transcript persistence design are required next (including duplicate user
+  rows, delivered follow-ups, failed turns and usage attribution). H38 does not
+  claim to repair this distinct full-transcript persistence gap.
+
+- The expanded focused run passed all 19 regressions, including the actual
+  agent response builder, both specialist output modes and coordinator reply
+  history (`h38-focused-fourth.log`). Added signature-size overflow and
+  cancellation coverage afterward; the full package/workspace runs will cover
+  those too. Running all four affected package library suites with warnings
+  denied before the complete workspace/CI battery. No commit has been made
+  for this unverified milestone.
+
+- All four affected package library suites passed: **3,252 passed, zero
+  failed, two intentionally ignored** (528 core, 1,901 orchestrator, 615
+  providers, 208 sessions), with Rust warnings denied. Log:
+  `h38-packages.log`. An additional cancellation regression and formatting
+  cleanup were added after that package compilation; the complete battery
+  below covers the final source snapshot.
+- Starting the serialized full local CI battery: workspace unit/integration/
+  doc tests, all-target Clippy, default/single-frontend builds and smoke runs,
+  WASM guests, release benchmark smokes, released coverage fixture, Python,
+  palette, formatting, diff and both supply-chain gates. Evidence uses the
+  `h38-final-*` prefix in the main repository's `target/harness-reliability/`.
+  This source is still unpublished; a passing package subset is not enough.
+
+- The first full-workspace build stopped on a desktop test fixture that aliases
+  `Message` as `SessionMessage`; it lacked the newly required optional-field
+  initializer. Added `gemini_replay: None` there. Also replaced an unnecessary
+  cloned one-element test slice with `std::slice::from_ref` during review.
+  The failed attempt and its exact source snapshot are preserved under
+  `h38-attempt1/`; no publication occurred. Restarting the complete battery,
+  with all-target Clippy first to catch compile/lint issues before longer jobs.
+
+
+## 2026-11-16 — H38 complete local verification; publication preparation
+
+- The full workspace run passed **6,135 tests, zero failed, 17 intentionally
+  ignored**, across 86 unit/integration/doc-test groups. This adds 19 tests to
+  the preceding 6,116-test milestone; two existing orchestration tests were
+  also strengthened for replay. All-target workspace Clippy passed with
+  warnings denied, as did the full workspace build.
+- Default launcher commands, cache-report smoke, desktop-only and CLI-only
+  builds, CLI runtime smoke, all four WASM guest builds, all nine release
+  benchmark smoke targets, the released llvm-cov/Tarpaulin integration fixture,
+  13 Python tests, UI palette, formatting and diff checks passed.
+- Fresh `cargo deny check` passed advisories, bans, licenses and sources.
+  Its **67 duplicate-family warnings remain open under H28**; they were not
+  suppressed. The strict cargo-audit wrapper passed with 1,509 advisories and
+  1,079 locked dependencies, including registry lookup, with no warnings.
+  No dependency or security-exception change is part of H38.
+- An environment restart interrupted the earlier workspace compilation: the
+  runner and all compiler children were gone, with no workspace exit result.
+  There was no readable prior-boot evidence establishing a cause. Preserved
+  `h38-interrupted-*` logs/state; verified all **1,009 source hashes** matched;
+  resumed only unfinished gates with one Cargo compilation job. The final
+  runner completed every gate with exit zero. A final hash check confirmed
+  that source stayed unchanged throughout. Evidence is under the main
+  repository's `target/harness-reliability/h38-final-*`; this entry is a
+  documentation-only addition after validation.
+- Launcher smoke used isolated XDG data/config/cache/state directories under
+  `target/harness-reliability/h38-app-smoke`, so migration 042 did not modify
+  normal application data. All build artifacts remained disk-backed.
+- H38 preserves complete native messages through decoding, collection,
+  orchestration and explicit SQLite writes/reloads. It does **not** close H39:
+  production settlement still substitutes summaries for full provider history.
+  Exact-head GitHub checks are required before H38 acceptance.
+- H39 preparation is isolated in the `h39` worktree: success and later-provider-
+  failure regressions for original call/result persistence, plus a coordinator
+  status-reply regression checking visible-once delivery and durable call/result
+  ordering. These are prepared, not yet executed or claimed as reproductions.
+- **H40:** `multi_agent_task_with_history` clips each message at 4,000 characters
+  and stops older history after 16,000 characters. The headless branch uses
+  that helper while the inbox branch receives typed history. Two baseline
+  probes target lost late constraints and older unresolved obligations. Final
+  coverage must capture the actual headless provider request and inspect
+  approved-plan semantics. No H39/H40 implementation is included in H38.

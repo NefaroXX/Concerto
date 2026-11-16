@@ -123,6 +123,7 @@ impl LlmProvider for MockProvider {
 /// The default terminal chunk: empty delta, no tool call.
 fn empty_final_chunk() -> CompletionChunk {
     CompletionChunk {
+        gemini_replay: None,
         reasoning: None,
         delta: String::new(),
         tool_call: None,
@@ -176,6 +177,7 @@ mod tests {
     #[tokio::test]
     async fn scripted_replays_turns_and_falls_back_after_script_end() {
         let tool_call_chunk = CompletionChunk {
+            gemini_replay: None,
             reasoning: None,
             delta: String::new(),
             tool_call: Some(ToolCall {

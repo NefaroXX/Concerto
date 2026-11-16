@@ -14,6 +14,7 @@ use std::sync::Mutex;
 
 fn message(role: Role, content: impl Into<String>) -> Message {
     Message {
+        gemini_replay: None,
         role,
         content: content.into(),
         tool_calls: None,
@@ -270,4 +271,30 @@ async fn compaction_regression_reload_to_provider_retains_text_and_protocol_pair
     let persisted = store.load_messages(session, CancellationToken::new()).await.unwrap();
     assert_eq!(serde_json::to_value(&persisted).unwrap(), serde_json::to_value(&messages).unwrap());
     assert_eq!(persisted.iter().filter(|entry| entry.tool_results.is_some()).count(), 8);
+}
+
+#[test]
+fn replay_regression_compaction_cannot_reintroduce_removed_calls() {
+    let mut assistant = message(Role::Assistant, "retain this commitment");
+    let call = concerto_core::types::ToolCall {
+        id: "id".into(),
+        name: "read".into(),
+        arguments: serde_json::json!({}),
+        thought_signature: None,
+    };
+    assistant.tool_calls = Some(vec![call.clone()]);
+    assistant.gemini_replay = Some(
+        concerto_core::provider_replay::GeminiReplay::capture(
+            vec![serde_json::json!({"functionCall":{"name":"read","args":{}}})],
+            &assistant.content,
+            None,
+            &[call],
+        )
+        .unwrap(),
+    );
+    let retained = retain_conversation(&assistant).unwrap();
+    assert_eq!(retained.content, assistant.content);
+    assert!(retained.tool_calls.is_none());
+    assert!(retained.gemini_replay.is_none());
+    assert!(assistant.gemini_replay.is_some(), "source transcript stays intact");
 }

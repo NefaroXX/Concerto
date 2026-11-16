@@ -153,6 +153,7 @@ impl LlmProvider for ScriptedProvider {
         let mut chunks: Vec<_> = tool_calls
             .into_iter()
             .map(|tc| CompletionChunk {
+                gemini_replay: None,
                 reasoning: None,
                 delta: String::new(),
                 tool_call: Some(tc),
@@ -161,6 +162,7 @@ impl LlmProvider for ScriptedProvider {
             })
             .collect();
         chunks.push(CompletionChunk {
+            gemini_replay: None,
             reasoning: None,
             delta: String::new(),
             tool_call: None,

@@ -160,7 +160,14 @@ impl PluginBackedProvider {
             .map(|r| r == "stop" || r == "end_turn")
             .unwrap_or(true);
 
-        CompletionChunk { delta: content, reasoning: None, tool_call: None, is_final, usage: None }
+        CompletionChunk {
+            gemini_replay: None,
+            delta: content,
+            reasoning: None,
+            tool_call: None,
+            is_final,
+            usage: None,
+        }
     }
 
     /// Emit the completion, interspersed with keepalive chunks on `interval`
@@ -426,6 +433,7 @@ mod tests {
             stable_system_prefix_bytes: None,
             model: "test-model".into(),
             messages: vec![Message {
+                gemini_replay: None,
                 role: Role::User,
                 content: "hello".into(),
                 tool_calls: None,

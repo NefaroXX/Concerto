@@ -61,6 +61,7 @@ impl FactExtractor {
         for path in files {
             let content = std::fs::read_to_string(path).unwrap_or_default();
             messages.push(Message {
+                gemini_replay: None,
                 role: Role::User,
                 content,
                 tool_calls: None,

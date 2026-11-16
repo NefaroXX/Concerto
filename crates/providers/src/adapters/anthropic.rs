@@ -198,6 +198,7 @@ mod tests {
     /// A plain text-only message with every optional field empty.
     fn msg(role: Role, content: &str) -> Message {
         Message {
+            gemini_replay: None,
             role,
             content: content.into(),
             tool_calls: None,
@@ -218,6 +219,7 @@ mod tests {
             model: String::new(),
             messages: vec![
                 Message {
+                    gemini_replay: None,
                     role: Role::System,
                     content: "You are a helpful assistant.".into(),
                     tool_calls: None,
@@ -227,6 +229,7 @@ mod tests {
                     tokens_out: None,
                 },
                 Message {
+                    gemini_replay: None,
                     role: Role::User,
                     content: "Hello!".into(),
                     tool_calls: None,
@@ -236,6 +239,7 @@ mod tests {
                     tokens_out: None,
                 },
                 Message {
+                    gemini_replay: None,
                     role: Role::Assistant,
                     content: "Here is the file list.".into(),
                     tool_calls: Some(vec![ToolCall {
@@ -251,6 +255,7 @@ mod tests {
                     tokens_out: None,
                 },
                 Message {
+                    gemini_replay: None,
                     role: Role::Assistant,
                     content: "Here".into(),
                     tool_calls: None,
@@ -260,6 +265,7 @@ mod tests {
                     tokens_out: None,
                 },
                 Message {
+                    gemini_replay: None,
                     role: Role::Tool,
                     content: String::new(),
                     tool_calls: None,
@@ -273,6 +279,7 @@ mod tests {
                     tokens_out: None,
                 },
                 Message {
+                    gemini_replay: None,
                     role: Role::User,
                     content: "Run that again.".into(),
                     tool_calls: None,
@@ -467,6 +474,7 @@ mod tests {
             stable_system_prefix_bytes: None,
             messages: vec![
                 Message {
+                    gemini_replay: None,
                     role: Role::System,
                     content: "You are a test assistant.".into(),
                     tool_calls: None,
@@ -476,6 +484,7 @@ mod tests {
                     tokens_out: None,
                 },
                 Message {
+                    gemini_replay: None,
                     role: Role::User,
                     content: "Hello".into(),
                     tool_calls: None,
@@ -594,6 +603,7 @@ mod tests {
             session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![Message {
+                gemini_replay: None,
                 role: Role::Tool,
                 content: String::new(),
                 tool_calls: None,
@@ -652,6 +662,7 @@ mod tests {
             session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![Message {
+                gemini_replay: None,
                 role: Role::Tool,
                 content: String::new(),
                 tool_calls: None,
@@ -689,6 +700,7 @@ mod tests {
             stable_system_prefix_bytes: None,
             messages: vec![
                 Message {
+                    gemini_replay: None,
                     role: Role::System,
                     content: "first system".into(),
                     tool_calls: None,
@@ -698,6 +710,7 @@ mod tests {
                     tokens_out: None,
                 },
                 Message {
+                    gemini_replay: None,
                     role: Role::System,
                     content: "second system".into(),
                     tool_calls: None,

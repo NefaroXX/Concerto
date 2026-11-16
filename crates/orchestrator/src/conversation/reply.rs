@@ -37,6 +37,7 @@ pub(crate) async fn reply_to_user(
     }
     if let Some(store) = store {
         let message = Message {
+            gemini_replay: None,
             role: Role::Assistant,
             content: content.into(),
             tool_calls: None,

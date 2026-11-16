@@ -105,6 +105,12 @@ following scenarios no longer require fully manual execution:
   instructions, active task state, literal markers, retries and cache prefixes.
   Text-only history that cannot fit must report context overflow, not truncate
   obligations to satisfy the size budget.
+- Native Gemini replay (ADR-86): `replay_regression` tests cover decoder part
+  order/signatures, thought routing, empty trailing signatures, call IDs,
+  capture bounds, incomplete attempts, legacy JSON, edited content, both
+  collectors, actual orchestration history builders, context estimates and
+  SQLite close/reopen. These tests do not establish full provider-transcript
+  persistence by run settlement; H39 tracks that separate gap.
 - Scenario 5 (provider failure after a file write does not repeat the write):
   `provider_failure_after_file_write_does_not_repeat_the_write`
   (`crates/orchestrator/src/agent_loop.rs`).

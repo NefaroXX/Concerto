@@ -350,6 +350,7 @@ mod tests {
         let (tokens_in, tokens_out) =
             message_row_usage(&[metric("openai", 120, 60), metric("openai", 80, 40)]);
         let assistant = Message {
+            gemini_replay: None,
             role: concerto_core::types::Role::Assistant,
             content: "done".to_string(),
             tool_calls: None,

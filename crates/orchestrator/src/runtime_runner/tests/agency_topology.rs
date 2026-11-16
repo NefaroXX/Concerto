@@ -181,6 +181,7 @@ fn multi_agent_task_includes_persisted_conversation_history() {
     let task = AgentTask::new_action_required(session_id, "apply the fix");
     let history = vec![
         Message {
+            gemini_replay: None,
             role: Role::User,
             content: "do not change the public API".into(),
             tool_calls: None,
@@ -190,6 +191,7 @@ fn multi_agent_task_includes_persisted_conversation_history() {
             tokens_out: None,
         },
         Message {
+            gemini_replay: None,
             role: Role::Assistant,
             content: "understood".into(),
             tool_calls: None,
