@@ -1,40 +1,43 @@
 # OpenCode handoff — Concerto harness reliability
 
-Checkpoint requested by the user on 2026-11-16. Resume from this document and
-the work logs; do not restart the audit or infer that the whole goal is done.
+Checkpoint requested by the user on 2026-11-16, updated after the H39 root
+milestone was published and verified. Resume from this document and the work
+logs; do not restart the completed audit or infer that the whole goal is done.
 
 ## Start here
 
-The latest candidate fixes root conversation persistence. **Do not publish it
-yet:** the final strict cargo-audit gate failed because the registry yanked
-check timed out. Every other local gate passed. The runner has terminated;
-there is no background validation to wait for. Rerun the unchanged strict audit,
-preserving its new log, before deciding whether publication is ready.
+**The H39 root milestone is published and verified.** The strict cargo-audit
+rerun on the unchanged candidate passed: exit 0, 1,509 advisories, 1,079
+dependencies, no yanked-check timeout. The squashed H39 commit `2dbf25a` and
+the ADR-acceptance commit `72c414a` are published on
+`fix/harness-streaming-integrity`; all twelve remote checks passed on both
+exact heads. ADR-87 is Accepted for the root boundary. Evidence:
+`target/harness-reliability/h39-audit-resume-1.log` and the H39 work log.
 
-The existing draft [PR #379](https://github.com/NefaroXX/Concerto/pull/379) targets
-`dev`. Its published head remains `14390eb0a54581ca9deee7562f2d069f974cd8d9`,
-with all twelve remote checks verified green. Neither checkpoint below is
-pushed. No PR, policy gate, exception list or remote branch was changed for
-this handoff.
+[PR #379](https://github.com/NefaroXX/Concerto/pull/379) targets `dev`, is open
+and draft, and its head is `72c414aa3ec83061cb18d9f4101ea39ed6402d16`. Do not
+merge without authorization. Continue with the remaining H39 work below
+(specialist/process-scoped history and cancelled-run spend settlement), then
+H40; H40's prepared fixture now has H39's public `connect_path` API available on
+the PR branch.
 
 ## Git and worktrees
 
 | Location | Branch | State |
 | --- | --- | --- |
-| `/home/sol/Projects/Concerto` | `checkpoint/opencode-harness-2026-11-16` | Documentation-only handoff on published `14390eb`; original PR branch remains at `14390eb` |
-| `/home/sol/Projects/Concerto-worktrees/h39` | `fix/harness-transcript-continuity` | Local checkpoint `a88e8419ffdfb8f6d771f285f4e8e13681cef037`; root repair, tests, ADR and detailed log |
+| `/home/sol/Projects/Concerto` | `checkpoint/opencode-harness-2026-11-16` | Local documentation-only handoff branch; PR branch is at `72c414a` |
+| `/home/sol/Projects/Concerto-worktrees/h39` | `fix/harness-transcript-continuity` | `72c414a`; H39 root milestone published on `fix/harness-streaming-integrity`; ADR-87 Accepted |
 | `/home/sol/Projects/Concerto-worktrees/h40` | `fix/harness-headless-history` | Local checkpoint `950a722b63299c83de48cce2720a28e33bcba31f`; prepared regressions and H41 fixture correction, not verified |
 
-Dedicated local refs `checkpoint/opencode-h39-2026-11-16` and
-`checkpoint/opencode-h40-2026-11-16` preserve those exact checkpoints if the
-working topic branches are rebased or their local WIP commits are rewritten.
-These are intentional WIP checkpoints, not claims of completed verification.
-All three worktrees should be clean after the handoff commit.
+Dedicated local refs `checkpoint/opencode-h39-2026-11-16` (pre-squash WIP
+`a88e841`) and `checkpoint/opencode-h40-2026-11-16` (`950a722`) preserve those
+checkpoints after the H39 topic branch was squashed for publication. The H40
+checkpoint remains pre-verification preparation. All worktrees are clean.
 
 The detailed current H39 work log is in the **H39 worktree** at
 `docs/harness-reliability-work-log.md`. Its investigation is
 `docs/harness-transcript-investigation.md`, and its contract is
-`docs/adrs/ADR-87-root-provider-transcript.md` (still Proposed).
+`docs/adrs/ADR-87-root-provider-transcript.md` (Accepted for the root boundary).
 H40 preparation is in its own `docs/harness-headless-history-investigation.md`.
 
 ## Working requirements
@@ -61,7 +64,7 @@ H40 preparation is in its own `docs/harness-headless-history-investigation.md`.
   not these isolated worktrees; use fallback searches for unindexed changes.
   Refresh the main index after promotion.
 
-## H39: implemented candidate
+## H39: published root milestone
 
 The root `AgentLoop` and coordinator dispatch loop now persist completed
 assistant turns before tools and each completed tool result before later work.
@@ -118,24 +121,27 @@ Final battery state is in main checkout
 | Nine release benchmark smoke targets | Passed |
 | Palette and Python checks | Passed; 13 Python tests |
 | Cargo-deny | All four gates passed; **67 duplicate warnings remain tracked as H28** |
-| Strict cargo-audit | **Failed, exit 1: registry timeout; incomplete verification** |
+| Strict cargo-audit | **Passed on rerun: exit 0, 1,509 advisories, 1,079 dependencies; no yanked-check timeout** |
 
-Audit loaded 1,509 advisories and scanned 1,079 dependencies, then emitted:
+The first strict run failed with a registry yanked-check timeout; that
+diagnostic is retained at `docs/verification/h39-audit-checkpoint.txt`. Rerunning
+only that gate on the unchanged candidate passed, without `--no-yanked`,
+`--no-fetch`, new exceptions or an exit-code-only assertion. Log:
+`target/harness-reliability/h39-audit-resume-1.log`, committed copy at
+`docs/verification/h39-audit-resume-1.txt`.
 
-```text
-error: couldn't check if the package is yanked: registry: request could not be completed in the allotted timeframe
-error: cargo-audit reported diagnostics despite exit zero; audit is incomplete or unclean
-```
+Source integrity was rechecked against the battery snapshot: **1,013 of 1,014
+hashes match** `h39-final-source-sha256.json`. The single difference is
+`docs/harness-reliability-work-log.md`, updated after the battery finished (the
+two audit evidence files are the other post-run additions). No production or
+test source changed, so the battery was not repeated.
 
-The strict wrapper behaved correctly. Do not bypass the failure with
-`--no-yanked`, `--no-fetch`, new exceptions, or an exit-code-only assertion.
-The diagnostic is committed in the H39 worktree at
-`docs/verification/h39-audit-checkpoint.txt`.
-
-All **1,014 source hashes matched after the runner finished**, before the
-checkpoint work-log update and audit evidence file were added. No production
-or test source changed during validation. The checkpoint's only subsequent
-changes were those documentation/evidence additions.
+The squashed commit `2dbf25a` was pushed to `fix/harness-streaming-integrity`;
+all twelve exact-head checks passed in runs `43910428429` (format, clippy,
+tests, build, benchmarks, WASM, cargo-deny, cargo-audit, palette) and
+`43910428481` (Linux/macOS/Windows native). The ADR-acceptance commit `72c414a`
+passed all twelve again in runs `43912024136` and `43912024403`. The PR #379
+body now carries these exact results.
 
 Preserved artifacts under main `target/harness-reliability/`:
 
@@ -148,35 +154,21 @@ Preserved artifacts under main `target/harness-reliability/`:
   no workspace success is claimed for that attempt.
 - `h39-runtime-outcome-baseline.log`, `h39-runtime-outcome-repair-2.log`:
   failing then passing verification/stop-reason regressions.
-- `pr-body-h39-draft.md`: **unpublished draft with pending-verification text**;
-  replace placeholders before using. `h39-commit-message.txt` is a proposed
-  final message, not the WIP checkpoint's verification claim.
+- `pr-body-h39-draft.md`: the published PR #379 body as of `72c414a`.
+  `h39-commit-message.txt` was the final squashed commit message.
 
-Do not rerun the old script in place and overwrite these evidence files. First
-rerun only the incomplete strict gate on unchanged code, with a new log:
-
-```bash
-cd /home/sol/Projects/Concerto-worktrees/h39
-env TMPDIR=/var/tmp CARGO_TARGET_DIR=/home/sol/Projects/Concerto/target \
-  RUSTFLAGS="-D warnings" CARGO_INCREMENTAL=0 \
-  python3 scripts/check-cargo-audit.py \
-  > /home/sol/Projects/Concerto/target/harness-reliability/h39-audit-resume-1.log 2>&1
-```
-
-Inspect both exit status and log. If a substantive finding appears, fix it and
-run the checks required by that change. With unchanged source and a clean
-strict audit, retain the already-passing battery evidence; do not repeat it
-merely because a tool observation handle expired. Update the log/ADR and PR
-description accurately, promote H39 onto `fix/harness-streaming-integrity`,
-publish, then watch all twelve checks on the exact head. The prior H38 runs were
-`43785417943` (main CI) and `43785417957` (native matrix); these are not H39 runs.
+Do not rerun the old battery script in place and overwrite these evidence
+files. If a later change to H39 is made, run only the checks that change
+requires, then the full CI battery, and verify all twelve remote checks on the
+exact new SHA. Do not inherit the green result from `2dbf25a`/`72c414a`.
 
 ## H40 and H41: prepared, not executed
 
 The H40 branch is still based on `14390eb` plus its WIP checkpoint. Integrate the
-verified H39 commit before compiling: the new CLI fixture uses H39's public
-`connect_path` API. Do not mistake its current dependency on that missing API
-for an implementation regression.
+published H39 squash `2dbf25a` (not the pre-squash checkpoint) before compiling:
+the new CLI fixture uses H39's public `connect_path` API, which exists there. Do
+not mistake its current dependency on that missing API for an implementation
+regression.
 
 - Two wired helper probes already reproduced the 4,000-character per-message
   and 16,000-character total cutoffs. Original failing evidence is retained.
@@ -206,7 +198,7 @@ for an implementation regression.
 
 After the actual CLI baseline, implement and verify the routing change, retain
 meaningful replacement coverage if deleting the clipped helper/tests, run the
-full battery, and publish only after the H39 head is green.
+full battery, and publish on top of the verified H39 head (`2dbf25a`).
 
 ## Remaining findings
 
