@@ -37,7 +37,7 @@ passing repository tests alone does not close a finding.
 | H25 | P2 | Benchmark required-pattern checks count unreadable files as matching | Fixed and verified; awaiting merge |
 | H26 | P2 | Nine non-standard benchmark task manifests contain invalid-length IDs | Fixed and verified; awaiting merge |
 | H27 | P1 | Native orchestrator builds fail on macOS (Linux syscall) and Windows (test helper cfgs) | Fixed and verified; awaiting merge |
-| H28 | P2 | Unused dependencies and inconsistent versions inflate the dependency graph | Initial cleanup verified on 43a3e79; 67 duplicate families remain under review |
+| H28 | P2 | Unused dependencies and inconsistent versions inflate the dependency graph | Fixed and scoped: 37 unused direct dependencies and 6 redundant duplicate declarations removed (2 lock packages dropped); 67 duplicate families remain, all upstream-gated or platform-specific |
 | H29 | P2 | Declared Rust 1.88 minimum contradicts required locked dependencies | Fixed and verified: MSRV 1.94 declared; full workspace `check --all-targets` on Rust 1.94.0 passed with warnings denied |
 | H30 | P1 | Locked wasmtimer retains unmaintained pin-utils and fails the supply-chain gate | Fixed and verified; awaiting merge |
 | H31 | P1 | Bundled SQLite/SQLCipher fails the WAL memory-disclosure security gate | Fixed and verified; awaiting merge |
@@ -54,7 +54,8 @@ passing repository tests alone does not close a finding.
 
 Table reconciled 2026-11-16 after the H39/H40/H41 publication; the H40 and
 H41 rows were previously left at their preparation state. Open work is the
-register below (H12, H14, H23, H28 residual, H29, H34, H39 remainder).
+register below (H12, H14, H23, H29, H34, H39 remainder); H28 is scoped, with
+only upstream- or platform-gated duplicate families left.
 
 
 ## 2026-10-29 — H01: preserve streaming events across chunks
@@ -2574,3 +2575,75 @@ has terminated; there is no remaining validation process to wait on.
   fmt --all -- --check` passed. The declared MSRV is therefore build-verified
   on the host target. CI remains on 1.96.0; the wasm32-wasip2 guest target is
   still built by CI on 1.96.0 and is not part of this claim.
+
+## 2026-11-16 — H28: unused dependencies removed, duplicate families scoped
+
+- Removed **6 redundant declarations** that repeated a dependency already
+  declared in the same manifest (`eval` tempfile and time, `eval-runner` time,
+  `mcp` serde_json and tokio, `orchestrator` base64). The retained declaration
+  is identical, so the resolved graph and feature selection are unchanged.
+- Removed **37 unused direct dependencies** after checking every `src`,
+  `tests`, `benches`, `examples` and `build.rs` file for `use`, path forms,
+  macro invocations, feature gates and optional-dependency references:
+  `api-types` ulid (the `Ulid` type arrives through `concerto_core::ids`) and
+  time; `cli` tokio-util (`CancellationToken` is re-exported by
+  `concerto_core`); `config` semver; `desktop` ulid (imported by the app module
+  from `concerto_core`) and walkdir; `eval` tokio-util, tracing and ulid;
+  `eval-runner` dirs, tokio-util, thiserror and tracing; `lsp` thiserror,
+  camino, url (URIs come from `lsp_types::Uri`) and the unused `tokio-test`
+  dev-dependency; `mcp` serde and thiserror; `memory` fd-lock (the crate uses
+  `std::sync::RwLock`; the lock-file helper lives in `config`); `observability`
+  the unused `opentelemetry-stdout` dev-dependency; `plugin-sdk` serde and
+  serde_json; `providers` tokio-util and thiserror; `sessions` tokio-util and
+  futures; `tools` futures, thiserror and ulid; `test-plugin-wasm`,
+  `test-provider-plugin-wasm` and `test-adapter-plugin-wasm` serde and
+  serde_json; `test-dialect-plugin-wasm` serde only (its serde_json use is
+  real and retained).
+- Deliberately kept: `desktop` anyhow (used by `tests/ui_quality.rs`; its
+  placement as a normal dependency was not changed), `eval-runner` dev
+  sqlx/ulid, `lsp` futures (`futures::future::join_all`), `mcp` serde_json and
+  tracing, `tools` tokio-util, `config` fd-lock, and every other dependency
+  whose crate-level usage was confirmed. No dependency was removed merely
+  because a text search missed it.
+- Verification on this tree: `cargo check --workspace --all-targets -j1`
+  passed in 2 m 15 s (exit 0) with `RUSTFLAGS="-D warnings"`, after a targeted
+  check of every touched crate and WASM guest passed in 2 m 02 s. `cargo deny
+  check` passed (exit 0, 4.0 s) with **67 duplicate families**, unchanged from
+  the pre-cleanup count because none of the removed declarations owned a
+  duplicate version (log `target/harness-reliability/h28-final-deny.log`).
+  `cargo audit` exited 0 (11.6 s); it reported no vulnerabilities but its
+  registry yanked check timed out on this run, the known H36 environment
+  limitation (log `target/harness-reliability/h28-final-audit.log`).
+  `cargo fmt --all -- --check` passed (exit 0).
+- `Cargo.lock` changes: **2 packages removed** — `opentelemetry-stdout` 0.33.0
+  (dev-only) and `tokio-test` 0.4.5 (dev-only). No package versions changed,
+  no packages were added, and retained packages only lost the removed direct
+  edges. `deny.toml`, `.cargo/audit.toml`, `rust-toolchain.toml` and CI were
+  not modified.
+- Classification of the remaining 67 duplicate families (all upstream-gated or
+  platform-specific, and therefore no longer treated as avoidable inflation):
+  - **Upstream semver/ecosystem majors:** thiserror 1.0/2.0 and
+    thiserror-impl (sqlx 0.9 uses 2.x); reqwest 0.12/0.13 (opentelemetry-otlp
+    and langfuse use 0.13); the figment/toml 0.8-era stack — toml
+    0.8.23/1.1.6, serde_spanned 0.6/1.1, toml_datetime 0.6/1.1, toml_edit
+    0.22/0.25, winnow 0.7/1.0; base64 0.13/0.21/0.22/0.23 (spm_precompiled via
+    fastembed, tiktoken-rs, reqwest/utoipa, and newer consumers); the
+    iced/winit stack — rustix 0.38/1.1, calloop 0.13/0.14,
+    calloop-wayland-source 0.3/0.4, linux-raw-sys 0.4/0.12,
+    smithay-client-toolkit 0.19/0.20; the sha2 ecosystem — sha2 0.10/0.11,
+    digest 0.10/0.11, block-buffer 0.10/0.12, crypto-common 0.1/0.2,
+    cpufeatures 0.2/0.3; syn 2/3 with darling 0.20/0.23 (and darling_core,
+    darling_macro); plus other transitive major pairs: bitflags 1/2,
+    fancy-regex 0.13/0.16 with bit-set/bit-vec, getrandom 0.2/0.3/0.4,
+    hashbrown 0.14–0.17 with foldhash 0.1/0.2, nom 7/8, lru 0.16/0.18,
+    quick-xml 0.38/0.39, rustc-hash 1/2, signal-hook 0.3/0.4, and the font
+    stack (font-types, read-fonts, skrifa).
+  - **Platform-only:** windows/windows-core/windows-implement/
+    windows-interface/windows-result/windows-strings/windows-sys/
+    windows-targets plus the eight `windows_*` architecture crates; Apple/macOS
+    block2, objc2, objc2-app-kit, objc2-foundation, core-foundation,
+    core-graphics-types, foreign-types, foreign-types-shared and
+    security-framework; Android jni-sys; Redox redox_syscall; UEFI r-efi.
+  - **Dev-only:** the rand_core 0.9/0.10 split, where 0.10 arrives only through
+    the memory crate's dev-only rand 0.10; criterion and proptest resolve onto
+    existing versions and add no family.

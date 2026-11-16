@@ -38,11 +38,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 time = { workspace = true }
-ulid = { workspace = true }
 camino = { workspace = true }
 once_cell = { workspace = true }
 petgraph = { workspace = true }
-walkdir = { workspace = true }
 
 iced = { workspace = true, features = ["highlighter", "advanced"] }
 iced_core = "0.14.0"

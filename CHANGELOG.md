@@ -363,6 +363,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Dependency graph trimmed.** Removed 37 unused direct dependencies and six
+  redundant duplicate declarations across the workspace manifests. The
+  lockfile drops two dev-only packages (`opentelemetry-stdout`, `tokio-test`);
+  retained dependency versions and feature declarations are unchanged, and no
+  `deny.toml` policy or suppression was touched. The 67 remaining duplicate
+  families are upstream-gated or platform-specific.
+
 - **Cache-friendly single-agent prompt shape (ADR-48).** With
   `[context] cache_stable_prefix = true`, the single-agent loop builds its
   request through `PromptBuilder::build_agent_request`: one system message
