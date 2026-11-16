@@ -1,8 +1,9 @@
 //! Durable, same-session context compaction checkpoints.
 //!
 //! The full transcript remains in `messages` for UI restore and audit.  Only the
-//! active model history is materialised from bounded checkpoint summaries plus a
-//! recent uncompacted tail.  Checkpoints use the existing session checkpoint
+//! active model history retains conversational text and roles, with bounded
+//! checkpoint evidence for older tool exchanges plus a recent uncompacted tail.
+//! Checkpoints use the existing session checkpoint
 //! table under a reserved internal label namespace so they survive process
 //! restarts without creating a second visible session.
 
@@ -75,7 +76,7 @@ struct StoredCheckpoint {
 
 /// [`ContextEngine`](crate::context_engine::ContextEngine) calls this with the
 /// policy it resolved from the `[context]` config surface (ADR-048 §6). It
-/// refreshes durable checkpoints when needed and returns the bounded history
+/// refreshes durable checkpoints when needed and returns the compacted history
 /// used for the next model request. Persisted source messages are never
 /// modified.
 pub(crate) async fn refresh_and_materialize_with_policy(
@@ -351,21 +352,27 @@ fn materialize_history(messages: &[Message], checkpoints: &[StoredCheckpoint]) -
     }
 
     let mut active = Vec::new();
-    // System messages are mandatory and remain verbatim even when their sequence
-    // happens to fall inside a compacted range.
-    active.extend(
-        messages
-            .iter()
-            .take(covered_end as usize)
-            .filter(|message| message.role == Role::System)
-            .cloned(),
-    );
+    // Checkpoint excerpts cannot decide which instructions or commitments are
+    // still active. Recover conversational text from the source transcript,
+    // preserving role and order even for legacy/hierarchical checkpoints.
+    active.extend(messages.iter().take(covered_end as usize).filter_map(retain_conversation));
 
     for stored in frontier(checkpoints) {
         if stored.checkpoint.end_sequence > covered_end {
             continue;
         }
+        let range_has_tools = messages
+            .iter()
+            .take(stored.checkpoint.end_sequence as usize)
+            .skip(stored.checkpoint.start_sequence.saturating_sub(1) as usize)
+            .any(|message| message.role == Role::Tool || message.tool_calls.is_some());
+        if !range_has_tools {
+            // Plain conversation is already present verbatim. Adding its lossy
+            // duplicate would consume context without preserving more evidence.
+            continue;
+        }
         active.push(Message {
+            gemini_replay: None,
             role: Role::System,
             content: format_checkpoint_for_prompt(&stored.checkpoint),
             tool_calls: None,
@@ -378,6 +385,27 @@ fn materialize_history(messages: &[Message], checkpoints: &[StoredCheckpoint]) -
 
     active.extend(messages.iter().skip(covered_end as usize).cloned());
     active
+}
+
+fn retain_conversation(message: &Message) -> Option<Message> {
+    match message.role {
+        Role::Tool => None,
+        Role::Assistant => {
+            // Historical calls/results move together into checkpoint evidence.
+            // Replaying only the assistant call would orphan the protocol pair.
+            // Reasoning is durable in the source, not in compacted requests.
+            if message.content.is_empty() {
+                return None;
+            }
+            let mut retained = message.clone();
+            retained.tool_calls = None;
+            retained.tool_results = None;
+            retained.reasoning_content = None;
+            retained.gemini_replay = None;
+            Some(retained)
+        }
+        _ => Some(message.clone()),
+    }
 }
 
 fn frontier(checkpoints: &[StoredCheckpoint]) -> Vec<&StoredCheckpoint> {
@@ -494,30 +522,33 @@ fn format_checkpoint_for_prompt(checkpoint: &ContextCheckpoint) -> String {
 }
 
 pub(crate) fn estimate_messages_tokens(messages: &[Message]) -> u64 {
-    messages.iter().map(estimate_message_tokens).sum()
+    messages.iter().map(estimate_message_tokens).fold(0, u64::saturating_add)
 }
 
-/// Token cost of one message (ADR-48 §4 `measured beats estimate`).
+/// Estimate the current message payload, independently of historical usage.
+/// Provider input counts describe an entire earlier request, and output counts
+/// may include reasoning or content no longer present. They are accounting
+/// records, not additive sizes of messages in the current window.
 ///
-/// When a message carries *both* a provider-reported input and output token
-/// count, those are authoritative and used verbatim. Otherwise (either side
-/// unknown, i.e. `None`), the byte/4 heuristic applies — including mixed
-/// states where only one side is known, so we never under-count a partial
-/// report.
+/// This remains a byte/4 heuristic with per-message overhead, not a tokenizer
+/// or a proof that the final provider request fits its context capacity.
 fn estimate_message_tokens(message: &Message) -> u64 {
-    match (message.tokens_in, message.tokens_out) {
-        (Some(input), Some(output)) => input.saturating_add(output),
-        _ => {
-            let mut bytes = message.content.len();
-            if let Some(tool_calls) = &message.tool_calls {
-                bytes += serde_json::to_vec(tool_calls).map_or(0, |json| json.len());
-            }
-            if let Some(tool_results) = &message.tool_results {
-                bytes += serde_json::to_vec(tool_results).map_or(0, |json| json.len());
-            }
-            (bytes as u64).div_ceil(4) + 4
-        }
+    // Adapters send structured tool results instead of their legacy display
+    // text. Count that canonical payload once, as the provider guard does.
+    let mut bytes = if message.role == Role::Tool && message.tool_results.is_some() {
+        0
+    } else {
+        message.content.len()
+    };
+    bytes = bytes.saturating_add(message.reasoning_content.as_ref().map_or(0, String::len));
+    if let Some(tool_calls) = &message.tool_calls {
+        bytes = bytes.saturating_add(serde_json::to_vec(tool_calls).map_or(0, |json| json.len()));
     }
+    if let Some(tool_results) = &message.tool_results {
+        bytes = bytes.saturating_add(serde_json::to_vec(tool_results).map_or(0, |json| json.len()));
+    }
+    bytes = bytes.max(message.gemini_replay.as_ref().map_or(0, |replay| replay.encoded_len()));
+    (bytes as u64).div_ceil(4).saturating_add(4)
 }
 
 /// Planning-stage predicate (ADR-048 §2): does the given window warrant
@@ -587,6 +618,7 @@ mod tests {
 
     fn message(role: Role, content: impl Into<String>) -> Message {
         Message {
+            gemini_replay: None,
             role,
             content: content.into(),
             tool_calls: None,
@@ -608,27 +640,51 @@ mod tests {
         }
     }
 
-    /// ADR-48 §4 (`measured beats estimate`): when a message carries both
-    /// provider-reported counts, the sum is authoritative — the byte heuristic
-    /// would multiply the cost here.
+    pub(super) fn tool_exchange(turn: usize) -> [Message; 2] {
+        let id = format!("read-{turn}");
+        let mut call = message(Role::Assistant, "");
+        call.tool_calls = Some(vec![concerto_core::types::ToolCall {
+            id: id.clone(),
+            name: "filesystem".into(),
+            arguments: serde_json::json!({"path": format!("source-{turn}.rs")}),
+            ..Default::default()
+        }]);
+        let mut result = message(Role::Tool, "");
+        result.tool_results = Some(vec![concerto_core::types::ToolResult {
+            id,
+            name: "filesystem".into(),
+            content: serde_json::json!({"content": "source line\n".repeat(1_000)}),
+        }]);
+        [call, result]
+    }
+
     #[test]
-    fn estimate_uses_measured_usage_when_both_sides_known() {
-        let mut measured = message(Role::Assistant, "x".repeat(400));
-        measured.tokens_in = Some(10);
-        measured.tokens_out = Some(5);
-        // Byte heuristic for 400 bytes would be 400.div_ceil(4) + 4 = 104.
-        assert_eq!(estimate_messages_tokens(&[measured]), 15);
-
-        // Mixed state (only one side measured) still falls back to the
-        // heuristic so a partial report never under-counts the window.
-        let mut partial = message(Role::Assistant, "x".repeat(400));
-        partial.tokens_in = Some(10);
+    fn estimate_uses_current_payload_with_any_usage_metadata() {
         let heuristic = (400_u64).div_ceil(4) + 4;
-        assert_eq!(estimate_messages_tokens(&[partial]), heuristic);
+        for usage in [(Some(10), Some(5)), (Some(10), None), (None, Some(5)), (None, None)] {
+            let mut entry = message(Role::Assistant, "x".repeat(400));
+            (entry.tokens_in, entry.tokens_out) = usage;
+            assert_eq!(estimate_messages_tokens(&[entry]), heuristic);
+        }
+    }
 
-        // Unknown usage is unchanged: exactly the heuristic.
-        let unknown = message(Role::Assistant, "x".repeat(400));
-        assert_eq!(estimate_messages_tokens(&[unknown]), heuristic);
+    #[test]
+    fn estimate_counts_replay_reasoning_and_avoids_tool_display_duplication() {
+        let mut assistant = message(Role::Assistant, "answer");
+        let without_reasoning = estimate_message_tokens(&assistant);
+        assistant.reasoning_content = Some("🦀".repeat(100));
+        assert_eq!(estimate_message_tokens(&assistant), without_reasoning + 100);
+
+        let mut tool = message(Role::Tool, "legacy display ".repeat(1_000));
+        tool.tool_results = Some(vec![concerto_core::types::ToolResult {
+            id: "read-1".into(),
+            name: "filesystem".into(),
+            content: serde_json::json!({"content":"the actual result"}),
+        }]);
+        let with_display = estimate_message_tokens(&tool);
+        tool.content.clear();
+        assert_eq!(estimate_message_tokens(&tool), with_display);
+        assert!(with_display > 4, "structured payload must still be counted");
     }
 
     /// ADR-048 §5 auditability: a compaction decision that writes a new
@@ -744,6 +800,7 @@ mod tests {
         let mut messages = Vec::new();
         for turn in 0..8 {
             messages.push(message(Role::User, format!("request {turn} {}", "x".repeat(160))));
+            messages.extend(tool_exchange(turn));
             messages.push(message(Role::Assistant, format!("response {turn} {}", "y".repeat(160))));
         }
         store.append_messages(session.id, &messages, CancellationToken::new()).await.unwrap();
@@ -841,7 +898,7 @@ mod tests {
             )
             .await
             .unwrap();
-        // 15 user turns -> 30 messages of realistic prose, far past the tiny
+        // 15 user turns with tool payloads, far past the tiny
         // test trigger (10 tokens) so compaction must fire.
         let mut messages = Vec::new();
         for turn in 0..15 {
@@ -853,6 +910,7 @@ mod tests {
                     "x".repeat(160),
                 ),
             ));
+            messages.extend(tool_exchange(turn));
             messages.push(message(
                 Role::Assistant,
                 format!(
@@ -952,17 +1010,17 @@ mod tests {
             active.iter().any(|entry| entry.role == Role::User && entry.content == request_five),
             "retained user turn (request 5) missing from active history"
         );
-        // Exactly the retained user turns survive as user messages; older
-        // turns are summarized, never kept verbatim.
+        // ADR-85: earlier user instructions are equally mandatory. A summary
+        // cannot safely decide that their obligations have expired.
         assert_eq!(
             active.iter().filter(|entry| entry.role == Role::User).count(),
-            2,
-            "exactly the retained user turns remain in the active history"
+            6,
+            "all user turns retain their instruction authority"
         );
         let request_zero = format!("request 0 {}", "x".repeat(120));
         assert!(
-            !active.iter().any(|entry| entry.role == Role::User && entry.content == request_zero),
-            "a compacted turn must not survive as a verbatim user message"
+            active.iter().any(|entry| entry.role == Role::User && entry.content == request_zero),
+            "the first user instruction must survive compaction verbatim"
         );
     }
 
@@ -974,3 +1032,7 @@ mod tests {
         assert!(!summary.is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "context_compaction_regressions.rs"]
+mod regression_tests;

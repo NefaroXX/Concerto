@@ -559,15 +559,16 @@ impl SqliteSessionStore {
             .await
     }
 
-    /// Connect to an explicit database path. SQLite WAL and `busy_timeout`
-    /// provide safe multi-process coordination; no process-lifetime advisory
-    /// lock is held.
+    /// Connect to an explicit plaintext database path. SQLite WAL and
+    /// `busy_timeout` provide safe multi-process coordination; no
+    /// process-lifetime advisory lock is held. Marked encrypted databases are
+    /// rejected; open those with [`Self::connect_with_at_rest`] instead.
     ///
-    /// Self-heals a corrupted database (ADR-54): if the first open fails, the
-    /// main file is quarantined to `<name>.corrupt-<unix_utc_ts>.bak` and the
-    /// open is retried once against a fresh database. If that retry also
-    /// fails, the original error is returned (it is never masked).
-    async fn connect_path(db_path: &std::path::Path) -> Result<Self, SessionError> {
+    /// Self-heals an invalid database header (ADR-54): the main file is
+    /// quarantined to `<name>.corrupt-<unix_utc_ts>.bak` and the open is retried
+    /// once against a fresh database. Schema or migration errors on a valid
+    /// SQLite file never quarantine it. A failed retry returns the original error.
+    pub async fn connect_path(db_path: &std::path::Path) -> Result<Self, SessionError> {
         // A marker-carrying database is encrypted: never open it with the
         // plaintext path (and therefore never let the ADR-54 header heuristic
         // below quarantine a healthy encrypted file).
@@ -914,6 +915,7 @@ impl SessionStore for SqliteSessionStore {
         };
 
         let reasoning_content = msg.reasoning_content.clone();
+        let gemini_replay = msg.gemini_replay.as_ref().map(serde_json::to_string).transpose()?;
         // ADR-48 §4: real usage when the message carries it; the schema
         // columns are NOT NULL DEFAULT 0, so `None` (unknown) is stored as 0
         // and round-trips back as `None` on load.
@@ -922,8 +924,8 @@ impl SessionStore for SqliteSessionStore {
 
         // Atomic insert with sequence number computed via COALESCE to avoid TOCTOU race
         sqlx::query(
-            "INSERT INTO messages (id, session_id, sequence_num, role, content, tool_calls, tool_results, reasoning_content, tokens_in, tokens_out) \
-            SELECT ?, ?, COALESCE(MAX(sequence_num), 0) + 1, ?, ?, ?, ?, ?, ?, ? FROM messages WHERE session_id = ?"
+            "INSERT INTO messages (id, session_id, sequence_num, role, content, tool_calls, tool_results, reasoning_content, tokens_in, tokens_out, gemini_replay) \
+            SELECT ?, ?, COALESCE(MAX(sequence_num), 0) + 1, ?, ?, ?, ?, ?, ?, ?, ? FROM messages WHERE session_id = ?"
         )
         .bind(id.to_string())
         .bind(session_id.to_string())
@@ -934,6 +936,7 @@ impl SessionStore for SqliteSessionStore {
         .bind(reasoning_content)
         .bind(tokens_in)
         .bind(tokens_out)
+        .bind(gemini_replay)
         .bind(session_id.to_string())
         .execute(&self.pool)
         .await?;
@@ -975,14 +978,16 @@ impl SessionStore for SqliteSessionStore {
             };
 
             let reasoning_content = msg.reasoning_content.clone();
+            let gemini_replay =
+                msg.gemini_replay.as_ref().map(serde_json::to_string).transpose()?;
             // ADR-48 §4: real usage when the message carries it; `None`
             // (unknown) is stored as 0 (columns are NOT NULL DEFAULT 0).
             let tokens_in = msg.tokens_in.unwrap_or(0) as i64;
             let tokens_out = msg.tokens_out.unwrap_or(0) as i64;
 
             sqlx::query(
-                "INSERT INTO messages (id, session_id, sequence_num, role, content, tool_calls, tool_results, reasoning_content, tokens_in, tokens_out) \
-                SELECT ?, ?, COALESCE(MAX(sequence_num), 0) + 1, ?, ?, ?, ?, ?, ?, ? FROM messages WHERE session_id = ?"
+                "INSERT INTO messages (id, session_id, sequence_num, role, content, tool_calls, tool_results, reasoning_content, tokens_in, tokens_out, gemini_replay) \
+                SELECT ?, ?, COALESCE(MAX(sequence_num), 0) + 1, ?, ?, ?, ?, ?, ?, ?, ? FROM messages WHERE session_id = ?"
             )
             .bind(id.to_string())
             .bind(session_id.to_string())
@@ -993,6 +998,7 @@ impl SessionStore for SqliteSessionStore {
             .bind(reasoning_content)
             .bind(tokens_in)
             .bind(tokens_out)
+            .bind(gemini_replay)
             .bind(session_id.to_string())
             .execute(&mut *tx)
             .await?;
@@ -1010,7 +1016,7 @@ impl SessionStore for SqliteSessionStore {
         check_cancel(&cancel)?;
 
         let rows = sqlx::query(
-            "SELECT role, content, tool_calls, tool_results, reasoning_content, tokens_in, tokens_out FROM messages WHERE session_id = ? ORDER BY sequence_num ASC"
+            "SELECT role, content, tool_calls, tool_results, reasoning_content, tokens_in, tokens_out, gemini_replay FROM messages WHERE session_id = ? ORDER BY sequence_num ASC"
         )
         .bind(session_id.to_string())
         .fetch_all(&self.pool)
@@ -1026,6 +1032,8 @@ impl SessionStore for SqliteSessionStore {
             let tool_calls_json: Option<String> = row.try_get("tool_calls")?;
             let tool_results_json: Option<String> = row.try_get("tool_results")?;
             let reasoning_content: Option<String> = row.try_get("reasoning_content")?;
+            let replay_json: Option<String> = row.try_get("gemini_replay")?;
+            let gemini_replay = replay_json.as_deref().map(serde_json::from_str).transpose()?;
             let tokens_in: i64 = row.try_get("tokens_in")?;
             let tokens_out: i64 = row.try_get("tokens_out")?;
 
@@ -1058,6 +1066,7 @@ impl SessionStore for SqliteSessionStore {
             };
 
             messages.push(Message {
+                gemini_replay,
                 role,
                 content,
                 tool_calls,
@@ -1204,6 +1213,9 @@ impl SessionStore for SqliteSessionStore {
         // ON DELETE CASCADE (project_active_sessions, orchestration_checkpoints)
         // are left to the cascade and must NOT be deleted here.
         for table in [
+            "gate_read_versions",
+            "gate_read_scopes",
+            "gate_read_legacy_sessions",
             "messages",
             "provider_metrics",
             "session_events",
@@ -2102,11 +2114,30 @@ mod tests {
     use concerto_core::traits::AuditLog;
     use concerto_core::types::{Role, TokenBudget};
 
+    /// Check the linked engine, including SQLCipher on Unix. A clean lockfile
+    /// alone cannot prove that the bundled SQLCipher amalgamation is patched.
+    #[tokio::test]
+    async fn sqlite_runtime_includes_wal_page_size_security_fix(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let pool = SqlitePool::connect("sqlite::memory:").await?;
+        let version: String =
+            sqlx::query_scalar("SELECT sqlite_version()").fetch_one(&pool).await?;
+        pool.close().await;
+        let parts = version.split('.').map(str::parse::<u32>).collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(parts.len(), 3, "unexpected SQLite version: {version}");
+        assert!(
+            parts.as_slice() >= [3, 54, 0].as_slice(),
+            "SQLite {version} lacks the RUSTSEC-2026-0459 WAL page-size fix"
+        );
+        Ok(())
+    }
+
     #[test]
     fn conversation_history_add_and_retrieve() {
         let budget = TokenBudget::new(1000, 100);
         let mut history = ConversationHistory::new(budget);
         let msg = Message {
+            gemini_replay: None,
             role: Role::User,
             content: "Hello".to_string(),
             tool_calls: None,
@@ -2149,6 +2180,7 @@ mod tests {
             .unwrap();
 
         let msg = Message {
+            gemini_replay: None,
             role: Role::User,
             content: "Hello, world!".to_string(),
             tool_calls: None,
@@ -2161,6 +2193,7 @@ mod tests {
 
         // ADR-46: reasoning_content round-trips through the DB.
         let reasoning_msg = Message {
+            gemini_replay: None,
             role: Role::Assistant,
             content: "With reasoning".to_string(),
             tool_calls: None,
@@ -2201,6 +2234,7 @@ mod tests {
 
         // ADR-48 §4: measured usage is persisted verbatim.
         let measured = Message {
+            gemini_replay: None,
             role: Role::User,
             content: "measured".to_string(),
             tool_calls: None,
@@ -2214,6 +2248,7 @@ mod tests {
         // Unknown usage (`None`) is stored as 0 and restores as `None` so the
         // estimator heuristic applies — never a fake zero.
         let unknown = Message {
+            gemini_replay: None,
             role: Role::Assistant,
             content: "unknown".to_string(),
             tool_calls: None,
@@ -2243,6 +2278,7 @@ mod tests {
 
         // Simulate a pre-ADR-48 row: tokens written as 0 by an older version.
         let msg = Message {
+            gemini_replay: None,
             role: Role::User,
             content: "legacy".to_string(),
             tool_calls: None,
@@ -2419,6 +2455,7 @@ mod tests {
         let session =
             store.create_session(&project_dir, "p", "m", CancellationToken::new()).await.unwrap();
         let msgs = [Message {
+            gemini_replay: None,
             role: Role::User,
             content: "should not persist".into(),
             tool_calls: None,
@@ -2450,6 +2487,7 @@ mod tests {
             .await
             .unwrap();
         let first_message = Message {
+            gemini_replay: None,
             role: Role::User,
             content: "from first".into(),
             tool_calls: None,
@@ -2459,6 +2497,7 @@ mod tests {
             tokens_out: None,
         };
         let second_message = Message {
+            gemini_replay: None,
             role: Role::Assistant,
             content: "from second".into(),
             tool_calls: None,
@@ -2594,6 +2633,7 @@ mod tests {
             store.create_session(&project_dir, "p", "m", CancellationToken::new()).await.unwrap();
         let msgs = vec![
             Message {
+                gemini_replay: None,
                 role: Role::User,
                 content: "first".into(),
                 tool_calls: None,
@@ -2603,6 +2643,7 @@ mod tests {
                 tokens_out: None,
             },
             Message {
+                gemini_replay: None,
                 role: Role::Assistant,
                 content: "second".into(),
                 tool_calls: None,
@@ -2629,6 +2670,7 @@ mod tests {
             store.create_session(&project_dir, "p", "m", CancellationToken::new()).await.unwrap();
         let msgs = vec![
             Message {
+                gemini_replay: None,
                 role: Role::User,
                 content: "A".into(),
                 tool_calls: None,
@@ -2638,6 +2680,7 @@ mod tests {
                 tokens_out: None,
             },
             Message {
+                gemini_replay: None,
                 role: Role::Assistant,
                 content: "B".into(),
                 tool_calls: None,
@@ -2647,6 +2690,7 @@ mod tests {
                 tokens_out: None,
             },
             Message {
+                gemini_replay: None,
                 role: Role::User,
                 content: "C".into(),
                 tool_calls: None,
@@ -3323,6 +3367,7 @@ mod tests {
             .save_message(
                 session.id,
                 &Message {
+                    gemini_replay: None,
                     role: Role::User,
                     content: "hello".into(),
                     tool_calls: None,
@@ -3593,6 +3638,45 @@ mod tests {
             .unwrap();
         let listed = store.list_spend_records(session.id, CancellationToken::new()).await.unwrap();
         assert!(listed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_session_removes_read_provenance_only_for_that_session() {
+        let store = SqliteSessionStore::connect_in_memory().await.unwrap();
+        let session = store
+            .create_session(
+                camino::Utf8Path::new("/var/tmp/read-provenance"),
+                "provider",
+                "model",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let id = session.id.to_string();
+        sqlx::query("INSERT INTO gate_read_scopes (project_root, session_id) VALUES ('root', ?)")
+            .bind(&id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO gate_read_versions (project_root, session_id, agent_id, path, version)             VALUES ('root', ?, 'agent', 'file', '<absent>')")
+            .bind(&id).execute(&store.pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO gate_read_legacy_sessions (session_id) VALUES (?), ('other-session')",
+        )
+        .bind(&id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        assert!(store.delete_session(session.id, CancellationToken::new()).await.unwrap());
+        let count: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM gate_read_versions)             + (SELECT COUNT(*) FROM gate_read_scopes)")
+            .fetch_one(&store.pool).await.unwrap();
+        assert_eq!(count, 0);
+        let remaining: Vec<String> =
+            sqlx::query_scalar("SELECT session_id FROM gate_read_legacy_sessions")
+                .fetch_all(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining, ["other-session"]);
     }
 
     #[tokio::test]
@@ -4190,3 +4274,6 @@ mod tests {
         assert_eq!(audit_row_count(&store).await, 1, "the old row must survive");
     }
 }
+
+#[cfg(test)]
+mod gemini_replay_tests;

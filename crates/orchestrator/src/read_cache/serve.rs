@@ -6,24 +6,21 @@
 //! four **never-stale** rules before a cached read may be served — the rules
 //! are listed in the parent module's docs. Nothing here *writes* cache state:
 //! the parent's `cache_read_output` attaches content bytes to an existing
-//! observation row, and the advisory `Allow` gate plus the `ServedFromCache`
-//! audit row stay at the call sites (ADR-65 F1a/F1b, see
+//! observation row. Call sites must check advisory `Allow` before invoking
+//! this disk-reading probe and record `ServedFromCache` after a hit (see
 //! `crate::agent_loop`), so a served read is never a policy-engine bypass.
 //!
-//! Stability contract: the four predicates and their check order are
-//! observable behavior — serving must remain impossible on any doubt. The
-//! function bodies move verbatim from `read_cache.rs`. The failure tests
-//! below pin the missing-row, stat-divergence (stale), and partial-observation
-//! (never-hashed) edges.
+//! A matching timestamp and size are only cheap rejection checks. Serving
+//! also requires byte equality with the actual contained path the filesystem
+//! tool would read; lexical resource keys are not filesystem identities.
 
 use std::path::Path;
 
 use concerto_core::CancellationToken;
-use concerto_sessions::ResourceFacts;
+use concerto_sessions::{CachedRead, ResourceFacts};
+use tokio::io::AsyncReadExt;
 
-use crate::tool_facts::{
-    canonical_project_path, mtime_ms, project_root_hash, resolve_path, ToolFactContext,
-};
+use crate::tool_facts::{canonical_project_path, mtime_ms, project_root_hash, ToolFactContext};
 
 /// The result of a successful cache serve — the cached content plus the
 /// `event_id` the content is attributable to (the clean row's `last_event_id`),
@@ -60,14 +57,13 @@ pub fn plain_single_path_read<'a>(tool: &str, args: &'a serde_json::Value) -> Op
 /// Decide whether to serve this read from cache. Returns `Some` only when all
 /// four predicates hold; returns `None` (execute normally) on any doubt or
 /// error — serving never fails the loop, it just doesn't happen.
+/// Callers must obtain advisory policy Allow before this reads disk bytes.
 ///
-/// The serve re-stats the same resolved path the observation hashed by reducing
-/// the tool-reported path to its **canonical project-relative key** first
-/// (ADR-65 F5d) and then reusing [`crate::tool_facts::resolve_path`],
-/// guaranteeing `rule (3)` compares the row against the exact path that
-/// produced it. The lookup is scoped under the project root's
-/// `project_root_hash` (F5c): a row observed under a *different* root — or a
-/// legacy pre-scoping row (`project_root_hash == ""`) — never serves.
+/// Resource keys retain their lexical spelling for lookup, but the requested
+/// path and the cache key must resolve to the same contained file under the
+/// filesystem tool's rules. A bounded read then verifies current disk bytes.
+/// Rows from a different project root (including legacy unscoped rows) never
+/// serve. This observes bytes at read time; it does not lock out later edits.
 pub async fn maybe_serve_read(
     facts: &ToolFactContext,
     project_root: &Path,
@@ -95,26 +91,69 @@ pub async fn maybe_serve_read(
     }
     let content_hash = cached.row.content_hash.as_deref()?;
 
-    let resolved = resolve_path(project_root, &path);
-    // Rule 3: re-stat NOW and compare size + mtime with the observation.
-    let Ok(meta) = std::fs::metadata(&resolved) else {
-        return None;
-    };
-    if cached.row.size_bytes != Some(meta.len()) {
-        return None;
-    }
-    if cached.row.mtime_ms != mtime_ms(&meta) {
-        return None;
-    }
-
     // Rule 4's second half: the cached bytes must hash to the observed hash.
-    // This also catches a corrupted cache-vs-row mismatch with no extra disk
-    // read (the content already sits in the cached string).
-    if blake3::hash(cached.content.as_bytes()).to_hex().to_string() != content_hash {
+    // Refuse corrupted or oversized rows before doing any filesystem work.
+    if cached.content.len() > concerto_sessions::resource_facts::CACHE_LIMIT_BYTES
+        || blake3::hash(cached.content.as_bytes()).to_hex().to_string() != content_hash
+    {
         return None;
     }
 
+    current_file_matches(project_root, raw_path, &path, &cached, cancel).await?;
+    if cancel.is_cancelled() {
+        return None;
+    }
     cached.row.last_event_id.map(|event_id| ReadServe { path, content: cached.content, event_id })
+}
+
+/// Resolve like the tool, then compare a bounded read through one file handle.
+/// Metadata cannot establish byte freshness: editors may preserve timestamps.
+async fn current_file_matches(
+    project_root: &Path,
+    raw_path: &str,
+    cache_path: &str,
+    cached: &CachedRead,
+    cancel: &CancellationToken,
+) -> Option<()> {
+    let root = camino::Utf8PathBuf::from_path_buf(project_root.to_path_buf()).ok()?;
+    let raw_path = camino::Utf8PathBuf::from(raw_path);
+    let cache_path = camino::Utf8PathBuf::from(cache_path);
+    let resolved = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return None,
+        result = tokio::task::spawn_blocking(move || {
+            use concerto_tools::common::{path_comparison_key, resolve_path};
+            let requested = resolve_path(&root, &raw_path).ok()?;
+            let observed = resolve_path(&root, &cache_path).ok()?;
+            if path_comparison_key(&requested) != path_comparison_key(&observed)
+                || !requested.metadata().ok()?.is_file()
+            {
+                return None;
+            }
+            Some(requested)
+        }) => result.ok()??,
+    };
+    let read = async {
+        let file = tokio::fs::File::open(resolved).await.ok()?;
+        let meta = file.metadata().await.ok()?;
+        let expected_len = cached.content.len();
+        if !meta.is_file()
+            || meta.len() != expected_len as u64
+            || cached.row.size_bytes != Some(meta.len())
+            || cached.row.mtime_ms != mtime_ms(&meta)
+        {
+            return None;
+        }
+        // One extra byte detects growth after stat without an unbounded read.
+        let mut bytes = Vec::with_capacity(expected_len + 1);
+        file.take(expected_len as u64 + 1).read_to_end(&mut bytes).await.ok()?;
+        (bytes == cached.content.as_bytes()).then_some(())
+    };
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        result = read => result,
+    }
 }
 
 #[cfg(test)]
@@ -127,6 +166,154 @@ mod tests {
     // tests here and the cache-write tests there use one definition instead
     // of duplicated scaffolding.
     use super::super::tests::{cancel, mtime_ms, read_args, seed_clean_read, test_pool};
+
+    #[tokio::test]
+    async fn never_serves_same_size_external_edit_with_restored_mtime() {
+        let (_dir, pool) = test_pool().await;
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join("observed.txt");
+        seed_clean_read(&pool, root.path(), "observed.txt", b"old bytes").await;
+        let before = std::fs::metadata(&path).unwrap();
+        let modified = before.modified().unwrap();
+        std::fs::write(&path, b"new bytes").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(mtime_ms(&before), mtime_ms(&after));
+        let ctx = ToolFactContext::new(Some(pool), "reader");
+        assert!(
+            maybe_serve_read(
+                &ctx,
+                root.path(),
+                "filesystem",
+                &read_args("read", "observed.txt"),
+                &cancel(),
+            )
+            .await
+            .is_none(),
+            "matching stat metadata does not prove cached bytes still match disk"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn never_serves_a_different_file_after_rewriting_a_literal_backslash() {
+        let (_dir, pool) = test_pool().await;
+        let root = tempfile::tempdir().expect("root");
+        seed_clean_read(&pool, root.path(), "dir/file.txt", b"cached").await;
+        std::fs::write(root.path().join(r"dir\file.txt"), b"actual").unwrap();
+        let ctx = ToolFactContext::new(Some(pool), "reader");
+        assert!(
+            maybe_serve_read(
+                &ctx,
+                root.path(),
+                "filesystem",
+                &read_args("read", r"dir\file.txt"),
+                &cancel(),
+            )
+            .await
+            .is_none(),
+            "Unix backslashes name a different file, not a directory separator"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn never_serves_a_different_file_after_collapsing_a_symlink_parent() {
+        let (_dir, pool) = test_pool().await;
+        let root = tempfile::tempdir().unwrap();
+        seed_clean_read(&pool, root.path(), "dir/file.txt", b"cached").await;
+        std::fs::create_dir_all(root.path().join("other/child")).unwrap();
+        std::fs::write(root.path().join("other/file.txt"), b"actual").unwrap();
+        std::os::unix::fs::symlink(root.path().join("other/child"), root.path().join("dir/link"))
+            .unwrap();
+        let raw = "dir/link/../file.txt";
+        assert_eq!(std::fs::read(root.path().join(raw)).unwrap(), b"actual");
+        let ctx = ToolFactContext::new(Some(pool), "reader");
+        assert!(maybe_serve_read(
+            &ctx,
+            root.path(),
+            "filesystem",
+            &read_args("read", raw),
+            &cancel()
+        )
+        .await
+        .is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn never_serves_after_a_path_becomes_a_symlink_escape() {
+        let (_dir, pool) = test_pool().await;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let path = root.path().join("file.txt");
+        seed_clean_read(&pool, root.path(), "file.txt", b"same").await;
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let target = outside.path().join("file.txt");
+        std::fs::write(&target, b"same").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&target)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let ctx = ToolFactContext::new(Some(pool), "reader");
+        assert!(
+            maybe_serve_read(
+                &ctx,
+                root.path(),
+                "filesystem",
+                &read_args("read", "file.txt"),
+                &cancel()
+            )
+            .await
+            .is_none(),
+            "cache hits must obey the tool's containment rule even when bytes and metadata match"
+        );
+    }
+
+    #[tokio::test]
+    async fn serves_exact_current_bytes_at_cache_boundaries_and_honors_cancellation() {
+        let (_dir, pool) = test_pool().await;
+        for content in [
+            String::new(),
+            "雪🦀".to_owned(),
+            "x".repeat(concerto_sessions::resource_facts::CACHE_LIMIT_BYTES),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            seed_clean_read(&pool, root.path(), "file.txt", content.as_bytes()).await;
+            let ctx = ToolFactContext::new(Some(pool.clone()), "reader");
+            let served = maybe_serve_read(
+                &ctx,
+                root.path(),
+                "filesystem",
+                &read_args("read", "file.txt"),
+                &cancel(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(served.content, content);
+            let stopped = cancel();
+            stopped.cancel();
+            assert!(maybe_serve_read(
+                &ctx,
+                root.path(),
+                "filesystem",
+                &read_args("read", "file.txt"),
+                &stopped
+            )
+            .await
+            .is_none());
+        }
+    }
 
     #[tokio::test]
     async fn never_serves_dirty_or_missing_rows() {

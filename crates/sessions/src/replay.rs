@@ -209,6 +209,7 @@ mod tests {
         let mut history = ConversationHistory::new(budget);
         // Add a system message (should be preserved).
         history.add(Message {
+            gemini_replay: None,
             role: Role::System,
             content: "You are a helpful assistant.".into(),
             tool_calls: None,
@@ -220,6 +221,7 @@ mod tests {
         // Add several long user/assistant messages that exceed the budget.
         for i in 0..5 {
             history.add(Message {
+                gemini_replay: None,
                 role: Role::User,
                 content: format!(
                     "This is message number {i} with some extra padding to consume tokens."
@@ -246,6 +248,7 @@ mod tests {
         let budget = TokenBudget::new(10, 0);
         let mut history = ConversationHistory::new(budget);
         history.add(Message {
+            gemini_replay: None,
             role: Role::User,
             content: "Hello".into(),
             tool_calls: None,

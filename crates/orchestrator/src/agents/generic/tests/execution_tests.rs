@@ -78,6 +78,7 @@ fn fixture_agent(failures: usize, chunks: Vec<CompletionChunk>) -> GenericSpecia
 
 fn write_turn(id: &str, path: &str, content: &str) -> CompletionChunk {
     CompletionChunk {
+        gemini_replay: None,
         delta: "Continuing the change".into(),
         reasoning: None,
         tool_call: Some(ToolCall {
@@ -93,6 +94,7 @@ fn write_turn(id: &str, path: &str, content: &str) -> CompletionChunk {
 
 fn final_turn() -> CompletionChunk {
     CompletionChunk {
+        gemini_replay: None,
         delta: "The requested change is complete.".into(),
         reasoning: None,
         tool_call: None,

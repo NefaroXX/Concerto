@@ -1,3 +1,4 @@
+use crate::prompts::CompletedTurn;
 use std::sync::Arc;
 
 use crate::prompts::complete_provider_request;
@@ -475,6 +476,7 @@ impl TaskPlanner {
             // as a model ID and made real multi-agent planning fail immediately.
             model: String::new(),
             messages: vec![Message {
+                gemini_replay: None,
                 role: Role::User,
                 content: prompt,
                 tool_calls: None,
@@ -516,7 +518,7 @@ impl TaskPlanner {
                 max_tokens: Some(if attempt == 1 { 2048 } else { 16384 }),
                 ..request.clone()
             };
-            let (response, reasoning, _tool_calls, usage) = complete_provider_request(
+            let CompletedTurn { text: response, reasoning, usage, .. } = complete_provider_request(
                 &provider,
                 &attempt_request,
                 retry_policy,
@@ -761,6 +763,7 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<CompletionStream, ProviderError> {
             Ok(Box::pin(stream::iter(vec![Ok(CompletionChunk {
+                gemini_replay: None,
                 reasoning: None,
                 delta: self.response.clone(),
                 tool_call: None,
@@ -816,6 +819,7 @@ mod tests {
                 .expect("max-token recording lock is not poisoned")
                 .push(request.max_tokens.unwrap_or_default());
             Ok(Box::pin(stream::iter(vec![Ok(CompletionChunk {
+                gemini_replay: None,
                 reasoning: None,
                 delta: self.next_delta(),
                 tool_call: None,

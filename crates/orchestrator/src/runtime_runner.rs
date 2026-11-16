@@ -15,7 +15,7 @@ use crate::plan_approval::{
     rehydrate_durable_binding, ApprovedPlanContext, PlanBinding, PlanLedger,
 };
 use crate::registry::AgentRegistry;
-use crate::session_manager::{message_row_usage, ProjectSessionManager, SessionManagerConfig};
+use crate::session_manager::{ProjectSessionManager, SessionManagerConfig};
 use crate::{AgentRelationship, CollaborationRule};
 
 use concerto_config::AppConfig;
@@ -629,6 +629,13 @@ struct StageTracker {
 impl StageTracker {
     fn new(bus: EventBus, session_id: Ulid, task_id: TaskId) -> Self {
         Self { bus, session_id, task_id, current: None }
+    }
+
+    /// Settle the stage from the same status returned to the caller.
+    fn finish(&mut self, status: AgentCompletionStatus) {
+        if status == AgentCompletionStatus::Completed {
+            self.set(RunStage::Complete);
+        }
     }
 
     /// Advance to `stage`, publishing `RunStageChanged` only on transition.
@@ -1372,8 +1379,8 @@ async fn execute_agent_loop(
     let task_id = task.id.0;
     // Run-stage signals (ADR-55 §9): the loop is about to start, so the
     // run is Inspecting the workspace; a mutation-capable run then moves to
-    // Execute. Complete is reported only after `run` returns Ok below — an Err
-    // or cancellation never advances the stage. Under full local agency the
+    // Execute. Complete is reported only for a completed output below — a
+    // partial result, error or cancellation never advances the stage. Under full local agency the
     // single-agent (forced) loop is action-capable, so `execute_granted` is
     // true; the explicit flag keeps the stage independent of task shaping.
     {
@@ -1388,14 +1395,19 @@ async fn execute_agent_loop(
             // Full-local-agency runs are action-capable: an empty final message
             // is left as the model produced it (no honesty synthesis, which is
             // reserved for read-only runs that no longer exist as a mode).
-            stage_tracker.lock().unwrap_or_else(|error| error.into_inner()).set(RunStage::Complete);
+            stage_tracker
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .finish(output.completion_status);
             output
         }
         Err(error) => {
             // Flush any partial transcript before surfacing the failure
             // (ADR-36): still-`Running` tool calls settle as Cancelled inside
             // stop().
-            transcript_recorder.stop().await;
+            transcript_recorder
+                .finish(&[TranscriptEntry::Error { content: error.to_string() }])
+                .await;
             event_recorder.stop().await;
             // Persist whatever the loop settled before failing (e.g. rate
             // limit): tokens consumed and cost accrued so far must not
@@ -2992,6 +3004,22 @@ pub async fn run_shared_agent(
 /// opt-in only) the review-cycle resumability store. They mirror exactly what
 /// the single-agent in-process gate is built from, so both gated paths enforce
 /// the same policy over the same durable log.
+/// The single routing decision for coordinator conversation history (H40).
+///
+/// Approved-plan runs take the ADR-60 D7 contract: the verified structured
+/// artifact and its decision ledger govern, and the old rendered transcript is
+/// excluded. Every other run — including headless one-shots with no interactive
+/// inbox — receives the persisted messages as typed history. Keeping the
+/// predicate here, and calling it only from the coordinator wiring, means the
+/// D7 boundary cannot silently weaken without failing the matching control in
+/// `tests::approved_plan_d7`.
+fn conversation_history_for_run(
+    approved_plan: Option<&ApprovedPlanContext>,
+    history: &[Message],
+) -> Option<Vec<Message>> {
+    approved_plan.is_none().then(|| history.to_vec())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_multi_agent(
     req: &AgentRunRequest,
@@ -3037,6 +3065,7 @@ async fn run_multi_agent(
         // Run-start row: no provider call has happened yet, so there is no
         // usage to record — tokens stay `None` by design.
         let user_message = Message {
+            gemini_replay: None,
             role: concerto_core::types::Role::User,
             content: req.input.clone(),
             tool_calls: None,
@@ -3507,8 +3536,15 @@ async fn run_multi_agent(
         current_source_revision(&req.project_dir).await,
     );
     coordinator = coordinator.with_conversation_inbox(services.conversation_inbox.clone());
-    if services.conversation_inbox.is_some() && approved_plan.is_none() {
-        coordinator = coordinator.with_conversation_history(req.conversation_history.clone());
+    // ADR-60 D7: an approved-plan run injects no conversation transcript — the
+    // whiteboard-verified structured artifact governs instead. Every other run
+    // attaches the persisted messages as typed history, with or without an
+    // interactive inbox: headless one-shot runs have no inbox, and routing them
+    // through clipped task prose lost long and older obligations (H40). A
+    // degraded/legacy plan load yields `approved_plan == None`, which keeps the
+    // documented pre-D7 prose-mode behavior of supplying history.
+    if let Some(history) = conversation_history_for_run(approved_plan, &req.conversation_history) {
+        coordinator = coordinator.with_conversation_history(history);
     }
     // ADR-65 §7: the checkpoint row's own updated_at backs the additive v4
     // backfill for pre-§7 (v3) checkpoints (fail-soft when absent).
@@ -3630,13 +3666,11 @@ async fn run_multi_agent(
     // ADR-60 D7: an approved-plan run does NOT inject the conversation
     // history as prose — that transcript carries the rendered plan markdown,
     // and the whiteboard-verified structured artifact governs instead.
-    // Prior decisions that matter ride the ledger in the task description;
-    // non-approved runs keep the exact pre-D7 history injection.
-    let multi_task = match approved_plan {
-        Some(_) => task.clone(),
-        None if services.conversation_inbox.is_some() => task.clone(),
-        None => multi_agent_task_with_history(task.clone(), &req.conversation_history),
-    };
+    // Prior decisions that matter ride the ledger in the task description.
+    // Non-approved runs receive the history as typed messages through
+    // `with_conversation_history` above; the task description stays the
+    // caller's objective without a synthetic transcript or rendered roles.
+    let multi_task = task.clone();
     let mut context = AgentContext::new(SessionContext::new(session_id, project_dir.clone()));
     if let Some(checkpoint) = req
         .resume_checkpoint_json
@@ -3769,46 +3803,26 @@ async fn run_multi_agent(
         Ok(output) => output,
         Err(error) => {
             stage_feed.abort();
-            // Settle the coordinator's usage first: it feeds both the failure
-            // row below and the metrics/spend tail, so one rate-limit
-            // exhaustion or cancellation records the same tokens everywhere
-            // (ADR-48 §4 — real usage when available, on the message row too).
+            // Actual provider turns already carry their own usage. Run-level
+            // failures are not synthetic assistant turns in the model history.
             let settled = coordinator.settled_metrics();
-            if let Some(store) = &session_store {
-                let content = if matches!(
-                    &error,
-                    OrchestratorError::Cancelled
-                        | OrchestratorError::Provider(ProviderError::Cancelled)
-                ) {
-                    "Task cancelled.".to_string()
-                } else {
-                    format!("Task failed: {error}")
-                };
-                let (tokens_in, tokens_out) = message_row_usage(settled);
-                let failure_message = Message {
-                    role: concerto_core::types::Role::Assistant,
-                    content,
-                    tool_calls: None,
-                    tool_results: None,
-                    reasoning_content: None,
-                    tokens_in,
-                    tokens_out,
-                };
-                if let Err(store_error) = store
-                    .append_messages(session_id, &[failure_message], req.cancel_token.clone())
-                    .await
-                {
-                    if is_expected_cancellation(&store_error, &req.cancel_token) {
-                        tracing::debug!(%store_error, "run cancelled; failure message not persisted");
-                    } else {
-                        tracing::warn!(%store_error, "failed to persist multi-agent failure");
-                    }
-                }
+            let observation = crate::provider_transcript::run_failure(task.id, &error);
+            if let Err(store_error) = crate::provider_transcript::append_completed_messages(
+                session_store.as_ref(),
+                session_id,
+                &[observation],
+                CancellationToken::new(),
+            )
+            .await
+            {
+                tracing::warn!(%store_error, %session_id, "failed to persist runtime failure");
             }
-            transcript_recorder.stop().await;
+            transcript_recorder
+                .finish(&[TranscriptEntry::Error { content: error.to_string() }])
+                .await;
             event_recorder.stop().await;
-            // Persist the coordinator's settled metrics (bound above, before
-            // the failure row) before the error propagates: on a rate-limit
+            // Persist the coordinator's settled metrics before the error
+            // propagates: on a rate-limit
             // exhaustion / cancellation the run consumed real tokens without
             // any output — the audit trail must still record them. Best-effort
             // like the success tail.
@@ -3831,7 +3845,10 @@ async fn run_multi_agent(
         }
     };
     stage_feed.abort();
-    stage_tracker.lock().unwrap_or_else(|error| error.into_inner()).set(RunStage::Complete);
+    stage_tracker
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .finish(output.completion_status);
     // ADR-55 §4 (M3): on a completed planning-only run, bind the
     // rendered plan (the coordinator's final message) to this objective,
     // keyed by the same plan_id the coordinator persisted as the durable
@@ -3921,29 +3938,19 @@ async fn run_multi_agent(
     .await;
     let conversation_handoff =
         services.conversation_inbox.as_ref().is_some_and(|inbox| inbox.is_handoff());
-    if let Some(store) = session_store.as_ref().filter(|_| !conversation_handoff) {
-        // ADR-48 §4: the assistant row records the same settled usage the
-        // `provider_metrics` and spend writes above record for this run. The
-        // run-start user row predates any provider call and stays `None`.
-        let (tokens_in, tokens_out) = message_row_usage(&output.provider_metrics);
-        let assistant_message = Message {
-            role: concerto_core::types::Role::Assistant,
-            content: if reply_only { output.final_message.clone() } else { output.summary() },
-            tool_calls: None,
-            tool_results: None,
-            reasoning_content: None,
-            tokens_in,
-            tokens_out,
-        };
-        if let Err(error) =
-            store.append_messages(session_id, &[assistant_message], req.cancel_token.clone()).await
-        {
-            if is_expected_cancellation(&error, &req.cancel_token) {
-                tracing::debug!(%error, "run cancelled; assistant message not persisted");
-            } else {
-                tracing::warn!(%error, "failed to persist multi-agent assistant message");
-            }
-        }
+    // Preserve runtime verification/termination facts separately from the
+    // coordinator's original provider turns and the rendered summary.
+    let observation = crate::provider_transcript::run_outcome(&output);
+    if let Err(error) = crate::provider_transcript::append_completed_messages(
+        session_store.as_ref(),
+        session_id,
+        &[observation],
+        CancellationToken::new(),
+    )
+    .await
+    {
+        tracing::warn!(%error, %session_id, "failed to persist runtime outcome");
+        output.final_message.push_str(" Degraded: the runtime outcome could not be persisted.");
     }
     let mut transcript = vec![TranscriptEntry::Assistant { content: output.final_message.clone() }];
     if !reply_only {
@@ -4431,6 +4438,11 @@ async fn drive_supervised_run(
         .filter(|meta| meta.state == AgentState::Completed && expected.contains(&meta.agent_id))
         .count();
     let all_completed = total > 0 && completed == total && failed_to_start.is_empty();
+    let completion_status = if all_completed {
+        AgentCompletionStatus::Completed
+    } else {
+        AgentCompletionStatus::Partial
+    };
     for agent_id in &summary.failed {
         tracing::warn!(%agent_id, "supervised multi-agent run finished with a failed agent");
         // Supremacy invariant: a runtime child crash / restart-budget
@@ -4489,7 +4501,7 @@ async fn drive_supervised_run(
     let project_root =
         camino::Utf8PathBuf::from_path_buf(run.project_root.clone()).unwrap_or_default();
 
-    stage_tracker.lock().unwrap_or_else(|error| error.into_inner()).set(RunStage::Complete);
+    stage_tracker.lock().unwrap_or_else(|error| error.into_inner()).finish(completion_status);
     // Per-child provider metrics/spend are not surfaced through the parent in
     // this slice (the mock-provider children consume none), so there is
     // nothing to persist here yet — the coordinator tail's metric writes are
@@ -4497,6 +4509,7 @@ async fn drive_supervised_run(
     // assistant row's token fields stay `None` for the same reason.
     if let Some(store) = session_store {
         let assistant_message = Message {
+            gemini_replay: None,
             role: Role::Assistant,
             content: final_message.clone(),
             tool_calls: None,
@@ -4547,66 +4560,11 @@ async fn drive_supervised_run(
         tool_events: Vec::new(),
         verification: Vec::new(),
         project_root: Some(project_root),
-        completion_status: if all_completed {
-            AgentCompletionStatus::Completed
-        } else {
-            AgentCompletionStatus::Partial
-        },
+        completion_status,
         provider_metrics: Vec::new(),
         checkpoint_json: None,
         provider_error_class: None,
     })
-}
-
-/// Carry persisted conversational decisions into the multi-agent path.
-///
-/// The coordinator and every specialist derive their prompts from the parent
-/// task, so enriching that task keeps planning and execution on the same
-/// context without introducing a second, specialist-specific history channel.
-fn multi_agent_task_with_history(mut task: AgentTask, history: &[Message]) -> AgentTask {
-    if history.is_empty() {
-        return task;
-    }
-
-    let mut context = String::from(
-        "\n\n<conversation_history>\n\
-         The following messages are prior context from this same session. \
-         Preserve the user's earlier decisions and constraints:\n",
-    );
-    const MAX_HISTORY_CHARS: usize = 16_000;
-    const MAX_MESSAGE_CHARS: usize = 4_000;
-    let mut selected = Vec::new();
-    let mut selected_chars = 0usize;
-    for message in history.iter().rev() {
-        if selected_chars >= MAX_HISTORY_CHARS {
-            break;
-        }
-        let content = message.content.chars().take(MAX_MESSAGE_CHARS).collect::<String>();
-        selected_chars = selected_chars.saturating_add(content.chars().count());
-        selected.push((message.role.clone(), content));
-    }
-    selected.reverse();
-    if selected.len() < history.len() {
-        context.push_str(
-            "\n[older session history omitted; retrieve durable events/messages if needed]\n",
-        );
-    }
-    for (message_role, message_content) in selected {
-        let role = match message_role {
-            concerto_core::types::Role::System => "system",
-            concerto_core::types::Role::User => "user",
-            concerto_core::types::Role::Assistant => "assistant",
-            concerto_core::types::Role::Tool => "tool",
-            _ => "unknown",
-        };
-        context.push_str("\n[");
-        context.push_str(role);
-        context.push_str("]\n");
-        context.push_str(&message_content);
-    }
-    context.push_str("\n</conversation_history>");
-    task.description.push_str(&context);
-    task
 }
 
 fn is_resume_request(input: &str) -> bool {

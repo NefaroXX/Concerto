@@ -1196,6 +1196,7 @@ mod tests {
             let stream = futures::stream::iter(script.into_iter().map(|response| {
                 Ok(match response {
                     TestResponse::Text(delta) => CompletionChunk {
+                        gemini_replay: None,
                         delta,
                         reasoning: None,
                         tool_call: None,
@@ -1203,6 +1204,7 @@ mod tests {
                         usage: None,
                     },
                     TestResponse::ToolCall(tool_call) => CompletionChunk {
+                        gemini_replay: None,
                         delta: String::new(),
                         reasoning: None,
                         tool_call: Some(tool_call),
@@ -1210,6 +1212,7 @@ mod tests {
                         usage: None,
                     },
                     TestResponse::Done => CompletionChunk {
+                        gemini_replay: None,
                         delta: String::new(),
                         reasoning: None,
                         tool_call: None,

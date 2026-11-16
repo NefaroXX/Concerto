@@ -681,6 +681,7 @@ async fn host_completion(
         }
     };
     let mut content = String::new();
+    let mut final_seen = false;
     loop {
         let next = tokio::select! {
             _ = cancel.cancelled() => { caller.data_mut().last_error = Some(COMPLETION_CANCELLED.into()); return Ok(RESULT_ERROR); },
@@ -714,6 +715,13 @@ async fn host_completion(
             return Ok(RESULT_ERROR);
         }
         content.push_str(&chunk.delta);
+        final_seen |= chunk.is_final;
+    }
+
+    if !final_seen {
+        caller.data_mut().last_error =
+            Some("completion failed: stream ended before a final chunk".into());
+        return Ok(RESULT_ERROR);
     }
 
     // 5. Serialize response and write to scratch.

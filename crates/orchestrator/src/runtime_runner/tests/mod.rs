@@ -798,3 +798,28 @@ mod stage_feed;
 // single-agent path — one probe set per run, fail-soft without a manifest.
 #[path = "manifest_injection.rs"]
 mod manifest_injection;
+
+#[tokio::test]
+async fn transcript_failure_follows_pending_status_without_becoming_an_assistant_answer() {
+    let (recorder_store, store, session_id, bus) = transcript_store();
+    let recorder = start_transcript_recorder(&bus, store, session_id, GateLabels::default());
+    recorder.record_user_message("Inspect evidence".into()).await;
+    publish(
+        &bus,
+        session_id,
+        EventKind::AssistantMessage {
+            task_id: concerto_core::types::TaskId::new(),
+            content: "Checking now".into(),
+        },
+    );
+    // No scheduler yield: finish must drain the status event before the error.
+    recorder.finish(&[TranscriptEntry::Error { content: "provider failure".into() }]).await;
+    assert_eq!(
+        recorder_store.recorded_transcript(),
+        vec![
+            TranscriptEntry::User { content: "Inspect evidence".into() },
+            TranscriptEntry::Assistant { content: "Checking now".into() },
+            TranscriptEntry::Error { content: "provider failure".into() },
+        ]
+    );
+}

@@ -1184,6 +1184,7 @@ impl ResponsesStreamState {
     fn handle_event(&mut self, event: crate::sse::SseEvent) {
         if event.keepalive {
             self.pending.push_back(Ok(CompletionChunk {
+                gemini_replay: None,
                 reasoning: None,
                 delta: String::new(),
                 tool_call: None,
@@ -1199,6 +1200,7 @@ impl ResponsesStreamState {
             "response.output_text.delta" => {
                 if let Some(delta) = data.get("delta").and_then(serde_json::Value::as_str) {
                     self.pending.push_back(Ok(CompletionChunk {
+                        gemini_replay: None,
                         reasoning: None,
                         delta: delta.to_owned(),
                         tool_call: None,
@@ -1287,6 +1289,7 @@ impl ResponsesStreamState {
             Ok(crate::tool_args::ToolArgumentParse::Value(value)) => {
                 let arguments = crate::protocol::ensure_arguments_object(value);
                 self.pending.push_back(Ok(CompletionChunk {
+                    gemini_replay: None,
                     reasoning: None,
                     delta: String::new(),
                     tool_call: Some(ToolCall { id, name, arguments, ..Default::default() }),
@@ -1299,6 +1302,7 @@ impl ResponsesStreamState {
                 // contract requires (never `Null`).
                 let arguments = crate::protocol::ensure_arguments_object(serde_json::Value::Null);
                 self.pending.push_back(Ok(CompletionChunk {
+                    gemini_replay: None,
                     reasoning: None,
                     delta: String::new(),
                     tool_call: Some(ToolCall { id, name, arguments, ..Default::default() }),
@@ -1338,6 +1342,7 @@ impl ResponsesStreamState {
             return;
         }
         self.pending.push_back(Ok(CompletionChunk {
+            gemini_replay: None,
             reasoning: None,
             delta: String::new(),
             tool_call: None,
@@ -1597,6 +1602,7 @@ mod tests {
             session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![concerto_core::types::Message {
+                gemini_replay: None,
                 role: concerto_core::types::Role::User,
                 content: "Hello".into(),
                 tool_calls: None,
@@ -1644,6 +1650,7 @@ mod tests {
             stable_system_prefix_bytes: None,
             model: "muse-v2".into(),
             messages: vec![concerto_core::types::Message {
+                gemini_replay: None,
                 role: concerto_core::types::Role::User,
                 content: "list files".into(),
                 tool_calls: None,
@@ -1690,6 +1697,7 @@ mod tests {
             stable_system_prefix_bytes: None,
             model: "muse-v2".into(),
             messages: vec![concerto_core::types::Message {
+                gemini_replay: None,
                 role: concerto_core::types::Role::User,
                 content: "hello".into(),
                 tool_calls: None,
@@ -1716,6 +1724,7 @@ mod tests {
             model: "muse-v2".into(),
             messages: vec![
                 concerto_core::types::Message {
+                    gemini_replay: None,
                     role: concerto_core::types::Role::Assistant,
                     content: String::new(),
                     tool_calls: Some(vec![ToolCall {
@@ -1730,6 +1739,7 @@ mod tests {
                     tokens_out: None,
                 },
                 concerto_core::types::Message {
+                    gemini_replay: None,
                     role: concerto_core::types::Role::Tool,
                     content: "file-a\nfile-b".into(),
                     tool_calls: None,
@@ -1969,6 +1979,7 @@ mod tests {
             model: "muse-v2".into(),
             messages: vec![
                 concerto_core::types::Message {
+                    gemini_replay: None,
                     role: concerto_core::types::Role::Assistant,
                     content: String::new(),
                     tool_calls: Some(vec![call.clone()]),
@@ -1978,6 +1989,7 @@ mod tests {
                     tokens_out: None,
                 },
                 concerto_core::types::Message {
+                    gemini_replay: None,
                     role: concerto_core::types::Role::Tool,
                     content: "file-a".into(),
                     tool_calls: None,
@@ -2311,6 +2323,7 @@ mod tests {
             stable_system_prefix_bytes: None,
             model: model.into(),
             messages: vec![concerto_core::types::Message {
+                gemini_replay: None,
                 role: concerto_core::types::Role::User,
                 content: "hello".into(),
                 tool_calls: None,

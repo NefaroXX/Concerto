@@ -172,6 +172,7 @@ mod tests {
             ) -> Result<CompletionStream, ProviderError> {
                 let chunks = vec![
                     Ok(CompletionChunk {
+                        gemini_replay: None,
                         delta: "Hello, ".into(),
                         reasoning: None,
                         tool_call: None,
@@ -179,6 +180,7 @@ mod tests {
                         usage: None,
                     }),
                     Ok(CompletionChunk {
+                        gemini_replay: None,
                         delta: "world!".into(),
                         reasoning: None,
                         tool_call: None,
@@ -186,6 +188,7 @@ mod tests {
                         usage: None,
                     }),
                     Ok(CompletionChunk {
+                        gemini_replay: None,
                         delta: String::new(),
                         reasoning: None,
                         tool_call: None,
@@ -300,6 +303,7 @@ mod tests {
                 let chunks =
                     vec![
                     Ok(CompletionChunk {
+                        gemini_replay: None,
                         delta:
                             "Hello, world! This is a test of the emergency broadcasting system. "
                                 .into(),
@@ -308,12 +312,14 @@ mod tests {
                         is_final: false, usage: None,
                     }),
                     Ok(CompletionChunk {
+                        gemini_replay: None,
                         delta: "This is only a test. If this had been an actual emergency, ".into(),
                         reasoning: None,
                         tool_call: None,
                         is_final: false, usage: None,
                     }),
                     Ok(CompletionChunk {
+                        gemini_replay: None,
                         delta:
                             "you would have been instructed where to go for further information."
                                 .into(),

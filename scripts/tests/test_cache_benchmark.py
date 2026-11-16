@@ -75,7 +75,10 @@ class ExportTests(unittest.TestCase):
         self.assertNotIn("supersecret", json.dumps(export))
 
     def test_cases_copy_snapshot_and_reject_credentials_before_writing(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        # Python CI runs outside Cargo, so .cargo/config.toml's TMPDIR does not apply.
+        scratch = Path(__file__).resolve().parents[2] / "target"
+        scratch.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="cache-export-test-", dir=scratch) as tmp:
             root = Path(tmp)
             task_dir = root / "suite" / "task"
             task_dir.mkdir(parents=True)

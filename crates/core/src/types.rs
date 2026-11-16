@@ -114,6 +114,9 @@ pub enum Role {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
+    /// Original Gemini parts, valid only while the canonical response is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gemini_replay: Option<crate::provider_replay::GeminiReplay>,
     pub role: Role,
     pub content: String,
     pub tool_calls: Option<Vec<ToolCall>>,
@@ -147,6 +150,9 @@ pub struct Message {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionChunk {
+    /// Native replay state, published only with a completed response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gemini_replay: Option<crate::provider_replay::GeminiReplay>,
     pub delta: String,
     pub reasoning: Option<String>,
     pub tool_call: Option<ToolCall>,
@@ -176,6 +182,7 @@ impl CompletionChunk {
     /// representation is this constructor, not an enum variant.
     pub fn keepalive() -> Self {
         Self {
+            gemini_replay: None,
             delta: String::new(),
             reasoning: None,
             tool_call: None,
@@ -3251,6 +3258,7 @@ mod tests {
     #[test]
     fn message_default_fields() {
         let msg = Message {
+            gemini_replay: None,
             role: Role::User,
             content: "hello".into(),
             tool_calls: None,
@@ -3270,6 +3278,7 @@ mod tests {
     fn message_serde_round_trip_with_and_without_reasoning() {
         // Without reasoning (legacy path): field serializes as null.
         let plain = Message {
+            gemini_replay: None,
             role: Role::Assistant,
             content: "ok".into(),
             tool_calls: None,
@@ -3285,6 +3294,7 @@ mod tests {
 
         // With reasoning: field round-trips.
         let thinking = Message {
+            gemini_replay: None,
             role: Role::Assistant,
             content: "answer".into(),
             tool_calls: None,
@@ -3313,6 +3323,7 @@ mod tests {
     fn message_token_counters_serde_round_trip() {
         // Measured usage persists and round-trips (ADR-48 §4).
         let with_usage = Message {
+            gemini_replay: None,
             role: Role::Assistant,
             content: "measured".into(),
             tool_calls: None,
@@ -3328,6 +3339,7 @@ mod tests {
 
         // `None` must not mean `0`: unknown usage stays distinctly unknown.
         let unknown = Message {
+            gemini_replay: None,
             role: Role::User,
             content: "unknown".into(),
             tool_calls: None,

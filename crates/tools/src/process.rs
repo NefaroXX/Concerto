@@ -150,6 +150,7 @@ impl ProcessHandle {
             cpu_budget,
             kernel_backstop,
             MAX_OUTPUT_SIZE,
+            false,
             cancel,
         )
         .await
@@ -171,7 +172,27 @@ impl ProcessHandle {
         }
         let mut command = Self::base_command(cmd, args, cwd, None);
         command.env_clear().envs(env).stdin(std::process::Stdio::null());
-        Self::spawn_and_collect(command, timeout, None, false, max_output_bytes, cancel).await
+        Self::spawn_and_collect(command, timeout, None, false, max_output_bytes, false, cancel)
+            .await
+    }
+
+    /// Execute a prepared command only when both output streams are captured
+    /// completely. Verification callers must not accept a truncated passing
+    /// prefix as evidence. The caller owns command/profile authorization.
+    pub async fn run_checked(
+        mut command: Command,
+        timeout: Duration,
+        cancel: CancellationToken,
+    ) -> Result<ProcessOutput, ToolError> {
+        if cancel.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        Self::spawn_and_collect(command, timeout, None, false, MAX_OUTPUT_SIZE, true, cancel).await
     }
 
     /// Common `Command` setup shared by every spawn entrypoint so piped
@@ -200,6 +221,7 @@ impl ProcessHandle {
         cpu_budget: Option<CpuBudget>,
         kernel_backstop: bool,
         max_output_bytes: u64,
+        require_complete: bool,
         cancel: CancellationToken,
     ) -> Result<ProcessOutput, ToolError> {
         #[cfg(unix)]
@@ -274,6 +296,13 @@ impl ProcessHandle {
                     Self::read_bounded(stderr, max_output_bytes),
                 );
 
+                if require_complete {
+                    if let Some(error) = stdout.error.or(stderr.error) {
+                        return Err(ToolError::Io(error));
+                    }
+                }
+                let stdout = stdout.text;
+                let stderr = stderr.text;
                 let status = match status_result {
                     Ok(status) => status,
                     // Keep the pre-existing `-1` exit code contract when the
@@ -309,17 +338,18 @@ impl ProcessHandle {
     /// to prevent resource exhaustion (spinning the loop without
     /// allocation).
     pub(crate) async fn read_with_limit<R: AsyncRead + Unpin>(reader: Option<R>) -> String {
-        Self::read_bounded(reader, MAX_OUTPUT_SIZE).await
+        Self::read_bounded(reader, MAX_OUTPUT_SIZE).await.text
     }
 
-    async fn read_bounded<R: AsyncRead + Unpin>(reader: Option<R>, limit: u64) -> String {
+    async fn read_bounded<R: AsyncRead + Unpin>(reader: Option<R>, limit: u64) -> CapturedOutput {
         let Some(mut r) = reader else {
-            return String::new();
+            return CapturedOutput { text: String::new(), error: None };
         };
         let mut buf = [0u8; 8192];
         let mut output = Vec::new();
         let mut total: u64 = 0;
         let mut over_limit = false;
+        let mut error = None;
         loop {
             match r.read(&mut buf).await {
                 Ok(0) => break,
@@ -331,6 +361,9 @@ impl ProcessHandle {
                             let cap = n.saturating_sub((total - limit) as usize);
                             output.extend_from_slice(&buf[..cap]);
                             over_limit = true;
+                            error = Some(std::io::Error::other(
+                                "process output exceeded capture limit; verification evidence is incomplete",
+                            ));
                         }
                         // Drain the rest without allocating.
                         // Using a fixed-size loop to avoid unbounded read_to_end.
@@ -338,11 +371,19 @@ impl ProcessHandle {
                     }
                     output.extend_from_slice(&buf[..n]);
                 }
-                Err(_) => break,
+                Err(read_error) => {
+                    error = Some(read_error);
+                    break;
+                }
             }
         }
-        String::from_utf8_lossy(&output).to_string()
+        CapturedOutput { text: String::from_utf8_lossy(&output).to_string(), error }
     }
+}
+
+struct CapturedOutput {
+    text: String,
+    error: Option<std::io::Error>,
 }
 
 /// SIGKILL the whole process group led by `child` and, as a belt-and-braces
@@ -466,6 +507,64 @@ mod tests {
     use camino::Utf8PathBuf;
     #[cfg(unix)]
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn checked_capture_distinguishes_complete_and_truncated_output() {
+        for (bytes, limit, incomplete) in
+            [(&b""[..], 0, false), (&b"abc"[..], 3, false), (&b"abcd"[..], 3, true)]
+        {
+            let captured = ProcessHandle::read_bounded(Some(bytes), limit).await;
+            assert_eq!(captured.error.is_some(), incomplete);
+            assert_eq!(captured.text.as_bytes(), &bytes[..bytes.len().min(limit as usize)]);
+        }
+    }
+
+    #[tokio::test]
+    async fn checked_capture_preserves_pipe_read_errors() {
+        struct BrokenReader;
+        impl AsyncRead for BrokenReader {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::Error::other("fixture pipe read failed")))
+            }
+        }
+        let captured = ProcessHandle::read_bounded(Some(BrokenReader), 10).await;
+        assert!(captured.error.unwrap().to_string().contains("fixture pipe read failed"));
+    }
+
+    #[test]
+    fn checked_capture_fixture() {
+        use std::io::Write;
+        let Ok(stream) = std::env::var("CONCERTO_CHECKED_CAPTURE_FIXTURE") else { return };
+        let mut writer: Box<dyn Write> = match stream.as_str() {
+            "stdout" => Box::new(std::io::stdout()),
+            "stderr" => Box::new(std::io::stderr()),
+            _ => panic!("unexpected fixture stream"),
+        };
+        let bytes = vec![b'a'; MAX_OUTPUT_SIZE as usize + 1];
+        writer.write_all(&bytes).unwrap();
+    }
+
+    #[tokio::test]
+    async fn checked_capture_rejects_successful_child_with_incomplete_evidence() {
+        for stream in ["stdout", "stderr"] {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "process::tests::checked_capture_fixture", "--nocapture"]);
+            command.env("CONCERTO_CHECKED_CAPTURE_FIXTURE", stream);
+            let result = ProcessHandle::run_checked(
+                command,
+                Duration::from_secs(10),
+                CancellationToken::new(),
+            )
+            .await;
+            let error =
+                result.expect_err("successful child exit cannot certify incomplete capture");
+            assert!(error.to_string().contains("capture limit"), "{stream}: {error:?}");
+        }
+    }
 
     // verifies: direct execution clears inherited environment on every platform.
     #[test]

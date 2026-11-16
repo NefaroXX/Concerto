@@ -66,6 +66,7 @@ mod tests {
             session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![Message {
+                gemini_replay: None,
                 role: Role::User,
                 content: "Hello".into(),
                 tool_calls: None,

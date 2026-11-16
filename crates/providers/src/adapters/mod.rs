@@ -28,6 +28,19 @@ pub use google::GeminiChatDialect;
 pub use ollama::OllamaChatDialect;
 pub use openai_compat::{map_usage, OpenAiChatDialect, UsageRequest};
 
+/// Preserve all system instructions for APIs with one top-level system field.
+/// Single-message requests keep their original bytes; later messages append in
+/// source order so checkpoint evidence cannot overwrite the policy prompt.
+fn append_system_text(system: &mut Option<String>, content: &str) {
+    match system {
+        Some(text) => {
+            text.push_str("\n\n");
+            text.push_str(content);
+        }
+        None => *system = Some(content.to_owned()),
+    }
+}
+
 /// Controls whether collected `reasoning_content` is echoed back to the
 /// provider on assistant messages (ADR-46).
 ///

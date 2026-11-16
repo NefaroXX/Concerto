@@ -1,4 +1,7 @@
-#![cfg(unix)]
+// These child-process fixtures isolate application data through XDG paths.
+// macOS resolves Library/Application Support instead, so a Unix-wide gate
+// would let the commands edit the real user's settings and stored data.
+#![cfg(target_os = "linux")]
 
 use std::path::Path;
 use std::process::{Command, Output};

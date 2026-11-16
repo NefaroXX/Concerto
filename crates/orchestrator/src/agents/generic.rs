@@ -35,6 +35,7 @@ mod freeform;
 mod prompt;
 pub(crate) mod verification;
 
+use crate::prompts::CompletedTurn;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -49,8 +50,8 @@ use concerto_core::traits::provider::LlmProvider;
 use concerto_core::types::{
     AgentContext, AgentId, AgentOutcome, AgentRunResult, AgentStage, CapabilitySet,
     CompletionRequest, CompletionUsage, DesignDoc, EvalProvenance, EvalResult, Message, OutputMode,
-    ResearchReport, ReviewReport, ReviewVerdict, Role, SubTask, SubmitDesignDocInput, ToolCall,
-    ToolChoice, ToolDefinition, ToolOutput, ToolResult,
+    ResearchReport, ReviewReport, ReviewVerdict, Role, SubTask, SubmitDesignDocInput, ToolChoice,
+    ToolDefinition, ToolOutput, ToolResult,
 };
 use concerto_core::{CancellationToken, OrchestratorError};
 use concerto_eval::EvalEngine;
@@ -504,8 +505,7 @@ impl GenericSpecialistAgent {
         request: &CompletionRequest,
         task: &SubTask,
         cancel: &CancellationToken,
-    ) -> Result<(String, Option<String>, Vec<ToolCall>, Option<CompletionUsage>), OrchestratorError>
-    {
+    ) -> Result<CompletedTurn, OrchestratorError> {
         match crate::prompts::complete_provider_request(
             &self.provider,
             request,
@@ -599,10 +599,10 @@ impl GenericSpecialistAgent {
         mut text: String,
         mut reasoning: Option<String>,
         mut usage: Option<CompletionUsage>,
+        mut gemini_replay: Option<concerto_core::provider_replay::GeminiReplay>,
         messages: &mut Vec<Message>,
         cancel: &CancellationToken,
-    ) -> Result<(String, Option<String>, Vec<ToolCall>, Option<CompletionUsage>), OrchestratorError>
-    {
+    ) -> Result<CompletedTurn, OrchestratorError> {
         let mut attempts = 0u32;
         loop {
             match parse_tool_blocks(driver, &text, attempts) {
@@ -628,10 +628,22 @@ impl GenericSpecialistAgent {
                         cancel,
                     )
                     .await;
-                    return Ok((text, reasoning, calls, usage));
+                    return Ok(CompletedTurn {
+                        text,
+                        reasoning,
+                        tool_calls: calls,
+                        usage,
+                        gemini_replay: None,
+                    });
                 }
                 BlockDecision::FinalAnswer(final_text) => {
-                    return Ok((final_text, reasoning, Vec::new(), usage));
+                    return Ok(CompletedTurn {
+                        gemini_replay: if final_text == text { gemini_replay } else { None },
+                        text: final_text,
+                        reasoning,
+                        tool_calls: Vec::new(),
+                        usage,
+                    });
                 }
                 BlockDecision::Exhausted { reason } => {
                     self.record_tool_driver_event(
@@ -675,6 +687,7 @@ impl GenericSpecialistAgent {
                     // the model can see its own defect, followed by the
                     // repair instruction.
                     messages.push(Message {
+                        gemini_replay: gemini_replay.take(),
                         role: Role::Assistant,
                         content: text.clone(),
                         tool_calls: None,
@@ -696,14 +709,20 @@ impl GenericSpecialistAgent {
                         stream: false,
                     };
                     driver.augment_request(&mut request);
-                    let (repaired_text, repaired_reasoning, _, repaired_usage) =
-                        match self.complete_provider_audited(&request, task, cancel).await {
-                            Ok(turn) => turn,
-                            Err(error) => return Err(error),
-                        };
+                    let CompletedTurn {
+                        text: repaired_text,
+                        reasoning: repaired_reasoning,
+                        usage: repaired_usage,
+                        gemini_replay: repaired_replay,
+                        ..
+                    } = match self.complete_provider_audited(&request, task, cancel).await {
+                        Ok(turn) => turn,
+                        Err(error) => return Err(error),
+                    };
                     usage = crate::tool_driver::merge_usage(usage, repaired_usage);
                     text = repaired_text;
-                    reasoning = repaired_reasoning.or(reasoning);
+                    reasoning = repaired_reasoning;
+                    gemini_replay = repaired_replay;
                 }
             }
         }
@@ -1402,6 +1421,7 @@ impl GenericSpecialistAgent {
         investigate_tools.push(tool_def.clone());
         let start = std::time::Instant::now();
         let mut messages = vec![Message {
+            gemini_replay: None,
             role: Role::User,
             content: prompt,
             tool_calls: None,
@@ -1452,6 +1472,7 @@ impl GenericSpecialistAgent {
             if closing && !closing_notice_sent {
                 closing_notice_sent = true;
                 messages.push(Message {
+                    gemini_replay: None,
                     role: Role::User,
                     content: format!(
                         "Investigation is over. Do not begin new investigation. Submit your {} \
@@ -1484,16 +1505,17 @@ impl GenericSpecialistAgent {
                 .sum::<u64>()
                 .div_ceil(4);
 
-            let (text, reasoning, tool_calls, usage) = crate::prompts::complete_provider_request(
-                &self.provider,
-                &request,
-                &self.retry_policy,
-                &self.bus,
-                task.session_id,
-                task.id,
-                &cancel,
-            )
-            .await?;
+            let CompletedTurn { text, reasoning, tool_calls, usage, gemini_replay } =
+                crate::prompts::complete_provider_request(
+                    &self.provider,
+                    &request,
+                    &self.retry_policy,
+                    &self.bus,
+                    task.session_id,
+                    task.id,
+                    &cancel,
+                )
+                .await?;
             let measured_tokens_in = usage.as_ref().and_then(|u| u.prompt_tokens);
             let measured_tokens_out = usage.as_ref().and_then(|u| u.completion_tokens);
             let argument_chars = tool_calls
@@ -1521,6 +1543,7 @@ impl GenericSpecialistAgent {
                 // submission attempt counts only when the text cannot be
                 // parsed as the report — a parsed report breaks immediately.
                 messages.push(Message {
+                    gemini_replay,
                     role: Role::Assistant,
                     content: text.clone(),
                     tool_calls: None,
@@ -1550,6 +1573,7 @@ impl GenericSpecialistAgent {
                         // rejected by OpenAI/Anthropic, which would turn the
                         // bounded repair into a hard provider failure.
                         messages.push(Message {
+                            gemini_replay: None,
                             role: Role::User,
                             content: format!(
                                 "The previous {} submission was rejected. Call {} with \
@@ -1575,6 +1599,7 @@ impl GenericSpecialistAgent {
                 // exactly as the provider produced them, then answer each one
                 // with a ToolResult in the same conversation.
                 messages.push(Message {
+                    gemini_replay,
                     role: Role::Assistant,
                     content: text.clone(),
                     tool_calls: Some(tool_calls.clone()),
@@ -1599,6 +1624,7 @@ impl GenericSpecialistAgent {
                             Err(reasons) => {
                                 validation_errors.extend(reasons.clone());
                                 messages.push(Message {
+                                    gemini_replay: None,
                                     role: Role::Tool,
                                     content: String::new(),
                                     tool_calls: None,
@@ -1659,6 +1685,7 @@ impl GenericSpecialistAgent {
                                             },
                                         );
                                         messages.push(Message {
+                                            gemini_replay: None,
                                             role: Role::Tool,
                                             content,
                                             tool_calls: None,
@@ -1718,10 +1745,24 @@ impl GenericSpecialistAgent {
                             }
                             None => HashMap::new(),
                         };
-                        // ADR-65 §4: safe read dedupe (same rule as the
-                        // freeform loop above; any doubt → execute normally).
-                        let serve = match &self.tool_facts {
-                            Some(facts) => {
+                        // Authorize before cache validation reads current disk bytes.
+                        // No executor or non-Allow verdict means no cached read.
+                        let serve = match (&self.tool_facts, &self.tool_executor) {
+                            (Some(facts), Some(executor))
+                                if crate::read_cache::plain_single_path_read(
+                                    &tool_call.name,
+                                    &arguments,
+                                )
+                                .is_some()
+                                    && executor
+                                        .policy_verdict_is_allow(
+                                            &tool_call.name,
+                                            &arguments,
+                                            &context.session,
+                                            cancel.clone(),
+                                        )
+                                        .await =>
+                            {
                                 crate::read_cache::maybe_serve_read(
                                     facts,
                                     &context.session.project_dir,
@@ -1731,28 +1772,7 @@ impl GenericSpecialistAgent {
                                 )
                                 .await
                             }
-                            None => None,
-                        };
-                        // ADR-65 F1a: serve only on an explicit policy Allow via
-                        // the advisory path; anything else runs the normal,
-                        // fully policy-checked executor path below.
-                        let serve = match &self.tool_executor {
-                            Some(executor) => match serve {
-                                Some(serve)
-                                    if executor
-                                        .policy_verdict_is_allow(
-                                            &tool_call.name,
-                                            &arguments,
-                                            &context.session,
-                                            cancel.clone(),
-                                        )
-                                        .await =>
-                                {
-                                    Some(serve)
-                                }
-                                _ => None,
-                            },
-                            None => None,
+                            _ => None,
                         };
                         if let Some(serve) = serve {
                             // ADR-65 F1b: persist the ServedFromCache audit row
@@ -1789,6 +1809,7 @@ impl GenericSpecialistAgent {
                             )
                             .await;
                             messages.push(Message {
+                                gemini_replay: None,
                                 role: Role::Tool,
                                 content: String::new(),
                                 tool_calls: None,
@@ -1882,6 +1903,7 @@ impl GenericSpecialistAgent {
                                     .await;
                                 }
                                 messages.push(Message {
+                                    gemini_replay: None,
                                     role: Role::Tool,
                                     content: String::new(),
                                     tool_calls: None,
@@ -1927,6 +1949,7 @@ impl GenericSpecialistAgent {
                                     },
                                 );
                                 messages.push(Message {
+                                    gemini_replay: None,
                                     role: Role::Tool,
                                     content: String::new(),
                                     tool_calls: None,
@@ -2698,6 +2721,7 @@ mod tests {
                 }
             };
             Ok(Box::pin(futures::stream::iter(vec![Ok(CompletionChunk {
+                gemini_replay: None,
                 delta: reply,
                 reasoning: None,
                 tool_call: None,
@@ -2726,6 +2750,7 @@ mod tests {
         ) -> Result<CompletionStream, concerto_core::error::ProviderError> {
             let chunk =
                 self.responses.lock().unwrap().pop_front().unwrap_or_else(|| CompletionChunk {
+                    gemini_replay: None,
                     delta: String::new(),
                     reasoning: None,
                     tool_call: None,
@@ -2760,6 +2785,7 @@ mod tests {
 
         let provider = Arc::new(SequencedProvider::new(vec![
             CompletionChunk {
+                gemini_replay: None,
                 reasoning: None,
                 delta: String::new(),
                 tool_call: Some(ToolCall {
@@ -2773,6 +2799,7 @@ mod tests {
                 usage: None,
             },
             CompletionChunk {
+                gemini_replay: None,
                 delta: "Wrote src/a.rs.".into(),
                 reasoning: None,
                 tool_call: None,
@@ -2941,6 +2968,7 @@ mod tests {
             self.calls.lock().unwrap().push(request);
             let chunk = if call_index == 0 {
                 CompletionChunk {
+                    gemini_replay: None,
                     reasoning: None,
                     delta: String::new(),
                     tool_call: Some(ToolCall {
@@ -2955,6 +2983,7 @@ mod tests {
                 }
             } else {
                 CompletionChunk {
+                    gemini_replay: None,
                     reasoning: None,
                     delta: "Recovered from tool failure.".into(),
                     tool_call: None,
@@ -3053,6 +3082,7 @@ mod tests {
         ) -> Result<CompletionStream, concerto_core::error::ProviderError> {
             let chunk =
                 self.responses.lock().unwrap().pop_front().unwrap_or_else(|| CompletionChunk {
+                    gemini_replay: None,
                     delta: String::new(),
                     reasoning: None,
                     tool_call: None,
@@ -3076,6 +3106,7 @@ mod tests {
     /// A `submit_*` tool call chunk with the given tool, id, and arguments.
     fn submission_chunk_for(tool: &str, id: &str, arguments: serde_json::Value) -> CompletionChunk {
         CompletionChunk {
+            gemini_replay: None,
             reasoning: None,
             delta: String::new(),
             tool_call: Some(ToolCall {
@@ -3097,6 +3128,7 @@ mod tests {
     /// A plain-text response chunk (provider refused the forced tool).
     fn text_chunk(text: &str) -> CompletionChunk {
         CompletionChunk {
+            gemini_replay: None,
             delta: text.into(),
             reasoning: None,
             tool_call: None,
@@ -3359,6 +3391,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_regression_native_calls_survive_both_specialist_history_paths() {
+        use concerto_core::provider_replay::GeminiReplay;
+        use concerto_providers::adapters::{Dialect, GeminiChatDialect, ReasoningEcho};
+        for mode in [OutputMode::Freeform, OutputMode::DesignDoc] {
+            let mut first = submission_chunk_for(
+                "read_file",
+                "native-id",
+                serde_json::json!({"operation":"read", "path":"src/auth.rs"}),
+            );
+            first.delta = "Read before editing.".into();
+            let call = first.tool_call.as_ref().unwrap();
+            let parts = vec![
+                serde_json::json!({"functionCall":{"id":call.id,"name":call.name,"args":call.arguments},"thoughtSignature":"call-signature"}),
+                serde_json::json!({"text":first.delta,"thoughtSignature":"text-signature"}),
+            ];
+            first.gemini_replay = Some(
+                GeminiReplay::capture(
+                    parts.clone(),
+                    &first.delta,
+                    None,
+                    std::slice::from_ref(call),
+                )
+                .unwrap(),
+            );
+            let last = if matches!(mode, OutputMode::Freeform) {
+                text_chunk("Read complete")
+            } else {
+                submission_chunk("submitted", valid_doc_args())
+            };
+            let provider = Arc::new(DesignDocProvider::new(vec![first, last]));
+            let agent = GenericSpecialistAgent::new(
+                AgentId::new("designer"),
+                "Designer".into(),
+                Some(AgentStage::new("design")),
+                provider.clone(),
+                Some(allow_all_executor(Box::new(ReadOnlyFilesystemTool))),
+                EventBus::new(128),
+                RetryPolicy::default(),
+                PromptSections::default(),
+                AgentCapabilities { fs_read: Some(true), ..Default::default() },
+            )
+            .with_output_mode(mode);
+            let result = agent
+                .run(&design_task(), ctx(), "mock-model", CancellationToken::new())
+                .await
+                .unwrap();
+            assert!(matches!(result.outcome, AgentOutcome::Success));
+            let requests = provider.calls.lock().unwrap();
+            let body = GeminiChatDialect.render_chat_body(
+                &requests[1],
+                "gemini",
+                ReasoningEcho::IfPresent,
+            );
+            assert!(body["contents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["parts"] == serde_json::json!(parts)));
+        }
+    }
+
+    #[tokio::test]
     async fn design_doc_text_fallback_feedback_then_repair() {
         // Unparseable text yields structured feedback asking for the tool
         // call; the model's next submission succeeds.
@@ -3481,6 +3575,7 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<CompletionStream, concerto_core::error::ProviderError> {
             Ok(Box::pin(futures::stream::iter(vec![Ok(CompletionChunk {
+                gemini_replay: None,
                 reasoning: None,
                 delta: String::new(),
                 tool_call: Some(ToolCall {
@@ -4803,6 +4898,7 @@ mod tests {
     /// defect shape from the live audit).
     fn filesystem_chunk(id: &str, arguments: serde_json::Value) -> CompletionChunk {
         CompletionChunk {
+            gemini_replay: None,
             reasoning: None,
             delta: String::new(),
             tool_call: Some(ToolCall {
@@ -4908,6 +5004,7 @@ mod tests {
             // broken (null-args) tool call — exactly the audit's evidence
             // shape.
             CompletionChunk {
+                gemini_replay: None,
                 delta: "Filesystem operation=\"list\" path=\"src\"".into(),
                 reasoning: None,
                 tool_call: Some(ToolCall {

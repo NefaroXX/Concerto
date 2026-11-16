@@ -97,6 +97,7 @@ mod tests {
 
     fn msg(role: Role, content: &str) -> Message {
         Message {
+            gemini_replay: None,
             role,
             content: content.into(),
             tool_calls: None,

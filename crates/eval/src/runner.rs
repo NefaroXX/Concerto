@@ -106,6 +106,35 @@ fn isolate_workspace(project_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Fraction of declared file-outcome groups satisfied by the final workspace.
+/// No declared file constraints means no file-check failure. Completion and
+/// passing tests remain independently required by suite aggregation.
+fn expected_files_score(outcomes: &[concerto_core::types::EvalOutcome], project_dir: &Path) -> f32 {
+    if outcomes.is_empty() {
+        return 1.0;
+    }
+    let correct = outcomes
+        .iter()
+        .filter(|outcome| {
+            outcome.files_changed.iter().all(|expected_file| {
+                let path = project_dir.join(expected_file);
+                if !path.exists() {
+                    return false;
+                }
+                if outcome.min_patterns.is_empty() {
+                    return true;
+                }
+                // Required contents must actually be inspected; I/O and decoding
+                // failures cannot satisfy a pattern assertion.
+                fs::read_to_string(&path).is_ok_and(|content| {
+                    outcome.min_patterns.iter().all(|pattern| content.contains(pattern.as_str()))
+                })
+            })
+        })
+        .count();
+    correct as f32 / outcomes.len() as f32
+}
+
 /// Runner for a benchmark suite.
 pub struct EvalRunner {
     /// Directory containing benchmark task sub‑directories.
@@ -234,37 +263,8 @@ impl EvalRunner {
                 .await
                 .map_err(|e| EvalError::HarnessSetupFailed(e.to_string()))?;
 
-            // Compute files_correctly_modified from expected_outcomes.
-            let files_correctly_modified = if task.expected_outcomes.is_empty() {
-                0.0
-            } else {
-                let mut correct = 0u32;
-                for outcome in &task.expected_outcomes {
-                    let mut all_match = true;
-                    for expected_file in &outcome.files_changed {
-                        let file_path = temp_path.join(expected_file);
-                        if !file_path.exists() {
-                            all_match = false;
-                            break;
-                        }
-                        // Check min_patterns if specified.
-                        if !outcome.min_patterns.is_empty() {
-                            if let Ok(content) = fs::read_to_string(&file_path) {
-                                for pattern in &outcome.min_patterns {
-                                    if !content.contains(pattern.as_str()) {
-                                        all_match = false;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if all_match {
-                        correct += 1;
-                    }
-                }
-                correct as f64 / task.expected_outcomes.len() as f64
-            };
+            let files_correctly_modified =
+                expected_files_score(&task.expected_outcomes, &temp_path);
 
             let time_ms = start.elapsed().as_millis() as u64;
 
@@ -278,7 +278,7 @@ impl EvalRunner {
                     total_cost_usd: agent_result.total_cost_usd,
                     time_to_complete_ms: time_ms,
                     tests_passing_after: eval_res.passed,
-                    files_correctly_modified: files_correctly_modified as f32,
+                    files_correctly_modified,
                     agent_outcome: agent_result.final_message,
                     session_id: agent_result.session_id,
                     telemetry: agent_result.telemetry,
@@ -555,5 +555,108 @@ mod tests {
         // count changes over time, so just verify the runner discovered and
         // reported at least one task.
         assert!(report.task_count > 0, "suite should contain at least one task");
+    }
+
+    #[test]
+    fn benchmark_without_file_expectations_has_no_failed_file_checks() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(expected_files_score(&[], root.path()), 1.0,
+            "empty optional file constraints must not force every otherwise-passing task to score zero");
+    }
+
+    #[tokio::test]
+    async fn benchmark_empty_file_constraints_still_require_completion_and_passing_tests() {
+        fs::create_dir_all(scratch_root()).unwrap();
+        let suite = tempfile::tempdir_in(scratch_root()).unwrap();
+        for (index, scenario) in ["passing", "incomplete", "failing_tests"].iter().enumerate() {
+            let project = suite.path().join(scenario);
+            fs::create_dir_all(project.join("src")).unwrap();
+            fs::write(
+                project.join("Cargo.toml"),
+                "[package]\nname = \"score_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .unwrap();
+            let passes = *scenario != "failing_tests";
+            fs::write(
+                project.join("src/lib.rs"),
+                format!("#[test] fn verification() {{ assert!({passes}); }}"),
+            )
+            .unwrap();
+            fs::write(
+                project.join("task.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "id": format!("{:026}", index + 1),
+                    "description": scenario,
+                    "project_snapshot_path": "./",
+                    "expected_outcomes": [],
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let factory: AgentFactory = Arc::new(|description, _dir| {
+            Box::pin(async move {
+                Ok(AgentRunResult {
+                    completed: description != "incomplete",
+                    ..AgentRunResult::default()
+                })
+            })
+        });
+        let report =
+            EvalRunner::new(suite.path()).with_agent_factory(factory).run_suite().await.unwrap();
+        assert_eq!(report.task_count, 3);
+        assert!((report.pass_rate - 1.0 / 3.0).abs() < 0.0001);
+        assert_eq!(
+            report
+                .individual_results
+                .iter()
+                .filter(|result| {
+                    result.completed
+                        && result.tests_passing_after
+                        && result.files_correctly_modified == 1.0
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn benchmark_required_patterns_fail_when_file_contents_cannot_be_read() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("answer.txt"), [0xff, 0xfe]).unwrap();
+        let outcome = concerto_core::types::EvalOutcome {
+            files_changed: vec!["answer.txt".into()],
+            tests_pass: true,
+            min_patterns: vec!["required".into()],
+            max_patterns: vec![],
+        };
+        assert_eq!(expected_files_score(std::slice::from_ref(&outcome), root.path()), 0.0);
+        fs::write(root.path().join("answer.txt"), "the required content").unwrap();
+        assert_eq!(expected_files_score(std::slice::from_ref(&outcome), root.path()), 1.0);
+        fs::write(root.path().join("answer.txt"), "missing").unwrap();
+        assert_eq!(expected_files_score(&[outcome], root.path()), 0.0);
+    }
+
+    #[test]
+    fn benchmark_corpus_loads_every_committed_category_with_unique_ids() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benchmark_tasks");
+        let mut ids = std::collections::HashSet::new();
+        let mut count = 0;
+        for category in fs::read_dir(root).unwrap() {
+            let category = category.unwrap();
+            if !category.file_type().unwrap().is_dir() {
+                continue;
+            }
+            let runner = EvalRunner::new(category.path());
+            let tasks = runner
+                .load_tasks()
+                .unwrap_or_else(|error| panic!("{}: {error}", category.path().display()));
+            for task in tasks {
+                assert!(ids.insert(task.id), "duplicate task id {}", task.id);
+                assert!(task.project_snapshot_path.is_dir());
+                count += 1;
+            }
+        }
+        assert!(count > 9, "the full corpus must include the category fixtures and standard suite");
     }
 }

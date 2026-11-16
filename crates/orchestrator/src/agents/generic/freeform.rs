@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::agents::execution_state::{display_reason, tool_failure_payload_with, ExecutionState};
+use crate::prompts::CompletedTurn;
 
 impl GenericSpecialistAgent {
     /// Execute through the existing executor, retaining observed progress when
@@ -41,6 +42,7 @@ impl GenericSpecialistAgent {
 
         let start = std::time::Instant::now();
         let mut messages = vec![Message {
+            gemini_replay: None,
             role: Role::User,
             content: prompt.clone(),
             tool_calls: None,
@@ -149,7 +151,7 @@ impl GenericSpecialistAgent {
                 request.messages.iter().map(|message| message.content.len() as u64).sum::<u64>()
                     / 4;
 
-            let (text, reasoning, tool_calls, usage) =
+            let CompletedTurn { text, reasoning, tool_calls, usage, gemini_replay } =
                 match self.complete_provider_audited(&request, task, &cancel).await {
                     Ok(turn) => turn,
                     Err(error)
@@ -181,31 +183,33 @@ impl GenericSpecialistAgent {
                         text,
                         reasoning,
                         usage,
+                        gemini_replay,
                         &mut messages,
                         &cancel,
                     )
                     .await
                 }
-                None => Ok((text, reasoning, tool_calls, usage)),
+                None => Ok(CompletedTurn { text, reasoning, tool_calls, usage, gemini_replay }),
             };
-            let (text, reasoning, tool_calls, usage) = match driver_turn {
-                Ok(turn) => turn,
-                Err(error)
-                    if progress.has_progress()
-                        && (cancel.is_cancelled()
-                            || matches!(
-                                error,
-                                OrchestratorError::Cancelled
-                                    | OrchestratorError::Provider(
-                                        concerto_core::error::ProviderError::Cancelled
-                                    )
-                            )) =>
-                {
-                    progress.interrupted();
-                    break;
-                }
-                Err(error) => return Err(error),
-            };
+            let CompletedTurn { text, reasoning, tool_calls, usage, gemini_replay } =
+                match driver_turn {
+                    Ok(turn) => turn,
+                    Err(error)
+                        if progress.has_progress()
+                            && (cancel.is_cancelled()
+                                || matches!(
+                                    error,
+                                    OrchestratorError::Cancelled
+                                        | OrchestratorError::Provider(
+                                            concerto_core::error::ProviderError::Cancelled
+                                        )
+                                )) =>
+                    {
+                        progress.interrupted();
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
             // ADR-48 decision 4: provider-reported usage as the source of
             // truth; the byte/4 heuristic is the fallback per dimension.
             let usage_in = usage.as_ref().and_then(|u| u.prompt_tokens);
@@ -214,6 +218,7 @@ impl GenericSpecialistAgent {
             tokens_out = tokens_out.saturating_add(usage_out.unwrap_or((text.len() / 4) as u64));
 
             messages.push(Message {
+                gemini_replay,
                 role: Role::Assistant,
                 content: text.clone(),
                 tool_calls: (!tool_calls.is_empty()).then_some(tool_calls.clone()),
@@ -290,6 +295,7 @@ impl GenericSpecialistAgent {
                             },
                         );
                         messages.push(Message {
+                            gemini_replay: None,
                             role: Role::Tool,
                             content,
                             tool_calls: None,
@@ -345,6 +351,7 @@ impl GenericSpecialistAgent {
                         },
                     );
                     messages.push(Message {
+                        gemini_replay: None,
                         role: Role::Tool,
                         content: String::new(),
                         tool_calls: None,
@@ -370,13 +377,24 @@ impl GenericSpecialistAgent {
                     }
                     None => HashMap::new(),
                 };
-                // ADR-65 §4: safe read dedupe — a plain single-path filesystem
-                // read whose clean observation still matches the disk (re-statted
-                // now, content hash verified) is a serve candidate. Any doubt
-                // degrades to normal execution; the model receives a
-                // byte-identical read result either way.
+                // Authorize before cache validation reads current disk bytes.
+                // Denial/approval-required/cache misses use normal execution.
                 let serve = match &self.tool_facts {
-                    Some(facts) => {
+                    Some(facts)
+                        if crate::read_cache::plain_single_path_read(
+                            &tool_call.name,
+                            &arguments,
+                        )
+                        .is_some()
+                            && executor
+                                .policy_verdict_is_allow(
+                                    &tool_call.name,
+                                    &arguments,
+                                    &context.session,
+                                    cancel.clone(),
+                                )
+                                .await =>
+                    {
                         crate::read_cache::maybe_serve_read(
                             facts,
                             &context.session.project_dir,
@@ -385,25 +403,6 @@ impl GenericSpecialistAgent {
                             &cancel,
                         )
                         .await
-                    }
-                    None => None,
-                };
-                // ADR-65 F1a: serve only when the policy engine explicitly
-                // allows the read through the advisory path (no decision row, no
-                // quota consumption); any non-Allow verdict runs the normal,
-                // fully policy-checked executor path below.
-                let serve = match serve {
-                    Some(serve)
-                        if executor
-                            .policy_verdict_is_allow(
-                                &tool_call.name,
-                                &arguments,
-                                &context.session,
-                                cancel.clone(),
-                            )
-                            .await =>
-                    {
-                        Some(serve)
                     }
                     _ => None,
                 };
@@ -438,6 +437,7 @@ impl GenericSpecialistAgent {
                     .await;
                     progress.succeeded(&tool_call.id, &tool_call.name, &arguments);
                     messages.push(Message {
+                        gemini_replay: None,
                         role: Role::Tool,
                         content: String::new(),
                         tool_calls: None,
@@ -517,6 +517,7 @@ impl GenericSpecialistAgent {
                             .await;
                         }
                         messages.push(Message {
+                            gemini_replay: None,
                             role: Role::Tool,
                             content: String::new(),
                             tool_calls: None,
@@ -592,6 +593,7 @@ impl GenericSpecialistAgent {
                             },
                         );
                         messages.push(Message {
+                            gemini_replay: None,
                             role: Role::Tool,
                             content: String::new(),
                             tool_calls: None,

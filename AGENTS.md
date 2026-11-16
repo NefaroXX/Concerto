@@ -95,7 +95,7 @@ cargo audit
 ## Gotchas — do NOT "fix" these without review
 - **cargo-deny exceptions are intentional**: many `RUSTSEC-*` advisories are
   ignored for unmaintained *transitive* deps, and `wasmtime` is pinned to
-  the **36.0.x LTS** line (minimum 36.0.19). Read `deny.toml`
+  the **36.0.x LTS** line (minimum 36.0.20). Read `deny.toml`
   justification/scope before changing anything. The two supply-chain gates are
   complementary: `cargo-deny` resolves features and cannot see
   optional/unactivated lockfile deps (e.g. `quinn-proto` via an unenabled
@@ -114,6 +114,12 @@ cargo audit
   unyanked `zip` (`9.0.3+`, `deflate-flate2-zlib-rs`). Do not "fix" a
   `cargo deny` yanked failure by deleting the Swagger UI again — update the
   vendored patch instead. See `vendor/utoipa-swagger-ui/README.vendored.md`.
+- **SQLx SQLite driver dependency patch**: `vendor/sqlx-sqlite` retains the
+  published 0.9.0 Rust source but permits `libsqlite3-sys` 0.40 for
+  RUSTSEC-2026-0459. The 0.39.x binding patches plain SQLite but still bundles
+  affected SQLCipher; keep the runtime SQLite version regression and encrypted
+  storage tests. Remove the patch when a published SQLx accepts the repaired
+  binding. See `vendor/sqlx-sqlite/README.vendored.md`.
 - **Policy gates**: every file write / shell / git op is policy-gated, but do
   not read "reversible via git stash/branch rollback" as a universal property:
   there is no automatic rollback pipeline (`ToolExecutor` never calls
@@ -188,6 +194,18 @@ cargo audit
   The free roster itself churns; `OPENCODE_ZEN_FREE_KNOWN`
   (`crates/providers/src/provider_defs.rs`) holds the last hand-verified set
   and live discovery (`GET /zen/v1/models`) covers the rest.
+
+## Provider history and runtime outcomes (ADR-87)
+
+Root single-agent and coordinator dispatch turns are persisted separately from
+rendered UI summaries. Keep original assistant calls, reasoning/native replay
+and completed tool results; never replace them with a synthetic assistant
+summary or duplicate aggregate usage. Runtime verification and stop reasons are
+labeled system observations with no usage. `provider_transcript.rs` bounds
+cleanup independently of generation cancellation. Context assembly adds
+request-only unknown-outcome responses for interrupted calls: never treat them
+as executed evidence or automatically rerun a historical call. Independent
+specialist/process histories remain separate unfinished H39 work.
 
 ## Key entrypoints (start reading here)
 - Interactive application: `crates/orchestrator/src/conversation.rs` — shared

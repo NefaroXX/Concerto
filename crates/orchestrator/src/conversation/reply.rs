@@ -21,7 +21,6 @@ pub(crate) fn reply_tool_definition() -> ToolDefinition {
 
 pub(crate) async fn reply_to_user(
     arguments: &Value,
-    store: Option<&Arc<dyn SessionStore>>,
     bus: &EventBus,
     task: &AgentTask,
     cancel: &CancellationToken,
@@ -35,21 +34,9 @@ pub(crate) async fn reply_to_user(
     if cancel.is_cancelled() {
         return json!({"error": "conversation cancelled"});
     }
-    if let Some(store) = store {
-        let message = Message {
-            role: Role::Assistant,
-            content: content.into(),
-            tool_calls: None,
-            tool_results: None,
-            reasoning_content: None,
-            tokens_in: None,
-            tokens_out: None,
-        };
-        if let Err(error) = store.append_messages(task.session_id, &[message], cancel.clone()).await
-        {
-            return json!({"error": format!("could not save reply: {error}")});
-        }
-    }
+    // The root coordinator persists the original tool call and its result.
+    // The transcript recorder owns this rendered reply; adding an assistant
+    // mirror to model history would split the call/result exchange.
     let _ = bus.publish_for_session(
         task.session_id,
         task.id.0,

@@ -185,73 +185,95 @@ async fn rehydration_rejects_tampered_durable_binding() {
 }
 
 #[tokio::test]
-async fn stage_tracker_emits_execute_sequence_for_action_required_run() {
-    let bus = EventBus::new(256);
-    let mut receiver = bus.subscribe();
-    let session_id = Ulid::new();
-    let store: Arc<dyn SessionStore> = Arc::new(EventRecorderStore::new());
-    let event_recorder = start_event_recorder(&bus, store.clone(), session_id);
-    let transcript_recorder =
-        start_transcript_recorder(&bus, store.clone(), session_id, GateLabels::default());
+async fn stage_tracker_completion_reflects_required_verification() {
+    for require_verification in [false, true] {
+        let bus = EventBus::new(256);
+        let mut receiver = bus.subscribe();
+        let session_id = Ulid::new();
+        let store: Arc<dyn SessionStore> = Arc::new(EventRecorderStore::new());
+        let event_recorder = start_event_recorder(&bus, store.clone(), session_id);
+        let transcript_recorder =
+            start_transcript_recorder(&bus, store.clone(), session_id, GateLabels::default());
 
-    let services = make_services(bus.clone());
-    let provider: Arc<dyn LlmProvider> =
-        Arc::new(ScriptedProvider::new(vec![vec![make_tool_call("write_file", "edit")], vec![]]));
-    let executor = make_executor();
+        let services = make_services(bus.clone());
+        let provider: Arc<dyn LlmProvider> = Arc::new(ScriptedProvider::new(vec![
+            vec![make_tool_call("write_file", "edit")],
+            vec![],
+        ]));
+        let executor = make_executor();
 
-    let task = AgentTask::new_action_required(session_id, "apply the fix");
-    // `run_shared_agent` creates the tracker and seeds Understand before
-    // dispatching; mirror that here so the full sequence is asserted.
-    let stage_tracker = Arc::new(Mutex::new(StageTracker::new(bus, session_id, task.id)));
-    stage_tracker.lock().unwrap_or_else(|error| error.into_inner()).set(RunStage::Understand);
+        let task = AgentTask::new_with_execution_mode(
+            session_id,
+            "apply the fix",
+            concerto_core::types::TaskExecutionMode::ActionRequired {
+                min_tool_calls: 1,
+                require_verification,
+            },
+        );
+        // `run_shared_agent` creates the tracker and seeds Understand before
+        // dispatching; mirror that here so the full sequence is asserted.
+        let stage_tracker = Arc::new(Mutex::new(StageTracker::new(bus, session_id, task.id)));
+        stage_tracker.lock().unwrap_or_else(|error| error.into_inner()).set(RunStage::Understand);
 
-    let project_dir = tempfile::tempdir().expect("tempdir for run");
-    let req = AgentRunRequest {
-        input: "apply the fix".into(),
-        selected_provider_id: Some("scripted".into()),
-        selected_model: Some("test-model".into()),
-        force_single_agent: true,
-        project_dir: project_dir.path().to_path_buf(),
-        session_id: Some(session_id),
-        conversation_history: Vec::new(),
-        memory_enabled: false,
-        cancel_token: CancellationToken::new(),
-        resume_checkpoint_json: None,
-    };
+        let project_dir = tempfile::tempdir().expect("tempdir for run");
+        let req = AgentRunRequest {
+            input: "apply the fix".into(),
+            selected_provider_id: Some("scripted".into()),
+            selected_model: Some("test-model".into()),
+            force_single_agent: true,
+            project_dir: project_dir.path().to_path_buf(),
+            session_id: Some(session_id),
+            conversation_history: Vec::new(),
+            memory_enabled: false,
+            cancel_token: CancellationToken::new(),
+            resume_checkpoint_json: None,
+        };
 
-    let output = execute_agent_loop(
-        req,
-        &services,
-        provider,
-        "test-model".into(),
-        None, // no advertised capability in this test
-        executor,
-        Arc::new(NullMemoryStore),
-        None,
-        session_id,
-        task,
-        event_recorder,
-        transcript_recorder,
-        RunEnvelope::Acting,
-        true,
-        &stage_tracker,
-        None, // no fact-writer pool in this test
-        Arc::new(crate::project_context::ProjectContext::disabled()),
-        None, // no manifest digest in this test (fail-soft: no block)
-        Arc::new(crate::verify::VerifierService::new(
-            project_dir.path().to_path_buf(),
-            concerto_eval::EvalEngine::new(project_dir.path()),
-        )),
-    )
-    .await
-    .expect("action-required run should complete");
+        let output = execute_agent_loop(
+            req,
+            &services,
+            provider,
+            "test-model".into(),
+            None, // no advertised capability in this test
+            executor,
+            Arc::new(NullMemoryStore),
+            None,
+            session_id,
+            task,
+            event_recorder,
+            transcript_recorder,
+            RunEnvelope::Acting,
+            true,
+            &stage_tracker,
+            None, // no fact-writer pool in this test
+            Arc::new(crate::project_context::ProjectContext::disabled()),
+            None, // no manifest digest in this test (fail-soft: no block)
+            Arc::new(crate::verify::VerifierService::new(
+                project_dir.path().to_path_buf(),
+                concerto_eval::EvalEngine::new(project_dir.path()),
+            )),
+        )
+        .await
+        .expect("action-required run should finish");
 
-    assert_eq!(output.completion_status, AgentCompletionStatus::Completed);
-    assert_eq!(
-        drain_stage_events(&mut receiver, session_id),
-        vec![RunStage::Understand, RunStage::Inspect, RunStage::Execute, RunStage::Complete,],
-        "action-required execute run reports Inspect -> Execute -> Complete"
-    );
+        assert_eq!(
+            output.completion_status,
+            if require_verification {
+                AgentCompletionStatus::Partial
+            } else {
+                AgentCompletionStatus::Completed
+            }
+        );
+        let mut expected = vec![RunStage::Understand, RunStage::Inspect, RunStage::Execute];
+        if !require_verification {
+            expected.push(RunStage::Complete);
+        }
+        assert_eq!(
+            drain_stage_events(&mut receiver, session_id),
+            expected,
+            "Complete is emitted only when the run's verification contract is met"
+        );
+    }
 }
 
 #[tokio::test]

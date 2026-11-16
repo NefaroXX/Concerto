@@ -96,6 +96,16 @@ allow = [
 ]
 confidence-threshold = 0.8
 
+# The patched SQLCipher source package separately declares the licenses of
+# its SQLite amalgamation (public-domain blessing) and bundled LibTomCrypt
+# (public domain / WTFPL). Reviewed the shipped source notices and
+# sqlcipher/LICENSE-libtomcrypt for this exact release (H31, 2026-11-11).
+# Keep this package-scoped so other dependencies still require review.
+[[licenses.exceptions]]
+name = "sqlcipher-src"
+version = "=420.0.0"
+allow = ["blessing", "WTFPL"]
+
 [bans]
 multiple-versions = "warn"
 # Workspace path dependencies are legitimate in a Cargo workspace.

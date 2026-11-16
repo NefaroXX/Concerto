@@ -8,8 +8,9 @@
 //!   and it decides whether the window warrants structural compaction before a
 //!   request is assembled.
 //! * [`ContextEngine::assemble`] runs the durable compaction pass
-//!   (checkpoint summaries + a bounded recent tail) with the configured policy
-//!   and returns the bounded history for the next model request.
+//!   with the configured policy: preserved conversational text, bounded tool
+//!   checkpoint evidence and a recent tail with full protocol records (ADR-85).
+//!   The provider guard rejects mandatory text that cannot fit its budget.
 //! * [`ContextEngine::maintain`] checkpoints any newly eligible ranges after a
 //!   completed run.
 //!
@@ -45,8 +46,8 @@ pub struct ContextBudgetPolicy {
     /// Estimated tokens before deterministic compaction triggers (default
     /// 16000).
     pub trigger_tokens: u64,
-    /// Most-recent user turns always retained verbatim after compaction
-    /// (default 4).
+    /// Most-recent user turns retaining full tool exchanges and reasoning
+    /// (default 4). Conversational text survives for all turns (ADR-85).
     pub retain_user_turns: usize,
     /// Minimum user turns before compaction may fire (default 6).
     pub minimum_user_turns: usize,
@@ -140,8 +141,8 @@ impl ContextEngine {
         }
     }
 
-    /// Token estimate for a window, using the shared production estimator
-    /// (`bytes / 4` + per-message overhead).
+    /// Estimate the current content, replayable reasoning and structured tool
+    /// payloads (`bytes / 4` + per-message overhead), never historical usage.
     pub fn estimate_tokens(&self, messages: &[Message]) -> u64 {
         estimate_messages_tokens(messages)
     }
@@ -149,7 +150,9 @@ impl ContextEngine {
     /// Assemble the bounded active history for the next request: maintain any
     /// newly eligible durable checkpoints under this engine's policy, then
     /// materialize the checkpoint frontier plus the uncompacted tail. The
-    /// source transcript is never modified. When a bus is supplied, every
+    /// source transcript is never modified. Interrupted tool exchanges receive
+    /// explicit unknown-outcome responses in the assembled request only; no
+    /// missing call is executed or reported as successful. When a bus is supplied, every
     /// compaction decision is published as `EventKind::ContextCompacted`
     /// (ADR-048 §5).
     pub async fn assemble(
@@ -160,7 +163,7 @@ impl ContextEngine {
         cancel: CancellationToken,
         bus: Option<&concerto_core::event::EventBus>,
     ) -> Result<Vec<Message>, SessionError> {
-        context_compaction::refresh_and_materialize_with_policy(
+        let messages = context_compaction::refresh_and_materialize_with_policy(
             store,
             session_id,
             fallback_history,
@@ -168,7 +171,8 @@ impl ContextEngine {
             cancel,
             bus,
         )
-        .await
+        .await?;
+        Ok(crate::provider_transcript::restore_tool_responses(messages))
     }
 
     /// Persist any newly eligible checkpoint ranges after a completed run,
@@ -217,6 +221,7 @@ mod tests {
 
     fn message(role: Role, content: impl Into<String>) -> Message {
         Message {
+            gemini_replay: None,
             role,
             content: content.into(),
             tool_calls: None,
@@ -234,6 +239,30 @@ mod tests {
             messages.push(message(Role::User, format!("request {turn} {}", "x".repeat(fill))));
             messages
                 .push(message(Role::Assistant, format!("response {turn} {}", "y".repeat(fill))));
+        }
+        messages
+    }
+
+    fn transcript_with_tools(turns: usize, fill: usize) -> Vec<Message> {
+        let mut messages = transcript(turns, fill);
+        // Compaction reclaims tool/reasoning payload, never mandatory prose.
+        // Exercise both the small and large cases with complete tool pairs.
+        for turn in (0..turns).rev() {
+            let id = format!("read-{turn}");
+            let mut call = message(Role::Assistant, "");
+            call.tool_calls = Some(vec![concerto_core::types::ToolCall {
+                id: id.clone(),
+                name: "filesystem".into(),
+                arguments: serde_json::json!({"path": "source.rs"}),
+                ..Default::default()
+            }]);
+            let mut result = message(Role::Tool, "");
+            result.tool_results = Some(vec![concerto_core::types::ToolResult {
+                id,
+                name: "filesystem".into(),
+                content: serde_json::json!({"content": "x".repeat(fill)}),
+            }]);
+            messages.splice(turn * 2 + 1..turn * 2 + 1, [call, result]);
         }
         messages
     }
@@ -362,11 +391,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn assemble_bounds_input_tokens_and_preserves_recent_turns() {
-        // Simulated long-run: a transcript far past the tuned trigger must
-        // assemble to a bounded window that still recalls the most recent
-        // turns. The messages are large enough that the deterministic summary
-        // (capped internally) provably shrinks the model-input tokens.
+    async fn assemble_reduces_tool_payloads_and_preserves_conversation() {
+        // Tool-heavy histories can shrink without discarding conversational
+        // obligations. Text-only histories cannot promise the same reduction.
         let store = Arc::new(SqliteSessionStore::connect_in_memory().await.unwrap());
         let session = store
             .create_session(
@@ -377,7 +404,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let messages = transcript(15, 2000);
+        let messages = transcript_with_tools(15, 2000);
         store.append_messages(session.id, &messages, CancellationToken::new()).await.unwrap();
 
         let engine = ContextEngine::from_config(Some(&ContextConfig {
@@ -460,6 +487,198 @@ mod tests {
             serde_json::to_vec(&first).unwrap(),
             serde_json::to_vec(&messages).unwrap(),
             "default budget passes the window through unchanged"
+        );
+    }
+
+    #[test]
+    fn context_size_and_plan_do_not_depend_on_historical_usage() {
+        let engine = ContextEngine::new();
+        let original = transcript(8, 40);
+        let expected_tokens = engine.estimate_tokens(&original);
+        let expected_plan = engine.plan(&original);
+        assert!(matches!(expected_plan, ContextPlan::PassThrough { .. }));
+        for usage in [
+            (Some(20_000), Some(500)),
+            (Some(0), Some(0)),
+            (Some(u64::MAX), Some(u64::MAX)),
+            (Some(20_000), None),
+            (None, Some(500)),
+        ] {
+            let mut accounted = original.clone();
+            for message in &mut accounted {
+                (message.tokens_in, message.tokens_out) = usage;
+            }
+            assert_eq!(engine.estimate_tokens(&accounted), expected_tokens, "usage={usage:?}");
+            assert_eq!(engine.plan(&accounted), expected_plan, "usage={usage:?}");
+        }
+    }
+
+    #[test]
+    fn zero_usage_cannot_hide_large_current_tool_payloads() {
+        use concerto_core::types::{ToolCall, ToolResult};
+        let engine = ContextEngine::new();
+        let mut messages = transcript(8, 10);
+        let small = engine.estimate_tokens(&messages);
+        let assistant = &mut messages[1];
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: "read-1".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::json!({"operation":"read","path":"observed.txt"}),
+            ..Default::default()
+        }]);
+        messages.push(Message {
+            tool_results: Some(vec![ToolResult {
+                id: "read-1".into(),
+                name: "filesystem".into(),
+                content: serde_json::json!({"content":"🦀".repeat(20_000)}),
+            }]),
+            ..message(Role::Tool, "")
+        });
+        let expected = engine.estimate_tokens(&messages);
+        assert!(expected > small + 20_000);
+        for message in &mut messages {
+            message.tokens_in = Some(0);
+            message.tokens_out = Some(0);
+        }
+        assert_eq!(engine.estimate_tokens(&messages), expected);
+        assert!(matches!(engine.plan(&messages), ContextPlan::Compact { .. }));
+    }
+
+    #[tokio::test]
+    async fn durable_compaction_uses_current_content_and_preserves_usage_records() {
+        let engine = ContextEngine::from_config(Some(&ContextConfig {
+            trigger_tokens: Some(1_000),
+            retain_user_turns: Some(2),
+            minimum_user_turns: Some(4),
+            cache_stable_prefix: None,
+        }));
+        // Expensive earlier requests cannot shrink a tiny current window;
+        // zero reported usage cannot exempt a large window from compaction.
+        for (fill, usage, should_compact) in [(20, 20_000, false), (2_000, 0, true)] {
+            let store = Arc::new(SqliteSessionStore::connect_in_memory().await.unwrap());
+            let session = store
+                .create_session(
+                    Utf8Path::new("/var/tmp/context-usage"),
+                    "provider",
+                    "model",
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            let mut messages = transcript_with_tools(8, fill);
+            for message in &mut messages {
+                message.tokens_in = Some(usage);
+                message.tokens_out = Some(usage);
+            }
+            store.append_messages(session.id, &messages, CancellationToken::new()).await.unwrap();
+            let before = store.load_messages(session.id, CancellationToken::new()).await.unwrap();
+            let active = engine
+                .assemble(store.clone(), session.id, &messages, CancellationToken::new(), None)
+                .await
+                .unwrap();
+            let checkpoints =
+                store.list_checkpoints(session.id, CancellationToken::new()).await.unwrap();
+            assert_eq!(!checkpoints.is_empty(), should_compact, "fill={fill}, usage={usage}");
+            if should_compact {
+                assert!(engine.estimate_tokens(&active) < engine.estimate_tokens(&messages));
+            } else {
+                assert_eq!(
+                    serde_json::to_value(&active).unwrap(),
+                    serde_json::to_value(&messages).unwrap()
+                );
+            }
+            let persisted =
+                store.load_messages(session.id, CancellationToken::new()).await.unwrap();
+            assert_eq!(
+                serde_json::to_value(persisted).unwrap(),
+                serde_json::to_value(before).unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transcript_regression_interrupted_batch_preserves_results_and_marks_unknown_outcomes()
+    {
+        use concerto_core::types::{ToolCall, ToolResult};
+        let store = Arc::new(SqliteSessionStore::connect_in_memory().await.unwrap());
+        let session = store
+            .create_session(Utf8Path::new("/project"), "test", "test", CancellationToken::new())
+            .await
+            .unwrap();
+        let calls: Vec<_> = ["done-one", "done-two", "unknown"]
+            .into_iter()
+            .map(|id| ToolCall {
+                id: id.into(),
+                name: "shell".into(),
+                arguments: serde_json::json!({"command": id}),
+                thought_signature: Some(format!("signature-{id}")),
+            })
+            .collect();
+        let mut assistant = message(Role::Assistant, "Run the checks");
+        assistant.tool_calls = Some(calls.clone());
+        assistant.gemini_replay = Some(
+            concerto_core::provider_replay::GeminiReplay::capture(
+                calls
+                    .iter()
+                    .map(|call| {
+                        serde_json::json!({"functionCall": {
+                "id":call.id, "name":call.name, "args":call.arguments
+            }, "thoughtSignature":call.thought_signature})
+                    })
+                    .collect(),
+                &assistant.content,
+                None,
+                &calls,
+            )
+            .unwrap(),
+        );
+        let mut first = message(Role::Tool, "first recorded result");
+        first.tool_results = Some(vec![ToolResult {
+            id: "done-one".into(),
+            name: "shell".into(),
+            content: serde_json::json!({"exit_code": 1}),
+        }]);
+        let mut second = message(Role::Tool, "second recorded result");
+        second.tool_results = Some(vec![ToolResult {
+            id: "done-two".into(),
+            name: "shell".into(),
+            content: serde_json::json!({"exit_code": 0}),
+        }]);
+        // A corrective instruction can occur between results in one batch.
+        // It must not cause a later real result to be mistaken for a missing one.
+        let original = vec![
+            message(Role::User, "Check"),
+            assistant,
+            first,
+            message(Role::User, "Inspect the first failure before retrying"),
+            second,
+        ];
+        store.append_messages(session.id, &original, CancellationToken::new()).await.unwrap();
+        let assembled = ContextEngine::new()
+            .assemble(store.clone(), session.id, &[], CancellationToken::new(), None)
+            .await
+            .unwrap();
+        let results: Vec<_> =
+            assembled.iter().filter_map(|m| m.tool_results.as_ref()).flatten().collect();
+        assert_eq!(results.len(), 3, "every original call needs a response for valid replay");
+        assert_eq!(results[0].content, serde_json::json!({"exit_code": 1}));
+        assert_eq!(results[1].content, serde_json::json!({"exit_code": 0}));
+        assert_eq!(results[2].id, "unknown");
+        assert_eq!(results[2].content["status"], "outcome_unknown");
+        assert!(results[2].content["error"].as_str().unwrap().contains("may have executed"));
+        assert!(results[2].content["error"].as_str().unwrap().contains("before retrying"));
+        assert!(assembled[2..5].iter().all(|m| m.role == Role::Tool));
+        assert_eq!(assembled[5].content, original[3].content);
+        assert_eq!(
+            serde_json::to_value(&assembled[1]).unwrap(),
+            serde_json::to_value(&original[1]).unwrap()
+        );
+        assert!(assembled[1].gemini_replay.as_ref().unwrap().parts_for(&assembled[1]).is_some());
+        let stored = store.load_messages(session.id, CancellationToken::new()).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(stored).unwrap(),
+            serde_json::to_value(original).unwrap(),
+            "recovery annotations must not pretend to be durable execution evidence"
         );
     }
 }

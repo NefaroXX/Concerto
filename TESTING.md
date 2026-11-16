@@ -25,6 +25,11 @@ rules/preset.
 
 ## Automated workspace checks
 
+Use `python3 scripts/check-cargo-audit.py` for the complete raw-lockfile audit
+CI gate. It runs cargo-audit with warnings denied and also rejects diagnostics
+that cargo-audit can print without a nonzero exit status, including incomplete
+registry/yank checks. The advisory exception policy stays in `.cargo/audit.toml`.
+
 These are the same checks CI runs; paste the output into the copied template's
 automated-checks table.
 
@@ -59,6 +64,27 @@ $env:CONCERTO_TEST_MODE = "1"
 | Cargo deny | | |
 | Cargo audit | | |
 
+### Released coverage tool contract check
+
+The default eval tests use isolated executable fixtures and do not require
+coverage tools. An additional Unix integration test exercises real Cargo tests
+with released cargo-llvm-cov and cargo-tarpaulin binaries. Install
+`llvm-tools-preview` for the selected Rust toolchain, place each coverage binary
+under `<tool-root>/cargo-llvm-cov/cargo-llvm-cov` and
+`<tool-root>/cargo-tarpaulin/cargo-tarpaulin`, then run:
+
+```bash
+CONCERTO_COVERAGE_TOOLS_DIR="/absolute/disk-backed/tool-root" \
+  cargo test --locked -p concerto-eval --test coverage_live -- --ignored --nocapture
+```
+
+The fixture uses a separate project and target directory per tool, including
+spaces in its path, and selects Tarpaulin's LLVM engine to avoid container
+ptrace restrictions. It verifies executed tests and parsed measurements, not a
+coverage percentage threshold. The coverage tool determines supported test
+types; cargo-llvm-cov does not instrument doctests on stable Rust. Normal
+workspace doc tests remain a separate required check.
+
 ### Acceptance-bar automation (Phase 6, 2026-08-01)
 
 The audit's 12 end-to-end scenarios are the acceptance bar. Phase 6 closed the
@@ -68,10 +94,23 @@ following scenarios no longer require fully manual execution:
 - Scenario 2 (project switch never reuses the previous project's memory
   services): `select_or_init_memory_services` extraction + 4 project-switch
   tests (`crates/orchestrator/src/runtime_runner.rs`).
-- Scenario 4 (compaction reduces model-input tokens):
+- Scenario 4 (compaction reduces historical tool payload while preserving
+  conversational instructions; ADR-85):
   `compaction_reduces_model_input_tokens` and
   `compaction_does_not_lose_user_visible_turns`
-  (`crates/orchestrator/src/context_compaction.rs`).
+  (`crates/orchestrator/src/context_compaction.rs`). Additional continuity
+  regressions in `context_compaction_regressions.rs` cover leaf/hierarchical
+  checkpoints, role/order and durable reload through the provider guard and
+  native wire renderers. Provider regressions cover overflow without losing
+  instructions, active task state, literal markers, retries and cache prefixes.
+  Text-only history that cannot fit must report context overflow, not truncate
+  obligations to satisfy the size budget.
+- Native Gemini replay (ADR-86): `replay_regression` tests cover decoder part
+  order/signatures, thought routing, empty trailing signatures, call IDs,
+  capture bounds, incomplete attempts, legacy JSON, edited content, both
+  collectors, actual orchestration history builders, context estimates and
+  SQLite close/reopen. These tests do not establish full provider-transcript
+  persistence by run settlement; H39 tracks that separate gap.
 - Scenario 5 (provider failure after a file write does not repeat the write):
   `provider_failure_after_file_write_does_not_repeat_the_write`
   (`crates/orchestrator/src/agent_loop.rs`).
@@ -83,10 +122,10 @@ following scenarios no longer require fully manual execution:
   (`crates/orchestrator/src/coordinator.rs`).
 - Scenario 12 (full gate incl. doctests): automated by CI — the test job in
   `.github/workflows/ci.yml` runs `cargo test --workspace` (doctests
-  included) and it passes locally (exit 0). Doctests emit pre-existing `E0602 unknown lint:
-  rustdoc::missing_docs` warnings from `[workspace.lints.rustdoc]` — non-fatal
-  (the CI test job does not set `RUSTFLAGS="-D warnings"`), affects all crates
-  uniformly, out of scope.
+  included). The obsolete `rustdoc::missing_docs` workspace lint has been
+  removed. Local full-battery verification sets `RUSTFLAGS="-D warnings"`;
+  CI denies warnings in all-target Clippy and the native matrix. Warnings
+  must be resolved, not classified as an acceptable test result.
 
 Scenarios not listed above are covered by tests from earlier phases or remain
 manual per the sheets below.
