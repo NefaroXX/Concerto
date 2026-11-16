@@ -1,44 +1,48 @@
 # OpenCode handoff — Concerto harness reliability
 
 Checkpoint requested by the user on 2026-11-16, updated after the H39 root
-milestone was published and verified. Resume from this document and the work
-logs; do not restart the completed audit or infer that the whole goal is done.
+milestone and H40/H41 were published and verified. Resume from this document
+and the work logs; do not restart completed work or infer that the whole goal
+is done.
 
 ## Start here
 
-**The H39 root milestone is published and verified.** The strict cargo-audit
-rerun on the unchanged candidate passed: exit 0, 1,509 advisories, 1,079
-dependencies, no yanked-check timeout. The squashed H39 commit `2dbf25a` and
-the ADR-acceptance commit `72c414a` are published on
-`fix/harness-streaming-integrity`; all twelve remote checks passed on both
-exact heads. ADR-87 is Accepted for the root boundary. Evidence:
-`target/harness-reliability/h39-audit-resume-1.log` and the H39 work log.
+**H39 root, H40 and H41 are published and verified.** H39: strict cargo-audit
+passed (exit 0, 1,509 advisories, 1,079 dependencies) and the squashed commit
+`2dbf25a` plus ADR-acceptance commit `72c414a` passed all twelve exact-head
+checks; ADR-87 is Accepted for the root boundary. H40: headless multi-agent
+runs now receive typed history (no clipped actual-task prose) with the ADR-60
+D7 approved-plan boundary pinned by a routing control. H41: the settings CLI
+fixture is Linux-gated to match its XDG-only isolation. The squashed H40/H41
+commit `91bf006` passed the 12/12 local battery and all twelve exact-head
+checks; the documentation-record commit `d4faeb4` is the verified PR head and
+also passed all twelve. Evidence: `target/harness-reliability/h40-final-*`,
+`h40-attempt1/`, and the work log.
 
 [PR #379](https://github.com/NefaroXX/Concerto/pull/379) targets `dev`, is open
-and draft, and its head is `72c414aa3ec83061cb18d9f4101ea39ed6402d16`. Do not
-merge without authorization. Continue with the remaining H39 work below
-(specialist/process-scoped history and cancelled-run spend settlement), then
-H40; H40's prepared fixture now has H39's public `connect_path` API available on
-the PR branch.
+and draft, and its head is `d4faeb4` (H40/H41 publication plus the docs-record
+commit). Do not merge without authorization. Remaining work is the
+rest of H39: specialist/process-scoped durable history and cancelled-run spend
+settlement.
 
 ## Git and worktrees
 
 | Location | Branch | State |
 | --- | --- | --- |
-| `/home/sol/Projects/Concerto` | `checkpoint/opencode-harness-2026-11-16` | Local documentation-only handoff branch; PR branch is at `72c414a` |
+| `/home/sol/Projects/Concerto` | `checkpoint/opencode-harness-2026-11-16` | Local documentation-only handoff branch; PR branch is at the H40/H41 head |
 | `/home/sol/Projects/Concerto-worktrees/h39` | `fix/harness-transcript-continuity` | `72c414a`; H39 root milestone published on `fix/harness-streaming-integrity`; ADR-87 Accepted |
-| `/home/sol/Projects/Concerto-worktrees/h40` | `fix/harness-headless-history` | Local checkpoint `950a722b63299c83de48cce2720a28e33bcba31f`; prepared regressions and H41 fixture correction, not verified |
+| `/home/sol/Projects/Concerto-worktrees/h40` | `fix/harness-headless-history` | H40/H41 published: code `91bf006`, docs-record commit on top; local battery 12/12, exact-head 12/12 on `91bf006` |
 
 Dedicated local refs `checkpoint/opencode-h39-2026-11-16` (pre-squash WIP
-`a88e841`) and `checkpoint/opencode-h40-2026-11-16` (`950a722`) preserve those
-checkpoints after the H39 topic branch was squashed for publication. The H40
-checkpoint remains pre-verification preparation. All worktrees are clean.
+`a88e841`), `checkpoint/opencode-h40-2026-11-16` (`950a722`) and
+`checkpoint/opencode-h40-rebased` (`4ea2018`) preserve the checkpoints after
+each topic branch was squashed for publication. All worktrees are clean.
 
 The detailed current H39 work log is in the **H39 worktree** at
 `docs/harness-reliability-work-log.md`. Its investigation is
 `docs/harness-transcript-investigation.md`, and its contract is
 `docs/adrs/ADR-87-root-provider-transcript.md` (Accepted for the root boundary).
-H40 preparation is in its own `docs/harness-headless-history-investigation.md`.
+H40/H41 is recorded in `docs/harness-headless-history-investigation.md`.
 
 ## Working requirements
 
@@ -56,8 +60,10 @@ H40 preparation is in its own `docs/harness-headless-history-investigation.md`.
   `RUSTFLAGS="-D warnings"` and `CARGO_INCREMENTAL=0`. Keep
   `CARGO_TARGET_DIR=/home/sol/Projects/Concerto/target` and `TMPDIR=/var/tmp`.
   Never build/test/clone under RAM-backed `/tmp`. Do not repurpose HOME.
-- No subagents were authorized. Read repository/subdirectory instructions and
-  relevant skills before editing. Do not run another Cargo job while one is
+- Subagents are authorized (user direction, 2026-11-16); the orchestrator may
+  delegate review, docs and verification. Read repository/subdirectory
+  instructions and relevant skills before editing. Do not run another Cargo
+  job while one is
   live. An expired tool observation handle alone does not establish completion;
   inspect processes and logs before restarting.
 - The code graph has no useful Concerto index. CCC indexes the main checkout,
@@ -162,50 +168,40 @@ files. If a later change to H39 is made, run only the checks that change
 requires, then the full CI battery, and verify all twelve remote checks on the
 exact new SHA. Do not inherit the green result from `2dbf25a`/`72c414a`.
 
-## H40 and H41: prepared, not executed
+## H40 and H41: published and verified
 
-The H40 branch is still based on `14390eb` plus its WIP checkpoint. Integrate the
-published H39 squash `2dbf25a` (not the pre-squash checkpoint) before compiling:
-the new CLI fixture uses H39's public `connect_path` API, which exists there. Do
-not mistake its current dependency on that missing API for an implementation
-regression.
-
-- Two wired helper probes already reproduced the 4,000-character per-message
-  and 16,000-character total cutoffs. Original failing evidence is retained.
-- `crates/cli/tests/headless_history.rs` is new and **unexecuted**. It seeds a
-  real isolated session, starts the actual headless CLI against a bounded
-  loopback OpenAI server, checks the JSON/session identity and captures the
-  request. It asserts long and older obligations, original assistant role,
-  and no duplicate flattened history inside the submitted task. It uses a
-  test-only credential, nonce keyring account, Linux XDG directories and a
-  proxy bypass for loopback. No live provider is required.
-- `coordinator_history_regressions.rs` is **unwired and unexecuted**. Include it
-  in the coordinator test module after integration. It captures real requests
-  with and without an inbox as a parity control for typed history.
-- Production H40 routing is unchanged. `run_multi_agent` attaches typed
-  history only when an inbox exists and there is no approved plan; headless
-  runs instead receive clipped prose through `multi_agent_task_with_history`.
-  Preserve the actual request-level failing baseline before fixing this.
-- Ordinary headless runs should get typed history without duplicating it in
-  task prose or manufacturing an interactive inbox. Approved-plan runs must
-  retain ADR-60 D7's separate verified-artifact/ledger contract, excluding old
-  rendered plan history. Review the D7 tests and add appropriate controls.
-- H41: `settings_commands.rs` used `cfg(unix)` with only XDG isolation, which
-  can reach the real macOS profile through `dirs` 6.0.0. Its prepared correction
-  restricts it to Linux, as does the new CLI fixture. This is source-confirmed;
-  no mutating test was run against a real macOS profile. Keep Linux behavioral
-  coverage and do not claim portable fixture coverage from this correction.
-
-After the actual CLI baseline, implement and verify the routing change, retain
-meaningful replacement coverage if deleting the clipped helper/tests, run the
-full battery, and publish on top of the verified H39 head (`2dbf25a`).
+- H40's request-level baseline is preserved in
+  `target/harness-reliability/h40-baseline-headless-history.log`: the real
+  headless CLI's provider request carried a system message plus one user
+  message with `<conversation_history>` prose; the long-preamble constraint and
+  older obligation were gone and the prior assistant turn had no role. Earlier
+  harness-only failures are kept as `h40-baseline-cli*.log`.
+- Production repair: `run_multi_agent` attaches `conversation_history` as
+  typed messages whenever no approved plan is bound, independent of the
+  interactive inbox; the submitted task description is the caller's objective.
+  Approved-plan runs retain ADR-60 D7 and get no transcript. The decision is
+  isolated in `conversation_history_for_run` and pinned by
+  `conversation_history_is_injected_only_without_an_approved_plan`.
+- The clipped-prose `multi_agent_task_with_history` helper and its helper-only
+  tests were deleted. Replacement coverage: the loopback headless CLI fixture
+  (durable constraints, one assistant-role prior reply, no flattened marker in
+  the task) and the coordinator parity control with/without an inbox.
+- H41 is the Linux-only gate on `settings_commands.rs` (and the new CLI
+  fixture). The macOS hazard is source-confirmed, never reproduced against a
+  real profile, and portable fixture coverage is not claimed.
+- Evidence: first battery `81fe15a` 11/12 (transient audit yanked-check timeout,
+  preserved as `h40-final-full-audit.first-attempt.log`, resumed strict gate
+  passed); final battery `8f2853e` 12/12 in 34 m 02 s with 1,019/1,019 source
+  hashes. Published as `91bf006`; all twelve exact-head checks passed (CI
+  `43942883154`, native `43942883053`). The docs-record commit `d4faeb4` is the
+  current head and also passed all twelve checks (CI `43944565310`, native
+  `43944565347`).
 
 ## Remaining findings
 
-Nine findings remain open: H12 event-queue memory bounds; H14 intermittent
+Seven findings remain open: H12 event-queue memory bounds; H14 intermittent
 checkpoint ToolNotFound; H23 MCP probe timeout cause; H28 unused dependencies /
 67 duplicate families; H29 declared Rust minimum; H34 unmarked incomplete
-subprocess capture; H39 specialist/process history and cancelled-run spend;
-H40 headless history; H41 settings-fixture platform isolation pending verification.
+subprocess capture; H39 specialist/process history and cancelled-run spend.
 Full status/history is in the work log. Passing tests do not establish overall
 harness superiority, and lost historical state cannot be reconstructed.
