@@ -15,7 +15,7 @@ use crate::plan_approval::{
     rehydrate_durable_binding, ApprovedPlanContext, PlanBinding, PlanLedger,
 };
 use crate::registry::AgentRegistry;
-use crate::session_manager::{message_row_usage, ProjectSessionManager, SessionManagerConfig};
+use crate::session_manager::{ProjectSessionManager, SessionManagerConfig};
 use crate::{AgentRelationship, CollaborationRule};
 
 use concerto_config::AppConfig;
@@ -1405,7 +1405,9 @@ async fn execute_agent_loop(
             // Flush any partial transcript before surfacing the failure
             // (ADR-36): still-`Running` tool calls settle as Cancelled inside
             // stop().
-            transcript_recorder.stop().await;
+            transcript_recorder
+                .finish(&[TranscriptEntry::Error { content: error.to_string() }])
+                .await;
             event_recorder.stop().await;
             // Persist whatever the loop settled before failing (e.g. rate
             // limit): tokens consumed and cost accrued so far must not
@@ -3780,47 +3782,26 @@ async fn run_multi_agent(
         Ok(output) => output,
         Err(error) => {
             stage_feed.abort();
-            // Settle the coordinator's usage first: it feeds both the failure
-            // row below and the metrics/spend tail, so one rate-limit
-            // exhaustion or cancellation records the same tokens everywhere
-            // (ADR-48 §4 — real usage when available, on the message row too).
+            // Actual provider turns already carry their own usage. Run-level
+            // failures are not synthetic assistant turns in the model history.
             let settled = coordinator.settled_metrics();
-            if let Some(store) = &session_store {
-                let content = if matches!(
-                    &error,
-                    OrchestratorError::Cancelled
-                        | OrchestratorError::Provider(ProviderError::Cancelled)
-                ) {
-                    "Task cancelled.".to_string()
-                } else {
-                    format!("Task failed: {error}")
-                };
-                let (tokens_in, tokens_out) = message_row_usage(settled);
-                let failure_message = Message {
-                    gemini_replay: None,
-                    role: concerto_core::types::Role::Assistant,
-                    content,
-                    tool_calls: None,
-                    tool_results: None,
-                    reasoning_content: None,
-                    tokens_in,
-                    tokens_out,
-                };
-                if let Err(store_error) = store
-                    .append_messages(session_id, &[failure_message], req.cancel_token.clone())
-                    .await
-                {
-                    if is_expected_cancellation(&store_error, &req.cancel_token) {
-                        tracing::debug!(%store_error, "run cancelled; failure message not persisted");
-                    } else {
-                        tracing::warn!(%store_error, "failed to persist multi-agent failure");
-                    }
-                }
+            let observation = crate::provider_transcript::run_failure(task.id, &error);
+            if let Err(store_error) = crate::provider_transcript::append_completed_messages(
+                session_store.as_ref(),
+                session_id,
+                &[observation],
+                CancellationToken::new(),
+            )
+            .await
+            {
+                tracing::warn!(%store_error, %session_id, "failed to persist runtime failure");
             }
-            transcript_recorder.stop().await;
+            transcript_recorder
+                .finish(&[TranscriptEntry::Error { content: error.to_string() }])
+                .await;
             event_recorder.stop().await;
-            // Persist the coordinator's settled metrics (bound above, before
-            // the failure row) before the error propagates: on a rate-limit
+            // Persist the coordinator's settled metrics before the error
+            // propagates: on a rate-limit
             // exhaustion / cancellation the run consumed real tokens without
             // any output — the audit trail must still record them. Best-effort
             // like the success tail.
@@ -3936,30 +3917,19 @@ async fn run_multi_agent(
     .await;
     let conversation_handoff =
         services.conversation_inbox.as_ref().is_some_and(|inbox| inbox.is_handoff());
-    if let Some(store) = session_store.as_ref().filter(|_| !conversation_handoff) {
-        // ADR-48 §4: the assistant row records the same settled usage the
-        // `provider_metrics` and spend writes above record for this run. The
-        // run-start user row predates any provider call and stays `None`.
-        let (tokens_in, tokens_out) = message_row_usage(&output.provider_metrics);
-        let assistant_message = Message {
-            gemini_replay: None,
-            role: concerto_core::types::Role::Assistant,
-            content: if reply_only { output.final_message.clone() } else { output.summary() },
-            tool_calls: None,
-            tool_results: None,
-            reasoning_content: None,
-            tokens_in,
-            tokens_out,
-        };
-        if let Err(error) =
-            store.append_messages(session_id, &[assistant_message], req.cancel_token.clone()).await
-        {
-            if is_expected_cancellation(&error, &req.cancel_token) {
-                tracing::debug!(%error, "run cancelled; assistant message not persisted");
-            } else {
-                tracing::warn!(%error, "failed to persist multi-agent assistant message");
-            }
-        }
+    // Preserve runtime verification/termination facts separately from the
+    // coordinator's original provider turns and the rendered summary.
+    let observation = crate::provider_transcript::run_outcome(&output);
+    if let Err(error) = crate::provider_transcript::append_completed_messages(
+        session_store.as_ref(),
+        session_id,
+        &[observation],
+        CancellationToken::new(),
+    )
+    .await
+    {
+        tracing::warn!(%error, %session_id, "failed to persist runtime outcome");
+        output.final_message.push_str(" Degraded: the runtime outcome could not be persisted.");
     }
     let mut transcript = vec![TranscriptEntry::Assistant { content: output.final_message.clone() }];
     if !reply_only {

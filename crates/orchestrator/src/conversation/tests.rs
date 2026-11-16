@@ -133,31 +133,32 @@ async fn status_reply_is_persisted_and_visible_without_closing_the_inbox() {
         .unwrap();
     let bus = EventBus::new(16);
     let mut events = bus.subscribe();
-    let task = concerto_core::types::AgentTask::new_coordinator_decides(session.id, "Work");
-    let result = reply_to_user(
-        &serde_json::json!({"message": "Tests are running"}),
-        Some(&store),
+    let recorder = crate::runtime_runner_impl::start_transcript_recorder(
         &bus,
-        &task,
-        &cancel,
-    )
-    .await;
+        store.clone(),
+        session.id,
+        Default::default(),
+    );
+    let task = concerto_core::types::AgentTask::new_coordinator_decides(session.id, "Work");
+    let result =
+        reply_to_user(&serde_json::json!({"message": "Tests are running"}), &bus, &task, &cancel)
+            .await;
     assert_eq!(result["continue_work"], true);
     assert!(
         matches!(&events.try_recv().unwrap().kind, EventKind::AssistantMessage { content, .. } if content == "Tests are running")
     );
+    recorder.stop().await;
+    let transcript = store.load_transcript(session.id, cancel.clone()).await.unwrap();
+    assert_eq!(transcript.len(), 1);
+    assert!(
+        matches!(&transcript[0], TranscriptEntry::Assistant { content } if content == "Tests are running")
+    );
     let history = store.load_messages(session.id, cancel.clone()).await.unwrap();
-    assert_eq!(history.len(), 1);
-    assert_eq!(history[0].role, Role::Assistant);
+    assert!(history.is_empty(), "display must not add a second canonical assistant turn");
     cancel.cancel();
-    let rejected = reply_to_user(
-        &serde_json::json!({"message": "Cancelled reply"}),
-        Some(&store),
-        &bus,
-        &task,
-        &cancel,
-    )
-    .await;
+    let rejected =
+        reply_to_user(&serde_json::json!({"message": "Cancelled reply"}), &bus, &task, &cancel)
+            .await;
     assert!(rejected.get("error").is_some());
     assert!(events.try_recv().is_err());
 }

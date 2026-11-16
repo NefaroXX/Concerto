@@ -47,9 +47,10 @@ passing repository tests alone does not close a finding.
 | H35 | P1 | Locked quinn-udp fails fresh raw-lockfile security scan | Fixed and verified on 66309f8; awaiting merge |
 | H36 | P2 | cargo-audit can report incomplete registry checks with exit zero | Fixed and verified on 66309f8; awaiting merge |
 | H37 | P1 | Native provider wire adapters discard mandatory system/assistant text | Fixed; full local battery and all 12 exact-head CI checks passed |
-| H38 | P2 | Gemini canonical history loses native part order/text signatures and misclassifies thought text | Full local battery passed; exact-head GitHub verification pending |
-| H39 | P1 | Run settlement persists summaries instead of complete provider history | Open; source path confirmed, restart reproduction required |
-| H40 | P2 | Headless multi-agent history clips messages and older obligations before dispatch | Open; source path confirmed, baseline regressions prepared |
+| H38 | P2 | Gemini canonical history loses native part order/text signatures and misclassifies thought text | Fixed; full local battery and all 12 exact-head CI checks passed on 14390eb |
+| H39 | P1 | Run settlement persists summaries instead of complete provider history | Root repair checkpointed locally: tests/builds/benchmarks passed; strict audit incomplete after registry timeout; specialist/process history and cancelled-run spend settlement remain open |
+| H40 | P2 | Headless multi-agent history clips messages and older obligations before dispatch | Both cutoff regressions reproduced; provider-request repair coverage required |
+| H41 | P1 | Settings CLI fixtures use XDG isolation on macOS, where application paths resolve to the real profile | Source-confirmed; Linux-only test gate prepared in H40 worktree, unverified/unpublished |
 
 
 ## 2026-10-29 — H01: preserve streaming events across chunks
@@ -2161,3 +2162,265 @@ Next: patch H18, then continue H07's truthful verification/completion handling.
   probes target lost late constraints and older unresolved obligations. Final
   coverage must capture the actual headless provider request and inspect
   approved-plan semantics. No H39/H40 implementation is included in H38.
+
+
+## 2026-11-16 — H38 published; H39/H40 reproduced
+
+- Published H38 as `14390eb0a54581ca9deee7562f2d069f974cd8d9` on the existing
+  PR branch; Git transport and GitHub agree on the SHA. Exact-head workflows:
+  [main 43785417943](https://github.com/NefaroXX/Concerto/actions/runs/43785417943)
+  and [native 43785417957](https://github.com/NefaroXX/Concerto/actions/runs/43785417957).
+  At this entry nine checks passed; workspace tests, Windows and macOS remain
+  running. The main code index was refreshed after publication.
+- Advanced the isolated `h39` worktree to that commit and wired the prepared
+  tests without changing production implementation. All **three H39 tests
+  failed at the missing-original-turn assertion**: successful single-agent
+  settlement, a later provider failure after an executed call, and coordinator
+  status-reply persistence. Both single-agent tests reached the second provider
+  request and had the expected run outcome; the coordinator produced exactly
+  one visible reply before the persistence assertion failed.
+- Both **H40 baseline probes failed**: a late explicit constraint disappeared
+  after per-message clipping and an older unresolved obligation disappeared
+  after aggregate clipping. These helper probes establish the cutoff defects;
+  provider-request coverage is still required for the repair.
+- Both commands exited 101 from assertion failures, with no compilation error.
+  All 1,013 source hashes still match the baseline snapshot. Preserved
+  `h39-baseline-{transcript,history}.log`, source hashes, patch and copies of all
+  three test files under the main `target/harness-reliability/` directory.
+  No H39/H40 fix has been committed or published.
+
+
+## 2026-11-16 — H38 exact-head CI certified; H39 request-level reproduction
+
+- Both workflows linked above completed successfully on exact head
+  `14390eb0a54581ca9deee7562f2d069f974cd8d9`: **all nine main jobs and all three
+  native-platform jobs passed**. H38 is closed, ADR-86 is accepted, and PR #379
+  records this exact-head proof. Eight findings remain open.
+- Strengthened the two single-agent H39 probes: after the first run succeeds
+  or fails at its second provider request, discard that loop, assemble history
+  from the actual session store through `ContextEngine::assemble` with an empty
+  fallback, and run a fresh loop whose provider captures its request. Both
+  runs complete normally but the captured request lacks the original completed
+  assistant/tool exchange; both assertions fail as expected (exit 101, zero
+  passed, two failed). The fixture now carries Gemini native state too, so the
+  repair must preserve that state as well as text/reasoning/call IDs/results.
+- This is a fresh-loop/context-assembly reproduction using SQLite's in-memory
+  backend, not an OS-process or on-disk database restart claim. A disk reopen
+  integration remains required before claiming whole-run restart fidelity.
+  Evidence: `h39-request-baseline.log`, status, source hashes and saved fixture;
+  all 1,013 snapshot files matched before these documentation-only updates.
+- No H39/H40 production repair has been committed or published. Their failing
+  regressions remain isolated from the green PR head in the `h39` worktree.
+
+
+## 2026-11-16 — H39 first repair passes reproduced transcript failures
+
+- The unpublished repair records completed assistant turns before tool
+  execution, then each completed tool result. A bounded cleanup write preserves
+  completed work when generation is cancelled; persistence failures remain
+  visible. Run summaries remain in the rendered transcript instead of becoming
+  replacement model answers. Coordinator status delivery does not insert a
+  second assistant message between its original call and result.
+- All three transcript regressions now pass (`h39-first-repair.log`), including
+  the two fresh-loop provider-request probes. The headless clipping probes
+  remain unresolved. This is focused evidence only, not full verification.
+- Expanding coverage to a real disk-backed store reopen, text-driver per-turn
+  usage, cancellation, incomplete tool batches and display transcript ownership
+  before the full battery. No new commit or publication has occurred.
+
+## 2026-11-16 — H39 disk reopen verified; usage reuse defect reproduced
+
+- The success and later-provider-failure fixtures now drop the original loop
+  and store, reopen the real disk database, assemble history without fallback,
+  and inspect a fresh loop's provider request. Both pass with original text,
+  reasoning, signed native Gemini state, call ID and executed result intact.
+  Their durable usage sums match the completed provider requests exactly.
+- A new reuse regression fails before the reset fix: the second run reports
+  `(24, 12)` input/output tokens instead of its own `(13, 5)`. Usage now resets
+  at the external `run()` boundary while remaining cumulative across internal
+  continuation rounds. `merge_run_progress` already replaces cumulative metrics;
+  inspection found no summing defect there, so it was left unchanged.
+- Evidence: `h39-disk-usage-baseline-2.log` (three passed, reuse regression
+  failed). The first attempt had two compile errors from this work: a stale
+  import and a test initializer incorrectly assuming `Message: Default`.
+  Both were corrected; that failed log is preserved separately.
+- Expanded tests for text-driver repair success/failure/exhaustion, cancelled
+  tool-result persistence, delivered-followup duplication and actual rendered
+  status transcript recording are running. This source remains unpublished;
+  full verification and interruption recovery are still outstanding.
+
+- The expanded run passed seven regressions, including real cancellation,
+  text-driver usage on all three outcomes, follow-up delivery and the rendered
+  status recorder. The new interrupted-batch regression failed as expected:
+  two recorded results left a third assistant call unanswered on replay.
+  Evidence: `h39-expanded-transcript-2.log`; the first expanded attempt used
+  the wrong private recorder module path and its compile-error log is retained.
+- The recovery candidate groups recorded responses with their original call
+  and adds an explicit `outcome_unknown` response only for missing IDs. It
+  preserves native assistant bytes and never writes synthetic outcomes back
+  to durable history. The status-reply helper now has one display owner, with
+  recorder coverage replacing its obsolete canonical-message mirror.
+- H40's two failing cutoff probes have moved intact to a separate disk-backed
+  `h40` worktree (`fix/harness-headless-history`, base `14390eb`). Their baseline
+  evidence remains preserved. H39 can now be verified and published as one
+  coherent transcript fix; H40 remains open and will follow separately.
+
+## 2026-11-16 — H39 recovery integration and broader checks
+
+- All eight focused tests passed after adding request-only interrupted-batch
+  repair (`h39-recovery.log`). A further disk-reopen request test verifies that
+  historical unresolved calls are annotated, never executed automatically.
+- The first broader orchestrator run passed 1,911 tests with one ignored and
+  one new fixture failure. That fixture incorrectly assumed an incomplete
+  provider stream could not retry; the existing contract explicitly retries
+  incomplete attempts without executing their calls. Its script ran out and
+  supplied a successful default response. The corrected fixture explicitly
+  ends the retry with authentication failure and still requires zero executed
+  calls, zero completed-turn usage, and no incomplete assistant persisted.
+  The inaccurate retry comment in `AgentLoop` was also corrected.
+- Cleanup now cancels its own token when its caller is dropped, as well as on
+  deadline or completion. Deterministic tests cover the ten-second deadline,
+  caller cancellation and propagation of an ambiguous write without retry.
+- Scope review: supervised child processes construct `AgentLoop` without a
+  session store or prior messages (`bin/agent_process.rs`); their independent
+  histories still require an agent-scoped persistence/restore design. The
+  parent supervisor's summary is not a substitute for those histories. This
+  root-conversation milestone does not close all of H39 or claim specialist
+  process restart fidelity. H39 remains open after this milestone until that
+  separate boundary is handled and tested.
+
+- The corrected broader suite passed **1,915 tests, zero failures, one
+  intentionally ignored test** (`h39-orchestrator-lib-2.log`). This includes
+  continuation usage, fresh-request unknown-result recovery and bounded cleanup.
+- Root runtime failures now finish the separate rendered transcript with a
+  typed error after draining pending status events. They do not add synthetic
+  assistant answers to canonical history. An ordering regression covers this
+  display boundary before the full battery.
+- Another H39 follow-up to verify: runtime metrics/spend settlement currently
+  receives the run cancellation token. Canonical completed-turn usage now
+  survives cancellation, but that alone does not prove cancelled-run metrics
+  and spend-table writes survive. Keep that separate settlement boundary open
+  with the supervised/specialist work; do not claim whole-system accounting
+  durability from the message-row tests.
+
+- The first full battery stopped at the warning-denied Clippy gate: removing
+  aggregate assistant summaries left `message_row_usage` unused in production.
+  Removed that obsolete helper and its three helper-only aggregation tests;
+  retained the real message-store usage round trip using per-turn values.
+  The new runtime usage regressions cover the replacement behavior. The failed
+  full-battery attempt is preserved in `h39-attempt1/`; no suppression was added.
+
+- The second full-battery attempt reached all-target Clippy and stopped on two
+  new test issues: a redundant complete-struct update and a captured-request
+  mutex guard whose scope extended to a later await. Removed the redundant
+  update and confined the guard and borrowed results to a lexical block before
+  the database await. Evidence is preserved in `h39-attempt2/`; no warnings were
+  ignored or suppressed. The process is terminal, not merely an expired
+  observation handle, and the battery is restarted on the corrected source.
+
+## 2026-11-16 — Review caught missing runtime outcomes before publication
+
+- Review found a defect in the unpublished H39 repair: deleting summary rows
+  outright also deleted runtime-only verification and termination details.
+  Verification can run after the final provider reply, so retaining provider
+  turns alone would let the next request miss a failed check or blocked reason.
+  The old `publish_end_reason` comment explicitly described that now-removed
+  persistence path. This is a gap introduced by this repair, not a baseline
+  failure or a reason to weaken checks.
+- Stopped the verified validation process tree during workspace compilation;
+  Clippy, formatting and the external coverage fixture had passed, but no
+  workspace result is claimed for that interrupted attempt. Preserved all
+  artifacts and the stop reason in `h39-outcome-review-interrupted/`.
+- Added regressions for a real post-provider verification error surviving disk
+  reopen into a fresh request, and for a partial exit retaining its blocked
+  reason. Running them against the current candidate before the correction.
+  The fix must retain labeled runtime facts separately from original assistant
+  turns, without inserting aggregate usage a second time.
+
+
+- Both runtime-outcome regressions failed at the missing-evidence assertions
+  (`h39-runtime-outcome-baseline.log`, zero passed/two failed). The correction
+  adds labeled system observations with completion status, changed paths,
+  compact verification/evidence references and stop details. Original provider
+  replies stay intact, and runtime observations carry no usage. Hard errors
+  and cancellation also record their reason through the bounded cleanup path.
+- The first compile of that correction used the wrong public path for
+  `ProviderError`; corrected it to `concerto_core::error::ProviderError` and
+  retained the failed log. The broader suite is running on the corrected source.
+
+
+- The corrected root-outcome implementation passes **1,915 orchestrator tests,
+  zero failures, one intentionally ignored** (`h39-runtime-outcome-repair-2.log`).
+  Both new regressions now pass alongside the earlier transcript/usage/cancel
+  cases. ADR-87 and the changelog describe runtime observations as well as
+  original turns; the work log keeps the remaining H39 boundaries open.
+- Restarting the complete local battery on this final candidate. The outgoing
+  PR head remains `14390eb`, with its twelve checks green; no H39 change is
+  published until the new battery passes. H40's offline CLI fixture remains
+  prepared and unexecuted in its separate worktree.
+
+
+## 2026-11-16 — H39 checkpoint and OpenCode handoff
+
+The user requested a checkpoint and handoff before publication. The full runner
+has terminated; there is no remaining validation process to wait on.
+
+- Workspace unit/integration/doc suites: **6,149 passed, zero failed, 17 ignored
+  across 86 groups**. The explicit released-tool coverage fixture passed too.
+- Formatting, diff check, warning-denied all-target Clippy, full workspace build,
+  desktop-only and CLI-only builds, launcher/cache-report smokes, all four WASM
+  guests, all nine release benchmark smoke targets, palette check and 13 Python
+  tests passed. Local Cargo compilation used `-j1`, `RUSTFLAGS="-D warnings"`,
+  `CARGO_INCREMENTAL=0`, disk-backed target and `/var/tmp` scratch.
+- Cargo-deny passed its advisory, ban, license and source gates. It still emits
+  **67 duplicate-version warnings** tracked under H28; they are not resolved or
+  suppressed by this milestone.
+- **Strict cargo-audit failed (exit 1).** It loaded 1,509 advisories and scanned
+  1,079 dependencies, but the registry yanked-package check timed out. The strict
+  wrapper correctly rejected cargo-audit's misleading zero exit status. This
+  is incomplete verification, not a pass; do not bypass registry checking,
+  weaken the gate or publish the candidate on this evidence.
+- Evidence: main repository `target/harness-reliability/h39-final-*`; the exact
+  audit diagnostic is also retained in `docs/verification/h39-audit-checkpoint.txt`.
+  All **1,014 source hashes matched** after the runner finished, before these
+  checkpoint documentation updates. No production/test source changed during
+  the final battery.
+- Root H39 remains unpublished and ADR-87 remains Proposed. The outgoing PR
+  head is still `14390eb`, previously verified with all twelve remote checks.
+  Rerun the unchanged strict audit first; investigate and fix any real finding.
+  After every local gate is clean, publish through the existing topic PR and
+  verify all twelve checks on its exact new SHA.
+- H40 is separately checkpointed preparation: two reproduced cutoff probes,
+  an unexecuted real-CLI loopback fixture, and an unwired coordinator parity
+  control. It needs H39's public explicit-path store API before compilation.
+  No H40 production routing repair has been made.
+- H41 was found while reviewing fixture isolation: `settings_commands.rs`
+  redirects only XDG directories but used `cfg(unix)`. The installed `dirs`
+  6.0.0 macOS implementation resolves configuration/data to Library/Application
+  Support, and Concerto delegates to it. The tests issue mutating commands.
+  Restricted the prepared H40 fixture to Linux; no real macOS profile was used
+  to reproduce the unsafe path. The correction is not yet verified/published.
+
+## 2026-11-16 — H39 strict audit rerun passes; publication ready
+
+- Reran only the incomplete strict gate on the unchanged candidate, keeping the
+  earlier failing diagnostic. `scripts/check-cargo-audit.py` exited **0** with
+  no `error:`/`warning:` diagnostics: 1,509 advisories loaded, 1,079
+  dependencies scanned, registry yanked-package check completed. Log:
+  `target/harness-reliability/h39-audit-resume-1.log`, committed copy at
+  `docs/verification/h39-audit-resume-1.txt`. The gate was not bypassed
+  (`--no-yanked`, `--no-fetch`, new exceptions and exit-code-only assertions
+  were not used).
+- Re-verified source integrity against `h39-final-source-sha256.json`:
+  **1,013 of 1,014 hashes match**. The single difference is
+  `docs/harness-reliability-work-log.md`, whose checkpoint section was added
+  after the battery finished; `docs/verification/h39-audit-checkpoint.txt` was
+  the other post-run addition. No production or test source changed, so the
+  already-passing battery evidence is retained rather than repeated.
+- All local gates are therefore clean on this candidate. ADR-87 moves to
+  full-local-verification-complete pending exact-head CI. Publication goes
+  through the existing topic PR #379 to `dev`; exact-head remote results must
+  still be recorded here and in the ADR before it is marked Accepted.
+- H39 remains open beyond the root milestone: specialist/process-scoped history
+  and cancelled-run spend settlement are unresolved. H40/H41 remain
+  checkpointed preparation only.

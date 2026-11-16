@@ -33,7 +33,6 @@ use crate::agents::tool_blocks::{parse_tool_blocks, BlockDecision};
 use crate::cycle::CycleBudgetTracker;
 use crate::exec_backend::ToolExecutionBackend;
 use crate::prompts::PromptBuilder;
-use crate::session_manager::message_row_usage;
 use crate::shell_repair::{self, ShellFailure};
 use crate::state::AgentState;
 use crate::tool_driver::{self, TextToolDriver};
@@ -542,6 +541,11 @@ impl AgentLoop {
         self.tool_attempts.clear();
         self.deterministic_failures.clear();
         self.pending_approval = None;
+        // Usage spans continuation rounds, but never separate calls to run().
+        self.usage_tokens_in = 0;
+        self.usage_tokens_out = 0;
+        self.usage_cost_usd = 0.0;
+        self.usage_latency_ms = 0;
         self.degraded.store(false, Ordering::Relaxed);
         // ADR-82 H04: reset the run freshness clock every run (never leaks
         // across runs or continuation rounds) and arm it when the strict gate
@@ -580,9 +584,17 @@ impl AgentLoop {
                 });
             }
 
-            let exit = self
+            let exit = match self
                 .run_once(task.clone(), seed, cancel.clone(), cumulative_progress.as_ref())
-                .await?;
+                .await
+            {
+                Ok(exit) => exit,
+                Err(error) => {
+                    let outcome = crate::provider_transcript::run_failure(task.id, &error);
+                    self.persist_provider_messages(session_id, &[outcome]).await;
+                    return Err(error);
+                }
+            };
 
             match exit {
                 AgentRunExit::Done(mut output) => {
@@ -748,6 +760,7 @@ impl AgentLoop {
                         tokens_in: None,
                         tokens_out: None,
                     });
+                    self.persist_provider_messages(session_id, &history[history.len() - 1..]).await;
                     self.initial_messages = history.clone();
                     continue;
                 }
@@ -820,7 +833,7 @@ impl AgentLoop {
     /// surfaces as a session event (`AgentThought` diagnostic channel — an
     /// existing payload field, no schema change) so the session event log
     /// carries WHY the run ended; the same reason lands in the message log
-    /// through `persist_run_partial`'s assistant summary. Content is
+    /// through `persist_run_partial`'s labeled runtime outcome. Content is
     /// truncated ([`END_REASON_CHARS`]) and fail-soft (a publish failure
     /// never changes the run's outcome).
     fn publish_end_reason(
@@ -983,14 +996,6 @@ impl AgentLoop {
             );
 
             // Phase 4: Call provider with retry
-            let request_started = std::time::Instant::now();
-            let request_tokens_in = request
-                .messages
-                .iter()
-                .map(|message| message.content.len() as u64)
-                .sum::<u64>()
-                .div_ceil(4);
-
             let CompletedTurn { text, reasoning, tool_calls, usage, gemini_replay } = match self
                 .call_provider_with_retry(&request, task.session_id, task.id, &cancel)
                 .await
@@ -1095,27 +1100,8 @@ impl AgentLoop {
                 },
             );
 
-            // Token accounting. ADR-48 decision 4: the provider-reported usage on the
-            // final chunk is the source of truth when present; the byte/4
-            // heuristic remains the fallback for providers that do not report
-            // usage. `0` is a valid measured value, so only `None` falls back.
-            let measured_tokens_in = usage.as_ref().and_then(|u| u.prompt_tokens);
-            let measured_tokens_out = usage.as_ref().and_then(|u| u.completion_tokens);
-            let tool_call_chars = serde_json::to_string(&tool_calls)
-                .map(|value| value.len() as u64)
-                .unwrap_or_default();
-            let estimated_tokens_out =
-                ((text.len() as u64).saturating_add(tool_call_chars)).div_ceil(4);
-            let usage_tokens_in = measured_tokens_in.unwrap_or(request_tokens_in);
-            let usage_tokens_out = measured_tokens_out.unwrap_or(estimated_tokens_out);
-            self.usage_tokens_in = self.usage_tokens_in.saturating_add(usage_tokens_in);
-            self.usage_tokens_out = self.usage_tokens_out.saturating_add(usage_tokens_out);
-            self.usage_cost_usd +=
-                self.provider.approximate_cost(usage_tokens_in, usage_tokens_out);
-            self.usage_latency_ms =
-                self.usage_latency_ms.saturating_add(request_started.elapsed().as_millis() as u64);
-
             // Phase 5: Process provider response
+            let transcript_start = messages.len();
             let action = self.process_provider_response(
                 CompletedTurn {
                     text: text.clone(),
@@ -1133,6 +1119,7 @@ impl AgentLoop {
                 &mut final_message,
                 &mut completed,
             );
+            self.persist_provider_messages(task.session_id, &messages[transcript_start..]).await;
             match action {
                 ProviderResponseAction::Break
                     if self
@@ -1530,6 +1517,19 @@ impl AgentLoop {
                     });
                 }
                 BlockDecision::Exhausted { reason } => {
+                    let reply = Message {
+                        role: Role::Assistant,
+                        content: text.clone(),
+                        tool_calls: None,
+                        tool_results: None,
+                        reasoning_content: reasoning.clone(),
+                        tokens_in: usage.as_ref().and_then(|usage| usage.prompt_tokens),
+                        tokens_out: usage.as_ref().and_then(|usage| usage.completion_tokens),
+                        gemini_replay: gemini_replay.take(),
+                    };
+                    self.persist_provider_messages(task.session_id, std::slice::from_ref(&reply))
+                        .await;
+                    messages.push(reply);
                     self.tool_executor
                         .record_tool_driver_event(
                             task.session_id,
@@ -1584,10 +1584,15 @@ impl AgentLoop {
                         tool_calls: None,
                         tool_results: None,
                         reasoning_content: reasoning.clone(),
-                        tokens_in: None,
-                        tokens_out: None,
+                        tokens_in: usage.as_ref().and_then(|usage| usage.prompt_tokens),
+                        tokens_out: usage.as_ref().and_then(|usage| usage.completion_tokens),
                     });
                     messages.push(TextToolDriver::repair_message(&reason));
+                    self.persist_provider_messages(
+                        task.session_id,
+                        &messages[messages.len() - 2..],
+                    )
+                    .await;
                     let mut request = self.build_provider_request(
                         &task.description,
                         iteration,
@@ -1608,7 +1613,7 @@ impl AgentLoop {
                     } = self
                         .call_provider_with_retry(&request, task.session_id, task.id, cancel)
                         .await?;
-                    usage = tool_driver::merge_usage(usage, repaired_usage);
+                    usage = repaired_usage;
                     text = repaired_text;
                     reasoning = repaired_reasoning;
                     gemini_replay = repaired_replay;
@@ -1622,15 +1627,17 @@ impl AgentLoop {
     ///
     /// Delegates to [`crate::prompts::complete_provider_request`], which wraps
     /// stream creation and collection with the time-to-first-byte and
-    /// stream-idle timeouts from the configured retry policy, retries only
-    /// before any output has begun, and is cancel-aware.
+    /// stream-idle timeouts from the configured retry policy, discards
+    /// incomplete attempts before retrying, and is cancel-aware. Tools only
+    /// execute after a complete response has been collected.
     async fn call_provider_with_retry(
-        &self,
+        &mut self,
         request: &CompletionRequest,
         session_id: Ulid,
         task_id: TaskId,
         cancel: &CancellationToken,
     ) -> Result<CompletedTurn, OrchestratorError> {
+        let started = std::time::Instant::now();
         match crate::prompts::complete_provider_request(
             &self.provider,
             request,
@@ -1642,7 +1649,10 @@ impl AgentLoop {
         )
         .await
         {
-            Ok(turn) => Ok(turn),
+            Ok(turn) => {
+                self.record_completed_usage(request, &turn, started.elapsed());
+                Ok(turn)
+            }
             Err(OrchestratorError::Provider(ProviderError::CapabilityRefused {
                 provider,
                 model,
@@ -1672,11 +1682,40 @@ impl AgentLoop {
         }
     }
 
+    /// Account at the completed request boundary, including repair attempts
+    /// that precede a later error. Each persisted assistant keeps its own usage.
+    fn record_completed_usage(
+        &mut self,
+        request: &CompletionRequest,
+        turn: &CompletedTurn,
+        latency: std::time::Duration,
+    ) {
+        let estimated_input = request
+            .messages
+            .iter()
+            .map(|message| message.content.len() as u64)
+            .sum::<u64>()
+            .div_ceil(4);
+        let call_bytes = serde_json::to_vec(&turn.tool_calls).map_or(0, |value| value.len() as u64);
+        let estimated_output = (turn.text.len() as u64).saturating_add(call_bytes).div_ceil(4);
+        let tokens_in =
+            turn.usage.as_ref().and_then(|usage| usage.prompt_tokens).unwrap_or(estimated_input);
+        let tokens_out = turn
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.completion_tokens)
+            .unwrap_or(estimated_output);
+        self.usage_tokens_in = self.usage_tokens_in.saturating_add(tokens_in);
+        self.usage_tokens_out = self.usage_tokens_out.saturating_add(tokens_out);
+        self.usage_cost_usd += self.provider.approximate_cost(tokens_in, tokens_out);
+        self.usage_latency_ms = self.usage_latency_ms.saturating_add(latency.as_millis() as u64);
+    }
+
     /// Phase 5: Process the provider's text response and tool calls.
     ///
     /// Pushes the assistant message to the conversation, attributes
-    /// provider-reported usage per ADR-48 decision 4 (`completion_tokens` on
-    /// the assistant message, `prompt_tokens` on the preceding user message),
+    /// provider-reported usage to that assistant turn without duplicating the
+    /// prompt count on an earlier user message,
     /// then evaluates whether the loop should break (task done), continue to
     /// the next iteration without executing tools (re-prompt needed), or
     /// proceed with tool execution.
@@ -1717,14 +1756,6 @@ impl AgentLoop {
             tokens_in,
             tokens_out,
         });
-
-        // Attribute the prompt usage to the last user message so every message
-        // in the persisted transcript carries its own measured cost (ADR-48).
-        if let (Some(prompt_tokens), Some(user_message)) =
-            (tokens_in, messages.iter_mut().rev().find(|m| m.role == Role::User))
-        {
-            user_message.tokens_in = Some(prompt_tokens);
-        }
 
         // Single-agent loop contract (issue #145): when the provider returns
         // no tool calls, prose completes the turn in every mode except
@@ -1814,19 +1845,23 @@ impl AgentLoop {
         messages: &mut Vec<Message>,
     ) -> Result<(), OrchestratorError> {
         for tc in tool_calls {
-            self.execute_single_tool_call(
-                tc,
-                task,
-                correlation_id,
-                session,
-                cancel.clone(),
-                tool_call_count,
-                file_changing_tool_count,
-                files_modified,
-                tool_events,
-                messages,
-            )
-            .await?;
+            let transcript_start = messages.len();
+            let result = self
+                .execute_single_tool_call(
+                    tc,
+                    task,
+                    correlation_id,
+                    session,
+                    cancel.clone(),
+                    tool_call_count,
+                    file_changing_tool_count,
+                    files_modified,
+                    tool_events,
+                    messages,
+                )
+                .await;
+            self.persist_provider_messages(task.session_id, &messages[transcript_start..]).await;
+            result?;
             // An approval timeout pauses the run: stop the remaining calls in
             // this batch so no further tool call is issued while awaiting the
             // user. `run_once` turns it into `AgentRunExit::AwaitingApproval`.
@@ -2113,6 +2148,20 @@ impl AgentLoop {
     // durable record is lost.
     // -----------------------------------------------------------------------
 
+    async fn persist_provider_messages(&self, session_id: Ulid, messages: &[Message]) {
+        if let Err(error) = crate::provider_transcript::append_completed_messages(
+            self.session_store.as_ref(),
+            session_id,
+            messages,
+            CancellationToken::new(),
+        )
+        .await
+        {
+            self.degraded.store(true, Ordering::Relaxed);
+            tracing::warn!(%error, %session_id, "failed to persist completed provider conversation");
+        }
+    }
+
     async fn persist_run_start(&self, task: &AgentTask, cancel: CancellationToken) {
         let Some(store) = &self.session_store else {
             return;
@@ -2171,6 +2220,9 @@ impl AgentLoop {
             return;
         };
 
+        let outcome = crate::provider_transcript::run_outcome(output);
+        self.persist_provider_messages(session_id, &[outcome]).await;
+
         if cancel.is_cancelled() {
             return;
         }
@@ -2205,29 +2257,6 @@ impl AgentLoop {
             self.degraded.store(true, Ordering::Relaxed);
             tracing::warn!(error = %e, "failed to persist TaskCompleted event");
         }
-
-        // ADR-48 §4: the terminal assistant row carries the run's
-        // provider-reported usage, the same totals the `provider_metrics`
-        // rows record for this run. The run-start user row predates any
-        // provider call and keeps `None`.
-        let (tokens_in, tokens_out) = message_row_usage(&output.provider_metrics);
-        let assistant_msg = Message {
-            gemini_replay: None,
-            role: Role::Assistant,
-            content: output.summary(),
-            tool_calls: None,
-            tool_results: None,
-            reasoning_content: None,
-            tokens_in,
-            tokens_out,
-        };
-        if cancel.is_cancelled() {
-            return;
-        }
-        if let Err(e) = store.append_messages(session_id, &[assistant_msg], cancel.clone()).await {
-            self.degraded.store(true, Ordering::Relaxed);
-            tracing::warn!(error = %e, "failed to persist assistant message");
-        }
     }
 
     async fn persist_run_partial(
@@ -2239,6 +2268,9 @@ impl AgentLoop {
         let Some(store) = &self.session_store else {
             return;
         };
+
+        let outcome = crate::provider_transcript::run_outcome(output);
+        self.persist_provider_messages(session_id, &[outcome]).await;
 
         if cancel.is_cancelled() {
             return;
@@ -2259,27 +2291,6 @@ impl AgentLoop {
         if let Err(e) = store.record_event(session_id, &event, cancel.clone()).await {
             self.degraded.store(true, Ordering::Relaxed);
             tracing::warn!(error = %e, "failed to persist TaskCompleted event");
-        }
-
-        // Same accounting as `persist_run_success`: the partial landing still
-        // spent real tokens, so the assistant row records them (ADR-48 §4).
-        let (tokens_in, tokens_out) = message_row_usage(&output.provider_metrics);
-        let assistant_msg = Message {
-            gemini_replay: None,
-            role: Role::Assistant,
-            content: output.summary(),
-            tool_calls: None,
-            tool_results: None,
-            reasoning_content: None,
-            tokens_in,
-            tokens_out,
-        };
-        if cancel.is_cancelled() {
-            return;
-        }
-        if let Err(e) = store.append_messages(session_id, &[assistant_msg], cancel.clone()).await {
-            self.degraded.store(true, Ordering::Relaxed);
-            tracing::warn!(error = %e, "failed to persist assistant message");
         }
     }
 
@@ -3536,6 +3547,7 @@ impl AgentLoop {
 
 #[cfg(test)]
 mod tests {
+    include!("agent_loop_transcript_regressions.rs");
     use super::*;
     use crate::verify::{
         eval_error_record, eval_result_record, verify_file_changes, EVAL_HARNESS_VERIFIER,
@@ -7225,13 +7237,10 @@ mod tests {
         }
     }
 
-    /// A completed run records the run's provider-reported usage on the
-    /// terminal assistant row (ADR-48 §4), while the run-start user row —
-    /// written before any provider call — carries no usage. Runs through the
-    /// real persistence seams against an in-memory store, so the asserted
-    /// values are the ones that actually land in the `messages` table.
+    /// Settlement must not insert a summary that duplicates usage already
+    /// recorded on the original provider turn.
     #[tokio::test]
-    async fn persist_run_success_records_usage_on_the_assistant_row() {
+    async fn settlement_does_not_duplicate_provider_turn_usage() {
         let store = concerto_sessions::SqliteSessionStore::connect_in_memory()
             .await
             .expect("in-memory sessions store");
@@ -7267,13 +7276,27 @@ mod tests {
             cost_usd: 0.0,
             latency_ms: 1,
         }];
+        let reply = Message {
+            role: Role::Assistant,
+            content: "Original provider answer".into(),
+            tokens_in: Some(120),
+            tokens_out: Some(60),
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: None,
+            gemini_replay: None,
+        };
+        loop_.persist_provider_messages(session_id, &[reply]).await;
         loop_.persist_run_success(session_id, &output, cancel.clone()).await;
 
         let messages = store.load_messages(session_id, cancel).await.expect("load messages");
-        assert_eq!(messages.len(), 2, "run-start user row + terminal assistant row");
+        assert_eq!(messages.len(), 3, "user, original provider turn and runtime outcome");
+        assert_eq!(messages[2].role, Role::System);
+        assert_eq!((messages[2].tokens_in, messages[2].tokens_out), (None, None));
         assert_eq!(messages[0].role, Role::User, "first row is the run-start user row");
         assert_eq!(messages[0].tokens_in, None, "no provider call had happened yet");
-        assert_eq!(messages[1].role, Role::Assistant, "second row is the assistant summary");
+        assert_eq!(messages[1].role, Role::Assistant);
+        assert_eq!(messages[1].content, "Original provider answer");
         assert_eq!(messages[1].tokens_in, Some(120), "provider-reported prompt tokens recorded");
         assert_eq!(
             messages[1].tokens_out,
@@ -8997,9 +9020,8 @@ mod tests {
         // Has tool calls → Proceed
         assert!(matches!(action, ProviderResponseAction::Proceed));
         assert_eq!(messages.len(), 2);
-        // ADR-48 §4: completion usage lands on the assistant message, prompt
-        // usage is attributed to the preceding user message.
-        assert_eq!(messages[0].tokens_in, Some(100), "prompt usage attributed to user message");
+        // Each completed provider turn owns both usage counts exactly once.
+        assert_eq!(messages[0].tokens_in, None);
         assert_eq!(messages[0].tokens_out, None);
         assert_eq!(messages[1].tokens_in, Some(100));
         assert_eq!(messages[1].tokens_out, Some(20));

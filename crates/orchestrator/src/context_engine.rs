@@ -150,7 +150,9 @@ impl ContextEngine {
     /// Assemble the bounded active history for the next request: maintain any
     /// newly eligible durable checkpoints under this engine's policy, then
     /// materialize the checkpoint frontier plus the uncompacted tail. The
-    /// source transcript is never modified. When a bus is supplied, every
+    /// source transcript is never modified. Interrupted tool exchanges receive
+    /// explicit unknown-outcome responses in the assembled request only; no
+    /// missing call is executed or reported as successful. When a bus is supplied, every
     /// compaction decision is published as `EventKind::ContextCompacted`
     /// (ADR-048 §5).
     pub async fn assemble(
@@ -161,7 +163,7 @@ impl ContextEngine {
         cancel: CancellationToken,
         bus: Option<&concerto_core::event::EventBus>,
     ) -> Result<Vec<Message>, SessionError> {
-        context_compaction::refresh_and_materialize_with_policy(
+        let messages = context_compaction::refresh_and_materialize_with_policy(
             store,
             session_id,
             fallback_history,
@@ -169,7 +171,8 @@ impl ContextEngine {
             cancel,
             bus,
         )
-        .await
+        .await?;
+        Ok(crate::provider_transcript::restore_tool_responses(messages))
     }
 
     /// Persist any newly eligible checkpoint ranges after a completed run,
@@ -591,5 +594,91 @@ mod tests {
                 serde_json::to_value(before).unwrap()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn transcript_regression_interrupted_batch_preserves_results_and_marks_unknown_outcomes()
+    {
+        use concerto_core::types::{ToolCall, ToolResult};
+        let store = Arc::new(SqliteSessionStore::connect_in_memory().await.unwrap());
+        let session = store
+            .create_session(Utf8Path::new("/project"), "test", "test", CancellationToken::new())
+            .await
+            .unwrap();
+        let calls: Vec<_> = ["done-one", "done-two", "unknown"]
+            .into_iter()
+            .map(|id| ToolCall {
+                id: id.into(),
+                name: "shell".into(),
+                arguments: serde_json::json!({"command": id}),
+                thought_signature: Some(format!("signature-{id}")),
+            })
+            .collect();
+        let mut assistant = message(Role::Assistant, "Run the checks");
+        assistant.tool_calls = Some(calls.clone());
+        assistant.gemini_replay = Some(
+            concerto_core::provider_replay::GeminiReplay::capture(
+                calls
+                    .iter()
+                    .map(|call| {
+                        serde_json::json!({"functionCall": {
+                "id":call.id, "name":call.name, "args":call.arguments
+            }, "thoughtSignature":call.thought_signature})
+                    })
+                    .collect(),
+                &assistant.content,
+                None,
+                &calls,
+            )
+            .unwrap(),
+        );
+        let mut first = message(Role::Tool, "first recorded result");
+        first.tool_results = Some(vec![ToolResult {
+            id: "done-one".into(),
+            name: "shell".into(),
+            content: serde_json::json!({"exit_code": 1}),
+        }]);
+        let mut second = message(Role::Tool, "second recorded result");
+        second.tool_results = Some(vec![ToolResult {
+            id: "done-two".into(),
+            name: "shell".into(),
+            content: serde_json::json!({"exit_code": 0}),
+        }]);
+        // A corrective instruction can occur between results in one batch.
+        // It must not cause a later real result to be mistaken for a missing one.
+        let original = vec![
+            message(Role::User, "Check"),
+            assistant,
+            first,
+            message(Role::User, "Inspect the first failure before retrying"),
+            second,
+        ];
+        store.append_messages(session.id, &original, CancellationToken::new()).await.unwrap();
+        let assembled = ContextEngine::new()
+            .assemble(store.clone(), session.id, &[], CancellationToken::new(), None)
+            .await
+            .unwrap();
+        let results: Vec<_> =
+            assembled.iter().filter_map(|m| m.tool_results.as_ref()).flatten().collect();
+        assert_eq!(results.len(), 3, "every original call needs a response for valid replay");
+        assert_eq!(results[0].content, serde_json::json!({"exit_code": 1}));
+        assert_eq!(results[1].content, serde_json::json!({"exit_code": 0}));
+        assert_eq!(results[2].id, "unknown");
+        assert_eq!(results[2].content["status"], "outcome_unknown");
+        assert!(results[2].content["error"].as_str().unwrap().contains("may have executed"));
+        assert!(results[2].content["error"].as_str().unwrap().contains("before retrying"));
+        assert!(assembled[2..5].iter().all(|m| m.role == Role::Tool));
+        assert_eq!(assembled[5].content, original[3].content);
+        assert_eq!(
+            serde_json::to_value(&assembled[1]).unwrap(),
+            serde_json::to_value(&original[1]).unwrap()
+        );
+        assert!(assembled[1].gemini_replay.as_ref().unwrap().parts_for(&assembled[1]).is_some());
+        let stored = store.load_messages(session.id, CancellationToken::new()).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(stored).unwrap(),
+            serde_json::to_value(original).unwrap(),
+            "recovery annotations must not pretend to be durable execution evidence"
+        );
     }
 }

@@ -195,6 +195,18 @@ cargo audit
   (`crates/providers/src/provider_defs.rs`) holds the last hand-verified set
   and live discovery (`GET /zen/v1/models`) covers the rest.
 
+## Provider history and runtime outcomes (ADR-87)
+
+Root single-agent and coordinator dispatch turns are persisted separately from
+rendered UI summaries. Keep original assistant calls, reasoning/native replay
+and completed tool results; never replace them with a synthetic assistant
+summary or duplicate aggregate usage. Runtime verification and stop reasons are
+labeled system observations with no usage. `provider_transcript.rs` bounds
+cleanup independently of generation cancellation. Context assembly adds
+request-only unknown-outcome responses for interrupted calls: never treat them
+as executed evidence or automatically rerun a historical call. Independent
+specialist/process histories remain separate unfinished H39 work.
+
 ## Key entrypoints (start reading here)
 - Interactive application: `crates/orchestrator/src/conversation.rs` — shared
   controller for TUI and desktop (ADR-84). Put conversation submission,

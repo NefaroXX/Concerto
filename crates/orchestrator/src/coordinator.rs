@@ -12766,6 +12766,8 @@ impl CoordinatorAgent {
             tokens_in: None,
             tokens_out: None,
         });
+        // Initial history and the submitted user turn already have persistence owners.
+        let mut transcript_cursor = messages.len();
         // ── Issue #63: resume one-shot WAIT re-evaluation ────────────────
         // A checkpoint-restored in-flight wait is NEVER re-entered into the
         // park loop; instead it is re-evaluated exactly once against the
@@ -12889,6 +12891,13 @@ impl CoordinatorAgent {
                 }
             }
 
+            self.persist_dispatch_messages(
+                task.session_id,
+                &messages,
+                &mut transcript_cursor,
+                ledger,
+            )
+            .await;
             if let Some(inbox) = &self.conversation_inbox {
                 let incoming = inbox
                     .receive(self.session_store.as_ref(), Some(&self.bus), task.session_id, cancel)
@@ -12897,12 +12906,14 @@ impl CoordinatorAgent {
                     self.conversation_resume = true;
                 }
                 messages.extend(incoming);
+                // ConversationInbox persisted these delivered user messages.
+                transcript_cursor = messages.len();
             }
 
             // W3c: issue the per-turn provider request and record its provider
             // metrics on the ledger in one ordered unit
             // ([`Self::request_dispatch_turn`]).
-            let CompletedTurn { text, reasoning, tool_calls, gemini_replay, .. } = self
+            let CompletedTurn { text, reasoning, tool_calls, gemini_replay, usage } = self
                 .request_dispatch_turn(model.as_str(), &messages, &tool_defs, task, cancel, ledger)
                 .await?; // provider-class errors classify at the decompose level
 
@@ -12913,9 +12924,16 @@ impl CoordinatorAgent {
                 tool_calls: (!tool_calls.is_empty()).then_some(tool_calls.clone()),
                 tool_results: None,
                 reasoning_content: reasoning,
-                tokens_in: None,
-                tokens_out: None,
+                tokens_in: usage.as_ref().and_then(|usage| usage.prompt_tokens),
+                tokens_out: usage.as_ref().and_then(|usage| usage.completion_tokens),
             });
+            self.persist_dispatch_messages(
+                task.session_id,
+                &messages,
+                &mut transcript_cursor,
+                ledger,
+            )
+            .await;
 
             if tool_calls.is_empty() {
                 // A message arriving during the provider request gets its
@@ -13027,7 +13045,6 @@ impl CoordinatorAgent {
                     crate::conversation::REPLY_TOOL if self.conversation_inbox.is_some() => {
                         crate::conversation::reply_to_user(
                             &tool_call.arguments,
-                            self.session_store.as_ref(),
                             &self.bus,
                             task,
                             cancel,
@@ -13313,6 +13330,13 @@ impl CoordinatorAgent {
                     tokens_in: None,
                     tokens_out: None,
                 });
+                self.persist_dispatch_messages(
+                    task.session_id,
+                    &messages,
+                    &mut transcript_cursor,
+                    ledger,
+                )
+                .await;
                 // ADR-35 amendment (2026-09-16 §2): the tool result was just
                 // delivered and the Coordinator requested human input — stop
                 // this batch's remaining tool calls; the outer break below
@@ -13460,7 +13484,37 @@ impl CoordinatorAgent {
             ));
         }
 
+        self.persist_dispatch_messages(task.session_id, &messages, &mut transcript_cursor, ledger)
+            .await;
         Ok((summary, advisory_plan))
+    }
+
+    /// Capture canonical turns before another provider/tool operation can fail.
+    /// User inbox delivery and rendered transcript recording have separate owners.
+    async fn persist_dispatch_messages(
+        &self,
+        session_id: Ulid,
+        messages: &[Message],
+        cursor: &mut usize,
+        ledger: &mut DispatchLedger,
+    ) {
+        let result = crate::provider_transcript::append_completed_messages(
+            self.session_store.as_ref(),
+            session_id,
+            &messages[*cursor..],
+            CancellationToken::new(),
+        )
+        .await;
+        // Never retry an ambiguous commit: repeating a batch could duplicate it.
+        *cursor = messages.len();
+        if let Err(error) = result {
+            tracing::warn!(%error, %session_id, "failed to persist completed coordinator conversation");
+            let note =
+                "Session persistence failed; the durable provider transcript may be incomplete.";
+            if !ledger.notes.iter().any(|existing| existing == note) {
+                ledger.notes.push(note.into());
+            }
+        }
     }
 
     /// W3c (run_dispatch_session per-turn request): issue one dispatch-loop
@@ -18467,6 +18521,7 @@ impl CoordinatorAgent {
 
 #[cfg(test)]
 mod tests {
+    include!("coordinator_transcript_regressions.rs");
     // R02: resume/continue coverage lives in `coordinator/tests/resume_tests.rs`.
     mod resume_tests;
     mod specialist_execution;

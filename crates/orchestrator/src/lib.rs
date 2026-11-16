@@ -70,6 +70,7 @@ pub mod progress;
 pub mod project_context;
 pub mod prompts;
 mod provider_telemetry;
+mod provider_transcript;
 mod read_cache;
 pub mod registry;
 pub mod resolver;

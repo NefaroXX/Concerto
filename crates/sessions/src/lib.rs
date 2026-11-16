@@ -559,15 +559,16 @@ impl SqliteSessionStore {
             .await
     }
 
-    /// Connect to an explicit database path. SQLite WAL and `busy_timeout`
-    /// provide safe multi-process coordination; no process-lifetime advisory
-    /// lock is held.
+    /// Connect to an explicit plaintext database path. SQLite WAL and
+    /// `busy_timeout` provide safe multi-process coordination; no
+    /// process-lifetime advisory lock is held. Marked encrypted databases are
+    /// rejected; open those with [`Self::connect_with_at_rest`] instead.
     ///
-    /// Self-heals a corrupted database (ADR-54): if the first open fails, the
-    /// main file is quarantined to `<name>.corrupt-<unix_utc_ts>.bak` and the
-    /// open is retried once against a fresh database. If that retry also
-    /// fails, the original error is returned (it is never masked).
-    async fn connect_path(db_path: &std::path::Path) -> Result<Self, SessionError> {
+    /// Self-heals an invalid database header (ADR-54): the main file is
+    /// quarantined to `<name>.corrupt-<unix_utc_ts>.bak` and the open is retried
+    /// once against a fresh database. Schema or migration errors on a valid
+    /// SQLite file never quarantine it. A failed retry returns the original error.
+    pub async fn connect_path(db_path: &std::path::Path) -> Result<Self, SessionError> {
         // A marker-carrying database is encrypted: never open it with the
         // plaintext path (and therefore never let the ADR-54 header heuristic
         // below quarantine a healthy encrypted file).

@@ -1,6 +1,6 @@
 # ADR-86: Gemini native response replay
 
-**Status:** Proposed — implementation and full local verification complete; exact-head CI pending
+**Status:** Accepted — full local battery and all 12 exact-head CI checks passed on 14390eb
 **Date:** 2026-11-15
 
 ## Problem
