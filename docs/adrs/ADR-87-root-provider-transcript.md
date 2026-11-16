@@ -1,7 +1,7 @@
 # ADR-87: Persist root provider turns independently of rendered summaries
 
 - Date: 2026-11-16
-- Status: Proposed — implementation and full local verification complete; exact-head CI pending
+- Status: Accepted — full local battery and all 12 exact-head CI checks passed on 2dbf25a
 - Related: ADR-36, ADR-48, ADR-85, ADR-86; H39 in the harness reliability log
 
 ## Problem

@@ -2424,3 +2424,9 @@ has terminated; there is no remaining validation process to wait on.
 - H39 remains open beyond the root milestone: specialist/process-scoped history
   and cancelled-run spend settlement are unresolved. H40/H41 remain
   checkpointed preparation only.
+- Published the root milestone as `2dbf25a` on `fix/harness-streaming-integrity`
+  (PR #379, base `dev`). **All 12 exact-head checks passed**: `43910428429`
+  (format, clippy, tests, build, benchmarks, WASM, cargo-deny, cargo-audit,
+  palette) and `43910428481` (Linux/macOS/Windows native shell). ADR-87 is
+  Accepted for the root boundary. H39's specialist/process and cancelled-run
+  spend work stays open, so this is not overall H39 completion.
