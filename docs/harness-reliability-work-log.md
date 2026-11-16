@@ -48,8 +48,9 @@ passing repository tests alone does not close a finding.
 | H36 | P2 | cargo-audit can report incomplete registry checks with exit zero | Fixed and verified on 66309f8; awaiting merge |
 | H37 | P1 | Native provider wire adapters discard mandatory system/assistant text | Fixed; full local battery and all 12 exact-head CI checks passed |
 | H38 | P2 | Gemini canonical history loses native part order/text signatures and misclassifies thought text | Full local battery passed; exact-head GitHub verification pending |
-| H39 | P1 | Run settlement persists summaries instead of complete provider history | Open; source path confirmed, restart reproduction required |
-| H40 | P2 | Headless multi-agent history clips messages and older obligations before dispatch | Open; source path confirmed, baseline regressions prepared |
+| H39 | P1 | Run settlement persists summaries instead of complete provider history | Root repair checkpointed locally at a88e841; strict audit incomplete after registry timeout; specialist/process and cancelled-spend work remain open |
+| H40 | P2 | Headless multi-agent history clips messages and older obligations before dispatch | Cutoff probes reproduced; request fixtures checkpointed at 950a722, not executed; production routing unchanged |
+| H41 | P1 | XDG-isolated settings CLI fixtures can access the real macOS profile | Source-confirmed; Linux-only gate checkpointed at 950a722, unverified/unpublished |
 
 
 ## 2026-10-29 — H01: preserve streaming events across chunks
@@ -2161,3 +2162,38 @@ Next: patch H18, then continue H07's truthful verification/completion handling.
   probes target lost late constraints and older unresolved obligations. Final
   coverage must capture the actual headless provider request and inspect
   approved-plan semantics. No H39/H40 implementation is included in H38.
+
+
+## 2026-11-16 — User-requested checkpoint and OpenCode handoff
+
+Start with [the OpenCode handoff](opencode-harness-handoff.md). Work is paused
+for transfer; the overall harness goal is not complete.
+
+- Published PR #379 remains at `14390eb0a54581ca9deee7562f2d069f974cd8d9`,
+  with all twelve remote checks verified green. No remote branch was changed.
+- H39 root recovery is checkpointed locally at
+  `a88e8419ffdfb8f6d771f285f4e8e13681cef037` in the `h39` worktree. Its own work
+  log contains the detailed implementation, baseline failures and corrections.
+- The final local H39 battery passed **6,149 workspace tests, zero failures,
+  17 ignored across 86 groups**, warning-denied all-target Clippy, formatting,
+  full/default/single-frontend builds, launcher smokes, four WASM guests,
+  nine benchmark targets, the released coverage fixture, palette and 13 Python
+  tests. Cargo-deny passed with **67 duplicate warnings still tracked by H28**.
+- **Strict cargo-audit failed, exit 1, after the registry yanked-package check
+  timed out.** It loaded 1,509 advisories and scanned 1,079 dependencies, then
+  the strict wrapper correctly rejected error diagnostics despite cargo-audit's
+  zero status. This is incomplete verification. Do not publish H39 or bypass
+  the gate. The runner is terminal; rerun that unchanged gate with a new log.
+- All 1,014 source hashes matched after validation and before documentation-only
+  checkpoint additions. Evidence remains under main
+  `target/harness-reliability/h39-final-*`; the failure diagnostic is also
+  committed under H39's `docs/verification/h39-audit-checkpoint.txt`.
+- H40/H41 preparation is checkpointed at
+  `950a722b63299c83de48cce2720a28e33bcba31f` in the `h40` worktree: existing cutoff
+  probes, an unexecuted real-CLI loopback fixture, an unwired coordinator parity
+  test, and the settings-fixture Linux gate. Integrate verified H39 before
+  compiling its new CLI fixture. Production headless routing is unchanged.
+- Dedicated `checkpoint/opencode-h39-2026-11-16` and
+  `checkpoint/opencode-h40-2026-11-16` refs preserve both WIP commits. Main is on
+  the documentation-only `checkpoint/opencode-harness-2026-11-16` branch.
+  These local checkpoints are not published verification milestones.
