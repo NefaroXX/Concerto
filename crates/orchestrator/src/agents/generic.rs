@@ -4452,6 +4452,7 @@ mod tests {
             duration_ms: 1234,
             output_tail: "ok".into(),
             coverage: None,
+            incomplete: false,
             provenance: EvalProvenance::Harness,
         };
         let s = GenericSpecialistAgent::format_summary(true, &result, "");
@@ -4469,6 +4470,7 @@ mod tests {
             duration_ms: 500,
             output_tail: "ok".into(),
             coverage: None,
+            incomplete: false,
             provenance: EvalProvenance::Harness,
         };
         let s = GenericSpecialistAgent::format_summary(true, &result, "Pass/Fail report");
@@ -4482,6 +4484,7 @@ mod tests {
             duration_ms: 300,
             output_tail: "FAILED test_foo".into(),
             coverage: None,
+            incomplete: false,
             provenance: EvalProvenance::Harness,
         };
         let s2 = GenericSpecialistAgent::format_summary(false, &result_fail, "Pass/Fail report");
@@ -4499,6 +4502,7 @@ mod tests {
             duration_ms: 10,
             output_tail: "error: could not find `Cargo.toml`".into(),
             coverage: None,
+            incomplete: false,
             provenance: EvalProvenance::Fallback,
         };
         let s = GenericSpecialistAgent::format_summary(false, &result, "");

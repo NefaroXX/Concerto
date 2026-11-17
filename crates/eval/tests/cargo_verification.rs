@@ -127,6 +127,7 @@ impl EvalProcessExecutor for RecordedOutput {
             summary: "fixture".into(),
             data: serde_json::json!({
                 "exit_code": self.exit_code, "stdout": self.stdout, "stderr": self.stderr,
+                "complete": true,
             }),
         })
     }

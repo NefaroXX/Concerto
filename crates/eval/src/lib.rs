@@ -359,12 +359,17 @@ impl EvalEngine {
                 .ok_or_else(|| {
                     EvalError::TestRunnerFailed("native executor returned no exit code".into())
                 })?;
+            // Fail closed: a governed executor that does not report capture
+            // completeness cannot certify that the evidence is complete.
+            let complete =
+                output.data.get("complete").and_then(serde_json::Value::as_bool).unwrap_or(false);
             return Ok(test_output::completed_result(
                 runner,
                 exit_code,
                 u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
                 output.data.get("stdout").and_then(serde_json::Value::as_str).unwrap_or_default(),
                 output.data.get("stderr").and_then(serde_json::Value::as_str).unwrap_or_default(),
+                complete,
             ));
         }
         let mut command = if let Some(profile) = &self.shell_profile {
@@ -405,6 +410,8 @@ impl EvalEngine {
                 duration_ms,
                 &String::from_utf8_lossy(&out.stdout),
                 &String::from_utf8_lossy(&out.stderr),
+                // `wait_with_output` drains both pipes to EOF: complete.
+                true,
             )),
             Ok(Err(e)) => Err(EvalError::Io(e)),
             Err(_elapsed) => Ok(EvalResult {
@@ -414,6 +421,7 @@ impl EvalEngine {
                 duration_ms,
                 output_tail: "timed out".into(),
                 coverage: None,
+                incomplete: false,
                 provenance: EvalProvenance::Harness,
             }),
         }
@@ -594,7 +602,9 @@ mod tests {
             );
             Ok(concerto_core::types::ToolOutput {
                 summary: "validated".into(),
-                data: serde_json::json!({"exit_code":0,"stdout":stdout,"stderr":""}),
+                data: serde_json::json!({
+                    "exit_code": 0, "stdout": stdout, "stderr": "", "complete": true,
+                }),
             })
         }
     }
@@ -1038,6 +1048,7 @@ mod tests {
             duration_ms: 100,
             output_tail: "all tests passed".into(),
             coverage: Some(inner),
+            incomplete: false,
             provenance: EvalProvenance::Harness,
         };
         let json = serde_json::to_string(&result).unwrap();

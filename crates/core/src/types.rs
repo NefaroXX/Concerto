@@ -1866,6 +1866,11 @@ pub struct EvalResult {
     /// Optional coverage measurement collected alongside the test run.
     #[serde(default)]
     pub coverage: Option<CoverageInfo>,
+    /// True when the captured process output was incomplete (a stream was
+    /// truncated at the capture limit or a pipe read failed). A passing
+    /// prefix cannot certify a run whose later evidence was discarded.
+    #[serde(default)]
+    pub incomplete: bool,
     /// Where this result came from: the project's detected harness, or the
     /// plain `cargo test` fallback used when no eval config was found.
     #[serde(default)]
@@ -3530,6 +3535,7 @@ mod tests {
             duration_ms: 12,
             output_tail: "ok".into(),
             coverage: None,
+            incomplete: false,
             provenance: EvalProvenance::Fallback,
         };
         let record = VerificationSummary::passed("src/lib.rs", "eval", "eval harness passed")

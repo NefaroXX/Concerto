@@ -43,7 +43,7 @@ passing repository tests alone does not close a finding.
 | H31 | P1 | Bundled SQLite/SQLCipher fails the WAL memory-disclosure security gate | Fixed and verified; awaiting merge |
 | H32 | P1 | Locked rustix fails the extended-attribute buffer soundness security gate | Fixed and verified; awaiting merge |
 | H33 | P2 | Nested Cargo fixtures can execute each other’s binaries with a shared target directory | Fixed and verified on 43a3e79; awaiting merge |
-| H34 | P2 | Bounded subprocess capture can conceal inconsistent test evidence without marking output incomplete | Open; source path traced, execution reproduction pending |
+| H34 | P2 | Bounded subprocess capture can conceal inconsistent test evidence without marking output incomplete | Fixed and verified; incomplete capture cannot certify an eval pass |
 | H35 | P1 | Locked quinn-udp fails fresh raw-lockfile security scan | Fixed and verified on 66309f8; awaiting merge |
 | H36 | P2 | cargo-audit can report incomplete registry checks with exit zero | Fixed and verified on 66309f8; awaiting merge |
 | H37 | P1 | Native provider wire adapters discard mandatory system/assistant text | Fixed; full local battery and all 12 exact-head CI checks passed |
@@ -54,7 +54,7 @@ passing repository tests alone does not close a finding.
 
 Table reconciled 2026-11-16 after the H39/H40/H41 publication; the H40 and
 H41 rows were previously left at their preparation state. Open work is the
-register below (H12, H14, H23, H29, H34, H39 remainder); H28 is scoped, with
+register below (H12, H14, H23, H29, H39 remainder); H28 is scoped, with
 only upstream- or platform-gated duplicate families left.
 
 
@@ -2647,3 +2647,46 @@ has terminated; there is no remaining validation process to wait on.
   - **Dev-only:** the rand_core 0.9/0.10 split, where 0.10 arrives only through
     the memory crate's dev-only rand 0.10; criterion and proptest resolve onto
     existing versions and add no family.
+
+## 2026-11-17 — H34: incomplete subprocess capture cannot certify a pass
+
+- Defect: `ProcessHandle::read_bounded` caps each stream at 10 MiB, drains and
+  discards the remainder, and `spawn_and_collect` returned only text. On the
+  weak `run`/`run_with_env`/`run_native` paths the truncation/read error was
+  dropped, so a Cargo child that exited zero with a passing `test result:` line
+  in the captured prefix and a failing summary beyond the cap was scored
+  `passed = true` by `test_output::completed_result`.
+- Fix: `ProcessOutput` carries `pub complete: bool`, set from both streams'
+  capture errors on every `spawn_and_collect` return (status-collection failure
+  included); `read_bounded`'s bounded-drain behavior is unchanged and
+  `run_checked` still returns `ToolError::Io` on incomplete capture. The shell
+  tool adds `complete` to its `ToolOutput`, and eval reads it fail-closed
+  (missing means not certified). `completed_result` now refuses a pass when
+  capture was incomplete and appends an explicit incomplete-evidence note;
+  `EvalResult.incomplete` (`#[serde(default)]`) preserves the distinction in
+  reports. The direct `wait_with_output` path is complete by construction;
+  coverage consumes `run_checked`, which only succeeds with complete output.
+- Before/after: on HEAD the verdict was exactly `exit_code == 0 && confirmed`;
+  the new eval test's `complete = true` branch is that old logic for the same
+  captured prefix and still asserts `passed`, while `complete = false` asserts
+  `!passed && incomplete`. The process fixture emits a passing summary, >10 MiB
+  filler, then `test result: FAILED.` and exits zero; HEAD returns the same
+  truncated prefix and has no completeness signal, whereas
+  `process::tests::weak_capture_marks_truncated_output_incomplete` now observes
+  `complete == false`, the retained passing prefix, and the absent failing
+  suffix. `process::tests::weak_capture_marks_small_complete_output` is the
+  complete control; `process::tests::checked_capture_rejects_successful_child_with_incomplete_evidence`
+  remains the `run_checked` hard-error control.
+- Verification (logs under `target/harness-reliability/`):
+  - `cargo test -p concerto-tools --lib process`: 28 passed, exit 0
+    (`h34-process.log`).
+  - `cargo test -p concerto-eval`: 107 unit + 3 integration passed, 1 ignored,
+    exit 0 (`h34-eval.log`); includes
+    `test_output::tests::incomplete_capture_cannot_pass_with_a_passing_prefix`.
+  - `cargo check --workspace --all-targets -j1`: exit 0 (`h34-check.log`).
+  - `cargo fmt --all -- --check`: exit 0.
+  - `cargo clippy -p concerto-tools -p concerto-eval -p concerto-core
+    --all-targets -j1 -- -D warnings`: exit 0 (`h34-clippy.log`).
+  - Focused `concerto-core`, `concerto-orchestrator` and `concerto-tools
+    --lib shell` regressions passed (`h34-core-test.log`,
+    `h34-orchestrator-test.log`, `h34-shell-test.log`).

@@ -111,6 +111,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Incomplete subprocess capture cannot certify tests.** `ProcessOutput` now
+  records whether both streams were captured completely, and eval verdicts
+  refuse a passing prefix when the capture was truncated or a pipe read
+  failed (`EvalResult.incomplete`). `run_checked` keeps rejecting incomplete
+  evidence as a hard error.
 - **Root conversation recovery.** Persist original completed provider turns,
   reasoning, native replay and each tool result through later failures and
   cancellation. Preserve runtime verification and stop reasons as labeled

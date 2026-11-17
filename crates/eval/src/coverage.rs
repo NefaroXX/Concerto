@@ -181,6 +181,8 @@ impl EvalEngine {
             start.elapsed().as_millis() as u64,
             &output.stdout,
             &output.stderr,
+            // `run_checked` returns Err rather than an incomplete success.
+            output.complete,
         );
         // Failing commands often leave partial or absent reports. Preserve
         // the command failure and never attach a potentially stale metric.

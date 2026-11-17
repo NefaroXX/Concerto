@@ -8,6 +8,7 @@ pub(super) fn completed_result(
     duration_ms: u64,
     stdout: &str,
     stderr: &str,
+    complete: bool,
 ) -> EvalResult {
     let mut combined = format!("{stdout}\n{stderr}");
     let confirmed = runner != TestRunner::Cargo || cargo_tests_passed(&combined);
@@ -18,6 +19,13 @@ pub(super) fn completed_result(
              missing or unsupported results cannot establish a pass.",
         );
     }
+    if !complete {
+        combined.push_str(
+            "\nverification failed: process output capture was incomplete (a stream exceeded \
+             the capture limit or a pipe read failed); an exit code and a passing prefix cannot \
+             certify the test run.",
+        );
+    }
     // Inspect all available evidence first; a later empty doc-test group or
     // long diagnostic must not erase earlier executed tests. Count characters
     // when bounding the display tail so Unicode output cannot panic.
@@ -25,10 +33,11 @@ pub(super) fn completed_result(
     EvalResult {
         runner,
         exit_code,
-        passed: exit_code == 0 && confirmed,
+        passed: exit_code == 0 && confirmed && complete,
         duration_ms,
         output_tail,
         coverage: None,
+        incomplete: !complete,
         provenance: EvalProvenance::Harness,
     }
 }
@@ -62,4 +71,34 @@ fn passed_count(summary: &str) -> Option<u64> {
         return None;
     }
     Some(passed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::completed_result;
+    use concerto_core::types::TestRunner;
+
+    const PASS: &str = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; \
+                        0 filtered out; finished in 0.00s\n";
+
+    #[test]
+    fn incomplete_capture_cannot_pass_with_a_passing_prefix() {
+        // This is what the weak process path returns for H34: the passing
+        // summary and filler survive, the later failing summary was discarded.
+        let captured = format!("{PASS}{}", "a".repeat(64));
+
+        let incomplete = completed_result(TestRunner::Cargo, 0, 5, &captured, "", false);
+        assert!(!incomplete.passed, "incomplete evidence cannot certify a pass");
+        assert!(incomplete.incomplete);
+        assert!(
+            incomplete.output_tail.contains("capture was incomplete"),
+            "the verdict must explain the incomplete evidence: {}",
+            incomplete.output_tail
+        );
+
+        let complete = completed_result(TestRunner::Cargo, 0, 5, &captured, "", true);
+        assert!(complete.passed, "the identical complete text still passes");
+        assert!(!complete.incomplete);
+        assert!(!complete.output_tail.contains("capture was incomplete"));
+    }
 }

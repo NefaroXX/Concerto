@@ -48,6 +48,11 @@ pub struct ProcessOutput {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
+    /// True only when both streams were captured without truncation or a pipe
+    /// read error. Weak callers (`run`, `run_with_env`, `run_native`) still
+    /// return the bounded prefix when this is false; verification callers must
+    /// use [`ProcessHandle::run_checked`] or refuse incomplete evidence.
+    pub complete: bool,
 }
 
 /// Spawn and collect output from a child process with cancel and timeout.
@@ -296,6 +301,7 @@ impl ProcessHandle {
                     Self::read_bounded(stderr, max_output_bytes),
                 );
 
+                let complete = stdout.error.is_none() && stderr.error.is_none();
                 if require_complete {
                     if let Some(error) = stdout.error.or(stderr.error) {
                         return Err(ToolError::Io(error));
@@ -307,7 +313,9 @@ impl ProcessHandle {
                     Ok(status) => status,
                     // Keep the pre-existing `-1` exit code contract when the
                     // child's status cannot be collected.
-                    Err(_) => return Ok(ProcessOutput { exit_code: -1, stdout, stderr }),
+                    Err(_) => {
+                        return Ok(ProcessOutput { exit_code: -1, stdout, stderr, complete })
+                    }
                 };
                 // Kernel-delivered budget kill: only when this plan carried
                 // the `ulimit` backstop, so a program that merely *exits* with
@@ -318,7 +326,7 @@ impl ProcessHandle {
                     }
                 }
                 let exit_code = status.code().unwrap_or(-1);
-                Ok(ProcessOutput { exit_code, stdout, stderr })
+                Ok(ProcessOutput { exit_code, stdout, stderr, complete })
             }) => {
                 match result {
                     Ok(output) => output,
@@ -564,6 +572,75 @@ mod tests {
                 result.expect_err("successful child exit cannot certify incomplete capture");
             assert!(error.to_string().contains("capture limit"), "{stream}: {error:?}");
         }
+    }
+
+    /// Child fixture for H34: a passing summary, more than the capture limit
+    /// of filler, then a failing summary — all on stdout, exiting zero.
+    #[test]
+    fn weak_capture_fixture() {
+        use std::io::Write;
+        if std::env::var_os("CONCERTO_WEAK_CAPTURE_FIXTURE").is_none() {
+            return;
+        }
+        let mut writer = std::io::stdout().lock();
+        writer
+            .write_all(
+                b"test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; \
+                  0 filtered out; finished in 0.00s\n",
+            )
+            .unwrap();
+        let filler = vec![b'a'; MAX_OUTPUT_SIZE as usize + 1];
+        writer.write_all(&filler).unwrap();
+        writer
+            .write_all(b"\ntest result: FAILED. 0 passed; 1 failed; finished in 0.00s\n")
+            .unwrap();
+        writer.flush().unwrap();
+    }
+
+    #[tokio::test]
+    async fn weak_capture_marks_truncated_output_incomplete() {
+        let directory = tempfile::tempdir().expect("project");
+        let root = Utf8Path::from_path(directory.path()).expect("UTF-8");
+        let executable = std::env::current_exe().expect("test executable");
+        let executable = executable.to_str().expect("UTF-8 executable");
+        // `run` delegates to this same weak spawn path without an env overlay.
+        let env = HashMap::from([("CONCERTO_WEAK_CAPTURE_FIXTURE".to_owned(), "1".to_owned())]);
+        let output = ProcessHandle::run_with_env(
+            executable,
+            &["--exact", "process::tests::weak_capture_fixture", "--nocapture"],
+            root,
+            Some(&env),
+            Duration::from_secs(30),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("weak capture still returns the bounded prefix");
+        assert_eq!(output.exit_code, 0);
+        assert!(!output.complete, "a truncated stream must be marked incomplete");
+        assert!(
+            output.stdout.contains("test result: ok."),
+            "the captured passing prefix must be retained"
+        );
+        assert!(!output.stdout.contains("FAILED"), "the discarded failing suffix must be absent");
+    }
+
+    #[tokio::test]
+    async fn weak_capture_marks_small_complete_output() {
+        let directory = tempfile::tempdir().expect("project");
+        let root = Utf8Path::from_path(directory.path()).expect("UTF-8");
+        let executable = std::env::current_exe().expect("test executable");
+        let executable = executable.to_str().expect("UTF-8 executable");
+        let output = ProcessHandle::run(
+            executable,
+            &["--exact", "process::tests::weak_capture_fixture", "--nocapture"],
+            root,
+            Duration::from_secs(10),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("small weak capture");
+        assert_eq!(output.exit_code, 0);
+        assert!(output.complete, "an untruncated capture must be marked complete");
     }
 
     // verifies: direct execution clears inherited environment on every platform.

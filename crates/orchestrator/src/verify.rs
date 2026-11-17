@@ -3170,6 +3170,7 @@ mod tests {
                     duration_ms: 3,
                     output_tail: "test result: ok".to_string(),
                     coverage: None,
+                    incomplete: false,
                     provenance: EvalProvenance::Harness,
                 })),
                 eval_error: StdMutex::new(None),

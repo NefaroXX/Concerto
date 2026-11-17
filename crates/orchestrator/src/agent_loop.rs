@@ -6675,6 +6675,7 @@ mod tests {
             duration_ms: 12,
             output_tail: "ok".into(),
             coverage: None,
+            incomplete: false,
             provenance: EvalProvenance::Fallback,
         };
         let record = eval_result_record(&path, &result);
@@ -10303,6 +10304,7 @@ mod tests {
                         "exit_code": 0,
                         "stdout": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n",
                         "stderr": "",
+                        "complete": true,
                     }),
                 }),
                 "denied" => Err(EvalError::Denied("verification refused".into())),

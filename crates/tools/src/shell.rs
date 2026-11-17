@@ -1137,6 +1137,7 @@ fn into_tool_output(
                 "exit_code": output.exit_code,
                 "stdout": output.stdout,
                 "stderr": output.stderr,
+                "complete": output.complete,
             });
 
             Ok(ToolOutput { summary, data })
