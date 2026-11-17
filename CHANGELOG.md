@@ -17,8 +17,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   methods whose defaults fail closed for stores without agent-scoped storage,
   and root/agent streams are isolated in both directions. `SpendRecord` gains
   an optional `agent_id` (backward-compatible; existing rows read as `None`)
-  so specialist costs can be attributed. No specialist plumbing, child history
-  files or IPC changes yet.
+  so specialist costs can be attributed. That foundation change did not yet
+  wire specialist history, child history files or IPC.
+- **In-process specialist history restore/persist (H39b step 2).** The
+  multi-agent runner loads each role's previously completed turns from the
+  agent-scoped stream before dispatch and appends only the turns that dispatch
+  actually completed, even when the run is cancelled. Freeform and structured
+  submission agents record completed assistant/tool turns without re-recording
+  restored history, and a trailing unresolved tool call is never persisted as
+  provider history. Root conversation `messages` is untouched, history is
+  best-effort (load/write failures log and never fail a run), and supervised
+  child history files, spend attribution, and IPC changes remain out of scope.
 - **Integrated terminal inspection and editing.** Runtime topology and full
   evidence records, project-scoped memory exploration, structured settings,
   workspace file/context commands and Rust language queries now accompany the

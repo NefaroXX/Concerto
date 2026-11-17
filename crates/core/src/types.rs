@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 
 // ---- providers (Phase 1) --------------------------------------------------
@@ -2322,6 +2323,63 @@ pub struct AgentRunResult {
 
 // ---- Phase 5: AgentContext --------------------------------------------------
 
+/// In-process specialist conversation history (H39b).
+///
+/// `seed` holds prior completed turns restored from an agent-scoped store
+/// before a run; it is prompt context only and is never written back.
+/// `produced` collects the completed turns this run actually created, so a
+/// caller can persist exactly the delta after the run. Restored turns are
+/// therefore never duplicated into the agent stream, and root conversation
+/// `messages` are never touched.
+///
+/// `produced` is run-local: it starts empty even when `seed` is non-empty and
+/// is shared through a clone (the runner keeps a handle while the agent owns
+/// the cloned context).
+#[derive(Debug, Clone, Default)]
+pub struct AgentHistory {
+    seed: Vec<Message>,
+    produced: Arc<Mutex<Vec<Message>>>,
+}
+
+impl AgentHistory {
+    /// Build history with restored prior turns as prompt context.
+    pub fn with_seed(seed: Vec<Message>) -> Self {
+        Self { seed, produced: Arc::new(Mutex::new(Vec::new())) }
+    }
+
+    /// Restored prior turns, in stream order.
+    pub fn seeded(&self) -> &[Message] {
+        &self.seed
+    }
+
+    /// Append `messages[recorded_len..]` to the produced turns and advance
+    /// `recorded_len` to `messages.len()`.
+    ///
+    /// `recorded_len` is an index into the same `messages` vector, so callers
+    /// start it after any restored seed to avoid re-recording those turns.
+    /// Lock poisoning is tolerated: a panic elsewhere must not lose an
+    /// already-completed turn or abort the run.
+    pub fn record_from(&self, messages: &[Message], recorded_len: &mut usize) {
+        let start = (*recorded_len).min(messages.len());
+        if start < messages.len() {
+            let delta = &messages[start..];
+            match self.produced.lock() {
+                Ok(mut produced) => produced.extend_from_slice(delta),
+                Err(poisoned) => poisoned.into_inner().extend_from_slice(delta),
+            }
+        }
+        *recorded_len = messages.len();
+    }
+
+    /// Clone of the completed turns produced by this run (never the seed).
+    pub fn produced(&self) -> Vec<Message> {
+        match self.produced.lock() {
+            Ok(produced) => produced.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+}
+
 /// Context passed to an expert agent when it runs.
 #[derive(Debug, Clone)]
 pub struct AgentContext {
@@ -2369,6 +2427,12 @@ pub struct AgentContext {
     /// are attributable to a run — **never inferred**: `None` when the caller
     /// has no run concept (single-agent loop).
     pub run_id: Option<String>,
+    /// H39b: specialist conversation history for this dispatch.
+    ///
+    /// Restored prior turns are prompt context only; new completed turns are
+    /// recorded here for the caller to persist to the agent-scoped stream.
+    /// Neither direction touches the root conversation history.
+    pub agent_history: AgentHistory,
 }
 
 impl AgentContext {
@@ -2393,6 +2457,7 @@ impl AgentContext {
             environment_manifest_digest: None,
             workspace_generation: None,
             run_id: None,
+            agent_history: AgentHistory::default(),
         }
     }
 }
@@ -3669,5 +3734,95 @@ mod tests {
             .with_generation("gen-1")
             .with_evidence_ids(vec!["evt-1".to_string()]);
         assert!(passing.is_passing_evidence(), "a full-stamped pass remains evidence");
+    }
+
+    // ---- AgentHistory (H39b) ------------------------------------------------
+
+    fn history_message(role: Role, content: &str) -> Message {
+        Message {
+            gemini_replay: None,
+            role,
+            content: content.to_string(),
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: None,
+            tokens_in: None,
+            tokens_out: None,
+        }
+    }
+
+    fn produced_contents(history: &AgentHistory) -> Vec<String> {
+        history.produced().into_iter().map(|message| message.content).collect()
+    }
+
+    #[test]
+    fn agent_history_seeded_turns_are_visible_but_not_produced() {
+        let seed = vec![
+            history_message(Role::User, "prior question"),
+            history_message(Role::Assistant, "prior answer"),
+        ];
+        let history = AgentHistory::with_seed(seed.clone());
+
+        let seeded = history.seeded();
+        assert_eq!(seeded.len(), seed.len());
+        assert_eq!(seeded[0].content, "prior question");
+        assert_eq!(seeded[1].content, "prior answer");
+        assert!(history.produced().is_empty(), "restored turns are seed, not produced");
+    }
+
+    #[test]
+    fn agent_history_record_from_appends_only_the_unrecorded_delta() {
+        let history = AgentHistory::default();
+        let messages =
+            vec![history_message(Role::User, "first"), history_message(Role::Assistant, "second")];
+        let mut recorded = 0;
+
+        history.record_from(&messages, &mut recorded);
+        assert_eq!(recorded, 2);
+        assert_eq!(produced_contents(&history), vec!["first", "second"]);
+
+        // A second call over the same slice must not re-record anything.
+        history.record_from(&messages, &mut recorded);
+        assert_eq!(recorded, 2);
+        assert_eq!(produced_contents(&history), vec!["first", "second"]);
+    }
+
+    #[test]
+    fn agent_history_record_from_empty_delta_is_a_noop() {
+        let history = AgentHistory::default();
+        let messages = vec![history_message(Role::User, "only")];
+        let mut recorded = messages.len();
+
+        history.record_from(&messages, &mut recorded);
+
+        assert_eq!(recorded, messages.len());
+        assert!(history.produced().is_empty(), "nothing new to record");
+    }
+
+    #[test]
+    fn agent_history_record_from_accumulates_two_shots_without_duplicates() {
+        let history = AgentHistory::default();
+        let first = vec![history_message(Role::User, "first")];
+        let mut recorded = 0;
+        history.record_from(&first, &mut recorded);
+
+        let second =
+            vec![history_message(Role::User, "first"), history_message(Role::Assistant, "second")];
+        history.record_from(&second, &mut recorded);
+
+        assert_eq!(recorded, 2);
+        assert_eq!(produced_contents(&history), vec!["first", "second"]);
+    }
+
+    #[test]
+    fn agent_history_record_from_starts_after_restored_seed() {
+        let history = AgentHistory::with_seed(vec![history_message(Role::User, "restored")]);
+        let mut messages = history.seeded().to_vec();
+        let mut recorded = messages.len();
+        messages.push(history_message(Role::User, "new prompt"));
+
+        history.record_from(&messages, &mut recorded);
+
+        assert_eq!(produced_contents(&history), vec!["new prompt"]);
     }
 }

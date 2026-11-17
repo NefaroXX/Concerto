@@ -1420,7 +1420,12 @@ impl GenericSpecialistAgent {
         }
         investigate_tools.push(tool_def.clone());
         let start = std::time::Instant::now();
-        let mut messages = vec![Message {
+        // H39b: restored prior turns lead the conversation; the current task
+        // prompt stays last. `recorded` starts after the seed so the restored
+        // turns are never re-recorded into the produced delta.
+        let mut messages = context.agent_history.seeded().to_vec();
+        let mut recorded = messages.len();
+        messages.push(Message {
             gemini_replay: None,
             role: Role::User,
             content: prompt,
@@ -1429,7 +1434,8 @@ impl GenericSpecialistAgent {
             reasoning_content: None,
             tokens_in: None,
             tokens_out: None,
-        }];
+        });
+        context.agent_history.record_from(&messages, &mut recorded);
         // ADR-48 decision 4: usage counters prefer provider-reported values;
         // the byte/4 heuristic is only the fallback per dimension.
         let mut tokens_in = 0_u64;
@@ -1450,6 +1456,10 @@ impl GenericSpecialistAgent {
         let mut tool_guard_rejects: HashMap<String, u32> = HashMap::new();
 
         let (summary, outcome) = 'submission: loop {
+            // Record only turns completed before this iteration. An attempt
+            // that fails before its assistant/tool messages are pushed is
+            // never recorded.
+            context.agent_history.record_from(&messages, &mut recorded);
             if cancel.is_cancelled() {
                 return Err(OrchestratorError::Cancelled);
             }
@@ -2016,6 +2026,10 @@ impl GenericSpecialistAgent {
             }
         };
 
+        // Capture the final submission turn and any completed validation
+        // turns. Incomplete attempts are never in `messages`.
+        context.agent_history.record_from(&messages, &mut recorded);
+
         let latency_ms = start.elapsed().as_millis() as u64;
         let cost_usd = self.provider.approximate_cost(tokens_in, tokens_out);
         let completion_message = if matches!(&outcome, AgentOutcome::Success) {
@@ -2293,6 +2307,7 @@ mod tests {
             environment_manifest_digest: None,
             run_id: None,
             workspace_generation: None,
+            agent_history: concerto_core::types::AgentHistory::default(),
         }
     }
 
@@ -5351,5 +5366,206 @@ mod tests {
         assert_eq!(refusal_rows.len(), 1, "exactly one refusal audit row");
         assert_eq!(refusal_rows[0].verdict, "Refused");
         assert_eq!(refusal_rows[0].rule_matched.as_deref(), Some("request_build"));
+    }
+
+    // ------------------------------------------------------------------
+    // H39b: agent-scoped history seed / production
+    // ------------------------------------------------------------------
+
+    fn history_message(role: Role, content: &str) -> Message {
+        Message {
+            gemini_replay: None,
+            role,
+            content: content.to_string(),
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: None,
+            tokens_in: None,
+            tokens_out: None,
+        }
+    }
+
+    fn freeform_agent(provider: Arc<dyn LlmProvider>) -> GenericSpecialistAgent {
+        GenericSpecialistAgent::new(
+            AgentId::new("docs-writer"),
+            "Docs Writer".into(),
+            Some(AgentStage::new("documentation")),
+            provider,
+            None,
+            EventBus::new(128),
+            RetryPolicy::default(),
+            PromptSections { system_instructions: "You write docs.".into(), ..Default::default() },
+            AgentCapabilities::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn freeform_appends_prompt_after_restored_history_and_records_only_delta() {
+        let seed = vec![
+            history_message(Role::User, "prior question"),
+            history_message(Role::Assistant, "prior answer"),
+        ];
+        let provider = Arc::new(DesignDocProvider::new(vec![text_chunk("fresh reply")]));
+        let agent = freeform_agent(provider.clone());
+        let mut context = ctx();
+        context.agent_history = concerto_core::types::AgentHistory::with_seed(seed.clone());
+        let history = context.agent_history.clone();
+
+        let result = agent
+            .run(&design_task(), context, "mock-model", CancellationToken::new())
+            .await
+            .expect("freeform run should succeed");
+        assert!(matches!(result.outcome, AgentOutcome::Success));
+
+        let request = provider
+            .calls
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .first()
+            .cloned()
+            .expect("provider should have been called");
+        assert_eq!(request.messages.len(), seed.len() + 1, "seed plus the current prompt");
+        assert_eq!(request.messages[0].content, "prior question");
+        assert_eq!(request.messages[1].content, "prior answer");
+        assert_eq!(request.messages[2].role, Role::User);
+        assert!(
+            request.messages[2].content.contains("Design the auth module"),
+            "current task prompt must stay last: {}",
+            request.messages[2].content
+        );
+
+        let produced = history.produced();
+        assert_eq!(produced.len(), 2, "prompt + completed assistant turn, never the seed");
+        assert_eq!(produced[0].role, Role::User);
+        assert!(produced[0].content.contains("Design the auth module"));
+        assert_eq!(produced[1].role, Role::Assistant);
+        assert_eq!(produced[1].content, "fresh reply");
+        assert!(
+            produced
+                .iter()
+                .all(|message| message.content != "prior question"
+                    && message.content != "prior answer"),
+            "restored turns must not be re-recorded: {produced:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn submission_records_prompt_validation_and_final_turn() {
+        let seed = vec![history_message(Role::User, "restored context")];
+        let provider = Arc::new(DesignDocProvider::new(vec![
+            submission_chunk("call_1", serde_json::json!({ "goals": ["ship"] })),
+            submission_chunk("call_2", valid_doc_args()),
+        ]));
+        let agent = design_doc_agent(provider);
+        let mut context = ctx();
+        context.agent_history = concerto_core::types::AgentHistory::with_seed(seed);
+        let history = context.agent_history.clone();
+
+        let result = agent
+            .run(&design_task(), context, "mock-model", CancellationToken::new())
+            .await
+            .expect("submission run should succeed");
+        assert!(matches!(result.outcome, AgentOutcome::Success));
+
+        let produced = history.produced();
+        assert_eq!(
+            produced.len(),
+            4,
+            "prompt + failed attempt + validation tool + final submission"
+        );
+        assert_eq!(produced[0].role, Role::User, "current prompt is recorded");
+        assert_eq!(produced[1].role, Role::Assistant);
+        assert!(produced[1].tool_calls.is_some(), "first submission attempt is complete");
+        assert_eq!(produced[2].role, Role::Tool);
+        assert!(
+            produced[2].tool_results.as_ref().is_some_and(|results| results.iter().any(|result| {
+                result.content.get("error").and_then(|value| value.as_str())
+                    == Some("validation_failed")
+            })),
+            "validation tool-result turn must be recorded: {produced:?}"
+        );
+        assert_eq!(produced[3].role, Role::Assistant);
+        assert!(
+            produced[3]
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| calls.iter().any(|call| call.name == SUBMIT_DESIGN_DOC_TOOL)),
+            "final submission turn must be recorded: {produced:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn submission_cancellation_records_only_completed_turns() {
+        let cancel = CancellationToken::new();
+        let provider = Arc::new(CancelAfterFirstSubmission::new(
+            submission_chunk("call_1", serde_json::json!({ "goals": ["ship"] })),
+            cancel.clone(),
+        ));
+        let agent = design_doc_agent(provider);
+        let context = ctx();
+        let history = context.agent_history.clone();
+
+        let error = agent
+            .run(&design_task(), context, "mock-model", cancel.clone())
+            .await
+            .expect_err("the second provider call cancels the run");
+        assert!(cancel.is_cancelled(), "provider fired the cancellation token: {error}");
+
+        let produced = history.produced();
+        assert_eq!(
+            produced.len(),
+            3,
+            "prompt, completed assistant attempt, and its validation tool result only: {produced:?}"
+        );
+        assert_eq!(produced[0].role, Role::User);
+        assert_eq!(produced[1].role, Role::Assistant);
+        assert!(produced[1].tool_calls.is_some());
+        assert_eq!(produced[2].role, Role::Tool);
+    }
+
+    /// Returns one completed submission attempt, then cancels the run on the
+    /// next request and returns `Cancelled` — the mid-run interruption shape.
+    struct CancelAfterFirstSubmission {
+        first: std::sync::Mutex<Option<CompletionChunk>>,
+        cancel: CancellationToken,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CancelAfterFirstSubmission {
+        fn new(first: CompletionChunk, cancel: CancellationToken) -> Self {
+            Self { first: std::sync::Mutex::new(Some(first)), cancel, calls: Default::default() }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for CancelAfterFirstSubmission {
+        async fn stream_completion(
+            &self,
+            _request: CompletionRequest,
+            _cancel: CancellationToken,
+        ) -> Result<CompletionStream, concerto_core::error::ProviderError> {
+            use std::sync::atomic::Ordering;
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                let chunk = self
+                    .first
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take()
+                    .unwrap_or_else(|| text_chunk(""));
+                Ok(Box::pin(futures::stream::iter(vec![Ok(chunk)])))
+            } else {
+                self.cancel.cancel();
+                Err(concerto_core::error::ProviderError::Cancelled)
+            }
+        }
+        fn context_capacity(&self, _model: &str) -> concerto_core::types::TokenBudget {
+            concerto_core::types::TokenBudget::new(128_000, 4_096)
+        }
+        fn approximate_cost(&self, _tokens_in: u64, _tokens_out: u64) -> f64 {
+            0.0
+        }
+        fn provider_name(&self) -> &'static str {
+            "design_doc"
+        }
     }
 }

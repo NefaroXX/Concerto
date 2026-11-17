@@ -48,7 +48,7 @@ passing repository tests alone does not close a finding.
 | H36 | P2 | cargo-audit can report incomplete registry checks with exit zero | Fixed and verified on 66309f8; awaiting merge |
 | H37 | P1 | Native provider wire adapters discard mandatory system/assistant text | Fixed; full local battery and all 12 exact-head CI checks passed |
 | H38 | P2 | Gemini canonical history loses native part order/text signatures and misclassifies thought text | Fixed; full local battery and all 12 exact-head CI checks passed on 14390eb |
-| H39 | P1 | Run settlement persists summaries instead of complete provider history | Root repair fixed, published and exact-head verified (`2dbf25a`; ADR-87 `72c414a`). Cancelled/errored-run metrics and spend settlement fixed in H39a (settlement outlives the run token, exactly-once per run); H39b persistence foundation landed (agent-scoped message store + optional spend `agent_id`); specialist/process-scoped history plumbing remains open (H39b steps 2–3) |
+| H39 | P1 | Run settlement persists summaries instead of complete provider history | Root repair fixed, published and exact-head verified (`2dbf25a`; ADR-87 `72c414a`). Cancelled/errored-run metrics and spend settlement fixed in H39a (settlement outlives the run token, exactly-once per run); H39b persistence foundation landed (agent-scoped message store + optional spend `agent_id`); in-process specialist history persist/restore landed (step 2); supervised child history and spend attribution remain open (step 3) |
 | H40 | P2 | Headless multi-agent history clips messages and older obligations before dispatch | Fixed, published and exact-head verified (`91bf006`); loopback CLI request fixture plus the approved-plan routing control |
 | H41 | P1 | Settings CLI fixtures use XDG isolation on macOS, where application paths resolve to the real profile | Fixed and verified on Linux, published with H40 (`91bf006`); macOS hazard source-confirmed, portable coverage not claimed |
 
@@ -2789,6 +2789,8 @@ has terminated; there is no remaining validation process to wait on.
   - `cargo test -p concerto-cli --lib dispatch::harness`: 10 passed, 0 failed
     (including `cli_checkpoint_create_then_inspect_share_the_service_payloads`).
   - `cargo test -p concerto-cli --test settings_commands`: 13 passed, 0 failed.
+  - `cargo test -p concerto-orchestrator --lib`: **1927 passed, 0 failed,
+    1 ignored**.
   - `cargo check --workspace --all-targets -j1`: exit 0.
   - `cargo clippy -p concerto-orchestrator -p concerto-cli --all-targets -j1
     -- -D warnings`: exit 0.
@@ -3040,3 +3042,62 @@ Branch: `fix/harness-headless-history` (HEAD `34a09ee` before this change).
   - `cargo fmt --all -- --check`: exit 0; `git diff --check`: clean.
 - **Status.** H39 remains open until steps 2–3 land; this entry closes only the
   H39b persistence foundation.
+
+## 2026-11-17 — H39b step 2: in-process specialist history persist/restore
+
+- **What is persisted.** `AgentRunner` now writes the completed turns a
+  specialist produced during one dispatch to that role's agent-scoped stream
+  (`agent_messages`, keyed by `(session_id, agent_id)`). `agent_id` is the
+  dispatched role string (`format!("{role}")`), the same identity the rest of
+  the runner already uses for lifecycle events. The `AgentHistory` delta lives
+  in `AgentContext`; `AgentRunResult` is unchanged.
+- **When.** Before `agent.run`, the runner loads
+  `load_agent_messages(session_id, role)` and installs the result as the
+  prompt seed. After `agent.run` returns — `Ok` or `Err`, including
+  cancellation — it appends only `AgentHistory::produced()`, never the seed.
+  A trailing assistant tool call without its matching tool result (the
+  contract submission, or a cancellation between request and result) is
+  trimmed before the append: OpenAI-compatible and Anthropic APIs reject that
+  shape on the next request. The append uses a fresh `CancellationToken` and
+  a 10 s timeout, so a
+  cancelled run still keeps turns completed before cancellation.
+- **What is recorded by the agent loops.** Freeform and structured submission
+  seed `messages` with the restored turns (current task prompt stays last),
+  start their recorded index *after* the seed, and call `record_from` after
+  the initial prompt, at the top of every loop iteration, and once after the
+  loop. That records completed assistant/tool turns and never records an
+  attempt whose provider call failed before its messages were pushed.
+- **Failure policy.** History is strictly best-effort. A load error logs a
+  warning and starts the dispatch with an empty seed; an append error or
+  timeout logs a warning. Neither is returned, neither affects settlement, and
+  the run result is unchanged. No store is required: `AgentRunner` defaults to
+  `None` and only the multi-agent runtime injects the session store. The
+  single-agent `AgentLoop` keeps its existing history path.
+- **ADR-87 compatibility.** Only the agent-scoped stream is read or written.
+  Root `messages` is untouched in both directions; the tests assert
+  `load_messages` stays empty after a specialist run.
+- **Known limits (H39 remains open).** Streams accumulate across dispatches
+  (no compaction or truncation yet); supervised child history files are still
+  step 3, and spend attribution (`SpendRecord::agent_id`) is still `None` at
+  the orchestrator settlement boundary.
+- **Verification (serial `-j1`, `TMPDIR=/var/tmp`, repository `target/`,
+  `RUSTFLAGS="-D warnings"`, `CARGO_INCREMENTAL=0`; logs under
+  `target/harness-reliability/h39b2-*`):**
+  - `cargo test -p concerto-core`: **539 passed, 0 failed** (+ 4 doc-tests),
+    including five `AgentHistory` slicing/seed unit tests.
+  - `cargo test -p concerto-orchestrator --lib agent_runner`: **25 passed,
+    0 failed**, including agent-stream/root isolation, seed restore without
+    duplicates, cancelled-run persistence, trailing-tool-call trimming, and
+    append-failure fail-soft.
+  - `cargo test -p concerto-orchestrator --lib agents::generic`: **85 passed,
+    0 failed**, including freeform prompt-after-seed ordering, submission
+    validation-turn persistence, and mid-run cancellation recording only
+    completed turns.
+  - `cargo check --workspace --all-targets -j1`: exit 0.
+  - `cargo clippy -p concerto-core -p concerto-orchestrator --all-targets -j1
+    -- -D warnings`: exit 0.
+  - `cargo fmt --all -- --check`: exit 0.
+- **Residual test gap.** The fail-closed *default* store stub was not built
+  because `SessionStore` has ~40 required methods; append failure is exercised
+  through a real SQLite foreign-key failure instead, and load failure is
+  fail-soft by construction (warning + empty seed).

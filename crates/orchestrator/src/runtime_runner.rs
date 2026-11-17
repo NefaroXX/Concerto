@@ -3526,7 +3526,10 @@ async fn run_multi_agent(
     // Policy checks, routing, coordination, and actual-cost recording all
     // share one tracker so estimates are not charged as spend.
     let runner = AgentRunner::new(registry.clone(), services.bus.clone(), spend_tracker.clone())
-        .with_blueprint_facade(facade.clone());
+        .with_blueprint_facade(facade.clone())
+        // H39b: in-process specialists restore and persist their own
+        // agent-scoped history. Root conversation messages stay untouched.
+        .with_session_store(session_store.clone());
     let routing = Arc::new(
         RoutingEngine::new(
             profiles.clone(),

@@ -27,9 +27,9 @@ use concerto_core::traits::agent::ExpertAgent;
 use concerto_core::traits::memory::{project_without_standing, MemoryStore};
 use concerto_core::traits::policy::PolicyEngine;
 use concerto_core::types::{
-    AgentContext, AgentId, AgentOutcome, AgentOutput, AgentRunResult, AgentStage, AgentTask,
-    CompletionRequest, DesignDoc, Message, PolicyAction, PolicyVerdict, ProviderMetrics, Role,
-    SubTask, SubTaskStatus, TaskExecutionMode, TaskId, ToolDefinition, ToolResult,
+    AgentContext, AgentHistory, AgentId, AgentOutcome, AgentOutput, AgentRunResult, AgentStage,
+    AgentTask, CompletionRequest, DesignDoc, Message, PolicyAction, PolicyVerdict, ProviderMetrics,
+    Role, SubTask, SubTaskStatus, TaskExecutionMode, TaskId, ToolDefinition, ToolResult,
 };
 use concerto_core::{CancellationToken, OrchestratorError};
 use concerto_providers::model::ModelProfile;
@@ -9512,6 +9512,7 @@ impl CoordinatorAgent {
                         environment_manifest_digest: this.environment_manifest_summary(),
                         run_id: this.run_id.clone(),
                         workspace_generation: this.snapshot_generation(),
+                        agent_history: AgentHistory::default(),
                     };
                     // ADR-35 §8 trigger 1 (stage absence): implement subtasks
                     // planned for the reserved `coordinator` role are executed
@@ -10615,6 +10616,7 @@ impl CoordinatorAgent {
                                 environment_manifest_digest: self.environment_manifest_summary(),
                                 run_id: self.run_id.clone(),
                                 workspace_generation: self.snapshot_generation(),
+                                agent_history: AgentHistory::default(),
                             };
                             match self
                                 .attempt_fallback_ladder(
@@ -11277,6 +11279,7 @@ impl CoordinatorAgent {
                         environment_manifest_digest: self.environment_manifest_summary(),
                         run_id: self.run_id.clone(),
                         workspace_generation: self.snapshot_generation(),
+                        agent_history: AgentHistory::default(),
                     };
                     let classify_err = OrchestratorError::AgentLoopError(error.clone());
                     match self
@@ -14264,6 +14267,7 @@ impl CoordinatorAgent {
             environment_manifest_digest: self.environment_manifest_summary(),
             run_id: self.run_id.clone(),
             workspace_generation: self.snapshot_generation(),
+            agent_history: AgentHistory::default(),
         };
         let profile = match self.model_selector.select_for_session(
             &agent_id,

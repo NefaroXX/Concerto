@@ -3,16 +3,18 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use concerto_core::error::ProviderError;
 use concerto_core::event::{EventBus, EventKind, ThinkingKind};
 use concerto_core::ids::Ulid;
 use concerto_core::traits::agent::ExpertAgent;
 use concerto_core::traits::provider::LlmProvider;
-use concerto_core::types::{AgentContext, AgentId, AgentOutcome, AgentRunResult, SubTask};
+use concerto_core::types::{AgentContext, AgentId, AgentOutcome, AgentRunResult, Message, SubTask};
 use concerto_core::{CancellationToken, OrchestratorError};
 use concerto_providers::model::ModelProfile;
 use concerto_sessions::spend::SpendTracker;
+use concerto_sessions::SessionStore;
 
 use crate::agents::execution_state::display_reason;
 use crate::cost::AgentCostEstimator;
@@ -21,6 +23,21 @@ use crate::registry::AgentRegistry;
 /// True when an error represents a cancelled run rather than a genuine
 /// failure — callers emit a cancellation lifecycle event for these instead
 /// of a failure event.
+/// Drop an assistant tool call at the tail of a run's produced history.
+///
+/// A specialist that ends on its contract submission — or is cancelled after
+/// the model requested a tool but before the result is pushed — leaves an
+/// assistant `tool_calls` message with no matching tool result. OpenAI-
+/// compatible and Anthropic APIs reject that shape on the next request, so it
+/// must not be persisted. Earlier calls always have their results because the
+/// loop pushes a tool message before requesting the next turn.
+fn without_trailing_unresolved_tool_call(mut messages: Vec<Message>) -> Vec<Message> {
+    while messages.last().is_some_and(|message| message.tool_calls.is_some()) {
+        messages.pop();
+    }
+    messages
+}
+
 fn is_cancellation_error(error: &OrchestratorError) -> bool {
     matches!(
         error,
@@ -86,6 +103,10 @@ pub struct AgentRunner {
     /// Resolved blueprint facade backing stage-kind cost estimation for the
     /// pre-dispatch budget reservation (`None` prices the flat default).
     blueprint_facade: Option<concerto_config::BlueprintFacade>,
+    /// Agent-scoped history store (H39b). `None` leaves history untouched;
+    /// the multi-agent runtime injects the session store, while the
+    /// single-agent loop keeps its own history path.
+    session_store: Option<Arc<dyn SessionStore>>,
 }
 
 impl AgentRunner {
@@ -103,7 +124,14 @@ impl AgentRunner {
             provider_concurrency: Arc::new(std::sync::Mutex::new(HashMap::new())),
             per_provider_limit: 2,
             blueprint_facade: None,
+            session_store: None,
         }
+    }
+
+    /// Attach the session store backing agent-scoped history (H39b).
+    pub fn with_session_store(mut self, store: Option<Arc<dyn SessionStore>>) -> Self {
+        self.session_store = store;
+        self
     }
 
     /// Attach the resolved blueprint facade backing stage-kind cost estimation.
@@ -167,7 +195,7 @@ impl AgentRunner {
         agent: Arc<dyn ExpertAgent>,
         role: AgentId,
         task: &SubTask,
-        context: AgentContext,
+        mut context: AgentContext,
         profile: &ModelProfile,
         cancel: CancellationToken,
     ) -> Result<AgentRunResult, OrchestratorError> {
@@ -243,6 +271,25 @@ impl AgentRunner {
 
         let start = std::time::Instant::now();
 
+        // H39b: restore this role's prior turns as prompt context before the
+        // run. A failed read must not abort the dispatch — the specialist
+        // simply starts without restored history.
+        if let Some(store) = &self.session_store {
+            match store.load_agent_messages(task.session_id, &role_name, cancel.clone()).await {
+                Ok(messages) => {
+                    context.agent_history = concerto_core::types::AgentHistory::with_seed(messages);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %task.session_id,
+                        role = %role_name,
+                        error = %error,
+                        "agent history load failed; continuing with an empty seed"
+                    );
+                }
+            }
+        }
+
         // Run the agent once — provider retry happens inside each specialist
         // agent (via with_provider_retry). The whole-agent run is never replayed.
         let result = agent.run(task, context.clone(), model_name, cancel.clone()).await;
@@ -255,6 +302,36 @@ impl AgentRunner {
         // Publish the live spend snapshot (and cap signal) after every
         // provider run settles so UIs show the tracker's session total.
         publish_spend_events(&self.bus, task.session_id, correlation_id, &self.spend_tracker);
+
+        // H39b: persist only the turns this run completed, even when the run
+        // ended in cancellation. The write uses a fresh token so a cancelled
+        // run still keeps its completed history; failures are logged and never
+        // affect settlement or the run's result.
+        if let Some(store) = &self.session_store {
+            let produced = without_trailing_unresolved_tool_call(context.agent_history.produced());
+            if !produced.is_empty() {
+                let append = store.append_agent_messages(
+                    task.session_id,
+                    &role_name,
+                    &produced,
+                    CancellationToken::new(),
+                );
+                match tokio::time::timeout(Duration::from_secs(10), append).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => tracing::warn!(
+                        session_id = %task.session_id,
+                        role = %role_name,
+                        error = %error,
+                        "agent history append failed; run result is unaffected"
+                    ),
+                    Err(_) => tracing::warn!(
+                        session_id = %task.session_id,
+                        role = %role_name,
+                        "agent history append timed out; run result is unaffected"
+                    ),
+                }
+            }
+        }
 
         match result {
             Ok(mut run_result) => {
@@ -1023,5 +1100,353 @@ mod tests {
             vec![concerto_core::event::ThinkingKind::Detail],
             "cancellation thought must stay Detail: {cancelled_events:?}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // H39b: agent-scoped history persist/restore
+    // ------------------------------------------------------------------
+
+    use concerto_core::traits::agent::ExpertAgent;
+    use concerto_core::types::{Message, Role};
+    use concerto_sessions::SqliteSessionStore;
+
+    #[derive(Clone, Copy)]
+    enum HistoryMockOutcome {
+        Success,
+        Cancelled,
+    }
+
+    /// Minimal expert-agent mock for the history tests: observes the restored
+    /// seed, optionally fires cancellation, records its scripted turns through
+    /// `context.agent_history`, then returns the scripted outcome.
+    struct HistoryMockAgent {
+        id: AgentId,
+        turns: Vec<Message>,
+        outcome: HistoryMockOutcome,
+        cancel_on_run: Option<CancellationToken>,
+        seed_seen: Arc<std::sync::Mutex<Option<Vec<Message>>>>,
+    }
+
+    impl HistoryMockAgent {
+        fn new(
+            id: AgentId,
+            turns: Vec<Message>,
+            outcome: HistoryMockOutcome,
+            cancel_on_run: Option<CancellationToken>,
+        ) -> (Self, Arc<std::sync::Mutex<Option<Vec<Message>>>>) {
+            let seed_seen = Arc::new(std::sync::Mutex::new(None));
+            (Self { id, turns, outcome, cancel_on_run, seed_seen: seed_seen.clone() }, seed_seen)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExpertAgent for HistoryMockAgent {
+        fn id(&self) -> AgentId {
+            self.id.clone()
+        }
+
+        fn stage(&self) -> Option<concerto_core::types::AgentStage> {
+            None
+        }
+
+        fn capabilities(&self) -> concerto_core::types::CapabilitySet {
+            concerto_core::types::CapabilitySet::default()
+        }
+
+        async fn run(
+            &self,
+            _task: &SubTask,
+            context: AgentContext,
+            _model: &str,
+            _cancel: CancellationToken,
+        ) -> Result<AgentRunResult, OrchestratorError> {
+            *self.seed_seen.lock().unwrap_or_else(|error| error.into_inner()) =
+                Some(context.agent_history.seeded().to_vec());
+            if let Some(cancel) = &self.cancel_on_run {
+                cancel.cancel();
+            }
+            let mut recorded = 0;
+            context.agent_history.record_from(&self.turns, &mut recorded);
+            match self.outcome {
+                HistoryMockOutcome::Success => Ok(AgentRunResult {
+                    verification: Vec::new(),
+                    task_id: TaskId::new(),
+                    role: self.id.clone(),
+                    outcome: AgentOutcome::Success,
+                    summary: "done".into(),
+                    files_modified: Vec::new(),
+                    tool_call_count: 0,
+                    cost_usd: 0.0,
+                    latency_ms: 0,
+                    provider: "mock".into(),
+                    model: "mock-model".into(),
+                    tokens_in: 0,
+                    tokens_out: 0,
+                }),
+                HistoryMockOutcome::Cancelled => Err(OrchestratorError::Cancelled),
+            }
+        }
+    }
+
+    fn history_message(role: Role, content: &str) -> Message {
+        Message {
+            gemini_replay: None,
+            role,
+            content: content.to_string(),
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: None,
+            tokens_in: None,
+            tokens_out: None,
+        }
+    }
+
+    fn runner_with_history_mock(
+        mock: HistoryMockAgent,
+        store: Option<Arc<dyn SessionStore>>,
+    ) -> AgentRunner {
+        let mut registry = AgentRegistry::new();
+        registry.register(Arc::new(mock));
+        AgentRunner::new(Arc::new(registry), EventBus::new(256), Arc::new(SpendTracker::default()))
+            .with_session_store(store)
+    }
+
+    async fn in_memory_store_with_session() -> (Arc<SqliteSessionStore>, Ulid) {
+        let store = Arc::new(
+            SqliteSessionStore::connect_in_memory().await.expect("in-memory store should open"),
+        );
+        let session = store
+            .create_session(
+                camino::Utf8Path::new("/tmp/h39b"),
+                "mock",
+                "mock-model",
+                CancellationToken::new(),
+            )
+            .await
+            .expect("session should be created");
+        (store, session.id)
+    }
+
+    #[tokio::test]
+    async fn agent_history_persists_to_agent_stream_not_root() {
+        let (store, session_id) = in_memory_store_with_session().await;
+        let turns = vec![
+            history_message(Role::User, "investigate"),
+            history_message(Role::Assistant, "findings"),
+        ];
+        let (mock, seed_seen) = HistoryMockAgent::new(
+            AgentId::new("researcher"),
+            turns,
+            HistoryMockOutcome::Success,
+            None,
+        );
+        let runner = runner_with_history_mock(mock, Some(store.clone()));
+        let session = SessionContext::new(session_id, std::path::PathBuf::from("/tmp"));
+        let task = make_task(TaskId::new(), session_id);
+
+        let result = runner
+            .run(
+                AgentId::new("researcher"),
+                &task,
+                AgentContext::new(session),
+                &make_profile(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("run should succeed");
+        assert!(matches!(result.outcome, AgentOutcome::Success));
+        assert!(
+            seed_seen
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+                .is_some_and(|seed| seed.is_empty()),
+            "a fresh agent stream starts with an empty seed"
+        );
+
+        let root = store.load_messages(session_id, CancellationToken::new()).await.unwrap();
+        assert!(root.is_empty(), "agent history must never touch root messages: {root:?}");
+        let stream = store
+            .load_agent_messages(session_id, "researcher", CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(stream.len(), 2);
+        assert_eq!(stream[0].role, Role::User);
+        assert_eq!(stream[0].content, "investigate");
+        assert_eq!(stream[1].role, Role::Assistant);
+        assert_eq!(stream[1].content, "findings");
+    }
+
+    #[tokio::test]
+    async fn agent_history_restores_seed_and_appends_without_duplicates() {
+        let (store, session_id) = in_memory_store_with_session().await;
+        let seed = vec![
+            history_message(Role::User, "first question"),
+            history_message(Role::Assistant, "first answer"),
+        ];
+        store
+            .append_agent_messages(session_id, "researcher", &seed, CancellationToken::new())
+            .await
+            .unwrap();
+        let delta = vec![history_message(Role::Assistant, "follow-up")];
+        let (mock, seed_seen) = HistoryMockAgent::new(
+            AgentId::new("researcher"),
+            delta,
+            HistoryMockOutcome::Success,
+            None,
+        );
+        let runner = runner_with_history_mock(mock, Some(store.clone()));
+        let session = SessionContext::new(session_id, std::path::PathBuf::from("/tmp"));
+        let task = make_task(TaskId::new(), session_id);
+
+        runner
+            .run(
+                AgentId::new("researcher"),
+                &task,
+                AgentContext::new(session),
+                &make_profile(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("run should succeed");
+
+        let observed = seed_seen
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .expect("mock must observe the seed");
+        assert_eq!(observed.len(), 2, "restored seed is visible to the agent");
+        assert_eq!(observed[0].content, "first question");
+        assert_eq!(observed[1].content, "first answer");
+
+        let stream = store
+            .load_agent_messages(session_id, "researcher", CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(stream.len(), 3, "seed plus exactly one delta, no duplicate seed");
+        assert_eq!(stream[0].content, "first question");
+        assert_eq!(stream[1].content, "first answer");
+        assert_eq!(stream[2].content, "follow-up");
+        let root = store.load_messages(session_id, CancellationToken::new()).await.unwrap();
+        assert!(root.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_run_persists_turns_completed_before_cancellation() {
+        let (store, session_id) = in_memory_store_with_session().await;
+        let cancel = CancellationToken::new();
+        let (mock, _) = HistoryMockAgent::new(
+            AgentId::new("researcher"),
+            vec![history_message(Role::Assistant, "partial result")],
+            HistoryMockOutcome::Cancelled,
+            Some(cancel.clone()),
+        );
+        let runner = runner_with_history_mock(mock, Some(store.clone()));
+        let session = SessionContext::new(session_id, std::path::PathBuf::from("/tmp"));
+        let task = make_task(TaskId::new(), session_id);
+
+        let error = runner
+            .run(
+                AgentId::new("researcher"),
+                &task,
+                AgentContext::new(session),
+                &make_profile(),
+                cancel.clone(),
+            )
+            .await
+            .expect_err("cancelled run must return an error");
+        assert!(matches!(error, OrchestratorError::Cancelled));
+        assert!(cancel.is_cancelled());
+
+        let stream = store
+            .load_agent_messages(session_id, "researcher", CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(stream.len(), 1, "the pre-cancellation turn must survive");
+        assert_eq!(stream[0].content, "partial result");
+        let root = store.load_messages(session_id, CancellationToken::new()).await.unwrap();
+        assert!(root.is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_history_does_not_persist_a_trailing_tool_call_without_its_result() {
+        let (store, session_id) = in_memory_store_with_session().await;
+        let mut submission = history_message(Role::Assistant, "");
+        submission.tool_calls = Some(vec![concerto_core::types::ToolCall {
+            id: "call_submit".into(),
+            name: "submit_design_doc".into(),
+            arguments: serde_json::json!({ "goals": ["ship"] }),
+            thought_signature: None,
+        }]);
+        let turns = vec![history_message(Role::User, "design it"), submission];
+        let (mock, _) = HistoryMockAgent::new(
+            AgentId::new("architect"),
+            turns,
+            HistoryMockOutcome::Success,
+            None,
+        );
+        let runner = runner_with_history_mock(mock, Some(store.clone()));
+        let session = SessionContext::new(session_id, std::path::PathBuf::from("/tmp"));
+        let task = make_task(TaskId::new(), session_id);
+
+        runner
+            .run(
+                AgentId::new("architect"),
+                &task,
+                AgentContext::new(session),
+                &make_profile(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("run should succeed");
+
+        let stream = store
+            .load_agent_messages(session_id, "architect", CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            stream.len(),
+            1,
+            "an unresolved trailing tool call must not become provider history: {stream:?}"
+        );
+        assert_eq!(stream[0].content, "design it");
+    }
+
+    #[tokio::test]
+    async fn agent_history_append_error_does_not_fail_the_run() {
+        // The store has no session row, so the agent-scoped append fails its
+        // foreign key. History persistence is fail-soft: the run still
+        // settles and returns its result.
+        let store = Arc::new(
+            SqliteSessionStore::connect_in_memory().await.expect("in-memory store should open"),
+        );
+        let unknown_session = Ulid::new();
+        let (mock, _) = HistoryMockAgent::new(
+            AgentId::new("researcher"),
+            vec![history_message(Role::Assistant, "would be persisted")],
+            HistoryMockOutcome::Success,
+            None,
+        );
+        let runner = runner_with_history_mock(mock, Some(store.clone()));
+        let session = SessionContext::new(unknown_session, std::path::PathBuf::from("/tmp"));
+        let task = make_task(TaskId::new(), unknown_session);
+
+        let result = runner
+            .run(
+                AgentId::new("researcher"),
+                &task,
+                AgentContext::new(session),
+                &make_profile(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("a history write failure must not fail the run");
+        assert!(matches!(result.outcome, AgentOutcome::Success));
+
+        let stream = store
+            .load_agent_messages(unknown_session, "researcher", CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(stream.is_empty(), "failed append leaves no rows");
     }
 }

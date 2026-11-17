@@ -41,7 +41,12 @@ impl GenericSpecialistAgent {
             .unwrap_or_default();
 
         let start = std::time::Instant::now();
-        let mut messages = vec![Message {
+        // H39b: restored prior turns lead the conversation; the current task
+        // prompt stays last. `recorded` starts after the seed so the restored
+        // turns are never re-recorded into the produced delta.
+        let mut messages = context.agent_history.seeded().to_vec();
+        let mut recorded = messages.len();
+        messages.push(Message {
             gemini_replay: None,
             role: Role::User,
             content: prompt.clone(),
@@ -50,7 +55,8 @@ impl GenericSpecialistAgent {
             reasoning_content: None,
             tokens_in: None,
             tokens_out: None,
-        }];
+        });
+        context.agent_history.record_from(&messages, &mut recorded);
         // Per-run corrective-retry streaks, mirroring the single-agent loop's
         // `tool_guard_rejects` map: at most
         // [`tool_guard::MAX_TOOL_GUARD_REJECTS`] corrective injections per
@@ -117,6 +123,9 @@ impl GenericSpecialistAgent {
         }
 
         'turns: for iteration in 0..MAX_TOOL_ITERATIONS {
+            // Record only turns completed before this iteration. A turn whose
+            // provider call fails is never appended, so it cannot be recorded.
+            context.agent_history.record_from(&messages, &mut recorded);
             if cancel.is_cancelled() {
                 if !progress.has_progress() {
                     return Err(OrchestratorError::Cancelled);
@@ -616,6 +625,10 @@ impl GenericSpecialistAgent {
                 summary = text;
             }
         }
+
+        // Capture the final completed turn (and any turns completed before a
+        // cancellation break).
+        context.agent_history.record_from(&messages, &mut recorded);
 
         let latency_ms = start.elapsed().as_millis() as u64;
         let cost_usd = self.provider.approximate_cost(tokens_in, tokens_out);
