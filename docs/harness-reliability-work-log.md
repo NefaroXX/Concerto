@@ -32,7 +32,7 @@ passing repository tests alone does not close a finding.
 | H20 | P1 | Yanked async-executor 1.14.0 remains locked after an upstream memory-safety regression | Fixed and verified; awaiting merge |
 | H21 | P2 | Multi-agent runtime stage reports Complete for partial outputs | Fixed and verified; awaiting merge |
 | H22 | P1 | Cache path normalization can select a different file from the filesystem tool | Fixed and verified with H15; awaiting merge |
-| H23 | P2 | CLI MCP probe integration test timed out during the H19 workspace run | Open; cause under investigation |
+| H23 | P2 | CLI MCP probe integration test timed out during the H19 workspace run | Fixed and verified: `initialize` gets a bounded startup allowance, later stages keep the configured budget, probe errors name the stage, and timed-out children are reaped; delayed-success and hung-initialize regressions added |
 | H24 | P2 | Final provider context guard omits replayable reasoning from its size estimate | Fixed and verified; awaiting merge |
 | H25 | P2 | Benchmark required-pattern checks count unreadable files as matching | Fixed and verified; awaiting merge |
 | H26 | P2 | Nine non-standard benchmark task manifests contain invalid-length IDs | Fixed and verified; awaiting merge |
@@ -52,10 +52,10 @@ passing repository tests alone does not close a finding.
 | H40 | P2 | Headless multi-agent history clips messages and older obligations before dispatch | Fixed, published and exact-head verified (`91bf006`); loopback CLI request fixture plus the approved-plan routing control |
 | H41 | P1 | Settings CLI fixtures use XDG isolation on macOS, where application paths resolve to the real profile | Fixed and verified on Linux, published with H40 (`91bf006`); macOS hazard source-confirmed, portable coverage not claimed |
 
-Table reconciled 2026-11-16 after the H39/H40/H41 publication; the H40 and
-H41 rows were previously left at their preparation state. Open work is the
-register below (H12, H14, H23, H29, H39 remainder); H28 is scoped, with
-only upstream- or platform-gated duplicate families left.
+Table reconciled 2026-11-17 after the H23 fix; the H40 and H41 rows were
+previously left at their preparation state. Open work is the register below
+(H12, H14, H29, H39 remainder); H28 is scoped, with only upstream- or
+platform-gated duplicate families left.
 
 
 ## 2026-10-29 — H01: preserve streaming events across chunks
@@ -2690,3 +2690,50 @@ has terminated; there is no remaining validation process to wait on.
   - Focused `concerto-core`, `concerto-orchestrator` and `concerto-tools
     --lib shell` regressions passed (`h34-core-test.log`,
     `h34-orchestrator-test.log`, `h34-shell-test.log`).
+
+## 2026-11-17 — H23: MCP first-stage startup allowance
+
+- The original workspace-run stall was never reproduced: after the failure, the
+  focused probe passed unchanged in 0.07 s and its 11-test target in 0.40 s
+  (2026-11-04). This change does not claim to have proven the original trigger.
+- Mechanism supported by the source evidence: `McpManager::handshake` applied
+  one aggregate `timeout_secs` around `spawn + initialize + tools/list`, while
+  the client also bounded each request. On a loaded host, child startup and an
+  earlier stage consumed that single aggregate budget, and the CLI probe's
+  equal-sized outer timeout replaced whichever stage was still waiting with a
+  generic "MCP probe timed out".
+- `Command::spawn` returns after fork/exec, so bounding spawn alone does not
+  cover interpreter bootstrap or the child's first response: both happen while
+  `initialize` waits. The first protocol stage therefore gets an explicit
+  startup allowance instead of being charged against a shared aggregate.
+- Deadline structure: spawn is bounded by `SPAWN_STARTUP_GRACE_SECS` (10 s);
+  `initialize` gets the configured stage timeout (3 s in the fixture) plus the
+  same 10 s startup allowance (13 s); `tools/list` gets the configured stage
+  timeout only (3 s); teardown gets `STOP_GRACE_PERIOD_SECS` (2 s). One extra
+  second is a watchdog scheduling margin, so
+  `concerto_mcp::handshake_budget(3)` = 10 + (3 + 10) + 3 + 2 + 1 = 29 s. The
+  CLI probe's outer select uses that total.
+- Attribution: a timed-out stage returns its `McpError::Timeout { method }` and
+  the probe reports `MCP probe timed out during <method>` plus the server id
+  (`<id>`). The outer watchdog only reports when no stage error arrives within
+  the stated total budget, so it cannot mask a stage-specific timeout.
+- Reaping: a failed `initialize` or `tools/list` stage calls the client's
+  `stop()` before the handshake returns its error — stdin is closed, the
+  process group is killed after the grace period, and the child is waited for.
+  Ctrl-C and `kill_on_drop` teardown paths are unchanged.
+- Regression: `startup_delay_within_grace_still_probes_successfully` uses a
+  Python fixture that writes its PID and delays its `initialize` reply by 4 s
+  (> the configured 3 s, < 3 s + 10 s grace). The probe now succeeds and lists
+  the tool; measured 4.05 s including CLI startup. This is the case that failed
+  before the change. `hung_mcp_initialize_times_out_by_stage_and_reaps_the_child`
+  reads `initialize` and never replies; it asserts the stage-specific error, a
+  generous bound of `handshake_budget(3) + 5 s` (34 s), a gone `/proc/<pid>`,
+  and an unchanged config file. Measured 15.03 s. The existing
+  `explicit_mcp_probe_connects_and_stops_without_persisting_enable_switches`
+  test remains green.
+- Verification (logs under `target/harness-reliability/`): `cargo test -p
+  concerto-cli --test settings_commands` 13 passed (startup 4.05 s, hung
+  15.03 s); `cargo test -p concerto-mcp` 32 lib + 22 client + 9 manager tests
+  passed; `cargo check --workspace --all-targets -j1` passed; `cargo clippy -p
+  concerto-mcp -p concerto-cli --all-targets -j1 -- -D warnings` passed;
+  `cargo fmt --all -- --check` passed.

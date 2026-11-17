@@ -111,6 +111,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **MCP probe timeouts are attributable and give the first stage a startup
+  allowance.** Child spawn is bounded separately, and `initialize` gets the
+  configured stage budget plus a bounded startup allowance because
+  `Command::spawn` returns after fork/exec while interpreter bootstrap is
+  observed by the first response; `tools/list` keeps the configured stage
+  budget. Probe failures name the stage and server, and a stage timeout stops
+  and reaps the child before the error is reported. Deterministic
+  delayed-`initialize` success and hung-`initialize` failure regressions cover
+  the behavior; the original intermittent stall was not reproduced and this
+  change does not claim to have proven its trigger.
 - **Incomplete subprocess capture cannot certify tests.** `ProcessOutput` now
   records whether both streams were captured completely, and eval verdicts
   refuse a passing prefix when the capture was truncated or a pipe read
