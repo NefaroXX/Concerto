@@ -145,6 +145,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Supervised child history keeps its harvest offset and hardens its files
+  (H39b review).** A child now receives the parent's exact seed message count
+  (`CONCERTO_AGENT_HISTORY_SEED_LEN`); startup trims its in-memory restore but
+  rewrites the accumulated file only when it grew past the seed, so an
+  externally truncated or seed-length file is never shrunk below the parent's
+  `initial_seed_len` slice (which previously dropped the first child turn).
+  The parent still warns loudly when the harvested file is shorter than
+  expected. History rewrites sync the temporary file before the atomic rename
+  (a sync failure fails the write and leaves the old file intact) and use a
+  ULID-bearing temporary name; metrics appends force mode `0600` even when
+  reopening an existing file. At the 4 MiB metrics cap, the sidecar now keeps
+  the contiguous prefix of whole lines that fits and logs the dropped count
+  instead of discarding the entire batch. Directory cleanup retries once and
+  logs the leaked path if both attempts fail. H39 remains open.
 - **Cancelled/errored runs persist provider metrics and spend exactly once.**
   Terminal accounting no longer takes the run's cancellation token: the
   persist helpers own a fresh token, so tokens/cost consumed before a

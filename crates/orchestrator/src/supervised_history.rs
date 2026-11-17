@@ -21,7 +21,18 @@
 //!
 //! All writes are bounded: history reads stop at 32 MiB and the metrics
 //! sidecar is capped at 4 MiB. File writes are atomic (same-directory
-//! temporary + rename) and mode `0600` on Unix.
+//! temporary + rename), synchronize the temporary file before the rename, and
+//! mode `0600` on Unix.
+//!
+//! ## Trust boundary
+//!
+//! The child is the attribution boundary (ADR-60): history lines it writes
+//! are trusted *semantically* as that child's own completed turns, and the
+//! parent does not try to re-validate their meaning. The parent only enforces
+//! structure — trimming an unanswered tool-call tail and applying the size
+//! caps below — and splits the file at the parent-stamped seed length. A
+//! child that wrote a forged or malformed but structurally valid turn would
+//! be trusted exactly like one it actually produced.
 
 use std::io::{Error as IoError, ErrorKind};
 use std::path::{Path, PathBuf};
@@ -29,11 +40,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use concerto_core::types::{Message, ProviderMetrics};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use ulid::Ulid;
 
 /// Environment variable carrying the accumulated history file path.
 pub const HISTORY_ENV: &str = "CONCERTO_AGENT_HISTORY_PATH";
 /// Environment variable carrying the JSON Lines metrics file path.
 pub const METRICS_ENV: &str = "CONCERTO_AGENT_METRICS_PATH";
+/// Environment variable carrying the parent's exact seed message count.
+///
+/// The parent trims the seed before writing it, so the file normally holds
+/// exactly this many messages when the child starts. The child uses it to
+/// decide whether a trimmed tail may be written back: only history grown past
+/// the seed can be child-produced.
+pub const SEED_LEN_ENV: &str = "CONCERTO_AGENT_HISTORY_SEED_LEN";
 
 /// Hard read cap for the accumulated history file (32 MiB).
 pub const MAX_HISTORY_BYTES: u64 = 32 * 1024 * 1024;
@@ -121,8 +140,11 @@ pub async fn read_messages(path: &Path) -> std::io::Result<Vec<Message>> {
 /// periodic flush that trimmed it would lose the call and leave a later result
 /// orphaned. The file may therefore hold a transient unanswered tail while the
 /// child is running. Restore and harvest trim it before the history is used:
-/// the child rewrites a trimmed file at startup, and the parent trims its
-/// harvested delta.
+/// the child trims in memory (and rewrites only a tail it produced, see
+/// [`restore_for_child`]), and the parent trims its harvested delta.
+///
+/// The child-written turns are trusted as that child's own turns (ADR-60
+/// attribution boundary); this function only applies the structural size cap.
 pub async fn append_turns(path: &Path, new_turns: &[Message]) -> std::io::Result<()> {
     if new_turns.is_empty() {
         return Ok(());
@@ -133,6 +155,40 @@ pub async fn append_turns(path: &Path, new_turns: &[Message]) -> std::io::Result
         .map_err(|error| IoError::new(ErrorKind::InvalidData, error.to_string()))?;
     reject_oversized_history(bytes.len())?;
     write_atomic(path, &bytes).await
+}
+
+/// Result of restoring the accumulated history for a supervised child.
+#[derive(Debug)]
+pub struct ChildRestore {
+    /// The messages the child should hand to `with_initial_messages`. The
+    /// unanswered tail is always trimmed here.
+    pub messages: Vec<Message>,
+    /// A failed attempt to rewrite a crash-left child tail. The in-memory
+    /// messages are still usable; the caller only needs to log the failure.
+    pub rewrite_error: Option<IoError>,
+}
+
+/// Restore the accumulated history for a supervised child process.
+///
+/// The parent trims the seed before writing it, so the messages in the file
+/// up to `seed_len` are normally provider-valid and belong to the parent's
+/// seed. The in-memory result is always trimmed, but the file is rewritten
+/// only when it has grown past the seed (`accumulated.len() > seed_len`):
+/// only a tail the child produced may shrink. When the file is at or below
+/// the seed length it is left byte-identical, which keeps the parent's
+/// `initial_seed_len` harvest slicing exact even if the file was truncated by
+/// an external failure. Rewrite failures are returned rather than aborting the
+/// restore so a child can still start with the trimmed in-memory history.
+pub async fn restore_for_child(path: &Path, seed_len: usize) -> std::io::Result<ChildRestore> {
+    let mut messages = read_messages(path).await?;
+    let accumulated_len = messages.len();
+    trim_unanswered_tool_call_tail(&mut messages);
+    let rewrite_error = if accumulated_len > seed_len && messages.len() != accumulated_len {
+        write_seed(path, &messages).await.err()
+    } else {
+        None
+    };
+    Ok(ChildRestore { messages, rewrite_error })
 }
 
 /// Refuse a rewrite that would exceed the read cap. The existing file is left
@@ -150,40 +206,64 @@ fn reject_oversized_history(size: usize) -> std::io::Result<()> {
 
 /// Append provider metrics as JSON Lines.
 ///
-/// One metric per line. Once the file would exceed [`MAX_METRICS_BYTES`] the
-/// remaining lines are dropped with a warning; the sidecar is telemetry and
-/// must never grow without bound.
+/// One metric per line. When the incoming batch would exceed
+/// [`MAX_METRICS_BYTES`], a contiguous prefix of whole lines that fits is
+/// appended and the rest are dropped with a warning; a line is never split.
+/// The sidecar is telemetry and must never grow without bound. The file is
+/// forced to mode `0600` after opening because an `OpenOptions` mode only
+/// applies when the file is created, not when an existing file is reopened.
 pub async fn append_metrics(path: &Path, metrics: &[ProviderMetrics]) -> std::io::Result<()> {
     if metrics.is_empty() {
         return Ok(());
-    }
-    let mut payload = String::new();
-    for metric in metrics {
-        let line = serde_json::to_string(metric)
-            .map_err(|error| IoError::new(ErrorKind::InvalidData, error.to_string()))?;
-        payload.push_str(&line);
-        payload.push('\n');
     }
     let existing = match tokio::fs::metadata(path).await {
         Ok(metadata) => metadata.len(),
         Err(error) if error.kind() == ErrorKind::NotFound => 0,
         Err(error) => return Err(error),
     };
-    if existing.saturating_add(payload.len() as u64) > MAX_METRICS_BYTES {
+    let mut budget = MAX_METRICS_BYTES.saturating_sub(existing);
+    let mut payload = String::new();
+    let mut kept = 0usize;
+    for metric in metrics {
+        let mut line = serde_json::to_string(metric)
+            .map_err(|error| IoError::new(ErrorKind::InvalidData, error.to_string()))?;
+        line.push('\n');
+        let line_len = line.len() as u64;
+        if line_len > budget {
+            break;
+        }
+        budget -= line_len;
+        payload.push_str(&line);
+        kept += 1;
+    }
+    let dropped = metrics.len() - kept;
+    if kept == 0 {
         tracing::warn!(
             path = %path.display(),
             existing,
-            incoming = payload.len(),
+            incoming = metrics.len(),
+            dropped,
             cap = MAX_METRICS_BYTES,
-            "supervised metrics sidecar cap reached; dropping new metric lines"
+            "supervised metrics sidecar cap reached; dropping all new metric lines"
         );
         return Ok(());
+    }
+    if dropped > 0 {
+        tracing::warn!(
+            path = %path.display(),
+            existing,
+            kept,
+            dropped,
+            cap = MAX_METRICS_BYTES,
+            "supervised metrics sidecar cap reached; dropping metric lines that do not fit"
+        );
     }
 
     let mut options = tokio::fs::OpenOptions::new();
     options.create(true).append(true);
     set_mode_0600(&mut options);
     let mut file = options.open(path).await?;
+    set_file_mode_0600(path).await?;
     file.write_all(payload.as_bytes()).await?;
     file.flush().await
 }
@@ -251,12 +331,20 @@ async fn read_limited(path: &Path, limit: u64) -> std::io::Result<Option<Vec<u8>
     Ok(Some(bytes))
 }
 
-/// Write `bytes` to a sibling temporary file, then rename it over `path`.
+/// Write `bytes` to a sibling temporary file, sync it, then rename it over
+/// `path`.
+///
+/// A `sync_all` failure fails the write: a history file that is visible after
+/// the rename but whose contents may be lost on a crash is worse than no
+/// rewrite at all (the previous file is left intact). The temporary name
+/// carries a fresh ULID in addition to the PID and sequence so concurrent
+/// writers cannot collide even across restarts.
 async fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("history");
     let sequence = WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let temporary = parent.join(format!(".{name}.{}.{sequence}.tmp", std::process::id()));
+    let temporary =
+        parent.join(format!(".{name}.{}.{}.{sequence}.tmp", std::process::id(), Ulid::new()));
 
     let result = async {
         let mut options = tokio::fs::OpenOptions::new();
@@ -265,6 +353,9 @@ async fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let mut file = options.open(&temporary).await?;
         file.write_all(bytes).await?;
         file.flush().await?;
+        // Durability before the rename: a synced temporary either becomes the
+        // new history or leaves the old one in place.
+        file.sync_all().await?;
         drop(file);
         // Unix renames over an existing file atomically; Windows does not.
         // Removing the destination first leaves the small non-atomic window
@@ -290,6 +381,20 @@ fn set_mode_0600(options: &mut tokio::fs::OpenOptions) {
 
 #[cfg(not(unix))]
 fn set_mode_0600(_options: &mut tokio::fs::OpenOptions) {}
+
+/// Force an existing file to mode `0600`; `OpenOptions::mode` only applies at
+/// creation, so an appended-to sidecar needs an explicit chmod.
+#[cfg(unix)]
+async fn set_file_mode_0600(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let permissions = std::fs::Permissions::from_mode(0o600);
+    tokio::fs::set_permissions(path, permissions).await
+}
+
+#[cfg(not(unix))]
+async fn set_file_mode_0600(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -472,6 +577,45 @@ mod tests {
         assert_eq!(loaded[0].tokens_in, 10);
         assert_eq!(loaded[1].provider, "anthropic");
         assert_eq!(loaded[1].tokens_in, 20);
+    }
+
+    #[tokio::test]
+    async fn metrics_cap_keeps_only_the_whole_lines_that_fit() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("metrics.jsonl");
+        let first = metric("openai", 10);
+        let second = metric("anthropic", 20);
+        let mut first_line = serde_json::to_string(&first).expect("serialize first");
+        first_line.push('\n');
+        let second_line = serde_json::to_string(&second).expect("serialize second");
+        // Leave room for exactly the first line; the second must be dropped
+        // whole rather than split or taking the first batch entry with it.
+        let existing = MAX_METRICS_BYTES - first_line.len() as u64;
+        std::fs::write(&path, vec![b' '; existing as usize]).expect("fill to the cap");
+
+        append_metrics(&path, &[first, second]).await.expect("append partial batch");
+
+        let bytes = std::fs::read(&path).expect("read metrics sidecar");
+        assert_eq!(bytes.len() as u64, MAX_METRICS_BYTES);
+        assert!(bytes.ends_with(first_line.as_bytes()), "the line that fits is appended whole");
+        assert!(!bytes.windows(second_line.len()).any(|window| window == second_line.as_bytes()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn metrics_permissions_are_forced_to_0600_on_append() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("metrics.jsonl");
+        std::fs::write(&path, b"").expect("pre-create metrics file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen fixture mode");
+
+        append_metrics(&path, &[metric("openai", 1)]).await.expect("append metrics");
+
+        let mode = std::fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "an existing metrics file must be chmodded to 0600");
     }
 
     #[tokio::test]

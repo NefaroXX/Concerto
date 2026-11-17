@@ -1,7 +1,7 @@
 //! H39b step 3: parent-owned supervised child history/metrics wiring.
 
 use super::*;
-use concerto_core::types::{Message, ProviderMetrics, Role};
+use concerto_core::types::{Message, ProviderMetrics, Role, ToolCall};
 use concerto_sessions::SqliteSessionStore;
 
 fn message(role: Role, content: &str) -> Message {
@@ -40,6 +40,15 @@ fn build_supervised_commands_stamps_history_paths_only_when_available() {
     let reviewer_paths = crate::supervised_history::paths_for(directory.path(), "reviewer");
     let mut paths = HashMap::new();
     paths.insert("reviewer".to_owned(), reviewer_paths.clone());
+    let history = SupervisedHistoryRun {
+        directory: directory.path().to_path_buf(),
+        paths,
+        seeds: vec![SupervisedHistorySeed {
+            agent_id: "reviewer".to_owned(),
+            initial_seed_len: 2,
+            paths: reviewer_paths.clone(),
+        }],
+    };
 
     let commands = build_supervised_commands(
         Path::new("/bin/true"),
@@ -47,7 +56,7 @@ fn build_supervised_commands_stamps_history_paths_only_when_available() {
         &tasks,
         &[("CONCERTO_PROVIDER".to_owned(), "mock".to_owned())],
         None,
-        Some(&paths),
+        Some(&history),
     );
     assert_eq!(commands.len(), 2);
 
@@ -60,11 +69,16 @@ fn build_supervised_commands_stamps_history_paths_only_when_available() {
         reviewer.get(crate::supervised_history::METRICS_ENV),
         Some(&reviewer_paths.metrics.to_string_lossy().into_owned())
     );
+    assert_eq!(
+        reviewer.get(crate::supervised_history::SEED_LEN_ENV).map(String::as_str),
+        Some("2")
+    );
     assert_eq!(reviewer.get("CONCERTO_AGENT_ID").map(String::as_str), Some("reviewer"));
 
     let worker = envs(&commands[1].1);
     assert!(!worker.contains_key(crate::supervised_history::HISTORY_ENV));
     assert!(!worker.contains_key(crate::supervised_history::METRICS_ENV));
+    assert!(!worker.contains_key(crate::supervised_history::SEED_LEN_ENV));
 
     let no_history = build_supervised_commands(
         Path::new("/bin/true"),
@@ -168,6 +182,86 @@ async fn prepare_and_harvest_restore_append_and_attribute_child_history() {
     assert_eq!(rows, vec![("mock".to_owned(), 1)], "exactly one child metric row");
 
     let _ = tokio::fs::remove_dir_all(&prepared.directory).await;
+}
+
+/// Regression for the H39b harvest offset-loss bug: when the accumulated file
+/// is not longer than the parent's seed, child startup must leave it
+/// byte-identical even though the unanswered tail is trimmed in memory.
+/// Rewriting it would shift the parent's `initial_seed_len` slice and drop the
+/// first child turn.
+#[tokio::test]
+async fn startup_never_shrinks_a_seed_length_file_and_harvest_keeps_every_child_turn() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let db_path = directory.path().join("sessions.db");
+    let store = SqliteSessionStore::connect_path(&db_path).await.expect("file-backed store");
+    let session_id = store
+        .create_session(
+            camino::Utf8Path::new("/tmp/h39b-offset"),
+            "mock",
+            "mock",
+            CancellationToken::new(),
+        )
+        .await
+        .expect("session")
+        .id;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+
+    let paths = crate::supervised_history::paths_for(directory.path(), "reviewer");
+    let mut unanswered = message(Role::Assistant, "");
+    unanswered.tool_calls = Some(vec![ToolCall {
+        id: "seed-call".to_owned(),
+        name: "filesystem".to_owned(),
+        arguments: serde_json::json!({ "path": "seed.txt" }),
+        thought_signature: None,
+    }]);
+    let seed = vec![message(Role::User, "seed question"), unanswered];
+    let seed_len = seed.len();
+    std::fs::write(&paths.history, serde_json::to_vec(&seed).expect("serialize seed"))
+        .expect("write seed fixture");
+    let before = std::fs::read(&paths.history).expect("read seed bytes");
+
+    // Child startup: the unanswered tail is trimmed in memory, but the file is
+    // exactly at the parent's seed length, so it must not be rewritten.
+    let restored = crate::supervised_history::restore_for_child(&paths.history, seed_len)
+        .await
+        .expect("restore child history");
+    assert_eq!(restored.messages.len(), seed_len - 1, "unanswered tail trimmed for the loop");
+    assert!(restored.rewrite_error.is_none(), "no rewrite is attempted at seed length");
+    assert_eq!(
+        std::fs::read(&paths.history).expect("reread seed bytes"),
+        before,
+        "a file at or below the seed length is left byte-identical"
+    );
+
+    // Child delta follows the seed and is appended without trimming.
+    let delta =
+        vec![seeded_message(Role::User, "child task"), seeded_message(Role::Assistant, "done")];
+    crate::supervised_history::append_turns(&paths.history, &delta)
+        .await
+        .expect("simulate child append");
+
+    let seed = SupervisedHistorySeed {
+        agent_id: "reviewer".to_owned(),
+        initial_seed_len: seed_len,
+        paths: paths.clone(),
+    };
+    harvest_supervised_history(Some(&store), session_id, None, &[seed]).await;
+
+    let accumulated = store
+        .load_agent_messages(session_id, "reviewer", CancellationToken::new())
+        .await
+        .expect("load agent history");
+    assert_eq!(
+        accumulated.len(),
+        delta.len(),
+        "no offset loss: every child turn is persisted: {accumulated:?}"
+    );
+    assert_eq!(accumulated[0].content, "child task");
+    assert_eq!(accumulated[1].content, "done");
+    assert!(
+        !accumulated.iter().any(|message| message.content == "seed question"),
+        "no seed turn is persisted as child history"
+    );
 }
 
 #[tokio::test]

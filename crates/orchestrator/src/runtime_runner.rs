@@ -678,7 +678,7 @@ async fn prepare_supervised_history(
                 %error,
                 "failed to restrict supervised history directory; child history disabled"
             );
-            let _ = tokio::fs::remove_dir_all(&directory).await;
+            remove_supervised_history_dir(&directory).await;
             return None;
         }
     }
@@ -757,8 +757,13 @@ async fn harvest_supervised_history(
         // are independent best-effort artifacts.
         match crate::supervised_history::read_messages(&seed.paths.history).await {
             Ok(accumulated) if accumulated.len() < seed.initial_seed_len => {
+                // Loud, never a silent skip: a short file means the seed
+                // offset no longer corresponds to the child's turns and
+                // harvesting would mis-slice. Leave the child turns
+                // unpersisted rather than attach the wrong messages.
                 tracing::warn!(
                     %agent_id,
+                    path = %seed.paths.history.display(),
                     expected = seed.initial_seed_len,
                     actual = accumulated.len(),
                     "supervised agent history is shorter than its seed; skipping append"
@@ -836,6 +841,31 @@ async fn harvest_supervised_history(
             let cancel = CancellationToken::new();
             if let Err(error) = store.record_spend(record, cancel).await {
                 tracing::warn!(%agent_id, %error, "failed to persist supervised spend record");
+            }
+        }
+    }
+}
+
+/// Remove the parent-owned per-run directory, retrying once on failure.
+///
+/// Cleanup is best-effort, but a transient filesystem error should not leak a
+/// directory full of child history. If both attempts fail, the leaked path is
+/// logged loudly so an operator can remove it.
+async fn remove_supervised_history_dir(directory: &Path) {
+    match tokio::fs::remove_dir_all(directory).await {
+        Ok(()) => {}
+        Err(first_error) => {
+            tracing::warn!(
+                path = %directory.display(),
+                %first_error,
+                "failed to remove supervised history directory; retrying once"
+            );
+            if let Err(second_error) = tokio::fs::remove_dir_all(directory).await {
+                tracing::warn!(
+                    path = %directory.display(),
+                    %second_error,
+                    "failed to remove supervised history directory after retry; directory leaked"
+                );
             }
         }
     }
@@ -4591,7 +4621,7 @@ fn build_supervised_commands(
     tasks: &[(String, String)],
     spawn_env: &[(String, String)],
     plan_id: Option<&str>,
-    history_paths: Option<&HashMap<String, crate::supervised_history::SupervisedHistoryPaths>>,
+    history: Option<&SupervisedHistoryRun>,
 ) -> Vec<(String, std::process::Command)> {
     tasks
         .iter()
@@ -4618,11 +4648,21 @@ fn build_supervised_commands(
             // H39b step 3: parent-owned files keep the child off the session
             // database. Both are absent when preparing the run directory
             // failed, in which case the child simply runs without history or
-            // metrics sidecar.
-            if let Some(agent_paths) = history_paths.and_then(|paths| paths.get(agent_id)) {
-                command
-                    .env(crate::supervised_history::HISTORY_ENV, &agent_paths.history)
-                    .env(crate::supervised_history::METRICS_ENV, &agent_paths.metrics);
+            // metrics sidecar. The seed length is the exact parent-trimmed
+            // seed count so a short (externally truncated) file is never
+            // rewritten below the parent's harvest offset.
+            if let Some(history) = history {
+                if let Some(agent_paths) = history.paths.get(agent_id) {
+                    command
+                        .env(crate::supervised_history::HISTORY_ENV, &agent_paths.history)
+                        .env(crate::supervised_history::METRICS_ENV, &agent_paths.metrics);
+                }
+                if let Some(seed) = history.seeds.iter().find(|seed| seed.agent_id == *agent_id) {
+                    command.env(
+                        crate::supervised_history::SEED_LEN_ENV,
+                        seed.initial_seed_len.to_string(),
+                    );
+                }
             }
             (agent_id.clone(), command)
         })
@@ -4658,7 +4698,6 @@ async fn drive_supervised_run(
     // the same restore seed across supervisor restarts.
     let supervised_history =
         prepare_supervised_history(session_store, run.session_id, &run.tasks).await;
-    let history_paths = supervised_history.as_ref().map(|history| &history.paths);
     let mut supervisor = Supervisor::new(run.config);
     // Keep a pool handle for the Decision rows emitted after `run.services` is
     // moved into the supervisor (`with_services`).
@@ -4678,7 +4717,7 @@ async fn drive_supervised_run(
         &run.tasks,
         &run.spawn_env,
         run.plan_id.as_deref(),
-        history_paths,
+        supervised_history.as_ref(),
     ) {
         if let Err(error) = supervisor.spawn_agent(&mut command, &agent_id) {
             tracing::warn!(%agent_id, %error, "supervised agent failed to start; recording a decision");
@@ -4749,13 +4788,7 @@ async fn drive_supervised_run(
     if let Some(history) = &supervised_history {
         harvest_supervised_history(session_store, run.session_id, Some(task_id.0), &history.seeds)
             .await;
-        if let Err(error) = tokio::fs::remove_dir_all(&history.directory).await {
-            tracing::warn!(
-                path = %history.directory.display(),
-                %error,
-                "failed to remove supervised history directory"
-            );
-        }
+        remove_supervised_history_dir(&history.directory).await;
     }
 
     if cancel.is_cancelled() {

@@ -3122,10 +3122,12 @@ Branch: `fix/harness-headless-history` (HEAD `34a09ee` before this change).
   delta without trimming, because the assistant turn carrying a tool call is
   persisted before its result exists; a periodic trim there would drop the
   call and orphan the later result in the middle of history. At startup the
-  child trims a crash-left unanswered tail and rewrites the file before any
-  append, and the parent trims its harvested delta. `AgentRunner`'s in-process
-  trim now delegates to the same helper. A rewrite that would exceed the
-  32 MiB cap is refused without touching the readable existing file.
+  child trims a crash-left unanswered tail in memory and rewrites the file
+  before any append only when the file has grown past the parent-stamped seed
+  length (see the review entry below), and the parent trims its harvested
+  delta. `AgentRunner`'s in-process trim now delegates to the same helper. A
+  rewrite that would exceed the 32 MiB cap is refused without touching the
+  readable existing file.
 - **Harvest before cancellation.** After `run_until` (including budget
   teardown) and before the parent's cancellation early return, the parent
   reads the child files and appends only `messages[initial_seed_len..]` with a
@@ -3165,3 +3167,71 @@ Branch: `fix/harness-headless-history` (HEAD `34a09ee` before this change).
     exit 0.
   - `cargo fmt --all -- --check`: exit 0; `git diff --check`: clean.
 - **Status.** H39 remains open until review.
+
+## 2026-11-17 — H39b review/security fixes
+
+- **Metrics file permissions.** `append_metrics` now forces mode `0600` after
+  opening the sidecar, not only at creation. `OpenOptions::mode` applies to a
+  newly created file, so a pre-existing metrics file (for example one copied
+  into the run directory) kept its wider mode when appended to. On non-Unix
+  the chmod is a no-op. Covered by a Unix test that pre-creates the file at
+  `0644` and asserts `0600` after append.
+- **Seed-length harvest boundary (data-loss fix).** The parent already trims
+  the seed before writing it, and now stamps the exact trimmed message count
+  as `CONCERTO_AGENT_HISTORY_SEED_LEN` on every child command. At startup the
+  child always trims the accumulated tail for `with_initial_messages`, but
+  rewrites the file only when it grew past that seed length; a file at or
+  below the seed is left byte-identical. Previously any trimmed tail was
+  rewritten, so an externally truncated or seed-length file could shrink
+  below the parent's `initial_seed_len`, shifting the harvest slice and
+  dropping the first child turn. The parent's short-file path remains a loud
+  `warn!` with agent id, path, expected and actual counts rather than a silent
+  skip. The new regression
+  (`startup_never_shrinks_a_seed_length_file_and_harvest_keeps_every_child_turn`)
+  constructs a seed ending in an unanswered assistant tool call, runs the
+  child startup/appends/harvest sequence, and proves every child turn is
+  persisted with no seed turn and no offset loss.
+- **Cleanup retry.** Post-harvest `remove_dir_all` retries once on failure and
+  warns with the leaked directory path if both attempts fail, so a transient
+  filesystem error does not silently leave child history behind.
+- **Atomic-write hardening.** Temporary names now include a fresh ULID in
+  addition to the PID and sequence (still `create_new(true)`), so concurrent
+  writers and restarts cannot collide. The temporary file is `sync_all`ed
+  before the rename; a sync failure fails the write and leaves the previous
+  history intact rather than publishing a file whose contents may be lost on
+  a crash.
+- **Metrics cap keeps whole lines.** When a batch would exceed the 4 MiB
+  sidecar cap, `append_metrics` now appends the contiguous prefix of whole
+  lines that fits and logs how many were dropped. Lines are never split, and
+  only a batch with no fitting line is dropped entirely. A focused test fills
+  the file to exactly one line's remaining budget and asserts the first line
+  is appended whole while the second is dropped.
+- **Trust boundary documented.** `supervised_history` now states explicitly
+  that child-written turns are trusted semantically as that child's own turns
+  (ADR-60 makes the child the attribution boundary); the parent enforces only
+  structural tail trimming and size caps. A child that wrote a structurally
+  valid forged turn would be trusted like one it produced itself.
+- **Known limits (H39 remains open).** Agent-scoped and supervised history
+  still accumulate without compaction; cancellation between a child's last
+  unflushed turns and the parent harvest loses those turns; metrics remain
+  best-effort telemetry (a line larger than the remaining budget is dropped
+  whole); and the file contract still assumes the parent's seed and the child
+  share one local filesystem with atomic rename semantics. This entry
+  addresses the review/security findings only. H39 is not closed.
+- **Verification (serial `--test-threads=1`, `TMPDIR=/var/tmp`, repository
+  `target/`, `RUSTFLAGS="-D warnings"`, `CARGO_INCREMENTAL=0`; logs under
+  `target/harness-reliability/h39b4-*`):**
+  - `cargo test -p concerto-orchestrator --lib supervised_history`:
+    **17 passed, 0 failed** (includes the new metrics-cap, permissions and
+    seed-boundary regression tests).
+  - `cargo test -p concerto-orchestrator --lib
+    runtime_runner_impl::tests::supervised_history`: **5 passed, 0 failed**.
+  - `cargo test -p concerto-orchestrator --test supervisor_agent_process`:
+    **5 passed, 0 failed**, including a real child stamped with seed length 2
+    that trims and rewrites its crash-left tail before appending.
+  - `cargo check --workspace --all-targets -j1`: exit 0.
+  - `cargo clippy -p concerto-orchestrator --all-targets -- -D warnings`:
+    exit 0.
+  - `cargo fmt --all -- --check`: exit 0; `git diff --check`: clean.
+- **Status.** H39 remains open pending further end-to-end review; this entry
+  claims only the H39b review fixes above.

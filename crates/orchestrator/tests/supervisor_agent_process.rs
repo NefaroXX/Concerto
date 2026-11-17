@@ -586,11 +586,13 @@ fn agent_process_with_history(
     script: serde_json::Value,
     history: &std::path::Path,
     metrics: &std::path::Path,
+    seed_len: usize,
 ) -> Command {
     let mut command = agent_process(root, script);
     command
         .env("CONCERTO_AGENT_HISTORY_PATH", history.display().to_string())
-        .env("CONCERTO_AGENT_METRICS_PATH", metrics.display().to_string());
+        .env("CONCERTO_AGENT_METRICS_PATH", metrics.display().to_string())
+        .env(concerto_orchestrator::supervised_history::SEED_LEN_ENV, seed_len.to_string());
     command
 }
 
@@ -669,6 +671,7 @@ async fn supervised_child_restores_and_appends_history_and_reports_metrics() {
                 one_write_script(),
                 &history_path,
                 &metrics_path,
+                2,
             ),
             "agent-a",
         )
