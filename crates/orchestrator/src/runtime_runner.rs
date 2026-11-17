@@ -771,6 +771,42 @@ async fn create_audit_pool(
     })
 }
 
+/// Open the audit pool with a small bounded retry.
+///
+/// A busy or transiently unavailable `sessions.db` must not silently disable
+/// checkpoint tooling for the whole run. Three attempts with 25 ms then 50 ms
+/// backoff cover the short-lived open window while preserving the caller's
+/// fail-soft contract: every failed attempt is logged and the final error is
+/// returned for [`build_audit_sink`] to degrade to a no-op audit sink.
+async fn create_audit_pool_with_retry(
+    data_dir: &std::path::Path,
+) -> Result<sqlx::SqlitePool, OrchestratorError> {
+    const ATTEMPTS: u32 = 3;
+    const BACKOFF_MS: [u64; 2] = [25, 50];
+
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match create_audit_pool(data_dir).await {
+            Ok(pool) => return Ok(pool),
+            Err(error) => {
+                tracing::warn!(
+                    attempt,
+                    attempts = ATTEMPTS,
+                    error = %error,
+                    "failed to open sessions DB for audit"
+                );
+                if attempt >= ATTEMPTS {
+                    return Err(error);
+                }
+            }
+        }
+        if let Some(delay_ms) = BACKOFF_MS.get((attempt - 1) as usize) {
+            tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
+        }
+    }
+}
+
 /// Resolve the provider based on the selected ID and configuration.
 ///
 /// Model-first strategy:
@@ -955,7 +991,7 @@ pub(crate) use continuity::*;
 /// writer in one run targets the same `sessions.db`.
 pub(crate) async fn build_audit_sink() -> (Arc<dyn AuditLog>, Option<sqlx::SqlitePool>) {
     match concerto_sessions::app_data_dir() {
-        Ok(data_dir) => match create_audit_pool(&data_dir).await {
+        Ok(data_dir) => match create_audit_pool_with_retry(&data_dir).await {
             Ok(pool) => (Arc::new(SqliteAuditLog::new(pool.clone())), Some(pool)),
             Err(e) => {
                 tracing::warn!(error = %e, "failed to open audit DB — audit logging disabled");

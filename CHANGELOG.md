@@ -111,6 +111,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Checkpoint tooling fails loudly and opens the sessions DB with a bounded
+  retry.** When the sessions database cannot be opened, the standalone harness
+  no longer leaves `checkpoint_create`/`checkpoint_inspect` unregistered and
+  reports the executor's misleading `tool not found`. The service now returns
+  a specific `CheckpointUnavailable` error naming the checkpoint
+  store/database before invoking, and the audit-pool open retries three times
+  (25 ms then 50 ms) while logging each failed attempt; degraded builds also
+  warn that checkpoint tools are unavailable. Registered checkpoint tools
+  still dispatch without a wired `CheckpointAccess`. The original intermittent
+  database-open failure was not reproduced.
 - **MCP probe timeouts are attributable and give the first stage a startup
   allowance.** Child spawn is bounded separately, and `initialize` gets the
   configured stage budget plus a bounded startup allowance because

@@ -23,7 +23,7 @@ passing repository tests alone does not close a finding.
 | H11 | P2 | Empty benchmark outcomes force a zero pass score | Fixed and verified; awaiting merge |
 | H12 | P2 | Durable event subscriber queues have no memory bound | Open |
 | H13 | P1 | Structured-response parsing rewrites Unicode before attempting JSON parsing | Fixed and verified; awaiting merge |
-| H14 | P2 | Checkpoint startup can degrade into ToolNotFound; CLI test failed intermittently | Open; observed during H02 verification |
+| H14 | P2 | Checkpoint startup can degrade into ToolNotFound; CLI test failed intermittently | Fixed and verified: missing checkpoint tooling now returns a specific `CheckpointUnavailable` refusal, the audit-pool open retries 3 times (25/50 ms), and degraded builds log why; the original open failure was not reproduced |
 | H15 | P1 | Orchestrator read cache trusts matching size/mtime without checking current bytes | Fixed and verified; awaiting merge |
 | H16 | P2 | Coverage runners misread reports, lose cancellation and trust incomplete test evidence | Fixed and verified on 66309f8; awaiting merge |
 | H17 | P1 | Resumed history lacks restored read-version claims when a new gate is constructed | Fixed and verified; awaiting merge |
@@ -54,7 +54,7 @@ passing repository tests alone does not close a finding.
 
 Table reconciled 2026-11-17 after the H23 fix; the H40 and H41 rows were
 previously left at their preparation state. Open work is the register below
-(H12, H14, H29, H39 remainder); H28 is scoped, with only upstream- or
+(H12, H29, H39 remainder); H28 is scoped, with only upstream- or
 platform-gated duplicate families left.
 
 
@@ -2737,3 +2737,59 @@ has terminated; there is no remaining validation process to wait on.
   passed; `cargo check --workspace --all-targets -j1` passed; `cargo clippy -p
   concerto-mcp -p concerto-cli --all-targets -j1 -- -D warnings` passed;
   `cargo fmt --all -- --check` passed.
+
+## 2026-11-17 — H14: refuse absent checkpoint tooling specifically; retry the audit-pool open
+
+- **Deterministic mechanism:** `build_standalone_harness_with_memory` builds its
+  pool through `build_audit_sink` → `create_audit_pool`. Any failure opening
+  `sessions.db` is deliberately fail-soft: `build_audit_sink` returns
+  `(NoopAuditLog, None)`. With no `gate_pool`, the checkpoint store is `None`
+  and `register_harness_tools` skips `checkpoint_create`/`checkpoint_inspect`.
+  `HarnessService::invoke` then executed the missing name and surfaced the
+  executor's generic `ToolError::ExecutionFailed { message: "tool not found:
+  checkpoint_inspect" }`.
+- **Misleading symptom:** the CLI printed
+  `harness operation failed: tool not found: checkpoint_inspect`, which reads
+  as a dispatch bug rather than a startup degradation. That was the observed
+  H02-era intermittent failure.
+- **Not reproduced:** the original trigger for the failed database open under
+  load was never captured or reproduced. This change makes the degraded state
+  deterministic and attributable; it does not claim to have proven the open
+  failure's root cause.
+- **New refusal:** `checkpoint_create` and `checkpoint_inspect` now dispatch
+  through a guard that returns `HarnessServiceError::CheckpointUnavailable`
+  before invoking when `CheckpointAccess` is absent **and** the corresponding
+  tool is not registered (checked by name in
+  `ToolExecutor::tool_definitions`). A registered checkpoint tool still
+  dispatches without wired access, so the mock/registry path and
+  `invoke_dispatches_each_operation_name` are unchanged. The variant's message
+  now covers create/inspect/restore and names the checkpoint store/sessions
+  database instead of claiming only restore is unavailable.
+- **Bounded retry:** `build_audit_sink` opens the pool through
+  `create_audit_pool_with_retry`: three attempts with 25 ms then 50 ms backoff,
+  logging every failed attempt with its attempt number and error, then
+  returning the final error so the existing fail-soft `(NoopAuditLog, None)`
+  contract is preserved. Non-checkpoint operations keep running on a degraded
+  pool.
+- **Visible cause:** when `build_standalone_harness_with_memory` finishes
+  without checkpoint parts, it logs a `tracing::warn!` naming the project root
+  and stating that the sessions database could not be opened, so the cause is
+  visible in logs rather than inferred from the tool-not-found symptom.
+- **Regression coverage:**
+  `harness_service::tests::missing_checkpoint_tooling_is_a_specific_refusal`
+  asserts the error variant for both `checkpoint_inspect` and
+  `checkpoint_create` through `invoke`, and that the text names the checkpoint
+  store/sessions database and never `tool not found`.
+  `harness_service::tests::registered_checkpoint_tool_dispatches_without_checkpoint_access`
+  pins the preserved registry path. `invoke_dispatches_each_operation_name`
+  still passes.
+- **Verification (logs under `target/harness-reliability/`, `h14-` prefix):**
+  - `cargo test -p concerto-orchestrator --lib harness_service`: 8 passed,
+    0 failed.
+  - `cargo test -p concerto-cli --lib dispatch::harness`: 10 passed, 0 failed
+    (including `cli_checkpoint_create_then_inspect_share_the_service_payloads`).
+  - `cargo test -p concerto-cli --test settings_commands`: 13 passed, 0 failed.
+  - `cargo check --workspace --all-targets -j1`: exit 0.
+  - `cargo clippy -p concerto-orchestrator -p concerto-cli --all-targets -j1
+    -- -D warnings`: exit 0.
+  - `cargo fmt --all -- --check`: exit 0.
