@@ -1130,12 +1130,15 @@ impl Event {
 /// When a [`SecretSanitizer`] is configured, all events are sanitized
 /// before publication to prevent accidental leakage of API keys, tokens,
 /// passwords, and other credentials through the event system.
-#[derive(Clone)]
 pub struct EventBus {
     tx: broadcast::Sender<Arc<Event>>,
     durable_subscribers: Arc<Mutex<Vec<Arc<DurableSender>>>>,
     /// Per-subscriber capacity for durable queues.
     durable_capacity: usize,
+    /// Open handles on this bus (the original plus every clone). The explicit
+    /// counter is the shutdown authority: `strong_count` on a shared field is
+    /// fragile because any future internal clone would extend bus lifetime.
+    handles: Arc<AtomicUsize>,
     /// Unique identifier for this bus instance, used for `Hash`/`Eq` in
     /// iced 0.14 `Subscription::run_with`.
     id: u64,
@@ -1161,6 +1164,22 @@ impl PartialEq for EventBus {
 }
 
 impl Eq for EventBus {}
+
+impl Clone for EventBus {
+    fn clone(&self) -> Self {
+        // Infallible accounting: every constructed `EventBus` has one handle,
+        // and only the last drop reaches zero.
+        self.handles.fetch_add(1, Ordering::Relaxed);
+        Self {
+            tx: self.tx.clone(),
+            durable_subscribers: Arc::clone(&self.durable_subscribers),
+            durable_capacity: self.durable_capacity,
+            handles: Arc::clone(&self.handles),
+            id: self.id,
+            sanitizer: self.sanitizer.clone(),
+        }
+    }
+}
 
 /// Receiver half of `EventBus`. Wraps `broadcast::Receiver`.
 #[derive(Debug)]
@@ -1451,6 +1470,7 @@ impl EventBus {
             tx,
             durable_subscribers: Arc::new(Mutex::new(Vec::new())),
             durable_capacity: DURABLE_QUEUE_CAPACITY,
+            handles: Arc::new(AtomicUsize::new(1)),
             id,
             sanitizer: None,
         }
@@ -1468,6 +1488,7 @@ impl EventBus {
             tx,
             durable_subscribers: Arc::new(Mutex::new(Vec::new())),
             durable_capacity: DURABLE_QUEUE_CAPACITY,
+            handles: Arc::new(AtomicUsize::new(1)),
             id,
             sanitizer: Some(Arc::new(sanitizer)),
         }
@@ -1484,6 +1505,7 @@ impl EventBus {
             tx,
             durable_subscribers: Arc::new(Mutex::new(Vec::new())),
             durable_capacity: durable_capacity.max(1),
+            handles: Arc::new(AtomicUsize::new(1)),
             id,
             sanitizer: None,
         }
@@ -1626,7 +1648,9 @@ impl Drop for EventBus {
     fn drop(&mut self) {
         // Clones share the subscriber list, so only the last bus handle owns
         // shutdown. A frontend/keepalive clone must not close live queues.
-        if Arc::strong_count(&self.durable_subscribers) != 1 {
+        // The explicit counter is authoritative: any handle still held after
+        // this decrement keeps the queues open.
+        if self.handles.fetch_sub(1, Ordering::AcqRel) != 1 {
             return;
         }
         let mut subscribers =
@@ -1939,6 +1963,94 @@ mod tests {
         assert!(durable.recv().await.is_some(), "retained event is still delivered");
         let end = tokio::time::timeout(std::time::Duration::from_secs(1), durable.recv()).await;
         assert!(matches!(end, Ok(None)), "closed queue yields None after draining");
+    }
+
+    /// Lost-wakeup regression: a receiver that has already parked on the
+    /// queue's `Notify` must still see events published afterwards, in order,
+    /// without a spurious `None` and without being counted as dropped.
+    ///
+    /// The default `#[tokio::test]` runtime is single-threaded. The spawned
+    /// task sends the handshake and then continues into `recv().await` until
+    /// the queue parks it; the test wakes only after that. A yield keeps this
+    /// robust without a timing sleep.
+    #[tokio::test]
+    async fn parked_durable_receiver_is_woken_without_loss() {
+        let bus = EventBus::default();
+        let mut receiver = bus.subscribe_durable();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            let first = receiver.recv().await;
+            let second = receiver.recv().await;
+            (first, second, receiver)
+        });
+
+        started_rx.await.expect("receiver task should start");
+        tokio::task::yield_now().await;
+
+        let session_id = new_id();
+        let correlation_id = new_id();
+        for content in ["first", "second"] {
+            bus.publish_for_session(
+                session_id,
+                correlation_id,
+                EventKind::AgentThought {
+                    agent_id: "parked".into(),
+                    content: content.into(),
+                    kind: ThinkingKind::Detail,
+                },
+            )
+            .expect("publish while the receiver is parked");
+        }
+
+        let (first, second, receiver) = task.await.expect("receiver task should not panic");
+        let first = first.expect("first recv must not return None");
+        let second = second.expect("second recv must not return None");
+        for (event, expected) in [(&first, "first"), (&second, "second")] {
+            let EventKind::AgentThought { content, .. } = &event.kind else {
+                panic!("unexpected event kind");
+            };
+            assert_eq!(content, expected, "events stay in publish order");
+        }
+        assert_eq!(receiver.dropped_events(), 0, "a parked receiver must not lose events");
+        assert_eq!(bus.durable_health().max_pending, 0, "both events were consumed");
+    }
+
+    /// The explicit handle counter, not `Arc::strong_count`, owns queue
+    /// shutdown: durable queues stay open while any clone survives and close
+    /// exactly when the last handle drops.
+    #[test]
+    fn durable_queues_close_only_when_last_bus_handle_drops() {
+        let bus = EventBus::default();
+        let mut receiver = bus.subscribe_durable();
+        let first = bus.clone();
+        let second = bus.clone();
+        drop(bus);
+
+        assert!(
+            matches!(receiver.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "two surviving clones must keep the queue open"
+        );
+        first
+            .publish(Event::new(new_id(), new_id(), EventKind::SessionSaved))
+            .expect("publish through a surviving clone");
+        assert!(receiver.try_recv().is_ok(), "a surviving clone keeps delivery alive");
+
+        drop(first);
+        assert!(
+            matches!(receiver.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "one surviving clone must keep the queue open"
+        );
+        second
+            .publish(Event::new(new_id(), new_id(), EventKind::SessionSaved))
+            .expect("publish through the last clone");
+        assert!(receiver.try_recv().is_ok(), "the last clone still delivers");
+
+        drop(second);
+        assert!(
+            matches!(receiver.try_recv(), Err(mpsc::error::TryRecvError::Disconnected)),
+            "the last handle drop must close the queue"
+        );
     }
 
     /// Dropping the receiver closes its queue; the next publish prunes it and

@@ -390,9 +390,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Durable event queues are bounded and gaps are surfaced.** Each durable
   subscriber now has an 8192-event bounded queue with counted drop-oldest
-  overflow instead of an unbounded mpsc channel, so a stalled recorder,
-  `--events-json` writer or indexer can no longer grow memory without limit
-  over a long session. `DurableHealth::dropped_events` and the receiver-level
+  overflow instead of an unbounded mpsc channel, so a stalled recorder or
+  `--events-json` writer can no longer grow memory without limit over a long
+  session. `DurableHealth::dropped_events` and the receiver-level
   `DurableEventReceiver::dropped_events()`/`capacity()` accessors expose the
   cumulative loss; overflow is logged at a rate-limited cadence and lag clears
   when the backlog drains. `EventRecording::finish` fails closed when the

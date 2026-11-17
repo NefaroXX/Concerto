@@ -86,7 +86,21 @@ impl EventRecording {
                                 store.record_event(session_id, &event, CancellationToken::new()).await?;
                             }
                         }
-                        // Capture overflow that occurred during the final drain.
+                        // Final observation before the task returns and drops
+                        // `receiver`. Dropping the receiver closes the queue;
+                        // after the flag flips, new `DurableSender::send` calls
+                        // see `closed` and return without pushing or counting
+                        // a drop. Any drop that already happened (including one
+                        // raced in during the drain) is visible here.
+                        //
+                        // Residual window: this read happens just before the
+                        // receiver drop, so a publisher that passes the closed
+                        // check and overflows between this observation and the
+                        // close can still be missed. `close` does not take the
+                        // queue lock, so a publisher already inside the
+                        // critical section can also count a drop just after the
+                        // flag flips. `finish` is best-effort for that in-flight
+                        // race; every drop observed here is fatal.
                         gap.observe(receiver.dropped_events(), receiver.capacity());
                         return Ok(());
                     }

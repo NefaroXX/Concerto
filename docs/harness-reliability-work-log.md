@@ -2801,9 +2801,10 @@ Branch: `fix/harness-headless-history` (HEAD `34a09ee` before this change).
 - **Failure:** `EventBus::subscribe_durable` wrapped an unbounded
   `mpsc::unbounded_channel`. The bus observed backlog only at 4096 (warn) and
   65536 (lag) and never bounded storage, so a stalled durable consumer — the
-  SQLite audit recorder, `--events-json` writer, indexer, recorders, routing or
-  telemetry subscriber — could grow memory without limit for the life of a
-  long session.
+  session event recorder (audit), `--events-json` writer, or the orchestrator
+  event/transcript recorders — could grow memory without limit for the life of
+  a long session. (Spend, routing, indexer and provider-telemetry
+  `subscribe_durable` calls are test-only on this HEAD.)
 - **Change:** replaced the per-subscriber unbounded mpsc with a bounded
   `Mutex<VecDeque<Arc<Event>>>` queue shared through an `Arc` between the
   publisher-side `DurableSender` and `DurableEventReceiver`, plus `Notify`,
@@ -2816,8 +2817,11 @@ Branch: `fix/harness-headless-history` (HEAD `34a09ee` before this change).
   checking the queue/closed state, so wakeups are not lost; `try_recv` maps
   empty/closed to the existing `mpsc::error::TryRecvError` contract. Receiver
   `Drop` closes and wakes the queue, and the last `EventBus` handle closes all
-  queues (a keepalive clone does not). Pruning and the 32-subscriber cap are
-  unchanged.
+  queues (a keepalive clone does not). The last-handle decision uses an
+  explicit `Arc<AtomicUsize>` handle counter incremented by a manual `Clone`
+  and decremented in `Drop`, not `Arc::strong_count` on an internal field, so
+  the bus identity (`id`/`Hash`/`Eq`) and keepalive semantics are preserved.
+  Pruning and the 32-subscriber cap are unchanged.
 - **Contract:** durable delivery is lossless only while a consumer keeps up.
   On overflow the oldest events are discarded, the retained suffix stays in
   publish order, and loss is counted and observable through
@@ -2834,7 +2838,10 @@ Branch: `fix/harness-headless-history` (HEAD `34a09ee` before this change).
   power-of-two drop count with the cumulative count and capacity; the existing
   backlog warning remains rate-limited and resets when the backlog drains.
 - **Consumer gap surfacing:** `EventRecording` polls the receiver after every
-  `recv`/`try_recv` drain step, accumulates the observed total, exposes
+  `recv`/`try_recv` drain step, plus one final observation after the
+  cancellation drain and before the receiver drops (the residual
+  publisher-vs-close race is documented in place), accumulates the observed
+  total, exposes
   `pub fn dropped_events(&self) -> u64`, logs one rate-limited `tracing::error!`
   per observed gap naming `session_id`, `dropped`, `gap`, `total` and
   `capacity`, and makes `finish(self)` return `SessionError::Storage` naming the
@@ -2868,6 +2875,12 @@ Branch: `fix/harness-headless-history` (HEAD `34a09ee` before this change).
   99 dropped, prompt return), `dropped_durable_receiver_is_pruned_from_health`
   (drop → publish prunes, health returns to zero),
   `dropping_bus_closes_durable_receiver` (drain then `None`),
+  `parked_durable_receiver_is_woken_without_loss` (spawned receiver parks on
+  `recv().await` after a handshake, two events published while parked arrive
+  in order as `Some`, `dropped_events == 0`, pending back to 0),
+  `durable_queues_close_only_when_last_bus_handle_drops` (three handles
+  dropped sequentially: queue stays open/`Empty` while a clone survives and
+  delivers through it, then becomes `Disconnected` on the last drop),
   `durable_delivery_is_lossless_within_capacity` and
   `durable_receiver_does_not_drop_burst_events` (1000 events under the default
   bound), `durable_receiver_exposes_capacity_and_cumulative_drops` (cap 4, 10
@@ -2889,15 +2902,19 @@ Branch: `fix/harness-headless-history` (HEAD `34a09ee` before this change).
   retained events, then run the writer), asserts exactly one `events_dropped`
   record with `dropped == 1` / `capacity == 8192`, strictly monotonic `seq`, the
   next event still present, and `run_finished` last.
-- **Verification (logs under `target/harness-reliability/`, `h12b-` prefix; one
-  Cargo job at a time with `-j1`, warnings denied, repository `target/`):**
-  - `cargo test -p concerto-core --lib event`: 34 passed, 0 failed.
+- **Verification (h12c follow-up logs under `target/harness-reliability/`,
+  `h12c-` prefix; one Cargo job at a time with `-j1`, warnings denied,
+  repository `target/`):**
+  - `cargo test -p concerto-core --lib event`: 36 passed, 0 failed (includes
+    `parked_durable_receiver_is_woken_without_loss` and
+    `durable_queues_close_only_when_last_bus_handle_drops`).
   - `cargo test -p concerto-sessions`: 212 passed, 0 failed (+ doc-tests 0).
   - `cargo test -p concerto-cli --lib dispatch::run`: 39 passed, 0 failed.
-  - `cargo test -p concerto-orchestrator --lib provider_telemetry`: 1 passed,
-    0 failed.
   - `cargo check --workspace --all-targets -j1`: exit 0.
-  - `cargo clippy -p concerto-core -p concerto-sessions -p
-    concerto-orchestrator -p concerto-cli --all-targets -j1 -- -D warnings`:
-    exit 0.
+  - `cargo clippy -p concerto-core -p concerto-sessions -p concerto-cli
+    --all-targets -j1 -- -D warnings`: exit 0.
   - `cargo fmt --all -- --check`: exit 0.
+  - `git diff --check`: exit 0.
+  - The earlier `h12b` pass also ran `cargo test -p concerto-orchestrator
+    --lib provider_telemetry`: 1 passed, 0 failed (orchestrator code is
+    unchanged in this follow-up).
