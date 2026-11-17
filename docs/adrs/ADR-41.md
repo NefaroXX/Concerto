@@ -52,3 +52,17 @@ misrepresented what the runtime actually produced:
 - The spend backend (`SpendTracker`, `SpendRecord`, policy checks, session
   caps) is unchanged — this ADR only moves the surfaces and wires the events
   and persistence that already existed in the taxonomy and schema.
+
+## Amendment (2026-11-17, H39a)
+
+Decision point 5 and the first consequences bullet say a failed run records no
+spend record because "spend is settled only on success". That is no longer the
+whole contract for terminal failure. Terminal metrics/spend settlement is
+**best-effort telemetry for every terminal outcome** — success, terminal error,
+and cancellation — and it is **independent of the run's cancellation token**:
+the settlement helpers own a fresh token, so tokens/cost consumed before a
+cancellation or terminal error still reach `provider_metrics`, `spend_records`
+and the session aggregates. Settlement is still best-effort (store failures are
+logged and swallowed) and exactly-once per run via `RunSettlement`. H39b adds
+optional per-agent `agent_id` attribution to `SpendRecord`, but does not change
+this best-effort or exactly-once contract.

@@ -82,11 +82,12 @@ async fn persist_spend_records_writes_one_record_per_metrics_entry() {
 /// Metrics/spend captured by a run whose cancellation token has already
 /// fired must still settle.
 ///
-/// This is the H39a regression: the old helpers took the run's token and
-/// passed it to `SessionStore::record_metrics`, whose `check_cancel` first
-/// statement returns `"operation cancelled"` — so a cancelled run wrote no
-/// metric row and left session totals at zero. Settlement now owns a fresh
-/// token, so both metrics entries (and their spend counterparts) land.
+/// This is the H39a regression mechanism, exercised directly: passing the
+/// run's pre-cancelled token to `SessionStore::record_metrics` fails at its
+/// `check_cancel` first statement (`"operation cancelled"`), which is exactly
+/// what the old helpers did. With that mechanism still failing, settlement —
+/// which owns a fresh token — still writes both metrics entries and their
+/// spend counterparts.
 #[tokio::test]
 async fn cancelled_run_token_still_settles_metrics_and_spend() {
     let store = concerto_sessions::SqliteSessionStore::connect_in_memory().await.unwrap();
@@ -128,8 +129,31 @@ async fn cancelled_run_token_still_settles_metrics_and_spend() {
         },
     ];
 
+    // The defect mechanism itself, before settlement: a store write that uses
+    // the run's cancelled token is rejected. This is the call the old helpers
+    // made, and it proves the cancellation guard — not a missing store or a
+    // later assertion — is what settlement has to route around.
+    let defect = store.record_metrics(session_id, metrics[0].clone(), run_cancel.clone()).await;
+    match &defect {
+        Err(concerto_sessions::SessionError::Database(message)) => {
+            assert!(
+                message.to_ascii_lowercase().contains("cancel"),
+                "expected the cancellation guard, got {message}"
+            );
+        }
+        other => panic!("record_metrics must reject a cancelled token, got {other:?}"),
+    }
+
     let settlement = RunSettlement::new();
     settle_run_accounting(Some(&store), session_id, Some(task_id), &metrics, &settlement).await;
+
+    // After the successful settlement the same cancelled token is still
+    // rejected, so the rows below can only have come from settlement's own
+    // fresh token.
+    assert!(
+        store.record_metrics(session_id, metrics[1].clone(), run_cancel.clone()).await.is_err(),
+        "settlement must not make the run token usable"
+    );
 
     // One spend row per non-empty provider, despite the cancelled run token.
     let records = store.list_spend_records(session_id, CancellationToken::new()).await.unwrap();

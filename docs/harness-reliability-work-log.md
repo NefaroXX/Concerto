@@ -48,7 +48,7 @@ passing repository tests alone does not close a finding.
 | H36 | P2 | cargo-audit can report incomplete registry checks with exit zero | Fixed and verified on 66309f8; awaiting merge |
 | H37 | P1 | Native provider wire adapters discard mandatory system/assistant text | Fixed; full local battery and all 12 exact-head CI checks passed |
 | H38 | P2 | Gemini canonical history loses native part order/text signatures and misclassifies thought text | Fixed; full local battery and all 12 exact-head CI checks passed on 14390eb |
-| H39 | P1 | Run settlement persists summaries instead of complete provider history | Root repair fixed, published and exact-head verified (`2dbf25a`; ADR-87 `72c414a`). Cancelled/errored-run metrics and spend settlement fixed in H39a (settlement outlives the run token, exactly-once per run); specialist/process-scoped history remains open |
+| H39 | P1 | Run settlement persists summaries instead of complete provider history | Root repair fixed, published and exact-head verified (`2dbf25a`; ADR-87 `72c414a`). Cancelled/errored-run metrics and spend settlement fixed in H39a (settlement outlives the run token, exactly-once per run); H39b persistence foundation landed (agent-scoped message store + optional spend `agent_id`); specialist/process-scoped history plumbing remains open (H39b steps 2–3) |
 | H40 | P2 | Headless multi-agent history clips messages and older obligations before dispatch | Fixed, published and exact-head verified (`91bf006`); loopback CLI request fixture plus the approved-plan routing control |
 | H41 | P1 | Settings CLI fixtures use XDG isolation on macOS, where application paths resolve to the real profile | Fixed and verified on Linux, published with H40 (`91bf006`); macOS hazard source-confirmed, portable coverage not claimed |
 
@@ -2949,8 +2949,11 @@ Branch: `fix/harness-headless-history` (HEAD `34a09ee` before this change).
 - **Tests (`crates/orchestrator/src/runtime_runner/tests/spend_dispatch.rs`).**
   `cancelled_run_token_still_settles_metrics_and_spend` (real in-memory
   `SqliteSessionStore`, two providers, a run token already cancelled at
-  settlement: two spend rows and session totals 200 in / 100 out / 0.03 cost;
-  the old helper with that token wrote no metric row and left totals at zero),
+  settlement. The test exercises the defect mechanism directly: a
+  `record_metrics` call with that token returns the cancellation error before
+  and after settlement, proving the guard is still live; settlement's own
+  fresh-token writes then land as two spend rows and session totals 200 in /
+  100 out / 0.03 cost),
   `settle_run_accounting_is_exactly_once_per_latch` (two calls with one latch:
   one spend row and undoubled totals), and the adapted
   `persist_spend_records_writes_one_record_per_metrics_entry`.
@@ -2969,3 +2972,71 @@ Branch: `fix/harness-headless-history` (HEAD `34a09ee` before this change).
   specialist-scoped history, remain open. H39 is not fully closed; only
   cancelled/errored-run root accounting settlement is.
 
+
+## 2026-11-17 — H39b foundation: agent-scoped message store + spend attribution
+
+- **Scope.** Step 1 of 3. Adds the persistence substrate only: an
+  agent-scoped message table, fail-closed store API, and optional per-agent
+  spend attribution. In-process specialist plumbing, supervised child history
+  files and IPC changes are explicitly **not** part of this step.
+- **Schema.**
+  - `crates/sessions/migrations/043_agent_scoped_messages.sql` creates
+    `agent_messages(id TEXT PK, session_id TEXT NOT NULL REFERENCES
+    sessions(id) ON DELETE CASCADE, agent_id TEXT NOT NULL,
+    agent_sequence_num INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT
+    NULL, tool_calls TEXT, tool_results TEXT, reasoning_content TEXT,
+    tokens_in INTEGER NOT NULL DEFAULT 0, tokens_out INTEGER NOT NULL DEFAULT
+    0, gemini_replay TEXT)` plus
+    `idx_agent_messages_stream(session_id, agent_id, agent_sequence_num)`.
+    Column shapes mirror `messages` (001 + 042) so `Message` round-trips
+    without loss.
+  - `crates/sessions/migrations/044_spend_agent_id.sql` adds nullable
+    `spend_records.agent_id` and `idx_spend_session_agent(session_id,
+    agent_id)`. Additive: pre-H39b rows and JSON read back as `None`.
+  - Migration README's next-free number is now 045; no registry list exists
+    (`sqlx::migrate!` enumerates files).
+- **Store API (additive, non-breaking).**
+  `SessionStore::append_agent_messages(session_id, agent_id, &[Message],
+  cancel)` and `load_agent_messages(session_id, agent_id, cancel)` have trait
+  defaults that return `SessionError::Storage("agent-scoped messages are
+  unavailable in this store")` — fail closed, never a silent success. Both are
+  implemented for `SqliteSessionStore`. Append is transactional and assigns
+  `agent_sequence_num = COALESCE(MAX(...), 0) + 1` scoped per `(session_id,
+  agent_id)`; load orders by that sequence. Root and agent loaders share one
+  `message_from_row` decoder, preserving role, content, tool calls/results,
+  reasoning, per-turn usage (0 ⇒ `None`, per ADR-48 §4) and Gemini replay.
+- **Isolation proof.** `agent_messages` is a separate table with its own
+  sequence; `load_messages` still selects only `messages`, and
+  `load_agent_messages` filters `(session_id, agent_id)`. The interleaved
+  root/alpha/beta test asserts each loader observes only its own ordered
+  stream. `delete_session` never names `agent_messages`; its rows disappear
+  through the FK cascade, which the cascade test proves by direct SQL.
+- **Spend attribution.** `SpendRecord` gains `#[serde(default)] agent_id:
+  Option<String>`; `record_spend`/`list_spend_records` persist and decode it.
+  Every workspace construction site was updated; the orchestrator's terminal
+  settlement passes `None` for now.
+- **H39a follow-ups folded in.** `cancelled_run_token_still_settles_metrics_and_spend`
+  now calls `record_metrics` with the pre-cancelled run token before and after
+  settlement and asserts both calls fail at the cancellation guard — the defect
+  mechanism is exercised rather than only described. ADR-41 has a dated
+  amendment: terminal failure/cancellation settlement is best-effort and
+  independent of the run cancellation token.
+- **Adoption plan (steps 2–3).** Step 2 routes in-process specialist history
+  through `append_agent_messages`/`load_agent_messages` with a stable agent id
+  and passes that id into spend records. Step 3 does the same for supervised
+  agent-process child history files (IPC/transport explicitly deferred until
+  then) and reconciles parent/child spend using the same `agent_id`.
+- **Verification (serial `-j1`, `TMPDIR=/var/tmp`, repository `target/`,
+  `RUSTFLAGS="-D warnings"`, `CARGO_INCREMENTAL=0`; logs under
+  `target/harness-reliability/h39b1-*`):**
+  - `cargo test -p concerto-sessions`: **220 passed, 0 failed** (+ 0
+    doc-tests), including all eight new H39b tests and the updated spend
+    round-trip.
+  - `cargo test -p concerto-orchestrator --lib
+    runtime_runner_impl::tests::spend_dispatch`: **6 passed, 0 failed**.
+  - `cargo check --workspace --all-targets -j1`: exit 0.
+  - `cargo clippy -p concerto-sessions -p concerto-orchestrator
+    -p concerto-api-server --all-targets -j1 -- -D warnings`: exit 0.
+  - `cargo fmt --all -- --check`: exit 0; `git diff --check`: clean.
+- **Status.** H39 remains open until steps 2–3 land; this entry closes only the
+  H39b persistence foundation.

@@ -567,6 +567,7 @@ async fn persist_spend_records(
             id: Ulid::new(),
             session_id,
             task_id,
+            agent_id: None,
             provider: metric.provider.clone(),
             model: metric.model.clone(),
             tokens_in: metric.tokens_in,

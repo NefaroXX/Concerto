@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Agent-scoped message persistence and spend attribution (H39b foundation).**
+  The session store can now keep an independently sequenced message stream per
+  `(session_id, agent_id)` in the new `agent_messages` table, with the same
+  role/content/tool/reasoning/usage/Gemini-replay fidelity as root messages.
+  `SessionStore::append_agent_messages` / `load_agent_messages` are additive
+  methods whose defaults fail closed for stores without agent-scoped storage,
+  and root/agent streams are isolated in both directions. `SpendRecord` gains
+  an optional `agent_id` (backward-compatible; existing rows read as `None`)
+  so specialist costs can be attributed. No specialist plumbing, child history
+  files or IPC changes yet.
 - **Integrated terminal inspection and editing.** Runtime topology and full
   evidence records, project-scoped memory exploration, structured settings,
   workspace file/context commands and Rust language queries now accompany the

@@ -219,6 +219,42 @@ pub trait SessionStore: Send + Sync {
         cancel: CancellationToken,
     ) -> Result<Vec<Message>, SessionError>;
 
+    // ---- Agent-scoped history (H39b) ----
+    //
+    // Root conversation history lives in `messages` and stays the only stream
+    // `load_messages` sees. Specialists and supervised agent processes get
+    // their own independently sequenced stream per `(session_id, agent_id)`.
+    // These are additive trait methods with fail-closed defaults: a store that
+    // has no agent-scoped storage reports an error instead of silently
+    // pretending the write/read succeeded.
+
+    /// Append messages to the `agent_id` stream of `session_id`, assigning
+    /// `agent_sequence_num` per `(session_id, agent_id)`. The append is
+    /// transactional and preserves the full `Message` projection (including
+    /// reasoning, per-turn usage and Gemini replay state).
+    async fn append_agent_messages(
+        &self,
+        session_id: Ulid,
+        agent_id: &str,
+        messages: &[Message],
+        cancel: CancellationToken,
+    ) -> Result<(), SessionError> {
+        let _ = (session_id, agent_id, messages, cancel);
+        Err(SessionError::Storage("agent-scoped messages are unavailable in this store".into()))
+    }
+
+    /// Load the `agent_id` stream of `session_id` in `agent_sequence_num`
+    /// order. Never returns root (`messages`-table) rows.
+    async fn load_agent_messages(
+        &self,
+        session_id: Ulid,
+        agent_id: &str,
+        cancel: CancellationToken,
+    ) -> Result<Vec<Message>, SessionError> {
+        let _ = (session_id, agent_id, cancel);
+        Err(SessionError::Storage("agent-scoped messages are unavailable in this store".into()))
+    }
+
     async fn list_recent_sessions(
         &self,
         limit: usize,
@@ -715,6 +751,70 @@ fn check_cancel(cancel: &CancellationToken) -> Result<(), SessionError> {
     }
 }
 
+/// Encode a [`Message`] role as the canonical lowercase token stored in the
+/// `messages` / `agent_messages` role columns.
+fn message_role_str(role: &concerto_core::types::Role) -> &'static str {
+    match role {
+        concerto_core::types::Role::System => "system",
+        concerto_core::types::Role::User => "user",
+        concerto_core::types::Role::Assistant => "assistant",
+        concerto_core::types::Role::Tool => "tool",
+        _ => "unknown",
+    }
+}
+
+/// Decode one `messages` / `agent_messages` row into a [`Message`].
+///
+/// Both tables share the same column shapes (migrations 001/042/043), so the
+/// root and agent-scoped loaders use this one decoder to guarantee identical
+/// round-trip semantics.
+fn message_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Message, SessionError> {
+    let role_str: String = row.try_get("role")?;
+    let content: String = row.try_get("content")?;
+    let tool_calls_json: Option<String> = row.try_get("tool_calls")?;
+    let tool_results_json: Option<String> = row.try_get("tool_results")?;
+    let reasoning_content: Option<String> = row.try_get("reasoning_content")?;
+    let replay_json: Option<String> = row.try_get("gemini_replay")?;
+    let gemini_replay = replay_json.as_deref().map(serde_json::from_str).transpose()?;
+    let tokens_in: i64 = row.try_get("tokens_in")?;
+    let tokens_out: i64 = row.try_get("tokens_out")?;
+
+    // ADR-48 §4: a stored value > 0 is real usage; 0 is indistinguishable
+    // from unknown (legacy rows and `None` writes), so it restores as `None`
+    // and the estimator heuristic applies.
+    let tokens_in = (tokens_in > 0).then_some(tokens_in as u64);
+    let tokens_out = (tokens_out > 0).then_some(tokens_out as u64);
+
+    let role = match role_str.as_str() {
+        "system" => concerto_core::types::Role::System,
+        "user" => concerto_core::types::Role::User,
+        "assistant" => concerto_core::types::Role::Assistant,
+        "tool" => concerto_core::types::Role::Tool,
+        other => return Err(SessionError::Serialization(format!("invalid message role: {other}"))),
+    };
+
+    let tool_calls = match tool_calls_json {
+        Some(json) if !json.is_empty() => Some(serde_json::from_str(&json)?),
+        _ => None,
+    };
+
+    let tool_results = match tool_results_json {
+        Some(json) if !json.is_empty() => Some(serde_json::from_str(&json)?),
+        _ => None,
+    };
+
+    Ok(Message {
+        gemini_replay,
+        role,
+        content,
+        tool_calls,
+        tool_results,
+        reasoning_content,
+        tokens_in,
+        tokens_out,
+    })
+}
+
 /// Decode one row of a session-summary listing query into a `SessionSummary`.
 ///
 /// Shared by `list_recent_sessions`, `list_sessions_for_project` and
@@ -1026,55 +1126,87 @@ impl SessionStore for SqliteSessionStore {
         for row in rows {
             // Cancellation checked at statement boundaries (row decode loop).
             check_cancel(&cancel)?;
+            messages.push(message_from_row(&row)?);
+        }
 
-            let role_str: String = row.try_get("role")?;
-            let content: String = row.try_get("content")?;
-            let tool_calls_json: Option<String> = row.try_get("tool_calls")?;
-            let tool_results_json: Option<String> = row.try_get("tool_results")?;
-            let reasoning_content: Option<String> = row.try_get("reasoning_content")?;
-            let replay_json: Option<String> = row.try_get("gemini_replay")?;
-            let gemini_replay = replay_json.as_deref().map(serde_json::from_str).transpose()?;
-            let tokens_in: i64 = row.try_get("tokens_in")?;
-            let tokens_out: i64 = row.try_get("tokens_out")?;
+        Ok(messages)
+    }
 
-            // ADR-48 §4: a stored value > 0 is real usage; 0 is
-            // indistinguishable from unknown (legacy rows and `None` writes),
-            // so it restores as `None` and the estimator heuristic applies.
-            let tokens_in = (tokens_in > 0).then_some(tokens_in as u64);
-            let tokens_out = (tokens_out > 0).then_some(tokens_out as u64);
+    async fn append_agent_messages(
+        &self,
+        session_id: Ulid,
+        agent_id: &str,
+        messages: &[Message],
+        cancel: CancellationToken,
+    ) -> Result<(), SessionError> {
+        check_cancel(&cancel)?;
 
-            let role = match role_str.as_str() {
-                "system" => concerto_core::types::Role::System,
-                "user" => concerto_core::types::Role::User,
-                "assistant" => concerto_core::types::Role::Assistant,
-                "tool" => concerto_core::types::Role::Tool,
-                other => {
-                    return Err(SessionError::Serialization(format!(
-                        "invalid message role: {other}"
-                    )))
-                }
-            };
+        let mut tx = self.pool.begin().await?;
 
-            let tool_calls = match tool_calls_json {
-                Some(json) if !json.is_empty() => Some(serde_json::from_str(&json)?),
-                _ => None,
-            };
+        for msg in messages {
+            // Cancellation checked at statement boundaries (per batch item).
+            check_cancel(&cancel)?;
 
-            let tool_results = match tool_results_json {
-                Some(json) if !json.is_empty() => Some(serde_json::from_str(&json)?),
-                _ => None,
-            };
+            let id = Ulid::new();
+            let role_str = message_role_str(&msg.role);
+            let tool_calls_json = msg.tool_calls.as_ref().map(serde_json::to_string).transpose()?;
+            let tool_results_json =
+                msg.tool_results.as_ref().map(serde_json::to_string).transpose()?;
+            let gemini_replay =
+                msg.gemini_replay.as_ref().map(serde_json::to_string).transpose()?;
+            // ADR-48 §4: `None` (unknown) stores as 0 and restores as `None`.
+            let tokens_in = msg.tokens_in.unwrap_or(0) as i64;
+            let tokens_out = msg.tokens_out.unwrap_or(0) as i64;
 
-            messages.push(Message {
-                gemini_replay,
-                role,
-                content,
-                tool_calls,
-                tool_results,
-                reasoning_content,
-                tokens_in,
-                tokens_out,
-            });
+            // Atomic per-stream sequence assignment: scoped to this
+            // `(session_id, agent_id)`, so concurrent agent streams never
+            // contend with each other or with the root `messages` sequence.
+            sqlx::query(
+                "INSERT INTO agent_messages (id, session_id, agent_id, agent_sequence_num, role, content, tool_calls, tool_results, reasoning_content, tokens_in, tokens_out, gemini_replay) \
+                SELECT ?, ?, ?, COALESCE(MAX(agent_sequence_num), 0) + 1, ?, ?, ?, ?, ?, ?, ?, ? FROM agent_messages WHERE session_id = ? AND agent_id = ?"
+            )
+            .bind(id.to_string())
+            .bind(session_id.to_string())
+            .bind(agent_id)
+            .bind(role_str)
+            .bind(&msg.content)
+            .bind(tool_calls_json)
+            .bind(tool_results_json)
+            .bind(msg.reasoning_content.clone())
+            .bind(tokens_in)
+            .bind(tokens_out)
+            .bind(gemini_replay)
+            .bind(session_id.to_string())
+            .bind(agent_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn load_agent_messages(
+        &self,
+        session_id: Ulid,
+        agent_id: &str,
+        cancel: CancellationToken,
+    ) -> Result<Vec<Message>, SessionError> {
+        check_cancel(&cancel)?;
+
+        let rows = sqlx::query(
+            "SELECT role, content, tool_calls, tool_results, reasoning_content, tokens_in, tokens_out, gemini_replay FROM agent_messages WHERE session_id = ? AND agent_id = ? ORDER BY agent_sequence_num ASC"
+        )
+        .bind(session_id.to_string())
+        .bind(agent_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut messages = Vec::with_capacity(rows.len());
+        for row in rows {
+            // Cancellation checked at statement boundaries (row decode loop).
+            check_cancel(&cancel)?;
+            messages.push(message_from_row(&row)?);
         }
 
         Ok(messages)
@@ -1526,10 +1658,11 @@ impl SessionStore for SqliteSessionStore {
         let task_id_str = record.task_id.map(|t| t.to_string());
 
         sqlx::query(
-            "INSERT INTO spend_records (id, session_id, task_id, provider, model, tokens_in, tokens_out, cost_usd, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            "INSERT INTO spend_records (id, session_id, task_id, agent_id, provider, model, tokens_in, tokens_out, cost_usd, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(record.id.to_string())
             .bind(record.session_id.to_string())
             .bind(task_id_str)
+            .bind(record.agent_id.as_deref())
             .bind(&record.provider)
             .bind(&record.model)
             .bind(record.tokens_in as i64)
@@ -1550,7 +1683,7 @@ impl SessionStore for SqliteSessionStore {
         check_cancel(&cancel)?;
 
         let rows = sqlx::query(
-            "SELECT id, session_id, task_id, provider, model, tokens_in, tokens_out, cost_usd, \
+            "SELECT id, session_id, task_id, agent_id, provider, model, tokens_in, tokens_out, cost_usd, \
              created_at FROM spend_records WHERE session_id = ? ORDER BY created_at ASC, id ASC",
         )
         .bind(session_id.to_string())
@@ -1579,6 +1712,8 @@ impl SessionStore for SqliteSessionStore {
                 ),
                 None => None,
             };
+            let agent_id: Option<String> =
+                row.try_get("agent_id").map_err(|e| SessionError::Database(e.to_string()))?;
             let provider: String =
                 row.try_get("provider").map_err(|e| SessionError::Database(e.to_string()))?;
             let model: String =
@@ -1598,6 +1733,7 @@ impl SessionStore for SqliteSessionStore {
                 id,
                 session_id: stored_session_id,
                 task_id,
+                agent_id,
                 provider,
                 model,
                 tokens_in: tokens_in as u64,
@@ -2111,8 +2247,10 @@ impl ConversationHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use concerto_core::provider_replay::GeminiReplay;
     use concerto_core::traits::AuditLog;
-    use concerto_core::types::{Role, TokenBudget};
+    use concerto_core::types::{Role, TokenBudget, ToolCall, ToolResult};
+    use serde_json::json;
 
     /// Check the linked engine, including SQLCipher on Unix. A clean lockfile
     /// alone cannot prove that the bundled SQLCipher amalgamation is patched.
@@ -2708,6 +2846,338 @@ mod tests {
         assert_eq!(loaded[0].content, "A");
         assert_eq!(loaded[1].content, "B");
         assert_eq!(loaded[2].content, "C");
+    }
+
+    // -----------------------------------------------------------------------
+    // H39b: agent-scoped message streams
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal message for the agent-scoped stream tests.
+    fn agent_msg(role: Role, content: &str) -> Message {
+        Message {
+            gemini_replay: None,
+            role,
+            content: content.into(),
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: None,
+            tokens_in: None,
+            tokens_out: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_messages_round_trip_preserves_reasoning_content() {
+        let store = SqliteSessionStore::connect_in_memory().await.unwrap();
+        let session = store
+            .create_session(
+                camino::Utf8Path::new("/tmp/agent-reasoning"),
+                "p",
+                "m",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let mut message = agent_msg(Role::Assistant, "answer");
+        message.reasoning_content = Some("thought step one/step two".into());
+        store
+            .append_agent_messages(session.id, "reviewer", &[message], CancellationToken::new())
+            .await
+            .unwrap();
+
+        let loaded = store
+            .load_agent_messages(session.id, "reviewer", CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].content, "answer");
+        assert_eq!(loaded[0].reasoning_content.as_deref(), Some("thought step one/step two"));
+    }
+
+    #[tokio::test]
+    async fn agent_messages_round_trip_preserves_gemini_replay() {
+        let store = SqliteSessionStore::connect_in_memory().await.unwrap();
+        let session = store
+            .create_session(
+                camino::Utf8Path::new("/tmp/agent-replay"),
+                "p",
+                "m",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let parts = vec![json!({"text": "response", "thoughtSignature": "opaque"})];
+        let mut message = agent_msg(Role::Assistant, "response");
+        message.gemini_replay =
+            Some(GeminiReplay::capture(parts.clone(), "response", None, &[]).unwrap());
+        store
+            .append_agent_messages(session.id, "reviewer", &[message], CancellationToken::new())
+            .await
+            .unwrap();
+
+        let loaded = store
+            .load_agent_messages(session.id, "reviewer", CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(loaded.len(), 1);
+        let replay = loaded[0].gemini_replay.as_ref().expect("replay state must round-trip");
+        assert_eq!(replay.parts_for(&loaded[0]).unwrap(), parts.as_slice());
+    }
+
+    #[tokio::test]
+    async fn agent_messages_round_trip_preserves_tool_calls_and_results() {
+        let store = SqliteSessionStore::connect_in_memory().await.unwrap();
+        let session = store
+            .create_session(
+                camino::Utf8Path::new("/tmp/agent-tools"),
+                "p",
+                "m",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let call = ToolCall {
+            id: "call_1".into(),
+            name: "read".into(),
+            arguments: json!({"path": "src/lib.rs"}),
+            thought_signature: Some("sig".into()),
+        };
+        let result = ToolResult {
+            id: "call_1".into(),
+            name: "read".into(),
+            content: json!({"content": "ok"}),
+        };
+        let mut assistant = agent_msg(Role::Assistant, "reading");
+        assistant.tool_calls = Some(vec![call.clone()]);
+        let mut tool = agent_msg(Role::Tool, "ok");
+        tool.tool_results = Some(vec![result.clone()]);
+
+        store
+            .append_agent_messages(
+                session.id,
+                "reviewer",
+                &[assistant, tool],
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let loaded = store
+            .load_agent_messages(session.id, "reviewer", CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(loaded.len(), 2);
+        let calls = loaded[0].tool_calls.as_ref().expect("tool calls must round-trip");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, call.id);
+        assert_eq!(calls[0].name, call.name);
+        assert_eq!(calls[0].arguments, call.arguments);
+        assert_eq!(calls[0].thought_signature, call.thought_signature);
+        let results = loaded[1].tool_results.as_ref().expect("tool results must round-trip");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, result.id);
+        assert_eq!(results[0].name, result.name);
+        assert_eq!(results[0].content, result.content);
+    }
+
+    #[tokio::test]
+    async fn agent_messages_load_ordered_by_agent_sequence_num() {
+        let store = SqliteSessionStore::connect_in_memory().await.unwrap();
+        let session = store
+            .create_session(
+                camino::Utf8Path::new("/tmp/agent-order"),
+                "p",
+                "m",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        store
+            .append_agent_messages(
+                session.id,
+                "reviewer",
+                &[agent_msg(Role::User, "one")],
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        store
+            .append_agent_messages(
+                session.id,
+                "reviewer",
+                &[agent_msg(Role::Assistant, "two"), agent_msg(Role::User, "three")],
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let loaded = store
+            .load_agent_messages(session.id, "reviewer", CancellationToken::new())
+            .await
+            .unwrap();
+        let contents: Vec<&str> = loaded.iter().map(|message| message.content.as_str()).collect();
+        assert_eq!(contents, vec!["one", "two", "three"]);
+    }
+
+    #[tokio::test]
+    async fn agent_messages_are_isolated_from_root_messages() {
+        let store = SqliteSessionStore::connect_in_memory().await.unwrap();
+        let session = store
+            .create_session(
+                camino::Utf8Path::new("/tmp/agent-isolation"),
+                "p",
+                "m",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let cancel = CancellationToken::new();
+
+        // Interleave the root stream with two agent streams so any table or
+        // filter mistake would surface as a mixed/duplicated load.
+        store
+            .append_messages(session.id, &[agent_msg(Role::User, "root-1")], cancel.clone())
+            .await
+            .unwrap();
+        store
+            .append_agent_messages(
+                session.id,
+                "alpha",
+                &[agent_msg(Role::User, "alpha-1")],
+                cancel.clone(),
+            )
+            .await
+            .unwrap();
+        store
+            .append_agent_messages(
+                session.id,
+                "beta",
+                &[agent_msg(Role::User, "beta-1")],
+                cancel.clone(),
+            )
+            .await
+            .unwrap();
+        store
+            .append_messages(session.id, &[agent_msg(Role::Assistant, "root-2")], cancel.clone())
+            .await
+            .unwrap();
+        store
+            .append_agent_messages(
+                session.id,
+                "alpha",
+                &[agent_msg(Role::Assistant, "alpha-2")],
+                cancel.clone(),
+            )
+            .await
+            .unwrap();
+        store
+            .append_agent_messages(
+                session.id,
+                "beta",
+                &[agent_msg(Role::Assistant, "beta-2")],
+                cancel.clone(),
+            )
+            .await
+            .unwrap();
+
+        let root = store.load_messages(session.id, cancel.clone()).await.unwrap();
+        let root_contents: Vec<&str> = root.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(root_contents, vec!["root-1", "root-2"], "root load sees only root rows");
+
+        let alpha = store.load_agent_messages(session.id, "alpha", cancel.clone()).await.unwrap();
+        let alpha_contents: Vec<&str> = alpha.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(alpha_contents, vec!["alpha-1", "alpha-2"], "alpha sees only its own stream");
+
+        let beta = store.load_agent_messages(session.id, "beta", cancel.clone()).await.unwrap();
+        let beta_contents: Vec<&str> = beta.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(beta_contents, vec!["beta-1", "beta-2"], "beta sees only its own stream");
+    }
+
+    #[tokio::test]
+    async fn agent_messages_append_preserves_per_turn_usage() {
+        let store = SqliteSessionStore::connect_in_memory().await.unwrap();
+        let session = store
+            .create_session(
+                camino::Utf8Path::new("/tmp/agent-usage"),
+                "p",
+                "m",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let mut measured = agent_msg(Role::User, "measured");
+        measured.tokens_in = Some(120);
+        measured.tokens_out = Some(34);
+        let unknown = agent_msg(Role::Assistant, "unknown");
+        store
+            .append_agent_messages(
+                session.id,
+                "reviewer",
+                &[measured, unknown],
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let loaded = store
+            .load_agent_messages(session.id, "reviewer", CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].tokens_in, Some(120));
+        assert_eq!(loaded[0].tokens_out, Some(34));
+        assert_eq!(loaded[1].tokens_in, None, "0 must restore as unknown");
+        assert_eq!(loaded[1].tokens_out, None);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_session_cascades_removes_its_agent_messages() {
+        let store = SqliteSessionStore::connect_in_memory().await.unwrap();
+        let session = store
+            .create_session(
+                camino::Utf8Path::new("/tmp/agent-cascade"),
+                "p",
+                "m",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        store
+            .append_agent_messages(
+                session.id,
+                "alpha",
+                &[agent_msg(Role::User, "alpha-1")],
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        store
+            .append_agent_messages(
+                session.id,
+                "beta",
+                &[agent_msg(Role::User, "beta-1")],
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        // `delete_session` never names `agent_messages`; removal is proven to
+        // come from the `ON DELETE CASCADE` FK.
+        assert!(store.delete_session(session.id, CancellationToken::new()).await.unwrap());
+
+        let remaining: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM agent_messages WHERE session_id = ?")
+                .bind(session.id.to_string())
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining.0, 0, "agent messages must not survive their session");
     }
 
     #[tokio::test]
@@ -3394,6 +3864,7 @@ mod tests {
                     id: Ulid::new(),
                     session_id: session.id,
                     task_id: None,
+                    agent_id: None,
                     provider: "openai".into(),
                     model: "gpt-4".into(),
                     tokens_in: 100,
@@ -3535,7 +4006,7 @@ mod tests {
     /// `record_spend` + `list_spend_records` round-trip: the listing returns
     /// every persisted record for the session, oldest first
     /// (`created_at ASC, id ASC`), with all fields intact — cost, tokens,
-    /// provider, model, and the optional task id.
+    /// provider, model, and the optional task and agent ids.
     async fn spend_records_round_trip_lists_in_order() {
         let store = SqliteSessionStore::connect_in_memory().await.unwrap();
         let session = store
@@ -3557,6 +4028,7 @@ mod tests {
             id: Ulid::from_parts(1_700_000_000_000, 1),
             session_id: session.id,
             task_id: Some(task_a.0),
+            agent_id: Some("reviewer".into()),
             provider: "openai".into(),
             model: "gpt-4".into(),
             tokens_in: 100,
@@ -3568,6 +4040,7 @@ mod tests {
             id: Ulid::from_parts(1_700_000_000_000, 2),
             session_id: session.id,
             task_id: None,
+            agent_id: None,
             provider: "anthropic".into(),
             model: "claude-3".into(),
             tokens_in: 200,
@@ -3579,6 +4052,7 @@ mod tests {
             id: Ulid::from_parts(1_700_000_100_000, 3),
             session_id: session.id,
             task_id: Some(task_b.0),
+            agent_id: Some("planner".into()),
             provider: "google".into(),
             model: "gemini-pro".into(),
             tokens_in: 300,
@@ -3602,6 +4076,7 @@ mod tests {
         // Field fidelity for the earliest record (with a task id).
         assert_eq!(listed[0].session_id, session.id);
         assert_eq!(listed[0].task_id, Some(task_a.0));
+        assert_eq!(listed[0].agent_id.as_deref(), Some("reviewer"));
         assert_eq!(listed[0].provider, "openai");
         assert_eq!(listed[0].model, "gpt-4");
         assert_eq!(listed[0].tokens_in, 100);
@@ -3609,8 +4084,9 @@ mod tests {
         assert!((listed[0].cost_usd - 0.01).abs() < f64::EPSILON);
         assert_eq!(listed[0].created_at, first.created_at);
 
-        // Field fidelity for a record without a task id.
+        // Field fidelity for a record without a task or agent id.
         assert_eq!(listed[1].task_id, None);
+        assert_eq!(listed[1].agent_id, None);
         assert_eq!(listed[1].provider, "anthropic");
         assert_eq!(listed[1].model, "claude-3");
         assert_eq!(listed[1].tokens_in, 200);
@@ -3621,6 +4097,57 @@ mod tests {
         let summary = store.spend_summary(session.id, cancel.clone()).await.unwrap();
         assert_eq!(summary.record_count, 3);
         assert!((summary.total_cost_usd - 0.09).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    /// H39b: `agent_id` is additive. A record written with a specialist id
+    /// round-trips, and a record without one restores as `None` (the shape
+    /// every pre-H39b row has).
+    async fn spend_record_agent_id_round_trips() {
+        let store = SqliteSessionStore::connect_in_memory().await.unwrap();
+        let session = store
+            .create_session(
+                camino::Utf8Path::new("/tmp/spend-agent"),
+                "openai",
+                "gpt-4",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let cancel = CancellationToken::new();
+
+        let attributed = crate::spend::SpendRecord {
+            id: Ulid::from_parts(1_700_000_000_000, 1),
+            session_id: session.id,
+            task_id: None,
+            agent_id: Some("reviewer".into()),
+            provider: "openai".into(),
+            model: "gpt-4".into(),
+            tokens_in: 10,
+            tokens_out: 5,
+            cost_usd: 0.001,
+            created_at: time::OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
+        };
+        let unattributed = crate::spend::SpendRecord {
+            id: Ulid::from_parts(1_700_000_000_001, 2),
+            session_id: session.id,
+            task_id: None,
+            agent_id: None,
+            provider: "openai".into(),
+            model: "gpt-4".into(),
+            tokens_in: 20,
+            tokens_out: 10,
+            cost_usd: 0.002,
+            created_at: time::OffsetDateTime::from_unix_timestamp(1_700_000_001).unwrap(),
+        };
+
+        store.record_spend(attributed.clone(), cancel.clone()).await.unwrap();
+        store.record_spend(unattributed.clone(), cancel.clone()).await.unwrap();
+
+        let listed = store.list_spend_records(session.id, cancel.clone()).await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].agent_id.as_deref(), Some("reviewer"));
+        assert_eq!(listed[1].agent_id, None);
     }
 
     #[tokio::test]
