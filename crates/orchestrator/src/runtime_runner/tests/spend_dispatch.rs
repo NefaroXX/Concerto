@@ -62,14 +62,7 @@ async fn persist_spend_records_writes_one_record_per_metrics_entry() {
         },
     ];
 
-    persist_spend_records(
-        Some(&store),
-        session_id,
-        Some(task_id),
-        &metrics,
-        CancellationToken::new(),
-    )
-    .await;
+    persist_spend_records(Some(&store), session_id, Some(task_id), &metrics).await;
 
     let records = store.list_spend_records(session_id, CancellationToken::new()).await.unwrap();
     assert_eq!(records.len(), 1, "exactly one record per settled call, empty providers skipped");
@@ -80,6 +73,136 @@ async fn persist_spend_records_writes_one_record_per_metrics_entry() {
     assert_eq!(records[0].tokens_in, 120);
     assert_eq!(records[0].tokens_out, 60);
     assert!((records[0].cost_usd - 0.02).abs() < f64::EPSILON);
+}
+
+// ------------------------------------------------------------------
+// H39a: terminal settlement outlives run cancellation and is
+// exactly-once per run.
+// ------------------------------------------------------------------
+/// Metrics/spend captured by a run whose cancellation token has already
+/// fired must still settle.
+///
+/// This is the H39a regression: the old helpers took the run's token and
+/// passed it to `SessionStore::record_metrics`, whose `check_cancel` first
+/// statement returns `"operation cancelled"` — so a cancelled run wrote no
+/// metric row and left session totals at zero. Settlement now owns a fresh
+/// token, so both metrics entries (and their spend counterparts) land.
+#[tokio::test]
+async fn cancelled_run_token_still_settles_metrics_and_spend() {
+    let store = concerto_sessions::SqliteSessionStore::connect_in_memory().await.unwrap();
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    let session_id = store
+        .create_session(
+            camino::Utf8Path::new("/tmp/spend-cancelled"),
+            "openai",
+            "gpt-4",
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .id;
+    let task_id = Ulid::new();
+
+    // The run's token is already cancelled (the defect scenario). Reads use a
+    // fresh token so the assertions themselves cannot be short-circuited.
+    let run_cancel = CancellationToken::new();
+    run_cancel.cancel();
+    assert!(run_cancel.is_cancelled());
+
+    let metrics = vec![
+        ProviderMetrics {
+            provider: "openai".into(),
+            model: "gpt-4".into(),
+            tokens_in: 120,
+            tokens_out: 60,
+            cost_usd: 0.02,
+            latency_ms: 42,
+        },
+        ProviderMetrics {
+            provider: "anthropic".into(),
+            model: "claude".into(),
+            tokens_in: 80,
+            tokens_out: 40,
+            cost_usd: 0.01,
+            latency_ms: 17,
+        },
+    ];
+
+    let settlement = RunSettlement::new();
+    settle_run_accounting(Some(&store), session_id, Some(task_id), &metrics, &settlement).await;
+
+    // One spend row per non-empty provider, despite the cancelled run token.
+    let records = store.list_spend_records(session_id, CancellationToken::new()).await.unwrap();
+    assert_eq!(records.len(), 2, "a cancelled run still writes one spend row per provider");
+    // `list_spend_records` orders by `(created_at, id)`; both rows land in the
+    // same second, so compare the provider set rather than insertion order.
+    let mut providers: Vec<&str> = records.iter().map(|record| record.provider.as_str()).collect();
+    providers.sort_unstable();
+    assert_eq!(providers, vec!["anthropic", "openai"]);
+    assert!(records.iter().all(|record| record.task_id == Some(task_id)));
+
+    // Metrics rows are visible through the session aggregates they update in
+    // the same transaction as the row insert.
+    let session = store
+        .load_session(session_id, CancellationToken::new())
+        .await
+        .unwrap()
+        .expect("session exists");
+    assert_eq!(session.total_tokens_in, 200, "both entries' input tokens reached the aggregate");
+    assert_eq!(session.total_tokens_out, 100, "both entries' output tokens reached the aggregate");
+    assert!(
+        (session.total_cost_usd - 0.03).abs() < f64::EPSILON,
+        "both entries' cost reached the aggregate, got {}",
+        session.total_cost_usd
+    );
+}
+
+/// The run latch makes terminal settlement exactly-once: a second terminal
+/// tail (or a repeated call) is a no-op and cannot duplicate telemetry.
+#[tokio::test]
+async fn settle_run_accounting_is_exactly_once_per_latch() {
+    let store = concerto_sessions::SqliteSessionStore::connect_in_memory().await.unwrap();
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    let session_id = store
+        .create_session(
+            camino::Utf8Path::new("/tmp/spend-exactly-once"),
+            "openai",
+            "gpt-4",
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .id;
+    let task_id = Ulid::new();
+    let metrics = vec![ProviderMetrics {
+        provider: "openai".into(),
+        model: "gpt-4".into(),
+        tokens_in: 120,
+        tokens_out: 60,
+        cost_usd: 0.02,
+        latency_ms: 42,
+    }];
+
+    let settlement = RunSettlement::new();
+    settle_run_accounting(Some(&store), session_id, Some(task_id), &metrics, &settlement).await;
+    // Same latch: the loser must not write a second metrics/spend pair.
+    settle_run_accounting(Some(&store), session_id, Some(task_id), &metrics, &settlement).await;
+
+    let records = store.list_spend_records(session_id, CancellationToken::new()).await.unwrap();
+    assert_eq!(records.len(), 1, "one spend row for one settled run, not one per terminal tail");
+
+    let session = store
+        .load_session(session_id, CancellationToken::new())
+        .await
+        .unwrap()
+        .expect("session exists");
+    assert_eq!(session.total_tokens_in, 120, "session totals must not double");
+    assert_eq!(session.total_tokens_out, 60, "session totals must not double");
+    assert!(
+        (session.total_cost_usd - 0.02).abs() < f64::EPSILON,
+        "session cost must not double, got {}",
+        session.total_cost_usd
+    );
 }
 
 // ------------------------------------------------------------------

@@ -111,6 +111,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Cancelled/errored runs persist provider metrics and spend exactly once.**
+  Terminal accounting no longer takes the run's cancellation token: the
+  persist helpers own a fresh token, so tokens/cost consumed before a
+  cancellation or error still reach `provider_metrics`, `spend_records` and
+  the session totals instead of being dropped by the store's cancellation
+  check. A run-scoped settlement latch is claimed before the writes so a run
+  writes its metrics/spend at most once even if a terminal tail is reached
+  twice; a partial write failure is logged and not retried (duplicate
+  telemetry is worse than a missing row). Specialist/process-scoped history
+  remains tracked under H39.
 - **Checkpoint tooling fails loudly and opens the sessions DB with a bounded
   retry.** When the sessions database cannot be opened, the standalone harness
   no longer leaves `checkpoint_create`/`checkpoint_inspect` unregistered and

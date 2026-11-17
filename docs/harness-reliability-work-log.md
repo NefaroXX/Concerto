@@ -48,7 +48,7 @@ passing repository tests alone does not close a finding.
 | H36 | P2 | cargo-audit can report incomplete registry checks with exit zero | Fixed and verified on 66309f8; awaiting merge |
 | H37 | P1 | Native provider wire adapters discard mandatory system/assistant text | Fixed; full local battery and all 12 exact-head CI checks passed |
 | H38 | P2 | Gemini canonical history loses native part order/text signatures and misclassifies thought text | Fixed; full local battery and all 12 exact-head CI checks passed on 14390eb |
-| H39 | P1 | Run settlement persists summaries instead of complete provider history | Root repair fixed, published and exact-head verified (`2dbf25a`; ADR-87 `72c414a`); specialist/process history and cancelled-run spend settlement remain open |
+| H39 | P1 | Run settlement persists summaries instead of complete provider history | Root repair fixed, published and exact-head verified (`2dbf25a`; ADR-87 `72c414a`). Cancelled/errored-run metrics and spend settlement fixed in H39a (settlement outlives the run token, exactly-once per run); specialist/process-scoped history remains open |
 | H40 | P2 | Headless multi-agent history clips messages and older obligations before dispatch | Fixed, published and exact-head verified (`91bf006`); loopback CLI request fixture plus the approved-plan routing control |
 | H41 | P1 | Settings CLI fixtures use XDG isolation on macOS, where application paths resolve to the real profile | Fixed and verified on Linux, published with H40 (`91bf006`); macOS hazard source-confirmed, portable coverage not claimed |
 
@@ -2918,3 +2918,54 @@ Branch: `fix/harness-headless-history` (HEAD `34a09ee` before this change).
   - The earlier `h12b` pass also ran `cargo test -p concerto-orchestrator
     --lib provider_telemetry`: 1 passed, 0 failed (orchestrator code is
     unchanged in this follow-up).
+
+## 2026-11-17 — H39a: cancelled/errored-run settlement is exact-once
+
+- **Defect.** `runtime_runner` persisted terminal metrics/spend with the run's
+  `req.cancel_token.clone()` on all four terminal sites (single-agent Ok/Err,
+  multi-agent Ok/Err). `SqliteSessionStore::record_metrics` starts with
+  `check_cancel(&cancel)`, so a cancelled run token made every write fail and
+  the tokens/cost consumed before cancellation never reached
+  `provider_metrics`, `spend_records` or the session aggregates. Settlement
+  was also not explicitly exactly-once per run.
+- **Mechanism.** `persist_provider_metrics` and `persist_spend_records` no
+  longer accept a `CancellationToken`; each owns a fresh
+  `CancellationToken::new()`, so a caller cannot pass the run token and the
+  writes outlive cancellation. They stay best-effort: store failures are
+  logged and swallowed. A private `RunSettlement { done: AtomicBool }` is
+  created once in `run_shared_agent`, threaded as `&RunSettlement` into
+  `execute_agent_loop` and `run_multi_agent`, and claimed with
+  `!done.swap(true, SeqCst)` by
+  `settle_run_accounting(store, session_id, task_id, metrics, settlement)`,
+  which only the winner uses to call both persist helpers. The latch is
+  claimed **before** the writes, so a partial write failure is logged and not
+  retried — duplicate telemetry is worse than a missing row.
+- **Metric sources kept verbatim.** Single-agent uses
+  `agent.provider_metrics()` (one aggregated settled entry; non-destructive).
+  Multi-agent uses `coordinator.settled_metrics()`, which is non-destructive
+  (`&[ProviderMetrics]`) and either the exact copy of the success output's
+  `provider_metrics` or the pre-failure per-dispatch accumulation. Its
+  semantics were not changed.
+- **Tests (`crates/orchestrator/src/runtime_runner/tests/spend_dispatch.rs`).**
+  `cancelled_run_token_still_settles_metrics_and_spend` (real in-memory
+  `SqliteSessionStore`, two providers, a run token already cancelled at
+  settlement: two spend rows and session totals 200 in / 100 out / 0.03 cost;
+  the old helper with that token wrote no metric row and left totals at zero),
+  `settle_run_accounting_is_exactly_once_per_latch` (two calls with one latch:
+  one spend row and undoubled totals), and the adapted
+  `persist_spend_records_writes_one_record_per_metrics_entry`.
+- **Verification (serial `-j1`, `TMPDIR=/var/tmp`, repository `target/`,
+  `RUSTFLAGS="-D warnings"`, `CARGO_INCREMENTAL=0`; logs under
+  `target/harness-reliability/h39a-*`):**
+  - `cargo test -p concerto-orchestrator --lib runtime_runner_impl::tests`:
+    69 passed, 0 failed (includes the three spend/settlement tests).
+  - `cargo test -p concerto-sessions`: 212 passed, 0 failed (+ 0 doc-tests).
+  - `cargo check --workspace --all-targets -j1`: exit 0.
+  - `cargo clippy -p concerto-orchestrator -p concerto-sessions --all-targets
+    -j1 -- -D warnings`: exit 0.
+  - `cargo fmt --all -- --check`: exit 0.
+- **Residual boundary (H39b, explicitly not fixed here).** Supervised
+  agent-process child history and parent spend reconciliation, and
+  specialist-scoped history, remain open. H39 is not fully closed; only
+  cancelled/errored-run root accounting settlement is.
+

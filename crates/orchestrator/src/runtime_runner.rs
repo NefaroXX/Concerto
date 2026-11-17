@@ -5,6 +5,7 @@ mod operator_input;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::agent_runner::AgentRunner;
@@ -499,15 +500,30 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
+/// Best-effort persist of the run's settled provider metrics.
+///
+/// **Settlement must outlive run cancellation.** Terminal accounting is not
+/// part of the run's cancellable work: tokens already consumed before a
+/// cancellation/error must still reach `provider_metrics` and the session
+/// totals. The helper therefore owns a fresh token instead of accepting the
+/// run's cancellation token — a parameter would let a caller re-introduce the
+/// H39a defect where `SessionStore::record_metrics` short-circuits on a
+/// pre-cancelled token. Failures (including a store that was already closed)
+/// are logged and swallowed: settlement is telemetry, never run control flow.
+///
+/// Exactly-once semantics belong to [`settle_run_accounting`]; this helper is
+/// the write half and does not itself deduplicate.
 async fn persist_provider_metrics(
     store: Option<&Arc<dyn concerto_sessions::SessionStore>>,
     session_id: Ulid,
     metrics: &[ProviderMetrics],
-    cancel: CancellationToken,
 ) {
     let Some(store) = store else {
         return;
     };
+    // Fresh, uncancelled token: settlement deliberately ignores the run's
+    // cancellation (see the doc comment above).
+    let cancel = CancellationToken::new();
     for metric in metrics {
         if metric.provider.trim().is_empty() {
             continue;
@@ -528,18 +544,21 @@ async fn persist_provider_metrics(
 /// accumulated usage cost already persisted as metrics). `task_id` is the task
 /// id available at the call site — the run's root task for multi-agent runs,
 /// whose per-subtask spend is attributed to it because per-subtask ids are not
-/// exposed beyond the coordinator. Failures are logged and swallowed so spend
-/// persistence never breaks a run.
+/// exposed beyond the coordinator. Settlement must outlive run cancellation
+/// (it owns a fresh token; see [`persist_provider_metrics`]) and failures are
+/// logged and swallowed so spend persistence never breaks a run.
 async fn persist_spend_records(
     store: Option<&Arc<dyn concerto_sessions::SessionStore>>,
     session_id: Ulid,
     task_id: Option<Ulid>,
     metrics: &[ProviderMetrics],
-    cancel: CancellationToken,
 ) {
     let Some(store) = store else {
         return;
     };
+    // Fresh, uncancelled token: settlement deliberately ignores the run's
+    // cancellation (see `persist_provider_metrics`).
+    let cancel = CancellationToken::new();
     for metric in metrics {
         if metric.provider.trim().is_empty() {
             continue;
@@ -559,6 +578,57 @@ async fn persist_spend_records(
             tracing::warn!(%error, %session_id, "failed to persist spend record");
         }
     }
+}
+
+/// Run-scoped exactly-once latch for terminal accounting.
+///
+/// One instance is created per run entry point (`run_shared_agent`) and shared
+/// by the single-agent and multi-agent terminal paths. Only the first terminal
+/// site to [`claim`](Self::claim) writes metrics/spend; a later terminal site
+/// on the same run (e.g. an error tail reached after a success tail already
+/// settled) is a no-op, so no duplicate rows reach `provider_metrics` /
+/// `spend_records` or the session aggregates.
+struct RunSettlement {
+    done: AtomicBool,
+}
+
+impl RunSettlement {
+    fn new() -> Self {
+        Self { done: AtomicBool::new(false) }
+    }
+
+    /// Atomically claim the one settlement write for this run.
+    ///
+    /// Returns `true` for exactly one caller. `SeqCst` is intentional: the
+    /// claim is a single run-wide decision gate, not a data race to optimise.
+    fn claim(&self) -> bool {
+        !self.done.swap(true, Ordering::SeqCst)
+    }
+}
+
+/// Claim the run's settlement latch and, only on the winner, persist the
+/// settled provider metrics and spend rows.
+///
+/// The latch is claimed **before** the writes: a partial write failure is
+/// logged inside [`persist_provider_metrics`] / [`persist_spend_records`] and
+/// deliberately not retried — duplicate telemetry is worse than a missing row,
+/// and the loser of the race must never write a second copy.
+///
+/// Settlement is independent of the run's cancellation token: the persist
+/// helpers own fresh tokens so tokens consumed before a cancellation still
+/// reach the audit trail (H39a).
+async fn settle_run_accounting(
+    store: Option<&Arc<dyn concerto_sessions::SessionStore>>,
+    session_id: Ulid,
+    task_id: Option<Ulid>,
+    metrics: &[ProviderMetrics],
+    settlement: &RunSettlement,
+) {
+    if !settlement.claim() {
+        return;
+    }
+    persist_provider_metrics(store, session_id, metrics).await;
+    persist_spend_records(store, session_id, task_id, metrics).await;
 }
 
 /// True when a store failure is the expected cancellation tail of a run
@@ -1315,6 +1385,10 @@ async fn execute_agent_loop(
     // `verify_run` project-tests travel the same policy path as the loop's
     // own evaluation.
     verify_service: Arc<crate::verify::VerifierService>,
+    // H39a: the run-scoped exactly-once settlement latch shared with the
+    // multi-agent path; the terminal Ok/Err tails claim it before writing
+    // metrics/spend so a run settles at most once.
+    settlement: &RunSettlement,
 ) -> Result<AgentOutput, OrchestratorError> {
     // ADR-67 M-01 (audit C-03 gate): the in-run overflow-strategy slot is
     // removed from `AgentLoop`. Context overflow is bounded deterministically
@@ -1448,20 +1522,15 @@ async fn execute_agent_loop(
             // Persist whatever the loop settled before failing (e.g. rate
             // limit): tokens consumed and cost accrued so far must not
             // vanish from the audit trail. Best-effort like the success tail.
+            // Settlement owns its own token, so a cancelled run token cannot
+            // suppress these rows (H39a).
             let settled = agent.provider_metrics();
-            persist_provider_metrics(
-                metrics_store.as_ref(),
-                session_id,
-                &settled,
-                req.cancel_token.clone(),
-            )
-            .await;
-            persist_spend_records(
+            settle_run_accounting(
                 metrics_store.as_ref(),
                 session_id,
                 Some(task_id),
                 &settled,
-                req.cancel_token.clone(),
+                settlement,
             )
             .await;
             return Err(error);
@@ -1481,21 +1550,15 @@ async fn execute_agent_loop(
             },
         ])
         .await;
-    persist_provider_metrics(
-        metrics_store.as_ref(),
-        session_id,
-        &output.provider_metrics,
-        req.cancel_token.clone(),
-    )
-    .await;
     // One spend record per settled provider call (the single-agent run
-    // aggregates its usage into one metrics entry; best-effort).
-    persist_spend_records(
+    // aggregates its usage into one metrics entry; best-effort). The run
+    // latch keeps a later error tail from writing duplicates (H39a).
+    settle_run_accounting(
         metrics_store.as_ref(),
         session_id,
         Some(task_id),
         &output.provider_metrics,
-        req.cancel_token.clone(),
+        settlement,
     )
     .await;
     maintain_context_after_run(
@@ -2896,6 +2959,11 @@ pub async fn run_shared_agent(
         );
     }
 
+    // H39a: one run-scoped settlement latch shared by the single-agent and
+    // multi-agent terminal paths, so metrics/spend are written exactly once
+    // per run even if a terminal tail is reached more than once.
+    let settlement = RunSettlement::new();
+
     // 7. Multi-agent dispatch. With full local agency the coordinator owns
     // every non-forced run; it engages specialists on need inside its decision
     // loop — never by pre-scanning the user's words. `force_single_agent` is
@@ -2923,6 +2991,7 @@ pub async fn run_shared_agent(
             project_context.clone(),
             &describe_state,
             verify_service.clone(),
+            &settlement,
         )
         .await;
     }
@@ -3011,6 +3080,7 @@ pub async fn run_shared_agent(
         project_context,
         single_agent_manifest_digest,
         verify_service.clone(),
+        &settlement,
     )
     .await?;
 
@@ -3095,6 +3165,10 @@ async fn run_multi_agent(
     // harness engine upgrades to the governed executor-backed engine below,
     // so coordinator-path verification travels the same policy path.
     verify_service: Arc<crate::verify::VerifierService>,
+    // H39a: the run-scoped exactly-once settlement latch shared with the
+    // single-agent path; the terminal Ok/Err tails claim it before writing
+    // metrics/spend so a run settles at most once.
+    settlement: &RunSettlement,
 ) -> Result<AgentOutput, OrchestratorError> {
     let project_dir = req.project_dir.clone();
     if let Some(store) = &session_store {
@@ -3861,20 +3935,14 @@ async fn run_multi_agent(
             // propagates: on a rate-limit
             // exhaustion / cancellation the run consumed real tokens without
             // any output — the audit trail must still record them. Best-effort
-            // like the success tail.
-            persist_provider_metrics(
-                session_store.as_ref(),
-                session_id,
-                settled,
-                req.cancel_token.clone(),
-            )
-            .await;
-            persist_spend_records(
+            // like the success tail, and independent of the run's cancellation
+            // token so a cancelled run still settles (H39a).
+            settle_run_accounting(
                 session_store.as_ref(),
                 session_id,
                 Some(task.id.0),
                 settled,
-                req.cancel_token.clone(),
+                settlement,
             )
             .await;
             return Err(error);
@@ -3953,23 +4021,17 @@ async fn run_multi_agent(
     }
     output.project_root =
         Some(camino::Utf8PathBuf::from_path_buf(project_dir.clone()).unwrap_or_default());
-    persist_provider_metrics(
-        session_store.as_ref(),
-        session_id,
-        &output.provider_metrics,
-        req.cancel_token.clone(),
-    )
-    .await;
     // One spend record per completed subtask call (each entry in
     // `provider_metrics` maps to one settled `AgentRunner` run; the run's
     // root task id is attributed since per-subtask ids are not exposed here).
-    // Best-effort: a spend-persistence failure never fails the run.
-    persist_spend_records(
+    // Best-effort: a spend-persistence failure never fails the run. The run
+    // latch keeps a later error tail from writing duplicates (H39a).
+    settle_run_accounting(
         session_store.as_ref(),
         session_id,
         Some(task.id.0),
         &output.provider_metrics,
-        req.cancel_token.clone(),
+        settlement,
     )
     .await;
     let conversation_handoff =

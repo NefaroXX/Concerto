@@ -229,6 +229,7 @@ async fn stage_tracker_completion_reflects_required_verification() {
             resume_checkpoint_json: None,
         };
 
+        let settlement = RunSettlement::new();
         let output = execute_agent_loop(
             req,
             &services,
@@ -252,6 +253,7 @@ async fn stage_tracker_completion_reflects_required_verification() {
                 project_dir.path().to_path_buf(),
                 concerto_eval::EvalEngine::new(project_dir.path()),
             )),
+            &settlement,
         )
         .await
         .expect("action-required run should finish");
@@ -308,6 +310,7 @@ async fn stage_tracker_omits_complete_when_run_fails() {
         resume_checkpoint_json: None,
     };
 
+    let settlement = RunSettlement::new();
     let result = execute_agent_loop(
         req,
         &services,
@@ -331,6 +334,7 @@ async fn stage_tracker_omits_complete_when_run_fails() {
             project_dir.path().to_path_buf(),
             concerto_eval::EvalEngine::new(project_dir.path()),
         )),
+        &settlement,
     )
     .await;
 
