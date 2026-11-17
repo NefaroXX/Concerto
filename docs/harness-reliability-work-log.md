@@ -21,7 +21,7 @@ passing repository tests alone does not close a finding.
 | H09 | P2 | Compaction truncates constraints and unresolved work | Fixed; full local battery and all 12 exact-head CI checks passed |
 | H10 | P2 | Agent-driven benchmark fixture policy denies tools | Fixed and verified; awaiting merge |
 | H11 | P2 | Empty benchmark outcomes force a zero pass score | Fixed and verified; awaiting merge |
-| H12 | P2 | Durable event subscriber queues have no memory bound | Open |
+| H12 | P2 | Durable event subscriber queues have no memory bound | Fixed and verified; awaiting merge (durable queues bounded at 8192 with counted drop-oldest overflow; session recorder fails closed on an observed gap, CLI writes `events_dropped`) |
 | H13 | P1 | Structured-response parsing rewrites Unicode before attempting JSON parsing | Fixed and verified; awaiting merge |
 | H14 | P2 | Checkpoint startup can degrade into ToolNotFound; CLI test failed intermittently | Fixed and verified: missing checkpoint tooling now returns a specific `CheckpointUnavailable` refusal, the audit-pool open retries 3 times (25/50 ms), and degraded builds log why; the original open failure was not reproduced |
 | H15 | P1 | Orchestrator read cache trusts matching size/mtime without checking current bytes | Fixed and verified; awaiting merge |
@@ -52,9 +52,9 @@ passing repository tests alone does not close a finding.
 | H40 | P2 | Headless multi-agent history clips messages and older obligations before dispatch | Fixed, published and exact-head verified (`91bf006`); loopback CLI request fixture plus the approved-plan routing control |
 | H41 | P1 | Settings CLI fixtures use XDG isolation on macOS, where application paths resolve to the real profile | Fixed and verified on Linux, published with H40 (`91bf006`); macOS hazard source-confirmed, portable coverage not claimed |
 
-Table reconciled 2026-11-17 after the H23 fix; the H40 and H41 rows were
-previously left at their preparation state. Open work is the register below
-(H12, H29, H39 remainder); H28 is scoped, with only upstream- or
+Table reconciled 2026-11-17 after the H23 and H12 fixes; the H40 and H41 rows
+were previously left at their preparation state. Open work is the register
+below (H29, H39 remainder); H28 is scoped, with only upstream- or
 platform-gated duplicate families left.
 
 
@@ -2792,4 +2792,112 @@ has terminated; there is no remaining validation process to wait on.
   - `cargo check --workspace --all-targets -j1`: exit 0.
   - `cargo clippy -p concerto-orchestrator -p concerto-cli --all-targets -j1
     -- -D warnings`: exit 0.
+  - `cargo fmt --all -- --check`: exit 0.
+
+## 2026-11-17 — H12: bound durable event subscriber queues
+
+Branch: `fix/harness-headless-history` (HEAD `34a09ee` before this change).
+
+- **Failure:** `EventBus::subscribe_durable` wrapped an unbounded
+  `mpsc::unbounded_channel`. The bus observed backlog only at 4096 (warn) and
+  65536 (lag) and never bounded storage, so a stalled durable consumer — the
+  SQLite audit recorder, `--events-json` writer, indexer, recorders, routing or
+  telemetry subscriber — could grow memory without limit for the life of a
+  long session.
+- **Change:** replaced the per-subscriber unbounded mpsc with a bounded
+  `Mutex<VecDeque<Arc<Event>>>` queue shared through an `Arc` between the
+  publisher-side `DurableSender` and `DurableEventReceiver`, plus `Notify`,
+  `closed: AtomicBool`, `pending: AtomicUsize` and `dropped: AtomicU64`.
+  `DURABLE_QUEUE_CAPACITY = 8192` (above the 4096 warn threshold). `send` locks
+  briefly, and when full pops the oldest event before pushing the new one
+  (`dropped += 1`, `lagging = true`) and notifies one waiter. Publishes never
+  await the consumer, and tracing output happens after the queue lock is
+  released. `recv` registers the `Notify` waiter with `enable()` before
+  checking the queue/closed state, so wakeups are not lost; `try_recv` maps
+  empty/closed to the existing `mpsc::error::TryRecvError` contract. Receiver
+  `Drop` closes and wakes the queue, and the last `EventBus` handle closes all
+  queues (a keepalive clone does not). Pruning and the 32-subscriber cap are
+  unchanged.
+- **Contract:** durable delivery is lossless only while a consumer keeps up.
+  On overflow the oldest events are discarded, the retained suffix stays in
+  publish order, and loss is counted and observable through
+  `DurableHealth::dropped_events` (bus-wide) and
+  `DurableEventReceiver::dropped_events()` (per subscriber, cumulative). The
+  receiver also exposes `capacity()`. Consumers must compare the receiver count
+  across receive iterations; an increase is a gap. The unreachable
+  `DURABLE_PENDING_LAG = 65536` threshold was removed; `lagging` now latches on
+  the first drop and clears when the backlog drains, while the cumulative
+  drop count remains.
+- **Observability:** `DurableHealth` gained additive `dropped_events: u64`
+  (summed across subscribers) alongside `subscriber_count`, `max_pending` and
+  `lagging_subscribers`. Overflow logs at the first drop and at each
+  power-of-two drop count with the cumulative count and capacity; the existing
+  backlog warning remains rate-limited and resets when the backlog drains.
+- **Consumer gap surfacing:** `EventRecording` polls the receiver after every
+  `recv`/`try_recv` drain step, accumulates the observed total, exposes
+  `pub fn dropped_events(&self) -> u64`, logs one rate-limited `tracing::error!`
+  per observed gap naming `session_id`, `dropped`, `gap`, `total` and
+  `capacity`, and makes `finish(self)` return `SessionError::Storage` naming the
+  session and drop count so run completion fails closed. `Drop` still only
+  cancels. The two orchestrator recorder loops (session events and typed
+  transcript) poll the same accessor and log rate-limited errors naming the
+  consumer (`session-event-recorder`, `transcript-recorder`), the session and
+  the count; their `JoinHandle<()>` loops have no error return path, so they
+  remain log-only. The CLI `EventsWriter` writes one
+  `{"event":"events_dropped","dropped":<cumulative>,"capacity":<cap>}` NDJSON
+  record (with the next monotonic `seq`) before the next event or the terminal
+  `run_finished` line; its failure policy is unchanged. `sessions::spend`,
+  `providers::routing`, `orchestrator::provider_telemetry` and
+  `memory::indexer` are producer-only on this HEAD: their `subscribe_durable`
+  calls are test-only, so there is no production receiver to poll. That
+  boundary is explicit rather than silently treated as a covered consumer.
+- **Audit outcome:** `EventRecording::finish` fails closed for callers that use
+  it (the cache/replay and desktop smoke paths); the orchestrator's
+  `start_event_recorder` loop — the session-event recorder used by
+  `run_shared_agent`, `concerto run` and the desktop runtime — and
+  `start_transcript_recorder` both return `JoinHandle<()>` with no error path,
+  so their gaps are logged only. Provider-call telemetry persisted through
+  those recorders is therefore also log-only, and `--events-json` remains a
+  progress trace whose gap is explicit in the file rather than an audit
+  authority. No control flow was changed at those boundaries.
+- **Tests (`crates/core/src/event.rs`):**
+  `durable_overflow_drops_oldest_and_reports_loss` (cap 4, 10 published →
+  6 dropped, retained 6–9 in order, `max_pending == 4`, lag=1, drain clears
+  pending/lag but keeps the loss count),
+  `stalled_durable_receiver_does_not_block_publisher` (cap 1, 100 published →
+  99 dropped, prompt return), `dropped_durable_receiver_is_pruned_from_health`
+  (drop → publish prunes, health returns to zero),
+  `dropping_bus_closes_durable_receiver` (drain then `None`),
+  `durable_delivery_is_lossless_within_capacity` and
+  `durable_receiver_does_not_drop_burst_events` (1000 events under the default
+  bound), `durable_receiver_exposes_capacity_and_cumulative_drops` (cap 4, 10
+  published → accessor reports 6 and survives draining), plus the existing
+  pending, prune, ordering and broadcast-interaction tests.
+- **Tests (`crates/sessions/src/recording.rs`):**
+  `normal_short_run_reports_no_drops_and_finishes_cleanly` (3 events,
+  accessor 0, clean `finish`, all 3 recorded),
+  `dropped_events_accessor_is_cumulative`,
+  `gap_observer_accumulates_each_new_gap_once`, and
+  `finish_fails_closed_when_drops_were_reported` (`SessionError::Storage` names
+  the session, count and "incomplete"). The core test-only capacity
+  constructor is not reachable outside core tests, so sessions cannot force
+  real overflow through the bus; detection/accumulation is tested directly and
+  the finish gate is tested with a synthetic cumulative counter.
+- **Tests (`crates/cli/src/dispatch/run.rs`):**
+  `events_json_reports_durable_queue_drops_before_terminal_line` forces real
+  overflow at the default 8192 bound (publish `capacity + 1`, drain the
+  retained events, then run the writer), asserts exactly one `events_dropped`
+  record with `dropped == 1` / `capacity == 8192`, strictly monotonic `seq`, the
+  next event still present, and `run_finished` last.
+- **Verification (logs under `target/harness-reliability/`, `h12b-` prefix; one
+  Cargo job at a time with `-j1`, warnings denied, repository `target/`):**
+  - `cargo test -p concerto-core --lib event`: 34 passed, 0 failed.
+  - `cargo test -p concerto-sessions`: 212 passed, 0 failed (+ doc-tests 0).
+  - `cargo test -p concerto-cli --lib dispatch::run`: 39 passed, 0 failed.
+  - `cargo test -p concerto-orchestrator --lib provider_telemetry`: 1 passed,
+    0 failed.
+  - `cargo check --workspace --all-targets -j1`: exit 0.
+  - `cargo clippy -p concerto-core -p concerto-sessions -p
+    concerto-orchestrator -p concerto-cli --all-targets -j1 -- -D warnings`:
+    exit 0.
   - `cargo fmt --all -- --check`: exit 0.

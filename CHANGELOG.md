@@ -388,6 +388,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Durable event queues are bounded and gaps are surfaced.** Each durable
+  subscriber now has an 8192-event bounded queue with counted drop-oldest
+  overflow instead of an unbounded mpsc channel, so a stalled recorder,
+  `--events-json` writer or indexer can no longer grow memory without limit
+  over a long session. `DurableHealth::dropped_events` and the receiver-level
+  `DurableEventReceiver::dropped_events()`/`capacity()` accessors expose the
+  cumulative loss; overflow is logged at a rate-limited cadence and lag clears
+  when the backlog drains. `EventRecording::finish` fails closed when the
+  session recorder observed a gap, the durable event and transcript recorders
+  log a rate-limited error, and `--events-json` writes an `events_dropped`
+  record. Delivery remains lossless while a consumer keeps up; retained events
+  stay in publish order.
+
 - **Dependency graph trimmed.** Removed 37 unused direct dependencies and six
   redundant duplicate declarations across the workspace manifests. The
   lockfile drops two dev-only packages (`opentelemetry-stdout`, `tokio-test`);

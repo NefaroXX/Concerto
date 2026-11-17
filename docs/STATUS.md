@@ -329,10 +329,16 @@ The expected manual release checks are maintained in [Testing](../TESTING.md).
 - **`VectorStore` trait moved to `concerto_core`.** The trait now lives in
   `concerto_core::VectorStore`, eliminating `concerto-memory` as a dependency
   of `concerto-plugins` and removing the transitive vector-store dependency.
-- **Bounded, observed durable event-bus backlog:** durable subscribers (spend
-  tracking, audit, replay) stay lossless but warn at 4096 pending events and
-  latch a lag health flag at 65536, surfaced via `EventBus::durable_health()`;
-  dead subscribers are pruned on publish and subscribe.
+- **Bounded, observed durable event-bus backlog:** each durable subscriber
+  (spend tracking, audit, replay) has an 8192-event bounded queue with
+  drop-oldest overflow. Delivery is lossless while a consumer keeps up; on
+  overflow the oldest events are discarded and counted in
+  `DurableHealth::dropped_events` and
+  `DurableEventReceiver::dropped_events()`, while a 4096-pending warning and a
+  lag flag remain observable via `EventBus::durable_health()`. Dead
+  subscribers are pruned on publish and subscribe; `EventRecording::finish`
+  fails closed on an observed gap and `--events-json` emits an
+  `events_dropped` record.
 - **Debounced memory re-index watcher:** 1s debounce with a bounded,
   deduplicated queue and a rate-limited overflow warning instead of unbounded
   queue growth.
