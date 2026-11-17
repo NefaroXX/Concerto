@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Supervised child history and spend attribution (H39b step 3).** ADR-60
+  agent-process children now restore their prior typed conversation from a
+  parent-owned per-run file and append only the turns they complete, so a
+  supervisor restart resumes with the prior process's flushed history without
+  giving the child session-database access. The parent trims an unanswered
+  trailing tool call, the child rewrites any crash-left unanswered tail at
+  startup without dropping an in-flight call between periodic flushes, and
+  history is capped at 32 MiB (an oversized rewrite is refused without
+  damaging the existing file) and metrics at 4 MiB. Files are written
+  atomically with mode `0600` under a mode-`0700` directory, and the parent
+  harvests before the cancellation early return. Each child's metrics become
+  `provider_metrics` rows and `SpendRecord`s attributed to that child agent
+  with the run's root task; root settlement does not re-record them. The IPC
+  protocol is unchanged; terminal events gain an additive compact
+  `provider_metrics` payload.
 - **Agent-scoped message persistence and spend attribution (H39b foundation).**
   The session store can now keep an independently sequenced message stream per
   `(session_id, agent_id)` in the new `agent_messages` table, with the same

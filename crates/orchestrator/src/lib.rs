@@ -83,6 +83,7 @@ pub mod state;
 pub mod studio_runtime;
 pub mod subscriptions;
 pub mod suitability;
+pub mod supervised_history;
 pub mod supervisor;
 pub mod task_transform;
 pub mod timeline;

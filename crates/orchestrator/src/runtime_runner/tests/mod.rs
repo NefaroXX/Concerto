@@ -799,6 +799,10 @@ mod stage_feed;
 #[path = "manifest_injection.rs"]
 mod manifest_injection;
 
+// H39b step 3: supervised child history/metrics file wiring.
+#[path = "supervised_history.rs"]
+mod supervised_history;
+
 #[tokio::test]
 async fn transcript_failure_follows_pending_status_without_becoming_an_assistant_answer() {
     let (recorder_store, store, session_id, bus) = transcript_store();

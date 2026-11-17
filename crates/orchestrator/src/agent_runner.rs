@@ -32,9 +32,7 @@ use crate::registry::AgentRegistry;
 /// must not be persisted. Earlier calls always have their results because the
 /// loop pushes a tool message before requesting the next turn.
 fn without_trailing_unresolved_tool_call(mut messages: Vec<Message>) -> Vec<Message> {
-    while messages.last().is_some_and(|message| message.tool_calls.is_some()) {
-        messages.pop();
-    }
+    crate::supervised_history::trim_unanswered_tool_call_tail(&mut messages);
     messages
 }
 

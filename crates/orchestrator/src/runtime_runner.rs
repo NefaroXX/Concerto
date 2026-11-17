@@ -632,6 +632,215 @@ async fn settle_run_accounting(
     persist_spend_records(store, session_id, task_id, metrics).await;
 }
 
+/// One child's parent-owned history/metrics files and restore seed length.
+struct SupervisedHistorySeed {
+    agent_id: String,
+    initial_seed_len: usize,
+    paths: crate::supervised_history::SupervisedHistoryPaths,
+}
+
+/// Parent-owned per-run supervised history directory.
+struct SupervisedHistoryRun {
+    directory: PathBuf,
+    paths: HashMap<String, crate::supervised_history::SupervisedHistoryPaths>,
+    seeds: Vec<SupervisedHistorySeed>,
+}
+
+/// Create a mode-0700 per-run directory and write each child's restore seed.
+///
+/// Best-effort: a filesystem failure disables supervised history for this run
+/// (children receive no history env) rather than failing the run. The parent
+/// trims a trailing unanswered tool call from the seed before writing it, so
+/// the child never receives a provider-invalid tool-call tail and the
+/// accumulated-length delta stays exact.
+async fn prepare_supervised_history(
+    store: Option<&Arc<dyn SessionStore>>,
+    session_id: Ulid,
+    tasks: &[(String, String)],
+) -> Option<SupervisedHistoryRun> {
+    let directory =
+        std::env::temp_dir().join(format!("concerto-supervised-{session_id}-{}", Ulid::new()));
+    if let Err(error) = tokio::fs::create_dir_all(&directory).await {
+        tracing::warn!(
+            path = %directory.display(),
+            %error,
+            "failed to create supervised history directory; child history disabled"
+        );
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = std::fs::Permissions::from_mode(0o700);
+        if let Err(error) = tokio::fs::set_permissions(&directory, permissions).await {
+            tracing::warn!(
+                path = %directory.display(),
+                %error,
+                "failed to restrict supervised history directory; child history disabled"
+            );
+            let _ = tokio::fs::remove_dir_all(&directory).await;
+            return None;
+        }
+    }
+
+    let mut paths = HashMap::new();
+    let mut seeds = Vec::new();
+    for (agent_id, _) in tasks {
+        let agent_paths = crate::supervised_history::paths_for(&directory, agent_id);
+        let mut seed = load_supervised_seed(store, session_id, agent_id).await;
+        crate::supervised_history::trim_unanswered_tool_call_tail(&mut seed);
+        match crate::supervised_history::write_seed(&agent_paths.history, &seed).await {
+            Ok(()) => {
+                seeds.push(SupervisedHistorySeed {
+                    agent_id: agent_id.clone(),
+                    initial_seed_len: seed.len(),
+                    paths: agent_paths.clone(),
+                });
+                paths.insert(agent_id.clone(), agent_paths);
+            }
+            Err(error) => tracing::warn!(
+                %agent_id,
+                path = %agent_paths.history.display(),
+                %error,
+                "failed to write supervised history seed; child history disabled for agent"
+            ),
+        }
+    }
+    Some(SupervisedHistoryRun { directory, paths, seeds })
+}
+
+/// Load one child's prior typed history. Fail-soft: a load failure is an
+/// empty seed, matching the in-process runner's best-effort restore.
+async fn load_supervised_seed(
+    store: Option<&Arc<dyn SessionStore>>,
+    session_id: Ulid,
+    agent_id: &str,
+) -> Vec<Message> {
+    let Some(store) = store else {
+        return Vec::new();
+    };
+    let cancel = CancellationToken::new();
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        store.load_agent_messages(session_id, agent_id, cancel),
+    )
+    .await
+    {
+        Ok(Ok(messages)) => messages,
+        Ok(Err(error)) => {
+            tracing::warn!(%agent_id, %error, "failed to load supervised agent history; starting empty");
+            Vec::new()
+        }
+        Err(_elapsed) => {
+            tracing::warn!(%agent_id, "supervised agent history load timed out; starting empty");
+            Vec::new()
+        }
+    }
+}
+
+/// Harvest the child-owned history and metrics files after the supervisor
+/// stops, before the parent checks cancellation. Fresh cleanup tokens keep a
+/// completed child's work durable even when the run was cancelled.
+async fn harvest_supervised_history(
+    store: Option<&Arc<dyn SessionStore>>,
+    session_id: Ulid,
+    task_id: Option<Ulid>,
+    seeds: &[SupervisedHistorySeed],
+) {
+    let Some(store) = store else {
+        return;
+    };
+
+    for seed in seeds {
+        let agent_id = seed.agent_id.as_str();
+        // A history read failure must not suppress metrics: the two sidecars
+        // are independent best-effort artifacts.
+        match crate::supervised_history::read_messages(&seed.paths.history).await {
+            Ok(accumulated) if accumulated.len() < seed.initial_seed_len => {
+                tracing::warn!(
+                    %agent_id,
+                    expected = seed.initial_seed_len,
+                    actual = accumulated.len(),
+                    "supervised agent history is shorter than its seed; skipping append"
+                );
+            }
+            Ok(accumulated) => {
+                let mut turns = accumulated[seed.initial_seed_len..].to_vec();
+                crate::supervised_history::trim_unanswered_tool_call_tail(&mut turns);
+                if !turns.is_empty() {
+                    let cancel = CancellationToken::new();
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        store.append_agent_messages(session_id, agent_id, &turns, cancel),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => tracing::warn!(
+                            %agent_id,
+                            %error,
+                            "failed to append supervised agent history"
+                        ),
+                        Err(_elapsed) => tracing::warn!(
+                            %agent_id,
+                            "supervised agent history append timed out"
+                        ),
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(
+                %agent_id,
+                path = %seed.paths.history.display(),
+                %error,
+                "failed to read supervised agent history; skipping append"
+            ),
+        }
+
+        let metrics = match crate::supervised_history::read_metrics(&seed.paths.metrics).await {
+            Ok(metrics) => metrics,
+            Err(error) => {
+                tracing::warn!(
+                    %agent_id,
+                    path = %seed.paths.metrics.display(),
+                    %error,
+                    "failed to read supervised agent metrics"
+                );
+                continue;
+            }
+        };
+        for metric in metrics {
+            if metric.provider.trim().is_empty() {
+                continue;
+            }
+            // Fresh, uncancelled token: a cancelled run must still account
+            // for work the child completed before teardown (H39a).
+            let cancel = CancellationToken::new();
+            if let Err(error) = store.record_metrics(session_id, metric.clone(), cancel).await {
+                tracing::warn!(%agent_id, %error, "failed to persist supervised provider metrics");
+            }
+            let record = concerto_sessions::spend::SpendRecord {
+                id: Ulid::new(),
+                session_id,
+                task_id,
+                agent_id: Some(seed.agent_id.clone()),
+                provider: metric.provider,
+                model: metric.model,
+                tokens_in: metric.tokens_in,
+                tokens_out: metric.tokens_out,
+                cost_usd: metric.cost_usd,
+                created_at: time::OffsetDateTime::now_utc(),
+            };
+            // Fresh token for the spend write as well: metrics and spend are
+            // independent best-effort rows, and either may fail without
+            // suppressing the other.
+            let cancel = CancellationToken::new();
+            if let Err(error) = store.record_spend(record, cancel).await {
+                tracing::warn!(%agent_id, %error, "failed to persist supervised spend record");
+            }
+        }
+    }
+}
+
 /// True when a store failure is the expected cancellation tail of a run
 /// being cancelled: the token fired, or the store reported a cancelled
 /// operation (e.g. `check_cancel`'s "operation cancelled"). Such failures
@@ -4382,6 +4591,7 @@ fn build_supervised_commands(
     tasks: &[(String, String)],
     spawn_env: &[(String, String)],
     plan_id: Option<&str>,
+    history_paths: Option<&HashMap<String, crate::supervised_history::SupervisedHistoryPaths>>,
 ) -> Vec<(String, std::process::Command)> {
     tasks
         .iter()
@@ -4404,6 +4614,15 @@ fn build_supervised_commands(
             // `GateRequest.plan_id` and its terminal whiteboard events).
             if let Some(plan_id) = plan_id {
                 command.env("CONCERTO_PLAN_ID", plan_id);
+            }
+            // H39b step 3: parent-owned files keep the child off the session
+            // database. Both are absent when preparing the run directory
+            // failed, in which case the child simply runs without history or
+            // metrics sidecar.
+            if let Some(agent_paths) = history_paths.and_then(|paths| paths.get(agent_id)) {
+                command
+                    .env(crate::supervised_history::HISTORY_ENV, &agent_paths.history)
+                    .env(crate::supervised_history::METRICS_ENV, &agent_paths.metrics);
             }
             (agent_id.clone(), command)
         })
@@ -4435,6 +4654,11 @@ async fn drive_supervised_run(
         "supervised multi-agent run starting without review-cycle resumability \
          (ADR-60 Deferred 3): in-flight review state is lost on restart"
     );
+    // Parent-owned history is prepared before spawning so every child gets
+    // the same restore seed across supervisor restarts.
+    let supervised_history =
+        prepare_supervised_history(session_store, run.session_id, &run.tasks).await;
+    let history_paths = supervised_history.as_ref().map(|history| &history.paths);
     let mut supervisor = Supervisor::new(run.config);
     // Keep a pool handle for the Decision rows emitted after `run.services` is
     // moved into the supervisor (`with_services`).
@@ -4454,6 +4678,7 @@ async fn drive_supervised_run(
         &run.tasks,
         &run.spawn_env,
         run.plan_id.as_deref(),
+        history_paths,
     ) {
         if let Err(error) = supervisor.spawn_agent(&mut command, &agent_id) {
             tracing::warn!(%agent_id, %error, "supervised agent failed to start; recording a decision");
@@ -4516,6 +4741,22 @@ async fn drive_supervised_run(
             supervisor.run_until(CancellationToken::new(), |_| false).await
         }
     };
+
+    // Harvest before the cancellation early return: completed child turns
+    // and spend are durable even when the parent run was cancelled. The
+    // directory is parent-owned and single-run, so files cannot collide with
+    // another run; removal is best-effort.
+    if let Some(history) = &supervised_history {
+        harvest_supervised_history(session_store, run.session_id, Some(task_id.0), &history.seeds)
+            .await;
+        if let Err(error) = tokio::fs::remove_dir_all(&history.directory).await {
+            tracing::warn!(
+                path = %history.directory.display(),
+                %error,
+                "failed to remove supervised history directory"
+            );
+        }
+    }
 
     if cancel.is_cancelled() {
         event_recorder.stop().await;
@@ -4604,11 +4845,9 @@ async fn drive_supervised_run(
         camino::Utf8PathBuf::from_path_buf(run.project_root.clone()).unwrap_or_default();
 
     stage_tracker.lock().unwrap_or_else(|error| error.into_inner()).finish(completion_status);
-    // Per-child provider metrics/spend are not surfaced through the parent in
-    // this slice (the mock-provider children consume none), so there is
-    // nothing to persist here yet — the coordinator tail's metric writes are
-    // deliberately omitted rather than called with empty data, and the
-    // assistant row's token fields stay `None` for the same reason.
+    // Child history/metrics were harvested above and attributed to the child
+    // agent. The root settlement path deliberately does not re-record them:
+    // `provider_metrics` stays empty so no metric is accounted twice.
     if let Some(store) = session_store {
         let assistant_message = Message {
             gemini_replay: None,

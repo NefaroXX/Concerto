@@ -48,7 +48,7 @@ passing repository tests alone does not close a finding.
 | H36 | P2 | cargo-audit can report incomplete registry checks with exit zero | Fixed and verified on 66309f8; awaiting merge |
 | H37 | P1 | Native provider wire adapters discard mandatory system/assistant text | Fixed; full local battery and all 12 exact-head CI checks passed |
 | H38 | P2 | Gemini canonical history loses native part order/text signatures and misclassifies thought text | Fixed; full local battery and all 12 exact-head CI checks passed on 14390eb |
-| H39 | P1 | Run settlement persists summaries instead of complete provider history | Root repair fixed, published and exact-head verified (`2dbf25a`; ADR-87 `72c414a`). Cancelled/errored-run metrics and spend settlement fixed in H39a (settlement outlives the run token, exactly-once per run); H39b persistence foundation landed (agent-scoped message store + optional spend `agent_id`); in-process specialist history persist/restore landed (step 2); supervised child history and spend attribution remain open (step 3) |
+| H39 | P1 | Run settlement persists summaries instead of complete provider history | Root repair fixed, published and exact-head verified (`2dbf25a`; ADR-87 `72c414a`). Cancelled/errored-run metrics and spend settlement fixed in H39a (settlement outlives the run token, exactly-once per run); H39b persistence foundation landed (agent-scoped message store + optional spend `agent_id`); in-process specialist history persist/restore landed (step 2); supervised child history restore/append and child-agent spend attribution landed (step 3). H39 remains open pending review |
 | H40 | P2 | Headless multi-agent history clips messages and older obligations before dispatch | Fixed, published and exact-head verified (`91bf006`); loopback CLI request fixture plus the approved-plan routing control |
 | H41 | P1 | Settings CLI fixtures use XDG isolation on macOS, where application paths resolve to the real profile | Fixed and verified on Linux, published with H40 (`91bf006`); macOS hazard source-confirmed, portable coverage not claimed |
 
@@ -3101,3 +3101,67 @@ Branch: `fix/harness-headless-history` (HEAD `34a09ee` before this change).
   because `SessionStore` has ~40 required methods; append failure is exercised
   through a real SQLite foreign-key failure instead, and load failure is
   fail-soft by construction (warning + empty seed).
+
+## 2026-11-17 — H39b step 3: supervised child history and spend attribution
+
+- **Shared file contract.** New `concerto_orchestrator::supervised_history`
+  owns the parent/child boundary: a per-agent typed JSON history array
+  (`CONCERTO_AGENT_HISTORY_PATH`) and a JSON Lines metrics sidecar
+  (`CONCERTO_AGENT_METRICS_PATH`). Agent ids are sanitized to
+  ASCII alphanumerics, `_` and `-` for file names, so a hostile id cannot
+  escape the parent-created directory. History reads stop at 32 MiB and the
+  metrics sidecar at 4 MiB. Writes are atomic sibling-temp + rename and mode
+  `0600` on Unix; the per-run directory is mode `0700`.
+- **Restore and append.** The parent loads
+  `(session_id, agent_id)` history from the session store, trims a trailing
+  unanswered tool call, writes the seed once, and stamps both paths on every
+  child command (`build_supervised_commands`). The child restores the
+  accumulated file before `AgentLoop::run`, appends only completed provider
+  turns through a poison-tolerant sink every 500 ms, and does a final flush
+  after the loop. `append_turns` reads the accumulated file and appends the new
+  delta without trimming, because the assistant turn carrying a tool call is
+  persisted before its result exists; a periodic trim there would drop the
+  call and orphan the later result in the middle of history. At startup the
+  child trims a crash-left unanswered tail and rewrites the file before any
+  append, and the parent trims its harvested delta. `AgentRunner`'s in-process
+  trim now delegates to the same helper. A rewrite that would exceed the
+  32 MiB cap is refused without touching the readable existing file.
+- **Harvest before cancellation.** After `run_until` (including budget
+  teardown) and before the parent's cancellation early return, the parent
+  reads the child files and appends only `messages[initial_seed_len..]` with a
+  fresh token and a 10 s timeout. Metrics are read independently of history
+  failures. Each non-empty provider entry becomes one `provider_metrics` row
+  and one `SpendRecord` with `agent_id = Some(child id)` and the run's root
+  `task_id`; failures log and continue. Root `AgentOutput.provider_metrics`
+  stays empty, so root settlement cannot account the child twice.
+- **IPC.** No protocol version bump and no new IPC methods. The terminal
+  whiteboard payload gains an additive compact `provider_metrics` array
+  (`agent_id`, provider/model, tokens, cost, latency) for inspection; the
+  authoritative rows come from the parent-owned sidecar.
+- **Failure policy.** History/metrics are best-effort. A seed load/write
+  failure disables that child's history for the run; a child restore/append
+  failure logs and continues; parent append/metrics/spend failures log and
+  never change the run outcome. A rewrite that would exceed the history cap is
+  refused without touching the readable existing file. The per-run directory
+  is removed best-effort after harvest.
+- **Verification (repository `target/`; focused runtime tests at
+  `--test-threads=1`; logs under `target/harness-reliability/h39b3-*`):**
+  - `cargo test -p concerto-orchestrator --lib`: **1944 passed, 0 failed,
+    1 ignored**, including the new shared-module, AgentLoop sink, parent
+    harvest, metrics-independent-of-history and oversized-rewrite rejection
+    tests.
+  - `cargo test -p concerto-orchestrator --lib agent_runner`: **25 passed,
+    0 failed**.
+  - `cargo test -p concerto-orchestrator --lib
+    runtime_runner_impl::tests::spend_dispatch`: **6 passed, 0 failed**.
+  - `cargo test -p concerto-orchestrator --test supervisor_agent_process`:
+    **5 passed, 0 failed**, including a real child that restores a seed with a
+    crash-left unanswered tool-call tail, rewrites the trimmed file, appends
+    its completed turns, emits metrics, and leaves one metric row.
+  - `cargo check -p concerto-orchestrator --all-targets`: exit 0.
+  - `cargo check --workspace --all-targets`: exit 0 (downstream crates and
+    the wasm plugin fixtures still compile).
+  - `cargo clippy -p concerto-orchestrator --all-targets -- -D warnings`:
+    exit 0.
+  - `cargo fmt --all -- --check`: exit 0; `git diff --check`: clean.
+- **Status.** H39 remains open until review.

@@ -112,6 +112,13 @@ pub struct AgentLoop {
     /// Prior conversation messages (loaded from the persistent session) used
     /// as context for the current run. Default empty.
     initial_messages: Vec<Message>,
+    /// Optional in-memory sink for completed provider turns (supervised child
+    /// history flush). Poisoning is tolerated: a sink panic must not abort the
+    /// run or discard the turn from the session store.
+    message_sink: Option<Arc<std::sync::Mutex<Vec<Message>>>>,
+    /// Optional sink for the provider metrics of a successful run (supervised
+    /// child metrics sidecar). Captured once when `run` returns `Ok`.
+    provider_metrics_sink: Option<Arc<std::sync::Mutex<Vec<ProviderMetrics>>>>,
     conversation_inbox: Option<crate::conversation::ConversationInbox>,
 
     /// Centralized policy for retrying transient provider failures. Lives at
@@ -403,6 +410,8 @@ impl AgentLoop {
             project_root,
             budget_allocator,
             initial_messages: Vec::new(),
+            message_sink: None,
+            provider_metrics_sink: None,
             conversation_inbox: None,
             retry_policy: RetryPolicy::default(),
             session_store: None,
@@ -465,6 +474,23 @@ impl AgentLoop {
         self
     }
 
+    /// Attach a sink for completed provider turns. Used by the supervised
+    /// agent-process binary to flush its own history to a parent-owned file.
+    pub fn with_message_sink(mut self, sink: Option<Arc<std::sync::Mutex<Vec<Message>>>>) -> Self {
+        self.message_sink = sink;
+        self
+    }
+
+    /// Attach a sink for provider metrics from a successful run. Used by the
+    /// supervised agent-process binary to record spend exactly once.
+    pub fn with_provider_metrics_sink(
+        mut self,
+        sink: Option<Arc<std::sync::Mutex<Vec<ProviderMetrics>>>>,
+    ) -> Self {
+        self.provider_metrics_sink = sink;
+        self
+    }
+
     pub fn with_conversation_inbox(
         mut self,
         inbox: Option<crate::conversation::ConversationInbox>,
@@ -524,11 +550,31 @@ impl AgentLoop {
 
     /// Run the agent loop for the given task.
     ///
-    /// Thin wrapper that handles best-effort session persistence around the
-    /// core loop (`run_inner`): it records the task start and the user prompt,
-    /// then persists success/failure outcomes. Persistence failures surface as
-    /// warnings and never abort the run.
+    /// Thin wrapper around the core loop (`run_inner`): the inner loop handles
+    /// best-effort session persistence (task start, user prompt, outcomes) and
+    /// this wrapper copies a successful run's provider metrics into the
+    /// optional supervised-child sink. Persistence and telemetry failures
+    /// surface as warnings and never abort the run.
     pub async fn run(
+        &mut self,
+        task: AgentTask,
+        cancel: CancellationToken,
+    ) -> Result<AgentOutput, OrchestratorError> {
+        let output = self.run_inner(task, cancel).await?;
+        if let Some(sink) = &self.provider_metrics_sink {
+            if !output.provider_metrics.is_empty() {
+                // Metrics are telemetry: a poisoned lock must not fail the run.
+                let mut guard = match sink.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.extend_from_slice(&output.provider_metrics);
+            }
+        }
+        Ok(output)
+    }
+
+    async fn run_inner(
         &mut self,
         task: AgentTask,
         cancel: CancellationToken,
@@ -2149,6 +2195,18 @@ impl AgentLoop {
     // -----------------------------------------------------------------------
 
     async fn persist_provider_messages(&self, session_id: Ulid, messages: &[Message]) {
+        if !messages.is_empty() {
+            if let Some(sink) = &self.message_sink {
+                // A panic while holding this lock poisons it; recover the
+                // guard so history capture keeps working for the rest of the
+                // process (the run itself must not fail because of telemetry).
+                let mut guard = match sink.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.extend_from_slice(messages);
+            }
+        }
         if let Err(error) = crate::provider_transcript::append_completed_messages(
             self.session_store.as_ref(),
             session_id,
@@ -7236,6 +7294,84 @@ mod tests {
         for pm in &output.provider_metrics {
             assert!(!pm.provider.is_empty(), "provider name must not be empty");
         }
+    }
+
+    #[tokio::test]
+    async fn provider_metrics_sink_receives_metrics_after_success() {
+        let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ =
+            make_loop(provider, approval, 10).with_provider_metrics_sink(Some(sink.clone()));
+        let task = AgentTask::new(Ulid::new(), "test");
+
+        let output = loop_.run(task, CancellationToken::new()).await.expect("successful run");
+
+        let captured = sink.lock().expect("metrics sink lock");
+        assert_eq!(captured.len(), 1, "one metric entry per successful run");
+        assert_eq!(captured[0].provider, "scripted");
+        assert_eq!(captured[0].tokens_in, output.provider_metrics[0].tokens_in);
+    }
+
+    #[tokio::test]
+    async fn message_sink_receives_completed_turns_without_session_store() {
+        let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let loop_ = make_loop(provider, approval, 10).with_message_sink(Some(sink.clone()));
+        let reply = Message {
+            role: Role::Assistant,
+            content: "completed turn".into(),
+            tokens_in: Some(3),
+            tokens_out: Some(4),
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: Some("reasoning".into()),
+            gemini_replay: None,
+        };
+
+        loop_.persist_provider_messages(Ulid::new(), std::slice::from_ref(&reply)).await;
+
+        let captured = sink.lock().expect("sink lock");
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].content, "completed turn");
+        assert_eq!(captured[0].reasoning_content.as_deref(), Some("reasoning"));
+        assert_eq!((captured[0].tokens_in, captured[0].tokens_out), (Some(3), Some(4)));
+    }
+
+    #[tokio::test]
+    async fn message_sink_tolerates_a_poisoned_lock() {
+        let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let poisoned = sink.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().expect("poison lock");
+            panic!("poison the sink");
+        })
+        .join();
+        assert!(sink.is_poisoned(), "fixture must poison the mutex");
+
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let loop_ = make_loop(provider, approval, 10).with_message_sink(Some(sink.clone()));
+        let reply = Message {
+            role: Role::Assistant,
+            content: "after poison".into(),
+            tokens_in: None,
+            tokens_out: None,
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: None,
+            gemini_replay: None,
+        };
+
+        loop_.persist_provider_messages(Ulid::new(), &[reply]).await;
+
+        let captured = match sink.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].content, "after poison");
     }
 
     /// Settlement must not insert a summary that duplicates usage already
