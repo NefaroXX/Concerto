@@ -631,6 +631,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_metric_lines_without_agent_id_deserialize_as_root() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("metrics.jsonl");
+        // Pre-agent_id sidecar shape: the field must default to None so an
+        // upgraded parent can still harvest a child started by an older build.
+        let legacy = r#"{"provider":"legacy","model":"m","tokens_in":5,"tokens_out":2,"cost_usd":0.5,"latency_ms":10}"#;
+        std::fs::write(&path, format!("{legacy}\n")).expect("write legacy metrics");
+
+        let loaded = read_metrics(&path).await.expect("legacy line must parse");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].agent_id, None);
+        assert_eq!(loaded[0].tokens_in, 5);
+    }
+
+    #[tokio::test]
     async fn missing_history_file_reads_as_empty() {
         let directory = tempfile::tempdir().expect("temp dir");
         let path = directory.path().join("missing.json");

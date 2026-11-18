@@ -553,26 +553,43 @@ impl AgentLoop {
     ///
     /// Thin wrapper around the core loop (`run_inner`): the inner loop handles
     /// best-effort session persistence (task start, user prompt, outcomes) and
-    /// this wrapper copies a successful run's provider metrics into the
-    /// optional supervised-child sink. Persistence and telemetry failures
-    /// surface as warnings and never abort the run.
+    /// this wrapper copies the run's provider metrics into the optional
+    /// supervised-child sink. The error path also forwards the settled usage
+    /// (`provider_metrics()` survives a failed run) so tokens consumed before
+    /// the failure are not silently dropped from the parent's harvest.
+    /// Persistence and telemetry failures surface as warnings and never abort
+    /// the run.
     pub async fn run(
         &mut self,
         task: AgentTask,
         cancel: CancellationToken,
     ) -> Result<AgentOutput, OrchestratorError> {
-        let output = self.run_inner(task, cancel).await?;
-        if let Some(sink) = &self.provider_metrics_sink {
-            if !output.provider_metrics.is_empty() {
-                // Metrics are telemetry: a poisoned lock must not fail the run.
-                let mut guard = match sink.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                guard.extend_from_slice(&output.provider_metrics);
+        match self.run_inner(task, cancel).await {
+            Ok(output) => {
+                self.forward_provider_metrics(&output.provider_metrics);
+                Ok(output)
+            }
+            Err(error) => {
+                let settled = self.provider_metrics();
+                self.forward_provider_metrics(&settled);
+                Err(error)
             }
         }
-        Ok(output)
+    }
+
+    /// Append settled metrics to the supervised-child sink, if configured.
+    /// Telemetry only: a poisoned lock must not fail the run.
+    fn forward_provider_metrics(&self, metrics: &[ProviderMetrics]) {
+        if metrics.is_empty() {
+            return;
+        }
+        if let Some(sink) = &self.provider_metrics_sink {
+            let mut guard = match sink.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.extend_from_slice(metrics);
+        }
     }
 
     async fn run_inner(
@@ -7312,6 +7329,24 @@ mod tests {
         assert_eq!(captured.len(), 1, "one metric entry per successful run");
         assert_eq!(captured[0].provider, "scripted");
         assert_eq!(captured[0].tokens_in, output.provider_metrics[0].tokens_in);
+    }
+
+    #[tokio::test]
+    async fn provider_metrics_sink_receives_settled_usage_after_failure() {
+        let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider =
+            Arc::new(CountingScriptedProvider::new(vec![Err(ProviderError::AuthFailure)]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ =
+            make_loop(provider, approval, 10).with_provider_metrics_sink(Some(sink.clone()));
+        let task = AgentTask::new(Ulid::new(), "failing task");
+
+        let result = loop_.run(task, CancellationToken::new()).await;
+        assert!(result.is_err(), "auth failure must surface as an error");
+
+        let captured = sink.lock().expect("metrics sink lock");
+        assert_eq!(captured.len(), 1, "failed runs must still forward settled usage");
+        assert_eq!(captured[0].provider, "counting-scripted");
     }
 
     #[tokio::test]

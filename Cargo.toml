@@ -214,11 +214,11 @@ unsafe_code = "deny"
 # Vendored patch: utoipa-swagger-ui 9.0.2
 # Upstream 9.0.2 declares `[build-dependencies] zip = "3.0"`, and crates.io has
 # yanked every `zip` release in that range (the newest, 8.6.0, is also yanked).
-# The only unyanked `zip` is 9.0.3, which no utoipa-swagger-ui release accepts
-# (10.x pins yanked `^8.6`). Rather than weaken `yanked = "deny"` in deny.toml,
-# the crate is vendored at `vendor/utoipa-swagger-ui` with the build dependency
-# bumped to the unyanked 9.0.3 and the single 3.x->9.x build-script API change
-# applied. The patch keeps the offline `vendored` Swagger UI assets (no CDN) and
+# Unyanked `zip` releases start at 9.0.5 (9.0.3/9.0.4 are yanked and affected by
+# RUSTSEC-2026-0548), and no utoipa-swagger-ui release accepts 9.x (10.x pins
+# yanked `^8.6`). Rather than weaken `yanked = "deny"` in deny.toml, the crate
+# is vendored at `vendor/utoipa-swagger-ui` with the build dependency bumped to
+# 9.0.5+ and the single 3.x->9.x build-script API change applied. The patch keeps the offline `vendored` Swagger UI assets (no CDN) and
 # utoipa 5 generation untouched.
 # ---------------------------------------------------------------------------
 [patch.crates-io]
