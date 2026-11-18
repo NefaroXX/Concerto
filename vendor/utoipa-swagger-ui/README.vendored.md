@@ -8,17 +8,18 @@ via `[patch.crates-io]` from the workspace root `Cargo.toml`.
 
 Upstream 9.0.2 declares a build dependency on `zip ^3.0`. Every `zip` release
 in that range is **yanked** on crates.io, as is `zip 8.6.0` (the only release in
-the `^8.6` range pinned by upstream 10.x). The only unyanked `zip` is **9.0.3**.
+the `^8.6` range pinned by upstream 10.x). The unyanked `zip` releases start at
+**9.0.5**; earlier 9.x releases are both yanked and affected by RUSTSEC-2026-0548.
 
 We do not weaken the `yanked = "deny"` gate in `deny.toml`, so this crate is
-patched locally to build against the unyanked `zip 9.0.3` instead.
+patched locally to build against the unyanked, patched `zip 9.0.5+` instead.
 
 ## Local changes from upstream 9.0.2
 
 Exactly two edits, both minimal:
 
 1. `Cargo.toml` — the `[build-dependencies.zip]` requirement goes from
-   `version = "3.0"` / `features = ["deflate"]` to `version = "9.0.3"` /
+   `version = "3.0"` / `features = ["deflate"]` to `version = "9.0.5"` /
    `features = ["deflate-flate2-zlib-rs"]`.
    - `zip` declares its `flate2` dependency with `default-features = false`,
      so a backend must be named explicitly. `deflate-flate2-zlib-rs` selects

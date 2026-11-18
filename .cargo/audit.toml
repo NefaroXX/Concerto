@@ -53,4 +53,8 @@ ignore = [
     "RUSTSEC-2026-0370",
     "RUSTSEC-2026-0371",
     "RUSTSEC-2026-0372",
+    # chrono / chrono-tz — unmaintained, no vulnerability; latest releases,
+    # no safe upgrade; replacement tracked separately; see deny.toml
+    "RUSTSEC-2026-0543",
+    "RUSTSEC-2026-0555",
 ]

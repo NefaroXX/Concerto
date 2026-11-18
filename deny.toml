@@ -76,6 +76,19 @@ ignore = [
     "RUSTSEC-2026-0370",  # zvariant unmaintained — merged into zbus 6.0.0 (wire module)
     "RUSTSEC-2026-0371",  # zbus_names unmaintained — merged into zbus 6.0.0 (names module)
     "RUSTSEC-2026-0372",  # zvariant_derive unmaintained — derives now provided by zbus 6.0.0
+    # === chrono / chrono-tz unmaintained (no vulnerability) ===
+    # Reason: RUSTSEC-2026-0543 (chrono) and RUSTSEC-2026-0555 (chrono-tz),
+    # both published 2026-09-14, are maintenance-only notices. All current
+    # releases are affected and no safe upgrade exists. The workspace uses
+    # chrono for UTC timestamps and chrono-tz only to validate a configured
+    # IANA timezone; neither is an adversarial parsing path. A replacement
+    # (jiff/time) is a cross-crate API migration tracked separately, not a
+    # selectable dependency bump.
+    # Scope: workspace-wide (direct deps in core/config); transitive through
+    # sqlx and other crates.
+    # Review date: 2026-11-18 — revisit when a maintained replacement lands.
+    "RUSTSEC-2026-0543",  # chrono unmaintained — no security issue
+    "RUSTSEC-2026-0555",  # chrono-tz unmaintained — no security issue
 ]
 
 [licenses]
