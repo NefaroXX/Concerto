@@ -45,6 +45,7 @@ async fn persist_spend_records_writes_one_record_per_metrics_entry() {
     // mirroring the `persist_provider_metrics` guard.
     let metrics = vec![
         ProviderMetrics {
+            agent_id: None,
             provider: "openai".into(),
             model: "gpt-4".into(),
             tokens_in: 120,
@@ -53,6 +54,7 @@ async fn persist_spend_records_writes_one_record_per_metrics_entry() {
             latency_ms: 42,
         },
         ProviderMetrics {
+            agent_id: None,
             provider: "".into(),
             model: "gpt-4".into(),
             tokens_in: 999,
@@ -73,6 +75,61 @@ async fn persist_spend_records_writes_one_record_per_metrics_entry() {
     assert_eq!(records[0].tokens_in, 120);
     assert_eq!(records[0].tokens_out, 60);
     assert!((records[0].cost_usd - 0.02).abs() < f64::EPSILON);
+}
+
+/// In-process spend attribution rides on `ProviderMetrics::agent_id`: a
+/// specialist metric persists its role, while an unattributed root metric
+/// persists `None`.
+#[tokio::test]
+async fn persist_spend_records_carries_agent_attribution_from_metrics() {
+    let store = concerto_sessions::SqliteSessionStore::connect_in_memory().await.unwrap();
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    let session_id = store
+        .create_session(
+            camino::Utf8Path::new("/tmp/spend-agent-attribution"),
+            "openai",
+            "gpt-4",
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .id;
+    let task_id = Ulid::new();
+
+    let metrics = vec![
+        ProviderMetrics {
+            agent_id: Some("implementer".into()),
+            provider: "openai".into(),
+            model: "gpt-4".into(),
+            tokens_in: 120,
+            tokens_out: 60,
+            cost_usd: 0.02,
+            latency_ms: 42,
+        },
+        ProviderMetrics {
+            agent_id: None,
+            provider: "openai".into(),
+            model: "gpt-4".into(),
+            tokens_in: 10,
+            tokens_out: 5,
+            cost_usd: 0.001,
+            latency_ms: 7,
+        },
+    ];
+
+    persist_spend_records(Some(&store), session_id, Some(task_id), &metrics).await;
+
+    let records = store.list_spend_records(session_id, CancellationToken::new()).await.unwrap();
+    assert_eq!(records.len(), 2, "one record per metric");
+    let mut by_agent: Vec<Option<&str>> =
+        records.iter().map(|record| record.agent_id.as_deref()).collect();
+    by_agent.sort_unstable();
+    assert_eq!(
+        by_agent,
+        vec![None, Some("implementer")],
+        "the specialist carries its role and the root metric stays unattributed"
+    );
+    assert!(records.iter().all(|record| record.task_id == Some(task_id)));
 }
 
 // ------------------------------------------------------------------
@@ -112,6 +169,7 @@ async fn cancelled_run_token_still_settles_metrics_and_spend() {
 
     let metrics = vec![
         ProviderMetrics {
+            agent_id: None,
             provider: "openai".into(),
             model: "gpt-4".into(),
             tokens_in: 120,
@@ -120,6 +178,7 @@ async fn cancelled_run_token_still_settles_metrics_and_spend() {
             latency_ms: 42,
         },
         ProviderMetrics {
+            agent_id: None,
             provider: "anthropic".into(),
             model: "claude".into(),
             tokens_in: 80,
@@ -199,6 +258,7 @@ async fn settle_run_accounting_is_exactly_once_per_latch() {
         .id;
     let task_id = Ulid::new();
     let metrics = vec![ProviderMetrics {
+        agent_id: None,
         provider: "openai".into(),
         model: "gpt-4".into(),
         tokens_in: 120,

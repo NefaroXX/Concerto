@@ -431,6 +431,7 @@ mod tests {
 
     fn metric(provider: &str, tokens_in: u64) -> ProviderMetrics {
         ProviderMetrics {
+            agent_id: None,
             provider: provider.to_owned(),
             model: "model".to_owned(),
             tokens_in,

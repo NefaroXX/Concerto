@@ -67,6 +67,7 @@ impl MockProvider {
     /// Collect metrics for the mock provider.
     pub fn collect_metrics(&self) -> ProviderMetrics {
         ProviderMetrics {
+            agent_id: None,
             provider: self.provider_name().to_string(),
             model: "mock-model".to_string(),
             tokens_in: self.tokens_in,

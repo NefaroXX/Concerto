@@ -135,6 +135,7 @@ async fn prepare_and_harvest_restore_append_and_attribute_child_history() {
         .await
         .expect("simulate child append");
     let metric = ProviderMetrics {
+        agent_id: None,
         provider: "mock".to_owned(),
         model: "mock-model".to_owned(),
         tokens_in: 11,
@@ -328,6 +329,7 @@ async fn metrics_are_harvested_even_when_history_is_unreadable() {
     let paths = crate::supervised_history::paths_for(directory.path(), "reviewer");
     std::fs::write(&paths.history, b"not json").expect("corrupt history fixture");
     let metric = ProviderMetrics {
+        agent_id: None,
         provider: "mock".to_owned(),
         model: "mock-model".to_owned(),
         tokens_in: 5,

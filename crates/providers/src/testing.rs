@@ -156,6 +156,7 @@ pub fn assert_terminal_usage_contract(chunks: &[CompletionChunk]) {
 impl ScriptedProvider {
     pub fn collect_metrics(&self) -> ProviderMetrics {
         ProviderMetrics {
+            agent_id: None,
             provider: self.provider_name().to_string(),
             model: "test-model".to_string(),
             tokens_in: 0,

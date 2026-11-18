@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **In-process specialist spend attribution (H39b review).** `ProviderMetrics`
+  now carries an optional `agent_id` identifying the specialist/child that
+  consumed the tokens (`None` for root/coordinator or single-agent calls).
+  Coordinator specialist results stamp their role, and terminal spend
+  persistence copies that attribution into `SpendRecord.agent_id`; provider
+  metrics rows remain unattributed, and root settlement is still the only
+  writer for coordinator-path spend.
 - **Supervised child history and spend attribution (H39b step 3).** ADR-60
   agent-process children now restore their prior typed conversation from a
   parent-owned per-run file and append only the turns they complete, so a
@@ -142,6 +149,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   actions. Unsaved edits and changed proposals block a review decision;
   unrelated staged files are retained. LSP replies are scoped to the originating
   document revision and cursor.
+
+### Changed
+
+- **Restored agent prompt history is bounded (H39b review).** In-process
+  specialist and supervised child restore seeds are trimmed to the most recent
+  512 messages, dropping leading tool results so a window never starts with an
+  orphaned result; assistant tool-call/result pairs inside the window are
+  preserved. This bounds prompt growth only — persisted agent-scoped message
+  rows still accumulate.
 
 ### Fixed
 

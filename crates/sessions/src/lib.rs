@@ -2463,6 +2463,7 @@ mod tests {
             .unwrap();
 
         let metrics = ProviderMetrics {
+            agent_id: None,
             provider: "openai".to_string(),
             model: "gpt-4".to_string(),
             tokens_in: 100,
@@ -2505,6 +2506,7 @@ mod tests {
         .unwrap();
 
         let metrics = ProviderMetrics {
+            agent_id: None,
             provider: "openai".to_string(),
             model: "gpt-4".to_string(),
             tokens_in: 100,
@@ -2545,6 +2547,7 @@ mod tests {
             .unwrap();
 
         let metrics = ProviderMetrics {
+            agent_id: None,
             provider: "openai".to_string(),
             model: "gpt-4".to_string(),
             tokens_in: 100,

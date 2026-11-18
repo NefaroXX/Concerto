@@ -452,6 +452,7 @@ impl AgentLoop {
     /// persist what was consumed before failure.
     pub(crate) fn provider_metrics(&self) -> Vec<ProviderMetrics> {
         vec![ProviderMetrics {
+            agent_id: None,
             provider: self.provider.provider_name().to_string(),
             model: self.usage_model.clone(),
             tokens_in: self.usage_tokens_in,
@@ -7406,6 +7407,7 @@ mod tests {
         output.session_id = session_id;
         output.completion_status = concerto_core::types::AgentCompletionStatus::Completed;
         output.provider_metrics = vec![ProviderMetrics {
+            agent_id: None,
             provider: "openai".to_string(),
             model: "gpt-4".to_string(),
             tokens_in: 120,

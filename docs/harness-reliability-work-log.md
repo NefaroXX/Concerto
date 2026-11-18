@@ -48,7 +48,7 @@ passing repository tests alone does not close a finding.
 | H36 | P2 | cargo-audit can report incomplete registry checks with exit zero | Fixed and verified on 66309f8; awaiting merge |
 | H37 | P1 | Native provider wire adapters discard mandatory system/assistant text | Fixed; full local battery and all 12 exact-head CI checks passed |
 | H38 | P2 | Gemini canonical history loses native part order/text signatures and misclassifies thought text | Fixed; full local battery and all 12 exact-head CI checks passed on 14390eb |
-| H39 | P1 | Run settlement persists summaries instead of complete provider history | Root repair fixed, published and exact-head verified (`2dbf25a`; ADR-87 `72c414a`). Cancelled/errored-run metrics and spend settlement fixed in H39a (settlement outlives the run token, exactly-once per run); H39b persistence foundation landed (agent-scoped message store + optional spend `agent_id`); in-process specialist history persist/restore landed (step 2); supervised child history restore/append and child-agent spend attribution landed (step 3). H39 remains open pending review |
+| H39 | P1 | Run settlement persists summaries instead of complete provider history | Implemented; pending full local battery and exact-head CI. Root repair fixed, published and exact-head verified (`2dbf25a`; ADR-87 `72c414a`). H39a settlement and H39b steps 1–3 landed; H39b review follow-ups now attribute in-process specialist spend via `ProviderMetrics::agent_id` and bound restored prompt history at 512 messages (DB rows still accumulate). Not yet claimed CI-green |
 | H40 | P2 | Headless multi-agent history clips messages and older obligations before dispatch | Fixed, published and exact-head verified (`91bf006`); loopback CLI request fixture plus the approved-plan routing control |
 | H41 | P1 | Settings CLI fixtures use XDG isolation on macOS, where application paths resolve to the real profile | Fixed and verified on Linux, published with H40 (`91bf006`); macOS hazard source-confirmed, portable coverage not claimed |
 
@@ -3235,3 +3235,39 @@ Branch: `fix/harness-headless-history` (HEAD `34a09ee` before this change).
   - `cargo fmt --all -- --check`: exit 0; `git diff --check`: clean.
 - **Status.** H39 remains open pending further end-to-end review; this entry
   claims only the H39b review fixes above.
+
+## 2026-11-18 — H39b review follow-ups: in-process attribution and bounded history
+
+- **In-process spend attribution.** `ProviderMetrics` gains
+  `#[serde(default)] agent_id: Option<String>` (the specialist/child that
+  consumed the tokens; `None` = root coordinator or single-agent run).
+  `metrics_from_result` stamps `Some(result.role)` for each specialist result,
+  while coordinator planning and every non-coordinator producer leave `None`.
+  `persist_spend_records` now copies `metric.agent_id` into the
+  `SpendRecord`, so the root settlement writes attributed specialist spend.
+  `record_metrics` is unchanged and keeps `provider_metrics` unattributed.
+  Root settlement remains the only writer for coordinator-path metrics, and
+  `AgentRunner` still does not write spend, so nothing is double-counted.
+  Supervised child metrics keep parent-side harvest attribution and are still
+  absent from the root `AgentOutput.provider_metrics`.
+- **Bounded prompt history.** New `concerto_core::types::MAX_AGENT_HISTORY_MESSAGES
+  = 512` and `bound_agent_history_seed` / `AgentHistory::with_seed_bounded`
+  keep only the most recent 512 restored messages, then drop leading
+  `Role::Tool` messages so the prompt window never starts with an orphaned
+  tool result. Assistant tool-call/result pairs wholly inside the window are
+  preserved in order, and at or below the cap the seed is untouched.
+  `AgentRunner` uses the bounded constructor after `load_agent_messages`, and
+  `load_supervised_seed` bounds the seed before it is written for the child.
+  This bounds prompt growth only; persisted `agent_messages` rows continue to
+  accumulate.
+- **Unit coverage.** Core adds five `AgentHistory` bound tests (last-512,
+  leading-tool drop, in-window pair survival, ordering, no-op at/below the
+  cap). The spend-dispatch suite adds an attributed-vs-unattributed
+  `SpendRecord` test, and the coordinator's `metrics_from_result` test asserts
+  the role lands in `agent_id`.
+- **Remaining known limits.** Supervised history still has a sub-500 ms crash
+  window between periodic flushes; metrics are lost if a child crashes before
+  flushing its sidecar; and in-process specialist history is keyed per role,
+  so multiple concurrent dispatches of the same role share one stream.
+- **Status.** Implemented pending the full local battery and exact-head CI;
+  this entry does not claim CI green.

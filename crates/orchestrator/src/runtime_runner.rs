@@ -37,8 +37,9 @@ use concerto_core::traits::provider::LlmProvider;
 use concerto_core::transcript::TranscriptEntry;
 use concerto_core::types::ToolRegistry;
 use concerto_core::types::{
-    AgentCompletionStatus, AgentContext, AgentId, AgentOutput, AgentStage, AgentTask, DesignDoc,
-    Message, ProjectId, ProviderMetrics, Role, SessionContext, TaskExecutionMode, TaskId,
+    bound_agent_history_seed, AgentCompletionStatus, AgentContext, AgentId, AgentOutput,
+    AgentStage, AgentTask, DesignDoc, Message, ProjectId, ProviderMetrics, Role, SessionContext,
+    TaskExecutionMode, TaskId,
 };
 use concerto_core::types::{Condition, PolicyRule};
 use concerto_core::{
@@ -567,7 +568,7 @@ async fn persist_spend_records(
             id: Ulid::new(),
             session_id,
             task_id,
-            agent_id: None,
+            agent_id: metric.agent_id.clone(),
             provider: metric.provider.clone(),
             model: metric.model.clone(),
             tokens_in: metric.tokens_in,
@@ -726,7 +727,12 @@ async fn load_supervised_seed(
     )
     .await
     {
-        Ok(Ok(messages)) => messages,
+        Ok(Ok(messages)) => {
+            // Bound prompt growth before the seed is written: the DB stream
+            // may be arbitrarily long, but the child only needs the most
+            // recent window sans any leading orphaned tool result.
+            bound_agent_history_seed(messages)
+        }
         Ok(Err(error)) => {
             tracing::warn!(%agent_id, %error, "failed to load supervised agent history; starting empty");
             Vec::new()

@@ -275,7 +275,8 @@ impl AgentRunner {
         if let Some(store) = &self.session_store {
             match store.load_agent_messages(task.session_id, &role_name, cancel.clone()).await {
                 Ok(messages) => {
-                    context.agent_history = concerto_core::types::AgentHistory::with_seed(messages);
+                    context.agent_history =
+                        concerto_core::types::AgentHistory::with_seed_bounded(messages);
                 }
                 Err(error) => {
                     tracing::warn!(

@@ -1426,6 +1426,7 @@ fn acceptance_failure_result(task: &AgentTask, summary: String) -> AgentRunResul
 
 fn metrics_from_result(result: &AgentRunResult) -> ProviderMetrics {
     ProviderMetrics {
+        agent_id: Some(result.role.to_string()),
         provider: result.provider.clone(),
         model: result.model.clone(),
         tokens_in: result.tokens_in,
@@ -13585,6 +13586,7 @@ impl CoordinatorAgent {
             let tokens_out = measured_out.unwrap_or(estimated_out);
             let cost = self.planning_provider.approximate_cost(tokens_in, tokens_out);
             let settled = ProviderMetrics {
+                agent_id: None,
                 provider: self.planning_provider.provider_name().to_owned(),
                 model: model.to_owned(),
                 tokens_in,
@@ -24965,6 +24967,7 @@ mod tests {
             tokens_out: 200,
         };
         let metrics = metrics_from_result(&result);
+        assert_eq!(metrics.agent_id.as_deref(), Some("coder"));
         assert_eq!(metrics.provider, "openai");
         assert_eq!(metrics.model, "gpt-4o");
         assert_eq!(metrics.tokens_in, 500);

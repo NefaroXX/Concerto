@@ -48,6 +48,7 @@ impl MetricsRecorder {
 
     pub fn finish(&self) -> ProviderMetrics {
         ProviderMetrics {
+            agent_id: None,
             provider: self.provider.clone(),
             model: self.model.clone(),
             tokens_in: self.tokens_in,

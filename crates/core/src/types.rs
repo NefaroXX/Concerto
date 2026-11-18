@@ -285,6 +285,13 @@ impl TokenBudget {
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ProviderMetrics {
+    /// The specialist/child agent that consumed these tokens.
+    ///
+    /// `None` means the root coordinator (or a single-agent run) is the
+    /// consumer. The parent stamps child attribution explicitly when writing
+    /// spend; `record_metrics` rows stay unattributed.
+    #[serde(default)]
+    pub agent_id: Option<String>,
     pub provider: String,
     pub model: String,
     pub tokens_in: u64,
@@ -2341,10 +2348,52 @@ pub struct AgentHistory {
     produced: Arc<Mutex<Vec<Message>>>,
 }
 
+/// Maximum number of restored messages kept in an in-process agent prompt seed.
+///
+/// This bounds prompt growth only: the agent-scoped session stream
+/// (`agent_messages`) still accumulates every completed turn. Trimming the
+/// seed keeps a long-lived specialist from growing its prompt without bound
+/// while preserving the most recent turns that matter for continuity.
+pub const MAX_AGENT_HISTORY_MESSAGES: usize = 512;
+
+/// Bound a restored agent history seed to the most recent
+/// [`MAX_AGENT_HISTORY_MESSAGES`] messages.
+///
+/// Over the cap, the oldest messages are discarded first, then leading
+/// `Role::Tool` messages are dropped so the kept window never begins with an
+/// orphaned tool result. Assistant tool calls and their results that lie
+/// wholly inside the kept window are preserved in order. At or below the cap
+/// this is a no-op (the seed is returned unchanged, including any leading
+/// tool message an explicit test supplied).
+///
+/// This bounds prompt growth, not persisted database rows.
+pub fn bound_agent_history_seed(mut seed: Vec<Message>) -> Vec<Message> {
+    if seed.len() <= MAX_AGENT_HISTORY_MESSAGES {
+        return seed;
+    }
+    seed.drain(..seed.len() - MAX_AGENT_HISTORY_MESSAGES);
+    let leading_tool_messages =
+        seed.iter().take_while(|message| message.role == Role::Tool).count();
+    if leading_tool_messages > 0 {
+        seed.drain(..leading_tool_messages);
+    }
+    seed
+}
+
 impl AgentHistory {
-    /// Build history with restored prior turns as prompt context.
+    /// Build history with restored prior turns as prompt context, bounded to
+    /// [`MAX_AGENT_HISTORY_MESSAGES`].
     pub fn with_seed(seed: Vec<Message>) -> Self {
-        Self { seed, produced: Arc::new(Mutex::new(Vec::new())) }
+        Self::with_seed_bounded(seed)
+    }
+
+    /// Build history with a restored seed bounded to
+    /// [`MAX_AGENT_HISTORY_MESSAGES`] messages.
+    ///
+    /// See [`bound_agent_history_seed`] for the trimming rules. The bound is
+    /// prompt-only; persisted agent history continues to accumulate.
+    pub fn with_seed_bounded(seed: Vec<Message>) -> Self {
+        Self { seed: bound_agent_history_seed(seed), produced: Arc::new(Mutex::new(Vec::new())) }
     }
 
     /// Restored prior turns, in stream order.
@@ -3824,5 +3873,105 @@ mod tests {
         history.record_from(&messages, &mut recorded);
 
         assert_eq!(produced_contents(&history), vec!["new prompt"]);
+    }
+
+    fn history_tool_call_message(content: &str) -> Message {
+        let mut message = history_message(Role::Assistant, content);
+        message.tool_calls = Some(vec![ToolCall {
+            id: "call-1".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({ "path": "a.rs" }),
+            thought_signature: None,
+        }]);
+        message
+    }
+
+    fn history_tool_result_message(content: &str) -> Message {
+        let mut message = history_message(Role::Tool, content);
+        message.tool_results = Some(vec![ToolResult {
+            id: "call-1".into(),
+            name: "read".into(),
+            content: serde_json::json!({ "ok": true }),
+        }]);
+        message
+    }
+
+    #[test]
+    fn agent_history_bounded_seed_keeps_the_last_cap_and_ordering() {
+        let seed: Vec<Message> = (0..600)
+            .map(|index| history_message(Role::User, &format!("message {index}")))
+            .collect();
+
+        let history = AgentHistory::with_seed_bounded(seed);
+
+        let bounded = history.seeded();
+        assert_eq!(bounded.len(), MAX_AGENT_HISTORY_MESSAGES);
+        assert_eq!(bounded[0].content, "message 88", "oldest messages are dropped first");
+        assert_eq!(bounded[511].content, "message 599");
+        for (offset, message) in bounded.iter().enumerate() {
+            assert_eq!(
+                message.content,
+                format!("message {}", 88 + offset),
+                "ordering is unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_history_bounded_seed_drops_leading_tool_results() {
+        let mut seed = vec![
+            history_message(Role::User, "old 1"),
+            history_message(Role::User, "old 2"),
+            history_message(Role::User, "old 3"),
+            history_tool_result_message("orphaned result 1"),
+            history_tool_result_message("orphaned result 2"),
+            history_tool_result_message("orphaned result 3"),
+            history_tool_call_message("read a.rs"),
+            history_tool_result_message("ok a.rs"),
+        ];
+        seed.extend((0..507).map(|index| history_message(Role::User, &format!("tail {index}"))));
+        assert_eq!(seed.len(), 515);
+        assert_eq!(
+            seed.len() - MAX_AGENT_HISTORY_MESSAGES,
+            3,
+            "the three oldest turns are trimmed"
+        );
+
+        let bounded = bound_agent_history_seed(seed);
+
+        assert_eq!(bounded.len(), MAX_AGENT_HISTORY_MESSAGES - 3);
+        assert_eq!(
+            bounded[0].role,
+            Role::Assistant,
+            "window does not start with an orphaned tool result"
+        );
+        assert!(bounded[0].tool_calls.is_some(), "in-window assistant tool call survives");
+        assert_eq!(bounded[1].role, Role::Tool);
+        assert!(bounded[1].tool_results.is_some(), "its tool result survives");
+        assert_eq!(bounded[2].content, "tail 0");
+        assert_eq!(bounded[508].content, "tail 506");
+    }
+
+    #[test]
+    fn agent_history_bounded_seed_is_a_noop_at_or_below_the_cap() {
+        let mut at_cap: Vec<Message> = (0..MAX_AGENT_HISTORY_MESSAGES)
+            .map(|index| history_message(Role::User, &format!("m{index}")))
+            .collect();
+        at_cap[0] = history_tool_result_message("leading tool result");
+
+        let bounded = bound_agent_history_seed(at_cap.clone());
+        assert_eq!(bounded.len(), MAX_AGENT_HISTORY_MESSAGES);
+        assert_eq!(bounded[0].role, Role::Tool, "at the cap the seed is untouched");
+        assert_eq!(bounded[0].content, "leading tool result");
+        for (bounded_message, original) in bounded.iter().zip(at_cap.iter()) {
+            assert_eq!(bounded_message.role, original.role);
+            assert_eq!(bounded_message.content, original.content);
+        }
+
+        let below_cap = vec![history_message(Role::User, "only")];
+        let bounded_below = bound_agent_history_seed(below_cap);
+        assert_eq!(bounded_below.len(), 1);
+        assert_eq!(bounded_below[0].role, Role::User);
+        assert_eq!(bounded_below[0].content, "only");
     }
 }
