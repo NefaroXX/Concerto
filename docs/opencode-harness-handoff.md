@@ -4,12 +4,14 @@ Checkpoint requested by the user on 2026-11-16. Updated 2026-11-21 after the
 H39b remainder was implemented on PR #380. Resume from this document and the
 work logs; do not restart completed work or infer that the whole goal is done.
 
-**2026-11-21 update:** all seven findings listed as open at the 2026-11-16
-checkpoint are addressed on PR #380 (head `fae4e80`, 12/12 exact-head checks,
-open and unmerged): H12, H14, H23, H29, H34 and H39 are fixed; H28 is scoped,
-with 67 upstream- or platform-gated duplicate families left. H14's original
-intermittent failure was not reproduced; the degraded path is now explicit and
-retried. H39b's known limits remain in the work log. PR #380 supersedes #379.
+**2026-11-21 status:** PR #380 implements or explicitly scopes the seven
+findings listed as open at the 2026-11-16 checkpoint, but it does **not** close
+this handoff. H12, H23, H29, H34 and H39 are implemented; H14 has a mitigation
+but its original intermittent cause was not reproduced; H28 is scoped, with 67
+upstream- or platform-gated duplicate families left; H39b's known limits remain
+in the work log. PR #380 (head `fae4e80`, 12/12 exact-head checks) is open and
+unmerged and supersedes #379. Do not call the handoff complete until it merges
+and the owner accepts the residuals.
 
 ## Start here
 
@@ -211,8 +213,8 @@ exact new SHA. Do not inherit the green result from `2dbf25a`/`72c414a`.
 
 ## Remaining findings (updated 2026-11-21)
 
-The seven findings listed at the 2026-11-16 checkpoint are addressed on
-PR #380:
+The seven findings listed at the 2026-11-16 checkpoint are implemented or
+explicitly scoped on PR #380, not all closed:
 
 - H12: durable subscriber queues are bounded at 8192 with counted drop-oldest
   overflow; the recorder fails closed on gaps and the CLI reports
@@ -245,5 +247,7 @@ Known residuals:
 - H14's original intermittent cause was not reproduced, though the degraded
   path is now explicit and retried.
 
-Full status/history is in the work log. Passing tests do not establish overall
-harness superiority, and lost historical state cannot be reconstructed.
+This handoff remains open until PR #380 merges and the owner accepts the
+scoped residuals above. Full status/history is in the work log. Passing tests
+do not establish overall harness superiority, and lost historical state cannot
+be reconstructed.
