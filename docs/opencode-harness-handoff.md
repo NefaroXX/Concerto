@@ -1,9 +1,15 @@
 # OpenCode handoff — Concerto harness reliability
 
-Checkpoint requested by the user on 2026-11-16, updated after the H39 root
-milestone and H40/H41 were published and verified. Resume from this document
-and the work logs; do not restart completed work or infer that the whole goal
-is done.
+Checkpoint requested by the user on 2026-11-16. Updated 2026-11-21 after the
+H39b remainder was implemented on PR #380. Resume from this document and the
+work logs; do not restart completed work or infer that the whole goal is done.
+
+**2026-11-21 update:** all seven findings listed as open at the 2026-11-16
+checkpoint are addressed on PR #380 (head `fae4e80`, 12/12 exact-head checks,
+open and unmerged): H12, H14, H23, H29, H34 and H39 are fixed; H28 is scoped,
+with 67 upstream- or platform-gated duplicate families left. H14's original
+intermittent failure was not reproduced; the degraded path is now explicit and
+retried. H39b's known limits remain in the work log. PR #380 supersedes #379.
 
 ## Start here
 
@@ -20,19 +26,22 @@ reconciliation `c901efc` also passed all twelve; `c901efc` is the verified PR
 head. Evidence: `target/harness-reliability/h40-final-*`,
 `h40-attempt1/`, and the work log.
 
-[PR #379](https://github.com/NefaroXX/Concerto/pull/379) targets `dev`, is open
-and draft, and its head is `c901efc` (H40/H41 publication, docs record, and
-findings-table reconciliation). Do not merge without authorization. Remaining work is the
-rest of H39: specialist/process-scoped durable history and cancelled-run spend
-settlement.
+[PR #379](https://github.com/NefaroXX/Concerto/pull/379) is open and draft at
+`c901efc`; it is superseded by
+[PR #380](https://github.com/NefaroXX/Concerto/pull/380), which carries H39b
+plus the earlier H12/H14/H23/H28/H29/H34/H40 fixes. PR #380 targets `dev`,
+head `fae4e80`, and is open and unmerged. Do not merge either without
+authorization. The H39 remainder described below -- specialist/process-scoped
+durable history and cancelled-run spend settlement -- is implemented on
+PR #380; see the update above and the work log for the exact-head evidence.
 
 ## Git and worktrees
 
 | Location | Branch | State |
 | --- | --- | --- |
-| `/home/sol/Projects/Concerto` | `checkpoint/opencode-harness-2026-11-16` | Local documentation-only handoff branch; PR branch is at the H40/H41 head |
+| `/home/sol/Projects/Concerto` | `checkpoint/opencode-harness-2026-11-16` | Local documentation-only handoff branch; current review candidate is PR #380 |
 | `/home/sol/Projects/Concerto-worktrees/h39` | `fix/harness-transcript-continuity` | `72c414a`; H39 root milestone published on `fix/harness-streaming-integrity`; ADR-87 Accepted |
-| `/home/sol/Projects/Concerto-worktrees/h40` | `fix/harness-headless-history` | H40/H41 published: code `91bf006`, docs-record commit on top; local battery 12/12, exact-head 12/12 on `91bf006` |
+| `/home/sol/Projects/Concerto-worktrees/h40` | `fix/harness-headless-history` | PR #380 head `fae4e80`; H39b + H40/H41; local battery green, 12/12 exact-head; open, not merged |
 
 Dedicated local refs `checkpoint/opencode-h39-2026-11-16` (pre-squash WIP
 `a88e841`), `checkpoint/opencode-h40-2026-11-16` (`950a722`) and
@@ -200,11 +209,41 @@ exact new SHA. Do not inherit the green result from `2dbf25a`/`72c414a`.
   macOS job on the last run first received no runner, was cancelled before any
   step, then passed unchanged on rerun).
 
-## Remaining findings
+## Remaining findings (updated 2026-11-21)
 
-Seven findings remain open: H12 event-queue memory bounds; H14 intermittent
-checkpoint ToolNotFound; H23 MCP probe timeout cause; H28 unused dependencies /
-67 duplicate families; H29 declared Rust minimum; H34 unmarked incomplete
-subprocess capture; H39 specialist/process history and cancelled-run spend.
+The seven findings listed at the 2026-11-16 checkpoint are addressed on
+PR #380:
+
+- H12: durable subscriber queues are bounded at 8192 with counted drop-oldest
+  overflow; the recorder fails closed on gaps and the CLI reports
+  `events_dropped`.
+- H14: missing checkpoint tooling returns `CheckpointUnavailable`; audit-pool
+  open retries three times; degraded builds log why. The original intermittent
+  failure was not reproduced.
+- H23: MCP probe `initialize` gets a bounded startup allowance while later
+  stages keep the configured budget; probe errors name the stage, and timed-out
+  children are reaped.
+- H28: 37 unused direct dependencies and 6 redundant declarations were removed.
+  Scoped, not eliminated: 67 duplicate families remain, all upstream-gated or
+  platform-specific.
+- H29: MSRV 1.94 is declared; workspace `check --all-targets` on Rust 1.94
+  passed with warnings denied.
+- H34: bounded subprocess capture now marks output incomplete and cannot
+  certify an eval pass.
+- H39: H39a settlement survives cancellation with a run-scoped exactly-once
+  latch; H39b steps 1-3 persist/restore agent-scoped history, forward failed
+  child usage, and cap restored prompt history at 512 messages. PR #380 head
+  `fae4e80` passed all twelve exact-head checks.
+
+Known residuals:
+
+- H39b: sub-500 ms supervised crash window; metrics lost if a child crashes
+  before flush; concurrent same-role in-process dispatches share a stream; and
+  persisted `agent_messages` rows still accumulate while restored prompts are
+  capped at 512.
+- H28 is the only handoff item not fully eliminated; it is explicitly scoped.
+- H14's original intermittent cause was not reproduced, though the degraded
+  path is now explicit and retried.
+
 Full status/history is in the work log. Passing tests do not establish overall
 harness superiority, and lost historical state cannot be reconstructed.
