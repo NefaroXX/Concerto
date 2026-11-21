@@ -2197,3 +2197,30 @@ for transfer; the overall harness goal is not complete.
   `checkpoint/opencode-h40-2026-11-16` refs preserve both WIP commits. Main is on
   the documentation-only `checkpoint/opencode-harness-2026-11-16` branch.
   These local checkpoints are not published verification milestones.
+
+
+## 2026-11-21 — Independent review of the OpenCode candidate
+
+Reviewed PR #380 at `fae4e80d4ec7a3f79323989598801f11cafaa058` in the H40
+worktree. [Full report](reviews/2026-11-21-harness-review.md) and reproducible
+isolated probes are committed on the review branch. This was a review/report
+request, not a resumption of implementation; no production code was changed.
+
+- Independently verified all twelve remote checks on that exact SHA: main
+  workflow `44958751032` and native workflow `44958750982`. Retained local log
+  `h40-ci2-test.log` records 6,219 passes, zero failures and 17 ignored tests
+  across 87 groups. The full battery was not rerun during this review.
+- Four P1 findings: distinct valid supervised agent IDs collide on sidecar
+  filenames; partial tool batches remain invalid after recovery trimming;
+  approval pauses skip persistence of completed specialist exchanges from the
+  current iteration; failed in-process specialists settle consumed usage at
+  zero cost. A P2 finding concerns log-only overflow handling in normal runtime
+  event/transcript recorders, distinct from the fail-closed benchmark recorder.
+- Three isolated probes compiled with warnings denied and failed their intended
+  safety assertions on the reviewed function bodies (exit 101): one filename
+  collision and two unresolved-call recovery cases. They use a minimal Message
+  stand-in and are not end-to-end integration tests. Remaining findings are
+  source-traced; the report specifies the required integration regressions.
+- These findings are separate from the residuals recorded as accepted in the
+  handoff. Recommendation: hold approval pending the four P1 corrections and
+  clarify runtime recording integrity. No PR was merged or modified.
