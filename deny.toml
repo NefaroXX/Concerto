@@ -92,11 +92,13 @@ ignore = [
     # === heapless 0.8.0 unsound collection APIs (no vulnerable call path) ===
     # Reason: RUSTSEC-2026-0574..-0582 (published 2026-11-18) are unsoundness
     # advisories in heapless 0.8 collection types, fixed in 0.9.4. heapless is
-    # a transitive no-alloc fallback of gix-hash -> faster-hex; gix-hash enables
-    # faster-hex's `std`/`alloc` feature, so the heapless code path is not
-    # selected for this workspace. faster-hex itself only uses heapless
-    # `Vec`/`String` (resize/from_utf8), not the affected SortedLinkedList,
-    # Deque, IndexMap, Spsc, treiber-stack, FindMutView, or IntoIter APIs.
+    # compiled as a transitive dependency via gix-hash -> faster-hex. gix-hash
+    # enables faster-hex's `std`/`alloc` feature, so faster-hex uses alloc
+    # `String`/`Vec`; its only heapless calls are `Vec::resize` and
+    # `String::from_utf8`/`from_utf8_unchecked`. None of the nine affected
+    # APIs (SortedLinkedList, Deque, IndexMap, Spsc, treiber stack,
+    # FindMutView, `Vec::IntoIter::drop`) are in any call path. heapless is
+    # native-only here; no wasm32-wasip2 guest depends on gix/faster-hex.
     # Scope: transitive only, build graph (gix-hash hex helpers).
     # Review date: 2026-11-21 — revisit when gix-hash accepts faster-hex 2.x
     # (which uses heapless 0.9.4) or gix drops the no-alloc fallback.
