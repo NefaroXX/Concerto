@@ -13,6 +13,12 @@ in the work log. PR #380 (head `fae4e80`, 12/12 exact-head checks) is open and
 unmerged and supersedes #379. Do not call the handoff complete until it merges
 and the owner accepts the residuals.
 
+**Decision (2026-11-21):** For H39/PR #380, accept H28 as scoped, H14 as
+mitigated with its root cause unreproduced, and the four H39b limits as
+documented. These are not blockers for #380. This is not a claim that the whole
+handoff is complete: #380 remains unmerged, and H28 is scoped rather than
+eliminated.
+
 ## Start here
 
 **H39 root, H40 and H41 are published and verified.** H39: strict cargo-audit
