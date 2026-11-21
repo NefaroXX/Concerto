@@ -57,4 +57,16 @@ ignore = [
     # no safe upgrade; replacement tracked separately; see deny.toml
     "RUSTSEC-2026-0543",
     "RUSTSEC-2026-0555",
+    # heapless 0.8 unsound collection APIs — transitive no-alloc fallback of
+    # gix-hash -> faster-hex; workspace enables faster-hex std/alloc and does
+    # not use the affected collection APIs; see deny.toml
+    "RUSTSEC-2026-0574",
+    "RUSTSEC-2026-0575",
+    "RUSTSEC-2026-0576",
+    "RUSTSEC-2026-0577",
+    "RUSTSEC-2026-0578",
+    "RUSTSEC-2026-0579",
+    "RUSTSEC-2026-0580",
+    "RUSTSEC-2026-0581",
+    "RUSTSEC-2026-0582",
 ]

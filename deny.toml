@@ -89,6 +89,26 @@ ignore = [
     # Review date: 2026-11-18 — revisit when a maintained replacement lands.
     "RUSTSEC-2026-0543",  # chrono unmaintained — no security issue
     "RUSTSEC-2026-0555",  # chrono-tz unmaintained — no security issue
+    # === heapless 0.8.0 unsound collection APIs (no vulnerable call path) ===
+    # Reason: RUSTSEC-2026-0574..-0582 (published 2026-11-18) are unsoundness
+    # advisories in heapless 0.8 collection types, fixed in 0.9.4. heapless is
+    # a transitive no-alloc fallback of gix-hash -> faster-hex; gix-hash enables
+    # faster-hex's `std`/`alloc` feature, so the heapless code path is not
+    # selected for this workspace. faster-hex itself only uses heapless
+    # `Vec`/`String` (resize/from_utf8), not the affected SortedLinkedList,
+    # Deque, IndexMap, Spsc, treiber-stack, FindMutView, or IntoIter APIs.
+    # Scope: transitive only, build graph (gix-hash hex helpers).
+    # Review date: 2026-11-21 — revisit when gix-hash accepts faster-hex 2.x
+    # (which uses heapless 0.9.4) or gix drops the no-alloc fallback.
+    "RUSTSEC-2026-0574",  # heapless FindMutView use-after-free (unused API)
+    "RUSTSEC-2026-0575",  # heapless Spsc ordering (unused API)
+    "RUSTSEC-2026-0576",  # heapless IndexMap::truncate (unused API)
+    "RUSTSEC-2026-0577",  # heapless panicking Drop (unused APIs)
+    "RUSTSEC-2026-0578",  # heapless SortedLinkedList::zeroize (unused API)
+    "RUSTSEC-2026-0579",  # heapless Deque TryFrom (unused API)
+    "RUSTSEC-2026-0580",  # heapless treiber stack race (unused API)
+    "RUSTSEC-2026-0581",  # heapless Deque::make_contiguous (unused API)
+    "RUSTSEC-2026-0582",  # heapless IndexMap::insert (unused API)
 ]
 
 [licenses]
