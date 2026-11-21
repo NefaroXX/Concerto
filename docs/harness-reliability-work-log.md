@@ -48,7 +48,7 @@ passing repository tests alone does not close a finding.
 | H36 | P2 | cargo-audit can report incomplete registry checks with exit zero | Fixed and verified on 66309f8; awaiting merge |
 | H37 | P1 | Native provider wire adapters discard mandatory system/assistant text | Fixed; full local battery and all 12 exact-head CI checks passed |
 | H38 | P2 | Gemini canonical history loses native part order/text signatures and misclassifies thought text | Fixed; full local battery and all 12 exact-head CI checks passed on 14390eb |
-| H39 | P1 | Run settlement persists summaries instead of complete provider history | Implemented; pending full local battery and exact-head CI. Root repair fixed, published and exact-head verified (`2dbf25a`; ADR-87 `72c414a`). H39a settlement and H39b steps 1–3 landed; H39b review follow-ups now attribute in-process specialist spend via `ProviderMetrics::agent_id` and bound restored prompt history at 512 messages (DB rows still accumulate). Not yet claimed CI-green |
+| H39 | P1 | Run settlement persists summaries instead of complete provider history | Implemented; full local CI-equivalent battery green 2026-11-21 (`494efd4`); exact-head CI recorded on the PR. Root repair fixed, published and exact-head verified (`2dbf25a`; ADR-87 `72c414a`). H39a settlement and H39b steps 1–3 landed; H39b review follow-ups attribute in-process specialist spend via `ProviderMetrics::agent_id`, forward failed-child usage, and bound restored prompt history at 512 messages (DB rows still accumulate) |
 | H40 | P2 | Headless multi-agent history clips messages and older obligations before dispatch | Fixed, published and exact-head verified (`91bf006`); loopback CLI request fixture plus the approved-plan routing control |
 | H41 | P1 | Settings CLI fixtures use XDG isolation on macOS, where application paths resolve to the real profile | Fixed and verified on Linux, published with H40 (`91bf006`); macOS hazard source-confirmed, portable coverage not claimed |
 
@@ -3271,3 +3271,38 @@ Branch: `fix/harness-headless-history` (HEAD `34a09ee` before this change).
   so multiple concurrent dispatches of the same role share one stream.
 - **Status.** Implemented pending the full local battery and exact-head CI;
   this entry does not claim CI green.
+
+## 2026-11-21 — H39b final validation, replay flake fixes, supply-chain closure
+
+- **Local battery green at `494efd4`.** Re-ran the CI-equivalent sequence with
+  `CARGO_TARGET_DIR=/home/sol/Projects/Concerto/target`, `-j1`, and
+  `RUSTFLAGS=-D warnings`: fmt; clippy all targets; workspace tests; workspace
+  build; `concerto` desktop/cli feature builds; launcher/config/cache/CLI
+  smokes; all wasm32-wasip2 guest builds; palette and Python script tests;
+  workspace bench smoke; `cargo deny check`; `check-cargo-audit.py`. All exit
+  zero. Logs: `target/harness-reliability/h40-ci2-*.log`.
+- **Failed-child spend regression fixed.** `AgentLoop::run` now forwards
+  provider metrics on both success and error, so a supervised child that
+  consumed tokens but failed is still harvested and attributed once. Added
+  the failed-run metrics sink test and legacy metrics JSON without `agent_id`.
+- **Replay determinism.** H39 put `provider_metrics` into `subtask-completed`
+  payloads; mock `latency_ms` is wall-clock, so two identical replay fixtures
+  occasionally differed 0 vs 1. `replay_diff` now scrubs `latency_ms` from the
+  canonical view while still comparing tokens, cost, provider, model, agent,
+  ordering, filesystem, and cursors.
+- **Screenshot collision.** The battery exposed second-resolution screenshot
+  filenames overwriting each other. Filenames now include nanoseconds; the
+  desktop screenshot tests pass.
+- **Supply-chain closure.** `zip` moved to `9.0.5+` (locked 9.7.0) for
+  RUSTSEC-2026-0548 while keeping no-default-features + `zlib-rs`; chrono and
+  chrono-tz maintenance notices carry justified ignores; wasmtime moved to
+  `36.0.23`, clearing RUSTSEC-2026-0566/-0569/-0571. The nine heapless 0.8
+  unsound notices are ignored in both files with the transitive
+  gix-hash/faster-hex scope and the exact reachable API (`Vec::resize`,
+  `String::from_utf8`); no wasm guest uses that path. Security re-review
+  approved the pair after restoring incidental `windows-sys` lock references.
+- **Known limits unchanged.** Supervised history has a sub-500 ms crash window
+  between periodic flushes; metrics are lost if a child crashes before sidecar
+  flush; in-process specialist history is per role, so concurrent dispatches
+  of one role share a stream; persisted `agent_messages` rows still
+  accumulate while only the restored prompt window is capped at 512.
