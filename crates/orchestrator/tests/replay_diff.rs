@@ -222,6 +222,17 @@ fn canonical(event: &WhiteboardEvent) -> Value {
     let mut payload = event.payload.clone();
     if let Some(map) = payload.as_object_mut() {
         map.remove("task_id");
+        // H39 added `provider_metrics` to `subtask-completed` payloads. Latency
+        // is wall-clock by nature, so scrub it from the canonical view while
+        // keeping every other metric field (provider, model, tokens, cost)
+        // compared.
+        if let Some(metrics) = map.get_mut("provider_metrics").and_then(Value::as_array_mut) {
+            for metric in metrics {
+                if let Some(metric) = metric.as_object_mut() {
+                    metric.remove("latency_ms");
+                }
+            }
+        }
     }
     json!({
         "event_id": if event.kind == WhiteboardKind::WriteApplied {
