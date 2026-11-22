@@ -54,6 +54,35 @@ the durable source as fabricated execution evidence. Native assistant replay
 state and recorded results remain intact. Matching is scoped to each assistant
 turn rather than globally to a possibly reused call ID.
 
+## Specialist-scoped history and live spend (H39b amendment, 2026-11-22)
+
+In-process specialists use the same durable-turn rule on an agent-scoped
+stream. `agent_messages` is keyed by `(session_id, role)` and never mixed into
+root `messages`; `AgentRunner` restores the most recent 512 rows, repairs
+unanswered tool calls request-only for the prompt, and appends only the turns
+produced by the current run. The restored seed is never re-appended. History
+I/O is best effort: load or append failure degrades the prompt/durability but
+does not fail or settle the run.
+
+Provider usage is accumulated on the run-owned `AgentHistory` handle after
+every completed request. On failure the history still carries the tokens and
+provider-priced cost for requests that completed before the error, so live
+spend settlement retains them and a subsequent dispatch is refused when the
+cap is exhausted. The failed in-process attempt is also persisted as one
+attributed `spend_records` row (agent id, tokens, cost) when a session store is
+attached; the success path leaves spend persistence to run settlement, so one
+attempt is never counted twice. This closes the earlier gap where a later
+provider error erased usage already consumed.
+
+A specialist assistant turn may request several tools. The assistant batch is
+recorded before execution and each completed tool result is appended as it
+finishes. If a tool pauses for approval, the ordinary early return preserves
+the batch and prior results; the paused call remains unresolved on disk and is
+repaired as request-only `outcome_unknown` on the next load. Regression
+coverage drives a real two-call batch where the first write succeeds and the
+second call pauses, then asserts the file, the recorded batch/result, and the
+repaired second outcome.
+
 ## Verification and limits
 
 Regression coverage exercises real disk-store reopen, context assembly and a
@@ -62,8 +91,9 @@ repair success, later failure and exhaustion; follow-up delivery; continuation
 and separate-run usage; recorded status replies; interrupted exchanges; and
 bounded cleanup. Full battery results belong in the work log.
 
-This milestone covers root single-agent and coordinator dispatch history.
-Independent specialist and supervised-process histories still need their own
-agent-scoped persistence and restore contract. They must not be mixed into the
-root provider stream. H39 remains open for that work. H40 separately tracks the
-headless coordinator's clipped history selection.
+The root milestone covers single-agent and coordinator dispatch history.
+In-process specialist history is now agent-scoped and restored per the
+amendment above. Supervised child history remains parent-owned temp-file
+history with parent-side harvest (ADR-60 S5), never the root provider stream;
+its remaining crash-window and compaction limits are recorded in the H39b work
+log. H40's headless clipped-history selection remains separately tracked.

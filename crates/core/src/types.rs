@@ -2346,6 +2346,23 @@ pub struct AgentRunResult {
 pub struct AgentHistory {
     seed: Vec<Message>,
     produced: Arc<Mutex<Vec<Message>>>,
+    usage: Arc<Mutex<AgentRunUsage>>,
+}
+
+/// Usage accumulated by completed provider requests during one in-process
+/// specialist run.
+///
+/// The history object is shared by every clone of the run's `AgentContext`,
+/// so the agent can keep incrementing usage while `AgentRunner` reads the same
+/// accumulator after the run, including when the agent returns an error. Cost
+/// is accumulated per completed request (using the provider's own pricing), so
+/// a later provider failure never refunds the tokens already consumed.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AgentRunUsage {
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub cost_usd: f64,
+    pub measured_requests: u32,
 }
 
 /// Maximum number of restored messages kept in an in-process agent prompt seed.
@@ -2393,7 +2410,11 @@ impl AgentHistory {
     /// See [`bound_agent_history_seed`] for the trimming rules. The bound is
     /// prompt-only; persisted agent history continues to accumulate.
     pub fn with_seed_bounded(seed: Vec<Message>) -> Self {
-        Self { seed: bound_agent_history_seed(seed), produced: Arc::new(Mutex::new(Vec::new())) }
+        Self {
+            seed: bound_agent_history_seed(seed),
+            produced: Arc::new(Mutex::new(Vec::new())),
+            usage: Arc::new(Mutex::new(AgentRunUsage::default())),
+        }
     }
 
     /// Restored prior turns, in stream order.
@@ -2425,6 +2446,31 @@ impl AgentHistory {
         match self.produced.lock() {
             Ok(produced) => produced.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Record one completed provider request's measured/estimated usage and
+    /// its provider-priced cost. Called as each turn completes so a later
+    /// provider error cannot refund tokens already consumed.
+    pub fn record_usage(&self, tokens_in: u64, tokens_out: u64, cost_usd: f64) {
+        let update = |usage: &mut AgentRunUsage| {
+            usage.tokens_in = usage.tokens_in.saturating_add(tokens_in);
+            usage.tokens_out = usage.tokens_out.saturating_add(tokens_out);
+            usage.cost_usd += cost_usd;
+            usage.measured_requests = usage.measured_requests.saturating_add(1);
+        };
+        match self.usage.lock() {
+            Ok(mut usage) => update(&mut usage),
+            Err(poisoned) => update(&mut poisoned.into_inner()),
+        }
+    }
+
+    /// Usage accumulated by completed provider requests in this run. A clone
+    /// shares the underlying accumulator with the agent's context.
+    pub fn usage(&self) -> AgentRunUsage {
+        match self.usage.lock() {
+            Ok(usage) => *usage,
+            Err(poisoned) => *poisoned.into_inner(),
         }
     }
 }

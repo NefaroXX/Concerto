@@ -3306,3 +3306,35 @@ Branch: `fix/harness-headless-history` (HEAD `34a09ee` before this change).
   flush; in-process specialist history is per role, so concurrent dispatches
   of one role share a stream; persisted `agent_messages` rows still
   accumulate while only the restored prompt window is capped at 512.
+
+## 2026-11-22 — H39b specialist history, failed-attempt spend, pause repair
+
+- **Agent-scoped specialist history.** `AgentRunner` now restores and appends
+  the specialist's own `agent_messages` stream keyed by `(session_id, role)`,
+  bounded to 512 prompt rows and repaired request-only for unanswered tool
+  calls before the run. The seed is never re-appended. Load/append failures
+  remain best effort and cannot fail or settle the run.
+- **Live usage survives provider errors.** Completed generic-specialist
+  requests record tokens and provider-priced cost on the run-owned
+  `AgentHistory`. On error `AgentRunner` settles that measured usage instead
+  of refunding the reservation to zero, so the live session total retains it
+  and a later dispatch is refused once the cap is exhausted. The failed
+  attempt is persisted as one attributed `spend_records` row when a store is
+  attached; the success path still leaves persistence to settlement.
+- **Batch pause repair.** The freeform specialist records the assistant batch
+  before executing tools and each completed result as it finishes. A
+  mid-batch approval pause now preserves the batch and prior result; the
+  paused call stays unresolved on disk and loads as request-only
+  `outcome_unknown`. A regression drives two calls in one provider stream
+  (write succeeds, publish pauses), asserting the retained file and repair.
+- **Verification (repository `target/`):**
+  - `cargo test -p concerto-orchestrator --lib`: **1960 passed, 0 failed,
+    1 ignored**; includes the new failed-attempt spend and mid-batch pause
+    tests plus the earlier agent-history suite.
+  - `cargo test -p concerto-core --lib`: **542 passed, 0 failed**.
+  - `cargo check --workspace --all-targets`: exit 0.
+  - `cargo clippy -p concerto-orchestrator --all-targets -- -D warnings`:
+    exit 0.
+  - `cargo fmt --all -- --check`; `git diff --check`: clean.
+- **Status.** Implemented pending the full CI-equivalent battery and
+  exact-head CI; this entry does not claim CI green.

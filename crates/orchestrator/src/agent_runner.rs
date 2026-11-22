@@ -13,7 +13,7 @@ use concerto_core::traits::provider::LlmProvider;
 use concerto_core::types::{AgentContext, AgentId, AgentOutcome, AgentRunResult, SubTask};
 use concerto_core::{CancellationToken, OrchestratorError};
 use concerto_providers::model::ModelProfile;
-use concerto_sessions::spend::SpendTracker;
+use concerto_sessions::spend::{SpendRecord, SpendTracker};
 use concerto_sessions::SessionStore;
 
 use crate::agents::execution_state::display_reason;
@@ -291,7 +291,12 @@ impl AgentRunner {
         let latency_ms = start.elapsed().as_millis() as u64;
         drop(provider_permit);
         drop(global_permit);
-        let actual_cost = result.as_ref().map_or(0.0, |run_result| run_result.cost_usd);
+        // R4/H39: usage is run-owned and survives an agent error. The agent
+        // records each completed request on the shared history handle, so a
+        // later provider failure cannot refund tokens already consumed.
+        let usage = context.agent_history.usage();
+        let actual_cost =
+            result.as_ref().map_or_else(|_| usage.cost_usd, |run_result| run_result.cost_usd);
         self.spend_tracker.settle_reservation(reserved_cost, actual_cost);
         // Publish the live spend snapshot (and cap signal) after every
         // provider run settles so UIs show the tracker's session total.
@@ -340,6 +345,42 @@ impl AgentRunner {
                 Ok(run_result)
             }
             Err(e) => {
+                // Failed in-process attempts consume real tokens but never
+                // reach the coordinator's `provider_metrics` collection (that
+                // only sees `Ok` results). Persist this attempt's attributed
+                // usage here, exactly once, from the run-owned accumulator.
+                // Success path leaves persistence to the run's settlement.
+                if usage.measured_requests > 0 {
+                    if let Some(store) = &self.session_store {
+                        let record = SpendRecord {
+                            id: Ulid::new(),
+                            session_id: task.session_id,
+                            task_id: Some(task.id.0),
+                            agent_id: Some(role_name.clone()),
+                            provider: profile.profile.provider.clone(),
+                            model: profile.model_name().to_string(),
+                            tokens_in: usage.tokens_in,
+                            tokens_out: usage.tokens_out,
+                            cost_usd: usage.cost_usd,
+                            created_at: time::OffsetDateTime::now_utc(),
+                        };
+                        let write = store.record_spend(record, CancellationToken::new());
+                        match tokio::time::timeout(Duration::from_secs(10), write).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => tracing::warn!(
+                                session_id = %task.session_id,
+                                role = %role_name,
+                                error = %error,
+                                "failed-attempt spend persistence failed; live settlement is unaffected"
+                            ),
+                            Err(_) => tracing::warn!(
+                                session_id = %task.session_id,
+                                role = %role_name,
+                                "failed-attempt spend persistence timed out; live settlement is unaffected"
+                            ),
+                        }
+                    }
+                }
                 let error = e.to_string();
                 let cancelled = is_cancellation_error(&e) || cancel.is_cancelled();
                 let _ = self.bus.publish_for_session(
@@ -1451,6 +1492,85 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(persisted.len(), 2, "the synthetic result is never persisted");
+    }
+
+    /// Mock whose first request completed with measured usage, then a later
+    /// provider request failed. It records usage on the run-owned history
+    /// exactly as the real specialist loops do.
+    struct UsageThenFailAgent {
+        id: AgentId,
+    }
+
+    #[async_trait::async_trait]
+    impl ExpertAgent for UsageThenFailAgent {
+        fn id(&self) -> AgentId {
+            self.id.clone()
+        }
+
+        fn capabilities(&self) -> concerto_core::types::CapabilitySet {
+            concerto_core::types::CapabilitySet::default()
+        }
+
+        async fn run(
+            &self,
+            _task: &SubTask,
+            context: AgentContext,
+            _model: &str,
+            _cancel: CancellationToken,
+        ) -> Result<AgentRunResult, OrchestratorError> {
+            context.agent_history.record_usage(1_000, 200, 0.02);
+            Err(OrchestratorError::Provider(ProviderError::Network("boom".into())))
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_run_settles_measured_usage_and_persists_it_once() {
+        let (store, session_id) = in_memory_store_with_session().await;
+        let tracker = Arc::new(SpendTracker::new(Some(0.01), None, None));
+        let mut registry = AgentRegistry::new();
+        registry.register(Arc::new(UsageThenFailAgent { id: AgentId::new("researcher") }));
+        let runner = AgentRunner::new(Arc::new(registry), EventBus::new(64), tracker.clone())
+            .with_session_store(Some(store.clone()));
+        let session = SessionContext::new(session_id, std::path::PathBuf::from("/tmp"));
+        let task = make_task(TaskId::new(), session_id);
+
+        let error = runner
+            .run(
+                AgentId::new("researcher"),
+                &task,
+                AgentContext::new(session),
+                &make_profile(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("the provider failure must remain the run's error");
+        assert!(error.to_string().contains("boom"), "original error retained: {error}");
+        assert!(
+            (tracker.session_total() - 0.02).abs() < f64::EPSILON,
+            "live spend must retain the completed first turn"
+        );
+
+        let spend = store.list_spend_records(session_id, CancellationToken::new()).await.unwrap();
+        assert_eq!(spend.len(), 1, "failed-attempt usage persisted exactly once: {spend:?}");
+        assert_eq!(spend[0].agent_id.as_deref(), Some("researcher"));
+        assert_eq!(spend[0].tokens_in, 1_000);
+        assert_eq!(spend[0].tokens_out, 200);
+        assert!((spend[0].cost_usd - 0.02).abs() < f64::EPSILON);
+
+        let second_error = runner
+            .run(
+                AgentId::new("researcher"),
+                &make_task(TaskId::new(), session_id),
+                AgentContext::new(SessionContext::new(
+                    session_id,
+                    std::path::PathBuf::from("/tmp"),
+                )),
+                &make_profile(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("exhausted cap must refuse a subsequent dispatch");
+        assert!(matches!(second_error, OrchestratorError::NoBudgetForDelegation));
     }
 
     #[tokio::test]

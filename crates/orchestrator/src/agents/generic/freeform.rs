@@ -177,7 +177,10 @@ impl GenericSpecialistAgent {
                         progress.interrupted();
                         break;
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        context.agent_history.record_from(&messages, &mut recorded);
+                        return Err(error);
+                    }
                 };
             // ADR-66 §4: resolve the turn through the text-fallback driver —
             // structured tool-call blocks parsed from the text, bounded
@@ -217,14 +220,27 @@ impl GenericSpecialistAgent {
                         progress.interrupted();
                         break;
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        context.agent_history.record_from(&messages, &mut recorded);
+                        return Err(error);
+                    }
                 };
             // ADR-48 decision 4: provider-reported usage as the source of
             // truth; the byte/4 heuristic is the fallback per dimension.
             let usage_in = usage.as_ref().and_then(|u| u.prompt_tokens);
             let usage_out = usage.as_ref().and_then(|u| u.completion_tokens);
-            tokens_in = tokens_in.saturating_add(usage_in.unwrap_or(estimated_tokens_in));
-            tokens_out = tokens_out.saturating_add(usage_out.unwrap_or((text.len() / 4) as u64));
+            let turn_tokens_in = usage_in.unwrap_or(estimated_tokens_in);
+            let turn_tokens_out = usage_out.unwrap_or((text.len() / 4) as u64);
+            tokens_in = tokens_in.saturating_add(turn_tokens_in);
+            tokens_out = tokens_out.saturating_add(turn_tokens_out);
+            // R4/H39: accumulate this completed request's usage on the
+            // run-owned history handle. A later provider failure returns an
+            // error, but the tokens already consumed stay chargeable.
+            context.agent_history.record_usage(
+                turn_tokens_in,
+                turn_tokens_out,
+                self.provider.approximate_cost(turn_tokens_in, turn_tokens_out),
+            );
 
             messages.push(Message {
                 gemini_replay,
@@ -569,6 +585,10 @@ impl GenericSpecialistAgent {
                                 "cancelled",
                             );
                             if !progress.has_progress() {
+                                // The assistant turn is already completed;
+                                // preserve it even though the run has no
+                                // retained tool progress.
+                                context.agent_history.record_from(&messages, &mut recorded);
                                 return Err(OrchestratorError::Cancelled);
                             }
                             progress.interrupted();
@@ -576,6 +596,12 @@ impl GenericSpecialistAgent {
                         }
                         if matches!(error, concerto_core::ToolError::PausedAwaitingApproval { .. })
                         {
+                            // R3/H39: an approval pause is an ordinary early
+                            // return. The assistant batch and every result
+                            // completed before the pause are durable evidence;
+                            // the paused call intentionally stays unresolved so
+                            // the next load repairs it as request-only.
+                            context.agent_history.record_from(&messages, &mut recorded);
                             return Err(OrchestratorError::Tool(error));
                         }
                         let payload = tool_failure_payload_with(

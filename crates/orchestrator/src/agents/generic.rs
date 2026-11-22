@@ -1535,9 +1535,17 @@ impl GenericSpecialistAgent {
                 .sum::<u64>();
             let estimated_tokens_out =
                 (text.len() as u64).saturating_add(argument_chars).div_ceil(4);
-            tokens_in = tokens_in.saturating_add(measured_tokens_in.unwrap_or(estimated_tokens_in));
-            tokens_out =
-                tokens_out.saturating_add(measured_tokens_out.unwrap_or(estimated_tokens_out));
+            let turn_tokens_in = measured_tokens_in.unwrap_or(estimated_tokens_in);
+            let turn_tokens_out = measured_tokens_out.unwrap_or(estimated_tokens_out);
+            tokens_in = tokens_in.saturating_add(turn_tokens_in);
+            tokens_out = tokens_out.saturating_add(turn_tokens_out);
+            // R4/H39: keep completed-request usage on the run-owned history
+            // handle so a later provider failure still settles real spend.
+            context.agent_history.record_usage(
+                turn_tokens_in,
+                turn_tokens_out,
+                self.provider.approximate_cost(turn_tokens_in, turn_tokens_out),
+            );
 
             // Attribute the prompt usage to the preceding user message so the
             // persisted transcript carries measured costs (ADR-48).
