@@ -1494,8 +1494,8 @@ mod tests {
         assert_eq!(persisted.len(), 2, "the synthetic result is never persisted");
     }
 
-    /// Mock whose first request completed with measured usage, then a later
-    /// provider request failed. It records usage on the run-owned history
+    /// Mock whose completed requests report measured usage, then a later
+    /// provider request fails. It records usage on the run-owned history
     /// exactly as the real specialist loops do.
     struct UsageThenFailAgent {
         id: AgentId,
@@ -1518,7 +1518,10 @@ mod tests {
             _model: &str,
             _cancel: CancellationToken,
         ) -> Result<AgentRunResult, OrchestratorError> {
-            context.agent_history.record_usage(1_000, 200, 0.02);
+            // Two completed requests before the third fails. A last-request
+            // implementation would lose the first request's tokens/cost.
+            context.agent_history.record_usage(600, 100, 0.006);
+            context.agent_history.record_usage(400, 100, 0.004);
             Err(OrchestratorError::Provider(ProviderError::Network("boom".into())))
         }
     }
@@ -1526,7 +1529,7 @@ mod tests {
     #[tokio::test]
     async fn failed_run_settles_measured_usage_and_persists_it_once() {
         let (store, session_id) = in_memory_store_with_session().await;
-        let tracker = Arc::new(SpendTracker::new(Some(0.01), None, None));
+        let tracker = Arc::new(SpendTracker::new(Some(0.005), None, None));
         let mut registry = AgentRegistry::new();
         registry.register(Arc::new(UsageThenFailAgent { id: AgentId::new("researcher") }));
         let runner = AgentRunner::new(Arc::new(registry), EventBus::new(64), tracker.clone())
@@ -1546,8 +1549,8 @@ mod tests {
             .expect_err("the provider failure must remain the run's error");
         assert!(error.to_string().contains("boom"), "original error retained: {error}");
         assert!(
-            (tracker.session_total() - 0.02).abs() < f64::EPSILON,
-            "live spend must retain the completed first turn"
+            (tracker.session_total() - 0.01).abs() < f64::EPSILON,
+            "live spend must retain every completed request, not just the last"
         );
 
         let spend = store.list_spend_records(session_id, CancellationToken::new()).await.unwrap();
@@ -1555,7 +1558,7 @@ mod tests {
         assert_eq!(spend[0].agent_id.as_deref(), Some("researcher"));
         assert_eq!(spend[0].tokens_in, 1_000);
         assert_eq!(spend[0].tokens_out, 200);
-        assert!((spend[0].cost_usd - 0.02).abs() < f64::EPSILON);
+        assert!((spend[0].cost_usd - 0.01).abs() < f64::EPSILON);
 
         let second_error = runner
             .run(
