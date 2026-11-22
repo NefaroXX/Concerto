@@ -1,7 +1,7 @@
 //! H39b step 3: parent-owned supervised child history/metrics wiring.
 
 use super::*;
-use concerto_core::types::{Message, ProviderMetrics, Role, ToolCall};
+use concerto_core::types::{Message, ProviderMetrics, Role, ToolCall, ToolResult};
 use concerto_sessions::SqliteSessionStore;
 
 fn message(role: Role, content: &str) -> Message {
@@ -185,13 +185,104 @@ async fn prepare_and_harvest_restore_append_and_attribute_child_history() {
     let _ = tokio::fs::remove_dir_all(&prepared.directory).await;
 }
 
-/// Regression for the H39b harvest offset-loss bug: when the accumulated file
-/// is not longer than the parent's seed, child startup must leave it
-/// byte-identical even though the unanswered tail is trimmed in memory.
-/// Rewriting it would shift the parent's `initial_seed_len` slice and drop the
-/// first child turn.
+/// R2: the seed is repaired before it is written and the stamped length is the
+/// repaired length, so harvest cannot re-ingest a synthetic result.
 #[tokio::test]
-async fn startup_never_shrinks_a_seed_length_file_and_harvest_keeps_every_child_turn() {
+async fn prepare_repairs_seed_and_stamps_the_repaired_length() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let db_path = directory.path().join("sessions.db");
+    let store = SqliteSessionStore::connect_path(&db_path).await.expect("file-backed store");
+    let session_id = store
+        .create_session(
+            camino::Utf8Path::new("/tmp/h40-r2-prepare"),
+            "mock",
+            "mock",
+            CancellationToken::new(),
+        )
+        .await
+        .expect("session")
+        .id;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+
+    let mut assistant = message(Role::Assistant, "");
+    assistant.tool_calls = Some(vec![
+        ToolCall {
+            id: "call-a".to_owned(),
+            name: "filesystem".to_owned(),
+            arguments: serde_json::json!({ "path": "a.txt" }),
+            thought_signature: None,
+        },
+        ToolCall {
+            id: "call-b".to_owned(),
+            name: "filesystem".to_owned(),
+            arguments: serde_json::json!({ "path": "b.txt" }),
+            thought_signature: None,
+        },
+    ]);
+    let mut answered = message(Role::Tool, "");
+    answered.tool_results = Some(vec![ToolResult {
+        id: "call-a".to_owned(),
+        name: "filesystem".to_owned(),
+        content: serde_json::json!({ "ok": true }),
+    }]);
+    let raw = vec![message(Role::User, "go"), assistant, answered];
+    store
+        .append_agent_messages(session_id, "reviewer", &raw, CancellationToken::new())
+        .await
+        .expect("seed raw history");
+
+    let tasks = vec![("reviewer".to_owned(), "review".to_owned())];
+    let prepared = prepare_supervised_history(Some(&store), session_id, &tasks)
+        .await
+        .expect("prepare history");
+    assert_eq!(prepared.seeds.len(), 1);
+    assert_eq!(
+        prepared.seeds[0].initial_seed_len, 4,
+        "the stamp is the repaired length, not the raw length"
+    );
+
+    let written = crate::supervised_history::read_messages(&prepared.seeds[0].paths.history)
+        .await
+        .expect("read repaired seed");
+    assert_eq!(written.len(), 4);
+    assert_eq!(
+        written[2].tool_results.as_ref().map(|results| results[0].id.as_str()),
+        Some("call-a"),
+        "the recorded result is preserved"
+    );
+    assert_eq!(
+        written[3].tool_results.as_ref().map(|results| results[0].id.as_str()),
+        Some("call-b"),
+        "the unanswered call gets a request-only result"
+    );
+    assert_eq!(
+        written[3].tool_results.as_ref().map(|results| &results[0].content["status"]),
+        Some(&serde_json::json!("outcome_unknown"))
+    );
+
+    let persisted = store
+        .load_agent_messages(session_id, "reviewer", CancellationToken::new())
+        .await
+        .expect("load raw history");
+    assert_eq!(persisted.len(), 3, "the synthetic result is never persisted");
+    assert_eq!(
+        persisted[2].tool_results.as_ref().map(Vec::len),
+        Some(1),
+        "only the genuinely recorded result is durable"
+    );
+    assert_eq!(
+        persisted[2].tool_results.as_ref().map(|results| results[0].id.as_str()),
+        Some("call-a")
+    );
+
+    let _ = tokio::fs::remove_dir_all(&prepared.directory).await;
+}
+
+/// Regression for the H39b harvest offset-loss bug and R2: startup must never
+/// rewrite the accumulated file, and the parent's stamped seed length must be
+/// the repaired length so harvest slices only child turns.
+#[tokio::test]
+async fn startup_never_rewrites_a_repaired_seed_and_harvest_keeps_every_child_turn() {
     let directory = tempfile::tempdir().expect("temp dir");
     let db_path = directory.path().join("sessions.db");
     let store = SqliteSessionStore::connect_path(&db_path).await.expect("file-backed store");
@@ -215,23 +306,28 @@ async fn startup_never_shrinks_a_seed_length_file_and_harvest_keeps_every_child_
         arguments: serde_json::json!({ "path": "seed.txt" }),
         thought_signature: None,
     }]);
-    let seed = vec![message(Role::User, "seed question"), unanswered];
+    let raw_seed = vec![message(Role::User, "seed question"), unanswered];
+    let seed = crate::provider_transcript::restore_tool_responses(raw_seed);
+    assert_eq!(seed.len(), 3, "the parent repairs the seed before writing");
     let seed_len = seed.len();
     std::fs::write(&paths.history, serde_json::to_vec(&seed).expect("serialize seed"))
         .expect("write seed fixture");
     let before = std::fs::read(&paths.history).expect("read seed bytes");
 
-    // Child startup: the unanswered tail is trimmed in memory, but the file is
-    // exactly at the parent's seed length, so it must not be rewritten.
-    let restored = crate::supervised_history::restore_for_child(&paths.history, seed_len)
+    // Child startup: repair is idempotent for the already-repaired seed, and
+    // the file must stay byte-identical so the harvest offset remains exact.
+    let restored = crate::supervised_history::restore_for_child(&paths.history)
         .await
         .expect("restore child history");
-    assert_eq!(restored.messages.len(), seed_len - 1, "unanswered tail trimmed for the loop");
-    assert!(restored.rewrite_error.is_none(), "no rewrite is attempted at seed length");
+    assert_eq!(
+        serde_json::to_value(&restored).expect("serialize restored seed"),
+        serde_json::to_value(&seed).expect("serialize written seed"),
+        "the repaired seed is unchanged for the loop"
+    );
     assert_eq!(
         std::fs::read(&paths.history).expect("reread seed bytes"),
         before,
-        "a file at or below the seed length is left byte-identical"
+        "child startup never rewrites the accumulated file"
     );
 
     // Child delta follows the seed and is appended without trimming.
@@ -454,7 +550,7 @@ async fn duplicate_physical_paths_disable_history_before_spawn() {
 }
 
 #[tokio::test]
-async fn harvest_trims_a_trailing_unanswered_tool_call() {
+async fn harvest_persists_an_interrupted_tail_for_load_time_repair() {
     let directory = tempfile::tempdir().expect("temp dir");
     let db_path = directory.path().join("sessions.db");
     let store = SqliteSessionStore::connect_path(&db_path).await.expect("file-backed store");
@@ -494,7 +590,24 @@ async fn harvest_trims_a_trailing_unanswered_tool_call() {
         .load_agent_messages(session_id, "reviewer", CancellationToken::new())
         .await
         .expect("load agent history");
-    assert!(accumulated.is_empty(), "unanswered tool call is never persisted");
+    assert_eq!(accumulated.len(), 1, "the interrupted call is durable evidence");
+    assert_eq!(
+        accumulated[0].tool_calls.as_ref().map(|calls| calls[0].id.as_str()),
+        Some("call-1"),
+        "harvest keeps the raw assistant call"
+    );
+
+    // Load-time repair supplies the missing result for the next request
+    // without persisting a fabricated result into the agent stream.
+    let repaired = crate::provider_transcript::restore_tool_responses(accumulated);
+    assert_eq!(repaired.len(), 2);
+    let synthetic = repaired[1]
+        .tool_results
+        .as_ref()
+        .and_then(|results| results.first())
+        .expect("synthetic result for the interrupted call");
+    assert_eq!(synthetic.id, "call-1");
+    assert_eq!(synthetic.content["status"], "outcome_unknown");
 }
 
 #[tokio::test]

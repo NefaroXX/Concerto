@@ -29,10 +29,11 @@
 //! The child is the attribution boundary (ADR-60): history lines it writes
 //! are trusted *semantically* as that child's own completed turns, and the
 //! parent does not try to re-validate their meaning. The parent only enforces
-//! structure — trimming an unanswered tool-call tail and applying the size
-//! caps below — and splits the file at the parent-stamped seed length. A
-//! child that wrote a forged or malformed but structurally valid turn would
-//! be trusted exactly like one it actually produced.
+//! structure — repairing an interrupted tool batch in memory for each provider
+//! request and applying the size caps below — and splits the file at the
+//! parent-stamped seed length. A child that wrote a forged or malformed but
+//! structurally valid turn would be trusted exactly like one it actually
+//! produced.
 
 use std::collections::HashMap;
 use std::io::{Error as IoError, ErrorKind};
@@ -47,12 +48,12 @@ use ulid::Ulid;
 pub const HISTORY_ENV: &str = "CONCERTO_AGENT_HISTORY_PATH";
 /// Environment variable carrying the JSON Lines metrics file path.
 pub const METRICS_ENV: &str = "CONCERTO_AGENT_METRICS_PATH";
-/// Environment variable carrying the parent's exact seed message count.
+/// Environment variable carrying the parent's exact repaired seed message count.
 ///
-/// The parent trims the seed before writing it, so the file normally holds
-/// exactly this many messages when the child starts. The child uses it to
-/// decide whether a trimmed tail may be written back: only history grown past
-/// the seed can be child-produced.
+/// The parent repairs the seed before writing it, so the file holds exactly
+/// this many messages when the child starts. The parent uses the same value to
+/// slice child-owned turns during harvest; the child reads the whole file and
+/// repairs it in memory without rewriting it.
 pub const SEED_LEN_ENV: &str = "CONCERTO_AGENT_HISTORY_SEED_LEN";
 
 /// Hard read cap for the accumulated history file (32 MiB).
@@ -159,18 +160,6 @@ pub fn unique_paths_for_agents<'a>(
     (unique, colliding)
 }
 
-/// Remove assistant tool calls at the tail that have no matching tool result.
-///
-/// This is the single implementation used by the in-process specialist runner
-/// and the supervised history file: OpenAI-compatible and Anthropic APIs
-/// reject an assistant `tool_calls` message with no following tool result, so
-/// an interrupted call must never become provider history.
-pub fn trim_unanswered_tool_call_tail(messages: &mut Vec<Message>) {
-    while messages.last().is_some_and(|message| message.tool_calls.is_some()) {
-        messages.pop();
-    }
-}
-
 /// Write the initial restore seed as a UTF-8 JSON array.
 ///
 /// The write is atomic (sibling temporary + rename) and mode `0600` on Unix.
@@ -197,9 +186,10 @@ pub async fn read_messages(path: &Path) -> std::io::Result<Vec<Message>> {
 /// the assistant turn carrying a tool call before the tool result exists, so a
 /// periodic flush that trimmed it would lose the call and leave a later result
 /// orphaned. The file may therefore hold a transient unanswered tail while the
-/// child is running. Restore and harvest trim it before the history is used:
-/// the child trims in memory (and rewrites only a tail it produced, see
-/// [`restore_for_child`]), and the parent trims its harvested delta.
+/// child is running. Durable evidence is never rewritten to hide that: every
+/// provider-facing restore repairs it in memory with
+/// [`crate::provider_transcript::restore_tool_responses`], and harvest persists
+/// the raw child turns so load-time repair sees them again.
 ///
 /// The child-written turns are trusted as that child's own turns (ADR-60
 /// attribution boundary); this function only applies the structural size cap.
@@ -215,38 +205,19 @@ pub async fn append_turns(path: &Path, new_turns: &[Message]) -> std::io::Result
     write_atomic(path, &bytes).await
 }
 
-/// Result of restoring the accumulated history for a supervised child.
-#[derive(Debug)]
-pub struct ChildRestore {
-    /// The messages the child should hand to `with_initial_messages`. The
-    /// unanswered tail is always trimmed here.
-    pub messages: Vec<Message>,
-    /// A failed attempt to rewrite a crash-left child tail. The in-memory
-    /// messages are still usable; the caller only needs to log the failure.
-    pub rewrite_error: Option<IoError>,
-}
-
 /// Restore the accumulated history for a supervised child process.
 ///
-/// The parent trims the seed before writing it, so the messages in the file
-/// up to `seed_len` are normally provider-valid and belong to the parent's
-/// seed. The in-memory result is always trimmed, but the file is rewritten
-/// only when it has grown past the seed (`accumulated.len() > seed_len`):
-/// only a tail the child produced may shrink. When the file is at or below
-/// the seed length it is left byte-identical, which keeps the parent's
-/// `initial_seed_len` harvest slicing exact even if the file was truncated by
-/// an external failure. Rewrite failures are returned rather than aborting the
-/// restore so a child can still start with the trimmed in-memory history.
-pub async fn restore_for_child(path: &Path, seed_len: usize) -> std::io::Result<ChildRestore> {
-    let mut messages = read_messages(path).await?;
-    let accumulated_len = messages.len();
-    trim_unanswered_tool_call_tail(&mut messages);
-    let rewrite_error = if accumulated_len > seed_len && messages.len() != accumulated_len {
-        write_seed(path, &messages).await.err()
-    } else {
-        None
-    };
-    Ok(ChildRestore { messages, rewrite_error })
+/// The file is read but never rewritten: the parent's `initial_seed_len`
+/// harvest slice depends on the file's exact prefix, so a child that shrank or
+/// repaired it would shift that slice and drop or misattribute turns. An
+/// interrupted tool batch is repaired in memory with
+/// [`crate::provider_transcript::restore_tool_responses`] instead, keeping the
+/// durable evidence raw while making the child's first provider request valid.
+/// The repair is idempotent, so a seed the parent already repaired is
+/// unchanged.
+pub async fn restore_for_child(path: &Path) -> std::io::Result<Vec<Message>> {
+    let messages = read_messages(path).await?;
+    Ok(crate::provider_transcript::restore_tool_responses(messages))
 }
 
 /// Refuse a rewrite that would exceed the read cap. The existing file is left
@@ -619,6 +590,78 @@ mod tests {
             Some("call-2"),
             "the result follows its call"
         );
+    }
+
+    #[tokio::test]
+    async fn restore_for_child_repairs_an_interrupted_batch_without_rewriting() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("history.json");
+        let mut assistant = message(Role::Assistant, "calling two tools");
+        assistant.tool_calls =
+            Some(vec![tool_call("call-a", "filesystem"), tool_call("call-b", "filesystem")]);
+        let mut answered = message(Role::Tool, "");
+        answered.tool_results = Some(vec![tool_result("call-a", "filesystem")]);
+        let seed = vec![message(Role::User, "go"), assistant, answered];
+        write_seed(&path, &seed).await.expect("write seed");
+        let before = std::fs::read(&path).expect("read seed bytes");
+
+        let restored = restore_for_child(&path).await.expect("restore child history");
+        assert_eq!(restored.len(), 4, "only the unanswered call gets a synthetic result");
+        assert_eq!(restored[1].tool_calls.as_ref().map(Vec::len), Some(2));
+        assert_eq!(
+            restored[2].tool_results.as_ref().map(|results| results[0].id.as_str()),
+            Some("call-a"),
+            "a recorded result is preserved unchanged"
+        );
+        let synthetic = restored[3]
+            .tool_results
+            .as_ref()
+            .and_then(|results| results.first())
+            .expect("synthetic result for the unanswered call");
+        assert_eq!(synthetic.id, "call-b");
+        assert_eq!(synthetic.content["status"], "outcome_unknown");
+        assert_eq!(
+            std::fs::read(&path).expect("reread seed bytes"),
+            before,
+            "restore never rewrites durable evidence"
+        );
+
+        assert_eq!(
+            serde_json::to_value(crate::provider_transcript::restore_tool_responses(
+                restored.clone()
+            ))
+            .expect("serialize re-repaired prompt"),
+            serde_json::to_value(&restored).expect("serialize restored prompt"),
+            "repairing an already-repaired prompt must not duplicate results"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_for_child_keeps_trailing_observations_after_synthetic_results() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("history.json");
+        let mut assistant = message(Role::Assistant, "");
+        assistant.tool_calls = Some(vec![tool_call("call-a", "filesystem")]);
+        let seed = vec![
+            message(Role::User, "go"),
+            assistant,
+            message(Role::System, "runtime verification"),
+        ];
+        write_seed(&path, &seed).await.expect("write seed");
+
+        let restored = restore_for_child(&path).await.expect("restore child history");
+        assert_eq!(restored.len(), 4);
+        assert_eq!(restored[2].role, Role::Tool);
+        assert_eq!(
+            restored[2].tool_results.as_ref().map(|results| results[0].id.as_str()),
+            Some("call-a")
+        );
+        assert_eq!(
+            restored[3].role,
+            Role::System,
+            "a non-tool observation stays after the results"
+        );
+        assert_eq!(restored[3].content, "runtime verification");
     }
 
     #[tokio::test]

@@ -30,7 +30,7 @@
 //! | `CONCERTO_PLAN_ID` | Optional approved plan id (ADR-60 D7 ledger enrichment); stamps every gated write and the terminal event. |
 //! | `CONCERTO_AGENT_SKILLS_SECTION` | Optional pre-rendered skills section injected into the system prompt; the parent renders it once (ADR-43). |
 //! | `CONCERTO_AGENT_HISTORY_PATH` | Optional parent-owned accumulated history file (typed JSON array) for restore and append. |
-//! | `CONCERTO_AGENT_HISTORY_SEED_LEN` | Optional exact seed message count stamped by the parent; a shorter file is never trimmed/rewritten below it. |
+//! | `CONCERTO_AGENT_HISTORY_SEED_LEN` | Optional exact repaired seed message count stamped by the parent; the child never rewrites the accumulated file. |
 //! | `CONCERTO_AGENT_METRICS_PATH` | Optional parent-owned JSON Lines sidecar for this process's provider metrics. |
 //!
 //! ## Stdout discipline
@@ -73,7 +73,7 @@ use concerto_orchestrator::gate_proxy::{
     ApprovalProxySink, GateProxyBackend, GateProxyClient, GateProxyMemoryStore,
 };
 use concerto_orchestrator::prompts::PromptBuilder;
-use concerto_orchestrator::supervised_history::{self, HISTORY_ENV, METRICS_ENV, SEED_LEN_ENV};
+use concerto_orchestrator::supervised_history::{self, HISTORY_ENV, METRICS_ENV};
 use concerto_sessions::whiteboard::{NewWhiteboardEvent, WhiteboardKind};
 use concerto_tools::undo::UndoManager;
 use serde_json::json;
@@ -133,28 +133,15 @@ async fn run() -> i32 {
         std::env::var(HISTORY_ENV).ok().filter(|path| !path.is_empty()).map(PathBuf::from);
     let metrics_path =
         std::env::var(METRICS_ENV).ok().filter(|path| !path.is_empty()).map(PathBuf::from);
-    // The parent trims the seed before writing it and stamps its exact length.
-    // Without the stamp (older parent or a test fixture) `0` means "no known
-    // seed", which keeps the historical rewrite-on-any-nonempty-file behavior.
-    let seed_len =
-        std::env::var(SEED_LEN_ENV).ok().and_then(|value| value.parse::<usize>().ok()).unwrap_or(0);
     let mut initial_messages = Vec::new();
     if let Some(path) = &history_path {
-        match supervised_history::restore_for_child(path, seed_len).await {
-            Ok(restored) => {
+        match supervised_history::restore_for_child(path).await {
+            Ok(messages) => {
                 // A crash can leave an assistant tool call with no result in
-                // the accumulated file; providers reject that shape, and no
-                // result can ever arrive now. Only a tail the child produced
-                // (history grown past the parent's seed) may be trimmed out
-                // of the file; a short file is left byte-identical so the
-                // parent's seed-length harvest offset stays exact.
-                if let Some(error) = restored.rewrite_error {
-                    eprintln!(
-                        "agent-process: failed to rewrite trimmed history {}: {error}",
-                        path.display()
-                    );
-                }
-                initial_messages = restored.messages;
+                // the accumulated file. `restore_for_child` repairs that in
+                // memory only; the file stays byte-identical so the parent's
+                // seed-length harvest offset remains exact.
+                initial_messages = messages;
             }
             Err(error) => eprintln!(
                 "agent-process: failed to restore supervised history {}: {error}",

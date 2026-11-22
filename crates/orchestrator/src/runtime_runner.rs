@@ -705,8 +705,13 @@ async fn prepare_supervised_history(
         let Some(agent_paths) = paths.get(agent_id).cloned() else {
             continue;
         };
-        let mut seed = load_supervised_seed(store, session_id, agent_id).await;
-        crate::supervised_history::trim_unanswered_tool_call_tail(&mut seed);
+        // Repair an interrupted tool batch before it becomes the child's seed,
+        // then re-bound because synthetic results add messages. The stamped
+        // length is the repaired length, so harvest slices only child turns
+        // and never re-ingests request-only repair results.
+        let seed = bound_agent_history_seed(crate::provider_transcript::restore_tool_responses(
+            load_supervised_seed(store, session_id, agent_id).await,
+        ));
         match crate::supervised_history::write_seed(&agent_paths.history, &seed).await {
             Ok(()) => {
                 seeds.push(SupervisedHistorySeed {
@@ -796,8 +801,10 @@ async fn harvest_supervised_history(
                 );
             }
             Ok(accumulated) => {
-                let mut turns = accumulated[seed.initial_seed_len..].to_vec();
-                crate::supervised_history::trim_unanswered_tool_call_tail(&mut turns);
+                // Persist the child's raw turns, including an interrupted tail.
+                // Load-time repair turns it into a valid provider request
+                // without replacing or dropping durable evidence.
+                let turns = accumulated[seed.initial_seed_len..].to_vec();
                 if !turns.is_empty() {
                     let cancel = CancellationToken::new();
                     match tokio::time::timeout(
@@ -4674,9 +4681,9 @@ fn build_supervised_commands(
             // H39b step 3: parent-owned files keep the child off the session
             // database. Both are absent when preparing the run directory
             // failed, in which case the child simply runs without history or
-            // metrics sidecar. The seed length is the exact parent-trimmed
-            // seed count so a short (externally truncated) file is never
-            // rewritten below the parent's harvest offset.
+            // metrics sidecar. The seed length is the exact repaired seed
+            // count so harvest slices only child turns; the child never
+            // rewrites the accumulated file.
             if let Some(history) = history {
                 if let Some(agent_paths) = history.paths.get(agent_id) {
                     command

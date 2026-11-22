@@ -10,7 +10,7 @@ use concerto_core::event::{EventBus, EventKind, ThinkingKind};
 use concerto_core::ids::Ulid;
 use concerto_core::traits::agent::ExpertAgent;
 use concerto_core::traits::provider::LlmProvider;
-use concerto_core::types::{AgentContext, AgentId, AgentOutcome, AgentRunResult, Message, SubTask};
+use concerto_core::types::{AgentContext, AgentId, AgentOutcome, AgentRunResult, SubTask};
 use concerto_core::{CancellationToken, OrchestratorError};
 use concerto_providers::model::ModelProfile;
 use concerto_sessions::spend::SpendTracker;
@@ -23,19 +23,6 @@ use crate::registry::AgentRegistry;
 /// True when an error represents a cancelled run rather than a genuine
 /// failure — callers emit a cancellation lifecycle event for these instead
 /// of a failure event.
-/// Drop an assistant tool call at the tail of a run's produced history.
-///
-/// A specialist that ends on its contract submission — or is cancelled after
-/// the model requested a tool but before the result is pushed — leaves an
-/// assistant `tool_calls` message with no matching tool result. OpenAI-
-/// compatible and Anthropic APIs reject that shape on the next request, so it
-/// must not be persisted. Earlier calls always have their results because the
-/// loop pushes a tool message before requesting the next turn.
-fn without_trailing_unresolved_tool_call(mut messages: Vec<Message>) -> Vec<Message> {
-    crate::supervised_history::trim_unanswered_tool_call_tail(&mut messages);
-    messages
-}
-
 fn is_cancellation_error(error: &OrchestratorError) -> bool {
     matches!(
         error,
@@ -275,8 +262,16 @@ impl AgentRunner {
         if let Some(store) = &self.session_store {
             match store.load_agent_messages(task.session_id, &role_name, cancel.clone()).await {
                 Ok(messages) => {
+                    // A cancelled or interrupted run can leave an assistant
+                    // tool call whose result never arrived. Repair it only for
+                    // this prompt: bound the restored window, add request-only
+                    // unknown-outcome results for unanswered calls, then bound
+                    // again because the synthetic results add messages. The
+                    // persisted stream stays raw.
+                    let seed = concerto_core::types::bound_agent_history_seed(messages);
+                    let seed = crate::provider_transcript::restore_tool_responses(seed);
                     context.agent_history =
-                        concerto_core::types::AgentHistory::with_seed_bounded(messages);
+                        concerto_core::types::AgentHistory::with_seed_bounded(seed);
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -307,7 +302,10 @@ impl AgentRunner {
         // run still keeps its completed history; failures are logged and never
         // affect settlement or the run's result.
         if let Some(store) = &self.session_store {
-            let produced = without_trailing_unresolved_tool_call(context.agent_history.produced());
+            // Persist the raw produced turns. An interrupted trailing tool
+            // call is durable evidence; the next load repairs it in memory
+            // rather than losing the call or inventing a result here.
+            let produced = context.agent_history.produced();
             if !produced.is_empty() {
                 let append = store.append_agent_messages(
                     task.session_id,
@@ -1368,7 +1366,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_history_does_not_persist_a_trailing_tool_call_without_its_result() {
+    async fn agent_history_persists_interrupted_tail_and_repairs_on_restore() {
         let (store, session_id) = in_memory_store_with_session().await;
         let mut submission = history_message(Role::Assistant, "");
         submission.tool_calls = Some(vec![concerto_core::types::ToolCall {
@@ -1403,12 +1401,56 @@ mod tests {
             .load_agent_messages(session_id, "architect", CancellationToken::new())
             .await
             .unwrap();
-        assert_eq!(
-            stream.len(),
-            1,
-            "an unresolved trailing tool call must not become provider history: {stream:?}"
-        );
+        assert_eq!(stream.len(), 2, "the interrupted call is durable evidence: {stream:?}");
         assert_eq!(stream[0].content, "design it");
+        assert_eq!(
+            stream[1].tool_calls.as_ref().map(|calls| calls[0].id.as_str()),
+            Some("call_submit")
+        );
+
+        // A second run observes the repaired seed: the recorded result is kept
+        // and the unanswered call gets a request-only unknown-outcome result.
+        let (second, seed_seen) = HistoryMockAgent::new(
+            AgentId::new("architect"),
+            Vec::new(),
+            HistoryMockOutcome::Success,
+            None,
+        );
+        let second_runner = runner_with_history_mock(second, Some(store.clone()));
+        second_runner
+            .run(
+                AgentId::new("architect"),
+                &task,
+                AgentContext::new(SessionContext::new(
+                    session_id,
+                    std::path::PathBuf::from("/tmp"),
+                )),
+                &make_profile(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("second run should succeed");
+
+        let observed = seed_seen
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .expect("mock must observe the repaired seed");
+        assert_eq!(observed.len(), 3, "repair adds exactly one synthetic result: {observed:?}");
+        assert_eq!(observed[1].tool_calls.as_ref().map(Vec::len), Some(1));
+        let synthetic = observed[2]
+            .tool_results
+            .as_ref()
+            .and_then(|results| results.first())
+            .expect("synthetic result");
+        assert_eq!(synthetic.id, "call_submit");
+        assert_eq!(synthetic.content["status"], "outcome_unknown");
+
+        let persisted = store
+            .load_agent_messages(session_id, "architect", CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(persisted.len(), 2, "the synthetic result is never persisted");
     }
 
     #[tokio::test]

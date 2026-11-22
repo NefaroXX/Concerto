@@ -627,8 +627,8 @@ async fn supervised_child_restores_and_appends_history_and_reports_metrics() {
             tokens_out: None,
         },
         // Simulates a prior process that crashed after persisting its tool
-        // call but before the result. Startup must trim and rewrite this tail;
-        // otherwise it would sit in the middle of the next run's history.
+        // call but before the result. The child repairs this batch in memory
+        // for its provider request but must leave the durable evidence raw.
         Message {
             gemini_replay: None,
             role: Role::Assistant,
@@ -695,11 +695,18 @@ async fn supervised_child_restores_and_appends_history_and_reports_metrics() {
         "the seed is not duplicated into the accumulated file"
     );
     assert!(
-        !messages.iter().any(|message| message
+        messages.iter().any(|message| message
             .tool_calls
             .as_ref()
             .is_some_and(|calls| calls.iter().any(|call| call.id == "stale-call"))),
-        "the restore path rewrites an unanswered crash tail out of the file"
+        "the interrupted crash tail stays durable evidence; startup must not rewrite it"
+    );
+    assert!(
+        !messages.iter().any(|message| message
+            .tool_results
+            .as_ref()
+            .is_some_and(|results| results.iter().any(|result| result.id == "stale-call"))),
+        "the request-only synthetic result is never persisted"
     );
     assert!(
         messages.iter().any(|message| message.role == Role::Tool
