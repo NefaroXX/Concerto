@@ -3338,3 +3338,28 @@ Branch: `fix/harness-headless-history` (HEAD `34a09ee` before this change).
   - `cargo fmt --all -- --check`; `git diff --check`: clean.
 - **Status.** Implemented pending the full CI-equivalent battery and
   exact-head CI; this entry does not claim CI green.
+
+## 2026-11-22 — Codex takeover after review round 2
+
+- Resumed implementation on `fix/harness-headless-history` from `90afd73`,
+  following the independent report committed as `7f546f5` on the review branch.
+- Working first on R4 (paid text-tool repair usage lost on failure) and R6
+  (cloned fallback contexts charge prior attempts again). The review probes
+  reproduced both defects before implementation; moving those scenarios into
+  the permanent suite and adding real runner/store budget coverage.
+- R5 runtime recorder-integrity propagation follows the accounting milestone.
+  Full local CI-equivalent checks and all twelve exact-head remote checks
+  remain publication gates.
+- Accounting implementation now records each completed request before repair
+  parsing, prices successful runs from the same accumulator, preserves each
+  malformed reply with its own usage, and resets attempt state independently
+  of history-store availability. Eight permanent tests cover both review
+  counterexamples plus successful repair, native errors, concurrent context
+  clones, history-load failure, durable spend after SQLite reopen and budget
+  refusal before another provider request.
+- Intermediate verification: the `accounting` filter passed all nine selected
+  tests (eight new plus existing settlement coverage); workspace formatting
+  and all-target clippy with warnings denied passed. The full serialized local
+  CI battery is running; retained logs use
+  `target/harness-reliability/round2-accounting-ci-*`. No remote validation is
+  claimed for these uncommitted changes.

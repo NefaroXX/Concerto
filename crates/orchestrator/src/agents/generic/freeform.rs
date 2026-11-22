@@ -62,9 +62,6 @@ impl GenericSpecialistAgent {
         // [`tool_guard::MAX_TOOL_GUARD_REJECTS`] corrective injections per
         // tool before the exhausted message tells the model to move on.
         let mut tool_guard_rejects: HashMap<String, u32> = HashMap::new();
-        // NOTE: chars/4 is a heuristic until provider usage is plumbed through.
-        let mut tokens_in = 0_u64;
-        let mut tokens_out = 0_u64;
         let mut tool_call_count = 0_u32;
         let mut files_modified = context
             .previous_results
@@ -154,34 +151,30 @@ impl GenericSpecialistAgent {
             if let Some(driver) = tool_driver.as_ref() {
                 driver.augment_request(&mut request);
             }
-            // ADR-48 decision 4: provider-reported usage as the source of
-            // truth; the byte/4 heuristic is the fallback per dimension.
-            let estimated_tokens_in =
-                request.messages.iter().map(|message| message.content.len() as u64).sum::<u64>()
-                    / 4;
-
-            let CompletedTurn { text, reasoning, tool_calls, usage, gemini_replay } =
-                match self.complete_provider_audited(&request, task, &cancel).await {
-                    Ok(turn) => turn,
-                    Err(error)
-                        if progress.has_progress()
-                            && (cancel.is_cancelled()
-                                || matches!(
-                                    error,
-                                    OrchestratorError::Cancelled
-                                        | OrchestratorError::Provider(
-                                            concerto_core::error::ProviderError::Cancelled
-                                        )
-                                )) =>
-                    {
-                        progress.interrupted();
-                        break;
-                    }
-                    Err(error) => {
-                        context.agent_history.record_from(&messages, &mut recorded);
-                        return Err(error);
-                    }
-                };
+            let turn = match self
+                .complete_provider_audited(&request, task, &context.agent_history, &cancel)
+                .await
+            {
+                Ok(turn) => turn,
+                Err(error)
+                    if progress.has_progress()
+                        && (cancel.is_cancelled()
+                            || matches!(
+                                error,
+                                OrchestratorError::Cancelled
+                                    | OrchestratorError::Provider(
+                                        concerto_core::error::ProviderError::Cancelled
+                                    )
+                            )) =>
+                {
+                    progress.interrupted();
+                    break;
+                }
+                Err(error) => {
+                    context.agent_history.record_from(&messages, &mut recorded);
+                    return Err(error);
+                }
+            };
             // ADR-66 §4: resolve the turn through the text-fallback driver —
             // structured tool-call blocks parsed from the text, bounded
             // repair on malformed blocks, loud failure on bound exhaustion.
@@ -191,17 +184,15 @@ impl GenericSpecialistAgent {
                     self.freeform_driver_turn(
                         driver,
                         task,
-                        model,
-                        text,
-                        reasoning,
-                        usage,
-                        gemini_replay,
+                        turn,
                         &mut messages,
+                        &context.agent_history,
                         &cancel,
+                        model,
                     )
                     .await
                 }
-                None => Ok(CompletedTurn { text, reasoning, tool_calls, usage, gemini_replay }),
+                None => Ok(turn),
             };
             let CompletedTurn { text, reasoning, tool_calls, usage, gemini_replay } =
                 match driver_turn {
@@ -225,23 +216,6 @@ impl GenericSpecialistAgent {
                         return Err(error);
                     }
                 };
-            // ADR-48 decision 4: provider-reported usage as the source of
-            // truth; the byte/4 heuristic is the fallback per dimension.
-            let usage_in = usage.as_ref().and_then(|u| u.prompt_tokens);
-            let usage_out = usage.as_ref().and_then(|u| u.completion_tokens);
-            let turn_tokens_in = usage_in.unwrap_or(estimated_tokens_in);
-            let turn_tokens_out = usage_out.unwrap_or((text.len() / 4) as u64);
-            tokens_in = tokens_in.saturating_add(turn_tokens_in);
-            tokens_out = tokens_out.saturating_add(turn_tokens_out);
-            // R4/H39: accumulate this completed request's usage on the
-            // run-owned history handle. A later provider failure returns an
-            // error, but the tokens already consumed stay chargeable.
-            context.agent_history.record_usage(
-                turn_tokens_in,
-                turn_tokens_out,
-                self.provider.approximate_cost(turn_tokens_in, turn_tokens_out),
-            );
-
             messages.push(Message {
                 gemini_replay,
                 role: Role::Assistant,
@@ -657,7 +631,8 @@ impl GenericSpecialistAgent {
         context.agent_history.record_from(&messages, &mut recorded);
 
         let latency_ms = start.elapsed().as_millis() as u64;
-        let cost_usd = self.provider.approximate_cost(tokens_in, tokens_out);
+        let concerto_core::types::AgentRunUsage { tokens_in, tokens_out, cost_usd, .. } =
+            context.agent_history.usage();
         if verification::has_failure(&verification) {
             progress.verification_failed();
         }

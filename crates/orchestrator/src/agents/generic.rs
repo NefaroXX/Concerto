@@ -48,10 +48,10 @@ use concerto_core::executor::ToolExecutor;
 use concerto_core::traits::agent::ExpertAgent;
 use concerto_core::traits::provider::LlmProvider;
 use concerto_core::types::{
-    AgentContext, AgentId, AgentOutcome, AgentRunResult, AgentStage, CapabilitySet,
-    CompletionRequest, CompletionUsage, DesignDoc, EvalProvenance, EvalResult, Message, OutputMode,
-    ResearchReport, ReviewReport, ReviewVerdict, Role, SubTask, SubmitDesignDocInput, ToolChoice,
-    ToolDefinition, ToolOutput, ToolResult,
+    AgentContext, AgentHistory, AgentId, AgentOutcome, AgentRunResult, AgentStage, CapabilitySet,
+    CompletionRequest, DesignDoc, EvalProvenance, EvalResult, Message, OutputMode, ResearchReport,
+    ReviewReport, ReviewVerdict, Role, SubTask, SubmitDesignDocInput, ToolChoice, ToolDefinition,
+    ToolOutput, ToolResult,
 };
 use concerto_core::{CancellationToken, OrchestratorError};
 use concerto_eval::EvalEngine;
@@ -504,6 +504,7 @@ impl GenericSpecialistAgent {
         &self,
         request: &CompletionRequest,
         task: &SubTask,
+        history: &AgentHistory,
         cancel: &CancellationToken,
     ) -> Result<CompletedTurn, OrchestratorError> {
         match crate::prompts::complete_provider_request(
@@ -517,7 +518,10 @@ impl GenericSpecialistAgent {
         )
         .await
         {
-            Ok(turn) => Ok(turn),
+            Ok(turn) => {
+                self.record_completed_usage(request, &turn, history);
+                Ok(turn)
+            }
             Err(OrchestratorError::Provider(
                 concerto_core::error::ProviderError::CapabilityRefused {
                     provider,
@@ -551,6 +555,34 @@ impl GenericSpecialistAgent {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Account at the provider completion boundary, before parsing or tool
+    /// repair can fail. Every request (including each repair) is priced once;
+    /// success and failure settlement both read this attempt's accumulator.
+    fn record_completed_usage(
+        &self,
+        request: &CompletionRequest,
+        turn: &CompletedTurn,
+        history: &AgentHistory,
+    ) {
+        let estimated_in =
+            request.messages.iter().map(|m| m.content.len() as u64).sum::<u64>().div_ceil(4);
+        let argument_bytes = turn
+            .tool_calls
+            .iter()
+            .filter_map(|call| serde_json::to_vec(&call.arguments).ok())
+            .map(|bytes| bytes.len() as u64)
+            .sum::<u64>();
+        let estimated_out = (turn.text.len() as u64).saturating_add(argument_bytes).div_ceil(4);
+        let tokens_in = turn.usage.as_ref().and_then(|u| u.prompt_tokens).unwrap_or(estimated_in);
+        let tokens_out =
+            turn.usage.as_ref().and_then(|u| u.completion_tokens).unwrap_or(estimated_out);
+        history.record_usage(
+            tokens_in,
+            tokens_out,
+            self.provider.approximate_cost(tokens_in, tokens_out),
+        );
     }
 
     /// Persist an ADR-66 §4 `tool_driver` audit row through the optional
@@ -595,55 +627,51 @@ impl GenericSpecialistAgent {
         &self,
         driver: &mut crate::tool_driver::TextToolDriver,
         task: &SubTask,
-        model: &str,
-        mut text: String,
-        mut reasoning: Option<String>,
-        mut usage: Option<CompletionUsage>,
-        mut gemini_replay: Option<concerto_core::provider_replay::GeminiReplay>,
+        mut turn: CompletedTurn,
         messages: &mut Vec<Message>,
+        history: &AgentHistory,
         cancel: &CancellationToken,
+        model: &str,
     ) -> Result<CompletedTurn, OrchestratorError> {
         let mut attempts = 0u32;
         loop {
-            match parse_tool_blocks(driver, &text, attempts) {
+            let decision = parse_tool_blocks(driver, &turn.text, attempts);
+            // A malformed reply is still a completed, paid provider turn.
+            // Preserve it with its own usage even when the repair bound ends
+            // this run; synthetic repair instructions carry no usage.
+            if matches!(decision, BlockDecision::Repair { .. } | BlockDecision::Exhausted { .. }) {
+                messages.push(Message {
+                    gemini_replay: turn.gemini_replay.take(),
+                    role: Role::Assistant,
+                    content: turn.text.clone(),
+                    tool_calls: None,
+                    tool_results: None,
+                    reasoning_content: turn.reasoning.clone(),
+                    tokens_in: turn.usage.as_ref().and_then(|usage| usage.prompt_tokens),
+                    tokens_out: turn.usage.as_ref().and_then(|usage| usage.completion_tokens),
+                });
+            }
+            match decision {
                 BlockDecision::Ready(calls) => {
+                    let detail = format!("{} tool call(s) parsed from text", calls.len());
                     let _ = self.bus.publish_for_session(
                         task.session_id,
                         task.id.0,
                         EventKind::AgentThought {
-                            agent_id: self.id.as_str().to_string(),
-                            content: format!(
-                                "tool_driver: fallback turn — {} tool call(s) parsed",
-                                calls.len()
-                            ),
+                            agent_id: self.id.to_string(),
+                            content: format!("tool_driver: fallback turn — {detail}"),
                             kind: ThinkingKind::Detail,
                         },
                     );
-                    self.record_tool_driver_event(
-                        task,
-                        model,
-                        "turn",
-                        "fallback",
-                        &format!("{} tool call(s) parsed from text", calls.len()),
-                        cancel,
-                    )
-                    .await;
-                    return Ok(CompletedTurn {
-                        text,
-                        reasoning,
-                        tool_calls: calls,
-                        usage,
-                        gemini_replay: None,
-                    });
+                    self.record_tool_driver_event(task, model, "turn", "fallback", &detail, cancel)
+                        .await;
+                    return Ok(CompletedTurn { tool_calls: calls, gemini_replay: None, ..turn });
                 }
                 BlockDecision::FinalAnswer(final_text) => {
-                    return Ok(CompletedTurn {
-                        gemini_replay: if final_text == text { gemini_replay } else { None },
-                        text: final_text,
-                        reasoning,
-                        tool_calls: Vec::new(),
-                        usage,
-                    });
+                    if final_text != turn.text {
+                        turn.gemini_replay = None;
+                    }
+                    return Ok(CompletedTurn { text: final_text, tool_calls: Vec::new(), ..turn });
                 }
                 BlockDecision::Exhausted { reason } => {
                     self.record_tool_driver_event(
@@ -667,7 +695,7 @@ impl GenericSpecialistAgent {
                         task.session_id,
                         task.id.0,
                         EventKind::AgentThought {
-                            agent_id: self.id.as_str().to_string(),
+                            agent_id: self.id.to_string(),
                             content: format!(
                                 "tool_driver: fallback repair attempt {attempts}: {reason}"
                             ),
@@ -683,19 +711,6 @@ impl GenericSpecialistAgent {
                         cancel,
                     )
                     .await;
-                    // Re-prompt: the malformed reply stays in the history so
-                    // the model can see its own defect, followed by the
-                    // repair instruction.
-                    messages.push(Message {
-                        gemini_replay: gemini_replay.take(),
-                        role: Role::Assistant,
-                        content: text.clone(),
-                        tool_calls: None,
-                        tool_results: None,
-                        reasoning_content: reasoning.clone(),
-                        tokens_in: None,
-                        tokens_out: None,
-                    });
                     messages.push(crate::tool_driver::TextToolDriver::repair_message(&reason));
                     let mut request = CompletionRequest {
                         session_id: Some(task.session_id),
@@ -709,20 +724,7 @@ impl GenericSpecialistAgent {
                         stream: false,
                     };
                     driver.augment_request(&mut request);
-                    let CompletedTurn {
-                        text: repaired_text,
-                        reasoning: repaired_reasoning,
-                        usage: repaired_usage,
-                        gemini_replay: repaired_replay,
-                        ..
-                    } = match self.complete_provider_audited(&request, task, cancel).await {
-                        Ok(turn) => turn,
-                        Err(error) => return Err(error),
-                    };
-                    usage = crate::tool_driver::merge_usage(usage, repaired_usage);
-                    text = repaired_text;
-                    reasoning = repaired_reasoning;
-                    gemini_replay = repaired_replay;
+                    turn = self.complete_provider_audited(&request, task, history, cancel).await?;
                 }
             }
         }
@@ -1436,10 +1438,6 @@ impl GenericSpecialistAgent {
             tokens_out: None,
         });
         context.agent_history.record_from(&messages, &mut recorded);
-        // ADR-48 decision 4: usage counters prefer provider-reported values;
-        // the byte/4 heuristic is only the fallback per dimension.
-        let mut tokens_in = 0_u64;
-        let mut tokens_out = 0_u64;
         let mut tool_call_count = 0_u32;
         let mut submission_attempts = 0_u32;
         // Closing-phase latch: set once a text-only (prose) turn ignored the
@@ -1508,44 +1506,18 @@ impl GenericSpecialistAgent {
                 max_tokens: Some(8192),
                 stream: false,
             };
-            let estimated_tokens_in = request
-                .messages
-                .iter()
-                .map(|message| message.content.len() as u64)
-                .sum::<u64>()
-                .div_ceil(4);
-
-            let CompletedTurn { text, reasoning, tool_calls, usage, gemini_replay } =
-                crate::prompts::complete_provider_request(
-                    &self.provider,
-                    &request,
-                    &self.retry_policy,
-                    &self.bus,
-                    task.session_id,
-                    task.id,
-                    &cancel,
-                )
-                .await?;
-            let measured_tokens_in = usage.as_ref().and_then(|u| u.prompt_tokens);
-            let measured_tokens_out = usage.as_ref().and_then(|u| u.completion_tokens);
-            let argument_chars = tool_calls
-                .iter()
-                .filter_map(|call| serde_json::to_vec(&call.arguments).ok())
-                .map(|value| value.len() as u64)
-                .sum::<u64>();
-            let estimated_tokens_out =
-                (text.len() as u64).saturating_add(argument_chars).div_ceil(4);
-            let turn_tokens_in = measured_tokens_in.unwrap_or(estimated_tokens_in);
-            let turn_tokens_out = measured_tokens_out.unwrap_or(estimated_tokens_out);
-            tokens_in = tokens_in.saturating_add(turn_tokens_in);
-            tokens_out = tokens_out.saturating_add(turn_tokens_out);
-            // R4/H39: keep completed-request usage on the run-owned history
-            // handle so a later provider failure still settles real spend.
-            context.agent_history.record_usage(
-                turn_tokens_in,
-                turn_tokens_out,
-                self.provider.approximate_cost(turn_tokens_in, turn_tokens_out),
-            );
+            let turn = crate::prompts::complete_provider_request(
+                &self.provider,
+                &request,
+                &self.retry_policy,
+                &self.bus,
+                task.session_id,
+                task.id,
+                &cancel,
+            )
+            .await?;
+            self.record_completed_usage(&request, &turn, &context.agent_history);
+            let CompletedTurn { text, reasoning, tool_calls, usage, gemini_replay } = turn;
 
             // Attribute the prompt usage to the preceding user message so the
             // persisted transcript carries measured costs (ADR-48).
@@ -2039,7 +2011,8 @@ impl GenericSpecialistAgent {
         context.agent_history.record_from(&messages, &mut recorded);
 
         let latency_ms = start.elapsed().as_millis() as u64;
-        let cost_usd = self.provider.approximate_cost(tokens_in, tokens_out);
+        let concerto_core::types::AgentRunUsage { tokens_in, tokens_out, cost_usd, .. } =
+            context.agent_history.usage();
         let completion_message = if matches!(&outcome, AgentOutcome::Success) {
             format!("{} completed ({tokens_in} in, {tokens_out} out)", contract.label)
         } else {
@@ -2281,6 +2254,7 @@ fn guard_coordinator_tool_call(
 
 #[cfg(test)]
 mod tests {
+    mod accounting;
     mod execution_tests;
     mod recovery;
     use super::*;

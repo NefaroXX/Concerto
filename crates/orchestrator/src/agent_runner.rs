@@ -187,6 +187,12 @@ impl AgentRunner {
         let role_name = format!("{role}");
         let model_name = profile.model_name();
         let correlation_id = task.id.0;
+        // A fallback may reuse a cloned context. Only the seed belongs to the
+        // caller: produced turns and measured usage belong to this attempt,
+        // even when history storage is absent or a history load fails.
+        context.agent_history = concerto_core::types::AgentHistory::with_seed_bounded(
+            context.agent_history.seeded().to_vec(),
+        );
 
         let _ = self.bus.publish_for_session(
             task.session_id,
@@ -278,7 +284,7 @@ impl AgentRunner {
                         session_id = %task.session_id,
                         role = %role_name,
                         error = %error,
-                        "agent history load failed; continuing with an empty seed"
+                        "agent history load failed; retaining the caller's seed"
                     );
                 }
             }
@@ -509,6 +515,7 @@ impl AgentRunner {
 
 #[cfg(test)]
 mod tests {
+    mod accounting;
     use super::*;
     use concerto_core::event::EventReceiver;
     use concerto_core::ids::Ulid;
