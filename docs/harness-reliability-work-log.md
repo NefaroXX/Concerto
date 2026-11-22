@@ -2224,3 +2224,38 @@ request, not a resumption of implementation; no production code was changed.
 - These findings are separate from the residuals recorded as accepted in the
   handoff. Recommendation: hold approval pending the four P1 corrections and
   clarify runtime recording integrity. No PR was merged or modified.
+
+## 2026-11-22 — Independent review round 2
+
+Reviewed PR #380 at `90afd73207472c9da9c65d67d81b813ab664d4bd`, including
+the five follow-up commits since round one. The
+[round-two report](reviews/2026-11-22-harness-review-round-2.md) and runnable
+review probes are retained on the review branch. This remains review work;
+no production fix or merge was performed.
+
+- Closed R1 (supervised path collisions), R2 (interrupted tool-batch recovery),
+  and R3 (the freeform approval-pause history loss), with source and passing
+  regression evidence. Reported the limits of the process-restart coverage.
+- R4 remains P1 for text-tool repair: the real specialist completed one paid
+  request before a repair-provider failure, or six before repair exhaustion,
+  and retained zero usage in both cases. The native-tool control retained
+  its 1,000 input tokens, 200 output tokens and $0.012 correctly.
+- New R6, P2: the real runner settles $0.03 for two failed $0.01 attempts when
+  cloned fallback contexts share the usage accumulator without a store.
+  A fresh accumulator currently depends on a successful history load.
+- R5, P2 remains unchanged: normal runtime recorder overflow is logged without
+  durable/caller-visible recording-integrity status.
+- Independently confirmed all twelve remote checks green on the exact reviewed
+  SHA: workflows `44975965542` and `44975965575`. Reran the unchanged candidate's
+  orchestrator library suite with warnings denied: **1,960 passed, zero
+  failed, one explicitly ignored stress test**. The full local CI battery was
+  not rerun during this review.
+- Four additional review probes compiled with warnings denied: **one passed,
+  three failed** (exit 101), reproducing the two accounting defects. Fixtures
+  execute the real specialist/runner at separate boundaries; they are outside
+  normal Cargo discovery. The runner restored its temporary test-module
+  declarations and the candidate worktree is clean. Logs and hashes are under
+  `target/harness-review-2026-11-22/`; reproduction sources are committed with
+  the report.
+- Recommendation: hold approval for the remaining accounting corrections and
+  recording-integrity decision. Accepted handoff residuals were not reopened.
