@@ -265,6 +265,194 @@ async fn startup_never_shrinks_a_seed_length_file_and_harvest_keeps_every_child_
     );
 }
 
+/// R1 regression: two distinct, valid configured ids that sanitize to the
+/// same readable prefix must get separate files, histories, and attributed
+/// spend.
+#[tokio::test]
+async fn colliding_agent_ids_get_separate_paths_histories_and_metrics() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let db_path = directory.path().join("sessions.db");
+    let store = SqliteSessionStore::connect_path(&db_path).await.expect("file-backed store");
+    let session_id = store
+        .create_session(
+            camino::Utf8Path::new("/tmp/h40-r1"),
+            "mock",
+            "mock",
+            CancellationToken::new(),
+        )
+        .await
+        .expect("session")
+        .id;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+
+    let dotted_id = "review.v1";
+    let underscored_id = "review_v1";
+    let dotted_seed = vec![
+        seeded_message(Role::User, "dotted question"),
+        seeded_message(Role::Assistant, "dotted answer"),
+    ];
+    let underscored_seed = vec![
+        seeded_message(Role::User, "underscore question"),
+        seeded_message(Role::Assistant, "underscore answer"),
+    ];
+    store
+        .append_agent_messages(session_id, dotted_id, &dotted_seed, CancellationToken::new())
+        .await
+        .expect("seed dotted agent history");
+    store
+        .append_agent_messages(
+            session_id,
+            underscored_id,
+            &underscored_seed,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("seed underscored agent history");
+
+    let tasks = vec![
+        (dotted_id.to_owned(), "dotted task".to_owned()),
+        (underscored_id.to_owned(), "underscore task".to_owned()),
+    ];
+    let prepared = prepare_supervised_history(Some(&store), session_id, &tasks)
+        .await
+        .expect("prepare history");
+    assert_eq!(prepared.seeds.len(), 2, "both distinct agents keep history");
+    let dotted_paths = prepared.paths.get(dotted_id).expect("dotted paths").clone();
+    let underscored_paths = prepared.paths.get(underscored_id).expect("underscored paths").clone();
+    assert_ne!(dotted_paths.history, underscored_paths.history);
+    assert_ne!(dotted_paths.metrics, underscored_paths.metrics);
+
+    // Each child restores only its own seed.
+    let dotted_restored =
+        crate::supervised_history::read_messages(&dotted_paths.history).await.expect("dotted seed");
+    let underscored_restored = crate::supervised_history::read_messages(&underscored_paths.history)
+        .await
+        .expect("underscore seed");
+    assert_eq!(
+        dotted_restored.iter().map(|message| message.content.as_str()).collect::<Vec<_>>(),
+        vec!["dotted question", "dotted answer"]
+    );
+    assert_eq!(
+        underscored_restored.iter().map(|message| message.content.as_str()).collect::<Vec<_>>(),
+        vec!["underscore question", "underscore answer"]
+    );
+
+    // Each child appends to its own file.
+    let dotted_delta = vec![
+        seeded_message(Role::User, "dotted child task"),
+        seeded_message(Role::Assistant, "dotted done"),
+    ];
+    crate::supervised_history::append_turns(&dotted_paths.history, &dotted_delta)
+        .await
+        .expect("append dotted turns");
+    let underscored_delta = vec![
+        seeded_message(Role::User, "underscore child task"),
+        seeded_message(Role::Assistant, "underscore done"),
+    ];
+    crate::supervised_history::append_turns(&underscored_paths.history, &underscored_delta)
+        .await
+        .expect("append underscore turns");
+
+    // Distinct metric lines stay on their own sidecars.
+    let dotted_metric = ProviderMetrics {
+        agent_id: None,
+        provider: "dotted-provider".to_owned(),
+        model: "mock-model".to_owned(),
+        tokens_in: 11,
+        tokens_out: 5,
+        cost_usd: 0.02,
+        latency_ms: 3,
+    };
+    let underscored_metric = ProviderMetrics {
+        agent_id: None,
+        provider: "underscore-provider".to_owned(),
+        model: "mock-model".to_owned(),
+        tokens_in: 22,
+        tokens_out: 9,
+        cost_usd: 0.04,
+        latency_ms: 4,
+    };
+    crate::supervised_history::append_metrics(&dotted_paths.metrics, &[dotted_metric])
+        .await
+        .expect("append dotted metrics");
+    crate::supervised_history::append_metrics(&underscored_paths.metrics, &[underscored_metric])
+        .await
+        .expect("append underscore metrics");
+
+    let root_task = Ulid::new();
+    harvest_supervised_history(Some(&store), session_id, Some(root_task), &prepared.seeds).await;
+
+    let dotted_stream = store
+        .load_agent_messages(session_id, dotted_id, CancellationToken::new())
+        .await
+        .expect("load dotted history");
+    let underscored_stream = store
+        .load_agent_messages(session_id, underscored_id, CancellationToken::new())
+        .await
+        .expect("load underscore history");
+    assert_eq!(
+        dotted_stream.iter().map(|message| message.content.as_str()).collect::<Vec<_>>(),
+        vec!["dotted question", "dotted answer", "dotted child task", "dotted done"]
+    );
+    assert_eq!(
+        underscored_stream.iter().map(|message| message.content.as_str()).collect::<Vec<_>>(),
+        vec![
+            "underscore question",
+            "underscore answer",
+            "underscore child task",
+            "underscore done",
+        ]
+    );
+
+    let spend =
+        store.list_spend_records(session_id, CancellationToken::new()).await.expect("list spend");
+    assert_eq!(spend.len(), 2, "each agent's spend is recorded exactly once");
+    let dotted_spend = spend
+        .iter()
+        .find(|record| record.agent_id.as_deref() == Some(dotted_id))
+        .expect("dotted spend");
+    assert_eq!(dotted_spend.provider, "dotted-provider");
+    assert_eq!((dotted_spend.tokens_in, dotted_spend.tokens_out), (11, 5));
+    let underscored_spend = spend
+        .iter()
+        .find(|record| record.agent_id.as_deref() == Some(underscored_id))
+        .expect("underscore spend");
+    assert_eq!(underscored_spend.provider, "underscore-provider");
+    assert_eq!((underscored_spend.tokens_in, underscored_spend.tokens_out), (22, 9));
+
+    // Authoritative metric rows are separate, not merged under one identity.
+    let options = sqlx::sqlite::SqliteConnectOptions::new().filename(&db_path);
+    let pool = sqlx::SqlitePool::connect_with(options).await.expect("metrics pool");
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT provider, tokens_in FROM provider_metrics WHERE session_id = ? ORDER BY provider",
+    )
+    .bind(session_id.to_string())
+    .fetch_all(&pool)
+    .await
+    .expect("query provider metrics");
+    pool.close().await;
+    assert_eq!(
+        rows,
+        vec![("dotted-provider".to_owned(), 11), ("underscore-provider".to_owned(), 22)]
+    );
+
+    let _ = tokio::fs::remove_dir_all(&prepared.directory).await;
+}
+
+/// R1: duplicate physical paths disable history before any child is spawned.
+#[tokio::test]
+async fn duplicate_physical_paths_disable_history_before_spawn() {
+    let tasks = vec![
+        ("reviewer".to_owned(), "first".to_owned()),
+        ("reviewer".to_owned(), "second".to_owned()),
+    ];
+    let prepared =
+        prepare_supervised_history(None, Ulid::new(), &tasks).await.expect("prepare history");
+    assert!(prepared.paths.is_empty(), "a shared path must not be handed to a child");
+    assert!(prepared.seeds.is_empty(), "no seed may be written to a shared path");
+    let _ = tokio::fs::remove_dir_all(&prepared.directory).await;
+}
+
 #[tokio::test]
 async fn harvest_trims_a_trailing_unanswered_tool_call() {
     let directory = tempfile::tempdir().expect("temp dir");

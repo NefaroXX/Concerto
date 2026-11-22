@@ -684,10 +684,27 @@ async fn prepare_supervised_history(
         }
     }
 
-    let mut paths = HashMap::new();
+    // R1: distinct configured ids must never share a history/metrics file.
+    // Derive every path first and disable history for any id whose physical
+    // path is already claimed by another id in this run. The check is
+    // deterministic (collisions are reported in task order), and a normal run
+    // has none because the file stem hashes the complete id.
+    let (mut paths, colliding) = crate::supervised_history::unique_paths_for_agents(
+        &directory,
+        tasks.iter().map(|(agent_id, _)| agent_id.as_str()),
+    );
+    for agent_id in &colliding {
+        tracing::warn!(
+            %agent_id,
+            "supervised history path collision; child history and metrics disabled for agent"
+        );
+    }
+
     let mut seeds = Vec::new();
     for (agent_id, _) in tasks {
-        let agent_paths = crate::supervised_history::paths_for(&directory, agent_id);
+        let Some(agent_paths) = paths.get(agent_id).cloned() else {
+            continue;
+        };
         let mut seed = load_supervised_seed(store, session_id, agent_id).await;
         crate::supervised_history::trim_unanswered_tool_call_tail(&mut seed);
         match crate::supervised_history::write_seed(&agent_paths.history, &seed).await {
@@ -697,14 +714,17 @@ async fn prepare_supervised_history(
                     initial_seed_len: seed.len(),
                     paths: agent_paths.clone(),
                 });
-                paths.insert(agent_id.clone(), agent_paths);
             }
-            Err(error) => tracing::warn!(
-                %agent_id,
-                path = %agent_paths.history.display(),
-                %error,
-                "failed to write supervised history seed; child history disabled for agent"
-            ),
+            Err(error) => {
+                // No seed means the child must not write a history either.
+                paths.remove(agent_id);
+                tracing::warn!(
+                    %agent_id,
+                    path = %agent_paths.history.display(),
+                    %error,
+                    "failed to write supervised history seed; child history disabled for agent"
+                );
+            }
         }
     }
     Some(SupervisedHistoryRun { directory, paths, seeds })

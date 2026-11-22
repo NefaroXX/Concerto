@@ -34,6 +34,7 @@
 //! child that wrote a forged or malformed but structurally valid turn would
 //! be trusted exactly like one it actually produced.
 
+use std::collections::HashMap;
 use std::io::{Error as IoError, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -62,6 +63,9 @@ pub const MAX_METRICS_BYTES: u64 = 4 * 1024 * 1024;
 /// Distinguishes concurrent temporary files in one directory.
 static WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Maximum readable prefix characters retained in a per-agent file stem.
+const MAX_SAFE_PREFIX: usize = 48;
+
 /// The two per-agent paths inside a parent-created run directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SupervisedHistoryPaths {
@@ -73,22 +77,31 @@ pub struct SupervisedHistoryPaths {
 
 /// Derive the per-agent file paths inside `root`.
 ///
-/// `agent_id` is sanitized to ASCII alphanumerics, `_` and `-`; every other
-/// character (including path separators and `.`) becomes `_`, so a hostile
-/// id can never escape `root` or produce a nested path.
+/// The file stem is a readable, path-safe prefix of the agent id plus a 64-bit
+/// hash of the *complete* id. Sanitizing alone would collapse distinct valid
+/// ids such as `review.v1` and `review_v1` onto one file; the hash keeps those
+/// identities separate while the prefix keeps filenames debuggable. Every
+/// other character (including path separators and `.`) becomes `_`, so a
+/// hostile id can never escape `root` or produce a nested path. The prefix is
+/// bounded so the filename stays comfortably under platform limits.
 pub fn paths_for(root: &Path, agent_id: &str) -> SupervisedHistoryPaths {
-    let safe = sanitize_agent_id(agent_id);
+    let stem = file_stem(agent_id);
     SupervisedHistoryPaths {
-        history: root.join(format!("{safe}.history.json")),
-        metrics: root.join(format!("{safe}.metrics.jsonl")),
+        history: root.join(format!("{stem}.history.json")),
+        metrics: root.join(format!("{stem}.metrics.jsonl")),
     }
 }
 
-/// Replace every character outside `[A-Za-z0-9_-]` with `_`; an empty id
-/// becomes the single character `_`.
+/// Readable prefix plus a stable 64-bit hash of the complete agent id.
+fn file_stem(agent_id: &str) -> String {
+    format!("{}-{:016x}", sanitize_agent_id(agent_id), stable_agent_id_hash(agent_id))
+}
+
+/// Replace every character outside `[A-Za-z0-9_-]` with `_` and retain at most
+/// [`MAX_SAFE_PREFIX`] characters; an empty prefix becomes `_`.
 fn sanitize_agent_id(agent_id: &str) -> String {
-    let mut sanitized = String::with_capacity(agent_id.len().max(1));
-    for character in agent_id.chars() {
+    let mut sanitized = String::with_capacity(agent_id.len().clamp(1, MAX_SAFE_PREFIX));
+    for character in agent_id.chars().take(MAX_SAFE_PREFIX) {
         if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
             sanitized.push(character);
         } else {
@@ -99,6 +112,51 @@ fn sanitize_agent_id(agent_id: &str) -> String {
         sanitized.push('_');
     }
     sanitized
+}
+
+/// Deterministic FNV-1a hash used only to disambiguate ephemeral filenames.
+///
+/// This is not a security boundary: the sanitized prefix already prevents path
+/// traversal, and the hash only needs to be stable across processes and
+/// restarts so a child re-reads the file its parent wrote.
+fn stable_agent_id_hash(agent_id: &str) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in agent_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// Derive paths for a run's agents, excluding every agent whose physical
+/// history file would be shared with another id.
+///
+/// Returns `(paths, colliding_agent_ids)`. Collisions are reported in input
+/// order so the caller's disabled set and logging are deterministic. A normal
+/// run has no collisions; this guards the invariant that two configured
+/// agents must never read or write one history/metrics file.
+pub fn unique_paths_for_agents<'a>(
+    root: &Path,
+    agent_ids: impl IntoIterator<Item = &'a str>,
+) -> (HashMap<String, SupervisedHistoryPaths>, Vec<String>) {
+    let derived: Vec<_> =
+        agent_ids.into_iter().map(|id| (id.to_owned(), paths_for(root, id))).collect();
+    let mut counts: HashMap<PathBuf, usize> = HashMap::new();
+    for (_, paths) in &derived {
+        *counts.entry(paths.history.clone()).or_insert(0) += 1;
+    }
+    let mut unique = HashMap::new();
+    let mut colliding = Vec::new();
+    for (agent_id, paths) in derived {
+        if counts.get(&paths.history).copied().unwrap_or(0) > 1 {
+            colliding.push(agent_id);
+        } else {
+            unique.insert(agent_id, paths);
+        }
+    }
+    (unique, colliding)
 }
 
 /// Remove assistant tool calls at the tail that have no matching tool result.
@@ -668,8 +726,10 @@ mod tests {
     fn paths_sanitize_agent_ids_and_prevent_traversal() {
         let root = Path::new("/tmp/run");
         let normal = paths_for(root, "review_agent-1");
-        assert_eq!(normal.history, Path::new("/tmp/run/review_agent-1.history.json"));
-        assert_eq!(normal.metrics, Path::new("/tmp/run/review_agent-1.metrics.jsonl"));
+        let expected_stem = file_stem("review_agent-1");
+        assert_eq!(normal.history, root.join(format!("{expected_stem}.history.json")));
+        assert_eq!(normal.metrics, root.join(format!("{expected_stem}.metrics.jsonl")));
+        assert_eq!(paths_for(root, "review_agent-1"), normal, "paths are deterministic");
 
         let hostile = paths_for(root, "../../etc/passwd");
         assert_eq!(hostile.history.parent(), Some(root), "must stay inside the run dir");
@@ -680,6 +740,56 @@ mod tests {
         assert!(!hostile_name.to_string_lossy().contains('\\'));
 
         let empty = paths_for(root, "");
-        assert_eq!(empty.history, Path::new("/tmp/run/_.history.json"));
+        assert_eq!(empty.history.parent(), Some(root));
+        assert!(empty.history.file_name().is_some_and(|name| {
+            let name = name.to_string_lossy();
+            name.starts_with("_-") && name.ends_with(".history.json")
+        }));
+    }
+
+    #[test]
+    fn distinct_valid_ids_never_share_a_history_or_metrics_path() {
+        let root = Path::new("/tmp/run");
+        // Both ids pass `config::agents::validate_agent_id`; sanitizing alone
+        // would collapse them onto `review_v1`.
+        let dotted = paths_for(root, "review.v1");
+        let underscored = paths_for(root, "review_v1");
+        assert_ne!(dotted.history, underscored.history);
+        assert_ne!(dotted.metrics, underscored.metrics);
+        assert!(dotted
+            .history
+            .file_name()
+            .is_some_and(|name| { name.to_string_lossy().starts_with("review_v1-") }));
+        assert!(underscored
+            .history
+            .file_name()
+            .is_some_and(|name| { name.to_string_lossy().starts_with("review_v1-") }));
+
+        let (unique, colliding) = unique_paths_for_agents(root, ["review.v1", "review_v1"]);
+        assert!(colliding.is_empty(), "distinct ids must not collide: {colliding:?}");
+        assert_eq!(unique.len(), 2);
+        assert_eq!(unique.get("review.v1"), Some(&dotted));
+        assert_eq!(unique.get("review_v1"), Some(&underscored));
+    }
+
+    #[test]
+    fn unique_paths_disable_duplicate_physical_paths_deterministically() {
+        let root = Path::new("/tmp/run");
+        let first = unique_paths_for_agents(root, ["reviewer", "reviewer"]);
+        let second = unique_paths_for_agents(root, ["reviewer", "reviewer"]);
+        assert_eq!(first, second, "the collision check is deterministic");
+        assert!(first.0.is_empty(), "neither duplicate may keep a shared file");
+        assert_eq!(first.1, vec!["reviewer".to_owned(), "reviewer".to_owned()]);
+    }
+
+    #[test]
+    fn long_agent_ids_keep_filenames_bounded() {
+        let root = Path::new("/tmp/run");
+        let long_id = "a".repeat(4_096);
+        let paths = paths_for(root, &long_id);
+        let name = paths.history.file_name().expect("file name").to_string_lossy();
+        // 48-character prefix + `-` + 16 hex hash + `.history.json`.
+        assert!(name.len() <= 48 + 1 + 16 + ".history.json".len(), "bounded name: {name}");
+        assert!(name.starts_with(&"a".repeat(48)));
     }
 }
