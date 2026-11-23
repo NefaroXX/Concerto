@@ -398,6 +398,20 @@ exit 1. `run`'s options must follow `run` (`concerto run --json`).
   `concerto sessions show <id>`, `concerto sessions events <id>`, and
   `concerto audit <id> --json`.
 
+The JSON object and report include `recording.status`: `complete`,
+`incomplete`, or `unknown`, covering the session event log and display transcript.
+Separate `event_log` and `transcript` outcomes
+report dropped events, failed writes, recorder failure and whether the integrity
+record was saved. `unknown` means no terminal recording result is available
+(including error/timeout responses), not a complete audit trail. Task status
+and exit code describe execution; an executed task can be `done` with incomplete
+recording. Human summaries show that warning. Automation requiring both
+recordings must also require `recording.status == "complete"`. This status
+does not certify separate provider-history, spend or policy-audit writes.
+The terminal `RecordingFinished` events are saved directly to the session store,
+independently of the bounded recording queue. An `--events-json` export's drop
+count only describes that export subscription.
+
 Known v1 semantics: on a completed run `final_message` carries the composed
 run summary (files changed, verification, notes); on error or timeout
 `session_id` is `null` and the token/cost metrics are zeroed even though a

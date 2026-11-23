@@ -205,8 +205,21 @@ summary or duplicate aggregate usage. Runtime verification and stop reasons are
 labeled system observations with no usage. `provider_transcript.rs` bounds
 cleanup independently of generation cancellation. Context assembly adds
 request-only unknown-outcome responses for interrupted calls: never treat them
-as executed evidence or automatically rerun a historical call. Independent
-specialist/process histories remain separate unfinished H39 work.
+as executed evidence or automatically rerun a historical call. Specialist and
+supervised-child histories are stored separately from root history. Restored
+specialist prompts are bounded at 512 messages; durable rows are not pruned.
+Each runner attempt owns fresh produced-message/usage state, preserving only
+the intended seed. Account for every completed request before repair parsing,
+including paid repair requests; retain each message's own usage on disk.
+
+Runtime `recording_integrity` covers the session event log and display
+transcript, independently of task completion. Missing health is unknown, never
+complete. Recorders save `RecordingFinished` directly to the session store,
+outside their bounded queues; failures also reach runtime output and rendered
+summaries without changing canonical provider messages. Keep session filtering
+before enqueue and queue close before final drain. A zero drop count from the
+CLI's separate event export does not certify either runtime recorder. Provider
+history, spend and policy-audit writes are outside this recording status.
 
 ## Key entrypoints (start reading here)
 - Interactive application: `crates/orchestrator/src/conversation.rs` — shared

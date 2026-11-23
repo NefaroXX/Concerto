@@ -1320,6 +1320,9 @@ pub struct AgentOutput {
     /// Additive: consumers that do not read this field are unaffected, and the
     /// only producer today is the single-agent loop's retry-exhausted arm.
     pub provider_error_class: Option<String>,
+    /// Terminal health of the normal runtime's two durable recorders. `None`
+    /// means unknown/not observed, never a claim that the audit trail is complete.
+    pub recording_integrity: Option<crate::recording::RecordingIntegrity>,
 }
 
 /// Completion state carried with output so the UI cannot render preserved
@@ -1785,8 +1788,28 @@ impl AgentOutput {
     /// For action-required tasks this is built from real `files_modified`,
     /// `verification`, and (optionally) `final_message` notes — never from
     /// unverified provider prose. For conversational (answer-only) tasks it
-    /// returns `final_message` verbatim.
+    /// returns `final_message`. A separate warning is appended when the runtime
+    /// reports incomplete recording; the model's original message is unchanged.
     pub fn summary(&self) -> String {
+        self.with_recording_warning(self.execution_summary())
+    }
+
+    /// Reply-only presentation still surfaces recording degradation without
+    /// injecting a runtime annotation into the model-authored message.
+    pub fn reply_summary(&self) -> String {
+        self.with_recording_warning(self.final_message.clone())
+    }
+
+    fn with_recording_warning(&self, mut summary: String) -> String {
+        if let Some(warning) = self.recording_integrity.as_ref().and_then(|health| health.warning())
+        {
+            summary.push_str("\n\n");
+            summary.push_str(&warning);
+        }
+        summary
+    }
+
+    fn execution_summary(&self) -> String {
         let has_execution = !self.files_modified.is_empty()
             || !self.verification.is_empty()
             || !self.tool_events.is_empty();
@@ -3288,6 +3311,7 @@ mod tests {
             provider_metrics: vec![],
             checkpoint_json: None,
             provider_error_class: None,
+            recording_integrity: None,
         };
         assert_eq!(output.summary(), "hello");
     }
@@ -3308,6 +3332,7 @@ mod tests {
             provider_metrics: vec![],
             checkpoint_json: None,
             provider_error_class: None,
+            recording_integrity: None,
         };
         let s = output.summary();
         assert!(s.contains("Completed"));
@@ -3413,6 +3438,7 @@ mod tests {
             provider_metrics: vec![],
             checkpoint_json: None,
             provider_error_class: None,
+            recording_integrity: None,
         };
         match AgentRunExit::Done(output) {
             AgentRunExit::Done(_) => {}
@@ -3741,6 +3767,7 @@ mod tests {
             provider_metrics: vec![],
             checkpoint_json: None,
             provider_error_class: None,
+            recording_integrity: None,
         };
         let summary = output.summary();
         assert!(summary.contains("py_compile passed"), "{summary}");

@@ -25,6 +25,7 @@ pub mod policy;
 pub mod policy_presets;
 pub mod provider_call;
 pub mod provider_replay;
+pub mod recording;
 pub mod sandbox;
 pub mod sanitizer;
 pub mod secret;

@@ -38,6 +38,13 @@ pub(super) mod approved_plan_d7;
 pub(super) struct EventRecorderStore {
     events: Arc<Mutex<Vec<concerto_core::event::Event>>>,
     transcript: Arc<Mutex<Vec<concerto_core::transcript::TranscriptEntry>>>,
+    event_pause: Option<Arc<recording_integrity::WritePause>>,
+    transcript_pause: Option<Arc<recording_integrity::WritePause>>,
+    fail_events: bool,
+    fail_transcript: bool,
+    fail_report: bool,
+    panic_event: bool,
+    report_store: Option<Arc<dyn SessionStore>>,
 }
 
 impl EventRecorderStore {
@@ -45,6 +52,13 @@ impl EventRecorderStore {
         Self {
             events: Arc::new(Mutex::new(Vec::new())),
             transcript: Arc::new(Mutex::new(Vec::new())),
+            event_pause: None,
+            transcript_pause: None,
+            fail_events: false,
+            fail_transcript: false,
+            fail_report: false,
+            panic_event: false,
+            report_store: None,
         }
     }
 
@@ -65,6 +79,26 @@ impl SessionStore for EventRecorderStore {
         event: &concerto_core::event::Event,
         _cancel: CancellationToken,
     ) -> Result<(), concerto_sessions::SessionError> {
+        if matches!(&event.kind, EventKind::RecordingFinished { .. }) {
+            if self.fail_report {
+                return Err(concerto_sessions::SessionError::Storage(
+                    "injected report failure".into(),
+                ));
+            }
+            if let Some(store) = &self.report_store {
+                store.record_event(event.session_id, event, _cancel).await?;
+            }
+        } else {
+            if let Some(pause) = &self.event_pause {
+                pause.wait_once().await;
+            }
+            assert!(!self.panic_event, "injected event recorder panic");
+            if self.fail_events {
+                return Err(concerto_sessions::SessionError::Storage(
+                    "injected event failure".into(),
+                ));
+            }
+        }
         self.events.lock().unwrap_or_else(|e| e.into_inner()).push(event.clone());
         Ok(())
     }
@@ -313,6 +347,14 @@ impl SessionStore for EventRecorderStore {
         entries: &[concerto_core::transcript::TranscriptEntry],
         _cancel: CancellationToken,
     ) -> Result<(), concerto_sessions::SessionError> {
+        if let Some(pause) = &self.transcript_pause {
+            pause.wait_once().await;
+        }
+        if self.fail_transcript {
+            return Err(concerto_sessions::SessionError::Storage(
+                "injected transcript failure".into(),
+            ));
+        }
         self.transcript.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(entries);
         Ok(())
     }
@@ -359,9 +401,15 @@ async fn event_recorder_filters_cross_session_events() {
     recorder.stop().await;
 
     let recorded = recorder_store.recorded_events();
-    assert_eq!(recorded.len(), 1, "only one event should be recorded");
+    assert_eq!(recorded.len(), 2, "one session event plus its terminal integrity report");
     assert_eq!(recorded[0].session_id, session_a, "recorded event must belong to session A");
+    assert!(
+        matches!(&recorded[1].kind, EventKind::RecordingFinished { outcome } if outcome.is_complete())
+    );
 }
+
+#[path = "recording_integrity.rs"]
+mod recording_integrity;
 
 // ------------------------------------------------------------------
 // Transcript recorder (ADR-36, stage 2)

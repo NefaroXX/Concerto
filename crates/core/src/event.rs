@@ -49,6 +49,11 @@ impl ThinkingKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum EventKind {
+    /// Written directly to the session store after the recorder drains, so
+    /// queue overflow cannot silently discard the integrity result itself.
+    RecordingFinished {
+        outcome: crate::recording::RecorderOutcome,
+    },
     BenchmarkRunMetadata {
         task_id: TaskId,
         metadata: serde_json::Value,
@@ -1242,6 +1247,9 @@ impl DurableQueue {
     /// Mark the queue closed and wake any waiting consumer so the bus can prune
     /// this subscriber.
     fn close(&self) {
+        // Synchronize with the publisher's under-lock closed check. Once close
+        // returns, neither queued events nor drop counters can grow again.
+        let _events = self.events.lock().unwrap_or_else(|error| error.into_inner());
         self.closed.store(true, Ordering::Release);
         self.notify.notify_waiters();
     }
@@ -1273,6 +1281,7 @@ impl DurableQueue {
 /// queue as the receiver. Sends are short and never await the consumer.
 struct DurableSender {
     queue: Arc<DurableQueue>,
+    session_id: Option<Ulid>,
 }
 
 impl DurableSender {
@@ -1288,6 +1297,9 @@ impl DurableSender {
     fn send(&self, event: Arc<Event>) -> bool {
         if self.queue.is_closed() {
             return false;
+        }
+        if self.session_id.is_some_and(|session| session != event.session_id) {
+            return true;
         }
         let mut overflow_warning = None;
         let mut backlog_warning = None;
@@ -1381,6 +1393,12 @@ impl std::fmt::Debug for DurableEventReceiver {
 }
 
 impl DurableEventReceiver {
+    /// Stop accepting events while retaining the queued suffix for draining.
+    /// The final drop count is stable after this returns.
+    pub fn close(&self) {
+        self.queue.close();
+    }
+
     /// Await the next queued event.
     ///
     /// Returns retained events in publish order and `None` once the queue is
@@ -1522,8 +1540,18 @@ impl EventBus {
     /// are discarded so a stalled consumer cannot grow memory without bound.
     /// Loss is counted in [`DurableHealth::dropped_events`].
     pub fn subscribe_durable(&self) -> DurableEventReceiver {
+        self.subscribe_durable_filtered(None)
+    }
+
+    /// Filter before enqueueing so unrelated sessions cannot evict this
+    /// session's events or contaminate its recorder's integrity counters.
+    pub fn subscribe_durable_for_session(&self, session_id: Ulid) -> DurableEventReceiver {
+        self.subscribe_durable_filtered(Some(session_id))
+    }
+
+    fn subscribe_durable_filtered(&self, session_id: Option<Ulid>) -> DurableEventReceiver {
         let queue = Arc::new(DurableQueue::new(self.durable_capacity));
-        let sender = Arc::new(DurableSender { queue: Arc::clone(&queue) });
+        let sender = Arc::new(DurableSender { queue: Arc::clone(&queue), session_id });
         let mut subscribers =
             self.durable_subscribers.lock().unwrap_or_else(|error| error.into_inner());
         prune_durable(&mut subscribers);
@@ -1828,6 +1856,42 @@ mod tests {
         }
         assert_eq!(received, n);
         assert_eq!(bus.durable_health().max_pending, 0);
+    }
+
+    #[test]
+    fn session_filtered_durable_queue_does_not_drop_for_other_sessions() {
+        let bus = EventBus::with_durable_capacity(16, 2);
+        let session = new_id();
+        let other = new_id();
+        let mut receiver = bus.subscribe_durable_for_session(session);
+        bus.publish_for_session(session, session, EventKind::SessionSaved).unwrap();
+        for _ in 0..20 {
+            bus.publish_for_session(other, other, EventKind::SessionSaved).unwrap();
+        }
+        receiver.close();
+        assert_eq!(receiver.dropped_events(), 0);
+        assert_eq!(receiver.try_recv().unwrap().session_id, session);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn closing_durable_receiver_freezes_drops_and_drains_retained_events() {
+        let bus = EventBus::with_durable_capacity(16, 4);
+        let mut receiver = bus.subscribe_durable();
+        let session = new_id();
+        for _ in 0..6 {
+            bus.publish_for_session(session, session, EventKind::SessionSaved).unwrap();
+        }
+        assert_eq!(receiver.dropped_events(), 2);
+        receiver.close();
+        for _ in 0..20 {
+            let _ = bus.publish_for_session(session, session, EventKind::SessionSaved);
+        }
+        for _ in 0..4 {
+            assert!(receiver.recv().await.is_some());
+        }
+        assert!(receiver.recv().await.is_none());
+        assert_eq!(receiver.dropped_events(), 2, "closed queues never gain more drops");
     }
 
     /// Dead (dropped) receivers are pruned from the subscriber list both on

@@ -1773,7 +1773,7 @@ async fn execute_agent_loop(
             tracker.set(RunStage::Execute);
         }
     }
-    let output = match agent.run(task, req.cancel_token.clone()).await {
+    let mut output = match agent.run(task, req.cancel_token.clone()).await {
         Ok(output) => {
             // Full-local-agency runs are action-capable: an empty final message
             // is left as the model produced it (no honesty synthesis, which is
@@ -1842,8 +1842,10 @@ async fn execute_agent_loop(
         Some(&services.bus),
     )
     .await;
-    transcript_recorder.stop().await;
-    event_recorder.stop().await;
+    let transcript = transcript_recorder.stop().await;
+    let event_log = event_recorder.stop().await;
+    output.recording_integrity =
+        Some(concerto_core::recording::RecordingIntegrity { event_log, transcript });
     Ok(output)
 }
 
@@ -4346,8 +4348,10 @@ async fn run_multi_agent(
         Some(&services.bus),
     )
     .await;
-    transcript_recorder.finish(&transcript).await;
-    event_recorder.stop().await;
+    let transcript = transcript_recorder.finish(&transcript).await;
+    let event_log = event_recorder.stop().await;
+    output.recording_integrity =
+        Some(concerto_core::recording::RecordingIntegrity { event_log, transcript });
     Ok(output)
 }
 
@@ -4954,8 +4958,8 @@ async fn drive_supervised_run(
         Some(&services.bus),
     )
     .await;
-    transcript_recorder.stop().await;
-    event_recorder.stop().await;
+    let transcript = transcript_recorder.stop().await;
+    let event_log = event_recorder.stop().await;
 
     Ok(AgentOutput {
         task_id,
@@ -4971,6 +4975,10 @@ async fn drive_supervised_run(
         provider_metrics: Vec::new(),
         checkpoint_json: None,
         provider_error_class: None,
+        recording_integrity: Some(concerto_core::recording::RecordingIntegrity {
+            event_log,
+            transcript,
+        }),
     })
 }
 

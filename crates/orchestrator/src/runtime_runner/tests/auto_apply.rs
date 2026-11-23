@@ -258,6 +258,10 @@ async fn stage_tracker_completion_reflects_required_verification() {
         .await
         .expect("action-required run should finish");
 
+        assert!(
+            output.recording_integrity.as_ref().is_some_and(|health| health.is_complete()),
+            "the real single-agent runtime returns recorder health even for a partial task"
+        );
         assert_eq!(
             output.completion_status,
             if require_verification {

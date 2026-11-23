@@ -544,6 +544,10 @@ async fn stage_tracker_supervised_spawn_failure_does_not_publish_complete() {
     .await
     .expect("a failed spawn settles without waiting for the run budget")
     .expect("a failed spawn returns a partial output");
+    assert!(
+        output.recording_integrity.as_ref().is_some_and(|health| health.is_complete()),
+        "the supervised runtime reports complete recording independently of failed work"
+    );
     assert_eq!(output.completion_status, AgentCompletionStatus::Partial);
     assert!(output.final_message.contains("failed agents: worker"));
     assert_eq!(drain_stage_events(&mut receiver, session_id), [RunStage::Execute]);

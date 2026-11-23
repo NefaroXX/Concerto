@@ -21,7 +21,7 @@ passing repository tests alone does not close a finding.
 | H09 | P2 | Compaction truncates constraints and unresolved work | Fixed; full local battery and all 12 exact-head CI checks passed |
 | H10 | P2 | Agent-driven benchmark fixture policy denies tools | Fixed and verified; awaiting merge |
 | H11 | P2 | Empty benchmark outcomes force a zero pass score | Fixed and verified; awaiting merge |
-| H12 | P2 | Durable event subscriber queues have no memory bound | Fixed and verified; awaiting merge (durable queues bounded at 8192 with counted drop-oldest overflow; session recorder fails closed on an observed gap, CLI writes `events_dropped`) |
+| H12 | P2 | Durable event subscriber queues have no memory bound | Bounded at 8192 with counted drop-oldest overflow; benchmark recording fails closed and CLI exports report their own drops. Normal runtime integrity is the R5 follow-up below |
 | H13 | P1 | Structured-response parsing rewrites Unicode before attempting JSON parsing | Fixed and verified; awaiting merge |
 | H14 | P2 | Checkpoint startup can degrade into ToolNotFound; CLI test failed intermittently | Fixed and verified: missing checkpoint tooling now returns a specific `CheckpointUnavailable` refusal, the audit-pool open retries 3 times (25/50 ms), and degraded builds log why; the original open failure was not reproduced |
 | H15 | P1 | Orchestrator read cache trusts matching size/mtime without checking current bytes | Fixed and verified; awaiting merge |
@@ -48,14 +48,20 @@ passing repository tests alone does not close a finding.
 | H36 | P2 | cargo-audit can report incomplete registry checks with exit zero | Fixed and verified on 66309f8; awaiting merge |
 | H37 | P1 | Native provider wire adapters discard mandatory system/assistant text | Fixed; full local battery and all 12 exact-head CI checks passed |
 | H38 | P2 | Gemini canonical history loses native part order/text signatures and misclassifies thought text | Fixed; full local battery and all 12 exact-head CI checks passed on 14390eb |
-| H39 | P1 | Run settlement persists summaries instead of complete provider history | Implemented; full local CI-equivalent battery green 2026-11-21 (`494efd4`); exact-head CI recorded on the PR. Root repair fixed, published and exact-head verified (`2dbf25a`; ADR-87 `72c414a`). H39a settlement and H39b steps 1–3 landed; H39b review follow-ups attribute in-process specialist spend via `ProviderMetrics::agent_id`, forward failed-child usage, and bound restored prompt history at 512 messages (DB rows still accumulate). The 2026-11-22 entry adds agent-scoped specialist persistence, failed-attempt live-spend settlement, and mid-batch pause repair; full CI certification remains the gate |
+| H39 | P1 | Run settlement persists summaries instead of complete provider history | Implemented and verified through review follow-ups R1–R4/R6 on `88020d0`; full local battery and all 12 exact-head checks passed. Documented child-crash windows, shared same-role streams and stored-history growth remain scoped limits |
 | H40 | P2 | Headless multi-agent history clips messages and older obligations before dispatch | Fixed, published and exact-head verified (`91bf006`); loopback CLI request fixture plus the approved-plan routing control |
 | H41 | P1 | Settings CLI fixtures use XDG isolation on macOS, where application paths resolve to the real profile | Fixed and verified on Linux, published with H40 (`91bf006`); macOS hazard source-confirmed, portable coverage not claimed |
 
-Table reconciled 2026-11-17 after the H23 and H12 fixes; the H40 and H41 rows
-were previously left at their preparation state. Open work is the register
-below (H29, H39 remainder); H28 is scoped, with only upstream- or
-platform-gated duplicate families left.
+Current-state summary reconciled 2026-11-23. Historical entries below retain
+their status at the time they were written. H29 is verified as recorded in its
+row; H28's remaining duplicate families are upstream- or platform-gated.
+The current open review follow-up is R5 and its verification.
+
+| Round-two follow-up | Current status |
+| --- | --- |
+| R4 — paid repair requests lose usage on failure | Fixed in `6a11791`; full local battery and all 12 remote checks passed on `88020d0` |
+| R5 — normal runtime recorder gaps have no durable/caller-visible integrity | Implemented; 95 focused tests passed. Fresh full validation in progress; unpublished |
+| R6 — cloned fallback contexts charge prior attempts again | Fixed in `6a11791`; sequential/concurrent/load-failure regressions and full certification on `88020d0` |
 
 
 ## 2026-10-29 — H01: preserve streaming events across chunks
@@ -3397,3 +3403,83 @@ Branch: `fix/harness-headless-history` (HEAD `34a09ee` before this change).
   this checkpoint; all twelve remote checks on the published head remain
   required. R5 is implemented in the separate recording-integrity worktree,
   with its own compilation and full validation still outstanding.
+
+## 2026-11-22 — R5 recorder integrity implementation in progress
+
+- Isolated worktree `r5`, branch `fix/harness-recording-integrity`, based on
+  accounting checkpoint `6a11791`, now fast-forwarded to dependency fix
+  `4f3e7e3`. The H40 accounting battery completed successfully; this worktree was
+  then fast-forwarded to validation checkpoint `88020d0` before R5 testing.
+- Added terminal recorder health, direct durable integrity events outside the
+  bounded queue, normal runtime output propagation, and separate headless JSON
+  recording status. Task execution status remains independent. Failed writes,
+  task failure and failure to save the integrity result cannot report complete.
+- Durable consumers can close before draining, freezing the drop counter.
+  Per-session subscriptions filter before enqueueing so unrelated session
+  traffic cannot cause false integrity failures. Normal recorders and the
+  existing benchmark recorder use these boundaries.
+- Added deterministic stalled-recorder scenarios with a fast export subscriber,
+  durable health reload from SQLite, failed final transcript writes, recorder
+  task panic and integrity-write failure. Implementation and tests are not yet
+  compiled or certified; R5 remains open until verification completes.
+
+
+- R5 review added bounded-write/drain and cancelled-stop regressions, healthy
+  SQLite reopen coverage, real single-agent/supervised runtime output checks,
+  and reply-only presentation coverage. CLI documentation scopes the status to
+  the event log/display transcript rather than claiming all persistence is
+  certified. These tests now enter validation after the completed H40 battery.
+
+## 2026-11-23 — R5 focused regressions passed
+
+- `cargo test --locked -j1 -p concerto-orchestrator --lib record` passed all
+  **95 selected tests, zero failures**, with warnings denied. This includes
+  both real runtime-recorder overflow scenarios, durable terminal-health reload
+  from SQLite, healthy recording, failed event/final transcript writes, failed
+  integrity persistence, worker panic, write/drain deadlines, cancelled-stop
+  cleanup and reply-only warning presentation. The export control is an
+  independently drained durable subscription, not a CLI file-writer fixture.
+- Workspace formatting and `git diff --check` passed. The full workspace
+  battery now runs against R5, including the core queue boundary tests, CLI
+  JSON/report contract, and single-agent/supervised integration assertions.
+  Logs: `target/harness-reliability/round2-recording-focused.log` and
+  `round2-recording-ci-*`. R5 publication remains gated on the entire battery.
+
+- The first R5 workspace pass cleared all-target clippy but failed the test
+  build: Cargo reused a workspace-feature core artifact lacking the new API,
+  while the focused orchestrator build had compiled and tested that API.
+  Clearing only selected top-level packages when switching worktrees was
+  insufficient. Cleared artifacts for **all 25 workspace packages**, retaining
+  third-party dependency caches and every verification log, then started a new
+  full battery under `round2-recording-clean-ci-*`. No source workaround,
+  warning suppression or reused test-pass claim; the failed build is retained
+  as `round2-recording-ci-test.log`.
+
+## 2026-11-23 — R4/R6 accounting milestone certified on GitHub
+
+- All **12 checks passed** on exact published head
+  `88020d0d0a1a38ef3375fd85e85bdf4f9ff4033e` in PR #380.
+  [Main CI](https://github.com/NefaroXX/Concerto/actions/runs/45110412213)
+  and [native shell CI](https://github.com/NefaroXX/Concerto/actions/runs/45110412161)
+  both identify that SHA; Linux, macOS and Windows passed. This certifies
+  accounting fixes `6a11791` and the dependency patch `4f3e7e3`, together with
+  the full local battery recorded above.
+- R4/R6 are closed for the reviewed failures. R5 remains unpublished pending
+  its fresh full local battery and its own exact-head remote checks.
+
+## 2026-11-23 — R5 local checkpoint; full verification running
+
+- The fresh workspace/all-target clippy pass completed with warnings denied
+  after clearing all workspace artifacts; formatting also passed. Combined
+  with the 95 focused regressions, this is the local checkpoint gate. The
+  restarted full workspace test/build/security battery is still running;
+  this checkpoint does not claim it passed and will not be published yet.
+- The source hashes in `round2-recording-source.json` match the checkpoint.
+  The active driver is `target/harness-reliability/round2-recording-clean-ci.py`
+  (logs/results use the same prefix). Check its actual process/results before
+  restarting it after an interruption.
+- Before final R5 certification, extend the existing Linux loopback fixture
+  `crates/cli/tests/headless_history.rs` to assert the real multi-agent CLI's
+  recording status and match both stdout recorder outcomes to durable
+  `RecordingFinished` events after reopening SQLite. This complements the
+  single-agent/supervised runtime assertions and the CLI mapping unit test.

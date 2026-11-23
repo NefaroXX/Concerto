@@ -231,6 +231,7 @@ mod tests {
             provider_metrics: vec![],
             checkpoint_json: None,
             provider_error_class: None,
+            recording_integrity: None,
         }
     }
 

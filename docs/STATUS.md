@@ -342,7 +342,15 @@ The expected manual release checks are maintained in [Testing](../TESTING.md).
   lag flag remain observable via `EventBus::durable_health()`. Dead
   subscribers are pruned on publish and subscribe; `EventRecording::finish`
   fails closed on an observed gap and `--events-json` emits an
-  `events_dropped` record.
+  `events_dropped` record. Normal runtime recorders now return independent
+  event/transcript integrity outcomes and save `RecordingFinished` directly
+  to the session store. Overflow, failed writes, failed recorder tasks and
+  failed integrity persistence are visible in summaries and the headless
+  `recording` object without changing task execution status. Session recorders
+  filter before enqueueing and close before draining so foreign-session traffic
+  cannot evict their events and final drop counts are stable. Individual writes
+  are bounded at 10 seconds and recorder drains at 30 seconds; exceeding either
+  deadline degrades recording instead of claiming a complete audit trail.
 - **Debounced memory re-index watcher:** 1s debounce with a bounded,
   deduplicated queue and a rate-limited overflow warning instead of unbounded
   queue growth.

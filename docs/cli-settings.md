@@ -246,6 +246,20 @@ rejected with a dedicated message.
   and timeout outcomes). Truncate-created mode `0600` (unix). A failed report
   write warns on stderr and does not change the run outcome or the exit code.
 
+The stdout JSON and report carry `recording.status` independently of the task's
+`status`: `complete`, `incomplete`, or `unknown`, covering the session event log
+and display transcript. Each recorder outcome includes
+its dropped-event and failed-write counts, recorder failure, and whether its
+integrity status was saved. A successful task keeps its execution status and
+exit code even when recording is incomplete; its human summary includes a
+warning. Require both `status == "done"` and `recording.status == "complete"`
+when automation needs completed work with both recordings intact. Separate
+provider-history, spend and policy-audit writes are outside this status. Error and
+timeout responses report recording as `unknown`; inspect the session's
+`RecordingFinished` events for any terminal recorder reports saved during cleanup.
+The optional event export is a separate subscriber and cannot certify session
+recording integrity.
+
 The default `--approvals deny` is fail-closed: any action that reaches the
 approval gate is refused and the run reports `awaiting_approval` (exit 3).
 Under the single-agent authority model ordinary local mutations are already

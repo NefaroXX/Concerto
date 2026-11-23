@@ -852,6 +852,7 @@ impl AgentLoop {
             provider_metrics: self.provider_metrics(),
             checkpoint_json: None,
             provider_error_class: None,
+            recording_integrity: None,
         });
         partial.final_message = format!(
             "{} ({MAX_CONTINUATION_ROUNDS}).",
@@ -1992,6 +1993,7 @@ impl AgentLoop {
             provider_metrics: self.provider_metrics(),
             checkpoint_json: None,
             provider_error_class: None,
+            recording_integrity: None,
         }
     }
 
@@ -7275,6 +7277,7 @@ mod tests {
             provider_metrics: vec![],
             checkpoint_json: None,
             provider_error_class: None,
+            recording_integrity: None,
         };
         let fp = ProgressFingerprint::from_output(&output);
         assert_eq!(fp.files_modified, 2, "should count two modified files");
@@ -7498,6 +7501,7 @@ mod tests {
             provider_metrics: vec![],
             checkpoint_json: None,
             provider_error_class: None,
+            recording_integrity: None,
         }
     }
 

@@ -15,6 +15,11 @@
 //! those tests keep running through the parent's `pub(crate) use recorders::*;`
 //! re-export, so no coverage moves or is deleted.
 
+#[path = "recorders/health.rs"]
+mod health;
+
+use concerto_core::recording::{RecorderKind, RecorderOutcome};
+use health::{drain_task, RecorderHealth, WRITE_TIMEOUT};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -34,20 +39,21 @@ pub(crate) struct NoopAuditLog;
 
 /// Rate-limited consumer-side surfacing of durable queue overflow.
 ///
-/// The recorder loops have no error return path, so a gap is logged rather than
-/// failing the run. The cumulative drop count is compared on every receive
+/// The same gap is retained in terminal recorder health. The cumulative drop
+/// count is compared on every receive
 /// step; an error is emitted at most once per observed gap, and only at the
 /// first gap or each doubling of the cumulative count, so a persistently
 /// lagging queue cannot flood the log.
 struct GapLog {
     consumer: &'static str,
+    health: Arc<RecorderHealth>,
     observed: u64,
     logged: u64,
 }
 
 impl GapLog {
-    fn new(consumer: &'static str) -> Self {
-        Self { consumer, observed: 0, logged: 0 }
+    fn new(consumer: &'static str, health: Arc<RecorderHealth>) -> Self {
+        Self { consumer, health, observed: 0, logged: 0 }
     }
 
     fn observe(&mut self, receiver: &DurableEventReceiver, session_id: Ulid) {
@@ -57,6 +63,7 @@ impl GapLog {
         }
         let gap = current - self.observed;
         self.observed = current;
+        self.health.dropped(current);
         if self.logged == 0 || current >= self.logged.saturating_mul(2) {
             self.logged = current;
             tracing::error!(
@@ -74,16 +81,16 @@ impl GapLog {
 pub(crate) struct EventRecorderGuard {
     cancel: CancellationToken,
     task: Option<tokio::task::JoinHandle<()>>,
+    health: Arc<RecorderHealth>,
+    store: Arc<dyn concerto_sessions::SessionStore>,
+    session_id: Ulid,
+    bus: EventBus,
 }
 
 impl EventRecorderGuard {
-    pub(crate) async fn stop(mut self) {
-        self.cancel.cancel();
-        if let Some(task) = self.task.take() {
-            if let Err(error) = task.await {
-                tracing::warn!(%error, "session event recorder failed to stop cleanly");
-            }
-        }
+    pub(crate) async fn stop(mut self) -> RecorderOutcome {
+        drain_task(&mut self.task, &self.health, &self.cancel).await;
+        self.health.persist(&self.store, self.session_id, &self.bus, CancellationToken::new()).await
     }
 }
 
@@ -93,60 +100,66 @@ impl Drop for EventRecorderGuard {
     }
 }
 
+async fn persist_event(
+    store: &Arc<dyn concerto_sessions::SessionStore>,
+    session_id: Ulid,
+    event: &Event,
+    health: &RecorderHealth,
+    cancel: &CancellationToken,
+) {
+    if event.session_id != session_id {
+        return;
+    }
+    let write_cancel = cancel.child_token();
+    let _cancel_on_drop = write_cancel.clone().drop_guard();
+    match tokio::time::timeout(WRITE_TIMEOUT, store.record_event(session_id, event, write_cancel))
+        .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            health.failed_write();
+            tracing::warn!(%error, %session_id, "failed to persist session event");
+        }
+        Err(_) => {
+            health.failed_write();
+            tracing::warn!(%session_id, "session event write timed out");
+        }
+    }
+}
+
 pub(crate) fn start_event_recorder(
     bus: &EventBus,
     store: Arc<dyn concerto_sessions::SessionStore>,
     session_id: Ulid,
 ) -> EventRecorderGuard {
-    let mut receiver = bus.subscribe_durable();
+    let mut receiver = bus.subscribe_durable_for_session(session_id);
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
+    let flush_cancel = CancellationToken::new();
+    let health = Arc::new(RecorderHealth::new(RecorderKind::EventLog));
+    let task_health = health.clone();
+    let task_store = store.clone();
     let task = tokio::spawn(async move {
-        let mut gap = GapLog::new("session-event-recorder");
+        let mut gap = GapLog::new("session-event-recorder", task_health.clone());
         loop {
-            tokio::select! {
-                _ = task_cancel.cancelled() => {
-                    while let Ok(event) = receiver.try_recv() {
-                        gap.observe(&receiver, session_id);
-                        if event.session_id != session_id {
-                            tracing::debug!(
-                                recorder_session = %session_id,
-                                event_session = %event.session_id,
-                                kind = ?event.kind,
-                                "skipping event for different session",
-                            );
-                            continue;
-                        }
-                        if let Err(error) = store.record_event(session_id, &event, task_cancel.clone()).await {
-                            tracing::warn!(%error, %session_id, "failed to flush session event");
-                        }
-                    }
-                    gap.observe(&receiver, session_id);
-                    break;
-                },
-                received = receiver.recv() => match received {
-                    Some(event) => {
-                        gap.observe(&receiver, session_id);
-                        if event.session_id != session_id {
-                            tracing::debug!(
-                                recorder_session = %session_id,
-                                event_session = %event.session_id,
-                                kind = ?event.kind,
-                                "skipping event for different session",
-                            );
-                        } else if let Err(error) = store.record_event(session_id, &event, task_cancel.clone()).await {
-                            tracing::warn!(%error, %session_id, "failed to persist session event");
-                        }
-                    }
-                    None => {
-                        gap.observe(&receiver, session_id);
-                        break;
-                    }
-                }
-            }
+            let event = tokio::select! {
+                _ = task_cancel.cancelled() => break,
+                event = receiver.recv() => event,
+            };
+            gap.observe(&receiver, session_id);
+            let Some(event) = event else { break };
+            persist_event(&task_store, session_id, &event, &task_health, &flush_cancel).await;
         }
+        // Close before draining: late publishers cannot extend the queue or
+        // change its drop counter after the final health observation.
+        receiver.close();
+        while let Ok(event) = receiver.try_recv() {
+            gap.observe(&receiver, session_id);
+            persist_event(&task_store, session_id, &event, &task_health, &flush_cancel).await;
+        }
+        gap.observe(&receiver, session_id);
     });
-    EventRecorderGuard { cancel, task: Some(task) }
+    EventRecorderGuard { cancel, task: Some(task), health, store, session_id, bus: bus.clone() }
 }
 
 /// Flush a batch once this many transcript-relevant events have accumulated in
@@ -263,12 +276,28 @@ async fn flush_entries(
     session_id: Ulid,
     entries: Vec<TranscriptEntry>,
     cancel: &CancellationToken,
+    health: &RecorderHealth,
 ) {
     if entries.is_empty() {
         return;
     }
-    if let Err(error) = store.append_transcript(session_id, &entries, cancel.clone()).await {
-        tracing::warn!(%error, %session_id, "failed to flush transcript entries");
+    let write_cancel = cancel.child_token();
+    let _cancel_on_drop = write_cancel.clone().drop_guard();
+    match tokio::time::timeout(
+        WRITE_TIMEOUT,
+        store.append_transcript(session_id, &entries, write_cancel),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            health.failed_write();
+            tracing::warn!(%error, %session_id, "failed to flush transcript entries");
+        }
+        Err(_) => {
+            health.failed_write();
+            tracing::warn!(%session_id, "transcript write timed out");
+        }
     }
 }
 
@@ -285,6 +314,7 @@ async fn handle_transcript_event(
     session_id: Ulid,
     flush_cancel: &CancellationToken,
     gate_labels: &GateLabels,
+    health: &RecorderHealth,
 ) {
     let Some(entry) = transcript_entry_from_event_with_labels(&event.kind, gate_labels) else {
         return;
@@ -294,7 +324,7 @@ async fn handle_transcript_event(
         state.merge(entry);
         state.drain_batch()
     };
-    flush_entries(store, session_id, batch, flush_cancel).await;
+    flush_entries(store, session_id, batch, flush_cancel, health).await;
 }
 
 /// Filter events from other sessions and forward this session's events to the
@@ -306,6 +336,7 @@ async fn handle_bus_event(
     store: &Arc<dyn concerto_sessions::SessionStore>,
     flush_cancel: &CancellationToken,
     gate_labels: &GateLabels,
+    health: &RecorderHealth,
 ) {
     if event.session_id != session_id {
         tracing::debug!(
@@ -316,7 +347,8 @@ async fn handle_bus_event(
         );
         return;
     }
-    handle_transcript_event(&event, state, store, session_id, flush_cancel, gate_labels).await;
+    handle_transcript_event(&event, state, store, session_id, flush_cancel, gate_labels, health)
+        .await;
 }
 
 pub(crate) struct TranscriptRecorderGuard {
@@ -329,6 +361,8 @@ pub(crate) struct TranscriptRecorderGuard {
     store: Arc<dyn concerto_sessions::SessionStore>,
     session_id: Ulid,
     state: Arc<Mutex<TranscriptRecorderState>>,
+    health: Arc<RecorderHealth>,
+    bus: EventBus,
 }
 
 impl TranscriptRecorderGuard {
@@ -348,33 +382,29 @@ impl TranscriptRecorderGuard {
             state.pending.extend_from_slice(entries);
             state.drain_settled_prefix()
         };
-        flush_entries(&self.store, self.session_id, batch, &self.flush_cancel).await;
+        flush_entries(&self.store, self.session_id, batch, &self.flush_cancel, &self.health).await;
     }
 
     /// Stop the recorder: cancel the background task, let it drain any events
     /// still in flight, then settle still-`Running` tool calls and flush
     /// everything remaining in order.
-    pub(crate) async fn stop(self) {
-        self.finish(&[]).await;
+    pub(crate) async fn stop(self) -> RecorderOutcome {
+        self.finish(&[]).await
     }
 
     /// Drain bus messages before appending the final response. Follow-ups and
     /// progress replies must precede the answer even if the recorder has not
     /// been scheduled since the coordinator published them.
-    pub(crate) async fn finish(mut self, entries: &[TranscriptEntry]) {
-        self.cancel.cancel();
-        if let Some(task) = self.task.take() {
-            if let Err(error) = task.await {
-                tracing::warn!(%error, "transcript recorder task failed to stop cleanly");
-            }
-        }
+    pub(crate) async fn finish(mut self, entries: &[TranscriptEntry]) -> RecorderOutcome {
+        drain_task(&mut self.task, &self.health, &self.cancel).await;
         let batch = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             state.settle_running();
             state.pending.extend_from_slice(entries);
             std::mem::take(&mut state.pending)
         };
-        flush_entries(&self.store, self.session_id, batch, &self.flush_cancel).await;
+        flush_entries(&self.store, self.session_id, batch, &self.flush_cancel, &self.health).await;
+        self.health.persist(&self.store, self.session_id, &self.bus, CancellationToken::new()).await
     }
 }
 
@@ -412,7 +442,7 @@ pub(crate) fn start_transcript_recorder(
     session_id: Ulid,
     gate_labels: GateLabels,
 ) -> TranscriptRecorderGuard {
-    let mut receiver = bus.subscribe_durable();
+    let mut receiver = bus.subscribe_durable_for_session(session_id);
     let cancel = CancellationToken::new();
     let flush_cancel = CancellationToken::new();
     let state = Arc::new(Mutex::new(TranscriptRecorderState::new()));
@@ -421,17 +451,18 @@ pub(crate) fn start_transcript_recorder(
     let task_state = state.clone();
     let task_store = store.clone();
     let task_labels = gate_labels;
+    let health = Arc::new(RecorderHealth::new(RecorderKind::Transcript));
+    let task_health = health.clone();
     let task = tokio::spawn(async move {
-        let mut gap = GapLog::new("transcript-recorder");
+        let mut gap = GapLog::new("transcript-recorder", task_health.clone());
         loop {
             tokio::select! {
                 _ = task_cancel.cancelled() => {
-                    // Best-effort drain of events that were in flight when
-                    // cancellation was requested; the final flush in stop()
-                    // persists whatever remains buffered.
+                    // Freeze the queue before draining its retained suffix.
+                    receiver.close();
                     while let Ok(event) = receiver.try_recv() {
                         gap.observe(&receiver, session_id);
-                        handle_bus_event(event, session_id, &task_state, &task_store, &task_flush_cancel, &task_labels).await;
+                        handle_bus_event(event, session_id, &task_state, &task_store, &task_flush_cancel, &task_labels, &task_health).await;
                     }
                     gap.observe(&receiver, session_id);
                     break;
@@ -439,7 +470,7 @@ pub(crate) fn start_transcript_recorder(
                 received = receiver.recv() => match received {
                     Some(event) => {
                         gap.observe(&receiver, session_id);
-                        handle_bus_event(event, session_id, &task_state, &task_store, &task_flush_cancel, &task_labels).await;
+                        handle_bus_event(event, session_id, &task_state, &task_store, &task_flush_cancel, &task_labels, &task_health).await;
                     }
                     None => {
                         gap.observe(&receiver, session_id);
@@ -449,7 +480,16 @@ pub(crate) fn start_transcript_recorder(
             }
         }
     });
-    TranscriptRecorderGuard { cancel, flush_cancel, task: Some(task), store, session_id, state }
+    TranscriptRecorderGuard {
+        cancel,
+        flush_cancel,
+        task: Some(task),
+        store,
+        session_id,
+        state,
+        health,
+        bus: bus.clone(),
+    }
 }
 
 #[async_trait]

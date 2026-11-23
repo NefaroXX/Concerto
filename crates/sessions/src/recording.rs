@@ -70,7 +70,7 @@ fn gap_error(session_id: Ulid, dropped: u64) -> SessionError {
 
 impl EventRecording {
     pub fn start(bus: &EventBus, store: Arc<dyn SessionStore>, session_id: Ulid) -> Self {
-        let mut receiver = bus.subscribe_durable();
+        let mut receiver = bus.subscribe_durable_for_session(session_id);
         let stop = CancellationToken::new();
         let stopped = stop.clone();
         let dropped = Arc::new(AtomicU64::new(0));
@@ -80,27 +80,15 @@ impl EventRecording {
             loop {
                 let next = tokio::select! {
                     _ = stopped.cancelled() => {
+                        receiver.close();
                         while let Ok(event) = receiver.try_recv() {
                             gap.observe(receiver.dropped_events(), receiver.capacity());
                             if event.session_id == session_id {
                                 store.record_event(session_id, &event, CancellationToken::new()).await?;
                             }
                         }
-                        // Final observation before the task returns and drops
-                        // `receiver`. Dropping the receiver closes the queue;
-                        // after the flag flips, new `DurableSender::send` calls
-                        // see `closed` and return without pushing or counting
-                        // a drop. Any drop that already happened (including one
-                        // raced in during the drain) is visible here.
-                        //
-                        // Residual window: this read happens just before the
-                        // receiver drop, so a publisher that passes the closed
-                        // check and overflows between this observation and the
-                        // close can still be missed. `close` does not take the
-                        // queue lock, so a publisher already inside the
-                        // critical section can also count a drop just after the
-                        // flag flips. `finish` is best-effort for that in-flight
-                        // race; every drop observed here is fatal.
+                        // Closing before the drain freezes both the queued
+                        // suffix and its final drop count against publishers.
                         gap.observe(receiver.dropped_events(), receiver.capacity());
                         return Ok(());
                     }

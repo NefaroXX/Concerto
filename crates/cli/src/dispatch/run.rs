@@ -818,12 +818,23 @@ fn build_json(
         ),
         None => (Value::Array(Vec::new()), 0, 0, 0, 0.0),
     };
+    let recording = output.and_then(|output| output.recording_integrity.as_ref());
+    let recording_status = match recording {
+        Some(health) if health.is_complete() => "complete",
+        Some(_) => "incomplete",
+        None => "unknown",
+    };
     json!({
         "mode": mode,
         "status": status,
         "session_id": session_id.map(|id| id.to_string()),
         "run_id": run_id,
         "provider_error_class": provider_error_class,
+        "recording": {
+            "status": recording_status,
+            "event_log": recording.map(|health| &health.event_log),
+            "transcript": recording.map(|health| &health.transcript),
+        },
         "final_message": final_message,
         "files_modified": files,
         "tool_call_count": tools,
@@ -1616,11 +1627,58 @@ mod tests {
         assert_eq!(outcome.json["run_id"], Value::Null);
         assert_eq!(outcome.json["provider_error_class"], Value::Null);
         assert_eq!(outcome.report_json["tool_calls"], json!([]));
+        assert_eq!(outcome.json["recording"]["status"], "unknown");
         assert!(
             outcome.json["final_message"].as_str().is_some_and(|m| m.contains("no LLM provider")),
             "error message missing: {}",
             outcome.json
         );
+    }
+
+    #[tokio::test]
+    async fn recording_integrity_is_independent_of_task_completion_in_json_and_report() {
+        use concerto_core::recording::{RecorderKind, RecorderOutcome, RecordingIntegrity};
+        for dropped in [0, 7] {
+            let directory = TempDir::new().unwrap();
+            let (manager, _audit) = in_memory_manager().await;
+            let mut output = sample_partial();
+            output.completion_status = AgentCompletionStatus::Completed;
+            output.final_message = "all done".into();
+            output.recording_integrity = Some(RecordingIntegrity {
+                event_log: RecorderOutcome {
+                    recording_id: Ulid::new(),
+                    recorder: RecorderKind::EventLog,
+                    dropped_events: dropped,
+                    failed_writes: 0,
+                    recorder_failed: false,
+                    report_persisted: true,
+                },
+                transcript: RecorderOutcome {
+                    recording_id: Ulid::new(),
+                    recorder: RecorderKind::Transcript,
+                    dropped_events: 0,
+                    failed_writes: 0,
+                    recorder_failed: false,
+                    report_persisted: true,
+                },
+            });
+            let outcome = execute_with_runner(
+                options(directory.path(), "do it", true),
+                Arc::new(StaticRunner { output }),
+                AppConfig::default(),
+                Some(manager),
+            )
+            .await;
+            assert_eq!(outcome.status, "done");
+            assert_eq!(outcome.exit_code, EXIT_DONE);
+            assert_eq!(
+                outcome.json["recording"]["status"],
+                if dropped == 0 { "complete" } else { "incomplete" }
+            );
+            assert_eq!(outcome.json["recording"]["event_log"]["dropped_events"], dropped);
+            assert_eq!(outcome.report_json["recording"], outcome.json["recording"]);
+            assert_eq!(outcome.message.contains("Recording incomplete"), dropped > 0);
+        }
     }
 
     #[tokio::test]
@@ -2063,6 +2121,7 @@ mod tests {
             provider_metrics: Vec::new(),
             checkpoint_json: None,
             provider_error_class: None,
+            recording_integrity: None,
         }
     }
 }
