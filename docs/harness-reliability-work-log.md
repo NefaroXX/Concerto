@@ -3361,5 +3361,39 @@ Branch: `fix/harness-headless-history` (HEAD `34a09ee` before this change).
   tests (eight new plus existing settlement coverage); workspace formatting
   and all-target clippy with warnings denied passed. The full serialized local
   CI battery is running; retained logs use
-  `target/harness-reliability/round2-accounting-ci-*`. No remote validation is
-  claimed for these uncommitted changes.
+  `target/harness-reliability/round2-accounting-ci-*`. Accounting was checkpointed locally at `6a11791`; no remote validation is
+  claimed for that commit yet.
+
+## 2026-11-22 — Accounting validation and dependency gate repair
+
+- The first full accounting battery passed all 6,237 workspace tests (17
+  ignored), warnings-denied clippy, formatting, workspace and both frontend
+  builds, launcher/cache smoke checks, WASM guests and benchmark smoke tests.
+- Its supply-chain gate rejected `url 2.5.8` for RUSTSEC-2026-0592 (recursive
+  nested `blob:` origins can exhaust the stack). Raised the direct dependency
+  minimum to 2.5.9 and updated the lockfile; its required `form_urlencoded`
+  patch is the only accompanying version update. Cargo also remapped two
+  existing dependency edges (`gix-imara-diff` → `hashbrown 0.17.1`,
+  `prost-derive` → `itertools 0.14.0`) without introducing other versions.
+  No advisory suppression.
+- `cargo deny check`, `cargo audit` and the complete-audit wrapper now pass
+  with the patched lockfile. A fresh full CI-equivalent run is underway in
+  H40, with logs under `target/harness-reliability/round2-accounting-patched-ci-*`.
+  The earlier test pass is not treated as validation of the changed lockfile.
+
+## 2026-11-23 — Accounting and dependency milestone verified locally
+
+- Completed the fresh full local CI-equivalent battery on accounting fix
+  `6a11791` plus URL security patch `4f3e7e3`. All 18 stages exited zero: fmt,
+  warnings-denied workspace/all-target clippy, workspace tests and doc tests,
+  workspace build, default-launcher/config/cache smoke checks, desktop-only and
+  CLI-only builds and startup checks, four WASM guests, benchmark smoke, deny,
+  audit, complete-audit wrapper, palette check and Python script tests.
+- Workspace results: **6,237 passed, zero failed, 17 ignored**, across 87 test
+  groups. The ignored cases remain explicitly marked in the existing suite.
+  No compiler warnings. Logs and per-command exit codes are retained under
+  `target/harness-reliability/round2-accounting-patched-ci-*`.
+- R4/R6 are implemented and locally verified. Publication to PR #380 follows
+  this checkpoint; all twelve remote checks on the published head remain
+  required. R5 is implemented in the separate recording-integrity worktree,
+  with its own compilation and full validation still outstanding.
