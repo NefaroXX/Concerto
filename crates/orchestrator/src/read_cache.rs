@@ -11,16 +11,17 @@
 //!    range/glob/recursive/options — see [`plain_single_path_read`]);
 //! 2. the path canonicalizes to a key inside the project root (ADR-65 F5d) and
 //!    a clean row exists for it under the root's `project_root_hash` (F5c);
-//! 3. a fresh `stat` of the resolved path NOW matches the row's `size_bytes`
-//!    and `mtime_ms` (never trusting the watcher — re-statted per serve);
+//! 3. the requested path and cache key resolve to the same contained file
+//!    under filesystem-tool rules; current size/mtime match the observation
+//!    and a bounded disk read matches the cached bytes (never just metadata);
 //! 4. cached content is present AND `blake3(content) == content_hash`.
 //!
-//! The final gate lives at the call site, not here: `maybe_serve_read` proves
-//! the cache matches the disk, and the loop then re-runs the policy engine
-//! through the **advisory** path (ADR-65 F1a) and serves only on an explicit
-//! `Allow`, recording a `ServedFromCache` audit row (F1b). A non-`Allow`
-//! verdict falls through to normal execution, so a served read is never a
-//! policy-engine bypass.
+//! Call sites first evaluate the policy engine through its advisory path and
+//! attempt cache validation only for an explicit Allow. Thus validation never
+//! reads fresh disk bytes before that check. A successful serve records its own
+//! audit row; a non-Allow verdict or any cache miss uses normal execution.
+//! Later external writes remain possible: this is a read-time observation,
+//! not a filesystem lock or an atomic compare-and-write guarantee.
 
 use std::path::Path;
 

@@ -123,10 +123,13 @@ pub enum HarnessServiceError {
     /// The operation named no known harness tool.
     #[error("unknown harness operation: {0}")]
     UnknownOperation(String),
-    /// The checkpoint state (store/gate/stash) was not wired into this
-    /// service, so `checkpoint_restore` cannot run.
+    /// The checkpoint tooling is unavailable: either the checkpoint
+    /// store/gate was not wired into this service, or the backing tool was
+    /// never registered because the sessions database could not be opened.
     #[error(
-        "checkpoint restore is unavailable: no checkpoint store/gate is wired to this service"
+        "checkpoint operations are unavailable: the checkpoint store/sessions database is \
+         not available to this service (checkpoint_create, checkpoint_inspect, and \
+         checkpoint_restore cannot run)"
     )]
     CheckpointUnavailable,
     /// The executor refused or failed the operation (policy denial, missing
@@ -201,7 +204,7 @@ impl HarnessService {
         input: serde_json::Value,
         cancel: CancellationToken,
     ) -> Result<HarnessInvocation, HarnessServiceError> {
-        self.invoke_executor(CHECKPOINT_CREATE_TOOL_NAME, input, cancel).await
+        self.invoke_checkpoint(CHECKPOINT_CREATE_TOOL_NAME, input, cancel).await
     }
 
     /// `checkpoint_inspect`.
@@ -210,7 +213,7 @@ impl HarnessService {
         input: serde_json::Value,
         cancel: CancellationToken,
     ) -> Result<HarnessInvocation, HarnessServiceError> {
-        self.invoke_executor(CHECKPOINT_INSPECT_TOOL_NAME, input, cancel).await
+        self.invoke_checkpoint(CHECKPOINT_INSPECT_TOOL_NAME, input, cancel).await
     }
 
     /// `verify_run`.
@@ -312,6 +315,28 @@ impl HarnessService {
             MEMORY_INSPECT_TOOL_NAME => self.memory_inspect(input, cancel).await,
             other => Err(HarnessServiceError::UnknownOperation(other.to_string())),
         }
+    }
+
+    /// Dispatch a checkpoint tool unless the checkpoint tooling is genuinely
+    /// absent.
+    ///
+    /// A registered tool still dispatches without [`CheckpointAccess`] (the
+    /// registry/mock path); only the degraded standalone state — no access
+    /// *and* no registered tool, which happens when the sessions DB could not
+    /// be opened at startup — becomes a specific refusal instead of the
+    /// executor's misleading `tool not found` error.
+    async fn invoke_checkpoint(
+        &self,
+        tool_name: &str,
+        input: serde_json::Value,
+        cancel: CancellationToken,
+    ) -> Result<HarnessInvocation, HarnessServiceError> {
+        let registered =
+            self.executor.tool_definitions().iter().any(|definition| definition.name == tool_name);
+        if self.checkpoint.is_none() && !registered {
+            return Err(HarnessServiceError::CheckpointUnavailable);
+        }
+        self.invoke_executor(tool_name, input, cancel).await
     }
 
     pub(crate) async fn invoke_executor(
@@ -653,6 +678,15 @@ pub async fn build_standalone_harness_with_memory(
         None => (None, None),
     };
 
+    if access.is_none() {
+        tracing::warn!(
+            project_root = %project_root.display(),
+            "checkpoint tools unavailable: the sessions database could not be opened, so \
+             checkpoint_create/checkpoint_inspect were not registered and checkpoint_restore \
+             has no store"
+        );
+    }
+
     Ok(StandaloneHarness {
         service,
         checkpoint: access,
@@ -788,6 +822,52 @@ mod tests {
             assert_eq!(invocation.operation, operation);
             assert_eq!(invocation.data["probe"], operation);
         }
+    }
+
+    #[tokio::test]
+    async fn missing_checkpoint_tooling_is_a_specific_refusal() {
+        // The degraded standalone-harness state: no `CheckpointAccess` and no
+        // registered checkpoint tools (the sessions DB never opened).
+        let service = service_with(&[]);
+        for operation in [CHECKPOINT_INSPECT_TOOL_NAME, CHECKPOINT_CREATE_TOOL_NAME] {
+            let error = service
+                .invoke(operation, serde_json::json!({}), CancellationToken::new())
+                .await
+                .expect_err("absent checkpoint tooling is refused before execution");
+            assert!(
+                matches!(error, HarnessServiceError::CheckpointUnavailable),
+                "{operation} returned {error:?}"
+            );
+        }
+
+        let error = service
+            .checkpoint_inspect(
+                serde_json::json!({"checkpoint_id": "cp-1"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("inspect refused without checkpoint tooling");
+        let message = error.to_string();
+        assert!(message.contains("checkpoint store"), "message was {message:?}");
+        assert!(message.contains("sessions database"), "message was {message:?}");
+        assert!(!message.contains("tool not found"), "message was {message:?}");
+    }
+
+    #[tokio::test]
+    async fn registered_checkpoint_tool_dispatches_without_checkpoint_access() {
+        // A registry-supplied checkpoint tool (unit tests, alternate frontends)
+        // still dispatches when no `CheckpointAccess` is wired; the guard only
+        // catches the genuinely absent-tool degraded state.
+        let service = service_with(&[CHECKPOINT_INSPECT_TOOL_NAME]);
+        let invocation = service
+            .invoke(
+                CHECKPOINT_INSPECT_TOOL_NAME,
+                serde_json::json!({"probe": "registered"}),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("registered checkpoint tool dispatches");
+        assert_eq!(invocation.data["probe"], "registered");
     }
 
     #[tokio::test]

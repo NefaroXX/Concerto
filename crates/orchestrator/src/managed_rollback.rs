@@ -784,7 +784,6 @@ mod tests {
         registry.stop("p1", "agent-a", &cancel).await.expect("cleanup");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn qualified_db_restore_runs_through_executor_when_acknowledged() {
         let (_dir, db) = temp_memory_db().await;
@@ -920,7 +919,6 @@ mod tests {
         registry.stop("p1", "agent-a", &cancel).await.expect("cleanup");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn host_op_input_mismatch_fails_loudly() {
         let registry = Arc::new(ManagedProcessRegistry::new());

@@ -32,8 +32,9 @@ Concerto uses the following runtime contracts:
    A checkpoint is versioned and scoped by session, project, root task, run,
    objective, and source revision. Running tasks are reconciled to pending
    after a process restart.
-3. The durable event recorder consumes a lossless per-process queue. Broadcast
-   remains the low-latency UI fan-out and is not the persistence boundary.
+3. The durable event recorder consumes a bounded per-process queue (see
+   **Amendment (2026-11-17)**). Broadcast remains the low-latency UI fan-out and
+   is not the persistence boundary.
 4. The task graph and its completed results materialize the typed working
    memory supplied to specialists. Checkpoints include that snapshot.
 5. Context reduction is request-budget driven. It is a no-op below its trigger
@@ -49,7 +50,28 @@ Concerto uses the following runtime contracts:
 - Retrying transport cannot repeat completed tool side effects.
 - Continue can recover after restart without rerunning completed graph nodes or
   accepting a checkpoint from another project/session.
-- Live UI consumers may still lag, but durable replay remains complete.
+- Live UI consumers may still lag; the durable queue preserves retained events
+  but is no longer guaranteed complete under sustained consumer stalls (see
+  **Amendment (2026-11-17)**).
 - Specialist prompts receive smaller role-relevant projections and can be
   reconstructed consistently after restart.
+
+## Amendment (2026-11-17) — the durable event queue is bounded and overflow is counted
+
+The original decision called the durable recorder queue "lossless." It is now
+bounded at `DURABLE_QUEUE_CAPACITY = 8192` events per subscriber with
+drop-oldest overflow. Delivery is lossless only while the consumer keeps up: on
+overflow the oldest events are discarded, the retained suffix stays in publish
+order, and the cumulative loss is exposed as
+`DurableHealth::dropped_events`. The publisher never blocks on a stalled
+consumer, and `lagging` latches on overflow and clears when the backlog drains.
+The superseded `DURABLE_PENDING_LAG = 65536` threshold is gone.
+
+The session store remains authoritative for persistence. Consumers detect a
+gap by comparing `DurableEventReceiver::dropped_events()` across receive
+iterations: `EventRecording::finish` fails closed on an observed gap, the
+durable event and transcript recorders log a rate-limited error, and
+`--events-json` writes an `events_dropped` record before the next line. A
+consumer that needs a complete audit trail must drain fast enough or reconcile
+from the store; the event stream is not an unbounded lossless log.
 

@@ -78,6 +78,7 @@ fn fixture_agent(failures: usize, chunks: Vec<CompletionChunk>) -> GenericSpecia
 
 fn write_turn(id: &str, path: &str, content: &str) -> CompletionChunk {
     CompletionChunk {
+        gemini_replay: None,
         delta: "Continuing the change".into(),
         reasoning: None,
         tool_call: Some(ToolCall {
@@ -93,6 +94,7 @@ fn write_turn(id: &str, path: &str, content: &str) -> CompletionChunk {
 
 fn final_turn() -> CompletionChunk {
     CompletionChunk {
+        gemini_replay: None,
         delta: "The requested change is complete.".into(),
         reasoning: None,
         tool_call: None,
@@ -246,4 +248,184 @@ async fn requested_tool_without_executor_is_an_unfinished_task() {
     let finished = repaired.run(&task, context, "mock", CancellationToken::new()).await.unwrap();
     assert_eq!(finished.outcome, AgentOutcome::Success);
     assert_eq!(std::fs::read_to_string(dir.path().join("a.rs")).unwrap(), "fixed");
+}
+
+/// A tool that always reports the scripted approval pause.
+struct PauseTool;
+
+#[async_trait::async_trait]
+impl concerto_core::traits::tool::Tool for PauseTool {
+    fn name(&self) -> &str {
+        "publish"
+    }
+
+    fn description(&self) -> &str {
+        "Fixture tool that pauses for approval"
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+
+    fn capability_requirements(&self) -> CapabilitySet {
+        CapabilitySet::default()
+    }
+
+    async fn execute(
+        &self,
+        _input: serde_json::Value,
+        _policy: &dyn concerto_core::traits::policy::PolicyEngine,
+        _session: &concerto_core::types::SessionContext,
+        _cancel: CancellationToken,
+    ) -> Result<ToolOutput, concerto_core::ToolError> {
+        Err(concerto_core::ToolError::PausedAwaitingApproval {
+            tool_name: "publish".into(),
+            detail: "fixture pause".into(),
+            input_hash: "hash".into(),
+            correlation_id: concerto_core::ids::Ulid::new(),
+            timeout_secs: 0,
+        })
+    }
+}
+
+/// Emits each scripted batch as one provider stream. A batch may contain
+/// several tool-call chunks, modelling one assistant turn that requests
+/// multiple tools.
+struct BatchedProvider {
+    batches: std::sync::Mutex<std::collections::VecDeque<Vec<CompletionChunk>>>,
+}
+
+impl BatchedProvider {
+    fn new(batches: Vec<Vec<CompletionChunk>>) -> Self {
+        Self { batches: std::sync::Mutex::new(batches.into()) }
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for BatchedProvider {
+    async fn stream_completion(
+        &self,
+        _request: CompletionRequest,
+        _cancel: CancellationToken,
+    ) -> Result<
+        concerto_core::traits::provider::CompletionStream,
+        concerto_core::error::ProviderError,
+    > {
+        let batch = self
+            .batches
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pop_front()
+            .unwrap_or_else(|| vec![final_turn()]);
+        Ok(Box::pin(futures::stream::iter(batch.into_iter().map(Ok))))
+    }
+
+    fn context_capacity(&self, _model: &str) -> concerto_core::types::TokenBudget {
+        concerto_core::types::TokenBudget::new(8_192, 1_024)
+    }
+
+    fn approximate_cost(&self, _tokens_in: u64, _tokens_out: u64) -> f64 {
+        0.0
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "batched"
+    }
+}
+
+fn tool_turn(
+    id: &str,
+    name: &str,
+    arguments: serde_json::Value,
+    final_chunk: bool,
+) -> CompletionChunk {
+    CompletionChunk {
+        gemini_replay: None,
+        delta: "working".into(),
+        reasoning: None,
+        tool_call: Some(ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments,
+            ..Default::default()
+        }),
+        is_final: final_chunk,
+        usage: None,
+    }
+}
+
+#[tokio::test]
+async fn paused_tool_batch_keeps_prior_results_and_restores_the_unanswered_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = concerto_core::types::ToolRegistry::default();
+    registry.register(Box::new(FixtureWriteTool { failures: AtomicUsize::new(0) }));
+    registry.register(Box::new(PauseTool));
+    let executor = ToolExecutor::new(
+        Arc::new(registry),
+        Arc::new(concerto_core::policy::SimplePolicyEngine::new(
+            vec![PolicyRule::AutoApprove(Condition::Always)],
+            Arc::new(NullAudit),
+        )),
+    );
+    let provider = Arc::new(BatchedProvider::new(vec![vec![
+        tool_turn(
+            "write-call",
+            "write_file",
+            serde_json::json!({"path": "a.rs", "content": "retained"}),
+            false,
+        ),
+        tool_turn("pause-call", "publish", serde_json::json!({}), true),
+    ]]));
+    let agent = GenericSpecialistAgent::new(
+        AgentId::new("coder"),
+        "Coder".into(),
+        Some(AgentStage::new("implement")),
+        provider,
+        Some(Arc::new(executor)),
+        EventBus::new(128),
+        RetryPolicy::default(),
+        PromptSections::default(),
+        AgentCapabilities::default(),
+    );
+    let (task, context) = fixture_context(dir.path());
+    let history = context.agent_history.clone();
+
+    let error = agent
+        .run(&task, context, "mock", CancellationToken::new())
+        .await
+        .expect_err("the approval pause is not a completed run");
+    assert!(matches!(
+        error,
+        OrchestratorError::Tool(concerto_core::ToolError::PausedAwaitingApproval { .. })
+    ));
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.rs")).unwrap(),
+        "retained",
+        "the tool executed before the pause must remain on disk"
+    );
+    let produced = history.produced();
+    let assistant = produced
+        .iter()
+        .find(|message| message.role == Role::Assistant && message.tool_calls.is_some())
+        .expect("assistant turn retained");
+    assert_eq!(assistant.tool_calls.as_ref().map(Vec::len), Some(2));
+    let results = produced
+        .iter()
+        .flat_map(|message| message.tool_results.as_deref().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 1, "only the write result was observed: {produced:?}");
+    assert_eq!(results[0].id, "write-call");
+
+    let repaired = crate::provider_transcript::restore_tool_responses(produced);
+    let repaired_results = repaired
+        .iter()
+        .flat_map(|message| message.tool_results.as_deref().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(repaired_results.len(), 2, "every call needs an outcome: {repaired:?}");
+    let pause_result = repaired_results
+        .iter()
+        .find(|result| result.id == "pause-call")
+        .expect("unanswered call repaired");
+    assert_eq!(pause_result.content["status"], "outcome_unknown");
 }

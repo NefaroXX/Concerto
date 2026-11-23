@@ -343,6 +343,7 @@ mod tests {
             stable_system_prefix_bytes: None,
             messages: vec![
                 concerto_core::types::Message {
+                    gemini_replay: None,
                     role: concerto_core::types::Role::System,
                     content: "You are a test assistant.".into(),
                     tool_calls: None,
@@ -352,6 +353,7 @@ mod tests {
                     tokens_out: None,
                 },
                 concerto_core::types::Message {
+                    gemini_replay: None,
                     role: concerto_core::types::Role::User,
                     content: "Hello".into(),
                     tool_calls: None,

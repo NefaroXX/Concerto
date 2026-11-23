@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **In-process specialist spend attribution (H39b review).** `ProviderMetrics`
+  now carries an optional `agent_id` identifying the specialist/child that
+  consumed the tokens (`None` for root/coordinator or single-agent calls).
+  Coordinator specialist results stamp their role, and terminal spend
+  persistence copies that attribution into `SpendRecord.agent_id`; provider
+  metrics rows remain unattributed, and root settlement is still the only
+  writer for coordinator-path spend.
+- **Supervised child history and spend attribution (H39b step 3).** ADR-60
+  agent-process children now restore their prior typed conversation from a
+  parent-owned per-run file and append only the turns they complete, so a
+  supervisor restart resumes with the prior process's flushed history without
+  giving the child session-database access. The parent trims an unanswered
+  trailing tool call, the child rewrites any crash-left unanswered tail at
+  startup without dropping an in-flight call between periodic flushes, and
+  history is capped at 32 MiB (an oversized rewrite is refused without
+  damaging the existing file) and metrics at 4 MiB. Files are written
+  atomically with mode `0600` under a mode-`0700` directory, and the parent
+  harvests before the cancellation early return. Each child's metrics become
+  `provider_metrics` rows and `SpendRecord`s attributed to that child agent
+  with the run's root task; root settlement does not re-record them. The IPC
+  protocol is unchanged; terminal events gain an additive compact
+  `provider_metrics` payload.
+- **Agent-scoped message persistence and spend attribution (H39b foundation).**
+  The session store can now keep an independently sequenced message stream per
+  `(session_id, agent_id)` in the new `agent_messages` table, with the same
+  role/content/tool/reasoning/usage/Gemini-replay fidelity as root messages.
+  `SessionStore::append_agent_messages` / `load_agent_messages` are additive
+  methods whose defaults fail closed for stores without agent-scoped storage,
+  and root/agent streams are isolated in both directions. `SpendRecord` gains
+  an optional `agent_id` (backward-compatible; existing rows read as `None`)
+  so specialist costs can be attributed. That foundation change did not yet
+  wire specialist history, child history files or IPC.
+- **In-process specialist history restore/persist (H39b step 2).** The
+  multi-agent runner loads each role's previously completed turns from the
+  agent-scoped stream before dispatch and appends only the turns that dispatch
+  actually completed, even when the run is cancelled. Freeform and structured
+  submission agents record completed assistant/tool turns without re-recording
+  restored history, and a trailing unresolved tool call is never persisted as
+  provider history. Root conversation `messages` is untouched, history is
+  best-effort (load/write failures log and never fail a run), and supervised
+  child history files, spend attribution, and IPC changes remain out of scope.
 - **Integrated terminal inspection and editing.** Runtime topology and full
   evidence records, project-scoped memory exploration, structured settings,
   workspace file/context commands and Rust language queries now accompany the
@@ -109,8 +150,207 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unrelated staged files are retained. LSP replies are scoped to the originating
   document revision and cursor.
 
+### Changed
+
+- **Restored agent prompt history is bounded (H39b review).** In-process
+  specialist and supervised child restore seeds are trimmed to the most recent
+  512 messages, dropping leading tool results so a window never starts with an
+  orphaned result; assistant tool-call/result pairs inside the window are
+  preserved. This bounds prompt growth only — persisted agent-scoped message
+  rows still accumulate.
+
 ### Fixed
 
+- **Supervised child history keeps its harvest offset and hardens its files
+  (H39b review).** A child now receives the parent's exact seed message count
+  (`CONCERTO_AGENT_HISTORY_SEED_LEN`); startup trims its in-memory restore but
+  rewrites the accumulated file only when it grew past the seed, so an
+  externally truncated or seed-length file is never shrunk below the parent's
+  `initial_seed_len` slice (which previously dropped the first child turn).
+  The parent still warns loudly when the harvested file is shorter than
+  expected. History rewrites sync the temporary file before the atomic rename
+  (a sync failure fails the write and leaves the old file intact) and use a
+  ULID-bearing temporary name; metrics appends force mode `0600` even when
+  reopening an existing file. At the 4 MiB metrics cap, the sidecar now keeps
+  the contiguous prefix of whole lines that fits and logs the dropped count
+  instead of discarding the entire batch. Directory cleanup retries once and
+  logs the leaked path if both attempts fail. H39 remains open.
+- **Cancelled/errored runs persist provider metrics and spend exactly once.**
+  Terminal accounting no longer takes the run's cancellation token: the
+  persist helpers own a fresh token, so tokens/cost consumed before a
+  cancellation or error still reach `provider_metrics`, `spend_records` and
+  the session totals instead of being dropped by the store's cancellation
+  check. A run-scoped settlement latch is claimed before the writes so a run
+  writes its metrics/spend at most once even if a terminal tail is reached
+  twice; a partial write failure is logged and not retried (duplicate
+  telemetry is worse than a missing row). Specialist/process-scoped history
+  remains tracked under H39.
+- **Checkpoint tooling fails loudly and opens the sessions DB with a bounded
+  retry.** When the sessions database cannot be opened, the standalone harness
+  no longer leaves `checkpoint_create`/`checkpoint_inspect` unregistered and
+  reports the executor's misleading `tool not found`. The service now returns
+  a specific `CheckpointUnavailable` error naming the checkpoint
+  store/database before invoking, and the audit-pool open retries three times
+  (25 ms then 50 ms) while logging each failed attempt; degraded builds also
+  warn that checkpoint tools are unavailable. Registered checkpoint tools
+  still dispatch without a wired `CheckpointAccess`. The original intermittent
+  database-open failure was not reproduced.
+- **MCP probe timeouts are attributable and give the first stage a startup
+  allowance.** Child spawn is bounded separately, and `initialize` gets the
+  configured stage budget plus a bounded startup allowance because
+  `Command::spawn` returns after fork/exec while interpreter bootstrap is
+  observed by the first response; `tools/list` keeps the configured stage
+  budget. Probe failures name the stage and server, and a stage timeout stops
+  and reaps the child before the error is reported. Deterministic
+  delayed-`initialize` success and hung-`initialize` failure regressions cover
+  the behavior; the original intermittent stall was not reproduced and this
+  change does not claim to have proven its trigger.
+- **Incomplete subprocess capture cannot certify tests.** `ProcessOutput` now
+  records whether both streams were captured completely, and eval verdicts
+  refuse a passing prefix when the capture was truncated or a pipe read
+  failed (`EvalResult.incomplete`). `run_checked` keeps rejecting incomplete
+  evidence as a hard error.
+- **Root conversation recovery.** Persist original completed provider turns,
+  reasoning, native replay and each tool result through later failures and
+  cancellation. Preserve runtime verification and stop reasons as labeled
+  observations, with per-turn usage counted once. Interrupted call batches get
+  explicit unknown-outcome responses when history is assembled; historical
+  calls are never executed automatically. Status replies and errors retain
+  their separate rendered transcript. Specialist/process history recovery
+  remains tracked under H39.
+- **Headless multi-agent history.** One-shot multi-agent runs now give the
+  coordinator the persisted conversation as typed messages instead of a
+  clipped, role-flattened prose block. Long-preamble constraints and older
+  unresolved obligations survive, and earlier assistant turns keep their
+  role. Approved-plan executions still use the verified structured artifact
+  and decision ledger rather than an old rendered transcript.
+- **Settings CLI test isolation.** The settings command fixture is restricted
+  to Linux, whose XDG isolation it actually uses; on macOS the same code paths
+  can reach the real user profile. Linux behavioral coverage is retained.
+- **Gemini native response replay.** Retain original part order, signed text,
+  empty signed trailing parts and native function-call IDs through completion
+  collection and stored messages. Thought parts go to reasoning rather than
+  visible answer text. Replay capture is bounded and committed only for a
+  completed stream; edited canonical content cannot be overridden by stale
+  native parts. Independent specialist/process history remains tracked under H39.
+- **Instruction continuity through compaction.** Earlier user instructions and
+  assistant commitments retain their text, roles and order across durable
+  checkpoints. Provider context reduction preserves active task state and
+  rejects oversized mandatory conversation before sending it. Literal markers
+  in user text cannot authorize truncation. Historical tool payloads remain
+  reducible; text-only histories may reach explicit context overflow sooner.
+- **Native provider prompt preservation.** Anthropic and Gemini retain all
+  system messages, so checkpoint evidence cannot replace the policy prompt.
+  Gemini retains assistant text beside tool calls; Anthropic preserves the
+  first system message's cache prefix when checkpoints follow it.
+
+- **Complete security audit gate:** reject registry-check errors even when
+  cargo-audit returns zero, and update locked quinn-udp to 0.5.16 for
+  RUSTSEC-2026-0538 without changing the advisory exception policy.
+
+- **Coverage verification:** discover coverage tools through the configured
+  build shell, collect reports separately from diagnostics, and require
+  executed passing tests. Tarpaulin reports use the released field names;
+  malformed metrics, missing/stale reports and incomplete captured output
+  fail explicitly. Standalone and scoped coverage preserve cancellation and
+  deadlines, and Unicode diagnostics no longer panic.
+
+- **Cargo regression fixture isolation.** Give temporary test projects unique
+  package identities so parallel verification cannot run another fixture's
+  binary when `CARGO_TARGET_DIR` points to a shared build directory.
+
+- **Dependency footprint.** Remove unused API-server dependencies on the
+  orchestrator, old Axum integration and HTTP middleware, plus unused direct
+  serialization/ID declarations. Consolidate desktop directory lookups on the
+  workspace dependency and remove the orchestrator's unused older copy.
+
+- **Filesystem dependency soundness.** Update locked `rustix` to 1.1.6 for
+  RUSTSEC-2026-0486, which affects zero-length extended-attribute buffers.
+
+- **SQLite/SQLCipher security.** Upgrade the linked database engine for
+  RUSTSEC-2026-0459, including the encrypted database path, and verify the
+  runtime SQLite version in the native CI matrix. A vendored SQLx driver
+  manifest permits the patched binding without changing driver implementation.
+
+- **Dependency maintenance.** Update the locked WASM timer dependency to 0.4.5,
+  removing unmaintained `pin-utils` (RUSTSEC-2026-0441) and including the
+  upstream timer Arc leak fix.
+
+- **Multi-agent completion stages.** Partial runs and requests for user input
+  preserve the last stage reached instead of reporting Complete. Single-agent,
+  coordinator and supervised runs settle their stage from the returned status.
+
+- **Native CI builds.** Restrict the supervisor's Linux parent-death syscall
+  to Linux, enable portable rollback tests on Windows, and align Unix fixture
+  helpers with their tests. Required CI workflows use the Node 24 checkout
+  action, retaining warnings-as-errors.
+
+- **Benchmark validity.** Agent-driven fixtures now explicitly allow and audit
+  their tool calls. Tasks without optional file constraints can pass when
+  completed with passing tests; unreadable required content fails its checks.
+  Nine category task IDs are valid ULIDs, and every committed category is
+  covered by a corpus-loading regression.
+
+- **Read-version protection survives resumed runs.** Identified sessions retain
+  observed file hashes and absence claims across gate recreation. Unknown
+  legacy provenance and unavailable storage require rereading; stored claims
+  remain bounded and are removed with their session.
+- **Provider context guard counts replayable reasoning.** Large reasoning
+  payloads can no longer bypass the input budget behind short visible answers;
+  fitting requests retain their reasoning unchanged.
+- **Compaction budgets current content independently of historical usage.**
+  Prior prompt/completion counts no longer inflate or erase current context
+  size. The estimate includes replayable reasoning and structured tool payloads
+  without counting legacy tool display text twice; accounting stays unchanged.
+- **Structured JSON preserves Unicode data.** Both model-response parsers try
+  original JSON before repair. Fallback repair changes only smart delimiters
+  and nonbreaking whitespace outside strings, preserving punctuation in keys
+  and values across strict, fenced and prose-wrapped responses.
+- **Cached reads validate current bytes and native paths.** Metadata equality
+  no longer hides same-size external edits. Cache keys must resolve to the same
+  contained file as the requested tool path, including native backslash and
+  symlink behavior. Bounded byte validation runs after advisory policy Allow
+  and honors cancellation; uncertainty falls through to normal execution.
+- **Continuation rounds retain execution progress.** Action-required tasks can
+  finish after work done in earlier rounds without repeating writes. Tool-call
+  minimums accumulate across rounds and are enforced at completion; a capped
+  round with progress can continue. Counts remain scoped to one run, and
+  required verification still governs the completion result.
+- **Verification failures cannot report successful completion.** The single-agent
+  loop includes failures from earlier continuation rounds before publishing
+  completion. Denied, errored and cancelled checks remain Partial; required
+  verification must have a passing check. Matching rechecks can resolve failures,
+  while skipped/unavailable checks cannot erase them. An absent test harness is
+  reported as unavailable, distinct from a broken runner; normal answer-only
+  completion remains supported. Live events and persisted summaries agree with
+  the output status. The optional strict freshness gate remains separate.
+- **Gated writes retain the version the agent read.** Default claims use
+  session/agent-scoped read observations, including raw binary hashes, so an
+  intervening external edit is refused instead of adopted as the new base.
+  Rereads refresh only that agent's observations; successful text writes
+  advance its own base. The bounded ledger fails closed when full.
+- **Incomplete provider streams cannot complete a run or execute partial tool
+  calls.** Orchestrator collectors and the plugin completion host require a
+  final chunk. Premature orchestrator EOF follows bounded request retries;
+  Gemini accepts STOP followed by clean EOF while preserving trailing usage
+  and cancellation/transport errors.
+- **Rust verification requires executed tests.** Cargo validation runs the full
+  suite at the resolved manifest root instead of guessing test-name filters
+  from changed paths. Empty, ignored-only or unrecognized results cannot pass
+  on exit code alone; direct and governed runs share the same evidence check.
+- **VFS reads reflect external edits and deletions.** Clean VFS originals
+  now read current disk contents, including bounded and binary reads. Pending
+  edits, deletions and rejected diff restorations retain precedence; appends
+  and transfers use fresh sources without copying binary placeholder text.
+- **File writes preserve Unicode content exactly.** Filesystem writes and VFS
+  staging/appending no longer replace Unicode punctuation with ASCII. This
+  prevents valid JSON and source literals from being corrupted and preserves
+  existing text when appending. Text and byte writes both retain their content.
+- **Streamed provider events survive fragmented network delivery.** The shared
+  SSE parser retains event fields across chunks and treats a split CRLF pair
+  as one line ending, preventing lost text/tool-call payloads and premature
+  event dispatch. Regression tests cover every split point and byte-by-byte
+  delivery with Unicode, multiline data and keepalives.
 - **The write gate surfaces approvals instead of hard-denying them.**
   `WriteGate::run_gated` returned `GateError::Denied` for every
   `RequireApproval` verdict (ADR-60's interactive approval surfacing was
@@ -187,6 +427,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   had been broken by a signature change, so `concerto --cli` was unavailable and
   `--reduced-motion` was rejected as an unknown subcommand. Both fixed and now
   built and smoke-run in CI (`c7f68a6`).
+- **Declared MSRV now matches the locked dependency graph.** The workspace
+  `rust-version` is 1.94 instead of 1.88, because the locked sqlx 0.9.0 family
+  requires 1.94.0, opentelemetry-langfuse 0.7.0 requires 1.93.1, and
+  tree-sitter 0.27.1 requires 1.90. CI remains pinned to Rust 1.96.0; 1.88
+  support is no longer claimed.
 
 ### Added
 
@@ -216,6 +461,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a scheduled baseline-comparison tier (`10357cd`).
 
 ### Changed
+
+- **Durable event queues are bounded and gaps are surfaced.** Each durable
+  subscriber now has an 8192-event bounded queue with counted drop-oldest
+  overflow instead of an unbounded mpsc channel, so a stalled recorder or
+  `--events-json` writer can no longer grow memory without limit over a long
+  session. `DurableHealth::dropped_events` and the receiver-level
+  `DurableEventReceiver::dropped_events()`/`capacity()` accessors expose the
+  cumulative loss; overflow is logged at a rate-limited cadence and lag clears
+  when the backlog drains. `EventRecording::finish` fails closed when the
+  session recorder observed a gap, the durable event and transcript recorders
+  log a rate-limited error, and `--events-json` writes an `events_dropped`
+  record. Delivery remains lossless while a consumer keeps up; retained events
+  stay in publish order.
+
+- **Dependency graph trimmed.** Removed 37 unused direct dependencies and six
+  redundant duplicate declarations across the workspace manifests. The
+  lockfile drops two dev-only packages (`opentelemetry-stdout`, `tokio-test`);
+  retained dependency versions and feature declarations are unchanged, and no
+  `deny.toml` policy or suppression was touched. The 67 remaining duplicate
+  families are upstream-gated or platform-specific.
 
 - **Cache-friendly single-agent prompt shape (ADR-48).** With
   `[context] cache_stable_prefix = true`, the single-agent loop builds its
@@ -669,6 +934,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Updated transitive async-executor to 1.14.1, fixing the executor-drop
+  use-after-free regression and removing the yanked 1.14.0 lockfile entry.
+- Raised the Wasmtime 36 LTS minimum to 36.0.20 for RUSTSEC-2026-0424
+  (unbounded memory usage when transferring borrowed component resources).
+  The plugin host retains its minimal async/Cranelift features, with the
+  component model, Winch and pooling allocator disabled; memory64 stays off.
+  No advisory exception was added.
 - Updated the plugin runtime to Wasmtime 36.0.19 LTS for the Cranelift fixes
   in RUSTSEC-2026-0379/0380, and retired all eight Wasmtime audit exceptions.
   Memory64 remains disabled; tests enforce the 64 MiB allocation/growth limit.

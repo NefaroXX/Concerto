@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 
 // ---- providers (Phase 1) --------------------------------------------------
@@ -114,6 +115,9 @@ pub enum Role {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
+    /// Original Gemini parts, valid only while the canonical response is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gemini_replay: Option<crate::provider_replay::GeminiReplay>,
     pub role: Role,
     pub content: String,
     pub tool_calls: Option<Vec<ToolCall>>,
@@ -147,6 +151,9 @@ pub struct Message {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionChunk {
+    /// Native replay state, published only with a completed response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gemini_replay: Option<crate::provider_replay::GeminiReplay>,
     pub delta: String,
     pub reasoning: Option<String>,
     pub tool_call: Option<ToolCall>,
@@ -176,6 +183,7 @@ impl CompletionChunk {
     /// representation is this constructor, not an enum variant.
     pub fn keepalive() -> Self {
         Self {
+            gemini_replay: None,
             delta: String::new(),
             reasoning: None,
             tool_call: None,
@@ -277,6 +285,13 @@ impl TokenBudget {
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ProviderMetrics {
+    /// The specialist/child agent that consumed these tokens.
+    ///
+    /// `None` means the root coordinator (or a single-agent run) is the
+    /// consumer. The parent stamps child attribution explicitly when writing
+    /// spend; `record_metrics` rows stay unattributed.
+    #[serde(default)]
+    pub agent_id: Option<String>,
     pub provider: String,
     pub model: String,
     pub tokens_in: u64,
@@ -1859,6 +1874,11 @@ pub struct EvalResult {
     /// Optional coverage measurement collected alongside the test run.
     #[serde(default)]
     pub coverage: Option<CoverageInfo>,
+    /// True when the captured process output was incomplete (a stream was
+    /// truncated at the capture limit or a pipe read failed). A passing
+    /// prefix cannot certify a run whose later evidence was discarded.
+    #[serde(default)]
+    pub incomplete: bool,
     /// Where this result came from: the project's detected harness, or the
     /// plain `cargo test` fallback used when no eval config was found.
     #[serde(default)]
@@ -2310,6 +2330,151 @@ pub struct AgentRunResult {
 
 // ---- Phase 5: AgentContext --------------------------------------------------
 
+/// In-process specialist conversation history (H39b).
+///
+/// `seed` holds prior completed turns restored from an agent-scoped store
+/// before a run; it is prompt context only and is never written back.
+/// `produced` collects the completed turns this run actually created, so a
+/// caller can persist exactly the delta after the run. Restored turns are
+/// therefore never duplicated into the agent stream, and root conversation
+/// `messages` are never touched.
+///
+/// `produced` is run-local: it starts empty even when `seed` is non-empty and
+/// is shared through a clone (the runner keeps a handle while the agent owns
+/// the cloned context).
+#[derive(Debug, Clone, Default)]
+pub struct AgentHistory {
+    seed: Vec<Message>,
+    produced: Arc<Mutex<Vec<Message>>>,
+    usage: Arc<Mutex<AgentRunUsage>>,
+}
+
+/// Usage accumulated by completed provider requests during one in-process
+/// specialist run.
+///
+/// The history object is shared by every clone of the run's `AgentContext`,
+/// so the agent can keep incrementing usage while `AgentRunner` reads the same
+/// accumulator after the run, including when the agent returns an error. Cost
+/// is accumulated per completed request (using the provider's own pricing), so
+/// a later provider failure never refunds the tokens already consumed.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AgentRunUsage {
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub cost_usd: f64,
+    pub measured_requests: u32,
+}
+
+/// Maximum number of restored messages kept in an in-process agent prompt seed.
+///
+/// This bounds prompt growth only: the agent-scoped session stream
+/// (`agent_messages`) still accumulates every completed turn. Trimming the
+/// seed keeps a long-lived specialist from growing its prompt without bound
+/// while preserving the most recent turns that matter for continuity.
+pub const MAX_AGENT_HISTORY_MESSAGES: usize = 512;
+
+/// Bound a restored agent history seed to the most recent
+/// [`MAX_AGENT_HISTORY_MESSAGES`] messages.
+///
+/// Over the cap, the oldest messages are discarded first, then leading
+/// `Role::Tool` messages are dropped so the kept window never begins with an
+/// orphaned tool result. Assistant tool calls and their results that lie
+/// wholly inside the kept window are preserved in order. At or below the cap
+/// this is a no-op (the seed is returned unchanged, including any leading
+/// tool message an explicit test supplied).
+///
+/// This bounds prompt growth, not persisted database rows.
+pub fn bound_agent_history_seed(mut seed: Vec<Message>) -> Vec<Message> {
+    if seed.len() <= MAX_AGENT_HISTORY_MESSAGES {
+        return seed;
+    }
+    seed.drain(..seed.len() - MAX_AGENT_HISTORY_MESSAGES);
+    let leading_tool_messages =
+        seed.iter().take_while(|message| message.role == Role::Tool).count();
+    if leading_tool_messages > 0 {
+        seed.drain(..leading_tool_messages);
+    }
+    seed
+}
+
+impl AgentHistory {
+    /// Build history with restored prior turns as prompt context, bounded to
+    /// [`MAX_AGENT_HISTORY_MESSAGES`].
+    pub fn with_seed(seed: Vec<Message>) -> Self {
+        Self::with_seed_bounded(seed)
+    }
+
+    /// Build history with a restored seed bounded to
+    /// [`MAX_AGENT_HISTORY_MESSAGES`] messages.
+    ///
+    /// See [`bound_agent_history_seed`] for the trimming rules. The bound is
+    /// prompt-only; persisted agent history continues to accumulate.
+    pub fn with_seed_bounded(seed: Vec<Message>) -> Self {
+        Self {
+            seed: bound_agent_history_seed(seed),
+            produced: Arc::new(Mutex::new(Vec::new())),
+            usage: Arc::new(Mutex::new(AgentRunUsage::default())),
+        }
+    }
+
+    /// Restored prior turns, in stream order.
+    pub fn seeded(&self) -> &[Message] {
+        &self.seed
+    }
+
+    /// Append `messages[recorded_len..]` to the produced turns and advance
+    /// `recorded_len` to `messages.len()`.
+    ///
+    /// `recorded_len` is an index into the same `messages` vector, so callers
+    /// start it after any restored seed to avoid re-recording those turns.
+    /// Lock poisoning is tolerated: a panic elsewhere must not lose an
+    /// already-completed turn or abort the run.
+    pub fn record_from(&self, messages: &[Message], recorded_len: &mut usize) {
+        let start = (*recorded_len).min(messages.len());
+        if start < messages.len() {
+            let delta = &messages[start..];
+            match self.produced.lock() {
+                Ok(mut produced) => produced.extend_from_slice(delta),
+                Err(poisoned) => poisoned.into_inner().extend_from_slice(delta),
+            }
+        }
+        *recorded_len = messages.len();
+    }
+
+    /// Clone of the completed turns produced by this run (never the seed).
+    pub fn produced(&self) -> Vec<Message> {
+        match self.produced.lock() {
+            Ok(produced) => produced.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Record one completed provider request's measured/estimated usage and
+    /// its provider-priced cost. Called as each turn completes so a later
+    /// provider error cannot refund tokens already consumed.
+    pub fn record_usage(&self, tokens_in: u64, tokens_out: u64, cost_usd: f64) {
+        let update = |usage: &mut AgentRunUsage| {
+            usage.tokens_in = usage.tokens_in.saturating_add(tokens_in);
+            usage.tokens_out = usage.tokens_out.saturating_add(tokens_out);
+            usage.cost_usd += cost_usd;
+            usage.measured_requests = usage.measured_requests.saturating_add(1);
+        };
+        match self.usage.lock() {
+            Ok(mut usage) => update(&mut usage),
+            Err(poisoned) => update(&mut poisoned.into_inner()),
+        }
+    }
+
+    /// Usage accumulated by completed provider requests in this run. A clone
+    /// shares the underlying accumulator with the agent's context.
+    pub fn usage(&self) -> AgentRunUsage {
+        match self.usage.lock() {
+            Ok(usage) => *usage,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+}
+
 /// Context passed to an expert agent when it runs.
 #[derive(Debug, Clone)]
 pub struct AgentContext {
@@ -2357,6 +2522,12 @@ pub struct AgentContext {
     /// are attributable to a run — **never inferred**: `None` when the caller
     /// has no run concept (single-agent loop).
     pub run_id: Option<String>,
+    /// H39b: specialist conversation history for this dispatch.
+    ///
+    /// Restored prior turns are prompt context only; new completed turns are
+    /// recorded here for the caller to persist to the agent-scoped stream.
+    /// Neither direction touches the root conversation history.
+    pub agent_history: AgentHistory,
 }
 
 impl AgentContext {
@@ -2381,6 +2552,7 @@ impl AgentContext {
             environment_manifest_digest: None,
             workspace_generation: None,
             run_id: None,
+            agent_history: AgentHistory::default(),
         }
     }
 }
@@ -3251,6 +3423,7 @@ mod tests {
     #[test]
     fn message_default_fields() {
         let msg = Message {
+            gemini_replay: None,
             role: Role::User,
             content: "hello".into(),
             tool_calls: None,
@@ -3270,6 +3443,7 @@ mod tests {
     fn message_serde_round_trip_with_and_without_reasoning() {
         // Without reasoning (legacy path): field serializes as null.
         let plain = Message {
+            gemini_replay: None,
             role: Role::Assistant,
             content: "ok".into(),
             tool_calls: None,
@@ -3285,6 +3459,7 @@ mod tests {
 
         // With reasoning: field round-trips.
         let thinking = Message {
+            gemini_replay: None,
             role: Role::Assistant,
             content: "answer".into(),
             tool_calls: None,
@@ -3313,6 +3488,7 @@ mod tests {
     fn message_token_counters_serde_round_trip() {
         // Measured usage persists and round-trips (ADR-48 §4).
         let with_usage = Message {
+            gemini_replay: None,
             role: Role::Assistant,
             content: "measured".into(),
             tool_calls: None,
@@ -3328,6 +3504,7 @@ mod tests {
 
         // `None` must not mean `0`: unknown usage stays distinctly unknown.
         let unknown = Message {
+            gemini_replay: None,
             role: Role::User,
             content: "unknown".into(),
             tool_calls: None,
@@ -3518,6 +3695,7 @@ mod tests {
             duration_ms: 12,
             output_tail: "ok".into(),
             coverage: None,
+            incomplete: false,
             provenance: EvalProvenance::Fallback,
         };
         let record = VerificationSummary::passed("src/lib.rs", "eval", "eval harness passed")
@@ -3651,5 +3829,195 @@ mod tests {
             .with_generation("gen-1")
             .with_evidence_ids(vec!["evt-1".to_string()]);
         assert!(passing.is_passing_evidence(), "a full-stamped pass remains evidence");
+    }
+
+    // ---- AgentHistory (H39b) ------------------------------------------------
+
+    fn history_message(role: Role, content: &str) -> Message {
+        Message {
+            gemini_replay: None,
+            role,
+            content: content.to_string(),
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: None,
+            tokens_in: None,
+            tokens_out: None,
+        }
+    }
+
+    fn produced_contents(history: &AgentHistory) -> Vec<String> {
+        history.produced().into_iter().map(|message| message.content).collect()
+    }
+
+    #[test]
+    fn agent_history_seeded_turns_are_visible_but_not_produced() {
+        let seed = vec![
+            history_message(Role::User, "prior question"),
+            history_message(Role::Assistant, "prior answer"),
+        ];
+        let history = AgentHistory::with_seed(seed.clone());
+
+        let seeded = history.seeded();
+        assert_eq!(seeded.len(), seed.len());
+        assert_eq!(seeded[0].content, "prior question");
+        assert_eq!(seeded[1].content, "prior answer");
+        assert!(history.produced().is_empty(), "restored turns are seed, not produced");
+    }
+
+    #[test]
+    fn agent_history_record_from_appends_only_the_unrecorded_delta() {
+        let history = AgentHistory::default();
+        let messages =
+            vec![history_message(Role::User, "first"), history_message(Role::Assistant, "second")];
+        let mut recorded = 0;
+
+        history.record_from(&messages, &mut recorded);
+        assert_eq!(recorded, 2);
+        assert_eq!(produced_contents(&history), vec!["first", "second"]);
+
+        // A second call over the same slice must not re-record anything.
+        history.record_from(&messages, &mut recorded);
+        assert_eq!(recorded, 2);
+        assert_eq!(produced_contents(&history), vec!["first", "second"]);
+    }
+
+    #[test]
+    fn agent_history_record_from_empty_delta_is_a_noop() {
+        let history = AgentHistory::default();
+        let messages = vec![history_message(Role::User, "only")];
+        let mut recorded = messages.len();
+
+        history.record_from(&messages, &mut recorded);
+
+        assert_eq!(recorded, messages.len());
+        assert!(history.produced().is_empty(), "nothing new to record");
+    }
+
+    #[test]
+    fn agent_history_record_from_accumulates_two_shots_without_duplicates() {
+        let history = AgentHistory::default();
+        let first = vec![history_message(Role::User, "first")];
+        let mut recorded = 0;
+        history.record_from(&first, &mut recorded);
+
+        let second =
+            vec![history_message(Role::User, "first"), history_message(Role::Assistant, "second")];
+        history.record_from(&second, &mut recorded);
+
+        assert_eq!(recorded, 2);
+        assert_eq!(produced_contents(&history), vec!["first", "second"]);
+    }
+
+    #[test]
+    fn agent_history_record_from_starts_after_restored_seed() {
+        let history = AgentHistory::with_seed(vec![history_message(Role::User, "restored")]);
+        let mut messages = history.seeded().to_vec();
+        let mut recorded = messages.len();
+        messages.push(history_message(Role::User, "new prompt"));
+
+        history.record_from(&messages, &mut recorded);
+
+        assert_eq!(produced_contents(&history), vec!["new prompt"]);
+    }
+
+    fn history_tool_call_message(content: &str) -> Message {
+        let mut message = history_message(Role::Assistant, content);
+        message.tool_calls = Some(vec![ToolCall {
+            id: "call-1".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({ "path": "a.rs" }),
+            thought_signature: None,
+        }]);
+        message
+    }
+
+    fn history_tool_result_message(content: &str) -> Message {
+        let mut message = history_message(Role::Tool, content);
+        message.tool_results = Some(vec![ToolResult {
+            id: "call-1".into(),
+            name: "read".into(),
+            content: serde_json::json!({ "ok": true }),
+        }]);
+        message
+    }
+
+    #[test]
+    fn agent_history_bounded_seed_keeps_the_last_cap_and_ordering() {
+        let seed: Vec<Message> = (0..600)
+            .map(|index| history_message(Role::User, &format!("message {index}")))
+            .collect();
+
+        let history = AgentHistory::with_seed_bounded(seed);
+
+        let bounded = history.seeded();
+        assert_eq!(bounded.len(), MAX_AGENT_HISTORY_MESSAGES);
+        assert_eq!(bounded[0].content, "message 88", "oldest messages are dropped first");
+        assert_eq!(bounded[511].content, "message 599");
+        for (offset, message) in bounded.iter().enumerate() {
+            assert_eq!(
+                message.content,
+                format!("message {}", 88 + offset),
+                "ordering is unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_history_bounded_seed_drops_leading_tool_results() {
+        let mut seed = vec![
+            history_message(Role::User, "old 1"),
+            history_message(Role::User, "old 2"),
+            history_message(Role::User, "old 3"),
+            history_tool_result_message("orphaned result 1"),
+            history_tool_result_message("orphaned result 2"),
+            history_tool_result_message("orphaned result 3"),
+            history_tool_call_message("read a.rs"),
+            history_tool_result_message("ok a.rs"),
+        ];
+        seed.extend((0..507).map(|index| history_message(Role::User, &format!("tail {index}"))));
+        assert_eq!(seed.len(), 515);
+        assert_eq!(
+            seed.len() - MAX_AGENT_HISTORY_MESSAGES,
+            3,
+            "the three oldest turns are trimmed"
+        );
+
+        let bounded = bound_agent_history_seed(seed);
+
+        assert_eq!(bounded.len(), MAX_AGENT_HISTORY_MESSAGES - 3);
+        assert_eq!(
+            bounded[0].role,
+            Role::Assistant,
+            "window does not start with an orphaned tool result"
+        );
+        assert!(bounded[0].tool_calls.is_some(), "in-window assistant tool call survives");
+        assert_eq!(bounded[1].role, Role::Tool);
+        assert!(bounded[1].tool_results.is_some(), "its tool result survives");
+        assert_eq!(bounded[2].content, "tail 0");
+        assert_eq!(bounded[508].content, "tail 506");
+    }
+
+    #[test]
+    fn agent_history_bounded_seed_is_a_noop_at_or_below_the_cap() {
+        let mut at_cap: Vec<Message> = (0..MAX_AGENT_HISTORY_MESSAGES)
+            .map(|index| history_message(Role::User, &format!("m{index}")))
+            .collect();
+        at_cap[0] = history_tool_result_message("leading tool result");
+
+        let bounded = bound_agent_history_seed(at_cap.clone());
+        assert_eq!(bounded.len(), MAX_AGENT_HISTORY_MESSAGES);
+        assert_eq!(bounded[0].role, Role::Tool, "at the cap the seed is untouched");
+        assert_eq!(bounded[0].content, "leading tool result");
+        for (bounded_message, original) in bounded.iter().zip(at_cap.iter()) {
+            assert_eq!(bounded_message.role, original.role);
+            assert_eq!(bounded_message.content, original.content);
+        }
+
+        let below_cap = vec![history_message(Role::User, "only")];
+        let bounded_below = bound_agent_history_seed(below_cap);
+        assert_eq!(bounded_below.len(), 1);
+        assert_eq!(bounded_below[0].role, Role::User);
+        assert_eq!(bounded_below[0].content, "only");
     }
 }

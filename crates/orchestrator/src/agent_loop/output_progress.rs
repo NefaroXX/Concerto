@@ -8,7 +8,10 @@
 //! No event bus, checkpoint, policy, session store, or async I/O appears in
 //! any body — call sites in `agent_loop.rs` pass all context explicitly.
 
-use concerto_core::types::{AgentOutput, ToolExecutionSummary, VerificationOutcome};
+use concerto_core::types::{
+    AgentOutput, AgentTask, TaskExecutionMode, ToolExecutionSummary, VerificationOutcome,
+    VerificationSummary,
+};
 /// Snapshot of progress used to detect non-convergence across continuation
 /// rounds (two identical fingerprints in a row ⇒ no real forward motion).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -54,17 +57,7 @@ pub(super) fn merge_run_progress(accumulated: &mut AgentOutput, latest: &AgentOu
     accumulated.tool_call_count =
         accumulated.tool_call_count.saturating_add(latest.tool_call_count);
     accumulated.tool_events.extend(latest.tool_events.clone());
-    for check in &latest.verification {
-        if let Some(existing) = accumulated
-            .verification
-            .iter_mut()
-            .find(|existing| existing.path == check.path && existing.command == check.command)
-        {
-            *existing = check.clone();
-        } else {
-            accumulated.verification.push(check.clone());
-        }
-    }
+    merge_verification(&mut accumulated.verification, &latest.verification);
     accumulated.final_message = latest.final_message.clone();
     accumulated.eval_result = latest.eval_result.clone();
     accumulated.completion_status = latest.completion_status;
@@ -73,6 +66,77 @@ pub(super) fn merge_run_progress(accumulated: &mut AgentOutput, latest: &AgentOu
     if latest.project_root.is_some() {
         accumulated.project_root = latest.project_root.clone();
     }
+}
+
+/// Carry unresolved checks across rounds; only the same verifier and scope
+/// can supersede an earlier result. A different check's pass cannot erase it.
+pub(super) fn merge_verification(
+    accumulated: &mut Vec<VerificationSummary>,
+    latest: &[VerificationSummary],
+) {
+    for check in latest {
+        let conclusive =
+            check.outcome == Some(VerificationOutcome::Passed) || check_prevents_completion(check);
+        accumulated.retain(|existing| {
+            let same_check = existing.path == check.path
+                && existing.command == check.command
+                && existing.verifier == check.verifier
+                && existing.scope == check.scope;
+            // A skipped/unavailable recheck cannot establish that a previous
+            // failure was repaired. Retain that unresolved failure alongside
+            // the latest gap until a conclusive recheck replaces both.
+            !same_check || (!conclusive && check_prevents_completion(existing))
+        });
+        accumulated.push(check.clone());
+    }
+}
+
+fn check_prevents_completion(record: &VerificationSummary) -> bool {
+    record.computed_inconsistent()
+        || matches!(
+            record.outcome,
+            Some(
+                VerificationOutcome::Failed
+                    | VerificationOutcome::Error
+                    | VerificationOutcome::Cancelled
+            )
+        )
+}
+
+/// Basic completion honesty for checks produced during this run. This does
+/// not certify freshness: the opt-in strict gate still checks fingerprints,
+/// generation and provenance. Never use legacy display-only `passed` flags
+/// to satisfy a required check, and never let one pass hide another failure.
+pub(super) fn verification_completion_blocker(
+    task: &AgentTask,
+    output: &AgentOutput,
+) -> Option<String> {
+    if output.eval_result.as_ref().is_some_and(|result| !result.passed) {
+        return Some("project tests did not pass".to_owned());
+    }
+    if let Some(record) =
+        output.verification.iter().find(|record| check_prevents_completion(record))
+    {
+        return Some(format!(
+            "{} for {}: {}",
+            record.command,
+            record.path,
+            if record.computed_inconsistent() {
+                "inconsistent verification result"
+            } else {
+                crate::verify::verification_ledger_label(record)
+            },
+        ));
+    }
+    let required = matches!(
+        task.execution_mode,
+        TaskExecutionMode::ActionRequired { require_verification: true, .. }
+    );
+    let ran_and_passed = output.eval_result.as_ref().is_some_and(|result| result.passed)
+        || output.verification.iter().any(|record| {
+            record.outcome == Some(VerificationOutcome::Passed) && !record.computed_inconsistent()
+        });
+    (required && !ran_and_passed).then(|| "required verification has no passing check".to_owned())
 }
 
 /// Number of successful, audited file-changing tool calls recorded in
@@ -357,5 +421,65 @@ mod tests {
         let instruction = continuation_instruction(reason);
         assert!(instruction.contains(reason));
         assert_eq!(instruction.matches(reason).count(), 1);
+    }
+
+    #[test]
+    fn completion_legacy_and_inconsistent_passes_do_not_satisfy_required_checks() {
+        let task = AgentTask::new_action_required(Ulid::new(), "verify output");
+        let mut legacy = VerificationSummary::passed("a.rs", "check", "legacy pass");
+        legacy.outcome = None;
+        let mut inconsistent = VerificationSummary::passed("a.rs", "check", "bad pass");
+        inconsistent.passed = false;
+        for record in [legacy, inconsistent] {
+            let mut output = empty_output();
+            output.verification = vec![record];
+            assert!(verification_completion_blocker(&task, &output).is_some());
+        }
+    }
+
+    #[test]
+    fn completion_rechecks_only_supersede_matching_verifiers_and_scopes() {
+        let task = AgentTask::new(Ulid::new(), "inspect output");
+        let failed = VerificationSummary::failed("a.html", "check", "broken")
+            .with_verifier("references")
+            .with_scope("a.html");
+        let unrelated = VerificationSummary::passed("a.html", "check", "syntax ok")
+            .with_verifier("syntax")
+            .with_scope("a.html");
+        let mut output = empty_output();
+        output.verification = vec![failed];
+        merge_verification(&mut output.verification, &[unrelated]);
+        assert_eq!(output.verification.len(), 2);
+        assert!(verification_completion_blocker(&task, &output).is_some());
+        let other_scope = VerificationSummary::passed("a.html", "check", "elsewhere ok")
+            .with_verifier("references")
+            .with_scope("elsewhere.html");
+        merge_verification(&mut output.verification, &[other_scope]);
+        assert!(verification_completion_blocker(&task, &output).is_some());
+        let recheck = VerificationSummary::passed("a.html", "check", "fixed")
+            .with_verifier("references")
+            .with_scope("a.html");
+        merge_verification(&mut output.verification, &[recheck]);
+        assert_eq!(output.verification.len(), 3);
+        assert!(verification_completion_blocker(&task, &output).is_none());
+    }
+
+    #[test]
+    fn completion_skipped_rechecks_cannot_erase_unresolved_failures() {
+        let task = AgentTask::new(Ulid::new(), "inspect output");
+        for gap in [VerificationOutcome::Skipped, VerificationOutcome::Unavailable] {
+            let failed = VerificationSummary::failed("a.rs", "check", "broken");
+            let unavailable = VerificationSummary::new("a.rs", "check", gap, "not rechecked");
+            let mut output = empty_output();
+            output.verification = vec![failed];
+            merge_verification(&mut output.verification, std::slice::from_ref(&unavailable));
+            merge_verification(&mut output.verification, &[unavailable]);
+            assert_eq!(output.verification.len(), 2, "repeated gaps do not duplicate records");
+            assert!(verification_completion_blocker(&task, &output).is_some());
+            let fixed = VerificationSummary::passed("a.rs", "check", "rechecked");
+            merge_verification(&mut output.verification, &[fixed]);
+            assert_eq!(output.verification.len(), 1);
+            assert!(verification_completion_blocker(&task, &output).is_none());
+        }
     }
 }

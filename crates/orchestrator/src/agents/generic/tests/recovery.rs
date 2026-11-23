@@ -42,6 +42,7 @@ impl LlmProvider for RecoveryProvider {
 
 fn turn(id: &str, tool: &str, arguments: serde_json::Value) -> CompletionChunk {
     CompletionChunk {
+        gemini_replay: None,
         delta: "Execute the next required operation".into(),
         tool_call: Some(ToolCall {
             id: id.into(),
@@ -231,6 +232,7 @@ async fn real_specialist_recovers_failed_check_from_disk_without_repeating_effec
             ),
             check(),
             CompletionChunk {
+                gemini_replay: None,
                 delta: "Repaired and verified".into(),
                 is_final: true,
                 reasoning: None,

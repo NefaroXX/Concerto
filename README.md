@@ -17,7 +17,7 @@ describes what is actually implemented. For what is still open, see
 [![CI](https://github.com/NefaroXX/Concerto/actions/workflows/ci.yml/badge.svg)](https://github.com/NefaroXX/Concerto/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE-MIT)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE-APACHE)
-![Rust](https://img.shields.io/badge/rust-1.88%2B-orange?logo=rust)
+![Rust](https://img.shields.io/badge/rust-1.94%2B-orange?logo=rust)
 [![Docs](https://img.shields.io/badge/docs-architecture-blue)](docs/architecture.md)
 [![ADRs](https://img.shields.io/badge/design-ADRs-blueviolet)](docs/adrs/README.md)
 
@@ -235,7 +235,7 @@ details.
 Linux is the primary development platform; macOS and Windows are not yet part
 of the verified test matrix.
 
-- Rust 1.88 or newer (the workspace MSRV). CI, and `rust-toolchain.toml`,
+- Rust 1.94 or newer (the workspace MSRV). CI, and `rust-toolchain.toml`,
   pin formatting, linting, and testing to Rust 1.96.0.
 - The `wasm32-wasip2` Rust target — required to build the
   `test-*-plugin-wasm` crates in the workspace.

@@ -130,6 +130,7 @@ impl ConversationInbox {
         let messages: Vec<Message> = inputs
             .iter()
             .map(|content| Message {
+                gemini_replay: None,
                 role: Role::User,
                 content: content.clone(),
                 tool_calls: None,

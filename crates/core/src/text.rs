@@ -16,9 +16,10 @@
 //!
 //! [`normalize_typographic`] maps the common typographic characters to their
 //! canonical ASCII equivalents and keeps a zero-allocation fast path when the
-//! input is already clean. The module is deliberately dependency-free so
-//! `concerto-core` (model-reply JSON extraction) and `concerto-tools`
-//! (file-write hygiene) can both reuse it without adding dependencies.
+//! input is already clean. This is a lossy transformation for callers that
+//! explicitly need punctuation repair, not a file-content sanitizer. Unicode
+//! punctuation is valid inside source/JSON strings; replacing it globally can
+//! corrupt both syntax and data. Filesystem writes must preserve supplied text.
 
 use std::borrow::Cow;
 

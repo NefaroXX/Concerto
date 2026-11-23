@@ -723,6 +723,7 @@ async fn observe_readiness(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     fn test_spec(id: &str, owner: &str) -> ManagedProcessSpec {
         let dir = std::env::temp_dir();
         ManagedProcessSpec::new(

@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
-# `vendor/utoipa-swagger-ui` is third-party source consumed only through the
+# `vendor/` contains third-party source consumed only through the
 # `[patch.crates-io]` entry at the bottom of this file. It is excluded so it is
 # not a workspace member: its dev-dependencies, lints, and formatting are not
 # ours to maintain.
-exclude = ["vendor/utoipa-swagger-ui"]
+exclude = ["vendor/utoipa-swagger-ui", "vendor/sqlx-sqlite"]
 members = [
     "crates/core",
     "crates/config",
@@ -36,7 +36,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.94"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/NefaroXX/Concerto"
 publish = false
@@ -93,7 +93,7 @@ tiktoken-rs = "0.6"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate", "time", "uuid"] }
 # SQLCipher build of the same libsqlite3-sys sqlx links (feature unification).
 # Enables `PRAGMA key` at-rest encryption for the sessions/audit database.
-libsqlite3-sys = { version = "0.37", features = ["bundled-sqlcipher"] }
+libsqlite3-sys = { version = "0.40", features = ["bundled-sqlcipher"] }
 
 # ---- Filesystem & paths (Phase 1, sessions) ----
 dirs = "6"
@@ -161,11 +161,9 @@ image = "0.25"
 
 # ---- HTTP server (Phase 3) ----
 axum = "0.8"
-tower-http = { version = "0.7", features = ["cors", "trace"] }
 
 # ---- OpenAPI (Phase 3) ----
 utoipa = { version = "5", features = ["axum_extras"] }
-utoipa-axum = "0.1"
 utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
 
 # ---- Indexing / RAG pipeline (Phase 4) ----
@@ -204,7 +202,7 @@ once_cell = "1"
 # ---- WASM Plugin Runtime (Phase 7, ADR-14, ADR-21) ----
 # Patched 36 LTS line; retain the minimal Cranelift/async sandbox (no Winch,
 # pooling allocator or component model). Keep memory64 disabled in PluginHost.
-wasmtime = { version = "~36.0.19", default-features = false, features = ["cranelift", "async"] }
+wasmtime = { version = "~36.0.20", default-features = false, features = ["cranelift", "async"] }
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
@@ -216,15 +214,18 @@ unsafe_code = "deny"
 # Vendored patch: utoipa-swagger-ui 9.0.2
 # Upstream 9.0.2 declares `[build-dependencies] zip = "3.0"`, and crates.io has
 # yanked every `zip` release in that range (the newest, 8.6.0, is also yanked).
-# The only unyanked `zip` is 9.0.3, which no utoipa-swagger-ui release accepts
-# (10.x pins yanked `^8.6`). Rather than weaken `yanked = "deny"` in deny.toml,
-# the crate is vendored at `vendor/utoipa-swagger-ui` with the build dependency
-# bumped to the unyanked 9.0.3 and the single 3.x->9.x build-script API change
-# applied. The patch keeps the offline `vendored` Swagger UI assets (no CDN) and
+# Unyanked `zip` releases start at 9.0.5 (9.0.3/9.0.4 are yanked and affected by
+# RUSTSEC-2026-0548), and no utoipa-swagger-ui release accepts 9.x (10.x pins
+# yanked `^8.6`). Rather than weaken `yanked = "deny"` in deny.toml, the crate
+# is vendored at `vendor/utoipa-swagger-ui` with the build dependency bumped to
+# 9.0.5+ and the single 3.x->9.x build-script API change applied. The patch keeps the offline `vendored` Swagger UI assets (no CDN) and
 # utoipa 5 generation untouched.
 # ---------------------------------------------------------------------------
 [patch.crates-io]
 utoipa-swagger-ui = { path = "vendor/utoipa-swagger-ui" }
+# SQLx 0.9.0 caps libsqlite3-sys below the SQLite/SQLCipher security fixes.
+# Only its driver dependency requirement is patched; see README.vendored.md.
+sqlx-sqlite = { path = "vendor/sqlx-sqlite" }
 
 # NOTE: no [workspace.lints.rustdoc] table here. On toolchains >= ~1.80 the
 # legacy `rustdoc::missing_docs` lint path is gone (renamed to the top-level

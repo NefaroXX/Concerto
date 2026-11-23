@@ -29,8 +29,8 @@ use concerto_config::{AgentCapabilities, PromptSections};
 use concerto_core::event::EventBus;
 use concerto_core::traits::policy::PolicyEngine;
 use concerto_core::types::{
-    AgentContext, AgentId, AgentRunResult, AgentStage, AgentTask, OutputMode, SubTaskStatus,
-    TaskId, ToolDefinition,
+    AgentContext, AgentHistory, AgentId, AgentRunResult, AgentStage, AgentTask, OutputMode,
+    SubTaskStatus, TaskId, ToolDefinition,
 };
 use concerto_core::CancellationToken;
 use concerto_providers::model::ModelProfile;
@@ -385,6 +385,7 @@ pub(crate) async fn run_consult_execution(
         environment_manifest_digest,
         run_id,
         workspace_generation,
+        agent_history: AgentHistory::default(),
     };
     consult_runner.run(agent_id, &consult_subtask, consult_ctx, &profile, cancel).await
 }

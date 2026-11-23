@@ -53,4 +53,20 @@ ignore = [
     "RUSTSEC-2026-0370",
     "RUSTSEC-2026-0371",
     "RUSTSEC-2026-0372",
+    # chrono / chrono-tz — unmaintained, no vulnerability; latest releases,
+    # no safe upgrade; replacement tracked separately; see deny.toml
+    "RUSTSEC-2026-0543",
+    "RUSTSEC-2026-0555",
+    # heapless 0.8 unsound collection APIs — compiled transitively via
+    # gix-hash -> faster-hex, but only Vec::resize/String::from_utf8 are
+    # reachable; no affected API is called; see deny.toml
+    "RUSTSEC-2026-0574",
+    "RUSTSEC-2026-0575",
+    "RUSTSEC-2026-0576",
+    "RUSTSEC-2026-0577",
+    "RUSTSEC-2026-0578",
+    "RUSTSEC-2026-0579",
+    "RUSTSEC-2026-0580",
+    "RUSTSEC-2026-0581",
+    "RUSTSEC-2026-0582",
 ]

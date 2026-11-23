@@ -1,8 +1,8 @@
 //! Persistent-context wrapper around the shared runtime runner.
 //!
 //! All frontends continue to call this module. Before dispatch, it replaces the
-//! full persisted transcript with durable checkpoint summaries plus a recent
-//! tail. The underlying runner still owns provider, tool, memory, and session
+//! persisted history with preserved conversation text, checkpoint evidence,
+//! runtime outcomes and a recent tail of replayable tool exchanges. The underlying runner still owns provider, tool, memory, and session
 //! execution; after success we checkpoint any newly eligible history.
 
 use concerto_core::CancellationToken;

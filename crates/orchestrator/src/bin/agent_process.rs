@@ -29,6 +29,9 @@
 //! | `CONCERTO_MOCK_SCRIPT_JSON` | Optional per-turn `CompletionChunk` script for the mock provider. |
 //! | `CONCERTO_PLAN_ID` | Optional approved plan id (ADR-60 D7 ledger enrichment); stamps every gated write and the terminal event. |
 //! | `CONCERTO_AGENT_SKILLS_SECTION` | Optional pre-rendered skills section injected into the system prompt; the parent renders it once (ADR-43). |
+//! | `CONCERTO_AGENT_HISTORY_PATH` | Optional parent-owned accumulated history file (typed JSON array) for restore and append. |
+//! | `CONCERTO_AGENT_HISTORY_SEED_LEN` | Optional exact repaired seed message count stamped by the parent; the child never rewrites the accumulated file. |
+//! | `CONCERTO_AGENT_METRICS_PATH` | Optional parent-owned JSON Lines sidecar for this process's provider metrics. |
 //!
 //! ## Stdout discipline
 //!
@@ -50,9 +53,9 @@
 //! - Memory stores/invalidations are supervisor-side (D6); the child's
 //!   memory store is a retrieval facade.
 
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use concerto_config::CredentialStore;
 use concerto_core::event::EventBus;
@@ -60,7 +63,7 @@ use concerto_core::ids::Ulid;
 use concerto_core::memory::ProjectId;
 use concerto_core::traits::approval::ApprovalSink;
 use concerto_core::traits::provider::LlmProvider;
-use concerto_core::types::{system_prompt_for, AgentTask};
+use concerto_core::types::{system_prompt_for, AgentTask, Message, ProviderMetrics};
 use concerto_core::{CancellationToken, RequestedOutcome};
 use concerto_eval::EvalEngine;
 use concerto_orchestrator::agent_process_config::{
@@ -70,6 +73,7 @@ use concerto_orchestrator::gate_proxy::{
     ApprovalProxySink, GateProxyBackend, GateProxyClient, GateProxyMemoryStore,
 };
 use concerto_orchestrator::prompts::PromptBuilder;
+use concerto_orchestrator::supervised_history::{self, HISTORY_ENV, METRICS_ENV};
 use concerto_sessions::whiteboard::{NewWhiteboardEvent, WhiteboardKind};
 use concerto_tools::undo::UndoManager;
 use serde_json::json;
@@ -122,6 +126,29 @@ async fn run() -> i32 {
     // id to every child; the child mirrors it onto each gated write and its
     // terminal whiteboard events so `fold_ledger` can attribute them.
     let plan_id = std::env::var("CONCERTO_PLAN_ID").ok().filter(|plan_id| !plan_id.is_empty());
+    // H39b step 3: the parent owns a per-run directory and passes the paths.
+    // The child never touches the session database; it restores the accumulated
+    // file and appends its own completed turns back to it.
+    let history_path =
+        std::env::var(HISTORY_ENV).ok().filter(|path| !path.is_empty()).map(PathBuf::from);
+    let metrics_path =
+        std::env::var(METRICS_ENV).ok().filter(|path| !path.is_empty()).map(PathBuf::from);
+    let mut initial_messages = Vec::new();
+    if let Some(path) = &history_path {
+        match supervised_history::restore_for_child(path).await {
+            Ok(messages) => {
+                // A crash can leave an assistant tool call with no result in
+                // the accumulated file. `restore_for_child` repairs that in
+                // memory only; the file stays byte-identical so the parent's
+                // seed-length harvest offset remains exact.
+                initial_messages = messages;
+            }
+            Err(error) => eprintln!(
+                "agent-process: failed to restore supervised history {}: {error}",
+                path.display()
+            ),
+        }
+    }
 
     // ADR-60 D1 orphan cleanup: on Linux, ask the kernel to SIGTERM this
     // process when its parent (the supervisor) dies. Best-effort — see
@@ -197,17 +224,58 @@ async fn run() -> i32 {
         false,
         project_root,
         None,
-    );
+    )
+    .with_initial_messages(initial_messages);
+    let history_sink = Arc::new(Mutex::new(Vec::new()));
+    let metrics_sink = Arc::new(Mutex::new(Vec::new()));
+    if history_path.is_some() {
+        agent = agent.with_message_sink(Some(history_sink.clone()));
+    }
+    if metrics_path.is_some() {
+        agent = agent.with_provider_metrics_sink(Some(metrics_sink.clone()));
+    }
 
     let task = AgentTask::new(Ulid::new(), description.clone());
     let cancel = CancellationToken::new();
-    match agent.run(task.clone(), cancel).await {
-        Ok(_output) => {
+    let flush_cancel = CancellationToken::new();
+    let flush_handle = if history_path.is_some() || metrics_path.is_some() {
+        Some(tokio::spawn(flush_periodically(
+            history_path.clone(),
+            history_sink.clone(),
+            metrics_path.clone(),
+            metrics_sink.clone(),
+            flush_cancel.clone(),
+        )))
+    } else {
+        None
+    };
+
+    let outcome = agent.run(task.clone(), cancel).await;
+    flush_cancel.cancel();
+    if let Some(handle) = flush_handle {
+        if let Err(error) = handle.await {
+            eprintln!("agent-process: supervised history flush task failed: {error}");
+        }
+    }
+    if let Some(path) = &history_path {
+        flush_turns(&history_sink, path).await;
+    }
+    if let Some(path) = &metrics_path {
+        flush_metrics(&metrics_sink, path).await;
+    }
+
+    match outcome {
+        Ok(output) => {
+            let metrics = provider_metrics_payload(&output.provider_metrics, &agent_id);
             let mut event = terminal_event(
                 &agent_id,
                 &task,
                 WhiteboardKind::SubtaskCompleted,
-                json!({ "task_id": task.id.to_string(), "status": "completed" }),
+                json!({
+                    "task_id": task.id.to_string(),
+                    "status": "completed",
+                    "provider_metrics": metrics,
+                }),
             );
             event.plan_id = plan_id;
             publish_best_effort(&backend, event).await;
@@ -227,6 +295,90 @@ async fn run() -> i32 {
             1
         }
     }
+}
+
+/// Flush completed turns every 500 ms until cancelled, then once more.
+async fn flush_periodically(
+    history_path: Option<PathBuf>,
+    history_sink: Arc<Mutex<Vec<Message>>>,
+    metrics_path: Option<PathBuf>,
+    metrics_sink: Arc<Mutex<Vec<ProviderMetrics>>>,
+    cancel: CancellationToken,
+) {
+    let mut ticker = tokio::time::interval(Duration::from_millis(500));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            // Cleanup uses its own token, so a cancelled run still flushes
+            // the turns it already completed.
+            _ = cancel.cancelled() => break,
+            _ = ticker.tick() => {}
+        }
+        if let Some(path) = &history_path {
+            flush_turns(&history_sink, path).await;
+        }
+        if let Some(path) = &metrics_path {
+            flush_metrics(&metrics_sink, path).await;
+        }
+    }
+    if let Some(path) = &history_path {
+        flush_turns(&history_sink, path).await;
+    }
+    if let Some(path) = &metrics_path {
+        flush_metrics(&metrics_sink, path).await;
+    }
+}
+
+/// Drain and append completed turns. A failed append logs and leaves the run
+/// otherwise unaffected (the parent also sees the terminal event).
+async fn flush_turns(sink: &Mutex<Vec<Message>>, path: &Path) {
+    let batch = {
+        let mut guard = match sink.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if guard.is_empty() {
+            return;
+        }
+        std::mem::take(&mut *guard)
+    };
+    if let Err(error) = supervised_history::append_turns(path, &batch).await {
+        eprintln!("agent-process: failed to append supervised history {}: {error}", path.display());
+    }
+}
+
+/// Drain and append provider metrics.
+async fn flush_metrics(sink: &Mutex<Vec<ProviderMetrics>>, path: &Path) {
+    let batch = {
+        let mut guard = match sink.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if guard.is_empty() {
+            return;
+        }
+        std::mem::take(&mut *guard)
+    };
+    if let Err(error) = supervised_history::append_metrics(path, &batch).await {
+        eprintln!("agent-process: failed to append supervised metrics {}: {error}", path.display());
+    }
+}
+
+/// Compact additive terminal-event metrics. The IPC protocol is unchanged;
+/// the supervisor reads this payload and writes the authoritative rows.
+fn provider_metrics_payload(metrics: &[ProviderMetrics], agent_id: &str) -> serde_json::Value {
+    json!(metrics
+        .iter()
+        .map(|metric| json!({
+            "agent_id": agent_id,
+            "provider": metric.provider,
+            "model": metric.model,
+            "tokens_in": metric.tokens_in,
+            "tokens_out": metric.tokens_out,
+            "cost_usd": metric.cost_usd,
+            "latency_ms": metric.latency_ms,
+        }))
+        .collect::<Vec<_>>())
 }
 
 /// Ask Linux to deliver `SIGTERM` to this process when its parent exits

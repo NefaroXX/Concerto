@@ -1,4 +1,7 @@
-#![cfg(unix)]
+// These child-process fixtures isolate application data through XDG paths.
+// macOS resolves Library/Application Support instead, so a Unix-wide gate
+// would let the commands edit the real user's settings and stored data.
+#![cfg(target_os = "linux")]
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -34,6 +37,72 @@ impl Fixture {
     fn config_path(&self) -> std::path::PathBuf {
         self.dir.path().join("config/concerto/config.toml")
     }
+}
+
+/// Python stdio fixture for H23. It records its PID, then either delays its
+/// `initialize` reply by `mode` seconds or, for mode `hang`, never replies.
+fn write_probe_script(fixture: &Fixture) -> std::path::PathBuf {
+    let script = fixture.dir.path().join("mcp_probe_fixture.py");
+    std::fs::write(
+        &script,
+        r#"import json, os, sys, time
+with open(sys.argv[1], "w") as handle:
+    handle.write(str(os.getpid()))
+mode = sys.argv[2]
+for line in sys.stdin:
+    request = json.loads(line)
+    if "id" not in request:
+        continue
+    if request["method"] == "initialize":
+        if mode == "hang":
+            while True:
+                time.sleep(60)
+        time.sleep(float(mode))
+        result = {"protocolVersion": "2025-11-25", "capabilities": {"tools": {}}, "serverInfo": {"name": "fixture", "version": "1.0.0"}}
+    elif request["method"] == "tools/list":
+        result = {"tools": [{"name": "fixture_tool", "description": "Fixture", "inputSchema": {"type": "object", "properties": {}}}]}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+"#,
+    )
+    .unwrap();
+    script
+}
+
+fn write_probe_server(
+    fixture: &Fixture,
+    id: &str,
+    script: &Path,
+    pid: &Path,
+    mode: &str,
+) -> std::path::PathBuf {
+    let server = fixture.dir.path().join(format!("{id}.toml"));
+    std::fs::write(
+        &server,
+        format!(
+            "id = '{id}'\ncommand = 'python3'\nargs = [{}, {}, '{mode}']\nenabled = false\ntimeout_secs = 3\n",
+            toml::Value::String(script.to_string_lossy().into_owned()),
+            toml::Value::String(pid.to_string_lossy().into_owned()),
+        ),
+    )
+    .unwrap();
+    server
+}
+
+/// Poll `/proc` briefly: the manager reaps the child before it returns.
+fn assert_fixture_reaped(pid_path: &Path) {
+    let pid: u32 = std::fs::read_to_string(pid_path)
+        .expect("fixture must write its pid")
+        .trim()
+        .parse()
+        .expect("fixture pid must parse");
+    let proc_path = format!("/proc/{pid}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while Path::new(&proc_path).exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(!Path::new(&proc_path).exists(), "fixture process {pid} was not reaped");
 }
 
 #[test]
@@ -200,6 +269,78 @@ for line in sys.stdin:
     fixture.success(&["extensions", "mcp", "add", server.to_str().unwrap()]);
     let before = std::fs::read_to_string(fixture.config_path()).unwrap();
     assert!(fixture.success(&["extensions", "mcp", "probe", "probe"]).contains("fixture_tool"));
+    assert_eq!(std::fs::read_to_string(fixture.config_path()).unwrap(), before);
+}
+
+/// H23 regression: `Command::spawn` returns after fork/exec, so a child's
+/// interpreter bootstrap and first reply can take longer than the configured
+/// stage budget. A 4 s delay (> the configured 3 s, < 3 s + startup grace)
+/// must still probe successfully because `initialize` gets the startup
+/// allowance. This is the case that failed before the change.
+#[test]
+fn startup_delay_within_grace_still_probes_successfully() {
+    let fixture = Fixture::new();
+    let script = write_probe_script(&fixture);
+    let pid = fixture.dir.path().join("startup.pid");
+    let server = write_probe_server(&fixture, "startup", &script, &pid, "4");
+    fixture.success(&["extensions", "mcp", "add", server.to_str().unwrap()]);
+    let before = std::fs::read_to_string(fixture.config_path()).unwrap();
+
+    let started = std::time::Instant::now();
+    let output = fixture.command(&["extensions", "mcp", "probe", "startup"]);
+    let elapsed = started.elapsed();
+    println!("startup-delay MCP probe elapsed: {elapsed:?}");
+    assert!(
+        output.status.success(),
+        "a reply inside the startup allowance must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("fixture_tool"),
+        "probe must list the fixture tool: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_secs(4),
+        "fixture did not apply its delay: {elapsed:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "startup-delayed probe exceeded the bounded window: {elapsed:?}"
+    );
+
+    assert_fixture_reaped(&pid);
+    assert_eq!(std::fs::read_to_string(fixture.config_path()).unwrap(), before);
+}
+
+/// H23 regression: a server that reads `initialize` and never replies must
+/// still fail by stage, inside the stated total budget, and be reaped.
+#[test]
+fn hung_mcp_initialize_times_out_by_stage_and_reaps_the_child() {
+    let fixture = Fixture::new();
+    let script = write_probe_script(&fixture);
+    let pid = fixture.dir.path().join("hung.pid");
+    let server = write_probe_server(&fixture, "hung", &script, &pid, "hang");
+    fixture.success(&["extensions", "mcp", "add", server.to_str().unwrap()]);
+    let before = std::fs::read_to_string(fixture.config_path()).unwrap();
+
+    let started = std::time::Instant::now();
+    let output = fixture.command(&["extensions", "mcp", "probe", "hung"]);
+    let elapsed = started.elapsed();
+    println!("hung MCP probe elapsed: {elapsed:?}");
+    assert!(!output.status.success(), "a hung initialize must fail the probe");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("MCP probe timed out during initialize (server `hung`)"),
+        "probe error must name the stage and server: {stderr}"
+    );
+    let generous_bound = concerto_mcp::handshake_budget(3) + std::time::Duration::from_secs(5);
+    assert!(
+        elapsed < generous_bound,
+        "hung probe exceeded the generous bound {generous_bound:?}: {elapsed:?}"
+    );
+
+    assert_fixture_reaped(&pid);
     assert_eq!(std::fs::read_to_string(fixture.config_path()).unwrap(), before);
 }
 

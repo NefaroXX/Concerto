@@ -3,6 +3,7 @@
 //! Phase 3: basic sequential loop with memory, undo, and eval hooks.
 //! Multi-agent coordination is Phase 5.
 
+use crate::prompts::CompletedTurn;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -32,7 +33,6 @@ use crate::agents::tool_blocks::{parse_tool_blocks, BlockDecision};
 use crate::cycle::CycleBudgetTracker;
 use crate::exec_backend::ToolExecutionBackend;
 use crate::prompts::PromptBuilder;
-use crate::session_manager::message_row_usage;
 use crate::shell_repair::{self, ShellFailure};
 use crate::state::AgentState;
 use crate::tool_driver::{self, TextToolDriver};
@@ -43,7 +43,8 @@ use crate::verify::{VerifierService, VerifySpawner};
 
 mod output_progress;
 use output_progress::{
-    audited_file_changes, continuation_instruction, merge_run_progress, ProgressFingerprint,
+    audited_file_changes, continuation_instruction, merge_run_progress, merge_verification,
+    verification_completion_blocker, ProgressFingerprint,
 };
 
 /// The single-agent loop driving plan → act → observe → plan cycles.
@@ -111,6 +112,13 @@ pub struct AgentLoop {
     /// Prior conversation messages (loaded from the persistent session) used
     /// as context for the current run. Default empty.
     initial_messages: Vec<Message>,
+    /// Optional in-memory sink for completed provider turns (supervised child
+    /// history flush). Poisoning is tolerated: a sink panic must not abort the
+    /// run or discard the turn from the session store.
+    message_sink: Option<Arc<std::sync::Mutex<Vec<Message>>>>,
+    /// Optional sink for the provider metrics of a successful run (supervised
+    /// child metrics sidecar). Captured once when `run` returns `Ok`.
+    provider_metrics_sink: Option<Arc<std::sync::Mutex<Vec<ProviderMetrics>>>>,
     conversation_inbox: Option<crate::conversation::ConversationInbox>,
 
     /// Centralized policy for retrying transient provider failures. Lives at
@@ -402,6 +410,8 @@ impl AgentLoop {
             project_root,
             budget_allocator,
             initial_messages: Vec::new(),
+            message_sink: None,
+            provider_metrics_sink: None,
             conversation_inbox: None,
             retry_policy: RetryPolicy::default(),
             session_store: None,
@@ -442,6 +452,7 @@ impl AgentLoop {
     /// persist what was consumed before failure.
     pub(crate) fn provider_metrics(&self) -> Vec<ProviderMetrics> {
         vec![ProviderMetrics {
+            agent_id: None,
             provider: self.provider.provider_name().to_string(),
             model: self.usage_model.clone(),
             tokens_in: self.usage_tokens_in,
@@ -461,6 +472,23 @@ impl AgentLoop {
     /// active session) so the model sees the full context.
     pub fn with_initial_messages(mut self, messages: Vec<Message>) -> Self {
         self.initial_messages = messages;
+        self
+    }
+
+    /// Attach a sink for completed provider turns. Used by the supervised
+    /// agent-process binary to flush its own history to a parent-owned file.
+    pub fn with_message_sink(mut self, sink: Option<Arc<std::sync::Mutex<Vec<Message>>>>) -> Self {
+        self.message_sink = sink;
+        self
+    }
+
+    /// Attach a sink for provider metrics from a successful run. Used by the
+    /// supervised agent-process binary to record spend exactly once.
+    pub fn with_provider_metrics_sink(
+        mut self,
+        sink: Option<Arc<std::sync::Mutex<Vec<ProviderMetrics>>>>,
+    ) -> Self {
+        self.provider_metrics_sink = sink;
         self
     }
 
@@ -523,11 +551,48 @@ impl AgentLoop {
 
     /// Run the agent loop for the given task.
     ///
-    /// Thin wrapper that handles best-effort session persistence around the
-    /// core loop (`run_inner`): it records the task start and the user prompt,
-    /// then persists success/failure outcomes. Persistence failures surface as
-    /// warnings and never abort the run.
+    /// Thin wrapper around the core loop (`run_inner`): the inner loop handles
+    /// best-effort session persistence (task start, user prompt, outcomes) and
+    /// this wrapper copies the run's provider metrics into the optional
+    /// supervised-child sink. The error path also forwards the settled usage
+    /// (`provider_metrics()` survives a failed run) so tokens consumed before
+    /// the failure are not silently dropped from the parent's harvest.
+    /// Persistence and telemetry failures surface as warnings and never abort
+    /// the run.
     pub async fn run(
+        &mut self,
+        task: AgentTask,
+        cancel: CancellationToken,
+    ) -> Result<AgentOutput, OrchestratorError> {
+        match self.run_inner(task, cancel).await {
+            Ok(output) => {
+                self.forward_provider_metrics(&output.provider_metrics);
+                Ok(output)
+            }
+            Err(error) => {
+                let settled = self.provider_metrics();
+                self.forward_provider_metrics(&settled);
+                Err(error)
+            }
+        }
+    }
+
+    /// Append settled metrics to the supervised-child sink, if configured.
+    /// Telemetry only: a poisoned lock must not fail the run.
+    fn forward_provider_metrics(&self, metrics: &[ProviderMetrics]) {
+        if metrics.is_empty() {
+            return;
+        }
+        if let Some(sink) = &self.provider_metrics_sink {
+            let mut guard = match sink.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.extend_from_slice(metrics);
+        }
+    }
+
+    async fn run_inner(
         &mut self,
         task: AgentTask,
         cancel: CancellationToken,
@@ -540,6 +605,11 @@ impl AgentLoop {
         self.tool_attempts.clear();
         self.deterministic_failures.clear();
         self.pending_approval = None;
+        // Usage spans continuation rounds, but never separate calls to run().
+        self.usage_tokens_in = 0;
+        self.usage_tokens_out = 0;
+        self.usage_cost_usd = 0.0;
+        self.usage_latency_ms = 0;
         self.degraded.store(false, Ordering::Relaxed);
         // ADR-82 H04: reset the run freshness clock every run (never leaks
         // across runs or continuation rounds) and arm it when the strict gate
@@ -560,12 +630,6 @@ impl AgentLoop {
         let mut last_partial: Option<AgentOutput> = None;
         let mut cumulative_progress: Option<AgentOutput> = None;
 
-        let mut carried_file_changes: u32 = 0;
-        // Cross-round file-changing carry (completion-fix reconciliation):
-        // the ActionRequired completion check runs INSIDE `run_once` with a
-        // round-scoped counter; the audited write path accumulates across
-        // continuation rounds. The carry tracks the audited file-changing
-        // total so a later round's check sees the earlier rounds' writes.
         for round in 0..MAX_CONTINUATION_ROUNDS {
             // Seed this round's conversation. The first round includes the
             // original task prompt; continuation rounds reuse the full prior
@@ -573,6 +637,7 @@ impl AgentLoop {
             let mut seed = history.clone();
             if round == 0 {
                 seed.push(Message {
+                    gemini_replay: None,
                     role: Role::User,
                     content: task.description.clone(),
                     tool_calls: None,
@@ -583,8 +648,17 @@ impl AgentLoop {
                 });
             }
 
-            let exit =
-                self.run_once(task.clone(), seed, cancel.clone(), carried_file_changes).await?;
+            let exit = match self
+                .run_once(task.clone(), seed, cancel.clone(), cumulative_progress.as_ref())
+                .await
+            {
+                Ok(exit) => exit,
+                Err(error) => {
+                    let outcome = crate::provider_transcript::run_failure(task.id, &error);
+                    self.persist_provider_messages(session_id, &[outcome]).await;
+                    return Err(error);
+                }
+            };
 
             match exit {
                 AgentRunExit::Done(mut output) => {
@@ -595,7 +669,7 @@ impl AgentLoop {
                     // Truthful completion (ADR-55 §1, completion fix):
                     // `AgentOutput.completion_status` is the single source
                     // of truth. `finalize_completion` set it from the agent's
-                    // own landing state (an eval failure stays `Partial`);
+                    // own landing state (verification failures stay `Partial`);
                     // no transport-level success ever overrides it here.
                     self.persist_run_success(session_id, &output, cancel.clone()).await;
                     self.note_degraded(&mut output);
@@ -699,9 +773,6 @@ impl AgentLoop {
                         cumulative_progress = Some(partial.clone());
                     }
                     let cumulative = cumulative_progress.as_ref().unwrap_or(&partial);
-                    // Reconcile the cross-round file-changing carry with the
-                    // audited write path (completion-fix).
-                    carried_file_changes = audited_file_changes(cumulative);
                     let fp = ProgressFingerprint::from_output(cumulative);
                     if Some(&fp) == last_fp.as_ref() {
                         stale_rounds += 1;
@@ -744,6 +815,7 @@ impl AgentLoop {
                     // history (same session_id, same project root).
                     history = self.initial_messages.clone();
                     history.push(Message {
+                        gemini_replay: None,
                         role: Role::User,
                         content: continuation_instruction(&reason),
                         tool_calls: None,
@@ -752,6 +824,7 @@ impl AgentLoop {
                         tokens_in: None,
                         tokens_out: None,
                     });
+                    self.persist_provider_messages(session_id, &history[history.len() - 1..]).await;
                     self.initial_messages = history.clone();
                     continue;
                 }
@@ -824,7 +897,7 @@ impl AgentLoop {
     /// surfaces as a session event (`AgentThought` diagnostic channel — an
     /// existing payload field, no schema change) so the session event log
     /// carries WHY the run ended; the same reason lands in the message log
-    /// through `persist_run_partial`'s assistant summary. Content is
+    /// through `persist_run_partial`'s labeled runtime outcome. Content is
     /// truncated ([`END_REASON_CHARS`]) and fail-soft (a publish failure
     /// never changes the run's outcome).
     fn publish_end_reason(
@@ -863,11 +936,10 @@ impl AgentLoop {
         task: AgentTask,
         seed_messages: Vec<Message>,
         cancel: CancellationToken,
-        // Cross-round audited file-changing carry (completion-fix): the
-        // ActionRequired completion check inside `decide_exit` sees the
-        // earlier continuation rounds' audited writes, not just this round's
-        // round-scoped counter.
-        prior_file_changes: u32,
+        // The same run's accumulated output supplies counters and verification
+        // to every completion boundary. Keep returned counts round-local so
+        // merging this round does not count earlier calls twice.
+        prior_progress: Option<&AgentOutput>,
     ) -> Result<AgentRunExit, OrchestratorError> {
         self.state = AgentState::Planning;
         let correlation_id = Ulid::new();
@@ -893,7 +965,10 @@ impl AgentLoop {
         let mut file_changing_tool_count = 0u32;
         let mut files_modified = Vec::new();
         let mut tool_events: Vec<ToolExecutionSummary> = Vec::new();
-        let mut verification: Vec<VerificationSummary> = Vec::new();
+        let prior_tool_calls = prior_progress.map_or(0, |output| output.tool_call_count);
+        let prior_file_changes = prior_progress.map_or(0, audited_file_changes);
+        let mut verification =
+            prior_progress.map_or_else(Vec::new, |output| output.verification.clone());
         let mut final_message = String::new();
         let mut completed = false;
         let mut messages: Vec<Message> = seed_messages;
@@ -985,15 +1060,7 @@ impl AgentLoop {
             );
 
             // Phase 4: Call provider with retry
-            let request_started = std::time::Instant::now();
-            let request_tokens_in = request
-                .messages
-                .iter()
-                .map(|message| message.content.len() as u64)
-                .sum::<u64>()
-                .div_ceil(4);
-
-            let (text, reasoning, tool_calls, usage) = match self
+            let CompletedTurn { text, reasoning, tool_calls, usage, gemini_replay } = match self
                 .call_provider_with_retry(&request, task.session_id, task.id, &cancel)
                 .await
             {
@@ -1062,27 +1129,29 @@ impl AgentLoop {
             // structured tool-call blocks parsed from the text, bounded
             // repair on malformed blocks, loud failure on bound exhaustion.
             // Native turns (driver inactive) pass through untouched.
-            let (text, reasoning, tool_calls, usage) = match tool_driver.as_mut() {
-                Some(driver) => {
-                    self.driver_resolve_turn(
-                        driver,
-                        &task,
-                        iteration,
-                        &files_modified,
-                        &tool_events,
-                        &verification,
-                        &retrieved_memory_block,
-                        text,
-                        reasoning,
-                        usage,
-                        &mut messages,
-                        correlation_id,
-                        &cancel,
-                    )
-                    .await?
-                }
-                None => (text, reasoning, tool_calls, usage),
-            };
+            let CompletedTurn { text, reasoning, tool_calls, usage, gemini_replay } =
+                match tool_driver.as_mut() {
+                    Some(driver) => {
+                        self.driver_resolve_turn(
+                            driver,
+                            &task,
+                            iteration,
+                            &files_modified,
+                            &tool_events,
+                            &verification,
+                            &retrieved_memory_block,
+                            text,
+                            reasoning,
+                            usage,
+                            gemini_replay,
+                            &mut messages,
+                            correlation_id,
+                            &cancel,
+                        )
+                        .await?
+                    }
+                    None => CompletedTurn { text, reasoning, tool_calls, usage, gemini_replay },
+                };
 
             // Publish lifecycle event after provider call succeeds
             let _ = self.bus.publish_for_session(
@@ -1095,34 +1164,18 @@ impl AgentLoop {
                 },
             );
 
-            // Token accounting. ADR-48 decision 4: the provider-reported usage on the
-            // final chunk is the source of truth when present; the byte/4
-            // heuristic remains the fallback for providers that do not report
-            // usage. `0` is a valid measured value, so only `None` falls back.
-            let measured_tokens_in = usage.as_ref().and_then(|u| u.prompt_tokens);
-            let measured_tokens_out = usage.as_ref().and_then(|u| u.completion_tokens);
-            let tool_call_chars = serde_json::to_string(&tool_calls)
-                .map(|value| value.len() as u64)
-                .unwrap_or_default();
-            let estimated_tokens_out =
-                ((text.len() as u64).saturating_add(tool_call_chars)).div_ceil(4);
-            let usage_tokens_in = measured_tokens_in.unwrap_or(request_tokens_in);
-            let usage_tokens_out = measured_tokens_out.unwrap_or(estimated_tokens_out);
-            self.usage_tokens_in = self.usage_tokens_in.saturating_add(usage_tokens_in);
-            self.usage_tokens_out = self.usage_tokens_out.saturating_add(usage_tokens_out);
-            self.usage_cost_usd +=
-                self.provider.approximate_cost(usage_tokens_in, usage_tokens_out);
-            self.usage_latency_ms =
-                self.usage_latency_ms.saturating_add(request_started.elapsed().as_millis() as u64);
-
             // Phase 5: Process provider response
+            let transcript_start = messages.len();
             let action = self.process_provider_response(
-                &text,
-                reasoning,
-                &tool_calls,
-                usage,
+                CompletedTurn {
+                    text: text.clone(),
+                    reasoning,
+                    tool_calls: tool_calls.clone(),
+                    usage,
+                    gemini_replay,
+                },
                 &task.execution_mode,
-                file_changing_tool_count,
+                prior_file_changes.saturating_add(file_changing_tool_count),
                 iteration,
                 correlation_id,
                 task.session_id,
@@ -1130,6 +1183,7 @@ impl AgentLoop {
                 &mut final_message,
                 &mut completed,
             );
+            self.persist_provider_messages(task.session_id, &messages[transcript_start..]).await;
             match action {
                 ProviderResponseAction::Break
                     if self
@@ -1215,6 +1269,10 @@ impl AgentLoop {
         self.state = AgentState::Evaluating;
         let (eval_result, eval_verification) =
             self.run_evaluation(&files_modified, cancel.clone()).await;
+        if cancel.is_cancelled() {
+            self.state = AgentState::Cancelled;
+            return Err(OrchestratorError::Cancelled);
+        }
 
         // Lightweight verification for file changes (H05: the shared sweep
         // implementation in `crate::verify`, stamped with this run's clock).
@@ -1225,7 +1283,7 @@ impl AgentLoop {
         let sweep_spawner = crate::verify::SystemSpawner::new();
         sweep_spawner.set_governed_eval(self.eval.clone());
         let mut sweep_coalesce = HashMap::new();
-        verification = crate::verify::verify_file_changes_with(
+        let sweep_verification = crate::verify::verify_file_changes_with(
             &files_modified,
             &self.project_root,
             &self.verification_stamp(),
@@ -1235,7 +1293,12 @@ impl AgentLoop {
             &cancel,
         )
         .await;
-        verification.extend(eval_verification);
+        merge_verification(&mut verification, &sweep_verification);
+        merge_verification(&mut verification, &eval_verification);
+        if cancel.is_cancelled() {
+            self.state = AgentState::Cancelled;
+            return Err(OrchestratorError::Cancelled);
+        }
 
         // Phase 9: Build agent output
         let output = self.build_agent_output(
@@ -1252,7 +1315,7 @@ impl AgentLoop {
         if let Some(exit) = self.decide_exit(
             &task,
             &output,
-            tool_call_count,
+            prior_tool_calls.saturating_add(tool_call_count),
             file_changing_tool_count,
             prior_file_changes,
             &eval_result,
@@ -1267,10 +1330,8 @@ impl AgentLoop {
             &task,
             &session,
             output,
-            &eval_result,
             tool_call_count,
             &files_modified,
-            &final_message,
             correlation_id,
             cancel,
         )
@@ -1465,11 +1526,11 @@ impl AgentLoop {
         mut text: String,
         mut reasoning: Option<String>,
         mut usage: Option<CompletionUsage>,
+        mut gemini_replay: Option<concerto_core::provider_replay::GeminiReplay>,
         messages: &mut Vec<Message>,
         correlation_id: Ulid,
         cancel: &CancellationToken,
-    ) -> Result<(String, Option<String>, Vec<ToolCall>, Option<CompletionUsage>), OrchestratorError>
-    {
+    ) -> Result<CompletedTurn, OrchestratorError> {
         let provider = self.provider.provider_name();
         let model = self.usage_model.clone();
         let mut attempts = 0u32;
@@ -1502,12 +1563,37 @@ impl AgentLoop {
                             cancel.clone(),
                         )
                         .await;
-                    return Ok((text, reasoning, calls, usage));
+                    return Ok(CompletedTurn {
+                        text,
+                        reasoning,
+                        tool_calls: calls,
+                        usage,
+                        gemini_replay: None,
+                    });
                 }
                 BlockDecision::FinalAnswer(final_text) => {
-                    return Ok((final_text, reasoning, Vec::new(), usage));
+                    return Ok(CompletedTurn {
+                        gemini_replay: if final_text == text { gemini_replay } else { None },
+                        text: final_text,
+                        reasoning,
+                        tool_calls: Vec::new(),
+                        usage,
+                    });
                 }
                 BlockDecision::Exhausted { reason } => {
+                    let reply = Message {
+                        role: Role::Assistant,
+                        content: text.clone(),
+                        tool_calls: None,
+                        tool_results: None,
+                        reasoning_content: reasoning.clone(),
+                        tokens_in: usage.as_ref().and_then(|usage| usage.prompt_tokens),
+                        tokens_out: usage.as_ref().and_then(|usage| usage.completion_tokens),
+                        gemini_replay: gemini_replay.take(),
+                    };
+                    self.persist_provider_messages(task.session_id, std::slice::from_ref(&reply))
+                        .await;
+                    messages.push(reply);
                     self.tool_executor
                         .record_tool_driver_event(
                             task.session_id,
@@ -1556,15 +1642,21 @@ impl AgentLoop {
                     // the model can see its own defect, followed by the
                     // repair instruction.
                     messages.push(Message {
+                        gemini_replay: gemini_replay.take(),
                         role: Role::Assistant,
                         content: text.clone(),
                         tool_calls: None,
                         tool_results: None,
                         reasoning_content: reasoning.clone(),
-                        tokens_in: None,
-                        tokens_out: None,
+                        tokens_in: usage.as_ref().and_then(|usage| usage.prompt_tokens),
+                        tokens_out: usage.as_ref().and_then(|usage| usage.completion_tokens),
                     });
                     messages.push(TextToolDriver::repair_message(&reason));
+                    self.persist_provider_messages(
+                        task.session_id,
+                        &messages[messages.len() - 2..],
+                    )
+                    .await;
                     let mut request = self.build_provider_request(
                         &task.description,
                         iteration,
@@ -1576,12 +1668,19 @@ impl AgentLoop {
                     );
                     request.session_id = Some(task.session_id);
                     driver.augment_request(&mut request);
-                    let (repaired_text, repaired_reasoning, _, repaired_usage) = self
+                    let CompletedTurn {
+                        text: repaired_text,
+                        reasoning: repaired_reasoning,
+                        usage: repaired_usage,
+                        gemini_replay: repaired_replay,
+                        ..
+                    } = self
                         .call_provider_with_retry(&request, task.session_id, task.id, cancel)
                         .await?;
-                    usage = tool_driver::merge_usage(usage, repaired_usage);
+                    usage = repaired_usage;
                     text = repaired_text;
-                    reasoning = repaired_reasoning.or(reasoning);
+                    reasoning = repaired_reasoning;
+                    gemini_replay = repaired_replay;
                 }
             }
         }
@@ -1592,16 +1691,17 @@ impl AgentLoop {
     ///
     /// Delegates to [`crate::prompts::complete_provider_request`], which wraps
     /// stream creation and collection with the time-to-first-byte and
-    /// stream-idle timeouts from the configured retry policy, retries only
-    /// before any output has begun, and is cancel-aware.
+    /// stream-idle timeouts from the configured retry policy, discards
+    /// incomplete attempts before retrying, and is cancel-aware. Tools only
+    /// execute after a complete response has been collected.
     async fn call_provider_with_retry(
-        &self,
+        &mut self,
         request: &CompletionRequest,
         session_id: Ulid,
         task_id: TaskId,
         cancel: &CancellationToken,
-    ) -> Result<(String, Option<String>, Vec<ToolCall>, Option<CompletionUsage>), OrchestratorError>
-    {
+    ) -> Result<CompletedTurn, OrchestratorError> {
+        let started = std::time::Instant::now();
         match crate::prompts::complete_provider_request(
             &self.provider,
             request,
@@ -1613,7 +1713,10 @@ impl AgentLoop {
         )
         .await
         {
-            Ok(turn) => Ok(turn),
+            Ok(turn) => {
+                self.record_completed_usage(request, &turn, started.elapsed());
+                Ok(turn)
+            }
             Err(OrchestratorError::Provider(ProviderError::CapabilityRefused {
                 provider,
                 model,
@@ -1643,21 +1746,47 @@ impl AgentLoop {
         }
     }
 
+    /// Account at the completed request boundary, including repair attempts
+    /// that precede a later error. Each persisted assistant keeps its own usage.
+    fn record_completed_usage(
+        &mut self,
+        request: &CompletionRequest,
+        turn: &CompletedTurn,
+        latency: std::time::Duration,
+    ) {
+        let estimated_input = request
+            .messages
+            .iter()
+            .map(|message| message.content.len() as u64)
+            .sum::<u64>()
+            .div_ceil(4);
+        let call_bytes = serde_json::to_vec(&turn.tool_calls).map_or(0, |value| value.len() as u64);
+        let estimated_output = (turn.text.len() as u64).saturating_add(call_bytes).div_ceil(4);
+        let tokens_in =
+            turn.usage.as_ref().and_then(|usage| usage.prompt_tokens).unwrap_or(estimated_input);
+        let tokens_out = turn
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.completion_tokens)
+            .unwrap_or(estimated_output);
+        self.usage_tokens_in = self.usage_tokens_in.saturating_add(tokens_in);
+        self.usage_tokens_out = self.usage_tokens_out.saturating_add(tokens_out);
+        self.usage_cost_usd += self.provider.approximate_cost(tokens_in, tokens_out);
+        self.usage_latency_ms = self.usage_latency_ms.saturating_add(latency.as_millis() as u64);
+    }
+
     /// Phase 5: Process the provider's text response and tool calls.
     ///
     /// Pushes the assistant message to the conversation, attributes
-    /// provider-reported usage per ADR-48 decision 4 (`completion_tokens` on
-    /// the assistant message, `prompt_tokens` on the preceding user message),
+    /// provider-reported usage to that assistant turn without duplicating the
+    /// prompt count on an earlier user message,
     /// then evaluates whether the loop should break (task done), continue to
     /// the next iteration without executing tools (re-prompt needed), or
     /// proceed with tool execution.
     #[allow(clippy::too_many_arguments)]
     fn process_provider_response(
         &self,
-        text: &str,
-        reasoning: Option<String>,
-        tool_calls: &[ToolCall],
-        usage: Option<CompletionUsage>,
+        turn: CompletedTurn,
         task_execution_mode: &TaskExecutionMode,
         file_changing_tool_count: u32,
         iteration: u32,
@@ -1667,6 +1796,7 @@ impl AgentLoop {
         final_message: &mut String,
         completed: &mut bool,
     ) -> ProviderResponseAction {
+        let CompletedTurn { text, reasoning, tool_calls, usage, gemini_replay } = turn;
         let action_required =
             matches!(task_execution_mode, TaskExecutionMode::ActionRequired { .. });
 
@@ -1681,6 +1811,7 @@ impl AgentLoop {
         };
 
         messages.push(Message {
+            gemini_replay,
             role: Role::Assistant,
             content: text.to_string(),
             tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls.to_vec()) },
@@ -1689,14 +1820,6 @@ impl AgentLoop {
             tokens_in,
             tokens_out,
         });
-
-        // Attribute the prompt usage to the last user message so every message
-        // in the persisted transcript carries its own measured cost (ADR-48).
-        if let (Some(prompt_tokens), Some(user_message)) =
-            (tokens_in, messages.iter_mut().rev().find(|m| m.role == Role::User))
-        {
-            user_message.tokens_in = Some(prompt_tokens);
-        }
 
         // Single-agent loop contract (issue #145): when the provider returns
         // no tool calls, prose completes the turn in every mode except
@@ -1741,6 +1864,8 @@ impl AgentLoop {
                     );
 
                     messages.push(Message {
+
+                        gemini_replay: None,
                         role: Role::User,
                         content: "This task requires concrete repository changes. Do not describe the result. Call the filesystem tool with operation \"write\" or \"delete\" and a concrete relative path. A text-only response is not valid completion.".to_string(),
                         tool_calls: None,
@@ -1784,19 +1909,23 @@ impl AgentLoop {
         messages: &mut Vec<Message>,
     ) -> Result<(), OrchestratorError> {
         for tc in tool_calls {
-            self.execute_single_tool_call(
-                tc,
-                task,
-                correlation_id,
-                session,
-                cancel.clone(),
-                tool_call_count,
-                file_changing_tool_count,
-                files_modified,
-                tool_events,
-                messages,
-            )
-            .await?;
+            let transcript_start = messages.len();
+            let result = self
+                .execute_single_tool_call(
+                    tc,
+                    task,
+                    correlation_id,
+                    session,
+                    cancel.clone(),
+                    tool_call_count,
+                    file_changing_tool_count,
+                    files_modified,
+                    tool_events,
+                    messages,
+                )
+                .await;
+            self.persist_provider_messages(task.session_id, &messages[transcript_start..]).await;
+            result?;
             // An approval timeout pauses the run: stop the remaining calls in
             // this batch so no further tool call is issued while awaiting the
             // user. `run_once` turns it into `AgentRunExit::AwaitingApproval`.
@@ -1812,7 +1941,7 @@ impl AgentLoop {
     /// ([`crate::verify::run_project_tests`], H05 single-implementation
     /// rule), stamped with this run's clock. `AgentOutput.eval_result`
     /// semantics are UNCHANGED: `Some` only for an actually-finished harness
-    /// run — no run-outcome change.
+    /// run; unavailable/error/cancelled checks remain typed in the ledger.
     async fn run_evaluation(
         &self,
         files_modified: &[Utf8PathBuf],
@@ -1880,8 +2009,8 @@ impl AgentLoop {
     /// `strict_verification_gate`, `task_finished=`, `verification_passed=`,
     /// `require_verification=`, `records=`, per-record `outcomes=[..]`,
     /// `freshness=`, and (for stale passes) `stale_detail=[..]` ledger tokens.
-    /// Flag off (the default) preserves the warn-and-continue below
-    /// byte-identically.
+    /// Flag off (the default) preserves the exit decision here. Finalization
+    /// still refuses successful completion for failed or unmet verification.
     #[allow(clippy::too_many_arguments)]
     fn decide_exit(
         &mut self,
@@ -1907,7 +2036,10 @@ impl AgentLoop {
         if let TaskExecutionMode::ActionRequired { min_tool_calls, require_verification } =
             task.execution_mode
         {
-            if tool_call_count < min_tool_calls {
+            // The minimum applies to the completed task, across all rounds.
+            // A capped round with real progress can continue toward it. Keep
+            // the existing no-tools failure for a run that never acted at all.
+            if tool_call_count < min_tool_calls && (completed || tool_call_count == 0) {
                 return Err(OrchestratorError::ExecutionRequiredButNoTools);
             }
 
@@ -1969,49 +2101,49 @@ impl AgentLoop {
         Ok(None)
     }
 
-    /// Phase 11: Finalize completion when the task is truly done.
-    /// Sets `Completed` state, publishes the completion event, stores the
-    /// task summary, and returns `AgentRunExit::Done`.
+    /// Phase 11: settle a naturally finished loop. Task success also requires
+    /// honest verification; output, live events and durable state use the same
+    /// completion status. A finished loop may therefore return Partial.
     #[allow(clippy::too_many_arguments)]
     async fn finalize_completion(
         &mut self,
         task: &AgentTask,
         session: &SessionContext,
         mut output: AgentOutput,
-        eval_result: &Option<concerto_core::types::EvalResult>,
         tool_call_count: u32,
         files_modified: &[Utf8PathBuf],
-        final_message: &str,
         correlation_id: Ulid,
         cancel: CancellationToken,
     ) -> Result<AgentRunExit, OrchestratorError> {
+        if cancel.is_cancelled() {
+            self.state = AgentState::Cancelled;
+            return Err(OrchestratorError::Cancelled);
+        }
         self.state = AgentState::Completed;
-
-        // Truthful completion: `AgentOutput.completion_status` is the single
-        // source of truth, decided HERE from the agent's own landing state —
-        // an eval failure stays `Partial`, everything else lands `Completed`
-        // (a run with no evaluation result is a normal done run, exactly once
-        // the task genuinely reached finalize). Nothing transport-derived
-        // (a successful provider call, a successful tool transfer) can
-        // override this afterwards; `persist_run_success` and the run-level
-        // Completion card mirror this status.
-        output.completion_status = if eval_result.as_ref().is_some_and(|result| !result.passed) {
+        let blocker = verification_completion_blocker(task, &output);
+        output.completion_status = if blocker.is_some() {
             concerto_core::types::AgentCompletionStatus::Partial
         } else {
             concerto_core::types::AgentCompletionStatus::Completed
         };
-        // Supremacy invariant: an eval-driven downgrade to `Partial` is a
-        // Coordinator Decision row (visibility), not a silent status flip.
-        if output.completion_status == concerto_core::types::AgentCompletionStatus::Partial {
-            let reason = eval_result
-                .as_ref()
-                .map(|result| format!("evaluation did not pass: {result:?}"))
-                .unwrap_or_else(|| "completion downgraded to Partial".to_owned());
+        if let Some(reason) = blocker {
+            let reason: String = reason.chars().take(END_REASON_CHARS).collect();
+            if !output.final_message.is_empty() {
+                output.final_message.push_str("\n\n");
+            }
+            output.final_message.push_str("Verification incomplete: ");
+            output.final_message.push_str(&reason);
+            let decision_kind = if output.eval_result.as_ref().is_some_and(|result| !result.passed)
+            {
+                "agent-loop-eval-downgrade"
+            } else {
+                "agent-loop-verification-downgrade"
+            };
             self.tool_executor
                 .record_coordinator_decision(
                     task.session_id,
                     concerto_core::ids::new_id(),
-                    "agent-loop-eval-downgrade",
+                    decision_kind,
                     &reason,
                     CancellationToken::new(),
                 )
@@ -2030,7 +2162,7 @@ impl AgentLoop {
             session,
             tool_call_count,
             files_modified,
-            final_message,
+            &output.final_message,
             cancel.clone(),
         )
         .await;
@@ -2080,6 +2212,32 @@ impl AgentLoop {
     // durable record is lost.
     // -----------------------------------------------------------------------
 
+    async fn persist_provider_messages(&self, session_id: Ulid, messages: &[Message]) {
+        if !messages.is_empty() {
+            if let Some(sink) = &self.message_sink {
+                // A panic while holding this lock poisons it; recover the
+                // guard so history capture keeps working for the rest of the
+                // process (the run itself must not fail because of telemetry).
+                let mut guard = match sink.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.extend_from_slice(messages);
+            }
+        }
+        if let Err(error) = crate::provider_transcript::append_completed_messages(
+            self.session_store.as_ref(),
+            session_id,
+            messages,
+            CancellationToken::new(),
+        )
+        .await
+        {
+            self.degraded.store(true, Ordering::Relaxed);
+            tracing::warn!(%error, %session_id, "failed to persist completed provider conversation");
+        }
+    }
+
     async fn persist_run_start(&self, task: &AgentTask, cancel: CancellationToken) {
         let Some(store) = &self.session_store else {
             return;
@@ -2110,6 +2268,7 @@ impl AgentLoop {
         // Run-start row: no provider call has happened yet, so there is no
         // usage to record — tokens stay `None` by design.
         let user_msg = Message {
+            gemini_replay: None,
             role: Role::User,
             content: task.description.clone(),
             tool_calls: None,
@@ -2137,13 +2296,16 @@ impl AgentLoop {
             return;
         };
 
+        let outcome = crate::provider_transcript::run_outcome(output);
+        self.persist_provider_messages(session_id, &[outcome]).await;
+
         if cancel.is_cancelled() {
             return;
         }
         // Truthful completion (completion-status fix): the TaskCompleted
         // event and the task row mirror `AgentOutput.completion_status` —
         // never an unconditional transport-level `success: true`. A partial
-        // landing (eval failure) persists `success: false` with a `partial`
+        // landing (verification failure) persists `success: false` with a `partial`
         // task row, exactly like `persist_run_partial`.
         let success =
             output.completion_status == concerto_core::types::AgentCompletionStatus::Completed;
@@ -2171,28 +2333,6 @@ impl AgentLoop {
             self.degraded.store(true, Ordering::Relaxed);
             tracing::warn!(error = %e, "failed to persist TaskCompleted event");
         }
-
-        // ADR-48 §4: the terminal assistant row carries the run's
-        // provider-reported usage, the same totals the `provider_metrics`
-        // rows record for this run. The run-start user row predates any
-        // provider call and keeps `None`.
-        let (tokens_in, tokens_out) = message_row_usage(&output.provider_metrics);
-        let assistant_msg = Message {
-            role: Role::Assistant,
-            content: output.summary(),
-            tool_calls: None,
-            tool_results: None,
-            reasoning_content: None,
-            tokens_in,
-            tokens_out,
-        };
-        if cancel.is_cancelled() {
-            return;
-        }
-        if let Err(e) = store.append_messages(session_id, &[assistant_msg], cancel.clone()).await {
-            self.degraded.store(true, Ordering::Relaxed);
-            tracing::warn!(error = %e, "failed to persist assistant message");
-        }
     }
 
     async fn persist_run_partial(
@@ -2204,6 +2344,9 @@ impl AgentLoop {
         let Some(store) = &self.session_store else {
             return;
         };
+
+        let outcome = crate::provider_transcript::run_outcome(output);
+        self.persist_provider_messages(session_id, &[outcome]).await;
 
         if cancel.is_cancelled() {
             return;
@@ -2224,26 +2367,6 @@ impl AgentLoop {
         if let Err(e) = store.record_event(session_id, &event, cancel.clone()).await {
             self.degraded.store(true, Ordering::Relaxed);
             tracing::warn!(error = %e, "failed to persist TaskCompleted event");
-        }
-
-        // Same accounting as `persist_run_success`: the partial landing still
-        // spent real tokens, so the assistant row records them (ADR-48 §4).
-        let (tokens_in, tokens_out) = message_row_usage(&output.provider_metrics);
-        let assistant_msg = Message {
-            role: Role::Assistant,
-            content: output.summary(),
-            tool_calls: None,
-            tool_results: None,
-            reasoning_content: None,
-            tokens_in,
-            tokens_out,
-        };
-        if cancel.is_cancelled() {
-            return;
-        }
-        if let Err(e) = store.append_messages(session_id, &[assistant_msg], cancel.clone()).await {
-            self.degraded.store(true, Ordering::Relaxed);
-            tracing::warn!(error = %e, "failed to persist assistant message");
         }
     }
 
@@ -2459,6 +2582,7 @@ impl AgentLoop {
                     },
                 );
                 messages.push(Message {
+                    gemini_replay: None,
                     role: Role::Tool,
                     content,
                     tool_calls: None,
@@ -2545,6 +2669,7 @@ impl AgentLoop {
                 },
             );
             messages.push(Message {
+                gemini_replay: None,
                 role: Role::Tool,
                 content,
                 tool_calls: None,
@@ -2666,12 +2791,17 @@ impl AgentLoop {
             None => HashMap::new(),
         };
 
-        // ADR-65 §4: safe read dedupe. A plain single-path filesystem read
-        // whose clean observation still matches the disk (re-statted now,
-        // content hash verified) is a serve candidate. Any doubt (_None_)
-        // degrades to normal execution below.
+        // Cache validation reads current bytes, so the advisory Allow check
+        // must precede it. A non-Allow verdict or cache miss falls through to
+        // normal policy-checked execution; the advisory check consumes no quota.
         let serve = match &self.tool_facts {
-            Some(facts) => {
+            Some(facts)
+                if crate::read_cache::plain_single_path_read(&tc.name, &arguments).is_some()
+                    && self
+                        .tool_executor
+                        .policy_verdict_is_allow(&tc.name, &arguments, session, cancel.clone())
+                        .await =>
+            {
                 crate::read_cache::maybe_serve_read(
                     facts,
                     &self.project_root,
@@ -2680,24 +2810,6 @@ impl AgentLoop {
                     &cancel,
                 )
                 .await
-            }
-            None => None,
-        };
-        // ADR-65 F1a: a cached read is served ONLY when the policy engine
-        // explicitly allows the read through the advisory path — re-evaluated
-        // here, per serve, so a served read is never a policy bypass. The
-        // advisory evaluation records no decision row and consumes no quota
-        // (see `ToolExecutor::policy_verdict_is_allow`); a non-`Allow` verdict
-        // falls through to the normal executor path below, where the full
-        // policy gate (Deny / RequireApproval) surfaces as usual.
-        let serve = match serve {
-            Some(serve)
-                if self
-                    .tool_executor
-                    .policy_verdict_is_allow(&tc.name, &arguments, session, cancel.clone())
-                    .await =>
-            {
-                Some(serve)
             }
             _ => None,
         };
@@ -2750,6 +2862,7 @@ impl AgentLoop {
                 serde_json::to_string(&served_data).unwrap_or_else(|_| "{}".to_string())
             );
             messages.push(Message {
+                gemini_replay: None,
                 role: Role::Tool,
                 content: tool_result_content.clone(),
                 tool_calls: None,
@@ -2878,6 +2991,7 @@ impl AgentLoop {
                 );
 
                 messages.push(Message {
+                    gemini_replay: None,
                     role: Role::Tool,
                     content: tool_result_content.clone(),
                     tool_calls: None,
@@ -3048,6 +3162,7 @@ impl AgentLoop {
                     tc.name, rule
                 );
                 messages.push(Message {
+                    gemini_replay: None,
                     role: Role::Tool,
                     content: denial_msg,
                     tool_calls: None,
@@ -3149,6 +3264,7 @@ impl AgentLoop {
                     tc.name, tc.id, e
                 );
                 messages.push(Message {
+                    gemini_replay: None,
                     role: Role::Tool,
                     content: error_msg,
                     tool_calls: None,
@@ -3269,6 +3385,7 @@ impl AgentLoop {
             &failure,
         );
         Some(Message {
+            gemini_replay: None,
             role: Role::User,
             content,
             tool_calls: None,
@@ -3506,6 +3623,7 @@ impl AgentLoop {
 
 #[cfg(test)]
 mod tests {
+    include!("agent_loop_transcript_regressions.rs");
     use super::*;
     use crate::verify::{
         eval_error_record, eval_result_record, verify_file_changes, EVAL_HARNESS_VERIFIER,
@@ -3638,26 +3756,25 @@ mod tests {
         ) -> Result<CompletionStream, ProviderError> {
             let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
             let tool_calls = self.responses.get(idx).cloned().unwrap_or_default();
-            let chunks: Vec<_> = if tool_calls.is_empty() {
-                vec![CompletionChunk {
-                    delta: String::new(),
+            let mut chunks: Vec<_> = tool_calls
+                .into_iter()
+                .map(|tc| CompletionChunk {
+                    gemini_replay: None,
                     reasoning: None,
-                    tool_call: None,
-                    is_final: true,
+                    delta: String::new(),
+                    tool_call: Some(tc),
+                    is_final: false,
                     usage: None,
-                }]
-            } else {
-                tool_calls
-                    .into_iter()
-                    .map(|tc| CompletionChunk {
-                        reasoning: None,
-                        delta: String::new(),
-                        tool_call: Some(tc),
-                        is_final: false,
-                        usage: None,
-                    })
-                    .collect()
-            };
+                })
+                .collect();
+            chunks.push(CompletionChunk {
+                gemini_replay: None,
+                reasoning: None,
+                delta: String::new(),
+                tool_call: None,
+                is_final: true,
+                usage: None,
+            });
             Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
         }
     }
@@ -3721,6 +3838,7 @@ mod tests {
                 self.saw_wire_tools.store(true, Ordering::SeqCst);
             }
             Ok(Box::pin(stream::iter(vec![Ok(CompletionChunk {
+                gemini_replay: None,
                 delta: self.reply_at(idx),
                 reasoning: None,
                 tool_call: None,
@@ -3767,6 +3885,7 @@ mod tests {
                 return Err(ProviderError::Network(format!("transient failure #{}", idx + 1)));
             }
             Ok(Box::pin(stream::iter(vec![Ok(CompletionChunk {
+                gemini_replay: None,
                 reasoning: None,
                 delta: String::new(),
                 tool_call: None,
@@ -3808,10 +3927,11 @@ mod tests {
                 ..Default::default()
             };
             Ok(Box::pin(stream::iter(vec![Ok(CompletionChunk {
+                gemini_replay: None,
                 reasoning: None,
                 delta: String::new(),
                 tool_call: Some(tc),
-                is_final: false,
+                is_final: true,
                 usage: None,
             })])))
         }
@@ -4960,13 +5080,13 @@ mod tests {
         let first_provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
         let (mut loop1, audit1) =
             make_loop_with_dir_capturing(first_provider, approval.clone(), 10, dir_path);
-        loop1.run_once(task.clone(), Vec::new(), cancel.clone(), 0).await.expect("instance 1");
+        loop1.run_once(task.clone(), Vec::new(), cancel.clone(), None).await.expect("instance 1");
 
         // Instance 2 (a later user message): same session + project, no re-prompt.
         let second_provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
         let (mut loop2, audit2) =
             make_loop_with_dir_capturing(second_provider, approval.clone(), 10, dir_path);
-        loop2.run_once(task.clone(), Vec::new(), cancel.clone(), 0).await.expect("instance 2");
+        loop2.run_once(task.clone(), Vec::new(), cancel.clone(), None).await.expect("instance 2");
 
         assert_eq!(
             prompts.load(Ordering::SeqCst),
@@ -4995,9 +5115,9 @@ mod tests {
         let task = AgentTask::new(Ulid::new(), "test task");
         let cancel = CancellationToken::new();
 
-        loop_.run_once(task.clone(), Vec::new(), cancel.clone(), 0).await.expect("round 1");
+        loop_.run_once(task.clone(), Vec::new(), cancel.clone(), None).await.expect("round 1");
         loop_.project_root = std::path::PathBuf::from(second.path());
-        loop_.run_once(task.clone(), Vec::new(), cancel.clone(), 0).await.expect("round 2");
+        loop_.run_once(task.clone(), Vec::new(), cancel.clone(), None).await.expect("round 2");
 
         assert_eq!(prompts.load(Ordering::SeqCst), 2, "a different project must be asked again");
         assert_eq!(audit.ack_rows(), 2, "both prompts are audited");
@@ -5022,7 +5142,7 @@ mod tests {
         let first_provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
         let (mut loop1, _audit1) =
             make_loop_with_dir_capturing(first_provider, approval.clone(), 10, dir_path);
-        let aborted = loop1.run_once(task.clone(), Vec::new(), cancel.clone(), 0).await;
+        let aborted = loop1.run_once(task.clone(), Vec::new(), cancel.clone(), None).await;
         assert!(matches!(aborted.unwrap_err(), OrchestratorError::Cancelled));
 
         // Instance 2: same triple; request_ack now returns true. Because the
@@ -5030,7 +5150,7 @@ mod tests {
         let second_provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
         let (mut loop2, _audit2) =
             make_loop_with_dir_capturing(second_provider, approval.clone(), 10, dir_path);
-        loop2.run_once(task.clone(), Vec::new(), cancel.clone(), 0).await.expect("second run");
+        loop2.run_once(task.clone(), Vec::new(), cancel.clone(), None).await.expect("second run");
 
         assert_eq!(
             prompts.load(Ordering::SeqCst),
@@ -5170,6 +5290,7 @@ mod tests {
             ) -> Result<CompletionStream, ProviderError> {
                 *self.captured.lock().expect("lock") = Some(request);
                 Ok(Box::pin(stream::iter(vec![Ok(CompletionChunk {
+                    gemini_replay: None,
                     reasoning: None,
                     delta: String::new(),
                     tool_call: None,
@@ -5355,6 +5476,7 @@ mod tests {
         ) -> Result<CompletionStream, ProviderError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let chunk = CompletionChunk {
+                gemini_replay: None,
                 delta: self.text.clone(),
                 reasoning: None,
                 tool_call: None,
@@ -5738,8 +5860,13 @@ mod tests {
         let mut loop_ = make_loop_with_fs_tool(dir.path(), provider.clone(), approval, 10)
             .with_usage_model("muse-v2".to_string())
             .with_advertised_tool_support(Some(false));
-        let task =
-            AgentTask::new_action_required(Ulid::new(), "write a file through the text driver");
+        // This fixture tests tool transport; file bytes are asserted below.
+        // It deliberately has no project verification harness.
+        let task = AgentTask::new_with_execution_mode(
+            Ulid::new(),
+            "write a file through the text driver",
+            TaskExecutionMode::ActionRequired { min_tool_calls: 1, require_verification: false },
+        );
         let result = loop_.run(task, CancellationToken::new()).await;
         assert!(result.is_ok(), "fallback-driven run should succeed: {:?}", result.err());
         let output = result.unwrap();
@@ -5784,7 +5911,13 @@ mod tests {
         let mut loop_ = make_loop_with_fs_tool(dir.path(), provider.clone(), approval, 10)
             .with_usage_model("muse-spark-1.3-contributor-free".to_string())
             .with_advertised_tool_support(Some(false));
-        let task = AgentTask::new_action_required(Ulid::new(), "write a file on muse-spark");
+        // This fixture tests tool transport; file bytes are asserted below.
+        // It deliberately has no project verification harness.
+        let task = AgentTask::new_with_execution_mode(
+            Ulid::new(),
+            "write a file on muse-spark",
+            TaskExecutionMode::ActionRequired { min_tool_calls: 1, require_verification: false },
+        );
         let result = loop_.run(task, CancellationToken::new()).await;
         assert!(
             result.is_ok(),
@@ -6385,7 +6518,8 @@ mod tests {
         let output = result.unwrap();
 
         let summary = output.summary();
-        assert!(summary.contains("Completed"), "summary should start with Completed");
+        assert_eq!(output.completion_status, concerto_core::types::AgentCompletionStatus::Partial);
+        assert!(summary.contains("Partial"), "unverified execution must remain Partial");
         assert!(summary.contains("Files changed:"), "summary should contain Files changed");
         assert!(summary.contains("src/main.rs"), "summary should contain the written path");
         // The raw model prose (empty delta from ScriptedProvider) should NOT
@@ -6572,9 +6706,9 @@ mod tests {
         assert!(!record.passed);
     }
 
-    /// The typed eval-error mapping is total: `Cancelled` maps to `Cancelled`
-    /// and every other harness error maps to `Error` carrying the error text —
-    /// never to an absent value.
+    /// Configured harness errors remain explicit: cancellation is Cancelled,
+    /// execution/setup failures are Error. Absence of a supported harness is
+    /// tested separately as Unavailable; no error is collapsed into silence.
     #[test]
     fn eval_error_mapping_is_total_and_typed() {
         use concerto_eval::EvalError;
@@ -6617,6 +6751,7 @@ mod tests {
             duration_ms: 12,
             output_tail: "ok".into(),
             coverage: None,
+            incomplete: false,
             provenance: EvalProvenance::Fallback,
         };
         let record = eval_result_record(&path, &result);
@@ -6639,13 +6774,11 @@ mod tests {
         assert!(!failed_record.passed);
     }
 
-    /// End-to-end through `run_evaluation`: a harness setup failure (no
-    /// manifest, no Cargo project reachable) yields `None` for `eval_result`
-    /// — identical to the old `.ok()` collapse, so `decide_exit` and the
-    /// completion downgrade behave exactly as before — while the verification
-    /// vec carries the typed `Error` record instead of silence.
+    /// A directory with no supported harness reports unavailability, distinct
+    /// from a configured check that failed to execute. Ordinary conversation
+    /// must not be treated as a failed test run merely because no harness exists.
     #[tokio::test]
-    async fn run_evaluation_maps_harness_failure_to_error_record_with_none_result() {
+    async fn completion_no_harness_is_unavailable_not_execution_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = Arc::new(ScriptedProvider::new(vec![]));
         let approval = Arc::new(ApprovalTestHarness::always_approve());
@@ -6656,8 +6789,8 @@ mod tests {
             eval_result.is_none(),
             "no harness run means no eval payload — exactly the old `.ok()` value"
         );
-        assert_eq!(records.len(), 1, "the failure maps to one record, never silence");
-        assert_eq!(records[0].outcome, Some(VerificationOutcome::Error));
+        assert_eq!(records.len(), 1, "unavailability maps to one record, never silence");
+        assert_eq!(records[0].outcome, Some(VerificationOutcome::Unavailable));
         assert!(!records[0].passed);
         assert!(records[0].checked_at.is_some());
     }
@@ -6826,6 +6959,7 @@ mod tests {
                 Some(Ok(chunks)) => Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok)))),
                 Some(Err(e)) => Err(e),
                 None => Ok(Box::pin(stream::iter(vec![Ok(CompletionChunk {
+                    gemini_replay: None,
                     reasoning: None,
                     delta: String::new(),
                     tool_call: None,
@@ -6839,12 +6973,78 @@ mod tests {
     /// Helper: a single answer-only completion chunk.
     fn answer_chunk() -> Vec<CompletionChunk> {
         vec![CompletionChunk {
+            gemini_replay: None,
             delta: String::new(),
             reasoning: None,
             tool_call: None,
             is_final: true,
             usage: None,
         }]
+    }
+
+    #[tokio::test]
+    async fn premature_eof_exhaustion_is_partial_not_completed() {
+        let provider = Arc::new(CountingScriptedProvider::new(vec![Ok(vec![]), Ok(vec![])]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ = make_loop(provider.clone(), approval, 10).with_retry_policy(
+            RetryPolicy::new(concerto_config::RetryConfig {
+                max_attempts: 2,
+                initial_delay_ms: 1,
+                max_delay_ms: 1,
+                jitter: false,
+                ..Default::default()
+            }),
+        );
+        let result = loop_
+            .run(AgentTask::new(Ulid::new(), "answer-only task"), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(result.completion_status, concerto_core::types::AgentCompletionStatus::Partial);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            result.provider_error_class.as_deref(),
+            Some(concerto_core::failures::PROVIDER_RETRIES_EXHAUSTED_CODE)
+        );
+    }
+
+    #[tokio::test]
+    async fn premature_eof_retries_without_executing_partial_tool_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let partial = CompletionChunk {
+            gemini_replay: None,
+            delta: "unfinished".into(),
+            reasoning: None,
+            tool_call: Some(ToolCall {
+                id: "partial-write".into(),
+                name: "filesystem".into(),
+                arguments: serde_json::json!({
+                    "operation": "write", "path": "must-not-exist.txt", "content": "partial",
+                }),
+                ..Default::default()
+            }),
+            is_final: false,
+            usage: None,
+        };
+        let provider =
+            Arc::new(CountingScriptedProvider::new(vec![Ok(vec![partial]), Ok(answer_chunk())]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let (loop_, fs_calls) =
+            make_loop_with_counting_fs_tool(dir.path(), provider.clone(), approval, 10);
+        let mut loop_ = loop_.with_retry_policy(RetryPolicy::new(concerto_config::RetryConfig {
+            max_attempts: 2,
+            initial_delay_ms: 1,
+            max_delay_ms: 1,
+            jitter: false,
+            ..Default::default()
+        }));
+        let result = loop_
+            .run(AgentTask::new(Ulid::new(), "answer-only task"), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(fs_calls.load(Ordering::SeqCst), 0, "partial attempt must not execute tools");
+        assert!(!dir.path().join("must-not-exist.txt").exists());
+        assert!(!result.final_message.contains("unfinished"));
     }
 
     #[tokio::test]
@@ -6925,10 +7125,11 @@ mod tests {
         };
         let provider = Arc::new(CountingScriptedProvider::new(vec![
             Ok(vec![CompletionChunk {
+                gemini_replay: None,
                 reasoning: None,
                 delta: String::new(),
                 tool_call: Some(write_tc),
-                is_final: false,
+                is_final: true,
                 usage: None,
             }]),
             Err(ProviderError::Network("transient failure after successful write".into())),
@@ -7113,13 +7314,106 @@ mod tests {
         }
     }
 
-    /// A completed run records the run's provider-reported usage on the
-    /// terminal assistant row (ADR-48 §4), while the run-start user row —
-    /// written before any provider call — carries no usage. Runs through the
-    /// real persistence seams against an in-memory store, so the asserted
-    /// values are the ones that actually land in the `messages` table.
     #[tokio::test]
-    async fn persist_run_success_records_usage_on_the_assistant_row() {
+    async fn provider_metrics_sink_receives_metrics_after_success() {
+        let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ =
+            make_loop(provider, approval, 10).with_provider_metrics_sink(Some(sink.clone()));
+        let task = AgentTask::new(Ulid::new(), "test");
+
+        let output = loop_.run(task, CancellationToken::new()).await.expect("successful run");
+
+        let captured = sink.lock().expect("metrics sink lock");
+        assert_eq!(captured.len(), 1, "one metric entry per successful run");
+        assert_eq!(captured[0].provider, "scripted");
+        assert_eq!(captured[0].tokens_in, output.provider_metrics[0].tokens_in);
+    }
+
+    #[tokio::test]
+    async fn provider_metrics_sink_receives_settled_usage_after_failure() {
+        let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider =
+            Arc::new(CountingScriptedProvider::new(vec![Err(ProviderError::AuthFailure)]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let mut loop_ =
+            make_loop(provider, approval, 10).with_provider_metrics_sink(Some(sink.clone()));
+        let task = AgentTask::new(Ulid::new(), "failing task");
+
+        let result = loop_.run(task, CancellationToken::new()).await;
+        assert!(result.is_err(), "auth failure must surface as an error");
+
+        let captured = sink.lock().expect("metrics sink lock");
+        assert_eq!(captured.len(), 1, "failed runs must still forward settled usage");
+        assert_eq!(captured[0].provider, "counting-scripted");
+    }
+
+    #[tokio::test]
+    async fn message_sink_receives_completed_turns_without_session_store() {
+        let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let loop_ = make_loop(provider, approval, 10).with_message_sink(Some(sink.clone()));
+        let reply = Message {
+            role: Role::Assistant,
+            content: "completed turn".into(),
+            tokens_in: Some(3),
+            tokens_out: Some(4),
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: Some("reasoning".into()),
+            gemini_replay: None,
+        };
+
+        loop_.persist_provider_messages(Ulid::new(), std::slice::from_ref(&reply)).await;
+
+        let captured = sink.lock().expect("sink lock");
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].content, "completed turn");
+        assert_eq!(captured[0].reasoning_content.as_deref(), Some("reasoning"));
+        assert_eq!((captured[0].tokens_in, captured[0].tokens_out), (Some(3), Some(4)));
+    }
+
+    #[tokio::test]
+    async fn message_sink_tolerates_a_poisoned_lock() {
+        let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let poisoned = sink.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().expect("poison lock");
+            panic!("poison the sink");
+        })
+        .join();
+        assert!(sink.is_poisoned(), "fixture must poison the mutex");
+
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![]]));
+        let approval = Arc::new(ApprovalTestHarness::always_approve());
+        let loop_ = make_loop(provider, approval, 10).with_message_sink(Some(sink.clone()));
+        let reply = Message {
+            role: Role::Assistant,
+            content: "after poison".into(),
+            tokens_in: None,
+            tokens_out: None,
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: None,
+            gemini_replay: None,
+        };
+
+        loop_.persist_provider_messages(Ulid::new(), &[reply]).await;
+
+        let captured = match sink.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].content, "after poison");
+    }
+
+    /// Settlement must not insert a summary that duplicates usage already
+    /// recorded on the original provider turn.
+    #[tokio::test]
+    async fn settlement_does_not_duplicate_provider_turn_usage() {
         let store = concerto_sessions::SqliteSessionStore::connect_in_memory()
             .await
             .expect("in-memory sessions store");
@@ -7148,6 +7442,7 @@ mod tests {
         output.session_id = session_id;
         output.completion_status = concerto_core::types::AgentCompletionStatus::Completed;
         output.provider_metrics = vec![ProviderMetrics {
+            agent_id: None,
             provider: "openai".to_string(),
             model: "gpt-4".to_string(),
             tokens_in: 120,
@@ -7155,13 +7450,27 @@ mod tests {
             cost_usd: 0.0,
             latency_ms: 1,
         }];
+        let reply = Message {
+            role: Role::Assistant,
+            content: "Original provider answer".into(),
+            tokens_in: Some(120),
+            tokens_out: Some(60),
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: None,
+            gemini_replay: None,
+        };
+        loop_.persist_provider_messages(session_id, &[reply]).await;
         loop_.persist_run_success(session_id, &output, cancel.clone()).await;
 
         let messages = store.load_messages(session_id, cancel).await.expect("load messages");
-        assert_eq!(messages.len(), 2, "run-start user row + terminal assistant row");
+        assert_eq!(messages.len(), 3, "user, original provider turn and runtime outcome");
+        assert_eq!(messages[2].role, Role::System);
+        assert_eq!((messages[2].tokens_in, messages[2].tokens_out), (None, None));
         assert_eq!(messages[0].role, Role::User, "first row is the run-start user row");
         assert_eq!(messages[0].tokens_in, None, "no provider call had happened yet");
-        assert_eq!(messages[1].role, Role::Assistant, "second row is the assistant summary");
+        assert_eq!(messages[1].role, Role::Assistant);
+        assert_eq!(messages[1].content, "Original provider answer");
         assert_eq!(messages[1].tokens_in, Some(120), "provider-reported prompt tokens recorded");
         assert_eq!(
             messages[1].tokens_out,
@@ -7705,6 +8014,7 @@ mod tests {
         // The assistant message that carried the (broken) tool call — its
         // text states the intended call explicitly.
         messages.push(Message {
+            gemini_replay: None,
             role: Role::Assistant,
             content: "Listing the sources now: Filesystem operation=\"list\" path=\"src\"".into(),
             tool_calls: None,
@@ -8750,10 +9060,13 @@ mod tests {
         let mut completed = false;
 
         let action = loop_.process_provider_response(
-            "", // _text placeholder (not used by this branch)
-            None,
-            &[], // no tool calls → enters the else-if chain
-            None,
+            CompletedTurn {
+                text: "".into(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                usage: None,
+                gemini_replay: None,
+            },
             &TaskExecutionMode::AnswerOnly,
             0,
             1,
@@ -8770,17 +9083,20 @@ mod tests {
     }
 
     #[test]
-    fn process_provider_response_coordinator_decides_completes_in_prose() {
+    fn replay_regression_process_response_preserves_native_prose() {
         let loop_ = make_minimal_loop();
         let mut messages = vec![];
         let mut final_message = String::new();
         let mut completed = false;
 
         let action = loop_.process_provider_response(
-            "direct coordinator answer",
-            None,
-            &[], // no tool calls → prose completion
-            None,
+            CompletedTurn {
+                text: "direct coordinator answer".into(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                usage: None,
+                gemini_replay: Some(concerto_core::provider_replay::GeminiReplay::capture(vec![serde_json::json!({"text":"direct coordinator answer", "thoughtSignature":"opaque"})], "direct coordinator answer", None, &[]).unwrap()),
+            },
             &TaskExecutionMode::CoordinatorDecides,
             0,
             1,
@@ -8797,6 +9113,8 @@ mod tests {
         assert!(matches!(action, ProviderResponseAction::Break));
         assert!(completed, "CoordinatorDecides prose must mark the run completed");
         assert_eq!(final_message, "direct coordinator answer");
+        let assistant = messages.last().unwrap();
+        assert!(assistant.gemini_replay.as_ref().unwrap().parts_for(assistant).is_some());
     }
 
     #[test]
@@ -8807,10 +9125,13 @@ mod tests {
         let mut completed = false;
 
         let action = loop_.process_provider_response(
-            "some analysis text",
-            None,
-            &[], // no tool calls
-            None,
+            CompletedTurn {
+                text: "some analysis text".into(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                usage: None,
+                gemini_replay: None,
+            },
             &TaskExecutionMode::ActionRequired { min_tool_calls: 1, require_verification: false },
             0, // file_changing_tool_count = 0
             1,
@@ -8829,6 +9150,7 @@ mod tests {
     fn process_provider_response_proceeds_with_tool_calls() {
         let loop_ = make_minimal_loop();
         let mut messages = vec![Message {
+            gemini_replay: None,
             role: Role::User,
             content: "user prompt".into(),
             tool_calls: None,
@@ -8841,20 +9163,24 @@ mod tests {
         let mut completed = false;
 
         let action = loop_.process_provider_response(
-            "need to execute",
-            None,
-            &[ToolCall {
-                id: "call_1".into(),
-                name: "echo".into(),
-                arguments: serde_json::json!({"text": "hi"}),
+            CompletedTurn {
+                text: "need to execute".into(),
+                reasoning: None,
+                tool_calls: [ToolCall {
+                    id: "call_1".into(),
+                    name: "echo".into(),
+                    arguments: serde_json::json!({"text": "hi"}),
 
-                ..Default::default()
-            }],
-            Some(CompletionUsage {
-                prompt_tokens: Some(100),
-                completion_tokens: Some(20),
-                ..Default::default()
-            }),
+                    ..Default::default()
+                }]
+                .to_vec(),
+                usage: Some(CompletionUsage {
+                    prompt_tokens: Some(100),
+                    completion_tokens: Some(20),
+                    ..Default::default()
+                }),
+                gemini_replay: None,
+            },
             &TaskExecutionMode::ActionRequired { min_tool_calls: 1, require_verification: false },
             0,
             1,
@@ -8868,9 +9194,8 @@ mod tests {
         // Has tool calls → Proceed
         assert!(matches!(action, ProviderResponseAction::Proceed));
         assert_eq!(messages.len(), 2);
-        // ADR-48 §4: completion usage lands on the assistant message, prompt
-        // usage is attributed to the preceding user message.
-        assert_eq!(messages[0].tokens_in, Some(100), "prompt usage attributed to user message");
+        // Each completed provider turn owns both usage counts exactly once.
+        assert_eq!(messages[0].tokens_in, None);
         assert_eq!(messages[0].tokens_out, None);
         assert_eq!(messages[1].tokens_in, Some(100));
         assert_eq!(messages[1].tokens_out, Some(20));
@@ -8884,16 +9209,20 @@ mod tests {
         let mut completed = false;
 
         let action = loop_.process_provider_response(
-            "non-empty text",
-            None,
-            &[ToolCall {
-                id: "call_1".into(),
-                name: "echo".into(),
-                arguments: serde_json::json!({}),
+            CompletedTurn {
+                text: "non-empty text".into(),
+                reasoning: None,
+                tool_calls: [ToolCall {
+                    id: "call_1".into(),
+                    name: "echo".into(),
+                    arguments: serde_json::json!({}),
 
-                ..Default::default()
-            }],
-            None,
+                    ..Default::default()
+                }]
+                .to_vec(),
+                usage: None,
+                gemini_replay: None,
+            },
             &TaskExecutionMode::ActionRequired { min_tool_calls: 1, require_verification: false },
             0,
             1,
@@ -9981,6 +10310,452 @@ mod tests {
             }
         }
         assert!(end_reason, "the loop-end reason must surface in the session event log");
+    }
+
+    /// Deterministic process boundary: exercises real evaluation mapping and
+    /// finalization without depending on installed test runners or the network.
+    #[tokio::test]
+    async fn action_required_continuation_completes_without_repeating_prior_writes() {
+        for writes in [1usize, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut script: Vec<_> = (0..writes)
+                .map(|i| vec![completion_test_write(&format!("note-{i}.txt"), "finished")])
+                .collect();
+            script.push(vec![]);
+            let provider = Arc::new(ScriptedProvider::new(script));
+            let mut loop_ = make_loop_with_fs_tool(
+                dir.path(),
+                provider.clone(),
+                Arc::new(ApprovalTestHarness::always_approve()),
+                1,
+            );
+            let mut events = loop_.bus.subscribe().into_inner();
+            let task = AgentTask::new_with_execution_mode(
+                Ulid::new(),
+                "write the notes",
+                TaskExecutionMode::ActionRequired {
+                    min_tool_calls: 1,
+                    require_verification: false,
+                },
+            );
+            let output = loop_.run(task, CancellationToken::new()).await.unwrap();
+            assert_eq!(
+                output.completion_status,
+                concerto_core::types::AgentCompletionStatus::Completed
+            );
+            assert_eq!(output.tool_call_count as usize, writes);
+            assert_eq!(output.tool_events.len(), writes);
+            assert_eq!(output.files_modified.len(), writes);
+            assert_eq!(provider.call_count.load(Ordering::SeqCst), writes + 1);
+            for i in 0..writes {
+                assert_eq!(
+                    std::fs::read_to_string(dir.path().join(format!("note-{i}.txt"))).unwrap(),
+                    "finished"
+                );
+            }
+            while let Ok(event) = events.try_recv() {
+                if let EventKind::AgentThought { content, .. } = &event.kind {
+                    assert!(
+                        !content.contains("no file action returned"),
+                        "prior writes satisfy the action contract"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn action_required_minimum_calls_can_accumulate_across_rounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![completion_test_write("first.txt", "one")],
+            vec![completion_test_write("second.txt", "two")],
+            vec![],
+        ]));
+        let mut loop_ = make_loop_with_fs_tool(
+            dir.path(),
+            provider.clone(),
+            Arc::new(ApprovalTestHarness::always_approve()),
+            1,
+        );
+        let task = AgentTask::new_with_execution_mode(
+            Ulid::new(),
+            "write both notes",
+            TaskExecutionMode::ActionRequired { min_tool_calls: 2, require_verification: false },
+        );
+        let output = loop_.run(task, CancellationToken::new()).await.unwrap();
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed
+        );
+        assert_eq!(output.tool_call_count, 2);
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn action_required_continuation_still_enforces_the_final_minimum() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![completion_test_write("first.txt", "one")],
+            vec![],
+        ]));
+        let mut loop_ = make_loop_with_fs_tool(
+            dir.path(),
+            provider.clone(),
+            Arc::new(ApprovalTestHarness::always_approve()),
+            1,
+        );
+        let task = AgentTask::new_with_execution_mode(
+            Ulid::new(),
+            "perform two actions",
+            TaskExecutionMode::ActionRequired { min_tool_calls: 2, require_verification: false },
+        );
+        let mut live = loop_.bus.subscribe().into_inner();
+        let result = loop_.run(task, CancellationToken::new()).await;
+        assert!(matches!(result, Err(OrchestratorError::ExecutionRequiredButNoTools)));
+        assert_eq!(
+            provider.call_count.load(Ordering::SeqCst),
+            2,
+            "allow the next round to act before enforcing the final minimum"
+        );
+        assert_eq!(std::fs::read_to_string(dir.path().join("first.txt")).unwrap(), "one");
+        while let Ok(event) = live.try_recv() {
+            assert!(!matches!(event.kind, EventKind::TaskCompleted { success: true, .. }));
+        }
+    }
+
+    #[tokio::test]
+    async fn action_required_new_run_does_not_inherit_prior_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![completion_test_write("first.txt", "one")],
+            vec![],
+            vec![],
+        ]));
+        let mut loop_ = make_loop_with_fs_tool(
+            dir.path(),
+            provider.clone(),
+            Arc::new(ApprovalTestHarness::always_approve()),
+            1,
+        );
+        let task = AgentTask::new_with_execution_mode(
+            Ulid::new(),
+            "perform an action",
+            TaskExecutionMode::ActionRequired { min_tool_calls: 1, require_verification: false },
+        );
+        let output = loop_.run(task.clone(), CancellationToken::new()).await.unwrap();
+        assert_eq!(
+            output.completion_status,
+            concerto_core::types::AgentCompletionStatus::Completed
+        );
+        let next_task = AgentTask::new_with_execution_mode(
+            task.session_id,
+            "perform another action",
+            task.execution_mode,
+        );
+        let result = loop_.run(next_task, CancellationToken::new()).await;
+        assert!(matches!(result, Err(OrchestratorError::ExecutionRequiredButNoTools)));
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 3);
+    }
+
+    struct CompletionEvalExecutor(&'static str);
+
+    #[async_trait]
+    impl concerto_eval::EvalProcessExecutor for CompletionEvalExecutor {
+        async fn execute(
+            &self,
+            _program: &str,
+            _args: &[&str],
+            _cwd: &std::path::Path,
+            cancel: CancellationToken,
+        ) -> Result<concerto_core::types::ToolOutput, concerto_eval::EvalError> {
+            use concerto_eval::EvalError;
+            match self.0 {
+                "passed" => Ok(concerto_core::types::ToolOutput {
+                    summary: "tests passed".into(),
+                    data: serde_json::json!({
+                        "exit_code": 0,
+                        "stdout": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n",
+                        "stderr": "",
+                        "complete": true,
+                    }),
+                }),
+                "denied" => Err(EvalError::Denied("verification refused".into())),
+                "io" => Err(EvalError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "test runner missing",
+                ))),
+                "timeout" => Err(EvalError::Timeout(Duration::from_millis(1))),
+                "cancelled" => {
+                    cancel.cancel();
+                    Err(EvalError::Cancelled)
+                }
+                other => panic!("unknown completion test outcome: {other}"),
+            }
+        }
+    }
+
+    fn completion_test_write(path: &str, content: &str) -> ToolCall {
+        ToolCall {
+            id: "completion-write".into(),
+            name: "filesystem".into(),
+            arguments: serde_json::json!({
+                "operation": "write", "path": path, "content": content,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_harness_errors_are_partial_in_output_live_and_durable_events() {
+        for (failure, require_verification) in [
+            ("denied", true),
+            ("denied", false),
+            ("io", true),
+            ("io", false),
+            ("timeout", true),
+            ("timeout", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+            let root = camino::Utf8Path::from_path(dir.path()).unwrap();
+            let store =
+                Arc::new(concerto_sessions::SqliteSessionStore::connect_in_memory().await.unwrap());
+            let session_id = store
+                .create_session(root, "test", "test", CancellationToken::new())
+                .await
+                .unwrap()
+                .id;
+            let provider = Arc::new(ScriptedProvider::new(vec![
+                vec![completion_test_write("output.txt", "done")],
+                vec![],
+            ]));
+            let mut loop_ = make_loop_with_fs_tool(
+                dir.path(),
+                provider,
+                Arc::new(ApprovalTestHarness::always_approve()),
+                4,
+            )
+            .with_session_store(Some(store.clone()));
+            loop_.eval = EvalEngine::new(dir.path())
+                .with_process_executor(Arc::new(CompletionEvalExecutor(failure)));
+            let mut live = loop_.bus.subscribe().into_inner();
+            let task = AgentTask::new_with_execution_mode(
+                session_id,
+                "write the output file",
+                TaskExecutionMode::ActionRequired { min_tool_calls: 1, require_verification },
+            );
+            let output = loop_.run(task, CancellationToken::new()).await.unwrap();
+            assert!(output.eval_result.is_none(), "{failure} never finished a test run");
+            assert!(output
+                .verification
+                .iter()
+                .any(|record| { record.outcome == Some(VerificationOutcome::Error) }));
+            assert_eq!(
+                output.completion_status,
+                concerto_core::types::AgentCompletionStatus::Partial,
+                "{failure} cannot complete the task"
+            );
+            let mut live_completions = Vec::new();
+            while let Ok(event) = live.try_recv() {
+                if let EventKind::TaskCompleted { success, .. } = event.kind {
+                    live_completions.push(success);
+                }
+            }
+            assert_eq!(live_completions, vec![false], "{failure}: live completion");
+            let persisted = store.load_events(session_id, CancellationToken::new()).await.unwrap();
+            let durable_completions: Vec<_> = persisted
+                .iter()
+                .filter_map(|stored| match stored.to_event().unwrap().kind {
+                    EventKind::TaskCompleted { success, .. } => Some(success),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(durable_completions, vec![false], "{failure}: durable completion");
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_cancelled_verification_never_publishes_success() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![completion_test_write("output.txt", "done")],
+            vec![],
+        ]));
+        let mut loop_ = make_loop_with_fs_tool(
+            dir.path(),
+            provider,
+            Arc::new(ApprovalTestHarness::always_approve()),
+            4,
+        );
+        loop_.eval = EvalEngine::new(dir.path())
+            .with_process_executor(Arc::new(CompletionEvalExecutor("cancelled")));
+        let mut live = loop_.bus.subscribe().into_inner();
+        let result = loop_
+            .run(
+                AgentTask::new_action_required(Ulid::new(), "write the output file"),
+                CancellationToken::new(),
+            )
+            .await;
+        match result {
+            Err(OrchestratorError::Cancelled) => {}
+            Ok(output) => assert_eq!(
+                output.completion_status,
+                concerto_core::types::AgentCompletionStatus::Partial,
+                "a cancelled verifier cannot complete the task"
+            ),
+            other => panic!("unexpected cancellation result: {other:?}"),
+        }
+        while let Ok(event) = live.try_recv() {
+            assert!(
+                !matches!(event.kind, EventKind::TaskCompleted { success: true, .. }),
+                "cancelled verification cannot publish success"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_continuation_retains_failures_until_a_successful_recheck() {
+        for (repair, action_required) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+            let mut script =
+                vec![vec![completion_test_write("index.html", "<img src=\"missing.png\">")]];
+            if repair {
+                script.push(vec![completion_test_write("index.html", "<p>fixed</p>")]);
+            }
+            script.push(vec![]);
+            let mut loop_ = make_loop_with_fs_tool(
+                dir.path(),
+                Arc::new(ScriptedProvider::new(script)),
+                Arc::new(ApprovalTestHarness::always_approve()),
+                1, // Every write reaches the iteration cap before the final answer.
+            );
+            loop_.eval = EvalEngine::new(dir.path())
+                .with_process_executor(Arc::new(CompletionEvalExecutor("passed")));
+            let mut live = loop_.bus.subscribe().into_inner();
+            let output = loop_
+                .run(
+                    if action_required {
+                        AgentTask::new_action_required(Ulid::new(), "prepare the page")
+                    } else {
+                        AgentTask::new_coordinator_decides(Ulid::new(), "prepare the page")
+                    },
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert!(output.eval_result.as_ref().is_some_and(|result| result.passed));
+            let html = output
+                .verification
+                .iter()
+                .find(|record| record.path.as_str().ends_with("index.html"))
+                .expect("the earlier HTML verification is retained");
+            assert_eq!(
+                html.outcome,
+                Some(if repair {
+                    VerificationOutcome::Passed
+                } else {
+                    VerificationOutcome::Failed
+                })
+            );
+            assert_eq!(
+                output.completion_status,
+                if repair {
+                    concerto_core::types::AgentCompletionStatus::Completed
+                } else {
+                    concerto_core::types::AgentCompletionStatus::Partial
+                },
+                "completion must include earlier rounds' unresolved failures; repair={repair}"
+            );
+            let mut completions = Vec::new();
+            while let Ok(event) = live.try_recv() {
+                if let EventKind::TaskCompleted { success, .. } = event.kind {
+                    completions.push(success);
+                }
+            }
+            assert_eq!(completions, vec![repair], "one truthful terminal event");
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_missing_required_verification_is_partial_but_optional_is_not() {
+        for require_verification in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let provider = Arc::new(ScriptedProvider::new(vec![
+                vec![completion_test_write("notes.txt", "reviewed")],
+                vec![],
+            ]));
+            let mut loop_ = make_loop_with_fs_tool(
+                dir.path(),
+                provider,
+                Arc::new(ApprovalTestHarness::always_approve()),
+                4,
+            );
+            let task = AgentTask::new_with_execution_mode(
+                Ulid::new(),
+                "write the notes",
+                TaskExecutionMode::ActionRequired { min_tool_calls: 1, require_verification },
+            );
+            let output = loop_.run(task, CancellationToken::new()).await.unwrap();
+            assert!(output.eval_result.is_none());
+            assert_eq!(output.verification.len(), 1);
+            assert_eq!(output.verification[0].outcome, Some(VerificationOutcome::Unavailable));
+            assert_eq!(
+                output.completion_status,
+                if require_verification {
+                    concerto_core::types::AgentCompletionStatus::Partial
+                } else {
+                    concerto_core::types::AgentCompletionStatus::Completed
+                },
+                "the task's required verification contract must be honored"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_run_cancelled_during_evaluation_is_not_done() {
+        struct CancelRun(CancellationToken);
+        #[async_trait]
+        impl concerto_eval::EvalProcessExecutor for CancelRun {
+            async fn execute(
+                &self,
+                _program: &str,
+                _args: &[&str],
+                _cwd: &std::path::Path,
+                _cancel: CancellationToken,
+            ) -> Result<concerto_core::types::ToolOutput, concerto_eval::EvalError> {
+                self.0.cancel();
+                Err(concerto_eval::EvalError::Cancelled)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![completion_test_write("output.txt", "done")],
+            vec![],
+        ]));
+        let mut loop_ = make_loop_with_fs_tool(
+            dir.path(),
+            provider,
+            Arc::new(ApprovalTestHarness::always_approve()),
+            4,
+        );
+        let cancel = CancellationToken::new();
+        loop_.eval =
+            EvalEngine::new(dir.path()).with_process_executor(Arc::new(CancelRun(cancel.clone())));
+        let mut live = loop_.bus.subscribe().into_inner();
+        let result = loop_
+            .run(AgentTask::new_action_required(Ulid::new(), "write the output file"), cancel)
+            .await;
+        assert!(matches!(result, Err(OrchestratorError::Cancelled)));
+        assert_eq!(loop_.state, AgentState::Cancelled);
+        while let Ok(event) = live.try_recv() {
+            assert!(!matches!(event.kind, EventKind::TaskCompleted { success: true, .. }));
+        }
     }
 
     /// The Done path with no evaluation result is a normal `Completed` run:

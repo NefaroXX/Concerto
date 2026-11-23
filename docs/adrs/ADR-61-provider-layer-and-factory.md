@@ -130,9 +130,10 @@ identically (ADR-32).
 `ContextGuardProvider` (`crates/providers/src/context_guard.rs`) wraps every
 provider as the last-stage enforcement of the context budget (ADR-48):
 budget = capacity − output reserve − safety margin; deterministic reduction
-(clip marked blocks, drop oldest conversation groups, insert compaction
-summaries), then a typed `ContextOverflow` error. In-loop LLM summarization
-does not exist on this path.
+(reduce optional retrieved/file evidence and old tool payloads), then a typed
+`ContextOverflow` error. Conversational instructions and active task state
+remain mandatory under [ADR-85](ADR-85-compaction-instruction-continuity.md).
+In-loop LLM summarization does not exist on this path.
 
 ## Consequences
 

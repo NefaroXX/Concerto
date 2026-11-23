@@ -21,7 +21,7 @@ use async_trait::async_trait;
 
 use concerto_config::{BlueprintFacade, ResolvedBlueprint, StageKind};
 use concerto_core::error::PolicyError;
-use concerto_core::event::{Event, EventBus};
+use concerto_core::event::{DurableEventReceiver, Event, EventBus};
 use concerto_core::ids::Ulid;
 use concerto_core::traits::policy::{AuditEntry, AuditLog};
 use concerto_core::transcript::{
@@ -31,6 +31,45 @@ use concerto_core::CancellationToken;
 
 /// Simple no‑op audit logger used when no UI logging is required.
 pub(crate) struct NoopAuditLog;
+
+/// Rate-limited consumer-side surfacing of durable queue overflow.
+///
+/// The recorder loops have no error return path, so a gap is logged rather than
+/// failing the run. The cumulative drop count is compared on every receive
+/// step; an error is emitted at most once per observed gap, and only at the
+/// first gap or each doubling of the cumulative count, so a persistently
+/// lagging queue cannot flood the log.
+struct GapLog {
+    consumer: &'static str,
+    observed: u64,
+    logged: u64,
+}
+
+impl GapLog {
+    fn new(consumer: &'static str) -> Self {
+        Self { consumer, observed: 0, logged: 0 }
+    }
+
+    fn observe(&mut self, receiver: &DurableEventReceiver, session_id: Ulid) {
+        let current = receiver.dropped_events();
+        if current <= self.observed {
+            return;
+        }
+        let gap = current - self.observed;
+        self.observed = current;
+        if self.logged == 0 || current >= self.logged.saturating_mul(2) {
+            self.logged = current;
+            tracing::error!(
+                consumer = self.consumer,
+                %session_id,
+                dropped = current,
+                gap,
+                capacity = receiver.capacity(),
+                "durable event consumer missed events: queue overflowed"
+            );
+        }
+    }
+}
 
 pub(crate) struct EventRecorderGuard {
     cancel: CancellationToken,
@@ -63,10 +102,12 @@ pub(crate) fn start_event_recorder(
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
     let task = tokio::spawn(async move {
+        let mut gap = GapLog::new("session-event-recorder");
         loop {
             tokio::select! {
                 _ = task_cancel.cancelled() => {
                     while let Ok(event) = receiver.try_recv() {
+                        gap.observe(&receiver, session_id);
                         if event.session_id != session_id {
                             tracing::debug!(
                                 recorder_session = %session_id,
@@ -80,10 +121,12 @@ pub(crate) fn start_event_recorder(
                             tracing::warn!(%error, %session_id, "failed to flush session event");
                         }
                     }
+                    gap.observe(&receiver, session_id);
                     break;
                 },
                 received = receiver.recv() => match received {
                     Some(event) => {
+                        gap.observe(&receiver, session_id);
                         if event.session_id != session_id {
                             tracing::debug!(
                                 recorder_session = %session_id,
@@ -95,7 +138,10 @@ pub(crate) fn start_event_recorder(
                             tracing::warn!(%error, %session_id, "failed to persist session event");
                         }
                     }
-                    None => break,
+                    None => {
+                        gap.observe(&receiver, session_id);
+                        break;
+                    }
                 }
             }
         }
@@ -376,6 +422,7 @@ pub(crate) fn start_transcript_recorder(
     let task_store = store.clone();
     let task_labels = gate_labels;
     let task = tokio::spawn(async move {
+        let mut gap = GapLog::new("transcript-recorder");
         loop {
             tokio::select! {
                 _ = task_cancel.cancelled() => {
@@ -383,15 +430,21 @@ pub(crate) fn start_transcript_recorder(
                     // cancellation was requested; the final flush in stop()
                     // persists whatever remains buffered.
                     while let Ok(event) = receiver.try_recv() {
+                        gap.observe(&receiver, session_id);
                         handle_bus_event(event, session_id, &task_state, &task_store, &task_flush_cancel, &task_labels).await;
                     }
+                    gap.observe(&receiver, session_id);
                     break;
                 }
                 received = receiver.recv() => match received {
                     Some(event) => {
+                        gap.observe(&receiver, session_id);
                         handle_bus_event(event, session_id, &task_state, &task_store, &task_flush_cancel, &task_labels).await;
                     }
-                    None => break,
+                    None => {
+                        gap.observe(&receiver, session_id);
+                        break;
+                    }
                 }
             }
         }

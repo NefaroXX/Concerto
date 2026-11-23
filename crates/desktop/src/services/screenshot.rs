@@ -55,17 +55,20 @@ fn screenshots_dir() -> Result<PathBuf, ScreenshotError> {
 /// Generates a timestamped filename for the screenshot.
 fn screenshot_filename() -> String {
     let now = time::OffsetDateTime::now_utc();
-    // Format: screenshot_20260704_153045.png
+    // Format: screenshot_20260704_153045_123456789.png. Nanoseconds keep
+    // successive captures (and parallel tests) from overwriting one another;
+    // the old second-only name collided within the same second.
     let date = now.date();
     let time_parts = now.time();
     format!(
-        "screenshot_{:04}{:02}{:02}_{:02}{:02}{:02}.png",
+        "screenshot_{:04}{:02}{:02}_{:02}{:02}{:02}_{:09}.png",
         date.year(),
         u8::from(date.month()),
         date.day(),
         time_parts.hour(),
         time_parts.minute(),
         time_parts.second(),
+        time_parts.nanosecond(),
     )
 }
 

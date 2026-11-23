@@ -232,6 +232,7 @@ mod tests {
             match self.behavior {
                 MockBehavior::Success => {
                     let chunk = CompletionChunk {
+                        gemini_replay: None,
                         delta: "ok".into(),
                         reasoning: None,
                         tool_call: None,

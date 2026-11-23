@@ -5,6 +5,7 @@ mod operator_input;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::agent_runner::AgentRunner;
@@ -15,7 +16,7 @@ use crate::plan_approval::{
     rehydrate_durable_binding, ApprovedPlanContext, PlanBinding, PlanLedger,
 };
 use crate::registry::AgentRegistry;
-use crate::session_manager::{message_row_usage, ProjectSessionManager, SessionManagerConfig};
+use crate::session_manager::{ProjectSessionManager, SessionManagerConfig};
 use crate::{AgentRelationship, CollaborationRule};
 
 use concerto_config::AppConfig;
@@ -36,8 +37,9 @@ use concerto_core::traits::provider::LlmProvider;
 use concerto_core::transcript::TranscriptEntry;
 use concerto_core::types::ToolRegistry;
 use concerto_core::types::{
-    AgentCompletionStatus, AgentContext, AgentId, AgentOutput, AgentStage, AgentTask, DesignDoc,
-    Message, ProjectId, ProviderMetrics, Role, SessionContext, TaskExecutionMode, TaskId,
+    bound_agent_history_seed, AgentCompletionStatus, AgentContext, AgentId, AgentOutput,
+    AgentStage, AgentTask, DesignDoc, Message, ProjectId, ProviderMetrics, Role, SessionContext,
+    TaskExecutionMode, TaskId,
 };
 use concerto_core::types::{Condition, PolicyRule};
 use concerto_core::{
@@ -499,15 +501,30 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
+/// Best-effort persist of the run's settled provider metrics.
+///
+/// **Settlement must outlive run cancellation.** Terminal accounting is not
+/// part of the run's cancellable work: tokens already consumed before a
+/// cancellation/error must still reach `provider_metrics` and the session
+/// totals. The helper therefore owns a fresh token instead of accepting the
+/// run's cancellation token — a parameter would let a caller re-introduce the
+/// H39a defect where `SessionStore::record_metrics` short-circuits on a
+/// pre-cancelled token. Failures (including a store that was already closed)
+/// are logged and swallowed: settlement is telemetry, never run control flow.
+///
+/// Exactly-once semantics belong to [`settle_run_accounting`]; this helper is
+/// the write half and does not itself deduplicate.
 async fn persist_provider_metrics(
     store: Option<&Arc<dyn concerto_sessions::SessionStore>>,
     session_id: Ulid,
     metrics: &[ProviderMetrics],
-    cancel: CancellationToken,
 ) {
     let Some(store) = store else {
         return;
     };
+    // Fresh, uncancelled token: settlement deliberately ignores the run's
+    // cancellation (see the doc comment above).
+    let cancel = CancellationToken::new();
     for metric in metrics {
         if metric.provider.trim().is_empty() {
             continue;
@@ -528,18 +545,21 @@ async fn persist_provider_metrics(
 /// accumulated usage cost already persisted as metrics). `task_id` is the task
 /// id available at the call site — the run's root task for multi-agent runs,
 /// whose per-subtask spend is attributed to it because per-subtask ids are not
-/// exposed beyond the coordinator. Failures are logged and swallowed so spend
-/// persistence never breaks a run.
+/// exposed beyond the coordinator. Settlement must outlive run cancellation
+/// (it owns a fresh token; see [`persist_provider_metrics`]) and failures are
+/// logged and swallowed so spend persistence never breaks a run.
 async fn persist_spend_records(
     store: Option<&Arc<dyn concerto_sessions::SessionStore>>,
     session_id: Ulid,
     task_id: Option<Ulid>,
     metrics: &[ProviderMetrics],
-    cancel: CancellationToken,
 ) {
     let Some(store) = store else {
         return;
     };
+    // Fresh, uncancelled token: settlement deliberately ignores the run's
+    // cancellation (see `persist_provider_metrics`).
+    let cancel = CancellationToken::new();
     for metric in metrics {
         if metric.provider.trim().is_empty() {
             continue;
@@ -548,6 +568,7 @@ async fn persist_spend_records(
             id: Ulid::new(),
             session_id,
             task_id,
+            agent_id: metric.agent_id.clone(),
             provider: metric.provider.clone(),
             model: metric.model.clone(),
             tokens_in: metric.tokens_in,
@@ -557,6 +578,328 @@ async fn persist_spend_records(
         };
         if let Err(error) = store.record_spend(record, cancel.clone()).await {
             tracing::warn!(%error, %session_id, "failed to persist spend record");
+        }
+    }
+}
+
+/// Run-scoped exactly-once latch for terminal accounting.
+///
+/// One instance is created per run entry point (`run_shared_agent`) and shared
+/// by the single-agent and multi-agent terminal paths. Only the first terminal
+/// site to [`claim`](Self::claim) writes metrics/spend; a later terminal site
+/// on the same run (e.g. an error tail reached after a success tail already
+/// settled) is a no-op, so no duplicate rows reach `provider_metrics` /
+/// `spend_records` or the session aggregates.
+struct RunSettlement {
+    done: AtomicBool,
+}
+
+impl RunSettlement {
+    fn new() -> Self {
+        Self { done: AtomicBool::new(false) }
+    }
+
+    /// Atomically claim the one settlement write for this run.
+    ///
+    /// Returns `true` for exactly one caller. `SeqCst` is intentional: the
+    /// claim is a single run-wide decision gate, not a data race to optimise.
+    fn claim(&self) -> bool {
+        !self.done.swap(true, Ordering::SeqCst)
+    }
+}
+
+/// Claim the run's settlement latch and, only on the winner, persist the
+/// settled provider metrics and spend rows.
+///
+/// The latch is claimed **before** the writes: a partial write failure is
+/// logged inside [`persist_provider_metrics`] / [`persist_spend_records`] and
+/// deliberately not retried — duplicate telemetry is worse than a missing row,
+/// and the loser of the race must never write a second copy.
+///
+/// Settlement is independent of the run's cancellation token: the persist
+/// helpers own fresh tokens so tokens consumed before a cancellation still
+/// reach the audit trail (H39a).
+async fn settle_run_accounting(
+    store: Option<&Arc<dyn concerto_sessions::SessionStore>>,
+    session_id: Ulid,
+    task_id: Option<Ulid>,
+    metrics: &[ProviderMetrics],
+    settlement: &RunSettlement,
+) {
+    if !settlement.claim() {
+        return;
+    }
+    persist_provider_metrics(store, session_id, metrics).await;
+    persist_spend_records(store, session_id, task_id, metrics).await;
+}
+
+/// One child's parent-owned history/metrics files and restore seed length.
+struct SupervisedHistorySeed {
+    agent_id: String,
+    initial_seed_len: usize,
+    paths: crate::supervised_history::SupervisedHistoryPaths,
+}
+
+/// Parent-owned per-run supervised history directory.
+struct SupervisedHistoryRun {
+    directory: PathBuf,
+    paths: HashMap<String, crate::supervised_history::SupervisedHistoryPaths>,
+    seeds: Vec<SupervisedHistorySeed>,
+}
+
+/// Create a mode-0700 per-run directory and write each child's restore seed.
+///
+/// Best-effort: a filesystem failure disables supervised history for this run
+/// (children receive no history env) rather than failing the run. The parent
+/// trims a trailing unanswered tool call from the seed before writing it, so
+/// the child never receives a provider-invalid tool-call tail and the
+/// accumulated-length delta stays exact.
+async fn prepare_supervised_history(
+    store: Option<&Arc<dyn SessionStore>>,
+    session_id: Ulid,
+    tasks: &[(String, String)],
+) -> Option<SupervisedHistoryRun> {
+    let directory =
+        std::env::temp_dir().join(format!("concerto-supervised-{session_id}-{}", Ulid::new()));
+    if let Err(error) = tokio::fs::create_dir_all(&directory).await {
+        tracing::warn!(
+            path = %directory.display(),
+            %error,
+            "failed to create supervised history directory; child history disabled"
+        );
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = std::fs::Permissions::from_mode(0o700);
+        if let Err(error) = tokio::fs::set_permissions(&directory, permissions).await {
+            tracing::warn!(
+                path = %directory.display(),
+                %error,
+                "failed to restrict supervised history directory; child history disabled"
+            );
+            remove_supervised_history_dir(&directory).await;
+            return None;
+        }
+    }
+
+    // R1: distinct configured ids must never share a history/metrics file.
+    // Derive every path first and disable history for any id whose physical
+    // path is already claimed by another id in this run. The check is
+    // deterministic (collisions are reported in task order), and a normal run
+    // has none because the file stem hashes the complete id.
+    let (mut paths, colliding) = crate::supervised_history::unique_paths_for_agents(
+        &directory,
+        tasks.iter().map(|(agent_id, _)| agent_id.as_str()),
+    );
+    for agent_id in &colliding {
+        tracing::warn!(
+            %agent_id,
+            "supervised history path collision; child history and metrics disabled for agent"
+        );
+    }
+
+    let mut seeds = Vec::new();
+    for (agent_id, _) in tasks {
+        let Some(agent_paths) = paths.get(agent_id).cloned() else {
+            continue;
+        };
+        // Repair an interrupted tool batch before it becomes the child's seed,
+        // then re-bound because synthetic results add messages. The stamped
+        // length is the repaired length, so harvest slices only child turns
+        // and never re-ingests request-only repair results.
+        let seed = bound_agent_history_seed(crate::provider_transcript::restore_tool_responses(
+            load_supervised_seed(store, session_id, agent_id).await,
+        ));
+        match crate::supervised_history::write_seed(&agent_paths.history, &seed).await {
+            Ok(()) => {
+                seeds.push(SupervisedHistorySeed {
+                    agent_id: agent_id.clone(),
+                    initial_seed_len: seed.len(),
+                    paths: agent_paths.clone(),
+                });
+            }
+            Err(error) => {
+                // No seed means the child must not write a history either.
+                paths.remove(agent_id);
+                tracing::warn!(
+                    %agent_id,
+                    path = %agent_paths.history.display(),
+                    %error,
+                    "failed to write supervised history seed; child history disabled for agent"
+                );
+            }
+        }
+    }
+    Some(SupervisedHistoryRun { directory, paths, seeds })
+}
+
+/// Load one child's prior typed history. Fail-soft: a load failure is an
+/// empty seed, matching the in-process runner's best-effort restore.
+async fn load_supervised_seed(
+    store: Option<&Arc<dyn SessionStore>>,
+    session_id: Ulid,
+    agent_id: &str,
+) -> Vec<Message> {
+    let Some(store) = store else {
+        return Vec::new();
+    };
+    let cancel = CancellationToken::new();
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        store.load_agent_messages(session_id, agent_id, cancel),
+    )
+    .await
+    {
+        Ok(Ok(messages)) => {
+            // Bound prompt growth before the seed is written: the DB stream
+            // may be arbitrarily long, but the child only needs the most
+            // recent window sans any leading orphaned tool result.
+            bound_agent_history_seed(messages)
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(%agent_id, %error, "failed to load supervised agent history; starting empty");
+            Vec::new()
+        }
+        Err(_elapsed) => {
+            tracing::warn!(%agent_id, "supervised agent history load timed out; starting empty");
+            Vec::new()
+        }
+    }
+}
+
+/// Harvest the child-owned history and metrics files after the supervisor
+/// stops, before the parent checks cancellation. Fresh cleanup tokens keep a
+/// completed child's work durable even when the run was cancelled.
+async fn harvest_supervised_history(
+    store: Option<&Arc<dyn SessionStore>>,
+    session_id: Ulid,
+    task_id: Option<Ulid>,
+    seeds: &[SupervisedHistorySeed],
+) {
+    let Some(store) = store else {
+        return;
+    };
+
+    for seed in seeds {
+        let agent_id = seed.agent_id.as_str();
+        // A history read failure must not suppress metrics: the two sidecars
+        // are independent best-effort artifacts.
+        match crate::supervised_history::read_messages(&seed.paths.history).await {
+            Ok(accumulated) if accumulated.len() < seed.initial_seed_len => {
+                // Loud, never a silent skip: a short file means the seed
+                // offset no longer corresponds to the child's turns and
+                // harvesting would mis-slice. Leave the child turns
+                // unpersisted rather than attach the wrong messages.
+                tracing::warn!(
+                    %agent_id,
+                    path = %seed.paths.history.display(),
+                    expected = seed.initial_seed_len,
+                    actual = accumulated.len(),
+                    "supervised agent history is shorter than its seed; skipping append"
+                );
+            }
+            Ok(accumulated) => {
+                // Persist the child's raw turns, including an interrupted tail.
+                // Load-time repair turns it into a valid provider request
+                // without replacing or dropping durable evidence.
+                let turns = accumulated[seed.initial_seed_len..].to_vec();
+                if !turns.is_empty() {
+                    let cancel = CancellationToken::new();
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        store.append_agent_messages(session_id, agent_id, &turns, cancel),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => tracing::warn!(
+                            %agent_id,
+                            %error,
+                            "failed to append supervised agent history"
+                        ),
+                        Err(_elapsed) => tracing::warn!(
+                            %agent_id,
+                            "supervised agent history append timed out"
+                        ),
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(
+                %agent_id,
+                path = %seed.paths.history.display(),
+                %error,
+                "failed to read supervised agent history; skipping append"
+            ),
+        }
+
+        let metrics = match crate::supervised_history::read_metrics(&seed.paths.metrics).await {
+            Ok(metrics) => metrics,
+            Err(error) => {
+                tracing::warn!(
+                    %agent_id,
+                    path = %seed.paths.metrics.display(),
+                    %error,
+                    "failed to read supervised agent metrics"
+                );
+                continue;
+            }
+        };
+        for metric in metrics {
+            if metric.provider.trim().is_empty() {
+                continue;
+            }
+            // Fresh, uncancelled token: a cancelled run must still account
+            // for work the child completed before teardown (H39a).
+            let cancel = CancellationToken::new();
+            if let Err(error) = store.record_metrics(session_id, metric.clone(), cancel).await {
+                tracing::warn!(%agent_id, %error, "failed to persist supervised provider metrics");
+            }
+            let record = concerto_sessions::spend::SpendRecord {
+                id: Ulid::new(),
+                session_id,
+                task_id,
+                agent_id: Some(seed.agent_id.clone()),
+                provider: metric.provider,
+                model: metric.model,
+                tokens_in: metric.tokens_in,
+                tokens_out: metric.tokens_out,
+                cost_usd: metric.cost_usd,
+                created_at: time::OffsetDateTime::now_utc(),
+            };
+            // Fresh token for the spend write as well: metrics and spend are
+            // independent best-effort rows, and either may fail without
+            // suppressing the other.
+            let cancel = CancellationToken::new();
+            if let Err(error) = store.record_spend(record, cancel).await {
+                tracing::warn!(%agent_id, %error, "failed to persist supervised spend record");
+            }
+        }
+    }
+}
+
+/// Remove the parent-owned per-run directory, retrying once on failure.
+///
+/// Cleanup is best-effort, but a transient filesystem error should not leak a
+/// directory full of child history. If both attempts fail, the leaked path is
+/// logged loudly so an operator can remove it.
+async fn remove_supervised_history_dir(directory: &Path) {
+    match tokio::fs::remove_dir_all(directory).await {
+        Ok(()) => {}
+        Err(first_error) => {
+            tracing::warn!(
+                path = %directory.display(),
+                %first_error,
+                "failed to remove supervised history directory; retrying once"
+            );
+            if let Err(second_error) = tokio::fs::remove_dir_all(directory).await {
+                tracing::warn!(
+                    path = %directory.display(),
+                    %second_error,
+                    "failed to remove supervised history directory after retry; directory leaked"
+                );
+            }
         }
     }
 }
@@ -629,6 +972,13 @@ struct StageTracker {
 impl StageTracker {
     fn new(bus: EventBus, session_id: Ulid, task_id: TaskId) -> Self {
         Self { bus, session_id, task_id, current: None }
+    }
+
+    /// Settle the stage from the same status returned to the caller.
+    fn finish(&mut self, status: AgentCompletionStatus) {
+        if status == AgentCompletionStatus::Completed {
+            self.set(RunStage::Complete);
+        }
     }
 
     /// Advance to `stage`, publishing `RunStageChanged` only on transition.
@@ -762,6 +1112,42 @@ async fn create_audit_pool(
     concerto_sessions::SqliteSessionStore::open_pool(&db_path).await.map_err(|e| {
         OrchestratorError::AgentLoopError(format!("failed to connect to audit DB: {e}"))
     })
+}
+
+/// Open the audit pool with a small bounded retry.
+///
+/// A busy or transiently unavailable `sessions.db` must not silently disable
+/// checkpoint tooling for the whole run. Three attempts with 25 ms then 50 ms
+/// backoff cover the short-lived open window while preserving the caller's
+/// fail-soft contract: every failed attempt is logged and the final error is
+/// returned for [`build_audit_sink`] to degrade to a no-op audit sink.
+async fn create_audit_pool_with_retry(
+    data_dir: &std::path::Path,
+) -> Result<sqlx::SqlitePool, OrchestratorError> {
+    const ATTEMPTS: u32 = 3;
+    const BACKOFF_MS: [u64; 2] = [25, 50];
+
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match create_audit_pool(data_dir).await {
+            Ok(pool) => return Ok(pool),
+            Err(error) => {
+                tracing::warn!(
+                    attempt,
+                    attempts = ATTEMPTS,
+                    error = %error,
+                    "failed to open sessions DB for audit"
+                );
+                if attempt >= ATTEMPTS {
+                    return Err(error);
+                }
+            }
+        }
+        if let Some(delay_ms) = BACKOFF_MS.get((attempt - 1) as usize) {
+            tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
+        }
+    }
 }
 
 /// Resolve the provider based on the selected ID and configuration.
@@ -948,7 +1334,7 @@ pub(crate) use continuity::*;
 /// writer in one run targets the same `sessions.db`.
 pub(crate) async fn build_audit_sink() -> (Arc<dyn AuditLog>, Option<sqlx::SqlitePool>) {
     match concerto_sessions::app_data_dir() {
-        Ok(data_dir) => match create_audit_pool(&data_dir).await {
+        Ok(data_dir) => match create_audit_pool_with_retry(&data_dir).await {
             Ok(pool) => (Arc::new(SqliteAuditLog::new(pool.clone())), Some(pool)),
             Err(e) => {
                 tracing::warn!(error = %e, "failed to open audit DB — audit logging disabled");
@@ -1272,6 +1658,10 @@ async fn execute_agent_loop(
     // `verify_run` project-tests travel the same policy path as the loop's
     // own evaluation.
     verify_service: Arc<crate::verify::VerifierService>,
+    // H39a: the run-scoped exactly-once settlement latch shared with the
+    // multi-agent path; the terminal Ok/Err tails claim it before writing
+    // metrics/spend so a run settles at most once.
+    settlement: &RunSettlement,
 ) -> Result<AgentOutput, OrchestratorError> {
     // ADR-67 M-01 (audit C-03 gate): the in-run overflow-strategy slot is
     // removed from `AgentLoop`. Context overflow is bounded deterministically
@@ -1372,8 +1762,8 @@ async fn execute_agent_loop(
     let task_id = task.id.0;
     // Run-stage signals (ADR-55 §9): the loop is about to start, so the
     // run is Inspecting the workspace; a mutation-capable run then moves to
-    // Execute. Complete is reported only after `run` returns Ok below — an Err
-    // or cancellation never advances the stage. Under full local agency the
+    // Execute. Complete is reported only for a completed output below — a
+    // partial result, error or cancellation never advances the stage. Under full local agency the
     // single-agent (forced) loop is action-capable, so `execute_granted` is
     // true; the explicit flag keeps the stage independent of task shaping.
     {
@@ -1388,32 +1778,32 @@ async fn execute_agent_loop(
             // Full-local-agency runs are action-capable: an empty final message
             // is left as the model produced it (no honesty synthesis, which is
             // reserved for read-only runs that no longer exist as a mode).
-            stage_tracker.lock().unwrap_or_else(|error| error.into_inner()).set(RunStage::Complete);
+            stage_tracker
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .finish(output.completion_status);
             output
         }
         Err(error) => {
             // Flush any partial transcript before surfacing the failure
             // (ADR-36): still-`Running` tool calls settle as Cancelled inside
             // stop().
-            transcript_recorder.stop().await;
+            transcript_recorder
+                .finish(&[TranscriptEntry::Error { content: error.to_string() }])
+                .await;
             event_recorder.stop().await;
             // Persist whatever the loop settled before failing (e.g. rate
             // limit): tokens consumed and cost accrued so far must not
             // vanish from the audit trail. Best-effort like the success tail.
+            // Settlement owns its own token, so a cancelled run token cannot
+            // suppress these rows (H39a).
             let settled = agent.provider_metrics();
-            persist_provider_metrics(
-                metrics_store.as_ref(),
-                session_id,
-                &settled,
-                req.cancel_token.clone(),
-            )
-            .await;
-            persist_spend_records(
+            settle_run_accounting(
                 metrics_store.as_ref(),
                 session_id,
                 Some(task_id),
                 &settled,
-                req.cancel_token.clone(),
+                settlement,
             )
             .await;
             return Err(error);
@@ -1433,21 +1823,15 @@ async fn execute_agent_loop(
             },
         ])
         .await;
-    persist_provider_metrics(
-        metrics_store.as_ref(),
-        session_id,
-        &output.provider_metrics,
-        req.cancel_token.clone(),
-    )
-    .await;
     // One spend record per settled provider call (the single-agent run
-    // aggregates its usage into one metrics entry; best-effort).
-    persist_spend_records(
+    // aggregates its usage into one metrics entry; best-effort). The run
+    // latch keeps a later error tail from writing duplicates (H39a).
+    settle_run_accounting(
         metrics_store.as_ref(),
         session_id,
         Some(task_id),
         &output.provider_metrics,
-        req.cancel_token.clone(),
+        settlement,
     )
     .await;
     maintain_context_after_run(
@@ -2848,6 +3232,11 @@ pub async fn run_shared_agent(
         );
     }
 
+    // H39a: one run-scoped settlement latch shared by the single-agent and
+    // multi-agent terminal paths, so metrics/spend are written exactly once
+    // per run even if a terminal tail is reached more than once.
+    let settlement = RunSettlement::new();
+
     // 7. Multi-agent dispatch. With full local agency the coordinator owns
     // every non-forced run; it engages specialists on need inside its decision
     // loop — never by pre-scanning the user's words. `force_single_agent` is
@@ -2875,6 +3264,7 @@ pub async fn run_shared_agent(
             project_context.clone(),
             &describe_state,
             verify_service.clone(),
+            &settlement,
         )
         .await;
     }
@@ -2963,6 +3353,7 @@ pub async fn run_shared_agent(
         project_context,
         single_agent_manifest_digest,
         verify_service.clone(),
+        &settlement,
     )
     .await?;
 
@@ -2992,6 +3383,22 @@ pub async fn run_shared_agent(
 /// opt-in only) the review-cycle resumability store. They mirror exactly what
 /// the single-agent in-process gate is built from, so both gated paths enforce
 /// the same policy over the same durable log.
+/// The single routing decision for coordinator conversation history (H40).
+///
+/// Approved-plan runs take the ADR-60 D7 contract: the verified structured
+/// artifact and its decision ledger govern, and the old rendered transcript is
+/// excluded. Every other run — including headless one-shots with no interactive
+/// inbox — receives the persisted messages as typed history. Keeping the
+/// predicate here, and calling it only from the coordinator wiring, means the
+/// D7 boundary cannot silently weaken without failing the matching control in
+/// `tests::approved_plan_d7`.
+fn conversation_history_for_run(
+    approved_plan: Option<&ApprovedPlanContext>,
+    history: &[Message],
+) -> Option<Vec<Message>> {
+    approved_plan.is_none().then(|| history.to_vec())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_multi_agent(
     req: &AgentRunRequest,
@@ -3031,12 +3438,17 @@ async fn run_multi_agent(
     // harness engine upgrades to the governed executor-backed engine below,
     // so coordinator-path verification travels the same policy path.
     verify_service: Arc<crate::verify::VerifierService>,
+    // H39a: the run-scoped exactly-once settlement latch shared with the
+    // single-agent path; the terminal Ok/Err tails claim it before writing
+    // metrics/spend so a run settles at most once.
+    settlement: &RunSettlement,
 ) -> Result<AgentOutput, OrchestratorError> {
     let project_dir = req.project_dir.clone();
     if let Some(store) = &session_store {
         // Run-start row: no provider call has happened yet, so there is no
         // usage to record — tokens stay `None` by design.
         let user_message = Message {
+            gemini_replay: None,
             role: concerto_core::types::Role::User,
             content: req.input.clone(),
             tool_calls: None,
@@ -3386,7 +3798,10 @@ async fn run_multi_agent(
     // Policy checks, routing, coordination, and actual-cost recording all
     // share one tracker so estimates are not charged as spend.
     let runner = AgentRunner::new(registry.clone(), services.bus.clone(), spend_tracker.clone())
-        .with_blueprint_facade(facade.clone());
+        .with_blueprint_facade(facade.clone())
+        // H39b: in-process specialists restore and persist their own
+        // agent-scoped history. Root conversation messages stay untouched.
+        .with_session_store(session_store.clone());
     let routing = Arc::new(
         RoutingEngine::new(
             profiles.clone(),
@@ -3507,8 +3922,15 @@ async fn run_multi_agent(
         current_source_revision(&req.project_dir).await,
     );
     coordinator = coordinator.with_conversation_inbox(services.conversation_inbox.clone());
-    if services.conversation_inbox.is_some() && approved_plan.is_none() {
-        coordinator = coordinator.with_conversation_history(req.conversation_history.clone());
+    // ADR-60 D7: an approved-plan run injects no conversation transcript — the
+    // whiteboard-verified structured artifact governs instead. Every other run
+    // attaches the persisted messages as typed history, with or without an
+    // interactive inbox: headless one-shot runs have no inbox, and routing them
+    // through clipped task prose lost long and older obligations (H40). A
+    // degraded/legacy plan load yields `approved_plan == None`, which keeps the
+    // documented pre-D7 prose-mode behavior of supplying history.
+    if let Some(history) = conversation_history_for_run(approved_plan, &req.conversation_history) {
+        coordinator = coordinator.with_conversation_history(history);
     }
     // ADR-65 §7: the checkpoint row's own updated_at backs the additive v4
     // backfill for pre-§7 (v3) checkpoints (fail-soft when absent).
@@ -3630,13 +4052,11 @@ async fn run_multi_agent(
     // ADR-60 D7: an approved-plan run does NOT inject the conversation
     // history as prose — that transcript carries the rendered plan markdown,
     // and the whiteboard-verified structured artifact governs instead.
-    // Prior decisions that matter ride the ledger in the task description;
-    // non-approved runs keep the exact pre-D7 history injection.
-    let multi_task = match approved_plan {
-        Some(_) => task.clone(),
-        None if services.conversation_inbox.is_some() => task.clone(),
-        None => multi_agent_task_with_history(task.clone(), &req.conversation_history),
-    };
+    // Prior decisions that matter ride the ledger in the task description.
+    // Non-approved runs receive the history as typed messages through
+    // `with_conversation_history` above; the task description stays the
+    // caller's objective without a synthetic transcript or rendered roles.
+    let multi_task = task.clone();
     let mut context = AgentContext::new(SessionContext::new(session_id, project_dir.clone()));
     if let Some(checkpoint) = req
         .resume_checkpoint_json
@@ -3769,69 +4189,46 @@ async fn run_multi_agent(
         Ok(output) => output,
         Err(error) => {
             stage_feed.abort();
-            // Settle the coordinator's usage first: it feeds both the failure
-            // row below and the metrics/spend tail, so one rate-limit
-            // exhaustion or cancellation records the same tokens everywhere
-            // (ADR-48 §4 — real usage when available, on the message row too).
+            // Actual provider turns already carry their own usage. Run-level
+            // failures are not synthetic assistant turns in the model history.
             let settled = coordinator.settled_metrics();
-            if let Some(store) = &session_store {
-                let content = if matches!(
-                    &error,
-                    OrchestratorError::Cancelled
-                        | OrchestratorError::Provider(ProviderError::Cancelled)
-                ) {
-                    "Task cancelled.".to_string()
-                } else {
-                    format!("Task failed: {error}")
-                };
-                let (tokens_in, tokens_out) = message_row_usage(settled);
-                let failure_message = Message {
-                    role: concerto_core::types::Role::Assistant,
-                    content,
-                    tool_calls: None,
-                    tool_results: None,
-                    reasoning_content: None,
-                    tokens_in,
-                    tokens_out,
-                };
-                if let Err(store_error) = store
-                    .append_messages(session_id, &[failure_message], req.cancel_token.clone())
-                    .await
-                {
-                    if is_expected_cancellation(&store_error, &req.cancel_token) {
-                        tracing::debug!(%store_error, "run cancelled; failure message not persisted");
-                    } else {
-                        tracing::warn!(%store_error, "failed to persist multi-agent failure");
-                    }
-                }
-            }
-            transcript_recorder.stop().await;
-            event_recorder.stop().await;
-            // Persist the coordinator's settled metrics (bound above, before
-            // the failure row) before the error propagates: on a rate-limit
-            // exhaustion / cancellation the run consumed real tokens without
-            // any output — the audit trail must still record them. Best-effort
-            // like the success tail.
-            persist_provider_metrics(
+            let observation = crate::provider_transcript::run_failure(task.id, &error);
+            if let Err(store_error) = crate::provider_transcript::append_completed_messages(
                 session_store.as_ref(),
                 session_id,
-                settled,
-                req.cancel_token.clone(),
+                &[observation],
+                CancellationToken::new(),
             )
-            .await;
-            persist_spend_records(
+            .await
+            {
+                tracing::warn!(%store_error, %session_id, "failed to persist runtime failure");
+            }
+            transcript_recorder
+                .finish(&[TranscriptEntry::Error { content: error.to_string() }])
+                .await;
+            event_recorder.stop().await;
+            // Persist the coordinator's settled metrics before the error
+            // propagates: on a rate-limit
+            // exhaustion / cancellation the run consumed real tokens without
+            // any output — the audit trail must still record them. Best-effort
+            // like the success tail, and independent of the run's cancellation
+            // token so a cancelled run still settles (H39a).
+            settle_run_accounting(
                 session_store.as_ref(),
                 session_id,
                 Some(task.id.0),
                 settled,
-                req.cancel_token.clone(),
+                settlement,
             )
             .await;
             return Err(error);
         }
     };
     stage_feed.abort();
-    stage_tracker.lock().unwrap_or_else(|error| error.into_inner()).set(RunStage::Complete);
+    stage_tracker
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .finish(output.completion_status);
     // ADR-55 §4 (M3): on a completed planning-only run, bind the
     // rendered plan (the coordinator's final message) to this objective,
     // keyed by the same plan_id the coordinator persisted as the durable
@@ -3900,50 +4297,34 @@ async fn run_multi_agent(
     }
     output.project_root =
         Some(camino::Utf8PathBuf::from_path_buf(project_dir.clone()).unwrap_or_default());
-    persist_provider_metrics(
-        session_store.as_ref(),
-        session_id,
-        &output.provider_metrics,
-        req.cancel_token.clone(),
-    )
-    .await;
     // One spend record per completed subtask call (each entry in
     // `provider_metrics` maps to one settled `AgentRunner` run; the run's
     // root task id is attributed since per-subtask ids are not exposed here).
-    // Best-effort: a spend-persistence failure never fails the run.
-    persist_spend_records(
+    // Best-effort: a spend-persistence failure never fails the run. The run
+    // latch keeps a later error tail from writing duplicates (H39a).
+    settle_run_accounting(
         session_store.as_ref(),
         session_id,
         Some(task.id.0),
         &output.provider_metrics,
-        req.cancel_token.clone(),
+        settlement,
     )
     .await;
     let conversation_handoff =
         services.conversation_inbox.as_ref().is_some_and(|inbox| inbox.is_handoff());
-    if let Some(store) = session_store.as_ref().filter(|_| !conversation_handoff) {
-        // ADR-48 §4: the assistant row records the same settled usage the
-        // `provider_metrics` and spend writes above record for this run. The
-        // run-start user row predates any provider call and stays `None`.
-        let (tokens_in, tokens_out) = message_row_usage(&output.provider_metrics);
-        let assistant_message = Message {
-            role: concerto_core::types::Role::Assistant,
-            content: if reply_only { output.final_message.clone() } else { output.summary() },
-            tool_calls: None,
-            tool_results: None,
-            reasoning_content: None,
-            tokens_in,
-            tokens_out,
-        };
-        if let Err(error) =
-            store.append_messages(session_id, &[assistant_message], req.cancel_token.clone()).await
-        {
-            if is_expected_cancellation(&error, &req.cancel_token) {
-                tracing::debug!(%error, "run cancelled; assistant message not persisted");
-            } else {
-                tracing::warn!(%error, "failed to persist multi-agent assistant message");
-            }
-        }
+    // Preserve runtime verification/termination facts separately from the
+    // coordinator's original provider turns and the rendered summary.
+    let observation = crate::provider_transcript::run_outcome(&output);
+    if let Err(error) = crate::provider_transcript::append_completed_messages(
+        session_store.as_ref(),
+        session_id,
+        &[observation],
+        CancellationToken::new(),
+    )
+    .await
+    {
+        tracing::warn!(%error, %session_id, "failed to persist runtime outcome");
+        output.final_message.push_str(" Degraded: the runtime outcome could not be persisted.");
     }
     let mut transcript = vec![TranscriptEntry::Assistant { content: output.final_message.clone() }];
     if !reply_only {
@@ -4273,6 +4654,7 @@ fn build_supervised_commands(
     tasks: &[(String, String)],
     spawn_env: &[(String, String)],
     plan_id: Option<&str>,
+    history: Option<&SupervisedHistoryRun>,
 ) -> Vec<(String, std::process::Command)> {
     tasks
         .iter()
@@ -4295,6 +4677,25 @@ fn build_supervised_commands(
             // `GateRequest.plan_id` and its terminal whiteboard events).
             if let Some(plan_id) = plan_id {
                 command.env("CONCERTO_PLAN_ID", plan_id);
+            }
+            // H39b step 3: parent-owned files keep the child off the session
+            // database. Both are absent when preparing the run directory
+            // failed, in which case the child simply runs without history or
+            // metrics sidecar. The seed length is the exact repaired seed
+            // count so harvest slices only child turns; the child never
+            // rewrites the accumulated file.
+            if let Some(history) = history {
+                if let Some(agent_paths) = history.paths.get(agent_id) {
+                    command
+                        .env(crate::supervised_history::HISTORY_ENV, &agent_paths.history)
+                        .env(crate::supervised_history::METRICS_ENV, &agent_paths.metrics);
+                }
+                if let Some(seed) = history.seeds.iter().find(|seed| seed.agent_id == *agent_id) {
+                    command.env(
+                        crate::supervised_history::SEED_LEN_ENV,
+                        seed.initial_seed_len.to_string(),
+                    );
+                }
             }
             (agent_id.clone(), command)
         })
@@ -4326,6 +4727,10 @@ async fn drive_supervised_run(
         "supervised multi-agent run starting without review-cycle resumability \
          (ADR-60 Deferred 3): in-flight review state is lost on restart"
     );
+    // Parent-owned history is prepared before spawning so every child gets
+    // the same restore seed across supervisor restarts.
+    let supervised_history =
+        prepare_supervised_history(session_store, run.session_id, &run.tasks).await;
     let mut supervisor = Supervisor::new(run.config);
     // Keep a pool handle for the Decision rows emitted after `run.services` is
     // moved into the supervisor (`with_services`).
@@ -4345,6 +4750,7 @@ async fn drive_supervised_run(
         &run.tasks,
         &run.spawn_env,
         run.plan_id.as_deref(),
+        supervised_history.as_ref(),
     ) {
         if let Err(error) = supervisor.spawn_agent(&mut command, &agent_id) {
             tracing::warn!(%agent_id, %error, "supervised agent failed to start; recording a decision");
@@ -4408,6 +4814,16 @@ async fn drive_supervised_run(
         }
     };
 
+    // Harvest before the cancellation early return: completed child turns
+    // and spend are durable even when the parent run was cancelled. The
+    // directory is parent-owned and single-run, so files cannot collide with
+    // another run; removal is best-effort.
+    if let Some(history) = &supervised_history {
+        harvest_supervised_history(session_store, run.session_id, Some(task_id.0), &history.seeds)
+            .await;
+        remove_supervised_history_dir(&history.directory).await;
+    }
+
     if cancel.is_cancelled() {
         event_recorder.stop().await;
         transcript_recorder.stop().await;
@@ -4431,6 +4847,11 @@ async fn drive_supervised_run(
         .filter(|meta| meta.state == AgentState::Completed && expected.contains(&meta.agent_id))
         .count();
     let all_completed = total > 0 && completed == total && failed_to_start.is_empty();
+    let completion_status = if all_completed {
+        AgentCompletionStatus::Completed
+    } else {
+        AgentCompletionStatus::Partial
+    };
     for agent_id in &summary.failed {
         tracing::warn!(%agent_id, "supervised multi-agent run finished with a failed agent");
         // Supremacy invariant: a runtime child crash / restart-budget
@@ -4489,14 +4910,13 @@ async fn drive_supervised_run(
     let project_root =
         camino::Utf8PathBuf::from_path_buf(run.project_root.clone()).unwrap_or_default();
 
-    stage_tracker.lock().unwrap_or_else(|error| error.into_inner()).set(RunStage::Complete);
-    // Per-child provider metrics/spend are not surfaced through the parent in
-    // this slice (the mock-provider children consume none), so there is
-    // nothing to persist here yet — the coordinator tail's metric writes are
-    // deliberately omitted rather than called with empty data, and the
-    // assistant row's token fields stay `None` for the same reason.
+    stage_tracker.lock().unwrap_or_else(|error| error.into_inner()).finish(completion_status);
+    // Child history/metrics were harvested above and attributed to the child
+    // agent. The root settlement path deliberately does not re-record them:
+    // `provider_metrics` stays empty so no metric is accounted twice.
     if let Some(store) = session_store {
         let assistant_message = Message {
+            gemini_replay: None,
             role: Role::Assistant,
             content: final_message.clone(),
             tool_calls: None,
@@ -4547,66 +4967,11 @@ async fn drive_supervised_run(
         tool_events: Vec::new(),
         verification: Vec::new(),
         project_root: Some(project_root),
-        completion_status: if all_completed {
-            AgentCompletionStatus::Completed
-        } else {
-            AgentCompletionStatus::Partial
-        },
+        completion_status,
         provider_metrics: Vec::new(),
         checkpoint_json: None,
         provider_error_class: None,
     })
-}
-
-/// Carry persisted conversational decisions into the multi-agent path.
-///
-/// The coordinator and every specialist derive their prompts from the parent
-/// task, so enriching that task keeps planning and execution on the same
-/// context without introducing a second, specialist-specific history channel.
-fn multi_agent_task_with_history(mut task: AgentTask, history: &[Message]) -> AgentTask {
-    if history.is_empty() {
-        return task;
-    }
-
-    let mut context = String::from(
-        "\n\n<conversation_history>\n\
-         The following messages are prior context from this same session. \
-         Preserve the user's earlier decisions and constraints:\n",
-    );
-    const MAX_HISTORY_CHARS: usize = 16_000;
-    const MAX_MESSAGE_CHARS: usize = 4_000;
-    let mut selected = Vec::new();
-    let mut selected_chars = 0usize;
-    for message in history.iter().rev() {
-        if selected_chars >= MAX_HISTORY_CHARS {
-            break;
-        }
-        let content = message.content.chars().take(MAX_MESSAGE_CHARS).collect::<String>();
-        selected_chars = selected_chars.saturating_add(content.chars().count());
-        selected.push((message.role.clone(), content));
-    }
-    selected.reverse();
-    if selected.len() < history.len() {
-        context.push_str(
-            "\n[older session history omitted; retrieve durable events/messages if needed]\n",
-        );
-    }
-    for (message_role, message_content) in selected {
-        let role = match message_role {
-            concerto_core::types::Role::System => "system",
-            concerto_core::types::Role::User => "user",
-            concerto_core::types::Role::Assistant => "assistant",
-            concerto_core::types::Role::Tool => "tool",
-            _ => "unknown",
-        };
-        context.push_str("\n[");
-        context.push_str(role);
-        context.push_str("]\n");
-        context.push_str(&message_content);
-    }
-    context.push_str("\n</conversation_history>");
-    task.description.push_str(&context);
-    task
 }
 
 fn is_resume_request(input: &str) -> bool {
