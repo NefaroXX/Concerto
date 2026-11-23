@@ -77,6 +77,34 @@ async fn write_response(socket: &mut tokio::net::TcpStream, request: &Value) {
     socket.write_all(response.as_bytes()).await.unwrap();
 }
 
+/// The normal multi-agent CLI must return the same terminal health that a
+/// later process can recover from its session database.
+async fn assert_recording_roundtrip(
+    path: &std::path::Path,
+    session_id: ulid::Ulid,
+    report: &Value,
+) {
+    use concerto_core::event::EventKind;
+    use concerto_core::recording::RecorderKind;
+
+    assert_eq!(report["recording"]["status"], "complete");
+    let store = SqliteSessionStore::connect_path(path).await.unwrap();
+    let events = store.load_events(session_id, CancellationToken::new()).await.unwrap();
+    let mut recorded = [0, 0];
+    for event in events {
+        if let EventKind::RecordingFinished { outcome } = event.to_event().unwrap().kind {
+            assert!(outcome.is_complete());
+            let (index, key) = match outcome.recorder {
+                RecorderKind::EventLog => (0, "event_log"),
+                RecorderKind::Transcript => (1, "transcript"),
+            };
+            assert_eq!(serde_json::to_value(outcome).unwrap(), report["recording"][key]);
+            recorded[index] += 1;
+        }
+    }
+    assert_eq!(recorded, [1, 1], "each recorder must persist exactly one matching report");
+}
+
 async fn capture_headless_request() -> Value {
     let fixture = tempfile::tempdir().unwrap();
     let project = fixture.path().join("project");
@@ -187,6 +215,7 @@ max_attempts = 1
     assert_eq!(report["status"], "done");
     assert_eq!(report["mode"], "multi");
     assert_eq!(report["session_id"], session.id.to_string());
+    assert_recording_roundtrip(&data.join("sessions.db"), session.id, &report).await;
     request
 }
 

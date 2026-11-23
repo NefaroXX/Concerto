@@ -60,7 +60,7 @@ The current open review follow-up is R5 and its verification.
 | Round-two follow-up | Current status |
 | --- | --- |
 | R4 — paid repair requests lose usage on failure | Fixed in `6a11791`; full local battery and all 12 remote checks passed on `88020d0` |
-| R5 — normal runtime recorder gaps have no durable/caller-visible integrity | Implemented; 95 focused tests passed. Fresh full validation in progress; unpublished |
+| R5 — normal runtime recorder gaps have no durable/caller-visible integrity | Implemented; 95 focused tests and 6,250 full-suite tests passed, including real CLI/SQLite outcome matching. All local gates green; exact-head remote certification follows publication |
 | R6 — cloned fallback contexts charge prior attempts again | Fixed in `6a11791`; sequential/concurrent/load-failure regressions and full certification on `88020d0` |
 
 
@@ -3483,3 +3483,59 @@ Branch: `fix/harness-headless-history` (HEAD `34a09ee` before this change).
   recording status and match both stdout recorder outcomes to durable
   `RecordingFinished` events after reopening SQLite. This complements the
   single-agent/supervised runtime assertions and the CLI mapping unit test.
+
+## 2026-11-23 — R5 full test pass and real CLI persistence round trip
+
+- The fresh battery passed **6,250 tests, zero failures, 17 ignored** across
+  87 groups, followed by workspace/default/desktop/CLI builds and startup
+  checks, all four WASM guests and benchmark smoke. Clearing workspace
+  artifacts resolved the earlier build mismatch without changing source.
+- Deny and ordinary audit passed, but the complete-audit wrapper correctly
+  rejected a registry timeout in the yanked-package check, despite
+  cargo-audit's zero exit. The gate remains required; no suppression or
+  `--no-yanked` substitution. Its failure is retained in
+  `round2-recording-clean-ci-audit-complete.log`.
+- Extended the existing Linux loopback CLI fixture to require complete
+  recording and reopen SQLite after the CLI exits. Each returned recorder
+  outcome must match exactly one durable `RecordingFinished` event. The
+  real multi-agent CLI fixture passed with warnings denied (one test).
+- Final validation now includes this additional boundary assertion and retries
+  all supply-chain gates first, under `round2-recording-final-ci-*`. Palette
+  and Python checks are also still required; the previous battery stopped
+  before reaching them. R5 remains unpublished until every gate passes.
+
+## 2026-11-23 — Fresh raw-lockfile advisory repaired
+
+- The final audit fetched 1,563 advisories and rejected locked `cookie 0.18.2`
+  for newly published RUSTSEC-2026-0594 (private-cookie nonces can repeat across
+  forked processes). Updated only the `cookie` lock entry to patched 0.18.3;
+  no direct dependency or advisory exception was added. The fetched RustSec
+  advisory identifies 0.18.3 as the fix.
+- The raw-lockfile audit found this even though the preceding feature-resolved
+  deny check passed, preserving the reason for retaining both gates. That
+  attempt also reported a registry timeout, so it is not complete validation.
+- A fresh full battery with the patched lockfile and real CLI round-trip
+  assertion now runs under `round2-recording-release-ci-*`, again checking
+  supply-chain gates first. Earlier failures and source fingerprints are
+  retained; no failed or incomplete result is treated as a pass.
+
+## 2026-11-23 — R5 complete local verification
+
+- All **18 stages** of `round2-recording-release-ci.py` passed on the final
+  source with the CLI round-trip assertion and patched `cookie 0.18.3`.
+  Workspace results: **6,250 passed, zero failed, 17 ignored**, including
+  unit, integration and doc tests across 87 groups.
+- Formatting, warnings-denied workspace/all-target clippy, workspace build,
+  default launcher/config/cache smoke, desktop-only and CLI-only builds and
+  startup checks, all four WASM guests, benchmark smoke, palette and Python
+  checks passed. Deny, audit and the complete-audit wrapper all passed with
+  live advisory/registry checks; no incomplete-audit diagnostic was accepted.
+- Source fingerprints match the tested candidate. The earlier cache-mismatch
+  build and registry-timeout failures remain retained alongside the passing
+  run; neither was dismissed or counted as a pass.
+- Runtime recording status covers the event log/display transcript. Error or
+  timeout responses without an `AgentOutput` remain explicitly `unknown`; any
+  completed cleanup reports are inspectable in the session database. Separate
+  provider-history, spend and policy-audit writes are outside this status.
+- Publication to PR #380 follows this checkpoint. R5 still requires all twelve
+  remote checks on its newly published head before certification.
