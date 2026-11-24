@@ -2259,3 +2259,44 @@ no production fix or merge was performed.
   the report.
 - Recommendation: hold approval for the remaining accounting corrections and
   recording-integrity decision. Accepted handoff residuals were not reopened.
+
+## 2026-11-24 — Major fixes checkpointed; handoff to OpenCode
+
+- At the user's request, stop after the current major fixes and hand further
+  work back to OpenCode. The complete handoff is
+  [harness-opencode-handoff.md](harness-opencode-handoff.md). This review
+  checkout contains the handoff; the implementation is in
+  `/home/sol/Projects/Concerto-worktrees/r5` on
+  `fix/harness-recording-integrity`, published as draft
+  [PR #381](https://github.com/NefaroXX/Concerto/pull/381).
+- R4 paid-repair accounting and R6 attempt isolation are fixed in `6a11791`;
+  their earlier full local/remote certification is recorded at `88020d0` in
+  the implementation work log. R5 now returns and durably saves independent
+  recorder health, including overflow/write/worker/report failures. Its
+  implementation is `f856f1d`, with actual CLI/SQLite outcome matching added
+  in `dac153b`. Patched URL/cookie dependencies clear their new advisories.
+- The final production/test candidate passed all **18 local stages**,
+  including **6,250 tests, zero failed, 17 ignored**, warnings-denied clippy,
+  builds/smokes, all four WASM guests, benchmarks, palette/Python checks and
+  all three supply-chain gates. The portable
+  [verification manifest](verification/2026-11-24-recording-local.json)
+  preserves commands, results and 24 matching source fingerprints. Full logs
+  remain in `target/harness-reliability/round2-recording-release-ci-*.log`.
+- Candidate HEAD and remote both equal
+  `f45008e6b77f06006fcbf769bdf113413fe33417`; the r5 worktree is clean.
+  At **17:11 UTC**, GitHub reports **7 passed, 5 running, zero failed**.
+  Passing: fmt, clippy, benchmarks, deny, audit, WASM, palette. Running:
+  tests, build, native Linux/macOS/Windows. Main workflow `45443176392` and
+  native workflow `45443176381` both identify this exact head. OpenCode must
+  finish that live CI watch; full remote certification is not claimed.
+- Preserve PR #380's externally rewound branch (`90afd73`). No merge or
+  force-push was performed. The documentation handoff is on this review
+  branch so it leaves PR #381's running checks intact.
+- The power interruption lost no committed source or completed local results.
+  No local build/test process remains. The optional r5 CCC refresh was
+  intentionally stopped for handoff at 742 files / 22,040 chunks; its
+  partial index/settings remain and `ccc index` can resume from r5. Do not
+  claim the refresh completed or restart the old parent-home indexing job.
+- Accepted crash-window/history-growth/same-role-stream limits remain scoped
+  as documented. No additional production fix was started after the handoff
+  request; the broader harness improvement effort remains open.

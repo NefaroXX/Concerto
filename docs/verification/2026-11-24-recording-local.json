@@ -1,0 +1,307 @@
+{
+  "candidate_commit": "dac153bdf127cc6a2624790149c53e1501f48ad2",
+  "publication_commit": "f45008e6b77f06006fcbf769bdf113413fe33417",
+  "source_fingerprints": {
+    "Cargo.lock": "7cc3b42bf590a8935643cc1f6abc05c684651fdfae0f5b66cee7ba40d0056bc2",
+    "Cargo.toml": "80cdbf24665ea7c20eba2d64fc920958f79ab19278158015fcbc48e9439961ef",
+    "crates/cli/src/app.rs": "5432611d040f95d7fb1fc5adca9438c14addd8f2b8ecdc37ad5f27d71f2de036",
+    "crates/cli/src/dispatch/run.rs": "04eb9a2ee929e5f3117b83f55ca35640578c5e5c38fddc9bd5d284e3b97def29",
+    "crates/core/src/event.rs": "5ad2a039f3562eed52938b35fc8cb9c10c3eb4b58d4d638cbe7c999ff885c259",
+    "crates/core/src/lib.rs": "759010192f6502330b124712e8ab7048739a35cec1076fca57376ca5dcf6077d",
+    "crates/core/src/recording.rs": "f721f0d5354130b15e726f2b44304633abe6bda957e443cebc702e1cb5ccb93f",
+    "crates/core/src/types.rs": "4ace4e4d383538a60f8d9166a4aad9d6684811e91e579c0be26ae0b8e2b213f5",
+    "crates/desktop/src/app/tests/mod.rs": "db16f2435efbe0946f3c04532f0006f069a5f316d6d1e0b390821639d7c17540",
+    "crates/eval/src/observation.rs": "768388f23cd4d2d68dd4cd33182ae2bbef0d31761da3ca0ea430f91693ed6398",
+    "crates/orchestrator/src/agent_loop.rs": "ce85f1c3f6efbb610a8075e8b19bc17e9c1a0bd480e48ed9bd971ae451c6c769",
+    "crates/orchestrator/src/agent_loop/output_progress.rs": "4efe79452d683a81e7811d700456b1a68cf747068e59dd0559f882ea9356b9e7",
+    "crates/orchestrator/src/conversation.rs": "ba62d758e5e8605596832eabffba88f11780c86cc640fc1a07fe2c79838e603e",
+    "crates/orchestrator/src/conversation/tests.rs": "f4bd6e20698ff56fbbc3c3b2e254165d3cdd3a31cc7fb9ec3b2e0e5c38ce9efc",
+    "crates/orchestrator/src/coordinator.rs": "e6f9a3045e05b6b96511bcca24c87e8d1fed0496342b74b78cb3e1f9bb78454b",
+    "crates/orchestrator/src/runtime_runner.rs": "5ecef1d11b30ce2201df414cf4052390fba623c9edc21b4a7a26aa63323b0a45",
+    "crates/orchestrator/src/runtime_runner/recorders.rs": "6ee9db278f2ffcfc8b4b620afae0412d73d90b4b4f8933dc809a784ea9a5e4f3",
+    "crates/orchestrator/src/runtime_runner/recorders/health.rs": "fa76f0064b4b6c9da86af94a9e1b721b03dad40162968311fa0ae7c8d5fe8aaf",
+    "crates/orchestrator/src/runtime_runner/tests/auto_apply.rs": "4057316d89432bd7511418341d803648d5e73748811ee7debd086413ccbc17c9",
+    "crates/orchestrator/src/runtime_runner/tests/mod.rs": "b6ff00d4b422272bf63e31a2001229d094ee095d1684166236bae65a7c47bfe3",
+    "crates/orchestrator/src/runtime_runner/tests/recording_integrity.rs": "92e24fc6ec5550437d9ce4a4c3ae1634e813b83ab39f8febadb15a8e3cea0b29",
+    "crates/orchestrator/src/runtime_runner/tests/stage_harness.rs": "46632850a547788f4e9986525b804e29333651c5f979ae3f80f80d049f2f00c3",
+    "crates/sessions/src/recording.rs": "fcae1120bd8004fc3629c5afbff1be161bf1f1586a2a1c4e956d5ee8875c555b",
+    "crates/cli/tests/headless_history.rs": "baaba2bd97fadab936e40551f98221cd03c8ebab8dc95dd916eaa281eae4e441"
+  },
+  "environment": {
+    "rustc": "1.96.0 (ac68faa20 2026-05-25)",
+    "TMPDIR": "/var/tmp",
+    "CARGO_TARGET_DIR": "/home/sol/Projects/Concerto/target",
+    "CARGO_INCREMENTAL": "0",
+    "RUSTFLAGS": "-D warnings",
+    "CONCERTO_TEST_MODE": "1"
+  },
+  "workspace_test_totals": {
+    "groups": 87,
+    "passed": 6250,
+    "failed": 0,
+    "ignored": 17
+  },
+  "local_steps": [
+    {
+      "step": "deny",
+      "command": [
+        "cargo",
+        "deny",
+        "check"
+      ],
+      "started": "2026-11-23T21:52:54.575469+00:00",
+      "exit_code": 0,
+      "finished": "2026-11-23T21:53:06.155435+00:00"
+    },
+    {
+      "step": "audit",
+      "command": [
+        "cargo",
+        "audit"
+      ],
+      "started": "2026-11-23T21:53:06.261677+00:00",
+      "exit_code": 0,
+      "finished": "2026-11-23T21:53:11.066062+00:00"
+    },
+    {
+      "step": "audit-complete",
+      "command": [
+        "python3",
+        "scripts/check-cargo-audit.py"
+      ],
+      "started": "2026-11-23T21:53:11.066483+00:00",
+      "exit_code": 0,
+      "finished": "2026-11-23T21:53:14.751120+00:00"
+    },
+    {
+      "step": "fmt",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "started": "2026-11-23T21:53:14.752670+00:00",
+      "exit_code": 0,
+      "finished": "2026-11-23T21:53:24.492272+00:00"
+    },
+    {
+      "step": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "-j1",
+        "--workspace",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "started": "2026-11-23T21:53:24.493436+00:00",
+      "exit_code": 0,
+      "finished": "2026-11-23T21:53:39.043675+00:00"
+    },
+    {
+      "step": "test",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j1",
+        "--workspace"
+      ],
+      "started": "2026-11-23T21:53:39.044499+00:00",
+      "exit_code": 0,
+      "finished": "2026-11-23T21:56:10.132515+00:00"
+    },
+    {
+      "step": "build",
+      "command": [
+        "cargo",
+        "build",
+        "--locked",
+        "-j1",
+        "--workspace"
+      ],
+      "started": "2026-11-23T21:56:10.133496+00:00",
+      "exit_code": 0,
+      "finished": "2026-11-23T21:56:12.461820+00:00"
+    },
+    {
+      "step": "launcher-help",
+      "command": [
+        "/home/sol/Projects/Concerto/target/debug/concerto",
+        "config",
+        "help"
+      ],
+      "started": "2026-11-23T21:56:12.462150+00:00",
+      "exit_code": 0,
+      "finished": "2026-11-23T21:56:12.574345+00:00"
+    },
+    {
+      "step": "launcher-keys",
+      "command": [
+        "/home/sol/Projects/Concerto/target/debug/concerto",
+        "config",
+        "keys",
+        "retry"
+      ],
+      "started": "2026-11-23T21:56:12.574644+00:00",
+      "exit_code": 0,
+      "finished": "2026-11-23T21:56:12.602544+00:00"
+    },
+    {
+      "step": "cache-smoke",
+      "command": [
+        "python3",
+        "scripts/cache-report-smoke.py",
+        "/home/sol/Projects/Concerto/target/debug/concerto"
+      ],
+      "started": "2026-11-23T21:56:12.602886+00:00",
+      "exit_code": 0,
+      "finished": "2026-11-23T21:56:12.878684+00:00"
+    },
+    {
+      "step": "desktop",
+      "command": [
+        "cargo",
+        "build",
+        "--locked",
+        "-j1",
+        "-p",
+        "concerto",
+        "--no-default-features",
+        "--features",
+        "desktop"
+      ],
+      "started": "2026-11-23T21:56:12.879228+00:00",
+      "exit_code": 0,
+      "finished": "2026-11-23T21:56:14.466681+00:00"
+    },
+    {
+      "step": "cli",
+      "command": [
+        "cargo",
+        "build",
+        "--locked",
+        "-j1",
+        "-p",
+        "concerto",
+        "--no-default-features",
+        "--features",
+        "cli"
+      ],
+      "started": "2026-11-23T21:56:14.467174+00:00",
+      "exit_code": 0,
+      "finished": "2026-11-23T21:56:15.814994+00:00"
+    },
+    {
+      "step": "cli-help",
+      "command": [
+        "/home/sol/Projects/Concerto/target/debug/concerto",
+        "--help"
+      ],
+      "started": "2026-11-23T21:56:15.815329+00:00",
+      "exit_code": 0,
+      "finished": "2026-11-23T21:56:15.882327+00:00"
+    },
+    {
+      "step": "cli-smoke",
+      "command": [
+        "/home/sol/Projects/Concerto/target/debug/concerto",
+        "--cli",
+        "--reduced-motion",
+        "projects",
+        "list"
+      ],
+      "started": "2026-11-23T21:56:15.882639+00:00",
+      "exit_code": 0,
+      "finished": "2026-11-23T21:56:15.910253+00:00"
+    },
+    {
+      "step": "wasm",
+      "command": [
+        "cargo",
+        "build",
+        "--locked",
+        "-j1",
+        "-p",
+        "test-plugin-wasm",
+        "-p",
+        "test-provider-plugin-wasm",
+        "-p",
+        "test-adapter-plugin-wasm",
+        "-p",
+        "test-dialect-plugin-wasm",
+        "--target",
+        "wasm32-wasip2"
+      ],
+      "started": "2026-11-23T21:56:15.910561+00:00",
+      "exit_code": 0,
+      "finished": "2026-11-23T21:56:16.347403+00:00"
+    },
+    {
+      "step": "bench",
+      "command": [
+        "cargo",
+        "bench",
+        "--locked",
+        "-j1",
+        "--workspace",
+        "--bench",
+        "checkpoint_restore",
+        "--bench",
+        "fts_search",
+        "--bench",
+        "policy",
+        "--bench",
+        "provider_streaming",
+        "--bench",
+        "serde",
+        "--bench",
+        "task_graph",
+        "--bench",
+        "vector_retrieval",
+        "--bench",
+        "verification",
+        "--bench",
+        "virtual_fs",
+        "--",
+        "--test"
+      ],
+      "started": "2026-11-23T21:56:16.347763+00:00",
+      "exit_code": 0,
+      "finished": "2026-11-23T21:56:37.817680+00:00"
+    },
+    {
+      "step": "palette",
+      "command": [
+        "bash",
+        "scripts/check-hardcoded-colors.sh"
+      ],
+      "started": "2026-11-23T21:56:37.818267+00:00",
+      "exit_code": 0,
+      "finished": "2026-11-23T21:56:38.236625+00:00"
+    },
+    {
+      "step": "python",
+      "command": [
+        "python3",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "scripts/tests",
+        "-v"
+      ],
+      "started": "2026-11-23T21:56:38.237049+00:00",
+      "exit_code": 0,
+      "finished": "2026-11-23T21:56:38.403101+00:00"
+    }
+  ],
+  "logs_directory": "/home/sol/Projects/Concerto/target/harness-reliability",
+  "logs_prefix": "round2-recording-release-ci-",
+  "scope_note": "Local results only. GitHub certification is recorded separately in the work log; source hashes exclude documentation-only handoff changes."
+}
