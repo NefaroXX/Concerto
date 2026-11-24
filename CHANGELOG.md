@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Recording integrity independent of task completion.** Normal single-agent,
+  coordinator and supervised runs now report event-log and display-transcript
+  integrity in their output and persist each recorder's final outcome. Queue
+  drops, failed writes, worker failures and failed outcome persistence produce
+  an incomplete recording warning without rewriting the model's reply or task
+  status. Headless JSON and reports expose `recording`; responses without a
+  runtime output explicitly report `unknown`.
+- **Accurate specialist request accounting.** Paid text-tool repair requests
+  remain charged when repair fails or exhausts its budget. Reused or cloned
+  fallback contexts reset attempt-local usage, preventing a later dispatch
+  from charging an earlier attempt again, including when history loading fails.
 - **In-process specialist spend attribution (H39b review).** `ProviderMetrics`
   now carries an optional `agent_id` identifying the specialist/child that
   consumed the tokens (`None` for root/coordinator or single-agent calls).

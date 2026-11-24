@@ -3539,3 +3539,22 @@ Branch: `fix/harness-headless-history` (HEAD `34a09ee` before this change).
   provider-history, spend and policy-audit writes are outside this status.
 - Publication to PR #380 follows this checkpoint. R5 still requires all twelve
   remote checks on its newly published head before certification.
+
+## 2026-11-24 — Power-interruption recovery and publication route
+
+- The final local candidate is committed at `dac153b`. After the power
+  interruption, both review and implementation worktrees are clean, no Cargo
+  or validation-driver process remains, all 18 release-battery stages retain
+  successful terminal results, and all 24 recorded source fingerprints match.
+  No interrupted process is being mistaken for a completed check.
+- The remote branch behind PR #380 is now `90afd73`, although the previously
+  published accounting candidate `88020d0` passed all twelve checks. Fetch
+  reported the remote rewind before the power interruption; its cause is
+  unknown. Preserve that branch and publish the complete verified candidate
+  on `fix/harness-recording-integrity` as a separate draft PR targeting `dev`.
+  This supersedes the preceding publication plan, not its validation evidence.
+- Current `dev` is `b58b6a6`. A read-only merge-tree check succeeds and produces
+  exactly the candidate's tree, so no integration edit is needed. Changelog
+  entries now describe the recording and accounting behavior. This recovery
+  checkpoint changes documentation only; exact-head remote certification is
+  still required after publication.
