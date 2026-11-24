@@ -17,6 +17,7 @@ fn build_messages(n: usize) -> Vec<Message> {
         .map(|i| {
             let role = if i % 2 == 0 { Role::User } else { Role::Assistant };
             Message {
+                gemini_replay: None,
                 role,
                 content: format!(
                     "This is message number {i} with some reasonably long content \
@@ -100,6 +101,7 @@ fn bench_serde(c: &mut Criterion) {
 
     // --- Single message ---
     let msg = Message {
+        gemini_replay: None,
         role: Role::User,
         content: "What is the capital of France?".into(),
         tool_calls: None,
@@ -120,6 +122,7 @@ fn bench_serde(c: &mut Criterion) {
 
     // --- Message with tool calls ---
     let msg_with_tc = Message {
+        gemini_replay: None,
         role: Role::Assistant,
         content: "Let me check that file for you.".into(),
         tool_calls: Some(vec![ToolCall {

@@ -407,7 +407,7 @@ checklist, not a gap list):
 
 - **Minimal Dependencies**: Only add dependencies with clear justification
 - **Regular Audits**: Run `cargo audit` and `cargo deny check` in CI
-- **MSRV Policy**: Maintain minimum supported Rust version (currently 1.88)
+- **MSRV Policy**: Maintain minimum supported Rust version (currently 1.94)
 - **Unmaintained Deps**: Pin or replace unmaintained transitive dependencies
 - **Security Advisories**: Review and document all `RUSTSEC-*` exceptions in `deny.toml`
 

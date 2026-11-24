@@ -19,6 +19,10 @@ pub struct SpendRecord {
     pub id: Ulid,
     pub session_id: Ulid,
     pub task_id: Option<Ulid>,
+    /// Specialist/agent attribution (`None` = root or unattributed call).
+    /// Additive: rows persisted before H39b read back as `None`.
+    #[serde(default)]
+    pub agent_id: Option<String>,
     pub provider: String,
     pub model: String,
     pub tokens_in: u64,
@@ -139,6 +143,7 @@ mod tests {
             id: Ulid::new(),
             session_id: Ulid::new(),
             task_id: None,
+            agent_id: None,
             provider: "openai".into(),
             model: "gpt-4".into(),
             tokens_in: 100,
@@ -294,6 +299,7 @@ mod tests {
             id: Ulid::new(),
             session_id: Ulid::new(),
             task_id: Some(Ulid::new()),
+            agent_id: None,
             provider: "anthropic".into(),
             model: "claude-3".into(),
             tokens_in: 200,

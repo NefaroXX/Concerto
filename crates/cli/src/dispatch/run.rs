@@ -540,9 +540,12 @@ pub(crate) async fn execute_with_runner(
     let bus = EventBus::new(1024);
     // `--events-json`: subscribe to the bus we are about to hand to the
     // runtime BEFORE the run starts, so the file captures the whole run. The
-    // durable (lossless, FIFO) subscription is used so no event is dropped and
-    // ordering is preserved — see `durable_subscriber_sees_broadcast_publishes_in_order`
-    // in `concerto-core`.
+    // durable (bounded, FIFO) subscription preserves the order of retained
+    // events and is lossless while this writer keeps up; beyond its queue
+    // capacity the oldest events are discarded and counted in
+    // `DurableHealth::dropped_events` — see
+    // `durable_subscriber_sees_broadcast_publishes_in_order` in
+    // `concerto-core`.
     let events_writer = match options.events_json.as_deref() {
         Some(path) => match EventsWriter::spawn(
             path.to_path_buf(),
@@ -815,12 +818,23 @@ fn build_json(
         ),
         None => (Value::Array(Vec::new()), 0, 0, 0, 0.0),
     };
+    let recording = output.and_then(|output| output.recording_integrity.as_ref());
+    let recording_status = match recording {
+        Some(health) if health.is_complete() => "complete",
+        Some(_) => "incomplete",
+        None => "unknown",
+    };
     json!({
         "mode": mode,
         "status": status,
         "session_id": session_id.map(|id| id.to_string()),
         "run_id": run_id,
         "provider_error_class": provider_error_class,
+        "recording": {
+            "status": recording_status,
+            "event_log": recording.map(|health| &health.event_log),
+            "transcript": recording.map(|health| &health.transcript),
+        },
         "final_message": final_message,
         "files_modified": files,
         "tool_call_count": tools,
@@ -914,8 +928,10 @@ struct EventsFinish {
 /// Owns a spawned task that selects over the durable event stream, a 10s
 /// heartbeat interval, and the finish signal. [`EventsWriter::finish`] drains
 /// any events still queued before writing the terminal `run_finished` line and
-/// joining the task, so the last line is always flushed and no published event
-/// is silently dropped.
+/// joining the task, so the last line is always flushed. Durable delivery is
+/// bounded: if this writer falls more than the queue capacity behind, the
+/// oldest events are dropped (counted in the bus health snapshot) rather than
+/// growing memory without bound.
 struct EventsWriter {
     finish_tx: tokio::sync::oneshot::Sender<EventsFinish>,
     handle: tokio::task::JoinHandle<()>,
@@ -954,6 +970,7 @@ async fn writer_loop(
 ) {
     let mut writer = std::io::BufWriter::new(file);
     let mut seq: u64 = 0;
+    let mut observed_dropped: u64 = 0;
     let started = std::time::Instant::now();
     let mut heartbeat = tokio::time::interval(EVENTS_HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -966,17 +983,36 @@ async fn writer_loop(
             maybe_event = receiver.recv() => {
                 match maybe_event {
                     Some(event) => {
+                        if !write_drop_notice(
+                            &mut writer,
+                            &mut seq,
+                            run_id.as_deref(),
+                            &receiver,
+                            &mut observed_dropped,
+                        ) {
+                            return;
+                        }
                         seq += 1;
                         let line = event_line(seq, run_id.as_deref(), &event);
                         if !write_line(&mut writer, &line) {
                             return;
                         }
                     }
-                    // Bus fully dropped: no more events can arrive, so wait for
-                    // the finish signal rather than closing without a terminal
-                    // line. (The caller keeps the bus alive until `finish`, so
-                    // this is a defensive path.)
+                    // Bus fully dropped: no more events can arrive, so record
+                    // any loss observed so far, then wait for the finish signal
+                    // rather than closing without a terminal line. (The caller
+                    // keeps the bus alive until `finish`, so this is a
+                    // defensive path.)
                     None => {
+                        if !write_drop_notice(
+                            &mut writer,
+                            &mut seq,
+                            run_id.as_deref(),
+                            &receiver,
+                            &mut observed_dropped,
+                        ) {
+                            return;
+                        }
                         if let Ok(finish) = finish_rx.await {
                             seq += 1;
                             let line = finish_line(seq, run_id.as_deref(), &finish);
@@ -1000,15 +1036,35 @@ async fn writer_loop(
                 }
             }
             finish = &mut finish_rx => {
-                // Everything published before `runner.run` returned is already
-                // queued; drain it so no event is lost and the terminal line is
-                // last.
+                // Everything still retained from before `runner.run` returned
+                // is already queued; drain it so the terminal line is last.
+                // (Overflow may already have discarded older events; each such
+                // gap is written as an `events_dropped` record before the next
+                // event or the terminal line.)
                 while let Ok(event) = receiver.try_recv() {
+                    if !write_drop_notice(
+                        &mut writer,
+                        &mut seq,
+                        run_id.as_deref(),
+                        &receiver,
+                        &mut observed_dropped,
+                    ) {
+                        return;
+                    }
                     seq += 1;
                     let line = event_line(seq, run_id.as_deref(), &event);
                     if !write_line(&mut writer, &line) {
                         return;
                     }
+                }
+                if !write_drop_notice(
+                    &mut writer,
+                    &mut seq,
+                    run_id.as_deref(),
+                    &receiver,
+                    &mut observed_dropped,
+                ) {
+                    return;
                 }
                 let finish = match finish {
                     Ok(finish) => finish,
@@ -1021,6 +1077,37 @@ async fn writer_loop(
             }
         }
     }
+}
+
+/// Write one `events_dropped` record when the durable receiver's cumulative
+/// drop count advances. Returns `false` if the writer stopped.
+///
+/// The record is written before the next event (or before the terminal line),
+/// so consumers can see exactly where the progress trace became incomplete.
+/// Sequence numbers stay strictly monotonic; the writer's failure policy is
+/// unchanged (a failed write stops capture and never changes the run outcome).
+fn write_drop_notice(
+    writer: &mut impl Write,
+    seq: &mut u64,
+    run_id: Option<&str>,
+    receiver: &DurableEventReceiver,
+    observed_dropped: &mut u64,
+) -> bool {
+    let current = receiver.dropped_events();
+    if current <= *observed_dropped {
+        return true;
+    }
+    *observed_dropped = current;
+    *seq += 1;
+    let line = json!({
+        "seq": *seq,
+        "ts": time::OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default(),
+        "run_id": run_id,
+        "event": "events_dropped",
+        "dropped": current,
+        "capacity": receiver.capacity(),
+    });
+    write_line(writer, &line)
 }
 
 /// One progress line: `{seq, ts, run_id, event: {<EventKind>: {...}}}`.
@@ -1196,6 +1283,7 @@ mod tests {
             let stream = futures::stream::iter(script.into_iter().map(|response| {
                 Ok(match response {
                     TestResponse::Text(delta) => CompletionChunk {
+                        gemini_replay: None,
                         delta,
                         reasoning: None,
                         tool_call: None,
@@ -1203,6 +1291,7 @@ mod tests {
                         usage: None,
                     },
                     TestResponse::ToolCall(tool_call) => CompletionChunk {
+                        gemini_replay: None,
                         delta: String::new(),
                         reasoning: None,
                         tool_call: Some(tool_call),
@@ -1210,6 +1299,7 @@ mod tests {
                         usage: None,
                     },
                     TestResponse::Done => CompletionChunk {
+                        gemini_replay: None,
                         delta: String::new(),
                         reasoning: None,
                         tool_call: None,
@@ -1537,11 +1627,58 @@ mod tests {
         assert_eq!(outcome.json["run_id"], Value::Null);
         assert_eq!(outcome.json["provider_error_class"], Value::Null);
         assert_eq!(outcome.report_json["tool_calls"], json!([]));
+        assert_eq!(outcome.json["recording"]["status"], "unknown");
         assert!(
             outcome.json["final_message"].as_str().is_some_and(|m| m.contains("no LLM provider")),
             "error message missing: {}",
             outcome.json
         );
+    }
+
+    #[tokio::test]
+    async fn recording_integrity_is_independent_of_task_completion_in_json_and_report() {
+        use concerto_core::recording::{RecorderKind, RecorderOutcome, RecordingIntegrity};
+        for dropped in [0, 7] {
+            let directory = TempDir::new().unwrap();
+            let (manager, _audit) = in_memory_manager().await;
+            let mut output = sample_partial();
+            output.completion_status = AgentCompletionStatus::Completed;
+            output.final_message = "all done".into();
+            output.recording_integrity = Some(RecordingIntegrity {
+                event_log: RecorderOutcome {
+                    recording_id: Ulid::new(),
+                    recorder: RecorderKind::EventLog,
+                    dropped_events: dropped,
+                    failed_writes: 0,
+                    recorder_failed: false,
+                    report_persisted: true,
+                },
+                transcript: RecorderOutcome {
+                    recording_id: Ulid::new(),
+                    recorder: RecorderKind::Transcript,
+                    dropped_events: 0,
+                    failed_writes: 0,
+                    recorder_failed: false,
+                    report_persisted: true,
+                },
+            });
+            let outcome = execute_with_runner(
+                options(directory.path(), "do it", true),
+                Arc::new(StaticRunner { output }),
+                AppConfig::default(),
+                Some(manager),
+            )
+            .await;
+            assert_eq!(outcome.status, "done");
+            assert_eq!(outcome.exit_code, EXIT_DONE);
+            assert_eq!(
+                outcome.json["recording"]["status"],
+                if dropped == 0 { "complete" } else { "incomplete" }
+            );
+            assert_eq!(outcome.json["recording"]["event_log"]["dropped_events"], dropped);
+            assert_eq!(outcome.report_json["recording"], outcome.json["recording"]);
+            assert_eq!(outcome.message.contains("Recording incomplete"), dropped > 0);
+        }
     }
 
     #[tokio::test]
@@ -1762,6 +1899,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn events_json_reports_durable_queue_drops_before_terminal_line() {
+        let dir = TempDir::new().expect("tempdir");
+        let events_path = dir.path().join("events.ndjson");
+        let bus = EventBus::new(1);
+        let mut receiver = bus.subscribe_durable();
+        let capacity = receiver.capacity();
+        let session_id = Ulid::new();
+        let correlation_id = Ulid::new();
+
+        // Force overflow at the real default bound: the core test-only
+        // capacity constructor is not reachable from this crate.
+        for _ in 0..=capacity {
+            bus.publish(Event::new(
+                session_id,
+                correlation_id,
+                concerto_core::event::EventKind::SessionSaved,
+            ))
+            .expect("publish");
+        }
+        // Drain the retained events so the writer test file stays small; the
+        // cumulative drop count survives draining by contract.
+        while receiver.try_recv().is_ok() {}
+        assert_eq!(receiver.dropped_events(), 1);
+
+        let writer =
+            EventsWriter::spawn(events_path.clone(), Some("run-drops".to_string()), receiver)
+                .expect("spawn writer");
+        bus.publish(Event::new(
+            session_id,
+            correlation_id,
+            concerto_core::event::EventKind::SessionSaved,
+        ))
+        .expect("publish");
+        writer.finish("done", EXIT_DONE, Some(session_id)).await;
+        drop(bus);
+
+        let lines = read_ndjson(&events_path);
+        assert_eq!(lines.len(), 3, "drop notice + one event + terminal: {lines:?}");
+        assert_eq!(lines[0]["event"], json!("events_dropped"), "{lines:?}");
+        assert_eq!(lines[0]["dropped"], json!(1));
+        assert_eq!(lines[0]["capacity"], json!(capacity as u64));
+        assert_eq!(lines[1]["event"], json!("SessionSaved"), "{lines:?}");
+        assert_eq!(lines[2]["event"], json!("run_finished"), "{lines:?}");
+        for (index, line) in lines.iter().enumerate() {
+            assert_eq!(line["seq"].as_u64(), Some(index as u64 + 1), "{line}");
+            assert_eq!(line["run_id"], json!("run-drops"), "{line}");
+        }
+    }
+
+    #[tokio::test]
     async fn events_json_terminal_line_on_timeout() {
         let dir = TempDir::new().expect("tempdir");
         let events_path = dir.path().join("events.ndjson");
@@ -1934,6 +2121,7 @@ mod tests {
             provider_metrics: Vec::new(),
             checkpoint_json: None,
             provider_error_class: None,
+            recording_integrity: None,
         }
     }
 }

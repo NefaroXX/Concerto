@@ -30,7 +30,7 @@ camino.workspace = true
 dirs.workspace = true
 reqwest.workspace = true
 anyhow = "1"
-url = "2"
+url = "2.5.9"
 futures = { workspace = true }
 
 [dev-dependencies]

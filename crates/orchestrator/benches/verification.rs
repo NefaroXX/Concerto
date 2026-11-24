@@ -51,6 +51,7 @@ impl StubSpawner {
             duration_ms: 1,
             output_tail: "test result: ok".to_string(),
             coverage: None,
+            incomplete: false,
             provenance: EvalProvenance::Harness,
         }
     }

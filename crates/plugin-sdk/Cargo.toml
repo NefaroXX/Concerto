@@ -9,9 +9,5 @@ publish.workspace = true
 [lib]
 name = "concerto_plugin_sdk"
 
-[dependencies]
-serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
-serde_json = { version = "1", default-features = false, features = ["alloc"] }
-
 [lints]
 workspace = true

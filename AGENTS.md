@@ -53,7 +53,7 @@ cargo audit
   `[workspace.lints]` already denies `clippy::all` and `unsafe_code`, so never
   add `unsafe` and keep warnings clean.
 - CI pins fmt/clippy to toolchain **1.96.0**; the workspace MSRV declared in
-  `Cargo.toml` is **1.88**. Use a current stable locally — just keep fmt/clippy
+  `Cargo.toml` is **1.94**. Use a current stable locally — just keep fmt/clippy
   output matching 1.96.0.
 
 ## Non-obvious environment requirements
@@ -95,7 +95,8 @@ cargo audit
 ## Gotchas — do NOT "fix" these without review
 - **cargo-deny exceptions are intentional**: many `RUSTSEC-*` advisories are
   ignored for unmaintained *transitive* deps, and `wasmtime` is pinned to
-  the **36.0.x LTS** line (minimum 36.0.19). Read `deny.toml`
+  the **36.0.x LTS** line (minimum 36.0.23; 36.0.20 is affected by
+  RUSTSEC-2026-0566/-0569/-0571, fixed in 36.0.21). Read `deny.toml`
   justification/scope before changing anything. The two supply-chain gates are
   complementary: `cargo-deny` resolves features and cannot see
   optional/unactivated lockfile deps (e.g. `quinn-proto` via an unenabled
@@ -104,7 +105,7 @@ cargo audit
   `deny.toml`).
 - **Dependencies**: historical phase comments are not authorization to retain
   unused crates. Add a dependency only for a current, tested need. Wasmtime is
-  pinned to the patched 36.0.x LTS line for the current RustSec advisories; do not
+  pinned to the patched 36.0.x LTS line (36.0.23) for the current RustSec advisories; do not
   move it to an unpatched release without checking the advisory and API
   (`crates/plugins/src/host.rs` pins `config.wasm_memory64(false)` — keep
   `winch` off on any bump, see deny.toml).
@@ -114,6 +115,12 @@ cargo audit
   unyanked `zip` (`9.0.3+`, `deflate-flate2-zlib-rs`). Do not "fix" a
   `cargo deny` yanked failure by deleting the Swagger UI again — update the
   vendored patch instead. See `vendor/utoipa-swagger-ui/README.vendored.md`.
+- **SQLx SQLite driver dependency patch**: `vendor/sqlx-sqlite` retains the
+  published 0.9.0 Rust source but permits `libsqlite3-sys` 0.40 for
+  RUSTSEC-2026-0459. The 0.39.x binding patches plain SQLite but still bundles
+  affected SQLCipher; keep the runtime SQLite version regression and encrypted
+  storage tests. Remove the patch when a published SQLx accepts the repaired
+  binding. See `vendor/sqlx-sqlite/README.vendored.md`.
 - **Policy gates**: every file write / shell / git op is policy-gated, but do
   not read "reversible via git stash/branch rollback" as a universal property:
   there is no automatic rollback pipeline (`ToolExecutor` never calls
@@ -188,6 +195,31 @@ cargo audit
   The free roster itself churns; `OPENCODE_ZEN_FREE_KNOWN`
   (`crates/providers/src/provider_defs.rs`) holds the last hand-verified set
   and live discovery (`GET /zen/v1/models`) covers the rest.
+
+## Provider history and runtime outcomes (ADR-87)
+
+Root single-agent and coordinator dispatch turns are persisted separately from
+rendered UI summaries. Keep original assistant calls, reasoning/native replay
+and completed tool results; never replace them with a synthetic assistant
+summary or duplicate aggregate usage. Runtime verification and stop reasons are
+labeled system observations with no usage. `provider_transcript.rs` bounds
+cleanup independently of generation cancellation. Context assembly adds
+request-only unknown-outcome responses for interrupted calls: never treat them
+as executed evidence or automatically rerun a historical call. Specialist and
+supervised-child histories are stored separately from root history. Restored
+specialist prompts are bounded at 512 messages; durable rows are not pruned.
+Each runner attempt owns fresh produced-message/usage state, preserving only
+the intended seed. Account for every completed request before repair parsing,
+including paid repair requests; retain each message's own usage on disk.
+
+Runtime `recording_integrity` covers the session event log and display
+transcript, independently of task completion. Missing health is unknown, never
+complete. Recorders save `RecordingFinished` directly to the session store,
+outside their bounded queues; failures also reach runtime output and rendered
+summaries without changing canonical provider messages. Keep session filtering
+before enqueue and queue close before final drain. A zero drop count from the
+CLI's separate event export does not certify either runtime recorder. Provider
+history, spend and policy-audit writes are outside this recording status.
 
 ## Key entrypoints (start reading here)
 - Interactive application: `crates/orchestrator/src/conversation.rs` — shared

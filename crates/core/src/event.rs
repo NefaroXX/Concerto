@@ -7,11 +7,12 @@ use crate::ids::{new_id, Ulid};
 use crate::sanitizer::SecretSanitizer;
 use crate::types::{AgentId, McpServerState, PluginState, TaskId};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Notify};
 
 /// Verbosity tier of an `AgentThought` (score-accordion V2).
 ///
@@ -48,6 +49,11 @@ impl ThinkingKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum EventKind {
+    /// Written directly to the session store after the recorder drains, so
+    /// queue overflow cannot silently discard the integrity result itself.
+    RecordingFinished {
+        outcome: crate::recording::RecorderOutcome,
+    },
     BenchmarkRunMetadata {
         task_id: TaskId,
         metadata: serde_json::Value,
@@ -1129,10 +1135,15 @@ impl Event {
 /// When a [`SecretSanitizer`] is configured, all events are sanitized
 /// before publication to prevent accidental leakage of API keys, tokens,
 /// passwords, and other credentials through the event system.
-#[derive(Clone)]
 pub struct EventBus {
     tx: broadcast::Sender<Arc<Event>>,
-    durable_subscribers: Arc<std::sync::Mutex<Vec<Arc<DurableSender>>>>,
+    durable_subscribers: Arc<Mutex<Vec<Arc<DurableSender>>>>,
+    /// Per-subscriber capacity for durable queues.
+    durable_capacity: usize,
+    /// Open handles on this bus (the original plus every clone). The explicit
+    /// counter is the shutdown authority: `strong_count` on a shared field is
+    /// fragile because any future internal clone would extend bus lifetime.
+    handles: Arc<AtomicUsize>,
     /// Unique identifier for this bus instance, used for `Hash`/`Eq` in
     /// iced 0.14 `Subscription::run_with`.
     id: u64,
@@ -1159,34 +1170,187 @@ impl PartialEq for EventBus {
 
 impl Eq for EventBus {}
 
+impl Clone for EventBus {
+    fn clone(&self) -> Self {
+        // Infallible accounting: every constructed `EventBus` has one handle,
+        // and only the last drop reaches zero.
+        self.handles.fetch_add(1, Ordering::Relaxed);
+        Self {
+            tx: self.tx.clone(),
+            durable_subscribers: Arc::clone(&self.durable_subscribers),
+            durable_capacity: self.durable_capacity,
+            handles: Arc::clone(&self.handles),
+            id: self.id,
+            sanitizer: self.sanitizer.clone(),
+        }
+    }
+}
+
 /// Receiver half of `EventBus`. Wraps `broadcast::Receiver`.
 #[derive(Debug)]
 pub struct EventReceiver {
     rx: broadcast::Receiver<Arc<Event>>,
 }
 
-/// Durable-subscription backlog thresholds (long-session robustness observability).
+/// Durable-subscription backlog threshold (long-session observability).
 ///
-/// These bound how far a slow or leaked durable consumer may fall behind before
-/// it is flagged. Delivery stays lossless: the bus only observes and warns, it
-/// never drops a durable event.
+/// A durable subscriber's queue is bounded by [`DURABLE_QUEUE_CAPACITY`]; once
+/// the backlog crosses this soft threshold the bus logs a rate-limited warning.
+/// Delivery is lossless **only while a consumer keeps up**: on overflow the
+/// oldest queued events are discarded and the loss is counted in
+/// [`DurableHealth::dropped_events`].
 const DURABLE_PENDING_WARN: usize = 4096;
-const DURABLE_PENDING_LAG: usize = 65536;
+/// Per-subscriber durable queue bound. Must exceed [`DURABLE_PENDING_WARN`] so
+/// the backlog warning fires before overflow starts under the default config.
+const DURABLE_QUEUE_CAPACITY: usize = 8192;
 const MAX_DURABLE_SUBSCRIBERS: usize = 32;
 
-/// Wrapper around one durable subscriber's unbounded channel plus the shared,
-/// atomic observability state that the publisher and the receiver keep in sync.
+/// Shared state for one durable subscriber's bounded queue.
 ///
-/// Stored behind an `Arc` in [`EventBus`] so the publisher (via the vector) and
-/// the receiver (via its own `Arc` handles) observe the same counters.
-struct DurableSender {
-    tx: mpsc::UnboundedSender<Arc<Event>>,
+/// The publisher ([`DurableSender`]) and the consumer
+/// ([`DurableEventReceiver`]) share this through an `Arc`, so the health
+/// counters always describe the same queue. Every queue mutation happens under
+/// `events`; the publisher never blocks on the consumer.
+struct DurableQueue {
+    events: Mutex<VecDeque<Arc<Event>>>,
+    notify: Notify,
+    closed: AtomicBool,
     /// Approximate number of events buffered for this subscriber.
-    pending: Arc<AtomicUsize>,
-    /// Rate-limiter for the warn log; reset when the backlog drains below half.
-    warned: Arc<AtomicBool>,
-    /// Latches once the subscriber exceeds `DURABLE_PENDING_LAG`.
-    lagging: Arc<AtomicBool>,
+    pending: AtomicUsize,
+    /// Total events discarded by drop-oldest overflow (monotonic).
+    dropped: AtomicU64,
+    /// Latches when overflow discards an event; clears when the backlog drains.
+    lagging: AtomicBool,
+    /// Rate-limiter for the backlog warn log; reset when the backlog drains.
+    warned: AtomicBool,
+    capacity: usize,
+}
+
+impl DurableQueue {
+    fn new(capacity: usize) -> Self {
+        Self {
+            events: Mutex::new(VecDeque::new()),
+            notify: Notify::new(),
+            closed: AtomicBool::new(false),
+            pending: AtomicUsize::new(0),
+            dropped: AtomicU64::new(0),
+            lagging: AtomicBool::new(false),
+            warned: AtomicBool::new(false),
+            capacity: capacity.max(1),
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// Mark the queue closed and wake any waiting consumer so the bus can prune
+    /// this subscriber.
+    fn close(&self) {
+        // Synchronize with the publisher's under-lock closed check. Once close
+        // returns, neither queued events nor drop counters can grow again.
+        let _events = self.events.lock().unwrap_or_else(|error| error.into_inner());
+        self.closed.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    /// Pop the oldest retained event, keeping the health counters exact.
+    fn pop_front(&self) -> Option<Arc<Event>> {
+        let mut events = self.events.lock().unwrap_or_else(|error| error.into_inner());
+        let event = events.pop_front();
+        if event.is_some() {
+            let _ = self.pending.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+                pending.checked_sub(1)
+            });
+            if events.is_empty() {
+                // The backlog drained, so the overflow latch clears. The
+                // cumulative drop counter stays as the loss record.
+                self.lagging.store(false, Ordering::Relaxed);
+            }
+            if self.pending.load(Ordering::Relaxed) < DURABLE_PENDING_WARN / 2 {
+                self.warned.store(false, Ordering::Relaxed);
+            }
+        }
+        event
+    }
+}
+
+/// Wrapper around one durable subscriber's bounded queue.
+///
+/// Stored behind an `Arc` in [`EventBus`] so the publisher observes the same
+/// queue as the receiver. Sends are short and never await the consumer.
+struct DurableSender {
+    queue: Arc<DurableQueue>,
+    session_id: Option<Ulid>,
+}
+
+impl DurableSender {
+    fn is_closed(&self) -> bool {
+        self.queue.is_closed()
+    }
+
+    /// Enqueue one event without blocking the publisher.
+    ///
+    /// When the queue is full the oldest event is discarded (drop-oldest) so
+    /// the retained suffix stays in publish order. Returns `false` when the
+    /// receiver has gone away.
+    fn send(&self, event: Arc<Event>) -> bool {
+        if self.queue.is_closed() {
+            return false;
+        }
+        if self.session_id.is_some_and(|session| session != event.session_id) {
+            return true;
+        }
+        let mut overflow_warning = None;
+        let mut backlog_warning = None;
+        {
+            let mut events = self.queue.events.lock().unwrap_or_else(|error| error.into_inner());
+            // Re-check under the lock so a concurrent receiver drop cannot
+            // enqueue into a closed queue.
+            if self.queue.is_closed() {
+                return false;
+            }
+            if events.len() >= self.queue.capacity {
+                events.pop_front();
+                let dropped = self.queue.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                self.queue.lagging.store(true, Ordering::Relaxed);
+                if should_warn_overflow(dropped) {
+                    overflow_warning = Some(dropped);
+                }
+            }
+            events.push_back(event);
+            let pending = events.len();
+            self.queue.pending.store(pending, Ordering::Relaxed);
+            if pending >= DURABLE_PENDING_WARN && !self.queue.warned.swap(true, Ordering::Relaxed) {
+                backlog_warning = Some(pending);
+            }
+        }
+        // Log after releasing the queue lock: tracing is not part of the
+        // publisher's critical section.
+        if let Some(dropped) = overflow_warning {
+            tracing::warn!(
+                dropped,
+                capacity = self.queue.capacity,
+                "durable subscriber queue overflow; dropping oldest events"
+            );
+        }
+        if let Some(pending) = backlog_warning {
+            tracing::warn!(
+                pending,
+                warn_threshold = DURABLE_PENDING_WARN,
+                capacity = self.queue.capacity,
+                "durable subscriber backlog exceeded warn threshold; consumer may be stalled"
+            );
+        }
+        self.queue.notify.notify_one();
+        true
+    }
+}
+
+/// Overflow warnings are rate-limited to the first drop and each power-of-two
+/// drop count, so a stalled consumer cannot flood the log.
+fn should_warn_overflow(dropped: u64) -> bool {
+    dropped == 1 || dropped.is_power_of_two()
 }
 
 /// Read-only snapshot of durable-subscriber health for tests and ops tooling.
@@ -1195,60 +1359,99 @@ pub struct DurableHealth {
     pub subscriber_count: usize,
     pub max_pending: usize,
     pub lagging_subscribers: usize,
+    /// Total events discarded by drop-oldest overflow, summed across
+    /// subscribers. Cumulative for each subscriber's lifetime.
+    pub dropped_events: u64,
 }
 
-/// Remove durable subscribers whose channel has closed (receiver dropped) so a
-/// list of dead receivers never grows without bound.
+/// Remove durable subscribers whose queue has closed (receiver or bus dropped)
+/// so a list of dead receivers never grows without bound.
 fn prune_durable(subscribers: &mut Vec<Arc<DurableSender>>) {
-    subscribers.retain(|sender| !sender.tx.is_closed());
+    subscribers.retain(|sender| !sender.is_closed());
 }
 
-/// Lossless per-process receiver for persistence and replay materialization.
+/// Bounded per-process receiver for persistence and replay materialization.
 ///
-/// Unlike the broadcast receiver, this queue does not discard older events
-/// when the consumer temporarily falls behind. It is intended for one durable
-/// recorder per active session, not UI fan-out.
-#[derive(Debug)]
+/// Unlike the broadcast receiver, this queue is bounded and does not block the
+/// publisher. It preserves the order of retained events, but delivery is
+/// lossless **only while the consumer keeps up**: if the backlog reaches the
+/// queue capacity, the oldest events are discarded and the loss is counted in
+/// [`DurableHealth::dropped_events`]. It is intended for one durable recorder
+/// per active session, not UI fan-out.
 pub struct DurableEventReceiver {
-    rx: mpsc::UnboundedReceiver<Arc<Event>>,
-    pending: Arc<AtomicUsize>,
-    warned: Arc<AtomicBool>,
-    lagging: Arc<AtomicBool>,
+    queue: Arc<DurableQueue>,
+}
+
+impl std::fmt::Debug for DurableEventReceiver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DurableEventReceiver")
+            .field("pending", &self.queue.pending.load(Ordering::Relaxed))
+            .field("dropped", &self.queue.dropped.load(Ordering::Relaxed))
+            .field("closed", &self.queue.is_closed())
+            .finish_non_exhaustive()
+    }
 }
 
 impl DurableEventReceiver {
-    /// Decrement the shared pending counter after an event is consumed, and
-    /// re-arm the warn mitigation once the backlog drains below half the warn
-    /// threshold.
-    fn on_consumed(&self) {
-        let _ =
-            self.pending.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |p| p.checked_sub(1));
-        if self.pending.load(Ordering::Relaxed) < DURABLE_PENDING_WARN / 2 {
-            self.warned.store(false, Ordering::Relaxed);
-        }
-        if self.pending.load(Ordering::Relaxed) < DURABLE_PENDING_LAG {
-            self.lagging.store(false, Ordering::Relaxed);
-        }
+    /// Stop accepting events while retaining the queued suffix for draining.
+    /// The final drop count is stable after this returns.
+    pub fn close(&self) {
+        self.queue.close();
     }
 
+    /// Await the next queued event.
+    ///
+    /// Returns retained events in publish order and `None` once the queue is
+    /// closed (receiver or bus dropped) and fully drained.
     pub async fn recv(&mut self) -> Option<Arc<Event>> {
-        match self.rx.recv().await {
-            Some(event) => {
-                self.on_consumed();
-                Some(event)
+        loop {
+            // Create and register the notification future *before* checking the
+            // queue: `enable` pinpoints the waiter so a concurrent
+            // `notify_one`/`notify_waiters` cannot be lost between the check
+            // and the await.
+            let notified = self.queue.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            if let Some(event) = self.queue.pop_front() {
+                return Some(event);
             }
-            None => None,
+            if self.queue.is_closed() {
+                return None;
+            }
+            notified.await;
         }
     }
 
     pub fn try_recv(&mut self) -> Result<Arc<Event>, mpsc::error::TryRecvError> {
-        match self.rx.try_recv() {
-            Ok(event) => {
-                self.on_consumed();
-                Ok(event)
-            }
-            Err(error) => Err(error),
+        match self.queue.pop_front() {
+            Some(event) => Ok(event),
+            None if self.queue.is_closed() => Err(mpsc::error::TryRecvError::Disconnected),
+            None => Err(mpsc::error::TryRecvError::Empty),
         }
+    }
+
+    /// Cumulative number of events this subscriber's queue has discarded.
+    ///
+    /// Consumers must compare this value across receive iterations: an increase
+    /// means the bounded queue overflowed between the two observations and the
+    /// discarded events will never be delivered. The count never decreases and
+    /// is not reset by draining.
+    pub fn dropped_events(&self) -> u64 {
+        self.queue.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Maximum number of events this subscriber's queue retains.
+    pub fn capacity(&self) -> usize {
+        self.queue.capacity
+    }
+}
+
+impl Drop for DurableEventReceiver {
+    fn drop(&mut self) {
+        // Marking the queue closed (and waking any waiter) lets the bus prune
+        // this subscriber on its next publish/subscribe pass.
+        self.queue.close();
     }
 }
 
@@ -1283,7 +1486,9 @@ impl EventBus {
         let id = BUS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
             tx,
-            durable_subscribers: Arc::new(std::sync::Mutex::new(Vec::new())),
+            durable_subscribers: Arc::new(Mutex::new(Vec::new())),
+            durable_capacity: DURABLE_QUEUE_CAPACITY,
+            handles: Arc::new(AtomicUsize::new(1)),
             id,
             sanitizer: None,
         }
@@ -1299,9 +1504,28 @@ impl EventBus {
         let id = BUS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
             tx,
-            durable_subscribers: Arc::new(std::sync::Mutex::new(Vec::new())),
+            durable_subscribers: Arc::new(Mutex::new(Vec::new())),
+            durable_capacity: DURABLE_QUEUE_CAPACITY,
+            handles: Arc::new(AtomicUsize::new(1)),
             id,
             sanitizer: Some(Arc::new(sanitizer)),
+        }
+    }
+
+    /// Test-only constructor with an explicit durable queue capacity so tests
+    /// can exercise overflow without publishing thousands of events.
+    #[cfg(test)]
+    fn with_durable_capacity(capacity: usize, durable_capacity: usize) -> Self {
+        let cap = if capacity == 0 { DEFAULT_CHANNEL_CAPACITY } else { capacity };
+        let (tx, _) = broadcast::channel(cap);
+        let id = BUS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self {
+            tx,
+            durable_subscribers: Arc::new(Mutex::new(Vec::new())),
+            durable_capacity: durable_capacity.max(1),
+            handles: Arc::new(AtomicUsize::new(1)),
+            id,
+            sanitizer: None,
         }
     }
 
@@ -1309,18 +1533,25 @@ impl EventBus {
         EventReceiver { rx: self.tx.subscribe() }
     }
 
-    /// Subscribe a lossless per-process persistence consumer.
+    /// Subscribe a bounded per-process persistence consumer.
+    ///
+    /// Delivery is lossless only while the consumer keeps up. Each queue is
+    /// bounded (see [`DURABLE_QUEUE_CAPACITY`]); on overflow the oldest events
+    /// are discarded so a stalled consumer cannot grow memory without bound.
+    /// Loss is counted in [`DurableHealth::dropped_events`].
     pub fn subscribe_durable(&self) -> DurableEventReceiver {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let pending = Arc::new(AtomicUsize::new(0));
-        let warned = Arc::new(AtomicBool::new(false));
-        let lagging = Arc::new(AtomicBool::new(false));
-        let sender = Arc::new(DurableSender {
-            tx,
-            pending: Arc::clone(&pending),
-            warned: Arc::clone(&warned),
-            lagging: Arc::clone(&lagging),
-        });
+        self.subscribe_durable_filtered(None)
+    }
+
+    /// Filter before enqueueing so unrelated sessions cannot evict this
+    /// session's events or contaminate its recorder's integrity counters.
+    pub fn subscribe_durable_for_session(&self, session_id: Ulid) -> DurableEventReceiver {
+        self.subscribe_durable_filtered(Some(session_id))
+    }
+
+    fn subscribe_durable_filtered(&self, session_id: Option<Ulid>) -> DurableEventReceiver {
+        let queue = Arc::new(DurableQueue::new(self.durable_capacity));
+        let sender = Arc::new(DurableSender { queue: Arc::clone(&queue), session_id });
         let mut subscribers =
             self.durable_subscribers.lock().unwrap_or_else(|error| error.into_inner());
         prune_durable(&mut subscribers);
@@ -1334,7 +1565,7 @@ impl EventBus {
             );
         }
         subscribers.push(sender);
-        DurableEventReceiver { rx, pending, warned, lagging }
+        DurableEventReceiver { queue }
     }
 
     /// Read-only durable-subscriber health snapshot (tests + ops).
@@ -1343,16 +1574,24 @@ impl EventBus {
             self.durable_subscribers.lock().unwrap_or_else(|error| error.into_inner());
         let mut max_pending = 0;
         let mut lagging_subscribers = 0;
+        let mut dropped_events = 0u64;
         for sender in subscribers.iter() {
-            let pending = sender.pending.load(Ordering::Relaxed);
+            let pending = sender.queue.pending.load(Ordering::Relaxed);
             if pending > max_pending {
                 max_pending = pending;
             }
-            if sender.lagging.load(Ordering::Relaxed) {
+            if sender.queue.lagging.load(Ordering::Relaxed) {
                 lagging_subscribers += 1;
             }
+            dropped_events =
+                dropped_events.saturating_add(sender.queue.dropped.load(Ordering::Relaxed));
         }
-        DurableHealth { subscriber_count: subscribers.len(), max_pending, lagging_subscribers }
+        DurableHealth {
+            subscriber_count: subscribers.len(),
+            max_pending,
+            lagging_subscribers,
+            dropped_events,
+        }
     }
 
     /// Publish an event to all active subscribers.
@@ -1394,23 +1633,9 @@ impl EventBus {
                 self.durable_subscribers.lock().unwrap_or_else(|error| error.into_inner());
             prune_durable(&mut subscribers);
             for sender in subscribers.iter() {
-                if sender.tx.send(Arc::clone(&event)).is_err() {
-                    // Channel closed (receiver dropped); pruned on a later pass.
-                    continue;
-                }
-                let pending = sender.pending.fetch_add(1, Ordering::Relaxed) + 1;
-                if pending > DURABLE_PENDING_LAG {
-                    sender.lagging.store(true, Ordering::Relaxed);
-                    sender.warned.store(true, Ordering::Relaxed);
-                } else if pending >= DURABLE_PENDING_WARN
-                    && !sender.warned.swap(true, Ordering::Relaxed)
-                {
-                    tracing::warn!(
-                        pending,
-                        warn_threshold = DURABLE_PENDING_WARN,
-                        "durable subscriber backlog exceeded warn threshold; consumer may be stalled"
-                    );
-                }
+                // Sends are bounded and never await, so one stalled subscriber
+                // cannot delay the publisher or the other subscribers.
+                let _ = sender.send(Arc::clone(&event));
             }
         }
         if !broadcast {
@@ -1444,6 +1669,24 @@ impl EventBus {
     ) -> Result<(), crate::error::CoreError> {
         let event = Event::new(correlation_id, session_id, kind);
         self.publish(event)
+    }
+}
+
+impl Drop for EventBus {
+    fn drop(&mut self) {
+        // Clones share the subscriber list, so only the last bus handle owns
+        // shutdown. A frontend/keepalive clone must not close live queues.
+        // The explicit counter is authoritative: any handle still held after
+        // this decrement keeps the queues open.
+        if self.handles.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        let mut subscribers =
+            self.durable_subscribers.lock().unwrap_or_else(|error| error.into_inner());
+        for sender in subscribers.iter() {
+            sender.queue.close();
+        }
+        subscribers.clear();
     }
 }
 
@@ -1520,11 +1763,12 @@ mod tests {
         }
     }
 
-    /// Long-session robustness: durable delivery is lossless. Publishing 1000
-    /// events to one durable subscriber and draining them yields exactly 1000
-    /// in order, and the backlog fully empties (health stays bounded).
+    /// Long-session robustness: delivery is lossless while the consumer keeps
+    /// up. Publishing 1000 events (well below the default durable bound) to one
+    /// subscriber and draining them yields exactly 1000 in order, and the
+    /// backlog fully empties without drops.
     #[test]
-    fn durable_delivery_is_lossless() {
+    fn durable_delivery_is_lossless_within_capacity() {
         let bus = EventBus::default();
         let mut durable = bus.subscribe_durable();
         let session_id = new_id();
@@ -1552,7 +1796,9 @@ mod tests {
             received += 1;
         }
         assert_eq!(received, 1_000);
-        assert_eq!(bus.durable_health().max_pending, 0);
+        let health = bus.durable_health();
+        assert_eq!(health.max_pending, 0);
+        assert_eq!(health.dropped_events, 0, "no loss below the queue bound");
     }
 
     /// The `--events-json` writer relies on `subscribe_durable`, so a plain
@@ -1612,6 +1858,42 @@ mod tests {
         assert_eq!(bus.durable_health().max_pending, 0);
     }
 
+    #[test]
+    fn session_filtered_durable_queue_does_not_drop_for_other_sessions() {
+        let bus = EventBus::with_durable_capacity(16, 2);
+        let session = new_id();
+        let other = new_id();
+        let mut receiver = bus.subscribe_durable_for_session(session);
+        bus.publish_for_session(session, session, EventKind::SessionSaved).unwrap();
+        for _ in 0..20 {
+            bus.publish_for_session(other, other, EventKind::SessionSaved).unwrap();
+        }
+        receiver.close();
+        assert_eq!(receiver.dropped_events(), 0);
+        assert_eq!(receiver.try_recv().unwrap().session_id, session);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn closing_durable_receiver_freezes_drops_and_drains_retained_events() {
+        let bus = EventBus::with_durable_capacity(16, 4);
+        let mut receiver = bus.subscribe_durable();
+        let session = new_id();
+        for _ in 0..6 {
+            bus.publish_for_session(session, session, EventKind::SessionSaved).unwrap();
+        }
+        assert_eq!(receiver.dropped_events(), 2);
+        receiver.close();
+        for _ in 0..20 {
+            let _ = bus.publish_for_session(session, session, EventKind::SessionSaved);
+        }
+        for _ in 0..4 {
+            assert!(receiver.recv().await.is_some());
+        }
+        assert!(receiver.recv().await.is_none());
+        assert_eq!(receiver.dropped_events(), 2, "closed queues never gain more drops");
+    }
+
     /// Dead (dropped) receivers are pruned from the subscriber list both on
     /// publish and on subscribe, so they never grow the vector without bound.
     #[test]
@@ -1635,21 +1917,22 @@ mod tests {
         assert!(a.try_recv().is_ok());
     }
 
-    /// A durable subscriber that never drains past the lag threshold is flagged
-    /// in the read-only health accessor (no timing/sleeps — deterministic).
+    /// Overflow uses drop-oldest: only the newest `capacity` events survive, in
+    /// publish order, and the loss is counted and observable. Draining clears
+    /// the lag latch and pending backlog but keeps the cumulative loss count.
     #[test]
-    fn durable_lag_health_flags_when_backlogged() {
-        let bus = EventBus::default();
-        let _never_drains = bus.subscribe_durable();
+    fn durable_overflow_drops_oldest_and_reports_loss() {
+        let bus = EventBus::with_durable_capacity(16, 4);
+        let mut durable = bus.subscribe_durable();
         let session_id = new_id();
         let correlation_id = new_id();
 
-        for i in 0..(DURABLE_PENDING_LAG + 1) {
+        for i in 0..10 {
             bus.publish_for_session(
                 session_id,
                 correlation_id,
                 EventKind::AgentThought {
-                    agent_id: "lag".into(),
+                    agent_id: "overflow".into(),
                     content: i.to_string(),
                     kind: ThinkingKind::Detail,
                 },
@@ -1658,8 +1941,198 @@ mod tests {
         }
 
         let health = bus.durable_health();
-        assert!(health.lagging_subscribers >= 1);
-        assert_eq!(health.max_pending, DURABLE_PENDING_LAG + 1);
+        assert_eq!(health.dropped_events, 6, "10 published - 4 retained");
+        assert_eq!(health.max_pending, 4);
+        assert_eq!(health.lagging_subscribers, 1);
+
+        let mut received = Vec::new();
+        while let Ok(event) = durable.try_recv() {
+            let EventKind::AgentThought { content, .. } = &event.kind else {
+                panic!("unexpected event kind");
+            };
+            received.push(content.clone());
+        }
+        assert_eq!(received.len(), 4, "queue bound caps retained events");
+        for (offset, content) in received.iter().enumerate() {
+            assert_eq!(content, &(offset + 6).to_string(), "retained suffix stays in order");
+        }
+
+        let health = bus.durable_health();
+        assert_eq!(health.max_pending, 0);
+        assert_eq!(health.lagging_subscribers, 0, "lag clears when the backlog drains");
+        assert_eq!(health.dropped_events, 6, "loss stays observable after draining");
+    }
+
+    /// The receiver exposes the cumulative per-subscriber overflow count and
+    /// the configured capacity, so a consumer can detect a gap by comparing
+    /// successive readings. Draining does not reset the count.
+    #[test]
+    fn durable_receiver_exposes_capacity_and_cumulative_drops() {
+        let bus = EventBus::with_durable_capacity(16, 4);
+        let mut receiver = bus.subscribe_durable();
+        assert_eq!(receiver.capacity(), 4);
+        assert_eq!(receiver.dropped_events(), 0);
+
+        for i in 0..10 {
+            bus.publish(Event::new(
+                new_id(),
+                new_id(),
+                EventKind::TokenUsed { tokens_in: i, tokens_out: 0 },
+            ))
+            .unwrap();
+        }
+
+        assert_eq!(receiver.dropped_events(), 6, "10 published - 4 retained");
+        while receiver.try_recv().is_ok() {}
+        assert_eq!(receiver.dropped_events(), 6, "draining is not a reset");
+    }
+
+    /// A stalled durable consumer cannot block the publisher: sends are bounded
+    /// and drop-oldest, so publishing from the same thread returns promptly
+    /// with every excess event accounted for.
+    #[test]
+    fn stalled_durable_receiver_does_not_block_publisher() {
+        let bus = EventBus::with_durable_capacity(16, 1);
+        let _stalled = bus.subscribe_durable();
+
+        let started = std::time::Instant::now();
+        for i in 0..100 {
+            bus.publish(Event::new(
+                new_id(),
+                new_id(),
+                EventKind::TokenUsed { tokens_in: i, tokens_out: 0 },
+            ))
+            .unwrap();
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "publisher must not wait on a stalled durable consumer"
+        );
+
+        let health = bus.durable_health();
+        assert_eq!(health.max_pending, 1, "queue stays at its bound");
+        assert_eq!(health.dropped_events, 99, "every excess event is accounted");
+        assert_eq!(health.lagging_subscribers, 1);
+    }
+
+    /// Dropping the bus closes its durable queues: the receiver drains the
+    /// retained events and then observes `None` instead of waiting forever.
+    #[tokio::test]
+    async fn dropping_bus_closes_durable_receiver() {
+        let bus = EventBus::default();
+        let mut durable = bus.subscribe_durable();
+        bus.publish(Event::new(new_id(), new_id(), EventKind::SessionSaved)).unwrap();
+        drop(bus);
+
+        assert!(durable.recv().await.is_some(), "retained event is still delivered");
+        let end = tokio::time::timeout(std::time::Duration::from_secs(1), durable.recv()).await;
+        assert!(matches!(end, Ok(None)), "closed queue yields None after draining");
+    }
+
+    /// Lost-wakeup regression: a receiver that has already parked on the
+    /// queue's `Notify` must still see events published afterwards, in order,
+    /// without a spurious `None` and without being counted as dropped.
+    ///
+    /// The default `#[tokio::test]` runtime is single-threaded. The spawned
+    /// task sends the handshake and then continues into `recv().await` until
+    /// the queue parks it; the test wakes only after that. A yield keeps this
+    /// robust without a timing sleep.
+    #[tokio::test]
+    async fn parked_durable_receiver_is_woken_without_loss() {
+        let bus = EventBus::default();
+        let mut receiver = bus.subscribe_durable();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            let first = receiver.recv().await;
+            let second = receiver.recv().await;
+            (first, second, receiver)
+        });
+
+        started_rx.await.expect("receiver task should start");
+        tokio::task::yield_now().await;
+
+        let session_id = new_id();
+        let correlation_id = new_id();
+        for content in ["first", "second"] {
+            bus.publish_for_session(
+                session_id,
+                correlation_id,
+                EventKind::AgentThought {
+                    agent_id: "parked".into(),
+                    content: content.into(),
+                    kind: ThinkingKind::Detail,
+                },
+            )
+            .expect("publish while the receiver is parked");
+        }
+
+        let (first, second, receiver) = task.await.expect("receiver task should not panic");
+        let first = first.expect("first recv must not return None");
+        let second = second.expect("second recv must not return None");
+        for (event, expected) in [(&first, "first"), (&second, "second")] {
+            let EventKind::AgentThought { content, .. } = &event.kind else {
+                panic!("unexpected event kind");
+            };
+            assert_eq!(content, expected, "events stay in publish order");
+        }
+        assert_eq!(receiver.dropped_events(), 0, "a parked receiver must not lose events");
+        assert_eq!(bus.durable_health().max_pending, 0, "both events were consumed");
+    }
+
+    /// The explicit handle counter, not `Arc::strong_count`, owns queue
+    /// shutdown: durable queues stay open while any clone survives and close
+    /// exactly when the last handle drops.
+    #[test]
+    fn durable_queues_close_only_when_last_bus_handle_drops() {
+        let bus = EventBus::default();
+        let mut receiver = bus.subscribe_durable();
+        let first = bus.clone();
+        let second = bus.clone();
+        drop(bus);
+
+        assert!(
+            matches!(receiver.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "two surviving clones must keep the queue open"
+        );
+        first
+            .publish(Event::new(new_id(), new_id(), EventKind::SessionSaved))
+            .expect("publish through a surviving clone");
+        assert!(receiver.try_recv().is_ok(), "a surviving clone keeps delivery alive");
+
+        drop(first);
+        assert!(
+            matches!(receiver.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "one surviving clone must keep the queue open"
+        );
+        second
+            .publish(Event::new(new_id(), new_id(), EventKind::SessionSaved))
+            .expect("publish through the last clone");
+        assert!(receiver.try_recv().is_ok(), "the last clone still delivers");
+
+        drop(second);
+        assert!(
+            matches!(receiver.try_recv(), Err(mpsc::error::TryRecvError::Disconnected)),
+            "the last handle drop must close the queue"
+        );
+    }
+
+    /// Dropping the receiver closes its queue; the next publish prunes it and
+    /// health returns to zero.
+    #[test]
+    fn dropped_durable_receiver_is_pruned_from_health() {
+        let bus = EventBus::default();
+        let receiver = bus.subscribe_durable();
+        assert_eq!(bus.durable_health().subscriber_count, 1);
+
+        drop(receiver);
+        bus.publish(Event::new(new_id(), new_id(), EventKind::SessionSaved)).unwrap();
+
+        let health = bus.durable_health();
+        assert_eq!(health.subscriber_count, 0, "closed receiver is pruned");
+        assert_eq!(health.max_pending, 0);
+        assert_eq!(health.dropped_events, 0);
+        assert_eq!(health.lagging_subscribers, 0);
     }
 
     #[tokio::test]

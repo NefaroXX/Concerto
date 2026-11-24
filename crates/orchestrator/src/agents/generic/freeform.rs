@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::agents::execution_state::{display_reason, tool_failure_payload_with, ExecutionState};
+use crate::prompts::CompletedTurn;
 
 impl GenericSpecialistAgent {
     /// Execute through the existing executor, retaining observed progress when
@@ -40,7 +41,13 @@ impl GenericSpecialistAgent {
             .unwrap_or_default();
 
         let start = std::time::Instant::now();
-        let mut messages = vec![Message {
+        // H39b: restored prior turns lead the conversation; the current task
+        // prompt stays last. `recorded` starts after the seed so the restored
+        // turns are never re-recorded into the produced delta.
+        let mut messages = context.agent_history.seeded().to_vec();
+        let mut recorded = messages.len();
+        messages.push(Message {
+            gemini_replay: None,
             role: Role::User,
             content: prompt.clone(),
             tool_calls: None,
@@ -48,15 +55,13 @@ impl GenericSpecialistAgent {
             reasoning_content: None,
             tokens_in: None,
             tokens_out: None,
-        }];
+        });
+        context.agent_history.record_from(&messages, &mut recorded);
         // Per-run corrective-retry streaks, mirroring the single-agent loop's
         // `tool_guard_rejects` map: at most
         // [`tool_guard::MAX_TOOL_GUARD_REJECTS`] corrective injections per
         // tool before the exhausted message tells the model to move on.
         let mut tool_guard_rejects: HashMap<String, u32> = HashMap::new();
-        // NOTE: chars/4 is a heuristic until provider usage is plumbed through.
-        let mut tokens_in = 0_u64;
-        let mut tokens_out = 0_u64;
         let mut tool_call_count = 0_u32;
         let mut files_modified = context
             .previous_results
@@ -115,6 +120,9 @@ impl GenericSpecialistAgent {
         }
 
         'turns: for iteration in 0..MAX_TOOL_ITERATIONS {
+            // Record only turns completed before this iteration. A turn whose
+            // provider call fails is never appended, so it cannot be recorded.
+            context.agent_history.record_from(&messages, &mut recorded);
             if cancel.is_cancelled() {
                 if !progress.has_progress() {
                     return Err(OrchestratorError::Cancelled);
@@ -143,52 +151,10 @@ impl GenericSpecialistAgent {
             if let Some(driver) = tool_driver.as_ref() {
                 driver.augment_request(&mut request);
             }
-            // ADR-48 decision 4: provider-reported usage as the source of
-            // truth; the byte/4 heuristic is the fallback per dimension.
-            let estimated_tokens_in =
-                request.messages.iter().map(|message| message.content.len() as u64).sum::<u64>()
-                    / 4;
-
-            let (text, reasoning, tool_calls, usage) =
-                match self.complete_provider_audited(&request, task, &cancel).await {
-                    Ok(turn) => turn,
-                    Err(error)
-                        if progress.has_progress()
-                            && (cancel.is_cancelled()
-                                || matches!(
-                                    error,
-                                    OrchestratorError::Cancelled
-                                        | OrchestratorError::Provider(
-                                            concerto_core::error::ProviderError::Cancelled
-                                        )
-                                )) =>
-                    {
-                        progress.interrupted();
-                        break;
-                    }
-                    Err(error) => return Err(error),
-                };
-            // ADR-66 §4: resolve the turn through the text-fallback driver —
-            // structured tool-call blocks parsed from the text, bounded
-            // repair on malformed blocks, loud failure on bound exhaustion.
-            // Native turns (driver inactive) pass through untouched.
-            let driver_turn = match tool_driver.as_mut() {
-                Some(driver) => {
-                    self.freeform_driver_turn(
-                        driver,
-                        task,
-                        model,
-                        text,
-                        reasoning,
-                        usage,
-                        &mut messages,
-                        &cancel,
-                    )
-                    .await
-                }
-                None => Ok((text, reasoning, tool_calls, usage)),
-            };
-            let (text, reasoning, tool_calls, usage) = match driver_turn {
+            let turn = match self
+                .complete_provider_audited(&request, task, &context.agent_history, &cancel)
+                .await
+            {
                 Ok(turn) => turn,
                 Err(error)
                     if progress.has_progress()
@@ -204,16 +170,54 @@ impl GenericSpecialistAgent {
                     progress.interrupted();
                     break;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    context.agent_history.record_from(&messages, &mut recorded);
+                    return Err(error);
+                }
             };
-            // ADR-48 decision 4: provider-reported usage as the source of
-            // truth; the byte/4 heuristic is the fallback per dimension.
-            let usage_in = usage.as_ref().and_then(|u| u.prompt_tokens);
-            let usage_out = usage.as_ref().and_then(|u| u.completion_tokens);
-            tokens_in = tokens_in.saturating_add(usage_in.unwrap_or(estimated_tokens_in));
-            tokens_out = tokens_out.saturating_add(usage_out.unwrap_or((text.len() / 4) as u64));
-
+            // ADR-66 §4: resolve the turn through the text-fallback driver —
+            // structured tool-call blocks parsed from the text, bounded
+            // repair on malformed blocks, loud failure on bound exhaustion.
+            // Native turns (driver inactive) pass through untouched.
+            let driver_turn = match tool_driver.as_mut() {
+                Some(driver) => {
+                    self.freeform_driver_turn(
+                        driver,
+                        task,
+                        turn,
+                        &mut messages,
+                        &context.agent_history,
+                        &cancel,
+                        model,
+                    )
+                    .await
+                }
+                None => Ok(turn),
+            };
+            let CompletedTurn { text, reasoning, tool_calls, usage, gemini_replay } =
+                match driver_turn {
+                    Ok(turn) => turn,
+                    Err(error)
+                        if progress.has_progress()
+                            && (cancel.is_cancelled()
+                                || matches!(
+                                    error,
+                                    OrchestratorError::Cancelled
+                                        | OrchestratorError::Provider(
+                                            concerto_core::error::ProviderError::Cancelled
+                                        )
+                                )) =>
+                    {
+                        progress.interrupted();
+                        break;
+                    }
+                    Err(error) => {
+                        context.agent_history.record_from(&messages, &mut recorded);
+                        return Err(error);
+                    }
+                };
             messages.push(Message {
+                gemini_replay,
                 role: Role::Assistant,
                 content: text.clone(),
                 tool_calls: (!tool_calls.is_empty()).then_some(tool_calls.clone()),
@@ -290,6 +294,7 @@ impl GenericSpecialistAgent {
                             },
                         );
                         messages.push(Message {
+                            gemini_replay: None,
                             role: Role::Tool,
                             content,
                             tool_calls: None,
@@ -345,6 +350,7 @@ impl GenericSpecialistAgent {
                         },
                     );
                     messages.push(Message {
+                        gemini_replay: None,
                         role: Role::Tool,
                         content: String::new(),
                         tool_calls: None,
@@ -370,13 +376,24 @@ impl GenericSpecialistAgent {
                     }
                     None => HashMap::new(),
                 };
-                // ADR-65 §4: safe read dedupe — a plain single-path filesystem
-                // read whose clean observation still matches the disk (re-statted
-                // now, content hash verified) is a serve candidate. Any doubt
-                // degrades to normal execution; the model receives a
-                // byte-identical read result either way.
+                // Authorize before cache validation reads current disk bytes.
+                // Denial/approval-required/cache misses use normal execution.
                 let serve = match &self.tool_facts {
-                    Some(facts) => {
+                    Some(facts)
+                        if crate::read_cache::plain_single_path_read(
+                            &tool_call.name,
+                            &arguments,
+                        )
+                        .is_some()
+                            && executor
+                                .policy_verdict_is_allow(
+                                    &tool_call.name,
+                                    &arguments,
+                                    &context.session,
+                                    cancel.clone(),
+                                )
+                                .await =>
+                    {
                         crate::read_cache::maybe_serve_read(
                             facts,
                             &context.session.project_dir,
@@ -385,25 +402,6 @@ impl GenericSpecialistAgent {
                             &cancel,
                         )
                         .await
-                    }
-                    None => None,
-                };
-                // ADR-65 F1a: serve only when the policy engine explicitly
-                // allows the read through the advisory path (no decision row, no
-                // quota consumption); any non-Allow verdict runs the normal,
-                // fully policy-checked executor path below.
-                let serve = match serve {
-                    Some(serve)
-                        if executor
-                            .policy_verdict_is_allow(
-                                &tool_call.name,
-                                &arguments,
-                                &context.session,
-                                cancel.clone(),
-                            )
-                            .await =>
-                    {
-                        Some(serve)
                     }
                     _ => None,
                 };
@@ -438,6 +436,7 @@ impl GenericSpecialistAgent {
                     .await;
                     progress.succeeded(&tool_call.id, &tool_call.name, &arguments);
                     messages.push(Message {
+                        gemini_replay: None,
                         role: Role::Tool,
                         content: String::new(),
                         tool_calls: None,
@@ -517,6 +516,7 @@ impl GenericSpecialistAgent {
                             .await;
                         }
                         messages.push(Message {
+                            gemini_replay: None,
                             role: Role::Tool,
                             content: String::new(),
                             tool_calls: None,
@@ -559,6 +559,10 @@ impl GenericSpecialistAgent {
                                 "cancelled",
                             );
                             if !progress.has_progress() {
+                                // The assistant turn is already completed;
+                                // preserve it even though the run has no
+                                // retained tool progress.
+                                context.agent_history.record_from(&messages, &mut recorded);
                                 return Err(OrchestratorError::Cancelled);
                             }
                             progress.interrupted();
@@ -566,6 +570,12 @@ impl GenericSpecialistAgent {
                         }
                         if matches!(error, concerto_core::ToolError::PausedAwaitingApproval { .. })
                         {
+                            // R3/H39: an approval pause is an ordinary early
+                            // return. The assistant batch and every result
+                            // completed before the pause are durable evidence;
+                            // the paused call intentionally stays unresolved so
+                            // the next load repairs it as request-only.
+                            context.agent_history.record_from(&messages, &mut recorded);
                             return Err(OrchestratorError::Tool(error));
                         }
                         let payload = tool_failure_payload_with(
@@ -592,6 +602,7 @@ impl GenericSpecialistAgent {
                             },
                         );
                         messages.push(Message {
+                            gemini_replay: None,
                             role: Role::Tool,
                             content: String::new(),
                             tool_calls: None,
@@ -615,8 +626,13 @@ impl GenericSpecialistAgent {
             }
         }
 
+        // Capture the final completed turn (and any turns completed before a
+        // cancellation break).
+        context.agent_history.record_from(&messages, &mut recorded);
+
         let latency_ms = start.elapsed().as_millis() as u64;
-        let cost_usd = self.provider.approximate_cost(tokens_in, tokens_out);
+        let concerto_core::types::AgentRunUsage { tokens_in, tokens_out, cost_usd, .. } =
+            context.agent_history.usage();
         if verification::has_failure(&verification) {
             progress.verification_failed();
         }

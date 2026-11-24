@@ -338,6 +338,7 @@ fn ollama_line_to_chunks(
             if let Some(content) = json["message"]["content"].as_str() {
                 if !content.is_empty() {
                     items.push(Ok(CompletionChunk {
+                        gemini_replay: None,
                         reasoning: None,
                         delta: content.to_string(),
                         tool_call: None,
@@ -364,6 +365,7 @@ fn ollama_line_to_chunks(
                         // round-trip.
                         let id = format!("oc_{}", name);
                         items.push(Ok(CompletionChunk {
+                            gemini_replay: None,
                             reasoning: None,
                             delta: String::new(),
                             tool_call: Some(concerto_core::types::ToolCall {
@@ -381,6 +383,7 @@ fn ollama_line_to_chunks(
             }
             if json.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
                 items.push(Ok(CompletionChunk {
+                    gemini_replay: None,
                     reasoning: None,
                     delta: String::new(),
                     tool_call: None,

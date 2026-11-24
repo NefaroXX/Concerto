@@ -33,6 +33,11 @@ pub type CompletionStream =
 pub trait LlmProvider: Send + Sync {
     /// Stream a completion as canonical [`CompletionChunk`]s.
     ///
+    /// Successful responses include a final chunk (`is_final: true`), even
+    /// for empty content. Transport EOF alone is not completion evidence:
+    /// consumers must reject streams that end without a final chunk and must
+    /// not execute buffered tool calls from incomplete attempts.
+    ///
     /// ADR-48 §4 — every connector must attach provider-reported wire usage
     /// to the terminal chunk only (via `CompletionChunk::usage`): `Some`
     /// when the provider reports counts, `None` when the wire carries no

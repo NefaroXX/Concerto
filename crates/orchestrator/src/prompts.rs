@@ -12,7 +12,6 @@ use concerto_config::{ShellBackendType, ShellProfileConfig};
 use concerto_core::error::ProviderError;
 use concerto_core::event::EventBus;
 use concerto_core::ids::Ulid;
-use concerto_core::text::normalize_typographic;
 use concerto_core::traits::provider::{CompletionStream, LlmProvider};
 use concerto_core::types::{
     CompletionRequest, CompletionUsage, Message, Role, ToolCall, ToolDefinition,
@@ -262,8 +261,7 @@ impl PromptBuilder {
     /// With [`PromptBuilder::with_cache_stable_prefix`] enabled,
     /// [`PromptBuilder::build`] emits exactly these bytes first and appends
     /// the volatile working memory (active state plus retrieved chunks) after
-    /// them, inside the same single system message so last-system-wins
-    /// adapters (Anthropic, Gemini) still see it while the bytes before it
+    /// them, inside the same single system message while the bytes before it
     /// never move. [`PromptBuilder::build_agent_request`] instead keeps the
     /// system message limited to this head plus the task-stable context and
     /// moves the per-iteration state to a trailing user message.
@@ -408,6 +406,7 @@ impl PromptBuilder {
     /// the orchestrator uses for its system and working-memory turns.
     fn message(role: Role, content: String) -> Message {
         Message {
+            gemini_replay: None,
             role,
             content,
             tool_calls: None,
@@ -605,12 +604,18 @@ fn platform_notes(os: &str) -> Vec<String> {
 /// pairing the first opening brace with the final closing brace, which was the
 /// source of repeated architect failures when a model added commentary.
 ///
-/// Typographic (Unicode) punctuation in model output is normalized to ASCII
-/// first — models emit curly quotes, en dashes, and non-breaking hyphens that
-/// `serde_json` rejects outright.
+/// Original candidates are tried before repairing smart-quote delimiters or
+/// nonbreaking whitespace outside strings. Unicode keys and values are data
+/// and must not be rewritten to make a response parse.
 pub fn parse_json_value(text: &str) -> Option<serde_json::Value> {
-    let normalized = normalize_typographic(text);
-    let trimmed = normalized.trim();
+    parse_json_value_raw(text).or_else(|| {
+        let repaired = repair_json_typography(text)?;
+        parse_json_value_raw(&repaired)
+    })
+}
+
+fn parse_json_value_raw(text: &str) -> Option<serde_json::Value> {
+    let trimmed = text.trim();
     if let Ok(value) = serde_json::from_str(trimmed) {
         return Some(value);
     }
@@ -628,14 +633,20 @@ pub fn parse_json_value(text: &str) -> Option<serde_json::Value> {
 /// Deserialize the first JSON fragment in a model response that deserializes
 /// to `T`.
 ///
-/// After normalizing typographic punctuation, tries in order: strict
-/// whole-text deserialization, deserialization after stripping an outer code
-/// fence, then every balanced `{...}`/`[...]` candidate in occurrence order.
+/// Tries strict whole-text deserialization, an outer code fence, then every
+/// balanced `{...}`/`[...]` candidate in occurrence order. Only after all
+/// original candidates fail does it try structural typography repair.
 /// A prose prefix may contain an earlier balanced fragment that is valid JSON
 /// of the wrong type — each candidate is tried until one deserializes to `T`.
 pub fn parse_json_substring<T: serde::de::DeserializeOwned>(text: &str) -> Option<T> {
-    let normalized = normalize_typographic(text);
-    let trimmed = normalized.trim();
+    parse_json_substring_raw(text).or_else(|| {
+        let repaired = repair_json_typography(text)?;
+        parse_json_substring_raw(&repaired)
+    })
+}
+
+fn parse_json_substring_raw<T: serde::de::DeserializeOwned>(text: &str) -> Option<T> {
+    let trimmed = text.trim();
 
     if let Ok(value) = serde_json::from_str::<T>(trimmed) {
         return Some(value);
@@ -654,6 +665,53 @@ pub fn parse_json_substring<T: serde::de::DeserializeOwned>(text: &str) -> Optio
         }
     }
     None
+}
+
+/// Repair only JSON typography with a structural meaning. Ordinary strings
+/// retain every codepoint, including curly quotes, dashes and nonbreaking
+/// spaces. Smart-quoted strings retain their contents while their delimiters
+/// become ASCII quotes. Ambiguous/malformed repairs must still pass serde.
+fn repair_json_typography(text: &str) -> Option<String> {
+    if !text.chars().any(|ch| matches!(ch, '“' | '”' | '\u{00a0}' | '\u{202f}')) {
+        return None;
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut closing_quote = None;
+    let mut escaped = false;
+    for ch in text.chars() {
+        if let Some(closer) = closing_quote {
+            if escaped {
+                out.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                out.push(ch);
+                escaped = true;
+            } else if ch == closer {
+                out.push('"');
+                closing_quote = None;
+            } else {
+                // An ASCII quote inside a smart-quoted string is content.
+                if ch == '"' && closer != '"' {
+                    out.push('\\');
+                }
+                out.push(ch);
+            }
+        } else {
+            match ch {
+                '"' => {
+                    closing_quote = Some('"');
+                    out.push(ch);
+                }
+                '“' | '”' => {
+                    closing_quote = Some('”');
+                    out.push('"');
+                }
+                '\u{00a0}' | '\u{202f}' => out.push(' '),
+                _ => out.push(ch),
+            }
+        }
+    }
+    (out != text).then_some(out)
 }
 
 fn strip_outer_fence(text: &str) -> &str {
@@ -729,22 +787,35 @@ fn balanced_end(text: &str, start: usize, opening: char) -> Option<usize> {
     None
 }
 
+/// One completed provider turn, including replay state that survives persistence.
+#[derive(Debug, Clone)]
+pub struct CompletedTurn {
+    pub text: String,
+    pub reasoning: Option<String>,
+    pub tool_calls: Vec<ToolCall>,
+    pub usage: Option<CompletionUsage>,
+    pub gemini_replay: Option<concerto_core::provider_replay::GeminiReplay>,
+}
+
 /// Collect a `CompletionStream` into its full text, any reasoning text, any
 /// tool calls, and the provider-reported usage (ADR-48 §4).
 ///
-/// Returns `(text, reasoning, tool_calls, usage)`. `reasoning` is `None` when
+/// Returns the complete canonical turn and native replay state. `reasoning` is `None` when
 /// no streamed reasoning was observed (ADR-46); otherwise the concatenated
 /// reasoning deltas. `usage` is `Some` only when the terminal chunk carried a
 /// provider usage report (providers report usage exclusively on the final
-/// chunk).
+/// chunk). EOF without a final chunk is a retryable transport failure;
+/// buffered output from that attempt must not escape to tool execution.
 pub async fn collect_stream(
     mut stream: CompletionStream,
-) -> Result<(String, Option<String>, Vec<ToolCall>, Option<CompletionUsage>), OrchestratorError> {
+) -> Result<CompletedTurn, OrchestratorError> {
     use futures::StreamExt;
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
     let mut usage = None;
+    let mut final_seen = false;
+    let mut gemini_replay = None;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(OrchestratorError::Provider)?;
         text.push_str(&chunk.delta);
@@ -755,11 +826,16 @@ pub async fn collect_stream(
             tool_calls.push(tool_call);
         }
         if chunk.is_final {
+            final_seen = true;
             usage = chunk.usage;
+            gemini_replay = chunk.gemini_replay;
         }
     }
+    if !final_seen {
+        return Err(OrchestratorError::Provider(incomplete_stream_error()));
+    }
     let reasoning = if reasoning.is_empty() { None } else { Some(reasoning) };
-    Ok((text, reasoning, tool_calls, usage))
+    Ok(CompletedTurn { text, reasoning, tool_calls, usage, gemini_replay })
 }
 
 /// Execute and collect one logical provider request through the single retry
@@ -770,7 +846,7 @@ pub async fn collect_stream(
 /// data. A retry recreates only this request; it never replays an agent or any
 /// tool side effects.
 ///
-/// Returns `(text, reasoning, tool_calls, usage)`; see [`collect_stream`].
+/// Returns the complete canonical turn and native replay state; see [`collect_stream`].
 #[allow(clippy::too_many_arguments)]
 pub async fn complete_provider_request(
     provider: &std::sync::Arc<dyn LlmProvider>,
@@ -780,7 +856,7 @@ pub async fn complete_provider_request(
     session_id: Ulid,
     task_id: TaskId,
     cancel: &CancellationToken,
-) -> Result<(String, Option<String>, Vec<ToolCall>, Option<CompletionUsage>), OrchestratorError> {
+) -> Result<CompletedTurn, OrchestratorError> {
     let first_byte_timeout = Duration::from_secs(retry_policy.config().time_to_first_byte_seconds);
     let idle_timeout = Duration::from_secs(retry_policy.config().stream_idle_timeout_seconds);
     let provider_name = provider.provider_name();
@@ -846,7 +922,7 @@ pub(crate) async fn collect_stream_with_timeouts(
     cancel: &CancellationToken,
     first_byte_timeout: Duration,
     idle_timeout: Duration,
-) -> Result<(String, Option<String>, Vec<ToolCall>, Option<CompletionUsage>), ProviderError> {
+) -> Result<CompletedTurn, ProviderError> {
     collect_stream_measured(stream, cancel, first_byte_timeout, idle_timeout, None).await
 }
 
@@ -856,18 +932,21 @@ async fn collect_stream_measured(
     first_byte_timeout: Duration,
     idle_timeout: Duration,
     mut recorder: Option<&mut crate::provider_telemetry::AttemptRecorder>,
-) -> Result<(String, Option<String>, Vec<ToolCall>, Option<CompletionUsage>), ProviderError> {
+) -> Result<CompletedTurn, ProviderError> {
     use futures::StreamExt;
 
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
     let mut usage = None;
+    let mut final_seen = false;
+    let mut gemini_replay = None;
     let mut first_chunk = true;
     loop {
         let timeout = if first_chunk { first_byte_timeout } else { idle_timeout };
         let phase = if first_chunk { "time-to-first-byte" } else { "stream-idle" };
         let next = tokio::select! {
+            biased;
             _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
             result = tokio::time::timeout(timeout, stream.next()) => {
                 result.map_err(|_| ProviderError::Timeout {
@@ -892,11 +971,20 @@ async fn collect_stream_measured(
             tool_calls.push(tool_call);
         }
         if chunk.is_final {
+            final_seen = true;
             usage = chunk.usage;
+            gemini_replay = chunk.gemini_replay;
         }
     }
+    if !final_seen {
+        return Err(incomplete_stream_error());
+    }
     let reasoning = if reasoning.is_empty() { None } else { Some(reasoning) };
-    Ok((text, reasoning, tool_calls, usage))
+    Ok(CompletedTurn { text, reasoning, tool_calls, usage, gemini_replay })
+}
+
+fn incomplete_stream_error() -> ProviderError {
+    ProviderError::StreamTransport("completion stream ended before a final chunk".into())
 }
 
 #[cfg(test)]
@@ -924,6 +1012,7 @@ mod tests {
         let builder = PromptBuilder::new("System prompt".to_string());
 
         let user_msg = Message {
+            gemini_replay: None,
             role: Role::User,
             content: "Hello".to_string(),
             tool_calls: None,
@@ -1134,6 +1223,54 @@ mod tests {
     }
 
     #[test]
+    fn valid_json_keeps_unicode_in_keys_and_values() {
+        for content in
+            ["café – a‑b …", "‘quoted’ and “double quoted”", "line\n{braces} \\\"escaped\\\" 🦀"]
+        {
+            let expected = serde_json::json!({ "unicode–key": content });
+            let raw = expected.to_string();
+            for text in [raw.clone(), format!("```json\n{raw}\n```"), format!("Result: {raw} done")]
+            {
+                assert_eq!(parse_json_value(&text), Some(expected.clone()), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn typed_json_keeps_unicode_across_wrappers_and_candidate_selection() {
+        let content = "Keep “quotes”, a‑b, en–dash, café and 🦀";
+        let raw = serde_json::json!({"task": content}).to_string();
+        for text in [
+            raw.clone(),
+            format!("```json\n{raw}\n```"),
+            format!("Preface {{\"other\":0}} then {raw}"),
+        ] {
+            let parsed: Option<TestPlanItem> = parse_json_substring(&text);
+            assert_eq!(parsed, Some(TestPlanItem { task: content.to_owned() }), "{text}");
+        }
+    }
+
+    #[test]
+    fn structural_quote_repair_preserves_string_contents() {
+        for input in [
+            "{“task”: \"Keep “quotes” and a‑b\"}",
+            "{“task”: “Keep ‘quotes’ and a‑b”}",
+            "{\u{a0}\"task\":\u{a0}\"Keep\u{a0}space\"}",
+        ] {
+            let expected = if input.contains("‘quotes’") {
+                "Keep ‘quotes’ and a‑b"
+            } else if input.contains("\u{a0}space") {
+                "Keep\u{a0}space"
+            } else {
+                "Keep “quotes” and a‑b"
+            };
+            let parsed: Option<TestPlanItem> = parse_json_substring(input);
+            assert_eq!(parsed, Some(TestPlanItem { task: expected.to_owned() }));
+            assert_eq!(parse_json_value(input), Some(serde_json::json!({"task": expected})));
+        }
+    }
+
+    #[test]
     fn parses_fenced_json() {
         let value = parse_json_value("```json\n{\"ok\":true}\n```").unwrap();
         assert_eq!(value["ok"], true);
@@ -1193,17 +1330,15 @@ mod tests {
     }
 
     #[test]
-    fn substring_normalizes_smart_quotes_and_non_breaking_hyphens() {
-        // U+201C/U+201D delimit the JSON strings and U+2011 (non-breaking
-        // hyphen) appears inside a value; both break strict serde_json, which
-        // previously also confused the string tracking in the balanced-bracket
-        // scan. Normalization maps them to ASCII before parsing.
+    fn substring_repairs_smart_delimiters_without_rewriting_hyphens() {
+        // Smart delimiters are malformed JSON, but the nonbreaking hyphens
+        // inside the string are valid data and survive delimiter repair.
         let input = concat!(
             "Result: {\u{201C}task\u{201D}: ",
             "\u{201C}write\u{2011}commit\u{2011}code\u{201D}} done",
         );
         let parsed: Option<TestPlanItem> = parse_json_substring(input);
-        assert_eq!(parsed, Some(TestPlanItem { task: "write-commit-code".into() }));
+        assert_eq!(parsed, Some(TestPlanItem { task: "write‑commit‑code".into() }));
     }
 
     #[test]
@@ -1230,6 +1365,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn premature_eof_is_not_a_completed_response() {
+        use concerto_core::types::CompletionChunk;
+        for chunks in [
+            vec![],
+            vec![CompletionChunk::keepalive()],
+            vec![CompletionChunk {
+                gemini_replay: None,
+                delta: "partial answer".into(),
+                reasoning: Some("partial reasoning".into()),
+                tool_call: Some(ToolCall { name: "filesystem".into(), ..Default::default() }),
+                is_final: false,
+                usage: None,
+            }],
+        ] {
+            let plain =
+                collect_stream(Box::pin(stream::iter(chunks.clone().into_iter().map(Ok)))).await;
+            assert!(
+                matches!(
+                    plain,
+                    Err(OrchestratorError::Provider(ProviderError::StreamTransport(_)))
+                ),
+                "premature EOF must fail: {plain:?}"
+            );
+            let timed = collect_stream_with_timeouts(
+                Box::pin(stream::iter(chunks.into_iter().map(Ok))),
+                &CancellationToken::new(),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            )
+            .await;
+            assert!(matches!(timed, Err(ProviderError::StreamTransport(_))), "{timed:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn premature_eof_does_not_override_cancellation() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = collect_stream_with_timeouts(
+            Box::pin(stream::empty()),
+            &cancel,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(result, Err(ProviderError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn premature_eof_guard_preserves_empty_completions_and_late_errors() {
+        use concerto_core::types::CompletionChunk;
+        for late_error in [false, true] {
+            let terminal = CompletionChunk { is_final: true, ..CompletionChunk::keepalive() };
+            let mut chunks = vec![Ok(terminal)];
+            if late_error {
+                chunks.push(Err(ProviderError::AuthFailure));
+            }
+            let result = collect_stream_with_timeouts(
+                Box::pin(stream::iter(chunks)),
+                &CancellationToken::new(),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            )
+            .await;
+            if late_error {
+                assert!(matches!(result, Err(ProviderError::AuthFailure)));
+            } else {
+                let CompletedTurn { text, reasoning, tool_calls: calls, usage, .. } =
+                    result.unwrap();
+                assert!(text.is_empty());
+                assert!(reasoning.is_none());
+                assert!(calls.is_empty());
+                assert!(usage.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn stream_without_first_chunk_times_out() {
         let pending: CompletionStream = Box::pin(stream::pending());
         let result = collect_stream_with_timeouts(
@@ -1247,6 +1460,7 @@ mod tests {
         use concerto_core::types::CompletionChunk;
         let stream: CompletionStream = Box::pin(stream::iter(vec![
             Ok(CompletionChunk {
+                gemini_replay: None,
                 delta: "part one".into(),
                 reasoning: Some("reason one".into()),
                 tool_call: None,
@@ -1254,6 +1468,7 @@ mod tests {
                 usage: None,
             }),
             Ok(CompletionChunk {
+                gemini_replay: None,
                 delta: "".into(),
                 reasoning: Some("reason two".into()),
                 tool_call: None,
@@ -1261,6 +1476,7 @@ mod tests {
                 usage: None,
             }),
             Ok(CompletionChunk {
+                gemini_replay: None,
                 delta: " part two".into(),
                 reasoning: None,
                 tool_call: None,
@@ -1268,7 +1484,8 @@ mod tests {
                 usage: None,
             }),
         ]));
-        let (text, reasoning, tool_calls, usage) = collect_stream(stream).await.unwrap();
+        let CompletedTurn { text, reasoning, tool_calls, usage, .. } =
+            collect_stream(stream).await.unwrap();
         assert_eq!(text, "part one part two");
         assert_eq!(reasoning.as_deref(), Some("reason onereason two"));
         assert!(tool_calls.is_empty());
@@ -1280,13 +1497,15 @@ mod tests {
     async fn collect_stream_reasoning_none_when_absent() {
         use concerto_core::types::CompletionChunk;
         let stream: CompletionStream = Box::pin(stream::iter(vec![Ok(CompletionChunk {
+            gemini_replay: None,
             delta: "no reasoning here".into(),
             reasoning: None,
             tool_call: None,
             is_final: true,
             usage: None,
         })]));
-        let (text, reasoning, tool_calls, usage) = collect_stream(stream).await.unwrap();
+        let CompletedTurn { text, reasoning, tool_calls, usage, .. } =
+            collect_stream(stream).await.unwrap();
         assert_eq!(text, "no reasoning here");
         assert_eq!(reasoning, None);
         assert!(tool_calls.is_empty());
@@ -1298,6 +1517,7 @@ mod tests {
         use concerto_core::types::{CompletionChunk, CompletionUsage};
         let stream: CompletionStream = Box::pin(stream::iter(vec![
             Ok(CompletionChunk {
+                gemini_replay: None,
                 delta: "hi".into(),
                 reasoning: None,
                 tool_call: None,
@@ -1305,6 +1525,7 @@ mod tests {
                 usage: None,
             }),
             Ok(CompletionChunk {
+                gemini_replay: None,
                 delta: "".into(),
                 reasoning: None,
                 tool_call: None,
@@ -1316,7 +1537,7 @@ mod tests {
                 }),
             }),
         ]));
-        let (_, _, _, usage) = collect_stream(stream).await.unwrap();
+        let CompletedTurn { usage, .. } = collect_stream(stream).await.unwrap();
         assert_eq!(
             usage,
             Some(CompletionUsage {
@@ -1331,6 +1552,7 @@ mod tests {
 
     fn user_message(content: &str) -> Message {
         Message {
+            gemini_replay: None,
             role: Role::User,
             content: content.to_string(),
             tool_calls: None,
@@ -1496,7 +1718,7 @@ mod tests {
     /// The shipped build template carries `{working_memory}`, so the
     /// active-state + retrieved-chunks block is delivered on the DEFAULT
     /// path (`cache_stable_prefix` off) — inside the single system message,
-    /// which is the one last-system-wins adapters (Anthropic, Gemini) read.
+    /// alongside the instruction text on every provider family.
     #[test]
     fn working_memory_block_reaches_the_model_on_the_default_path() {
         let builder = PromptBuilder::new(concerto_core::types::SYSTEM_PROMPT_BUILD.to_string());
@@ -1822,3 +2044,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "prompts_replay_tests.rs"]
+mod replay_tests;

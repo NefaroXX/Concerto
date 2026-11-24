@@ -1270,6 +1270,7 @@ mod tests {
             42.5,
             17,
             &[ProviderMetrics {
+                agent_id: None,
                 provider: "test".into(),
                 model: "gpt-4".into(),
                 tokens_in: 1000,

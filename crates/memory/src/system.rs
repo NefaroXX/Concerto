@@ -394,6 +394,7 @@ impl MemorySystem {
             return;
         }
         let messages = vec![Message {
+            gemini_replay: None,
             role: Role::User,
             content: entry.content.clone(),
             tool_calls: None,

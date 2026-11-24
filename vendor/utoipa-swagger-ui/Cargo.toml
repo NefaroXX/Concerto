@@ -152,14 +152,15 @@ optional = true
 
 # VENDORED PATCH (Concerto, 2026-10-16): upstream 9.0.2 requires `zip ^3.0`,
 # and every `zip` release in that range (`<= 8.6.0`) is yanked on crates.io.
-# The unyanked `zip` releases are 9.0.3/9.0.4, so this build dependency is
-# bumped to 9.0.3+. `zip`'s own `flate2` dependency disables default features,
+# The unyanked `zip` releases are 9.0.5+, so this build dependency is bumped to
+# 9.0.5+ (RUSTSEC-2026-0548 fixes ZipStreamReader name confusion before 9.0.5).
+# `zip`'s own `flate2` dependency disables default features,
 # so a backend must be named explicitly: `deflate-flate2-zlib-rs` selects
 # `flate2/zlib-rs`, whose `zlib-rs` crate is already in the workspace lock.
 # This avoids the default `deflate` feature (which would add `zopfli`) — the
 # build script only *reads* deflate entries, it never compresses.
 [build-dependencies.zip]
-version = "9.0.3"
+version = "9.0.5"
 features = ["deflate-flate2-zlib-rs"]
 default-features = false
 

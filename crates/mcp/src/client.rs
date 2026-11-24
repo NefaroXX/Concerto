@@ -53,9 +53,25 @@ type PendingMap = HashMap<u64, oneshot::Sender<Result<Value, McpError>>>;
 /// never stops paginating.
 const MAX_TOOL_LIST_PAGES: usize = 1000;
 
+/// Bounded startup allowance: the time allowed for [`McpClient::spawn`] to
+/// fork/exec and join its process group, and the extra allowance added to the
+/// first protocol stage.
+///
+/// `Command::spawn` returns only after fork/exec; interpreter bootstrap and the
+/// child's first response happen while `initialize` is waiting. `spawn` alone
+/// therefore cannot cover process startup. [`crate::McpManager`] bounds spawn
+/// with this value and calls `initialize(timeout_secs +
+/// SPAWN_STARTUP_GRACE_SECS)`, so the first stage is still bounded (by startup
+/// allowance plus the configured stage budget) and later stages keep the
+/// configured budget.
+pub const SPAWN_STARTUP_GRACE_SECS: u64 = 10;
+
 /// How long `stop` waits for the server to exit after stdin EOF before
-/// escalating to `kill`.
-const GRACE_PERIOD: Duration = Duration::from_secs(2);
+/// escalating to `kill`. Public so a caller that wraps a whole handshake can
+/// state the same total budget, including teardown of a timed-out server.
+pub const STOP_GRACE_PERIOD_SECS: u64 = 2;
+
+const GRACE_PERIOD: Duration = Duration::from_secs(STOP_GRACE_PERIOD_SECS);
 
 /// Structured server identity reported by a successful `initialize`.
 #[derive(Debug, Clone, PartialEq)]
@@ -202,6 +218,11 @@ impl McpClient {
     /// operation: calling `spawn` again while a server is live returns
     /// [`McpError::AlreadySpawned`]. A crashed server must be restarted via a
     /// fresh `spawn` (which is allowed after the old process exited).
+    ///
+    /// Callers should bound this call with [`SPAWN_STARTUP_GRACE_SECS`]. Note
+    /// that returning from `spawn` does not mean the child is ready: bootstrap
+    /// happens while `initialize` waits, so the manager adds the same startup
+    /// allowance to the first protocol stage; see the manager's handshake.
     pub async fn spawn(
         &mut self,
         command: &str,

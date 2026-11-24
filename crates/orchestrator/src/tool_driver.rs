@@ -125,6 +125,7 @@ impl TextToolDriver {
                 request.messages.insert(
                     0,
                     Message {
+                        gemini_replay: None,
                         role: Role::System,
                         content: section,
                         tool_calls: None,
@@ -218,6 +219,7 @@ impl TextToolDriver {
     /// concrete defect so the model can correct it.
     pub fn repair_message(reason: &str) -> Message {
         Message {
+            gemini_replay: None,
             role: Role::User,
             content: format!(
                 "Your previous reply was not a valid tool-call block: {reason}. \
@@ -496,6 +498,7 @@ mod tests {
             stable_system_prefix_bytes: None,
             messages: vec![
                 Message {
+                    gemini_replay: None,
                     role: Role::System,
                     content: "base system prompt".into(),
                     tool_calls: None,
@@ -505,6 +508,7 @@ mod tests {
                     tokens_out: None,
                 },
                 Message {
+                    gemini_replay: None,
                     role: Role::User,
                     content: "do the thing".into(),
                     tool_calls: None,
@@ -541,6 +545,7 @@ mod tests {
             session_id: None,
             stable_system_prefix_bytes: None,
             messages: vec![Message {
+                gemini_replay: None,
                 role: Role::User,
                 content: "do the thing".into(),
                 tool_calls: None,

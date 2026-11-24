@@ -17,7 +17,7 @@ describes what is actually implemented. For what is still open, see
 [![CI](https://github.com/NefaroXX/Concerto/actions/workflows/ci.yml/badge.svg)](https://github.com/NefaroXX/Concerto/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE-MIT)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE-APACHE)
-![Rust](https://img.shields.io/badge/rust-1.88%2B-orange?logo=rust)
+![Rust](https://img.shields.io/badge/rust-1.94%2B-orange?logo=rust)
 [![Docs](https://img.shields.io/badge/docs-architecture-blue)](docs/architecture.md)
 [![ADRs](https://img.shields.io/badge/design-ADRs-blueviolet)](docs/adrs/README.md)
 
@@ -235,7 +235,7 @@ details.
 Linux is the primary development platform; macOS and Windows are not yet part
 of the verified test matrix.
 
-- Rust 1.88 or newer (the workspace MSRV). CI, and `rust-toolchain.toml`,
+- Rust 1.94 or newer (the workspace MSRV). CI, and `rust-toolchain.toml`,
   pin formatting, linting, and testing to Rust 1.96.0.
 - The `wasm32-wasip2` Rust target — required to build the
   `test-*-plugin-wasm` crates in the workspace.
@@ -397,6 +397,20 @@ exit 1. `run`'s options must follow `run` (`concerto run --json`).
   database the TUI uses, so a run can be inspected afterwards with
   `concerto sessions show <id>`, `concerto sessions events <id>`, and
   `concerto audit <id> --json`.
+
+The JSON object and report include `recording.status`: `complete`,
+`incomplete`, or `unknown`, covering the session event log and display transcript.
+Separate `event_log` and `transcript` outcomes
+report dropped events, failed writes, recorder failure and whether the integrity
+record was saved. `unknown` means no terminal recording result is available
+(including error/timeout responses), not a complete audit trail. Task status
+and exit code describe execution; an executed task can be `done` with incomplete
+recording. Human summaries show that warning. Automation requiring both
+recordings must also require `recording.status == "complete"`. This status
+does not certify separate provider-history, spend or policy-audit writes.
+The terminal `RecordingFinished` events are saved directly to the session store,
+independently of the bounded recording queue. An `--events-json` export's drop
+count only describes that export subscription.
 
 Known v1 semantics: on a completed run `final_message` carries the composed
 run summary (files changed, verification, notes); on error or timeout

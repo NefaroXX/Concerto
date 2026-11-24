@@ -73,10 +73,12 @@ pub mod manager;
 pub mod tool_bridge;
 mod transport;
 
-pub use client::{McpCallResult, McpClient, McpServerInfo};
+pub use client::{
+    McpCallResult, McpClient, McpServerInfo, SPAWN_STARTUP_GRACE_SECS, STOP_GRACE_PERIOD_SECS,
+};
 pub use error::McpError;
 pub use manager::McpManager;
-pub use tool_bridge::{McpTool, HARD_TIMEOUT_CAP_SECS};
+pub use tool_bridge::{McpTool, DEFAULT_TIMEOUT_SECS, HARD_TIMEOUT_CAP_SECS};
 
 /// MCP protocol revision pinned for this client.
 ///
@@ -84,3 +86,29 @@ pub use tool_bridge::{McpTool, HARD_TIMEOUT_CAP_SECS};
 /// `LATEST_PROTOCOL_VERSION`); the 2026-07-28 stateless revision is beta and
 /// explicitly deferred (ADR-43, decision 2).
 pub const PROTOCOL_VERSION: &str = "2025-11-25";
+
+/// Total wall-clock budget for one spawn + `initialize` + `tools/list`
+/// handshake, including the bounded teardown used to reap a timed-out server.
+///
+/// This is the sum of the individual stage deadlines, not a shared deadline:
+/// spawn gets [`SPAWN_STARTUP_GRACE_SECS`]; the first protocol stage gets the
+/// configured per-stage timeout (clamped exactly as the manager clamps it)
+/// plus the same startup allowance, because `spawn` returns after fork/exec
+/// and bootstrap is observed while `initialize` waits; `tools/list` gets the
+/// configured per-stage timeout; and teardown gets
+/// [`STOP_GRACE_PERIOD_SECS`]. One extra second is a scheduling margin so an
+/// outer watchdog cannot fire on the same tick as the final stage and mask its
+/// error. Callers that wrap a whole handshake in an outer watchdog should use
+/// this total. The client caps any single bounded call at 300 s, so a
+/// configured first stage above that is shorter than the sum above; the total
+/// remains a safe upper bound.
+pub fn handshake_budget(timeout_secs: u64) -> std::time::Duration {
+    let per_stage = timeout_secs.clamp(1, 300);
+    std::time::Duration::from_secs(
+        SPAWN_STARTUP_GRACE_SECS
+            + (per_stage + SPAWN_STARTUP_GRACE_SECS)
+            + per_stage
+            + STOP_GRACE_PERIOD_SECS
+            + 1,
+    )
+}

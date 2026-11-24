@@ -130,6 +130,7 @@ impl ConversationInbox {
         let messages: Vec<Message> = inputs
             .iter()
             .map(|content| Message {
+                gemini_replay: None,
                 role: Role::User,
                 content: content.clone(),
                 tool_calls: None,
@@ -216,7 +217,7 @@ pub struct ConversationCompletion {
 impl ConversationCompletion {
     pub fn display_message(&self) -> String {
         match &self.result {
-            Ok(output) if self.reply_only => output.final_message.clone(),
+            Ok(output) if self.reply_only => output.reply_summary(),
             Ok(output) => output.summary(),
             Err(failure) => failure.user_message.clone(),
         }
@@ -420,7 +421,7 @@ impl ConversationTurn {
                         EventKind::AssistantMessage {
                             task_id: output.task_id,
                             content: if reply_only {
-                                output.final_message
+                                output.reply_summary()
                             } else {
                                 output.summary()
                             },

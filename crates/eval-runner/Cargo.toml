@@ -17,17 +17,13 @@ concerto-config = { path = "../config", version = "0.1.0" }
 concerto-tools = { path = "../tools", version = "0.1.0" }
 concerto-sessions = { path = "../sessions", version = "0.1.0" }
 concerto-memory = { path = "../memory", version = "0.1.0" }
-dirs = { workspace = true }
 camino = { workspace = true }
 blake3 = { workspace = true }
 
 toml = { workspace = true }
 tokio = { workspace = true, features = ["process", "time", "rt-multi-thread", "macros", "sync"] }
-tokio-util = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
 async-trait = "0.1"
 time = { workspace = true }
 
@@ -36,7 +32,6 @@ name = "cargo-eval"
 path = "src/main.rs"
 
 [dev-dependencies]
-time = { workspace = true }
 # Guard test (tests/persona_mem_recall.rs) provisions its own scratch SQLite
 # database to exercise the real SqliteVectorStore + SqliteFullTextStore, and
 # mints fresh MemoryIds. Both reuse existing workspace pins.

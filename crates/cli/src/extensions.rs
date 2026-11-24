@@ -26,6 +26,17 @@ fn toml_value(value: &impl serde::Serialize) -> anyhow::Result<String> {
     Ok(toml::Value::try_from(value)?.to_string())
 }
 
+/// Surface the handshake stage that timed out, including the server id, so a
+/// probe failure is attributable. Non-timeout failures keep their detail.
+fn probe_stage_error(error: anyhow::Error, server_id: &str) -> anyhow::Error {
+    match error.downcast_ref::<concerto_mcp::McpError>() {
+        Some(concerto_mcp::McpError::Timeout { method }) => {
+            anyhow::anyhow!("MCP probe timed out during {method} (server `{server_id}`)")
+        }
+        _ => error,
+    }
+}
+
 fn read_typed_file<T: serde::de::DeserializeOwned + serde::Serialize>(
     path: &str,
 ) -> anyhow::Result<T> {
@@ -210,8 +221,12 @@ fn run_mcp(args: &[String], project: &Path) -> anyhow::Result<()> {
                 .context("unknown MCP server id")?
                 .clone();
             server.enabled = true;
-            let timeout =
-                std::time::Duration::from_secs(server.timeout_secs.unwrap_or(60).clamp(1, 120));
+            // Match the manager's per-stage timeout semantics exactly, then
+            // bound the whole probe by the sum of the individual stages so the
+            // outer watchdog never masks a stage-specific error.
+            let timeout_secs =
+                server.timeout_secs.unwrap_or(concerto_mcp::DEFAULT_TIMEOUT_SECS).clamp(1, 300);
+            let budget = concerto_mcp::handshake_budget(timeout_secs);
             let manager = concerto_mcp::McpManager::new(
                 concerto_config::McpConfig { enabled: true, servers: vec![server] },
                 concerto_core::event::EventBus::new(64),
@@ -220,10 +235,14 @@ fn run_mcp(args: &[String], project: &Path) -> anyhow::Result<()> {
             return rt.block_on(async {
                 let mut registry = concerto_core::types::ToolRegistry::default();
                 let result: anyhow::Result<usize> = tokio::select! {
-                    result = tokio::time::timeout(timeout, manager.start_server(&args[1], &mut registry)) => {
+                    result = tokio::time::timeout(budget, manager.start_server(&args[1], &mut registry)) => {
                         match result {
                             Ok(result) => result.map_err(Into::into),
-                            Err(_) => Err(anyhow::anyhow!("MCP probe timed out")),
+                            Err(_) => Err(anyhow::anyhow!(
+                                "MCP probe timed out after {}s before any protocol stage completed (server `{}`)",
+                                budget.as_secs(),
+                                args[1]
+                            )),
                         }
                     }
                     signal = tokio::signal::ctrl_c() => {
@@ -235,7 +254,7 @@ fn run_mcp(args: &[String], project: &Path) -> anyhow::Result<()> {
                 };
                 let tools = manager.tools_for(&args[1]);
                 manager.stop_all(&mut registry).await;
-                result?;
+                result.map_err(|error| probe_stage_error(error, &args[1]))?;
                 output(&tools)
             });
         }

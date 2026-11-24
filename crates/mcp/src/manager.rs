@@ -52,7 +52,7 @@
 //! agent run), each [`McpClient`] `Drop` impl SIGKILLs and reaps its child so
 //! no server is orphaned.
 
-use crate::client::McpClient;
+use crate::client::{McpClient, SPAWN_STARTUP_GRACE_SECS};
 use crate::error::McpError;
 use crate::tool_bridge::{McpTool, DEFAULT_TIMEOUT_SECS};
 use concerto_api_types::extension::McpToolDescriptor;
@@ -498,6 +498,16 @@ impl McpManager {
     /// Spawn, `initialize`, and list the tools of `client`'s server.
     /// Failures are returned as `(error, human-readable detail)` so the caller
     /// can record them on the client and mark the server `Failed`.
+    ///
+    /// Deadlines are per stage. Spawn is bounded by
+    /// [`SPAWN_STARTUP_GRACE_SECS`]. The first protocol stage, `initialize`,
+    /// gets `timeout_secs + SPAWN_STARTUP_GRACE_SECS`: `Command::spawn`
+    /// returns after fork/exec, so interpreter bootstrap and the child's first
+    /// response are observed while `initialize` waits and need an explicit
+    /// startup allowance. `tools/list` gets `timeout_secs` only. No aggregate
+    /// deadline charges an earlier stage to a later one. A failed stage stops
+    /// and reaps the child before the error is returned, so a timed-out server
+    /// cannot outlive the handshake.
     async fn handshake(
         &self,
         server: &McpServerConfig,
@@ -505,29 +515,53 @@ impl McpManager {
         timeout_secs: u64,
         env: &[(&str, &str)],
     ) -> Result<Vec<McpToolDescriptor>, (McpError, String)> {
-        let exchange = async {
-            let mut guard = client.lock().await;
-            if let Err(e) = guard.spawn(&server.command, &server.args, env).await {
+        let mut guard = client.lock().await;
+        let spawn = tokio::time::timeout(
+            std::time::Duration::from_secs(SPAWN_STARTUP_GRACE_SECS),
+            guard.spawn(&server.command, &server.args, env),
+        )
+        .await;
+        match spawn {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
                 let detail = format!("spawn failed: {e}");
                 return Err((e, detail));
             }
-            if let Err(e) = guard.initialize(timeout_secs).await {
-                let detail = format!("initialize failed: {e}");
-                return Err((e, detail));
+            Err(_) => {
+                let detail = format!("spawn timed out after {SPAWN_STARTUP_GRACE_SECS}s");
+                return Err((McpError::Timeout { method: "spawn".into() }, detail));
             }
-            guard.list_tools(timeout_secs, CancellationToken::new()).await.map_err(|e| {
+        }
+        if let Err(e) = guard.initialize(timeout_secs + SPAWN_STARTUP_GRACE_SECS).await {
+            reap_after_failed_stage(&mut guard, &server.id).await;
+            let detail = format!("initialize failed: {e}");
+            return Err((e, detail));
+        }
+        match guard.list_tools(timeout_secs, CancellationToken::new()).await {
+            Ok(tools) => Ok(tools),
+            Err(e) => {
+                reap_after_failed_stage(&mut guard, &server.id).await;
                 let detail = format!("tools/list failed: {e}");
-                (e, detail)
-            })
-        };
-        tokio::time::timeout(std::time::Duration::from_secs(timeout_secs.clamp(1, 300)), exchange)
-            .await
-            .unwrap_or_else(|_| {
-                Err((
-                    McpError::Timeout { method: "discovery".into() },
-                    "MCP discovery timed out".into(),
-                ))
-            })
+                Err((e, detail))
+            }
+        }
+    }
+}
+
+/// Stop and reap a child whose handshake stage failed. `stop` closes stdin,
+/// escalates to `kill` after the bounded grace period, and waits for the
+/// process, so a timed-out server is gone before the handshake error is
+/// reported. `NotConnected` means there is nothing left to reap.
+async fn reap_after_failed_stage(client: &mut McpClient, server_id: &str) {
+    match client.stop().await {
+        Ok(_) | Err(McpError::NotConnected) => {}
+        Err(error) => {
+            tracing::warn!(
+                server = %server_id,
+                error = %error,
+                "failed to reap mcp server after handshake failure"
+            );
+        }
     }
 }
 

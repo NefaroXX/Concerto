@@ -17,6 +17,7 @@ fn build_request(n: usize, tool_calls: bool) -> CompletionRequest {
         .map(|i| {
             let role = if i % 2 == 0 { Role::User } else { Role::Assistant };
             Message {
+                gemini_replay: None,
                 role,
                 content: format!(
                     "This is conversation message number {i}. It simulates realistic \

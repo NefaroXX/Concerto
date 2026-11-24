@@ -3195,6 +3195,7 @@ mod tests {
         use concerto_core::types::{Message as SessionMessage, Role};
 
         let row = |role: Role, content: &str| SessionMessage {
+            gemini_replay: None,
             role,
             content: content.to_string(),
             tool_calls: None,

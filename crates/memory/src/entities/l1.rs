@@ -199,6 +199,7 @@ impl L1DedupJudge {
             "NEW MEMORY:\n{new_content}\n\nEXISTING MEMORIES (id, content):\n{candidate_lines}"
         );
         let message = Message {
+            gemini_replay: None,
             role: Role::User,
             content: prompt_body,
             tool_calls: None,

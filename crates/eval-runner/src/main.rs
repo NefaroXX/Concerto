@@ -8,7 +8,7 @@ use concerto_core::policy::SimplePolicyEngine;
 use concerto_core::traits::approval::ApprovalDecision;
 use concerto_core::traits::memory::{MemoryStore, NullMemoryStore};
 use concerto_core::traits::provider::LlmProvider;
-use concerto_core::types::{AgentTask, BenchmarkReport, ToolRegistry};
+use concerto_core::types::{AgentTask, BenchmarkReport, Condition, PolicyRule, ToolRegistry};
 use concerto_core::CancellationToken;
 use concerto_eval::runner::{AgentFactory, AgentRunResult};
 use concerto_eval::EvalEngine;
@@ -282,9 +282,8 @@ async fn run_agent(
     registry.register(Box::new(ShellTool::new()));
     let registry = Arc::new(registry);
 
-    // Create policy engine with permissive rules (expert mode)
-    // Empty rules means expert mode - all tools auto-approved
-    let policy = Arc::new(SimplePolicyEngine::new(Vec::new(), store.audit_sink()));
+    // The declared fixture policy must permit the tools used by benchmarks.
+    let policy = benchmark_policy(store.audit_sink());
 
     // Create tool executor with auto-approval
     let approval_sink = Arc::new(AllowAllApprovalSink {});
@@ -587,6 +586,70 @@ fn compare_with_baseline(
             baseline: worst_baseline,
             current: worst_current,
         })
+    }
+}
+
+/// Explicitly permissive benchmark fixture; policy decisions are still audited.
+fn benchmark_policy(
+    audit: Arc<dyn concerto_core::traits::policy::AuditLog>,
+) -> Arc<SimplePolicyEngine> {
+    Arc::new(SimplePolicyEngine::new(vec![PolicyRule::AutoApprove(Condition::Always)], audit))
+}
+
+#[cfg(test)]
+mod fixture_policy_tests {
+    use super::*;
+    use concerto_core::traits::policy::PolicyEngine;
+    use concerto_core::types::{CapabilitySet, PolicyAction, PolicyVerdict};
+
+    #[tokio::test]
+    async fn benchmark_fixture_policy_allows_and_audits_filesystem_and_shell() {
+        let store = concerto_sessions::SqliteSessionStore::connect_in_memory().await.unwrap();
+        let session = store
+            .create_session(
+                camino::Utf8Path::new("."),
+                "fixture",
+                "model",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let policy = benchmark_policy(store.audit_sink());
+        for (name, input) in [
+            (
+                "filesystem",
+                serde_json::json!({"operation":"write","path":"answer.txt","content":"fixed"}),
+            ),
+            ("shell", serde_json::json!({"command":"echo", "args":["verified"]})),
+        ] {
+            let action = PolicyAction {
+                tool_name: name,
+                input: &input,
+                session_id: session.id,
+                correlation_id: concerto_core::ids::Ulid::new(),
+                capability_requirements: CapabilitySet::default(),
+                sandbox_profile: None,
+                estimated_cost_usd: None,
+                command_facts: None,
+                orchestrator_authority: false,
+                path_facts: None,
+            };
+            assert_eq!(
+                policy.evaluate(&action, CancellationToken::new()).await.unwrap(),
+                PolicyVerdict::Allow,
+                "the declared permissive fixture denied {name}"
+            );
+        }
+        let rows = store
+            .load_audit_log(
+                session.id,
+                &concerto_sessions::AuditLogFilter::default(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.verdict == "Allow"));
     }
 }
 

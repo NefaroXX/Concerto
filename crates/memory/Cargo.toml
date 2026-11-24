@@ -20,7 +20,6 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
 camino = { workspace = true }
-fd-lock = { workspace = true }
 walkdir = "2"
 glob = { workspace = true }
 

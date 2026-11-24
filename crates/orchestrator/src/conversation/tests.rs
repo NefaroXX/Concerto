@@ -28,6 +28,7 @@ fn completion(turn: &ConversationTurn, session_id: Ulid) -> ConversationCompleti
             provider_metrics: Vec::new(),
             checkpoint_json: None,
             provider_error_class: None,
+            recording_integrity: None,
         }),
     }
 }
@@ -57,6 +58,40 @@ fn chat_work_chat_keeps_the_same_session() {
         assert!(controller.settle(&completion(&turn, id)));
         assert_eq!(controller.session_id, Some(id));
         assert_eq!(controller.status, RunStatus::Idle);
+    }
+}
+
+#[test]
+fn recording_warning_is_visible_in_reply_only_and_work_completion() {
+    use concerto_core::recording::{RecorderKind, RecorderOutcome, RecordingIntegrity};
+
+    let mut controller = ConversationController::default();
+    let turn = start(&mut controller, "Hello");
+    let mut completion = completion(&turn, Ulid::new());
+    let outcome = |recorder| RecorderOutcome {
+        recording_id: Ulid::new(),
+        recorder,
+        dropped_events: 0,
+        failed_writes: 0,
+        recorder_failed: false,
+        report_persisted: true,
+    };
+    let mut health = RecordingIntegrity {
+        event_log: outcome(RecorderKind::EventLog),
+        transcript: outcome(RecorderKind::Transcript),
+    };
+    completion.result.as_mut().unwrap().recording_integrity = Some(health.clone());
+    assert_eq!(completion.display_message(), "Hello");
+    health.transcript.dropped_events = 7;
+    completion.result.as_mut().unwrap().recording_integrity = Some(health);
+    for reply_only in [true, false] {
+        completion.reply_only = reply_only;
+        let display = completion.display_message();
+        assert!(display.contains("Hello"));
+        assert!(display.contains("Recording incomplete: transcript (lost 7 events)."));
+        let output = completion.result.as_ref().unwrap();
+        assert_eq!(output.final_message, "Hello", "presentation must preserve provider history");
+        assert_eq!(output.completion_status, AgentCompletionStatus::Completed);
     }
 }
 
@@ -133,31 +168,32 @@ async fn status_reply_is_persisted_and_visible_without_closing_the_inbox() {
         .unwrap();
     let bus = EventBus::new(16);
     let mut events = bus.subscribe();
-    let task = concerto_core::types::AgentTask::new_coordinator_decides(session.id, "Work");
-    let result = reply_to_user(
-        &serde_json::json!({"message": "Tests are running"}),
-        Some(&store),
+    let recorder = crate::runtime_runner_impl::start_transcript_recorder(
         &bus,
-        &task,
-        &cancel,
-    )
-    .await;
+        store.clone(),
+        session.id,
+        Default::default(),
+    );
+    let task = concerto_core::types::AgentTask::new_coordinator_decides(session.id, "Work");
+    let result =
+        reply_to_user(&serde_json::json!({"message": "Tests are running"}), &bus, &task, &cancel)
+            .await;
     assert_eq!(result["continue_work"], true);
     assert!(
         matches!(&events.try_recv().unwrap().kind, EventKind::AssistantMessage { content, .. } if content == "Tests are running")
     );
+    recorder.stop().await;
+    let transcript = store.load_transcript(session.id, cancel.clone()).await.unwrap();
+    assert_eq!(transcript.len(), 1);
+    assert!(
+        matches!(&transcript[0], TranscriptEntry::Assistant { content } if content == "Tests are running")
+    );
     let history = store.load_messages(session.id, cancel.clone()).await.unwrap();
-    assert_eq!(history.len(), 1);
-    assert_eq!(history[0].role, Role::Assistant);
+    assert!(history.is_empty(), "display must not add a second canonical assistant turn");
     cancel.cancel();
-    let rejected = reply_to_user(
-        &serde_json::json!({"message": "Cancelled reply"}),
-        Some(&store),
-        &bus,
-        &task,
-        &cancel,
-    )
-    .await;
+    let rejected =
+        reply_to_user(&serde_json::json!({"message": "Cancelled reply"}), &bus, &task, &cancel)
+            .await;
     assert!(rejected.get("error").is_some());
     assert!(events.try_recv().is_err());
 }

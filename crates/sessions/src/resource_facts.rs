@@ -188,9 +188,10 @@ pub struct ResourceFactRow {
 
 /// One verified cacheable read: the observation row the content belongs to
 /// plus the cached content bytes themselves (ADR-65 §4). The caller (not the
-/// store) is responsible for the never-stale validation: a fresh `stat`
-/// matching `row.size_bytes`/`row.mtime_ms` and `blake3(content) ==
-/// row.content_hash`. `content_cached` is `NULL` for any row that was never
+/// store) validates the requested path's containment and identity, matches
+/// `row.size_bytes`/`row.mtime_ms`, compares current disk bytes with `content`,
+/// and checks `blake3(content) == row.content_hash`. Metadata alone cannot
+/// establish freshness. `content_cached` is `NULL` for any row that was never
 /// cached, so `[`ResourceFacts::cached_read`]` answers `None` for those.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CachedRead {

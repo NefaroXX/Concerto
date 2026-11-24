@@ -329,10 +329,28 @@ The expected manual release checks are maintained in [Testing](../TESTING.md).
 - **`VectorStore` trait moved to `concerto_core`.** The trait now lives in
   `concerto_core::VectorStore`, eliminating `concerto-memory` as a dependency
   of `concerto-plugins` and removing the transitive vector-store dependency.
-- **Bounded, observed durable event-bus backlog:** durable subscribers (spend
-  tracking, audit, replay) stay lossless but warn at 4096 pending events and
-  latch a lag health flag at 65536, surfaced via `EventBus::durable_health()`;
-  dead subscribers are pruned on publish and subscribe.
+- **Bounded, observed durable event-bus backlog:** each live durable
+  subscriber (session event recording, the orchestrator event and transcript
+  recorders, and the `--events-json` writer) has an 8192-event bounded queue
+  with drop-oldest overflow. Other `subscribe_durable` users (spend tracking,
+  provider routing, the memory indexer, provider telemetry) are test-only on
+  this HEAD, not production subscribers. Delivery is lossless while a
+  consumer keeps up; on
+  overflow the oldest events are discarded and counted in
+  `DurableHealth::dropped_events` and
+  `DurableEventReceiver::dropped_events()`, while a 4096-pending warning and a
+  lag flag remain observable via `EventBus::durable_health()`. Dead
+  subscribers are pruned on publish and subscribe; `EventRecording::finish`
+  fails closed on an observed gap and `--events-json` emits an
+  `events_dropped` record. Normal runtime recorders now return independent
+  event/transcript integrity outcomes and save `RecordingFinished` directly
+  to the session store. Overflow, failed writes, failed recorder tasks and
+  failed integrity persistence are visible in summaries and the headless
+  `recording` object without changing task execution status. Session recorders
+  filter before enqueueing and close before draining so foreign-session traffic
+  cannot evict their events and final drop counts are stable. Individual writes
+  are bounded at 10 seconds and recorder drains at 30 seconds; exceeding either
+  deadline degrades recording instead of claiming a complete audit trail.
 - **Debounced memory re-index watcher:** 1s debounce with a bounded,
   deduplicated queue and a rate-limited overflow warning instead of unbounded
   queue growth.

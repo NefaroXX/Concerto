@@ -25,10 +25,10 @@
 //! the async message loop that feeds on [`LineEvent`]s is the remaining
 //! chunk.
 //!
-//! The orphan model per ADR-60: each agent child sets `PR_SET_PDEATHSIG` on
-//! itself so it dies with its supervisor (deferred to the agent-process entry,
-//! S5), and the supervisor's own cleanup path is stdin-close → child
-//! exits → reap.
+//! Linux children request `PR_SET_PDEATHSIG` before exec so the kernel signals
+//! them when their supervisor dies. All Unix children use their own process
+//! group for teardown. Other platforms do not have Linux's parent-death signal;
+//! the supervisor's portable cleanup path is stdin-close → child exits → reap.
 
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write as IoWrite};
@@ -860,10 +860,12 @@ impl Supervisor {
                 command.env("CONCERTO_WHITEBOARD_SCOPES", json);
             }
         }
-        // ADR-60 D1: orphan cleanup — child dies with supervisor, own process group.
+        // ADR-60 D1: Unix process-group teardown; Linux also supports a
+        // parent-death signal. prctl is not a portable Unix API.
         #[cfg(unix)]
         unsafe {
             command.pre_exec(|| {
+                #[cfg(target_os = "linux")]
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -1843,11 +1845,10 @@ async fn handle_execute_tool(
     // all key on the canonical operation while the registered name still
     // executes.
     services.gate.canonicalize_request(&mut request);
-    // ADR-60 D5 always-on: the supervisor attests each mutated target's
-    // current state at request arrival so every versioned write carries
-    // per-target `base_versions` claims (see [`crate::gate::stamp_base_versions`]);
-    // a caller-declared claim is never clobbered, per target.
-    stamp_base_versions(&services.gate, &mut request).await;
+    // Prefer this registered agent's observed read versions, with arrival-time
+    // stamping only for unobserved targets. Explicit per-target claims remain
+    // intact (see `stamp_base_versions`).
+    stamp_base_versions(&services.gate, &mut request, cancel).await;
     match services.gate.submit(request, cancel.clone()).await {
         Ok(outcome) => {
             // Wake subscribers: a gated write appended a `write-applied`
@@ -2780,6 +2781,26 @@ mod write_path_tests {
     }
 
     #[tokio::test]
+    async fn read_bound_versions_protect_supervised_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let (_db, pool) = test_pool().await;
+        let services = services(pool.clone(), root.path().to_path_buf());
+        let cancel = CancellationToken::new();
+        std::fs::write(root.path().join("f"), "base").unwrap();
+        let mut read = fs_write("read", "f", "");
+        read.input = json!({"operation":"read", "path":"f"});
+        let response = handle_execute_tool(&services, "agent-a", read, 1, &cancel).await;
+        assert!(response.error.is_none());
+        std::fs::write(root.path().join("f"), "external").unwrap();
+        let response =
+            handle_execute_tool(&services, "agent-a", fs_write("write", "f", "stale"), 2, &cancel)
+                .await;
+        assert_eq!(response.error.unwrap().code, IpcErrorCode::Conflict);
+        assert!(all_events(&pool).await.is_empty());
+        assert_eq!(std::fs::read_to_string(root.path().join("f")).unwrap(), "external");
+    }
+
+    #[tokio::test]
     async fn stamp_base_versions_injects_fresh_hashes_and_never_clobbers_declared_claims() {
         let dir = tempfile::tempdir().expect("tempdir created");
         let root = dir.path().to_path_buf();
@@ -2790,7 +2811,7 @@ mod write_path_tests {
         // A versioned write with no claim gets the arrival-time pre-image
         // hash stamped in (the always-on injection).
         let mut undecided = fs_write("stamp-a", "f.txt", "new");
-        stamp_base_versions(&services.gate, &mut undecided).await;
+        stamp_base_versions(&services.gate, &mut undecided, &CancellationToken::new()).await;
         assert_eq!(
             undecided.base_versions.get("f.txt").map(String::as_str),
             Some(blake3::hash(b"base").to_hex().to_string().as_str()),
@@ -2801,7 +2822,7 @@ mod write_path_tests {
         // it is stale (the gate will surface the conflict, not the stamp).
         let mut declared = fs_write("stamp-b", "f.txt", "new");
         declared.base_versions.insert("f.txt".to_owned(), "declared-stale".to_owned());
-        stamp_base_versions(&services.gate, &mut declared).await;
+        stamp_base_versions(&services.gate, &mut declared, &CancellationToken::new()).await;
         assert_eq!(
             declared.base_versions.get("f.txt").map(String::as_str),
             Some("declared-stale"),
@@ -2815,7 +2836,7 @@ mod write_path_tests {
         move_req.input = json!({
             "operation": "move", "path": "src.txt", "destination": "dest.txt"
         });
-        stamp_base_versions(&services.gate, &mut move_req).await;
+        stamp_base_versions(&services.gate, &mut move_req, &CancellationToken::new()).await;
         assert_eq!(
             move_req.base_versions.get("src.txt").map(String::as_str),
             Some(blake3::hash(b"move me").to_hex().to_string().as_str()),
@@ -2832,7 +2853,7 @@ mod write_path_tests {
         partial.input =
             json!({ "operation": "move", "path": "src.txt", "destination": "dest.txt" });
         partial.base_versions.insert("src.txt".to_owned(), "declared-stale".to_owned());
-        stamp_base_versions(&services.gate, &mut partial).await;
+        stamp_base_versions(&services.gate, &mut partial, &CancellationToken::new()).await;
         assert_eq!(
             partial.base_versions.get("src.txt").map(String::as_str),
             Some("declared-stale"),
@@ -2856,12 +2877,12 @@ mod write_path_tests {
         // claim: stamping must not change the request at all.
         let mut listed = fs_write("stamp-c", "f.txt", "x");
         listed.input = json!({ "operation": "list", "path": "." });
-        stamp_base_versions(&services.gate, &mut listed).await;
+        stamp_base_versions(&services.gate, &mut listed, &CancellationToken::new()).await;
         assert!(listed.base_versions.is_empty(), "non-versioned operation carries no claim");
 
         let mut shell = fs_write("stamp-d", "f.txt", "x");
         shell.tool = "shell".to_owned();
-        stamp_base_versions(&services.gate, &mut shell).await;
+        stamp_base_versions(&services.gate, &mut shell, &CancellationToken::new()).await;
         assert!(shell.base_versions.is_empty(), "non-filesystem tool carries no claim");
 
         // A copy stamps only its DESTINATION: the source is read-only by
@@ -2870,7 +2891,7 @@ mod write_path_tests {
         let mut copy_req = fs_write("stamp-f", "f.txt", "x");
         copy_req.input =
             json!({ "operation": "copy", "path": "orig.txt", "destination": "out.txt" });
-        stamp_base_versions(&services.gate, &mut copy_req).await;
+        stamp_base_versions(&services.gate, &mut copy_req, &CancellationToken::new()).await;
         assert!(
             !copy_req.base_versions.contains_key("orig.txt"),
             "the read-only copy source is not stamped as a claim"
@@ -2926,7 +2947,7 @@ mod write_path_tests {
 
         // The supervisor stamps the arrival-time claim...
         let mut request = fs_write("h-2", "f.txt", "mine");
-        stamp_base_versions(&services.gate, &mut request).await;
+        stamp_base_versions(&services.gate, &mut request, &CancellationToken::new()).await;
         assert_eq!(
             request.base_versions.get("f.txt").map(String::as_str),
             Some(blake3::hash(b"base").to_hex().to_string().as_str()),

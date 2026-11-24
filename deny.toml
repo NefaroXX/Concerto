@@ -76,6 +76,41 @@ ignore = [
     "RUSTSEC-2026-0370",  # zvariant unmaintained — merged into zbus 6.0.0 (wire module)
     "RUSTSEC-2026-0371",  # zbus_names unmaintained — merged into zbus 6.0.0 (names module)
     "RUSTSEC-2026-0372",  # zvariant_derive unmaintained — derives now provided by zbus 6.0.0
+    # === chrono / chrono-tz unmaintained (no vulnerability) ===
+    # Reason: RUSTSEC-2026-0543 (chrono) and RUSTSEC-2026-0555 (chrono-tz),
+    # both published 2026-09-14, are maintenance-only notices. All current
+    # releases are affected and no safe upgrade exists. The workspace uses
+    # chrono for UTC timestamps and chrono-tz only to validate a configured
+    # IANA timezone; neither is an adversarial parsing path. A replacement
+    # (jiff/time) is a cross-crate API migration tracked separately, not a
+    # selectable dependency bump.
+    # Scope: workspace-wide (direct deps in core/config); transitive through
+    # sqlx and other crates.
+    # Review date: 2026-11-18 — revisit when a maintained replacement lands.
+    "RUSTSEC-2026-0543",  # chrono unmaintained — no security issue
+    "RUSTSEC-2026-0555",  # chrono-tz unmaintained — no security issue
+    # === heapless 0.8.0 unsound collection APIs (no vulnerable call path) ===
+    # Reason: RUSTSEC-2026-0574..-0582 (published 2026-11-18) are unsoundness
+    # advisories in heapless 0.8 collection types, fixed in 0.9.4. heapless is
+    # compiled as a transitive dependency via gix-hash -> faster-hex. gix-hash
+    # enables faster-hex's `std`/`alloc` feature, so faster-hex uses alloc
+    # `String`/`Vec`; its only heapless calls are `Vec::resize` and
+    # `String::from_utf8`/`from_utf8_unchecked`. None of the nine affected
+    # APIs (SortedLinkedList, Deque, IndexMap, Spsc, treiber stack,
+    # FindMutView, `Vec::IntoIter::drop`) are in any call path. heapless is
+    # native-only here; no wasm32-wasip2 guest depends on gix/faster-hex.
+    # Scope: transitive only, build graph (gix-hash hex helpers).
+    # Review date: 2026-11-21 — revisit when gix-hash accepts faster-hex 2.x
+    # (which uses heapless 0.9.4) or gix drops the no-alloc fallback.
+    "RUSTSEC-2026-0574",  # heapless FindMutView use-after-free (unused API)
+    "RUSTSEC-2026-0575",  # heapless Spsc ordering (unused API)
+    "RUSTSEC-2026-0576",  # heapless IndexMap::truncate (unused API)
+    "RUSTSEC-2026-0577",  # heapless panicking Drop (unused APIs)
+    "RUSTSEC-2026-0578",  # heapless SortedLinkedList::zeroize (unused API)
+    "RUSTSEC-2026-0579",  # heapless Deque TryFrom (unused API)
+    "RUSTSEC-2026-0580",  # heapless treiber stack race (unused API)
+    "RUSTSEC-2026-0581",  # heapless Deque::make_contiguous (unused API)
+    "RUSTSEC-2026-0582",  # heapless IndexMap::insert (unused API)
 ]
 
 [licenses]
@@ -95,6 +130,16 @@ allow = [
     "NCSA",
 ]
 confidence-threshold = 0.8
+
+# The patched SQLCipher source package separately declares the licenses of
+# its SQLite amalgamation (public-domain blessing) and bundled LibTomCrypt
+# (public domain / WTFPL). Reviewed the shipped source notices and
+# sqlcipher/LICENSE-libtomcrypt for this exact release (H31, 2026-11-11).
+# Keep this package-scoped so other dependencies still require review.
+[[licenses.exceptions]]
+name = "sqlcipher-src"
+version = "=420.0.0"
+allow = ["blessing", "WTFPL"]
 
 [bans]
 multiple-versions = "warn"

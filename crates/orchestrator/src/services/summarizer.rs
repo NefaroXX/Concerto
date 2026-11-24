@@ -51,6 +51,7 @@ impl ProviderSummarizer {
 impl concerto_memory::summarizer::LLMSummarizer for ProviderSummarizer {
     async fn summarize(&self, messages: &[Message], prompt: &str) -> Result<String, MemoryError> {
         let system_msg = Message {
+            gemini_replay: None,
             role: Role::System,
             content: prompt.to_string(),
             tool_calls: None,
@@ -94,7 +95,7 @@ impl concerto_memory::summarizer::LLMSummarizer for ProviderSummarizer {
 
         // Collect the stream into text. We discard tool calls, reasoning, and
         // usage (a summarization is not charged to the session transcript).
-        let (text, _, _tool_calls, _usage) =
+        let crate::prompts::CompletedTurn { text, .. } =
             crate::prompts::collect_stream_with_timeouts(stream, &self.cancel, ttfb, idle)
                 .await
                 .map_err(|e| {

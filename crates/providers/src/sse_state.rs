@@ -137,6 +137,7 @@ impl AnthropicStreamState {
             // stream stays active and the orchestrator idle timeout does not
             // fire during long keep-alive-only periods.
             self.pending.push_back(Ok(CompletionChunk {
+                gemini_replay: None,
                 reasoning: None,
                 delta: String::new(),
                 tool_call: None,
@@ -188,6 +189,7 @@ impl AnthropicStreamState {
                 let index = data["index"].as_u64().unwrap_or(0) as usize;
                 if let Some(text) = self.parse.text_acc.remove(&index) {
                     self.pending.push_back(Ok(CompletionChunk {
+                        gemini_replay: None,
                         reasoning: None,
                         delta: text,
                         tool_call: None,
@@ -214,6 +216,7 @@ impl AnthropicStreamState {
                                 );
                             }
                             self.pending.push_back(Ok(CompletionChunk {
+                                gemini_replay: None,
                                 reasoning: None,
                                 delta: String::new(),
                                 tool_call: Some(ToolCall {
@@ -245,6 +248,7 @@ impl AnthropicStreamState {
                     self.pending.push_back(Err(error));
                 } else {
                     self.pending.push_back(Ok(CompletionChunk {
+                        gemini_replay: None,
                         reasoning: None,
                         delta: String::new(),
                         tool_call: None,

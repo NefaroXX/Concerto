@@ -347,6 +347,7 @@ impl OpenAiStreamState {
         self.emit_remaining_tools();
         self.emit_reasoning_if_any();
         self.pending.push_back(Ok(CompletionChunk {
+            gemini_replay: None,
             delta: String::new(),
             reasoning: None,
             tool_call: None,
@@ -360,6 +361,7 @@ impl OpenAiStreamState {
     fn emit_reasoning_if_any(&mut self) {
         if !self.reasoning_buffer.is_empty() {
             self.pending.push_back(Ok(CompletionChunk {
+                gemini_replay: None,
                 delta: String::new(),
                 reasoning: Some(std::mem::take(&mut self.reasoning_buffer)),
                 tool_call: None,
@@ -467,6 +469,7 @@ impl OpenAiStreamState {
             self.partial_tools.insert(ENVELOPE_CALL_INDEX, envelope);
         } else {
             self.pending.push_back(Ok(CompletionChunk {
+                gemini_replay: None,
                 delta: content,
                 reasoning: None,
                 tool_call: None,
@@ -481,6 +484,7 @@ impl OpenAiStreamState {
     fn emit_buffered_content(&mut self) {
         let content = std::mem::take(&mut self.content_buffer);
         self.pending.push_back(Ok(CompletionChunk {
+            gemini_replay: None,
             delta: content,
             reasoning: None,
             tool_call: None,
@@ -558,6 +562,7 @@ impl OpenAiStreamState {
                 crate::adapters::schema_loose::unflatten_tool_arguments(&mut args);
             }
             self.pending.push_back(Ok(CompletionChunk {
+                gemini_replay: None,
                 delta: String::new(),
                 reasoning: None,
                 tool_call: Some(ToolCall {
@@ -702,6 +707,7 @@ impl OpenAiStreamState {
             // stream stays active and the orchestrator idle timeout does not
             // fire during long keep-alive-only periods.
             self.pending.push_back(Ok(CompletionChunk {
+                gemini_replay: None,
                 delta: String::new(),
                 reasoning: None,
                 tool_call: None,
@@ -1545,6 +1551,7 @@ mod tests {
         use concerto_core::types::{Message, Role};
 
         let message = || Message {
+            gemini_replay: None,
             role: Role::User,
             content: "Hello".into(),
             tool_calls: None,

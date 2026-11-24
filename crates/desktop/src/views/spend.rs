@@ -131,6 +131,7 @@ mod tests {
             id: Ulid::new(),
             session_id: Ulid::new(),
             task_id: None,
+            agent_id: None,
             provider: "openrouter".into(),
             model: "m/a".into(),
             tokens_in,

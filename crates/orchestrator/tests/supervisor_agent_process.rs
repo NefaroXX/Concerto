@@ -34,7 +34,7 @@ use concerto_core::policy::SimplePolicyEngine;
 use concerto_core::traits::approval::{ApprovalDecision, ApprovalSink};
 use concerto_core::traits::memory::MemoryStore;
 use concerto_core::traits::policy::AuditLog;
-use concerto_core::types::{Condition, PolicyRule, ToolRegistry};
+use concerto_core::types::{Condition, Message, PolicyRule, Role, ToolCall, ToolRegistry};
 use concerto_core::CancellationToken;
 use concerto_orchestrator::gate::{FilePreImageReader, WriteGate};
 use concerto_orchestrator::subscriptions::SubscriptionManager;
@@ -578,4 +578,167 @@ async fn approval_without_a_supervisor_sink_denies_fail_closed() {
         agent.is_none_or(|meta| meta.state != AgentState::Completed),
         "a denied approval must never complete the task"
     );
+}
+
+/// The real agent-process binary plus the H39b step-3 parent-owned files.
+fn agent_process_with_history(
+    root: &std::path::Path,
+    script: serde_json::Value,
+    history: &std::path::Path,
+    metrics: &std::path::Path,
+    seed_len: usize,
+) -> Command {
+    let mut command = agent_process(root, script);
+    command
+        .env("CONCERTO_AGENT_HISTORY_PATH", history.display().to_string())
+        .env("CONCERTO_AGENT_METRICS_PATH", metrics.display().to_string())
+        .env(concerto_orchestrator::supervised_history::SEED_LEN_ENV, seed_len.to_string());
+    command
+}
+
+#[tokio::test]
+async fn supervised_child_restores_and_appends_history_and_reports_metrics() {
+    let root_dir = tempfile::tempdir().expect("tempdir");
+    git_commit_all(root_dir.path());
+    let (_pool_dir, pool) = whiteboard_pool(2).await;
+    let history_dir = tempfile::tempdir().expect("history tempdir");
+    let history_path = history_dir.path().join("agent-a.history.json");
+    let metrics_path = history_dir.path().join("agent-a.metrics.jsonl");
+
+    let seed = vec![
+        Message {
+            gemini_replay: None,
+            role: Role::User,
+            content: "prior question".to_owned(),
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: None,
+            tokens_in: None,
+            tokens_out: None,
+        },
+        Message {
+            gemini_replay: None,
+            role: Role::Assistant,
+            content: "prior answer".to_owned(),
+            tool_calls: None,
+            tool_results: None,
+            reasoning_content: None,
+            tokens_in: None,
+            tokens_out: None,
+        },
+        // Simulates a prior process that crashed after persisting its tool
+        // call but before the result. The child repairs this batch in memory
+        // for its provider request but must leave the durable evidence raw.
+        Message {
+            gemini_replay: None,
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: Some(vec![ToolCall {
+                id: "stale-call".to_owned(),
+                name: "filesystem".to_owned(),
+                arguments: json!({ "operation": "write", "path": "stale.txt" }),
+                thought_signature: None,
+            }]),
+            tool_results: None,
+            reasoning_content: None,
+            tokens_in: None,
+            tokens_out: None,
+        },
+    ];
+    std::fs::write(&history_path, serde_json::to_vec(&seed).expect("serialize seed"))
+        .expect("write seed");
+
+    let services = SupervisorServices {
+        gate: fs_gate(
+            engine(vec![PolicyRule::AutoApprove(Condition::Always)]),
+            pool.clone(),
+            root_dir.path().to_path_buf(),
+        ),
+        whiteboard_pool: pool.clone(),
+        subscriptions: SubscriptionManager::new(pool.clone()),
+        consolidation: None,
+        memory: Arc::new(CountingMemoryStore::new()),
+        project_id: ProjectId("proj-s5".to_owned()),
+        approval_sink: None,
+        bus: None,
+    };
+
+    let mut supervisor = Supervisor::new(SupervisorConfig::default());
+    supervisor
+        .spawn_agent(
+            &mut agent_process_with_history(
+                root_dir.path(),
+                one_write_script(),
+                &history_path,
+                &metrics_path,
+                2,
+            ),
+            "agent-a",
+        )
+        .expect("spawn agent process");
+
+    let summary = run_supervisor(supervisor, services, Duration::from_secs(6)).await;
+    assert!(summary.failed.is_empty(), "no agent may fail: {:?}", summary.failed);
+    let agent =
+        summary.agents.iter().find(|meta| meta.agent_id == "agent-a").expect("agent-a registered");
+    assert_eq!(agent.state, AgentState::Completed);
+
+    // The child restored the seed and appended only its own completed turns.
+    let bytes = std::fs::read(&history_path).expect("history file exists");
+    let messages: Vec<Message> = serde_json::from_slice(&bytes).expect("history is typed JSON");
+    assert!(messages.len() >= 5, "seed (2) + user prompt + tool turn + done: {messages:?}");
+    assert_eq!(messages[0].content, "prior question");
+    assert_eq!(messages[1].content, "prior answer");
+    assert_eq!(
+        messages.iter().filter(|message| message.content == "prior answer").count(),
+        1,
+        "the seed is not duplicated into the accumulated file"
+    );
+    assert!(
+        messages.iter().any(|message| message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| calls.iter().any(|call| call.id == "stale-call"))),
+        "the interrupted crash tail stays durable evidence; startup must not rewrite it"
+    );
+    assert!(
+        !messages.iter().any(|message| message
+            .tool_results
+            .as_ref()
+            .is_some_and(|results| results.iter().any(|result| result.id == "stale-call"))),
+        "the request-only synthetic result is never persisted"
+    );
+    assert!(
+        messages.iter().any(|message| message.role == Role::Tool
+            && message
+                .tool_results
+                .as_ref()
+                .is_some_and(|results| results.iter().any(|result| result.id == "call-1"))),
+        "the child's completed tool result is flushed"
+    );
+    assert!(
+        messages.iter().any(|message| message.role == Role::Assistant && message.content == "done"),
+        "the child's final assistant turn is flushed"
+    );
+
+    let metrics = concerto_orchestrator::supervised_history::read_metrics(&metrics_path)
+        .await
+        .expect("read child metrics");
+    assert_eq!(metrics.len(), 1, "one metric entry for the successful run");
+    assert_eq!(metrics[0].provider, "mock");
+
+    let events = wait_for_events(&pool, Duration::from_secs(8), |events| {
+        events.iter().any(|event| event.kind == WhiteboardKind::SubtaskCompleted)
+    })
+    .await;
+    let terminal = events
+        .iter()
+        .find(|event| event.kind == WhiteboardKind::SubtaskCompleted)
+        .expect("terminal event");
+    let payload_metrics = terminal.payload["provider_metrics"]
+        .as_array()
+        .expect("terminal event carries additive provider metrics");
+    assert_eq!(payload_metrics.len(), 1);
+    assert_eq!(payload_metrics[0]["agent_id"], json!("agent-a"));
+    assert_eq!(payload_metrics[0]["provider"], json!("mock"));
 }
